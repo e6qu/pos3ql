@@ -275,23 +275,19 @@ pub fn eval_full<'a>(
             unary(op, v)
         }
         Expr::Binary { op: BinaryOp::And, left, right } => {
-            // Short-circuit like PostgreSQL: a FALSE operand determines the
-            // result without evaluating the other (so `false AND 1/0` does
-            // not error). Three-valued logic otherwise.
-            let l = eval_full(left, arena, params, row, hooks)?;
-            if matches!(l, Datum::Bool(false)) {
-                return Ok(Datum::Bool(false));
-            }
-            let r = eval_full(right, arena, params, row, hooks)?;
-            logic(BinaryOp::And, l, r)
+            // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
+            // scan qual in a cost order that is not fixed, so a FALSE operand
+            // determines the result even when the *other* operand would error at
+            // runtime. Match that: a definite FALSE on either side yields FALSE
+            // and absorbs the sibling's runtime error. A constant erroring
+            // operand still errors — `check_constant_errors` surfaces it before
+            // we get here, so anything that reaches this point is per-row.
+            eval_logic_short_circuit(BinaryOp::And, left, right, arena, params, row, hooks)
         }
         Expr::Binary { op: BinaryOp::Or, left, right } => {
-            let l = eval_full(left, arena, params, row, hooks)?;
-            if matches!(l, Datum::Bool(true)) {
-                return Ok(Datum::Bool(true));
-            }
-            let r = eval_full(right, arena, params, row, hooks)?;
-            logic(BinaryOp::Or, l, r)
+            // Dual of AND: a definite TRUE on either side yields TRUE and
+            // absorbs the sibling's runtime error (PostgreSQL's `x OR TRUE`).
+            eval_logic_short_circuit(BinaryOp::Or, left, right, arena, params, row, hooks)
         }
         Expr::Binary { op, left, right } => {
             let l = eval_full(left, arena, params, row, hooks)?;
@@ -2231,6 +2227,46 @@ fn json_get<'a>(
     let mut buf = crate::util::StackStr::<8192>::new();
     let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&child)));
     Ok(Datum::Json { text: arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?, jsonb })
+}
+
+/// Evaluates `left AND right` / `left OR right` with PostgreSQL's short-circuit
+/// semantics. The *absorbing* value is FALSE for AND, TRUE for OR. PostgreSQL
+/// simplifies `x AND FALSE` / `x OR TRUE` at plan time — dropping `x` even when
+/// it would error — but is otherwise strict left-to-right: `SELECT (1/a=1) AND
+/// (b>0)` errors on the division, it does not swallow it because `b>0` is false.
+/// We reproduce that boundary by evaluating a *constant* operand first (its
+/// absorbing value short-circuits and drops the other side, matching plan-time
+/// folding; a constant that would error was already surfaced by
+/// `check_constant_errors`), and otherwise evaluating strictly left-to-right.
+/// WHERE's cost-based reordering of runtime conjuncts lives in `where_passes`.
+fn eval_logic_short_circuit<'a>(
+    op: BinaryOp,
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let absorbing = matches!(op, BinaryOp::Or);
+    // Only the right operand needs the constant-first treatment: if the left is
+    // constant it is already evaluated first below; if only the right is, hoist
+    // it so its absorbing value can drop a would-error left (PostgreSQL folds
+    // `x AND FALSE` regardless of which side the constant is on).
+    if !left.is_constant() && right.is_constant() {
+        let r = eval_full(right, arena, params, row, hooks)?;
+        if matches!(r, Datum::Bool(b) if b == absorbing) {
+            return Ok(Datum::Bool(absorbing));
+        }
+        let l = eval_full(left, arena, params, row, hooks)?;
+        return logic(op, l, r);
+    }
+    let l = eval_full(left, arena, params, row, hooks)?;
+    if matches!(l, Datum::Bool(b) if b == absorbing) {
+        return Ok(Datum::Bool(absorbing));
+    }
+    let r = eval_full(right, arena, params, row, hooks)?;
+    logic(op, l, r)
 }
 
 /// SQL three-valued AND/OR.

@@ -162,74 +162,139 @@ pub fn eval<'a>(
 /// subtrees are evaluated once here; per-row evaluation (with short-circuit)
 /// handles the rest.
 pub fn check_constant_errors<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+    fold_check(expr, arena).map(|_| ())
+}
+
+/// The simplification-aware core of [`check_constant_errors`], mirroring
+/// PostgreSQL's `eval_const_expressions`: it folds constant subexpressions
+/// (surfacing their errors) but simplifies `A AND FALSE`→`FALSE`,
+/// `A OR TRUE`→`TRUE`, and constant `CASE` arms — so a constant error inside a
+/// branch that simplification *drops* is not surfaced (PostgreSQL evaluates
+/// `... WHERE FALSE AND (id > (-1 % 0))` to no rows, never folding `-1 % 0`).
+/// Returns the folded boolean value when the expression provably reduces to
+/// one, else `None`.
+fn fold_check<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, SqlError> {
+    use super::ast::BinaryOp;
     if expr.is_constant() {
-        // Evaluate to surface a division-by-zero / overflow / bad-cast error;
-        // discard the value.
-        eval(expr, arena, NO_PARAMS, &NoColumns)?;
-        return Ok(());
+        // A fully-constant subtree folds eagerly; its error surfaces here.
+        return Ok(match eval(expr, arena, NO_PARAMS, &NoColumns)? {
+            Datum::Bool(b) => Some(b),
+            _ => None,
+        });
     }
     match expr {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
         | Expr::NumericLit(_) | Expr::Str(_) | Expr::Column { .. }
-        | Expr::Param(_) | Expr::DefaultMarker => Ok(()),
+        | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
+        // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
+        // (AND) / TRUE (OR) operand settles the result and drops the sibling,
+        // so the sibling's constant errors are never surfaced.
+        Expr::Binary { op: BinaryOp::And, left, right } => {
+            if fold_check(left, arena)? == Some(false) {
+                return Ok(Some(false));
+            }
+            if fold_check(right, arena)? == Some(false) {
+                return Ok(Some(false));
+            }
+            Ok(None)
+        }
+        Expr::Binary { op: BinaryOp::Or, left, right } => {
+            if fold_check(left, arena)? == Some(true) {
+                return Ok(Some(true));
+            }
+            if fold_check(right, arena)? == Some(true) {
+                return Ok(Some(true));
+            }
+            Ok(None)
+        }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
-        | Expr::IsNull { operand, .. } => check_constant_errors(operand, arena),
+        | Expr::IsNull { operand, .. } => {
+            fold_check(operand, arena)?;
+            Ok(None)
+        }
         Expr::Binary { left, right, .. } => {
-            check_constant_errors(left, arena)?;
-            check_constant_errors(right, arena)
+            fold_check(left, arena)?;
+            fold_check(right, arena)?;
+            Ok(None)
         }
         Expr::InList { operand, list, .. } => {
-            check_constant_errors(operand, arena)?;
+            fold_check(operand, arena)?;
             for e in *list {
-                check_constant_errors(e, arena)?;
+                fold_check(e, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Between { operand, low, high, .. } => {
-            check_constant_errors(operand, arena)?;
-            check_constant_errors(low, arena)?;
-            check_constant_errors(high, arena)
+            fold_check(operand, arena)?;
+            fold_check(low, arena)?;
+            fold_check(high, arena)?;
+            Ok(None)
         }
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            check_constant_errors(operand, arena)?;
-            check_constant_errors(pattern, arena)
+            fold_check(operand, arena)?;
+            fold_check(pattern, arena)?;
+            Ok(None)
         }
         Expr::Case { operand, whens, otherwise } => {
             if let Some(o) = operand {
-                check_constant_errors(o, arena)?;
-            }
-            for (c, r) in *whens {
-                check_constant_errors(c, arena)?;
-                check_constant_errors(r, arena)?;
+                // Operand form (`CASE x WHEN v ...`): the WHENs are compared to
+                // x, not boolean conditions, so no arm is dropped by folding.
+                fold_check(o, arena)?;
+                for (c, r) in *whens {
+                    fold_check(c, arena)?;
+                    fold_check(r, arena)?;
+                }
+            } else {
+                // Searched form: a constant-FALSE WHEN drops its THEN; a
+                // constant-TRUE WHEN makes the CASE that THEN and drops the
+                // rest — matching PostgreSQL, so a division in a dead arm
+                // (`WHEN 'a' LIKE 'b' THEN 2/0`) is never folded.
+                for (c, r) in *whens {
+                    match fold_check(c, arena)? {
+                        Some(false) => continue,
+                        Some(true) => {
+                            fold_check(r, arena)?;
+                            return Ok(None);
+                        }
+                        None => {
+                            fold_check(r, arena)?;
+                        }
+                    }
+                }
             }
             if let Some(e) = otherwise {
-                check_constant_errors(e, arena)?;
+                fold_check(e, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Call { args, .. } => {
             for a in *args {
-                check_constant_errors(a, arena)?;
+                fold_check(a, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Ok(()),
+        | Expr::ArraySubquery(_) => Ok(None),
         Expr::Array(items) => {
             for e in *items {
-                check_constant_errors(e, arena)?;
+                fold_check(e, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Subscript { base, index } => {
-            check_constant_errors(base, arena)?;
-            check_constant_errors(index, arena)
+            fold_check(base, arena)?;
+            fold_check(index, arena)?;
+            Ok(None)
         }
-        Expr::Field { base, .. } => check_constant_errors(base, arena),
+        Expr::Field { base, .. } => {
+            fold_check(base, arena)?;
+            Ok(None)
+        }
         Expr::AnyAll { operand, array, .. } => {
-            check_constant_errors(operand, arena)?;
-            check_constant_errors(array, arena)
+            fold_check(operand, arena)?;
+            fold_check(array, arena)?;
+            Ok(None)
         }
     }
 }

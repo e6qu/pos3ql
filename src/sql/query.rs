@@ -486,6 +486,12 @@ fn scan_source<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    // Order the WHERE conjuncts by PostgreSQL's clause cost once, up front, so
+    // the per-row leaf evaluates them cheapest-first without re-sorting.
+    let where_clause = match where_clause {
+        Some(w) => Some(reorder_qual(w, scope, arena)?),
+        None => None,
+    };
     // Assemble a JoinRow from the currently bound row bytes. Physical rows
     // are heap-encoded (fixed schema); derived rows are self-describing.
     fn assemble<'s, 'v, 'd>(
@@ -3531,13 +3537,12 @@ fn is_error_safe(e: &Expr) -> bool {
     }
 }
 
-/// Evaluates a WHERE predicate, ordering a top-level AND chain's conjuncts the
-/// way PostgreSQL's `order_qual_clauses` does: cheapest first, stably. That
-/// reproduces PostgreSQL's error timing in both directions — a cheap conjunct
-/// that filters the row short-circuits a costlier erroring one (so pos3ql does
-/// not error where PostgreSQL returns rows), and a cheap *erroring* conjunct
-/// runs before a costlier filtering one (so pos3ql errors where PostgreSQL
-/// does). Constants fold to cost 0, matching PostgreSQL's plan-time folding.
+/// Evaluates a WHERE predicate, short-circuiting a top-level AND chain
+/// left-to-right. The conjuncts are already in PostgreSQL's cost order — the
+/// scan reorders them once via [`reorder_qual`] before iterating rows — so a
+/// cheap filtering conjunct runs before a costlier erroring one (and a cheap
+/// erroring conjunct before a costlier filtering one), reproducing PostgreSQL's
+/// error timing without re-sorting per row.
 fn where_passes<'e, 'a>(
     predicate: &'e Expr<'a>,
     arena: &'a Arena,
@@ -3548,28 +3553,55 @@ fn where_passes<'e, 'a>(
     let mut conjuncts: [&'e Expr<'a>; MAX_CONJUNCTS] = [predicate; MAX_CONJUNCTS];
     let mut n = 0;
     if !flatten_and(predicate, &mut conjuncts, &mut n) || n <= 1 {
-        // Not an AND chain (or too many conjuncts): evaluate as-is.
         return conjunct_passes(predicate, arena, params, row, hooks);
     }
-    // Stable insertion sort of conjunct indices by ascending cost, then evaluate
-    // in that order with short-circuit. Allocation-free (n <= MAX_CONJUNCTS).
+    for &c in &conjuncts[..n] {
+        if !conjunct_passes(c, arena, params, row, hooks)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Reorders a WHERE predicate's top-level AND conjuncts by PostgreSQL's
+/// `order_qual_clauses` cost (cheapest first, stably), returning a rebuilt
+/// left-deep AND. Done once per scan (not per row), so it can afford the
+/// type-aware `qual_cost`. Constants and non-AND predicates pass through
+/// unchanged.
+fn reorder_qual<'a>(
+    pred: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let mut conj: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
+    let mut n = 0;
+    if !flatten_and(pred, &mut conj, &mut n) || n <= 1 {
+        return Ok(pred);
+    }
+    let cols = ScopeCols(scope);
+    let mut cost = [0u32; MAX_CONJUNCTS];
+    for (i, c) in conj[..n].iter().enumerate() {
+        cost[i] = qual_cost(c, &cols);
+    }
     let mut order = [0usize; MAX_CONJUNCTS];
     for (i, slot) in order[..n].iter_mut().enumerate() {
         *slot = i;
     }
     for i in 1..n {
         let mut j = i;
-        while j > 0 && qual_cost(conjuncts[order[j - 1]]) > qual_cost(conjuncts[order[j]]) {
+        while j > 0 && cost[order[j - 1]] > cost[order[j]] {
             order.swap(j - 1, j);
             j -= 1;
         }
     }
-    for &i in &order[..n] {
-        if !conjunct_passes(conjuncts[i], arena, params, row, hooks)? {
-            return Ok(false);
-        }
+    // Rebuild a left-deep AND in cost order.
+    let mut acc = conj[order[0]];
+    for &i in &order[1..n] {
+        acc = arena
+            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conj[i] })
+            .map_err(|_| arena_full())?;
     }
-    Ok(true)
+    Ok(acc)
 }
 
 /// Per-tuple evaluation cost of a qual expression, approximating PostgreSQL's
@@ -3577,7 +3609,7 @@ fn where_passes<'e, 'a>(
 /// operator, comparison, function, and cast counts one unit; the boolean
 /// connectives AND/OR/NOT are control flow and cost nothing; subqueries
 /// dominate. Only relative order matters.
-fn qual_cost(e: &Expr) -> u32 {
+fn qual_cost(e: &Expr, cols: &dyn super::exec::ColTypeResolver) -> u32 {
     use super::ast::{BinaryOp, UnaryOp};
     // PostgreSQL folds a constant subexpression to a single Const at plan time,
     // so it costs nothing at scan time and is evaluated first.
@@ -3588,39 +3620,72 @@ fn qual_cost(e: &Expr) -> u32 {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
         Expr::Binary { op: BinaryOp::And | BinaryOp::Or, left, right } => {
-            qual_cost(left) + qual_cost(right)
+            qual_cost(left, cols) + qual_cost(right, cols)
         }
-        Expr::Binary { left, right, .. } => 1 + qual_cost(left) + qual_cost(right),
-        Expr::Unary { op: UnaryOp::Not, operand } => qual_cost(operand),
-        Expr::Unary { operand, .. } => 1 + qual_cost(operand),
-        Expr::IsNull { operand, .. } => 1 + qual_cost(operand),
-        Expr::Cast { operand, .. } => 1 + qual_cost(operand),
-        Expr::Field { base, .. } => qual_cost(base),
-        Expr::Subscript { base, index } => 1 + qual_cost(base) + qual_cost(index),
+        Expr::Binary { op, left, right } => {
+            // A comparison that mixes a *runtime* integer side with a
+            // float/numeric side widens the integer with a cast, which
+            // PostgreSQL counts (`(b % 0)::numeric < 0.21` costs more than the
+            // int-only `100 = a % id`); a constant int operand is folded and
+            // cast for free.
+            let cast = if matches!(op, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
+                | BinaryOp::GtEq | BinaryOp::Eq | BinaryOp::NotEq)
+                && widening_cast(left, right, cols)
+            {
+                1
+            } else {
+                0
+            };
+            1 + cast + qual_cost(left, cols) + qual_cost(right, cols)
+        }
+        Expr::Unary { op: UnaryOp::Not, operand } => qual_cost(operand, cols),
+        Expr::Unary { operand, .. } => 1 + qual_cost(operand, cols),
+        Expr::IsNull { operand, .. } => 1 + qual_cost(operand, cols),
+        Expr::Cast { operand, .. } => 1 + qual_cost(operand, cols),
+        Expr::Field { base, .. } => qual_cost(base, cols),
+        Expr::Subscript { base, index } => 1 + qual_cost(base, cols) + qual_cost(index, cols),
         Expr::InList { operand, list, .. } => {
             // PostgreSQL expands `x IN (a, b, ...)` to `x=a OR x=b OR ...`, one
             // comparison per element, so the cost grows with the list length.
-            list.len() as u32 + qual_cost(operand) + list.iter().map(|e| qual_cost(e)).sum::<u32>()
+            list.len() as u32
+                + qual_cost(operand, cols)
+                + list.iter().map(|e| qual_cost(e, cols)).sum::<u32>()
         }
         Expr::Between { operand, low, high, .. } => {
-            2 + qual_cost(operand) + qual_cost(low) + qual_cost(high)
+            2 + qual_cost(operand, cols) + qual_cost(low, cols) + qual_cost(high, cols)
         }
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            1 + qual_cost(operand) + qual_cost(pattern)
+            1 + qual_cost(operand, cols) + qual_cost(pattern, cols)
         }
-        Expr::AnyAll { operand, array, .. } => 1 + qual_cost(operand) + qual_cost(array),
-        Expr::Call { args, .. } => 1 + args.iter().map(|e| qual_cost(e)).sum::<u32>(),
-        Expr::Array(elems) => elems.iter().map(|e| qual_cost(e)).sum::<u32>(),
+        Expr::AnyAll { operand, array, .. } => {
+            1 + qual_cost(operand, cols) + qual_cost(array, cols)
+        }
+        Expr::Call { args, .. } => 1 + args.iter().map(|e| qual_cost(e, cols)).sum::<u32>(),
+        Expr::Array(elems) => elems.iter().map(|e| qual_cost(e, cols)).sum::<u32>(),
         Expr::Case { operand, whens, otherwise } => {
-            let mut c = operand.map_or(0, |o| qual_cost(o));
+            let mut c = operand.map_or(0, |o| qual_cost(o, cols));
             for (w, t) in *whens {
-                c += 1 + qual_cost(w) + qual_cost(t);
+                c += 1 + qual_cost(w, cols) + qual_cost(t, cols);
             }
-            c + otherwise.map_or(0, |o| qual_cost(o))
+            c + otherwise.map_or(0, |o| qual_cost(o, cols))
         }
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
         | Expr::ArraySubquery(_) => 1000,
     }
+}
+
+/// Whether a comparison of `l` and `r` widens a runtime integer operand to
+/// float/numeric (a cast PostgreSQL charges). True when one side is an integer
+/// expression that is not a compile-time constant and the other side resolves
+/// to float/numeric.
+fn widening_cast(l: &Expr, r: &Expr, cols: &dyn super::exec::ColTypeResolver) -> bool {
+    use super::exec::infer_type_res;
+    use super::types::oid;
+    let ty = |e: &Expr| infer_type_res(e, cols).map(|(o, _)| o).unwrap_or(oid::UNKNOWN);
+    let wide = |o: i32| matches!(o, oid::FLOAT8 | oid::FLOAT4 | oid::NUMERIC);
+    let narrow = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8);
+    let (lt, rt) = (ty(l), ty(r));
+    (narrow(lt) && !l.is_constant() && wide(rt)) || (narrow(rt) && !r.is_constant() && wide(lt))
 }
 
 const MAX_SET_LEAVES: usize = 32;

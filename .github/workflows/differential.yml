@@ -70,9 +70,9 @@ jobs:
           FUZZ_COUNT: "10000"
           FUZZ_SEED: "1"
           # Ratchet budget for the fuzzer's known error-timing/semantic edge
-          # cases (pos3ql's WHERE-conjunct evaluation order can raise a division
-          # error where PostgreSQL returns rows — see BUGS.md B-039). Current
-          # baseline at count=10000 seed=1 is ~127; this gates regressions with a
+          # cases (see BUGS.md B-039). Baseline at count=10000 seed=1 is ~75
+          # after mirroring PG's boolean simplification, insertion-order scan,
+          # and cost-ordered WHERE conjuncts; this gates regressions with a
           # little headroom and must be ratcheted toward 0 as the gaps close.
-          FUZZ_BUDGET: "140"
+          FUZZ_BUDGET: "80"
         run: bash tests/external/ci_diff.sh

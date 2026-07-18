@@ -297,6 +297,10 @@ def main():
                               autocommit=True, sslmode="disable")
     pg = pg_conn.cursor()
     p3 = p3_conn.cursor()
+    # Pin the session time zone so timestamptz rendering matches across engines
+    # regardless of the reference server's host zone (pos3ql renders in UTC).
+    for c in (pg, p3):
+        c.execute("SET TimeZone='UTC'")
     # Cap any single statement so a pathological query cannot wedge the run.
     # An engine that does not enforce statement_timeout says so loudly; we report
     # which one and fall back to the job-level timeout for that engine.

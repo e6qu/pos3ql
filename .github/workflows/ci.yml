@@ -2,7 +2,14 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# One run per ref: a new push cancels the previous run; a feature branch runs
+# once (via pull_request) rather than twice.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-check:
@@ -12,6 +19,16 @@ jobs:
 
       - name: Install zsh (for the no-op guard)
         run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       # Fail fast on any new silent accept-and-ignore of SQL/protocol
       # semantics. See tools/check-noops.sh and BUGS.md B-019/B-020/B-021.

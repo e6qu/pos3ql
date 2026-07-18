@@ -115,6 +115,19 @@ if "$PY" "$EXT/slt_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --limit "$SLT_LIMIT" 
   ok "sqllogictest replay ($(grep '^TOTAL' "$WORK/slt.out"))"
 else bad "sqllogictest replay"; tail -40 "$WORK/slt.out"; fi
 
+# The corpus replay fills pos3ql's bounded table catalog to its limit, so give
+# the generative fuzzer its own fresh instance (a clean table space) rather than
+# letting its schema setup fail against a full catalog.
+echo "=== restart pos3ql (fresh table space for the fuzzer) ==="
+kill "$P3_PID" 2>/dev/null; wait "$P3_PID" 2>/dev/null
+rm -rf "${WORK}/p3data"
+./target/release/pos3ql --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+P3_PID=$!
+for _ in $(seq 1 100); do
+  psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+
 # --- generative differential fuzzer (gated by a ratchet budget) ------------
 echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, budget=$FUZZ_BUDGET) ==="
 "$PY" "$EXT/fuzz_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" \
@@ -122,7 +135,10 @@ echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, budget=$FUZZ_BUD
 DIV=$(grep -oE 'divergence=[0-9]+' "$WORK/fuzz.out" | tail -1 | cut -d= -f2)
 DIV=${DIV:-unknown}
 echo "$(grep '^TOTAL' "$WORK/fuzz.out")"
-if [[ "$DIV" =~ ^[0-9]+$ ]] && (( DIV <= FUZZ_BUDGET )); then
+if [[ ! "$DIV" =~ ^[0-9]+$ ]]; then
+  # No divergence count means the fuzzer crashed before finishing — show why.
+  bad "fuzzer produced no divergence count (crashed)"; tail -40 "$WORK/fuzz.out"
+elif (( DIV <= FUZZ_BUDGET )); then
   ok "fuzzer within budget ($DIV <= $FUZZ_BUDGET)"
 else
   bad "fuzzer over budget ($DIV > $FUZZ_BUDGET)"; grep -A3 DIVERGENCE "$WORK/fuzz.out" | head -60

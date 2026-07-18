@@ -229,6 +229,11 @@ def _cell(c):
         return "f:%.9g" % c
     if isinstance(c, bool):
         return "b:%d" % c
+    # psycopg returns raw bytes for text columns under a SQL_ASCII server and str
+    # under UTF8; decode losslessly (latin1 is a 1:1 map) so the comparison keys
+    # the value, not the server's encoding.
+    if isinstance(c, (bytes, bytearray, memoryview)):
+        return "s:" + bytes(c).decode("latin1")
     return "s:" + str(c)
 
 
@@ -258,12 +263,30 @@ def main():
                          autocommit=True, sslmode="disable").cursor()
     p3 = psycopg.connect(host=args.host, port=args.p3, user="postgres",
                          autocommit=True, sslmode="disable").cursor()
-    for stmt in SCHEMA:
-        pg.execute(stmt)
-        p3.execute(stmt)
+
+    # Pin the session time zone so timestamptz rendering is deterministic and
+    # identical on both engines — otherwise the reference server's default zone
+    # (the host's local zone) disagrees with pos3ql's UTC and every timestamptz
+    # value reads as a spurious divergence.
+    for cur in (pg, p3):
+        cur.execute("SET TimeZone='UTC'")
+
+    def setup(engine, cur, stmts):
+        # Fail loudly and identifiably: a setup error (e.g. the target engine's
+        # table catalog is full) must not surface as a bare traceback with no
+        # divergence count.
+        for stmt in stmts:
+            try:
+                cur.execute(stmt)
+            except psycopg.Error as e:
+                sys.stderr.write(f"fuzzer setup failed on {engine}: {e}\n"
+                                 f"  SQL: {stmt}\n")
+                sys.exit(2)
+
     values = "INSERT INTO fz VALUES " + ", ".join(ROWS)
-    pg.execute(values)
-    p3.execute(values)
+    for engine, cur in (("PostgreSQL", pg), ("pos3ql", p3)):
+        setup(engine, cur, SCHEMA)
+        setup(engine, cur, [values])
 
     rng = random.Random(args.seed)
     gen = Gen(rng)

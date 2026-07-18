@@ -1,0 +1,24 @@
+-- Transaction semantics.
+CREATE TABLE t5 (id int, v text);
+INSERT INTO t5 VALUES (1, 'base');
+BEGIN;
+INSERT INTO t5 VALUES (2, 'in-txn');
+UPDATE t5 SET v = 'changed' WHERE id = 1;
+SELECT * FROM t5 ORDER BY id;
+ROLLBACK;
+SELECT * FROM t5 ORDER BY id;
+BEGIN;
+INSERT INTO t5 VALUES (3, 'committed');
+COMMIT;
+SELECT * FROM t5 ORDER BY id;
+BEGIN;
+SELECT 1/0;
+SELECT 'blocked';
+COMMIT;
+SELECT * FROM t5 ORDER BY id;
+BEGIN;
+CREATE TABLE t5b (x int);
+INSERT INTO t5b VALUES (9);
+ROLLBACK;
+SELECT * FROM t5b;
+DROP TABLE t5;

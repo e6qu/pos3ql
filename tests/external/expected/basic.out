@@ -1,0 +1,157 @@
+-- SQL dialect conformance: types, literals, operators, functions,
+-- aggregates, DDL/DML, ordering, quoting. Run through real psql; output
+-- compared against expected/basic.out.
+-- types & literals
+SELECT 1, 2.5, 'text', TRUE, FALSE, NULL;
+ ?column? | ?column? | ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------+----------+----------
+        1 |      2.5 | text     | t        | f        | 
+(1 row)
+
+SELECT 1::bigint, '42'::int, 2.7::int, 'on'::bool, true::text, '2.5'::float8;
+ int8 | int4 | int4 | bool | text | float8 
+------+------+------+------+------+--------
+    1 |   42 |    3 | t    | true |    2.5
+(1 row)
+
+-- arithmetic, precedence, int8 widening via cast (int4 overflow errors)
+SELECT 1 + 2 * 3, (1 + 2) * 3, 7 / 2, 7 % 2, -5, 2147483647::bigint + 1;
+ ?column? | ?column? | ?column? | ?column? | ?column? |  ?column?  
+----------+----------+----------+----------+----------+------------
+        7 |        9 |        3 |        1 |       -5 | 2147483648
+(1 row)
+
+-- comparisons, concatenation
+SELECT 1 < 2, 2 <= 2, 3 <> 4, 'a' || 'b' || 'c', 'n=' || 42;
+ ?column? | ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------+----------
+ t        | t        | t        | abc      | n=42
+(1 row)
+
+-- three-valued logic
+SELECT NULL AND FALSE, NULL AND TRUE, NULL OR TRUE, 1 = NULL, NULL IS NULL, 5 IS NOT NULL;
+ ?column? | ?column? | ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------+----------+----------
+ f        |          | t        |          | t        | t
+(1 row)
+
+-- scalar functions
+SELECT length('héllo'), upper('mIx'), lower('MiX'), abs(-7), coalesce(NULL, 'x'), pg_typeof(1), pg_typeof(1.5);
+ length | upper | lower | abs | coalesce | pg_typeof | pg_typeof 
+--------+-------+-------+-----+----------+-----------+-----------
+      5 | MIX   | mix   |   7 | x        | integer   | numeric
+(1 row)
+
+-- DDL + DML
+CREATE TABLE t_basic (id int NOT NULL, name text, score float8, ok bool);
+INSERT INTO t_basic VALUES (1, 'ada', 9.5, true), (2, 'bob', 7.25, false), (3, 'cyd', NULL, NULL);
+INSERT INTO t_basic (id, name) VALUES (4, 'dee');
+SELECT * FROM t_basic ORDER BY id;
+ id | name | score | ok 
+----+------+-------+----
+  1 | ada  |   9.5 | t
+  2 | bob  |  7.25 | f
+  3 | cyd  |       | 
+  4 | dee  |       | 
+(4 rows)
+
+SELECT name, score * 2 AS double_score FROM t_basic WHERE score > 7 ORDER BY score DESC;
+ name | double_score 
+------+--------------
+ ada  |           19
+ bob  |         14.5
+(2 rows)
+
+SELECT name FROM t_basic WHERE ok ORDER BY name;
+ name 
+------
+ ada
+(1 row)
+
+UPDATE t_basic SET score = score + 0.5 WHERE id = 2;
+SELECT score FROM t_basic WHERE id = 2;
+ score 
+-------
+  7.75
+(1 row)
+
+DELETE FROM t_basic WHERE id = 4;
+SELECT count(*), count(score), sum(id), avg(score), min(name), max(score) FROM t_basic;
+ count | count | sum |  avg  | min | max 
+-------+-------+-----+-------+-----+-----
+     3 |     2 |   6 | 8.625 | ada | 9.5
+(1 row)
+
+SELECT count(*) FROM t_basic WHERE score IS NULL;
+ count 
+-------
+     1
+(1 row)
+
+-- NULL ordering (PostgreSQL: NULLS LAST asc, NULLS FIRST desc)
+CREATE TABLE t_nulls (v int);
+INSERT INTO t_nulls VALUES (3), (NULL), (1), (2);
+SELECT v FROM t_nulls ORDER BY v;
+ v 
+---
+ 1
+ 2
+ 3
+  
+(4 rows)
+
+SELECT v FROM t_nulls ORDER BY v DESC LIMIT 2;
+ v 
+---
+  
+ 3
+(2 rows)
+
+-- identifier quoting, case folding, string syntaxes
+CREATE TABLE "MixedCase" ("Id" int, "the name" text);
+INSERT INTO "MixedCase" VALUES (1, 'it''s');
+SELECT "Id", "the name" FROM "MixedCase";
+ Id | the name 
+----+----------
+  1 | it's
+(1 row)
+
+SELECT $$raw $ text$$, $q$has $$ inside$q$, E'tab\there';
+  ?column?  |   ?column?    |   ?column?   
+------------+---------------+--------------
+ raw $ text | has $$ inside | tab     here
+(1 row)
+
+-- multi-word and aliased type names, text coercion on insert
+CREATE TABLE t_types (a smallint, b bigint, c double precision, d varchar(10), e boolean);
+INSERT INTO t_types VALUES ('5', 9223372036854775807, 1e10, 'str', 'yes');
+SELECT * FROM t_types;
+ a |          b          |      c      |  d  | e 
+---+---------------------+-------------+-----+---
+ 5 | 9223372036854775807 | 10000000000 | str | t
+(1 row)
+
+-- session statements and transactions (accepted forms)
+SET client_min_messages = warning;
+SHOW server_version;
+  server_version   
+-------------------
+ 18.4 (pos3ql 0.1)
+(1 row)
+
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+BEGIN;
+COMMIT;
+ROLLBACK;
+psql:tests/external/sql/basic.sql:57: WARNING:  there is no transaction in progress
+-- cleanup
+DROP TABLE t_basic;
+DROP TABLE t_nulls;
+DROP TABLE "MixedCase";
+DROP TABLE t_types;
+DROP TABLE IF EXISTS never_existed;

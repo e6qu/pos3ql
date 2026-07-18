@@ -2297,13 +2297,11 @@ fn json_get<'a>(
 /// Evaluates `left AND right` / `left OR right` with PostgreSQL's short-circuit
 /// semantics. The *absorbing* value is FALSE for AND, TRUE for OR. PostgreSQL
 /// simplifies `x AND FALSE` / `x OR TRUE` at plan time — dropping `x` even when
-/// it would error — but is otherwise strict left-to-right: `SELECT (1/a=1) AND
-/// (b>0)` errors on the division, it does not swallow it because `b>0` is false.
-/// We reproduce that boundary by evaluating a *constant* operand first (its
-/// absorbing value short-circuits and drops the other side, matching plan-time
-/// folding; a constant that would error was already surfaced by
-/// `check_constant_errors`), and otherwise evaluating strictly left-to-right.
-/// WHERE's cost-based reordering of runtime conjuncts lives in `where_passes`.
+/// it would error, and even when the settling value is nested (`A AND (FALSE
+/// AND c)` drops `A`) — but is otherwise strict left-to-right: `(1/a=1) AND
+/// (b>0)` errors on the division, it does not swallow it because `b>0` is not
+/// statically FALSE. `fold_check` decides statically (surfacing a constant
+/// operand's own error left-first, exactly as plan-time folding does).
 fn eval_logic_short_circuit<'a>(
     op: BinaryOp,
     left: &Expr<'a>,
@@ -2314,17 +2312,19 @@ fn eval_logic_short_circuit<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let absorbing = matches!(op, BinaryOp::Or);
-    // Only the right operand needs the constant-first treatment: if the left is
-    // constant it is already evaluated first below; if only the right is, hoist
-    // it so its absorbing value can drop a would-error left (PostgreSQL folds
-    // `x AND FALSE` regardless of which side the constant is on).
-    if !left.is_constant() && right.is_constant() {
-        let r = eval_full(right, arena, params, row, hooks)?;
-        if matches!(r, Datum::Bool(b) if b == absorbing) {
-            return Ok(Datum::Bool(absorbing));
-        }
-        let l = eval_full(left, arena, params, row, hooks)?;
-        return logic(op, l, r);
+    // Left first: a statically-determined left settles the result (absorbing) or
+    // hands off to the right (non-absorbing), matching plan-time folding order.
+    match fold_check(left, arena)? {
+        Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
+        Some(_) => return eval_full(right, arena, params, row, hooks),
+        None => {}
+    }
+    // Left is runtime; if the right statically folds to the absorbing value it
+    // settles the result and drops the (possibly-erroring) left.
+    match fold_check(right, arena)? {
+        Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
+        Some(_) => return eval_full(left, arena, params, row, hooks),
+        None => {}
     }
     let l = eval_full(left, arena, params, row, hooks)?;
     if matches!(l, Datum::Bool(b) if b == absorbing) {

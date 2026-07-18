@@ -486,10 +486,11 @@ fn scan_source<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
-    // Order the WHERE conjuncts by PostgreSQL's clause cost once, up front, so
-    // the per-row leaf evaluates them cheapest-first without re-sorting.
+    // Fold `col IS [NOT] NULL` on NOT-NULL columns, then order the WHERE
+    // conjuncts by PostgreSQL's clause cost once, up front, so the per-row leaf
+    // evaluates them cheapest-first without re-sorting.
     let where_clause = match where_clause {
-        Some(w) => Some(reorder_qual(w, scope, arena)?),
+        Some(w) => Some(reorder_qual(fold_null(w, scope, arena)?, scope, arena)?),
         None => None,
     };
     // Assemble a JoinRow from the currently bound row bytes. Physical rows
@@ -3561,6 +3562,51 @@ fn where_passes<'e, 'a>(
         }
     }
     Ok(true)
+}
+
+/// Folds `col IS NOT NULL` to TRUE and `col IS NULL` to FALSE for a column with
+/// a NOT NULL constraint, as PostgreSQL does using the constraint — so
+/// `WHERE x/0 = 1 OR id IS NOT NULL` (id NOT NULL) drops the erroring branch.
+/// Rewrites only the boolean spine (AND/OR/NOT/IS NULL); other nodes pass
+/// through, since an IS NULL test appears as a boolean operand.
+fn fold_null<'a>(
+    e: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    use super::ast::{BinaryOp, UnaryOp};
+    match e {
+        Expr::IsNull { operand: Expr::Column { qualifier, name }, negated }
+            if scope
+                .find_column(*qualifier, name)
+                .ok()
+                .and_then(|(t, c)| scope.defs[t].map(|d| d.columns()[c].not_null))
+                .unwrap_or(false) =>
+        {
+            Ok(&*arena.alloc(Expr::Bool(*negated)).map_err(|_| arena_full())?)
+        }
+        Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } => {
+            let (l, r) = (fold_null(left, scope, arena)?, fold_null(right, scope, arena)?);
+            if core::ptr::eq(l, *left) && core::ptr::eq(r, *right) {
+                Ok(e)
+            } else {
+                Ok(&*arena
+                    .alloc(Expr::Binary { op: *op, left: l, right: r })
+                    .map_err(|_| arena_full())?)
+            }
+        }
+        Expr::Unary { op: UnaryOp::Not, operand } => {
+            let o = fold_null(operand, scope, arena)?;
+            if core::ptr::eq(o, *operand) {
+                Ok(e)
+            } else {
+                Ok(&*arena
+                    .alloc(Expr::Unary { op: UnaryOp::Not, operand: o })
+                    .map_err(|_| arena_full())?)
+            }
+        }
+        _ => Ok(e),
+    }
 }
 
 /// Reorders a WHERE predicate's top-level AND conjuncts by PostgreSQL's

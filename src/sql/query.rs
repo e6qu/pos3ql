@@ -3531,11 +3531,13 @@ fn is_error_safe(e: &Expr) -> bool {
     }
 }
 
-/// Evaluates a WHERE predicate. PostgreSQL's qual evaluation order is
-/// unspecified and cost-driven, so a filtering condition can run before an
-/// error-prone one; we match that by evaluating a top-level AND chain's
-/// error-safe conjuncts first (this only removes spurious errors, never adds
-/// one, since safe conjuncts cannot error).
+/// Evaluates a WHERE predicate, ordering a top-level AND chain's conjuncts the
+/// way PostgreSQL's `order_qual_clauses` does: cheapest first, stably. That
+/// reproduces PostgreSQL's error timing in both directions — a cheap conjunct
+/// that filters the row short-circuits a costlier erroring one (so pos3ql does
+/// not error where PostgreSQL returns rows), and a cheap *erroring* conjunct
+/// runs before a costlier filtering one (so pos3ql errors where PostgreSQL
+/// does). Constants fold to cost 0, matching PostgreSQL's plan-time folding.
 fn where_passes<'e, 'a>(
     predicate: &'e Expr<'a>,
     arena: &'a Arena,
@@ -3549,33 +3551,20 @@ fn where_passes<'e, 'a>(
         // Not an AND chain (or too many conjuncts): evaluate as-is.
         return conjunct_passes(predicate, arena, params, row, hooks);
     }
-    // Pass 1: error-safe conjuncts filter first.
-    for &c in &conjuncts[..n] {
-        if is_error_safe(c) && !conjunct_passes(c, arena, params, row, hooks)? {
-            return Ok(false);
-        }
-    }
-    // Pass 2: the remaining (possibly-erroring) conjuncts, cheapest first —
-    // PostgreSQL's `order_qual_clauses` evaluates a cheaper conjunct before a
-    // costlier one, so a cheap conjunct that happens to filter the row (even if
-    // it contains arithmetic, so pass 1 skipped it) runs before an expensive
-    // erroring one. Stable insertion sort of indices (allocation-free).
+    // Stable insertion sort of conjunct indices by ascending cost, then evaluate
+    // in that order with short-circuit. Allocation-free (n <= MAX_CONJUNCTS).
     let mut order = [0usize; MAX_CONJUNCTS];
-    let mut m = 0;
-    for i in 0..n {
-        if !is_error_safe(conjuncts[i]) {
-            order[m] = i;
-            m += 1;
-        }
+    for (i, slot) in order[..n].iter_mut().enumerate() {
+        *slot = i;
     }
-    for i in 1..m {
+    for i in 1..n {
         let mut j = i;
         while j > 0 && qual_cost(conjuncts[order[j - 1]]) > qual_cost(conjuncts[order[j]]) {
             order.swap(j - 1, j);
             j -= 1;
         }
     }
-    for &i in &order[..m] {
+    for &i in &order[..n] {
         if !conjunct_passes(conjuncts[i], arena, params, row, hooks)? {
             return Ok(false);
         }
@@ -3590,6 +3579,11 @@ fn where_passes<'e, 'a>(
 /// dominate. Only relative order matters.
 fn qual_cost(e: &Expr) -> u32 {
     use super::ast::{BinaryOp, UnaryOp};
+    // PostgreSQL folds a constant subexpression to a single Const at plan time,
+    // so it costs nothing at scan time and is evaluated first.
+    if e.is_constant() {
+        return 0;
+    }
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
@@ -3604,7 +3598,9 @@ fn qual_cost(e: &Expr) -> u32 {
         Expr::Field { base, .. } => qual_cost(base),
         Expr::Subscript { base, index } => 1 + qual_cost(base) + qual_cost(index),
         Expr::InList { operand, list, .. } => {
-            1 + qual_cost(operand) + list.iter().map(|e| qual_cost(e)).sum::<u32>()
+            // PostgreSQL expands `x IN (a, b, ...)` to `x=a OR x=b OR ...`, one
+            // comparison per element, so the cost grows with the list length.
+            list.len() as u32 + qual_cost(operand) + list.iter().map(|e| qual_cost(e)).sum::<u32>()
         }
         Expr::Between { operand, low, high, .. } => {
             2 + qual_cost(operand) + qual_cost(low) + qual_cost(high)

@@ -150,6 +150,13 @@ def _cell(c):
         return "f:%.9g" % c
     if isinstance(c, bool):
         return "b:%d" % c
+    # psycopg hands back raw bytes for text columns when the server encoding is
+    # SQL_ASCII (it will not guess a decoding); a UTF8 server yields str for the
+    # identical data. Decode losslessly so the comparison keys the value, not the
+    # server's encoding. latin1 is a total 1:1 map, so real bytea compares by
+    # content on both engines too.
+    if isinstance(c, (bytes, bytearray, memoryview)):
+        return "s:" + bytes(c).decode("latin1")
     return "s:" + str(c)
 
 
@@ -279,6 +286,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--limit", type=int, default=0, help="max blocks per file")
     ap.add_argument("--max-print", type=int, default=25)
+    ap.add_argument("--stmt-timeout-ms", type=int, default=60000,
+                    help="per-statement timeout; 0 disables")
     ap.add_argument("files", nargs="+")
     args = ap.parse_args()
 
@@ -288,6 +297,20 @@ def main():
                               autocommit=True, sslmode="disable")
     pg = pg_conn.cursor()
     p3 = p3_conn.cursor()
+    # Pin the session time zone so timestamptz rendering matches across engines
+    # regardless of the reference server's host zone (pos3ql renders in UTC).
+    for c in (pg, p3):
+        c.execute("SET TimeZone='UTC'")
+    # Cap any single statement so a pathological query cannot wedge the run.
+    # An engine that does not enforce statement_timeout says so loudly; we report
+    # which one and fall back to the job-level timeout for that engine.
+    if args.stmt_timeout_ms > 0:
+        for name, c in (("pg", pg), ("p3", p3)):
+            try:
+                c.execute("SET statement_timeout = %d" % args.stmt_timeout_ms)
+            except psycopg.Error as e:
+                print(f"note: {name} does not enforce statement_timeout "
+                      f"({e}); relying on job-level timeout for it")
 
     total = {"match": 0, "unsupported": 0, "divergence": 0, "blocks": 0}
     divergences = []

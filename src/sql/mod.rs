@@ -2355,6 +2355,34 @@ mod tests {
     }
 
     #[test]
+    fn multiway_equijoin_prunes_early() {
+        // A chained k-way equi-join must push each equality down to the level
+        // where its tables are bound and prune doomed partial rows there.
+        // Without that this is a naive O(N^k) nested loop that never returns;
+        // with it the test completes in milliseconds. Counts verified against
+        // PostgreSQL 18.4.
+        let (mut e, mut b) = test_engine();
+        let mut t = TxnState::new(&mut b, 256).unwrap();
+        run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (id int, v int)");
+        run_txn(&mut e, &mut b, &mut t,
+            "INSERT INTO t SELECT g, g % 10 FROM generate_series(1, 80) g");
+        // Six-way self-join chained on a unique key: N distinct chains.
+        let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+            "SELECT count(*) FROM t a, t b, t c, t d, t e, t f \
+             WHERE a.id=b.id AND b.id=c.id AND c.id=d.id AND d.id=e.id AND e.id=f.id"));
+        assert_eq!(rows, ["80"], "6-way chained equi-join: {rows:?}");
+        // A constant equality on a middle table prunes every chain but one.
+        let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+            "SELECT count(*) FROM t a, t b, t c WHERE a.id=b.id AND b.id=c.id AND b.id=7"));
+        assert_eq!(rows, ["1"], "constant-pruned join: {rows:?}");
+        // Pushdown must not change results: the leaf still checks the full WHERE,
+        // so a non-key predicate that only the leaf can evaluate still filters.
+        let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+            "SELECT count(*) FROM t a, t b WHERE a.id=b.id AND a.v + b.v = 4"));
+        assert_eq!(rows, ["8"], "leaf-checked predicate: {rows:?}");
+    }
+
+    #[test]
     fn named_timezone_dst_rendering() {
         let (mut e, mut b) = test_engine();
         let mut t = TxnState::new(&mut b, 256).unwrap();

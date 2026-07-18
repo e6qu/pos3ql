@@ -107,11 +107,11 @@ done
 
 print -- "\n=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==="
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
-if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/sqllogictest/test ]]; then
+if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then
   SLT_LIMIT=${POS3QL_SLT_LIMIT:-600}
   if "$SLT_VENV/bin/python" "$EXT/slt_diff.py" --pg $PG_PORT --p3 $P3_PORT \
        --limit "$SLT_LIMIT" \
-       vendor/sqllogictest/test/*.test vendor/sqllogictest/test/evidence/*.test \
+       vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
        > "$WORK/slt.out" 2>&1; then
     ok "sqllogictest differential ($(grep '^TOTAL' "$WORK/slt.out"))"
   else

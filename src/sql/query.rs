@@ -59,6 +59,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::relname_text(self.storage, oid, arena)
     }
+
+    fn reloid(&self, name: &str) -> Option<i32> {
+        super::catalog::reloid_of_name(self.storage, name)
+    }
 }
 
 fn sql_ok() -> Outcome {

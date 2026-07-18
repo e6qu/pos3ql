@@ -442,6 +442,23 @@ pub fn relname_text<'a>(
     Ok(None)
 }
 
+/// The OID of the relation named `name`, for `'relname'::regclass`. Resolves
+/// ordinary tables and synthesized index relations; `None` if no such relation.
+pub fn reloid_of_name(storage: &Storage, name: &str) -> Option<i32> {
+    for (slot, table) in storage.live_tables() {
+        if table.def.name.as_str() == name {
+            return Some(table_oid(storage, slot));
+        }
+    }
+    let mut idxs = [None; MAX_SYNTH_INDEXES];
+    let n = collect_indexes(storage, &mut idxs);
+    idxs[..n]
+        .iter()
+        .flatten()
+        .find(|info| info.name.as_str() == name)
+        .map(|info| info.oid)
+}
+
 /// One materialized foreign-key constraint.
 #[derive(Clone, Copy)]
 struct FkInfo {

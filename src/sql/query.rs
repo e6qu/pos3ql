@@ -3492,6 +3492,14 @@ fn flatten_and<'e, 'a>(e: &'e Expr<'a>, out: &mut [&'e Expr<'a>], n: &mut usize)
 /// as potentially-erroring.
 fn is_error_safe(e: &Expr) -> bool {
     use super::ast::{BinaryOp::*, UnaryOp};
+    // A constant subexpression cannot raise a *runtime* error: PostgreSQL folds
+    // it at plan time and `check_constant_errors` surfaces any error eagerly
+    // there, so by the time a row is filtered it is known good. This lets a
+    // constant-false conjunct (e.g. `-2.25 <> -2.25`, whose unary minus would
+    // otherwise mark it unsafe) filter the row before an erroring sibling runs.
+    if e.is_constant() {
+        return true;
+    }
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => true,

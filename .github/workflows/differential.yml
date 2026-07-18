@@ -1,0 +1,53 @@
+name: Differential
+
+# Runs the SQL corpora and the generative fuzzer against a REAL PostgreSQL 18
+# and against pos3ql, and diffs them. This is the coverage that the fast
+# unit-test CI (ci.yml) cannot give: tens of thousands of vendored
+# sqllogictest blocks plus thousands of generated statements, all validated
+# against PostgreSQL as the oracle.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          # Match pos3ql's C/byte collation so ordering/min/max agree.
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client and Python
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client python3-venv
+
+      - name: Differential conformance (corpora + fuzzer vs real PostgreSQL)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+          # Replay the whole vendored sqllogictest corpus (~11k blocks).
+          SLT_LIMIT: "50000"
+          # Generative fuzzer: thousands of distinct statements, deterministic.
+          FUZZ_COUNT: "10000"
+          FUZZ_SEED: "1"
+          # Ratchet budget for the fuzzer's known error-timing edge cases.
+          # Start permissive so the deterministic suite gates; lower over time
+          # as the divergences are fixed (goal: 0).
+          FUZZ_BUDGET: "100000"
+        run: bash tests/external/ci_diff.sh

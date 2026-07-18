@@ -13,14 +13,20 @@ on:
 jobs:
   differential:
     runs-on: ubuntu-latest
+    # Hard ceiling: the whole differential suite (corpora + fuzzer) finishes in
+    # minutes; this cap guarantees a pathological query can never wedge CI for
+    # hours, even if a per-statement guard is missing on one engine.
+    timeout-minutes: 40
 
     services:
       postgres:
         image: postgres:18
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
-          # Match pos3ql's C/byte collation so ordering/min/max agree.
-          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C"
+          # Match pos3ql: C/byte collation so ordering/min/max agree, and UTF8
+          # server encoding (vanilla PostgreSQL's real-world default, and what
+          # pos3ql advertises) so text columns decode to str, not raw bytes.
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
         ports:
           - 5432:5432
         options: >-

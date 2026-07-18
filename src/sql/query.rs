@@ -479,7 +479,7 @@ fn scan_source<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
-    where_clause: Option<&Expr<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
@@ -537,6 +537,8 @@ fn scan_source<'a>(
         // For a RIGHT/FULL join (always the last level), one flag per scanned
         // row of the deepest table, marking those that found a left partner.
         matched: Option<&[core::cell::Cell<bool>]>,
+        // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
+        pushdown: &[&[&'a Expr<'a>]],
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -573,12 +575,29 @@ fn scan_source<'a>(
                 }
             Ok(true)
         };
+        // Predicate pushdown: skip a partial row that already fails an error-safe
+        // WHERE conjunct fully bound at this depth.
+        let passes_pushdown = |bound: &[Option<&'a [u8]>; MAX_JOIN_TABLES]|
+         -> Result<bool, SqlError> {
+            if pushdown[depth].is_empty() {
+                return Ok(true);
+            }
+            let mut pbuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
+            let prow = assemble(scope, bound, depth + 1, &mut pbuf)?;
+            let pcr = Chained { inner: &prow, outer };
+            for &c in pushdown[depth] {
+                if !conjunct_passes(c, arena, params, &pcr, hooks)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
         // Derived tables scan their materialized rows; physical tables scan the
         // visibility-filtered heap.
         if let Some(rows) = scope.derived[depth] {
             for (idx, bytes) in rows.iter().enumerate() {
                 bound[depth] = Some(bytes);
-                if !on_matches(bound)? {
+                if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
                 }
                 matched_any = true;
@@ -587,7 +606,7 @@ fn scan_source<'a>(
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, f,
+                    outer, depth + 1, bound, matched, pushdown, f,
                 )? {
                     return Ok(false);
                 }
@@ -602,7 +621,7 @@ fn scan_source<'a>(
                 bound[depth] = Some(storage.heap.get(loc));
                 let this = idx;
                 idx += 1;
-                if !on_matches(bound)? {
+                if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
                 }
                 matched_any = true;
@@ -611,7 +630,7 @@ fn scan_source<'a>(
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, f,
+                    outer, depth + 1, bound, matched, pushdown, f,
                 )? {
                     return Ok(false);
                 }
@@ -625,7 +644,7 @@ fn scan_source<'a>(
             bound[depth] = None;
             if !level(
                 storage, scope, from, txid, where_clause, arena, params, hooks,
-                outer, depth + 1, bound, matched, f,
+                outer, depth + 1, bound, matched, pushdown, f,
             )? {
                 return Ok(false);
             }
@@ -670,6 +689,40 @@ fn scan_source<'a>(
         None
     };
 
+    // Predicate pushdown (inner/cross joins only): assign each error-safe WHERE
+    // conjunct to the join level at which all its tables are bound, so it can
+    // prune the search early instead of being checked only after the full
+    // Cartesian product is built. This turns a k-way equi-join from O(N^k)
+    // toward the filtered result size. Results are identical — a partial row
+    // that fails such a conjunct cannot satisfy the full WHERE (the conjunct's
+    // value does not depend on the still-unbound tables), and the leaf still
+    // evaluates the whole WHERE. Restricted to inner/cross joins so a
+    // WHERE clause over an outer join's nullable side is never pruned early.
+    let all_inner = from
+        .joins
+        .iter()
+        .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross));
+    let mut pd_bufs: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
+        [[&Expr::Null; MAX_CONJUNCTS]; MAX_JOIN_TABLES];
+    let mut pd_n = [0usize; MAX_JOIN_TABLES];
+    if all_inner && scope.n >= 2 && let Some(w) = where_clause {
+        let mut conj: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
+        let mut n = 0;
+        let conjuncts: &[&Expr] =
+            if flatten_and(w, &mut conj, &mut n) { &conj[..n] } else { core::slice::from_ref(&w) };
+        for &c in conjuncts {
+            if is_error_safe(c)
+                && let Some(d) = expr_max_table(c, scope)
+                && d < scope.n
+                && pd_n[d] < MAX_CONJUNCTS
+            {
+                pd_bufs[d][pd_n[d]] = c;
+                pd_n[d] += 1;
+            }
+        }
+    }
+    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] = core::array::from_fn(|d| &pd_bufs[d][..pd_n[d]]);
+
     let mut bound = [None; MAX_JOIN_TABLES];
     level(
         storage,
@@ -684,6 +737,7 @@ fn scan_source<'a>(
         0,
         &mut bound,
         matched,
+        &pushdown,
         f,
     )?;
 
@@ -2448,7 +2502,7 @@ fn fold_aggregates<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
-    where_clause: Option<&Expr<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
     agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -3313,6 +3367,50 @@ pub fn select_query<'a>(
 /// Evaluates a WHERE/HAVING predicate against a row, returning whether the row
 /// passes (NULL and FALSE both filter it out); errors on a non-boolean result.
 const MAX_CONJUNCTS: usize = 32;
+
+/// The highest 0-based table index in `scope` whose column this expression
+/// references — i.e. the join level at which the expression becomes fully
+/// bound. `None` if it references a column outside `scope` (a correlated/outer
+/// reference), a subquery, an aggregate, or any construct this analysis does
+/// not fully cover, in which case the conjunct is left for the final WHERE.
+fn expr_max_table(expr: &Expr, scope: &QueryScope) -> Option<usize> {
+    use Expr::*;
+    match expr {
+        Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | Param(_) => Some(0),
+        Column { qualifier, name } => scope.find_column(*qualifier, name).ok().map(|(t, _)| t),
+        Unary { operand, .. } | IsNull { operand, .. } | Cast { operand, .. } => {
+            expr_max_table(operand, scope)
+        }
+        Binary { left, right, .. } => {
+            Some(expr_max_table(left, scope)?.max(expr_max_table(right, scope)?))
+        }
+        Between { operand, low, high, .. } => Some(
+            expr_max_table(operand, scope)?
+                .max(expr_max_table(low, scope)?)
+                .max(expr_max_table(high, scope)?),
+        ),
+        Like { operand, pattern, .. } | Match { operand, pattern, .. } => {
+            Some(expr_max_table(operand, scope)?.max(expr_max_table(pattern, scope)?))
+        }
+        InList { operand, list, negated: _ } => {
+            let mut mx = expr_max_table(operand, scope)?;
+            for e in *list {
+                mx = mx.max(expr_max_table(e, scope)?);
+            }
+            Some(mx)
+        }
+        // Pure scalar function calls (not aggregates/window functions).
+        Call { args, over: None, .. } if !expr.is_aggregate() => {
+            let mut mx = 0;
+            for a in *args {
+                mx = mx.max(expr_max_table(a, scope)?);
+            }
+            Some(mx)
+        }
+        // Subqueries, aggregates, window/CASE/array/field/subscript: not pushed.
+        _ => None,
+    }
+}
 
 /// Evaluates one WHERE conjunct to a filter decision (NULL and FALSE both
 /// exclude the row; a non-boolean is a type error).

@@ -77,9 +77,17 @@ fi
 # --- jackc/pgx (Go) --------------------------------------------------------
 if command -v go >/dev/null; then
   GD="$WORK/gopgx"; mkdir -p "$GD"; cp "$DRV/pgx_driver.go" "$GD/main.go"
-  ( cd "$GD" && go mod init pgxdrv >/dev/null 2>&1 && go get github.com/jackc/pgx/v5@latest >/dev/null 2>&1 )
-  pgx() { ( cd "$GD" && go run main.go "$2" "$3" ) > "$1" 2>&1; }
-  diff_driver pgx pgx
+  # Build once so Go's fetch/toolchain-download noise stays out of the runtime
+  # transcript (`go run`'s first invocation would print `go: downloading …`).
+  ( cd "$GD" && go mod init pgxdrv >/dev/null 2>&1 \
+      && go get github.com/jackc/pgx/v5@latest >/dev/null 2>&1 \
+      && go build -o pgxbin main.go >/dev/null 2>&1 )
+  if [[ -x "$GD/pgxbin" ]]; then
+    pgx() { "$GD/pgxbin" "$2" "$3" > "$1" 2>&1; }
+    diff_driver pgx pgx
+  else
+    bad "pgx (build failed)"; ( cd "$GD" && go build -o pgxbin main.go ) 2>&1 | head -20
+  fi
 else
   echo "SKIP: pgx (no go)"
 fi

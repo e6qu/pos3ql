@@ -3131,9 +3131,6 @@ pub fn select_query<'a>(
     params: &[Datum<'a>],
     resp: &mut Responder,
 ) -> Outcome {
-    if let Err(e) = check_select_constants(stmt, arena) {
-        return sql_fail(e);
-    }
     let from = stmt.from.as_ref().expect("FROM-less handled by caller");
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
@@ -3179,6 +3176,14 @@ pub fn select_query<'a>(
             super::exec::infer_type_res(e, &cols).map(|_| ())
         };
         let analyze = || -> Result<(), SqlError> {
+            // SELECT-list items first: PostgreSQL analyzes types before it folds
+            // constants, so an invalid aggregate/operator (e.g. `min(boolean)`)
+            // errors ahead of a constant division elsewhere in the query.
+            for item in stmt.items {
+                if let SelectItem::Expr { expr, .. } = item {
+                    check(expr)?;
+                }
+            }
             if let Some(w) = stmt.where_clause {
                 check(w)?;
             }
@@ -3196,6 +3201,12 @@ pub fn select_query<'a>(
         if let Err(e) = analyze() {
             return sql_fail(e);
         }
+    }
+
+    // Constant folding runs after type analysis, matching PostgreSQL's
+    // analyze-then-plan order: `min(boolean)` errors before `1/0` folds.
+    if let Err(e) = check_select_constants(stmt, arena) {
+        return sql_fail(e);
     }
 
     // Result description.

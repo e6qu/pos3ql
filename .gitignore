@@ -1,0 +1,7 @@
+/target
+
+# Python bytecode cache from external test scripts
+__pycache__/
+
+# Runtime data directory (WAL/SSTs/manifest)
+/data/

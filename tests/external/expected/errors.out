@@ -1,0 +1,56 @@
+-- Error conformance: every failure must carry the right SQLSTATE
+-- (VERBOSITY verbose makes psql print it) and later statements must
+-- keep working.
+\set VERBOSITY verbose
+SELECT 1/0;
+psql:tests/external/sql/errors.sql:6: ERROR:  22012: division by zero
+SELECT 1.0/0;
+psql:tests/external/sql/errors.sql:7: ERROR:  22012: division by zero
+SELECT * FROM missing_table;
+psql:tests/external/sql/errors.sql:8: ERROR:  42P01: relation "missing_table" does not exist
+CREATE TABLE t_err (id int NOT NULL, v text);
+SELECT no_such_column FROM t_err;
+psql:tests/external/sql/errors.sql:10: ERROR:  42703: column "no_such_column" does not exist
+INSERT INTO t_err VALUES (NULL, 'x');
+psql:tests/external/sql/errors.sql:11: ERROR:  23502: null value in column "id" violates not-null constraint
+INSERT INTO t_err (no_col) VALUES (1);
+psql:tests/external/sql/errors.sql:12: ERROR:  42703: column "no_col" of relation "t_err" does not exist
+CREATE TABLE t_err (id int);
+psql:tests/external/sql/errors.sql:13: ERROR:  42P07: relation "t_err" already exists
+SELECT 'zap'::int;
+psql:tests/external/sql/errors.sql:14: ERROR:  22P02: invalid input syntax for type integer: "zap"
+SELECT 1::nosuchtype;
+psql:tests/external/sql/errors.sql:15: ERROR:  42704: type "nosuchtype" does not exist
+SELECT 9223372036854775807 + 1;
+psql:tests/external/sql/errors.sql:16: ERROR:  22003: bigint out of range
+SELECT nosuchfunc(1);
+psql:tests/external/sql/errors.sql:17: ERROR:  42883: function nosuchfunc() does not exist
+SELECT 1 +;
+psql:tests/external/sql/errors.sql:18: ERROR:  42601: syntax error: expected an expression
+SELECT count(*), id FROM t_err;
+psql:tests/external/sql/errors.sql:19: ERROR:  42803: column must appear in the GROUP BY clause or be used in an aggregate function
+DROP TABLE missing_table;
+psql:tests/external/sql/errors.sql:20: ERROR:  42P01: relation "missing_table" does not exist
+-- psql sends each ;-separated statement as its own Query message and
+-- (with ON_ERROR_STOP off) continues after errors; the wire_probe covers
+-- true multi-statement strings in one message.
+SELECT 'before'; SELECT 1/0; SELECT 'after';
+ ?column? 
+----------
+ before
+(1 row)
+
+psql:tests/external/sql/errors.sql:24: ERROR:  22012: division by zero
+ ?column? 
+----------
+ after
+(1 row)
+
+-- the session stays healthy after every error above
+SELECT 'session still works';
+      ?column?       
+---------------------
+ session still works
+(1 row)
+
+DROP TABLE t_err;

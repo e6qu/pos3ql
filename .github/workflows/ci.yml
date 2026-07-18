@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zsh (for the no-op guard)
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      # Fail fast on any new silent accept-and-ignore of SQL/protocol
+      # semantics. See tools/check-noops.sh and BUGS.md B-019/B-020/B-021.
+      - name: No-op guard
+        run: zsh tools/check-noops.sh
+
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --lib --bins -- -D warnings
+
+      - name: Test
+        run: cargo test

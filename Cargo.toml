@@ -1,0 +1,16 @@
+[package]
+name = "pos3ql"
+version = "0.1.0"
+edition = "2024"
+
+# Dependency policy: std + libc only. libc provides raw syscall bindings
+# (kqueue/epoll, sockets, low-level file I/O) that have no std equivalent.
+# Everything else — PG wire protocol, SQL parser, HTTP/SigV4 S3 client,
+# SHA-256/HMAC, CRC32C, PRNG, event loop — is implemented in this crate so
+# that all memory is statically allocated at startup and the core stays
+# deterministic for simulation testing.
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"

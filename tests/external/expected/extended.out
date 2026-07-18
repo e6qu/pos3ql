@@ -1,0 +1,54 @@
+-- Extended query protocol through psql's \bind (Parse/Bind/Execute over
+-- libpq) and \parse/\bind_named where available.
+CREATE TABLE t_ext (id int, v text);
+INSERT INTO t_ext VALUES ($1, $2) \bind 1 alpha \g
+INSERT INTO t_ext VALUES ($1, $2) \bind 2 beta \g
+SELECT $1::int + $2::int AS sum \bind 20 22 \g
+ sum 
+-----
+  42
+(1 row)
+
+SELECT * FROM t_ext WHERE id = $1 \bind 2 \g
+ id |  v   
+----+------
+  2 | beta
+(1 row)
+
+SELECT v FROM t_ext WHERE id + 1 = '3' ORDER BY v \bind \g
+  v   
+------
+ beta
+(1 row)
+
+SELECT count(*) FROM t_ext \bind \g
+ count 
+-------
+     2
+(1 row)
+
+-- named prepared statement, reused with different parameters
+SELECT v FROM t_ext WHERE id = $1 \parse find_by_id
+\bind_named find_by_id 1 \g
+   v   
+-------
+ alpha
+(1 row)
+
+\bind_named find_by_id 2 \g
+  v   
+------
+ beta
+(1 row)
+
+\close_prepared find_by_id
+-- extended-protocol errors recover after Sync
+SELECT * FROM t_missing WHERE id = $1 \bind 1 \g
+psql:tests/external/sql/extended.sql:19: ERROR:  relation "t_missing" does not exist
+SELECT 'recovered';
+ ?column?  
+-----------
+ recovered
+(1 row)
+
+DROP TABLE t_ext;

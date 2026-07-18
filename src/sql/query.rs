@@ -4810,25 +4810,41 @@ fn materialized_rows<'a>(
         w
     };
 
-    // Pass 1: count.
+    // Pass 1: count — and evaluate the projection and ORDER BY keys per row
+    // (discarding the values). PostgreSQL scans, filters, and projects in a
+    // single per-row pass below the Sort, so an early row's projection error
+    // surfaces before a later row's WHERE error. We materialize in two passes
+    // for a fixed-size allocation, so the count pass must reproduce that error
+    // timing rather than evaluate every WHERE before any projection.
     let mut count = 0usize;
     scan_source(
         storage, scope, from, txid, where_in_scan, arena, params, hooks,
         None,
         &mut |row| {
-            if !correlated.is_empty() {
-                let mut sc: [(*const Expr, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), Datum::Null); MAX_SUBQUERIES];
-                let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
-                let row_subs = merge_correlated(
+            let mut sc: [(*const Expr, Datum); MAX_SUBQUERIES] =
+                [(core::ptr::null(), Datum::Null); MAX_SUBQUERIES];
+            let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
+                [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+            let row_subs;
+            let row_hooks_owned;
+            let row_hooks: &EvalHooks = if correlated.is_empty() {
+                hooks
+            } else {
+                row_subs = merge_correlated(
                     correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
                 )?;
-                let row_hooks = EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None };
+                row_hooks_owned =
+                    EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None };
                 if let Some(w) = stmt.where_clause
-                    && !where_passes(w, arena, params, row, &row_hooks)? {
+                    && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                         return Ok(true);
                     }
+                &row_hooks_owned
+            };
+            let mut projected = [Datum::Null; MAX_PROJ];
+            project_row(stmt.items, scope, row, arena, params, row_hooks, &mut projected)?;
+            for oe in order_exprs.iter().take(n_order) {
+                eval_full(oe.expect("resolved"), arena, params, row, row_hooks)?;
             }
             count += 1;
             Ok(true)

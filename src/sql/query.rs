@@ -611,6 +611,47 @@ fn scan_source<'a>(
                     return Ok(false);
                 }
             }
+        } else if depth == 0 {
+            // Outermost scan: iterate in heap-offset (insertion) order so a
+            // per-row error surfaces on the same row as PostgreSQL, whose heap
+            // scan is physical (insertion) order for a freshly-loaded table.
+            // The rows live in a hash map (slot order), so snapshot the visible
+            // locations into the per-statement arena and sort by offset. Only
+            // the outermost scan is ordered — it drives output/error order, and
+            // ordering an inner join scan would re-snapshot per outer row.
+            let table = storage.table(scope.slots[depth]);
+            let mut count = 0usize;
+            for (_, state) in table.rows.iter() {
+                if state.visible_to(txid).is_some() {
+                    count += 1;
+                }
+            }
+            let mut src = table.rows.iter();
+            let ordered = arena
+                .alloc_slice_with(count, |_| loop {
+                    let (_, state) = src.next().expect("visible count is stable");
+                    if let Some(loc) = state.visible_to(txid) {
+                        break loc;
+                    }
+                })
+                .map_err(|_| arena_full())?;
+            ordered.sort_unstable_by_key(|l| l.offset);
+            for (this, &loc) in ordered.iter().enumerate() {
+                bound[depth] = Some(storage.heap.get(loc));
+                if !on_matches(bound)? || !passes_pushdown(bound)? {
+                    continue;
+                }
+                matched_any = true;
+                if let Some(m) = matched.filter(|_| depth + 1 == scope.n) {
+                    m[this].set(true);
+                }
+                if !level(
+                    storage, scope, from, txid, where_clause, arena, params, hooks,
+                    outer, depth + 1, bound, matched, pushdown, f,
+                )? {
+                    return Ok(false);
+                }
+            }
         } else {
             let table = storage.table(scope.slots[depth]);
             let mut idx = 0usize;

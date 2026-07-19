@@ -37,6 +37,7 @@ pub struct LexError {
 
 pub type StackStrMsg = &'static str;
 
+#[derive(Clone)]
 pub struct Lexer<'a> {
     text: &'a str,
     arena: &'a Arena,

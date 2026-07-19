@@ -40,3 +40,15 @@ SELECT x, first_value(x * 10) OVER (PARTITION BY x % 2 ORDER BY x) FROM generate
 SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x), percentile_cont(0.25) WITHIN GROUP (ORDER BY x) FROM generate_series(1, 5) AS g(x);
 SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x), percentile_disc(0.9) WITHIN GROUP (ORDER BY x) FROM generate_series(1, 10) AS g(x);
 SELECT mode() WITHIN GROUP (ORDER BY x) FROM (VALUES (3),(1),(1),(3),(3)) AS v(x);
+-- GROUPING SETS / ROLLUP / CUBE and the GROUPING() function
+SELECT a, b, sum(v) FROM (VALUES ('x','p',1),('x','q',2),('y','p',4),('y','q',8)) AS t(a,b,v) GROUP BY ROLLUP(a, b) ORDER BY a, b;
+SELECT a, b, sum(v) FROM (VALUES ('x','p',1),('x','q',2),('y','p',4),('y','q',8)) AS t(a,b,v) GROUP BY CUBE(a, b) ORDER BY a, b;
+SELECT a, b, sum(v) FROM (VALUES ('x','p',1),('x','q',2),('y','p',4),('y','q',8)) AS t(a,b,v) GROUP BY GROUPING SETS ((a,b),(a),()) ORDER BY a, b;
+SELECT a, grouping(a), grouping(b), grouping(a,b), sum(v) FROM (VALUES ('x','p',1),('x','q',2),('y','p',4)) AS t(a,b,v) GROUP BY ROLLUP(a, b) ORDER BY a, b;
+SELECT a, sum(v) FROM (VALUES ('x',1),('y',2)) AS t(a,v) GROUP BY GROUPING SETS ((a),()) ORDER BY a;
+SELECT sum(v) FROM (VALUES (1),(2),(3)) AS t(v) GROUP BY (); 
+SELECT a, b, count(*) FROM (VALUES (1,10),(1,20),(2,10)) AS t(a,b) GROUP BY GROUPING SETS (a, b) ORDER BY a, b;
+SELECT a, b, c, sum(v) FROM (VALUES (1,1,1,5),(1,2,1,7),(2,1,2,9)) AS t(a,b,c,v) GROUP BY a, ROLLUP(b, c) ORDER BY a, b, c;
+-- grouping by parenthesized scalar expressions (must not be read as group lists)
+SELECT (v + 1) * 2 AS g, count(*) FROM (VALUES (1),(1),(3)) AS t(v) GROUP BY (v + 1) * 2 ORDER BY g;
+SELECT (v), sum(v) FROM (VALUES (1),(2),(2)) AS t(v) GROUP BY (v) ORDER BY 1;

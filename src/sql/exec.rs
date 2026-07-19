@@ -2906,6 +2906,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     None => of(ColType::Text),
                 }
             }
+            "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),

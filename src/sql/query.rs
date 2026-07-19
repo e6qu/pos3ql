@@ -1105,6 +1105,9 @@ fn subst_select<'a>(
     }
     let items = arena.alloc_slice_copy(&items[..s.items.len()]).map_err(|_| arena_full())?;
     let group_by = subst_expr_slice(s.group_by, context, arena)?;
+    // Grouping-set bitmasks index into `group_by`; substitution preserves the
+    // column order and count, so they carry over unchanged.
+    let grouping_sets = arena.alloc_slice_copy(s.grouping_sets).map_err(|_| arena_full())?;
     let mut order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
         super::parser::MAX_LIST];
     if s.order_by.len() > super::parser::MAX_LIST {
@@ -1124,6 +1127,7 @@ fn subst_select<'a>(
         from,
         where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,
+        grouping_sets,
         having: opt_subst(s.having, context, arena)?,
         order_by,
         limit: opt_subst(s.limit, context, arena)?,
@@ -5043,6 +5047,169 @@ fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16),
     }
 }
 
+/// Aggregates and emits the output rows for a single grouping-set `mask` (bit
+/// *i* set = `group_by[i]` participates; a cleared bit collapses that column to
+/// NULL so every row shares one group and the output column reads NULL). Returns
+/// the surviving rows (visible columns followed by hidden ORDER BY key columns),
+/// unsorted — the caller concatenates the sets and sorts once.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn groups_for_mask<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    mask: u64,
+    row_count: usize,
+    agg_ptrs: &'a [*const Expr<'a>],
+    order_exprs: &[Option<&'a Expr<'a>>],
+    width: usize,
+    n_order: usize,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let n_keys = statement.group_by.len();
+
+    // Pass 2: encode group keys per row (columns outside this set → NULL).
+    let empty: &[u8] = &[];
+    let keys: &mut [(&[u8], u32)] = arena
+        .alloc_slice_with(row_count, |_| (empty, 0u32))
+        .map_err(|_| arena_full())?;
+    {
+        let mut at = 0usize;
+        scan_source(
+            storage, scope, from, txid, statement.where_clause, arena, params, hooks,
+            None,
+            &mut |row| {
+                let mut key_vals = [Datum::Null; MAX_PROJ];
+                for (k, g) in statement.group_by.iter().enumerate() {
+                    if mask & (1u64 << k) != 0 {
+                        key_vals[k] = eval_full(g, arena, params, row, hooks)?;
+                    }
+                }
+                keys[at].0 = super::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
+                keys[at].1 = at as u32;
+                at += 1;
+                Ok(true)
+            },
+        )?;
+    }
+    keys.sort_unstable();
+
+    let n_groups = {
+        let mut g = 0usize;
+        for i in 0..keys.len() {
+            if i == 0 || keys[i].0 != keys[i - 1].0 {
+                g += 1;
+            }
+        }
+        if keys.is_empty() && mask == 0 {
+            1 // grand total (no active grouping columns): one row even over zero input rows
+        } else {
+            g
+        }
+    };
+    let group_of: &mut [u32] = arena
+        .alloc_slice_with(row_count, |_| 0u32)
+        .map_err(|_| arena_full())?;
+    let rep_of: &mut [u32] = arena
+        .alloc_slice_with(n_groups, |_| 0u32)
+        .map_err(|_| arena_full())?;
+    {
+        let mut g = 0usize;
+        for i in 0..keys.len() {
+            if i > 0 && keys[i].0 != keys[i - 1].0 {
+                g += 1;
+            }
+            group_of[keys[i].1 as usize] = g as u32;
+            rep_of[g] = keys[i].1;
+        }
+    }
+
+    let n_aggs = agg_nodes.len();
+    let states: &mut [AggState] = arena
+        .alloc_slice_with(n_groups * n_aggs.max(1), |_| AggState::default())
+        .map_err(|_| arena_full())?;
+    for g in 0..n_groups {
+        for (i, (_, node)) in agg_nodes.iter().enumerate() {
+            states[g * n_aggs.max(1) + i].init(node)?;
+        }
+    }
+    if n_aggs > 0 {
+        let mut at = 0usize;
+        scan_source(
+            storage, scope, from, txid, statement.where_clause, arena, params, hooks,
+            None,
+            &mut |row| {
+                let g = group_of.get(at).copied().unwrap_or(0) as usize;
+                for (i, (_, node)) in agg_nodes.iter().enumerate() {
+                    states[g * n_aggs + i].update(node, arena, params, row, hooks)?;
+                }
+                at += 1;
+                Ok(true)
+            },
+        )?;
+    }
+
+    let out_rows: &mut [&[u8]] = arena
+        .alloc_slice_with(n_groups, |_| empty)
+        .map_err(|_| arena_full())?;
+    let mut survivors = 0usize;
+    for g in 0..n_groups {
+        let mut key_vals = [Datum::Null; MAX_PROJ];
+        if !keys.is_empty() {
+            let rep = keys
+                .iter()
+                .find(|(_, index)| group_of[*index as usize] as usize == g)
+                .expect("group non-empty");
+            for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
+                *slot = super::exec::decode_projected_pub(rep.0, k);
+            }
+        }
+        let mut agg_vals = [Datum::Null; MAX_AGGS];
+        for i in 0..n_aggs {
+            agg_vals[i] = states[g * n_aggs.max(1) + i].finish(arena)?;
+        }
+        let group_hooks = EvalHooks {
+            group: Some((statement.group_by, &key_vals[..n_keys], mask)),
+            aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
+            subs: hooks.subs,
+        windows: None, catalog: None, srf_index: None };
+        if let Some(h) = statement.having {
+            match eval_full(h, arena, params, &super::eval::NoColumns, &group_hooks)? {
+                Datum::Bool(true) => {}
+                Datum::Bool(false) | Datum::Null => continue,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "argument of HAVING must be type boolean"
+                    ))
+                }
+            }
+        }
+        let mut full = [Datum::Null; MAX_PROJ];
+        for (n, item) in statement.items.iter().enumerate() {
+            let SelectItem::Expr { expression, .. } = item else { unreachable!() };
+            full[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &group_hooks)?;
+        }
+        for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
+            full[width + k] = eval_full(
+                oe.expect("resolved"),
+                arena,
+                params,
+                &super::eval::NoColumns,
+                &group_hooks,
+            )?;
+        }
+        out_rows[survivors] =
+            super::exec::encode_projected_pub(&full[..width + n_order], arena)?;
+        survivors += 1;
+    }
+    Ok(&out_rows[..survivors])
+}
+
 /// GROUP BY / plain-aggregate execution: single scan collecting encoded
 /// (key, agg-argument) pairs is avoided by running one scan per phase —
 /// group keys with row-by-row aggregate folding, sort-based.
@@ -5091,165 +5258,62 @@ fn grouped_rows<'a>(
         },
     )?;
 
-    // No rows and no GROUP BY: aggregates still yield one row.
     let n_keys = statement.group_by.len();
-
-    // Pass 2: encode group keys per row.
-    let empty: &[u8] = &[];
-    let keys: &mut [(&[u8], u32)] = arena
-        .alloc_slice_with(row_count, |_| (empty, 0u32))
-        .map_err(|_| arena_full())?;
-    {
-        let mut at = 0usize;
-        scan_source(
-            storage, scope, from, txid, statement.where_clause, arena, params, hooks,
-            None,
-            &mut |row| {
-                let mut key_vals = [Datum::Null; MAX_PROJ];
-                for (k, g) in statement.group_by.iter().enumerate() {
-                    key_vals[k] = eval_full(g, arena, params, row, hooks)?;
-                }
-                keys[at].0 = super::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
-                keys[at].1 = at as u32;
-                at += 1;
-                Ok(true)
-            },
-        )?;
-    }
-    keys.sort_unstable();
-
-    // Group runs → per-group aggregate folding needs per-row agg updates;
-    // rows are identified by scan order, so fold with one more scan that
-    // dispatches updates to the right group.
-    let n_groups = {
-        let mut g = 0usize;
-        for i in 0..keys.len() {
-            if i == 0 || keys[i].0 != keys[i - 1].0 {
-                g += 1;
-            }
-        }
-        if keys.is_empty() && statement.group_by.is_empty() {
-            1 // plain aggregates over zero rows: one output row
-        } else {
-            g
-        }
-    };
-    // row index (scan order) → group index
-    let group_of: &mut [u32] = arena
-        .alloc_slice_with(row_count, |_| 0u32)
-        .map_err(|_| arena_full())?;
-    // representative key row per group
-    let rep_of: &mut [u32] = arena
-        .alloc_slice_with(n_groups, |_| 0u32)
-        .map_err(|_| arena_full())?;
-    {
-        let mut g = 0usize;
-        for i in 0..keys.len() {
-            if i > 0 && keys[i].0 != keys[i - 1].0 {
-                g += 1;
-            }
-            group_of[keys[i].1 as usize] = g as u32;
-            rep_of[g] = keys[i].1;
-        }
-    }
-
-    // Aggregate states per group.
+    let width = statement.items.len();
+    let n_order = statement.order_by.len();
     let n_aggs = agg_nodes.len();
-    let states: &mut [AggState] = arena
-        .alloc_slice_with(n_groups * n_aggs.max(1), |_| AggState::default())
-        .map_err(|_| arena_full())?;
-    for g in 0..n_groups {
-        for (i, (_, node)) in agg_nodes.iter().enumerate() {
-            states[g * n_aggs.max(1) + i].init(node)?;
-        }
-    }
-    if n_aggs > 0 {
-        let mut at = 0usize;
-        scan_source(
-            storage, scope, from, txid, statement.where_clause, arena, params, hooks,
-            None,
-            &mut |row| {
-                let g = group_of.get(at).copied().unwrap_or(0) as usize;
-                for (i, (_, node)) in agg_nodes.iter().enumerate() {
-                    states[g * n_aggs + i].update(node, arena, params, row, hooks)?;
-                }
-                at += 1;
-                Ok(true)
-            },
-        )?;
-    }
-
-    // Emit per group: reconstruct key values, inject hooks, evaluate
-    // HAVING then items.
+    // Aggregate-call node addresses, resolved once (shared by every set).
     let agg_ptrs: &[*const Expr] = arena
         .alloc_slice_with(n_aggs, |i| agg_nodes[i].0)
         .map_err(|_| arena_full())?;
-    // ORDER BY over groups: ordinals resolve to select items; every key
-    // expression evaluates under the group hooks (so aggregates work).
-    let n_order = statement.order_by.len();
-    let width = statement.items.len();
-    let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    // ORDER BY over groups: ordinals resolve to select items; keys evaluate
+    // under the group hooks (so aggregates work). Resolved once.
+    let mut order_arr: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     for (k, ob) in statement.order_by.iter().enumerate() {
-        order_exprs[k] = Some(super::exec::resolve_order_expr_pub(ob.expression, statement.items)?);
+        order_arr[k] = Some(super::exec::resolve_order_expr_pub(ob.expression, statement.items)?);
+    }
+    let order_exprs = &order_arr[..n_order];
+
+    // Grouping sets: the explicit mask list, or a single implicit set of all
+    // grouping columns for a plain GROUP BY / plain aggregate.
+    let all_mask = if n_keys >= 64 { u64::MAX } else { (1u64 << n_keys) - 1 };
+    let single = [all_mask];
+    let masks: &[u64] = if statement.grouping_sets.is_empty() {
+        &single[..]
+    } else {
+        statement.grouping_sets
+    };
+    if masks.len() > super::parser::MAX_GROUPING_SETS {
+        return Err(sql_err!("54000", "too many grouping sets"));
     }
 
-    // Materialize surviving groups (visible + hidden key columns).
+    // Aggregate each set independently, then concatenate (a single set is a
+    // straight copy). ORDER BY applies across the combined result, so it is
+    // deferred until after concatenation.
+    let empty_rows: &[&[u8]] = &[];
+    let mut per_set: [&[&[u8]]; super::parser::MAX_GROUPING_SETS] =
+        [empty_rows; super::parser::MAX_GROUPING_SETS];
+    let mut total = 0usize;
+    for (si, &mask) in masks.iter().enumerate() {
+        let rows = groups_for_mask(
+            storage, scope, from, txid, statement, agg_nodes, arena, params, hooks, mask,
+            row_count, agg_ptrs, order_exprs, width, n_order,
+        )?;
+        per_set[si] = rows;
+        total += rows.len();
+    }
+
     let empty: &[u8] = &[];
     let out_rows: &mut [&[u8]] = arena
-        .alloc_slice_with(n_groups, |_| empty)
+        .alloc_slice_with(total, |_| empty)
         .map_err(|_| arena_full())?;
-    let mut survivors = 0usize;
-    for g in 0..n_groups {
-        let mut key_vals = [Datum::Null; MAX_PROJ];
-        if !keys.is_empty() {
-            let rep = keys
-                .iter()
-                .find(|(_, index)| group_of[*index as usize] as usize == g)
-                .expect("group non-empty");
-            for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
-                *slot = super::exec::decode_projected_pub(rep.0, k);
-            }
+    let mut at = 0usize;
+    for rows in &per_set[..masks.len()] {
+        for &r in rows.iter() {
+            out_rows[at] = r;
+            at += 1;
         }
-        let mut agg_vals = [Datum::Null; MAX_AGGS];
-        for i in 0..n_aggs {
-            agg_vals[i] = states[g * n_aggs.max(1) + i].finish(arena)?;
-        }
-        let group_hooks = EvalHooks {
-            group: Some((statement.group_by, &key_vals[..n_keys])),
-            aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
-            subs: hooks.subs,
-        windows: None, catalog: None, srf_index: None };
-        if let Some(h) = statement.having {
-            match eval_full(h, arena, params, &super::eval::NoColumns, &group_hooks)? {
-                Datum::Bool(true) => {}
-                Datum::Bool(false) | Datum::Null => continue,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "argument of HAVING must be type boolean"
-                    ))
-                }
-            }
-        }
-        let mut full = [Datum::Null; MAX_PROJ];
-        for (n, item) in statement.items.iter().enumerate() {
-            let SelectItem::Expr { expression, .. } = item else { unreachable!() };
-            full[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &group_hooks)?;
-        }
-        for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
-            full[width + k] = eval_full(
-                oe.expect("resolved"),
-                arena,
-                params,
-                &super::eval::NoColumns,
-                &group_hooks,
-            )?;
-        }
-        out_rows[survivors] =
-            super::exec::encode_projected_pub(&full[..width + n_order], arena)?;
-        survivors += 1;
     }
-    let out_rows = &mut out_rows[..survivors];
 
     if n_order > 0 {
         out_rows.sort_unstable_by(|a, b| {

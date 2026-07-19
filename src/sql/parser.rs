@@ -13,6 +13,25 @@ use super::lexer::{LexError, Lexer, Tok};
 
 pub const MAX_LIST: usize = 64;
 pub const MAX_CTES: usize = 16;
+/// Upper bound on the number of grouping sets a single `GROUP BY` may expand to
+/// (after ROLLUP/CUBE expansion and cross-multiplication). Exceeding it is a
+/// loud error, never silent truncation.
+pub const MAX_GROUPING_SETS: usize = 256;
+
+/// Appends a grouping-set bitmask, failing loudly when the fixed buffer fills.
+fn push_mask(
+    buf: &mut [u64],
+    n: &mut usize,
+    mask: u64,
+    err: impl FnOnce() -> ParseError,
+) -> Result<(), ParseError> {
+    if *n == buf.len() {
+        return Err(err());
+    }
+    buf[*n] = mask;
+    *n += 1;
+    Ok(())
+}
 pub const MAX_ROWS: usize = 256;
 
 /// Words that cannot appear as a bare column reference; mirrors the
@@ -317,25 +336,12 @@ impl<'a> Parser<'a> {
             None
         };
         let where_clause = self.where_clause()?;
-        let mut group_exprs: [&'a Expr<'a>; MAX_LIST] = {
-            let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-            [null_expr; MAX_LIST]
-        };
-        let mut n_group = 0;
-        if self.eat_ident("group")? {
+        let (group_by, grouping_sets) = if self.eat_ident("group")? {
             self.expect_ident("by")?;
-            loop {
-                if n_group == MAX_LIST {
-                    return Err(self.limit("GROUP BY list", MAX_LIST));
-                }
-                group_exprs[n_group] = self.expression(0)?;
-                n_group += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-        }
-        let group_by = self.arena_slice(&group_exprs[..n_group])?;
+            self.group_by_clause()?
+        } else {
+            (&[][..], &[][..])
+        };
         let having = if self.eat_ident("having")? {
             Some(self.expression(0)?)
         } else {
@@ -347,6 +353,7 @@ impl<'a> Parser<'a> {
             from,
             where_clause,
             group_by,
+            grouping_sets,
             having,
             order_by: &[],
             limit: None,
@@ -435,6 +442,7 @@ impl<'a> Parser<'a> {
             from: None,
             where_clause: None,
             group_by: &[],
+            grouping_sets: &[],
             having: None,
             order_by,
             limit,
@@ -461,6 +469,7 @@ impl<'a> Parser<'a> {
                 from: None,
                 where_clause: None,
                 group_by: &[],
+                grouping_sets: &[],
                 having: None,
                 order_by: &[],
                 limit: None,
@@ -578,6 +587,7 @@ impl<'a> Parser<'a> {
                     from: None,
                     where_clause: None,
                     group_by: &[],
+                    grouping_sets: &[],
                     having: None,
                     order_by: &[],
                     limit: None,
@@ -2607,6 +2617,239 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.err_here("statement too large for SQL arena"))
     }
 
+    /// Parses the body of a `GROUP BY` clause (the keywords already consumed)
+    /// into a flat, deduplicated list of grouping expressions and a set of
+    /// grouping-set bitmasks over that list. A plain `GROUP BY a, b` returns an
+    /// empty mask set (meaning a single implicit all-columns set);
+    /// `ROLLUP`/`CUBE`/`GROUPING SETS` return explicit masks, cross-multiplied
+    /// across comma-separated top-level elements exactly as PostgreSQL does.
+    fn group_by_clause(&mut self) -> Result<(&'a [&'a Expr<'a>], &'a [u64]), ParseError> {
+        let null_expr = self.arena_expr(Expr::Null)?;
+        let mut flat: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
+        let mut n_flat = 0usize;
+        // Running cross-product of grouping-set masks; starts as one empty set.
+        let mut acc = [0u64; MAX_GROUPING_SETS];
+        let mut n_acc = 1usize;
+        let mut scratch = [0u64; MAX_GROUPING_SETS];
+        let mut explicit = false;
+        loop {
+            let mut elem = [0u64; MAX_GROUPING_SETS];
+            let mut n_elem = 0usize;
+            if self.peeked == Tok::Ident("rollup") || self.peeked == Tok::Ident("cube") {
+                let is_cube = self.peeked == Tok::Ident("cube");
+                self.advance()?;
+                self.expect_op("(")?;
+                let mut terms = [0u64; MAX_LIST];
+                let n_terms = self.grouping_term_list(&mut flat, &mut n_flat, &mut terms)?;
+                self.expect_op(")")?;
+                if is_cube {
+                    if n_terms > 20 {
+                        return Err(self.err_here("CUBE with too many columns"));
+                    }
+                    for subset in 0u32..(1u32 << n_terms) {
+                        let mut m = 0u64;
+                        for (t, &tm) in terms[..n_terms].iter().enumerate() {
+                            if subset & (1 << t) != 0 {
+                                m |= tm;
+                            }
+                        }
+                        push_mask(&mut elem, &mut n_elem, m, || self.err_here("too many grouping sets"))?;
+                    }
+                } else {
+                    for keep in (0..=n_terms).rev() {
+                        let mut m = 0u64;
+                        for &tm in &terms[..keep] {
+                            m |= tm;
+                        }
+                        push_mask(&mut elem, &mut n_elem, m, || self.err_here("too many grouping sets"))?;
+                    }
+                }
+                explicit = true;
+            } else if self.peeked == Tok::Ident("grouping") {
+                self.advance()?;
+                self.expect_ident("sets")?;
+                self.expect_op("(")?;
+                loop {
+                    self.grouping_set_member(&mut flat, &mut n_flat, &mut elem, &mut n_elem)?;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+                explicit = true;
+            } else {
+                let m = self.grouping_term(&mut flat, &mut n_flat)?;
+                push_mask(&mut elem, &mut n_elem, m, || self.err_here("too many grouping sets"))?;
+            }
+            // Cross product: acc × elem.
+            let mut n_new = 0usize;
+            for &a in &acc[..n_acc] {
+                for &e in &elem[..n_elem] {
+                    push_mask(&mut scratch, &mut n_new, a | e, || self.err_here("too many grouping sets"))?;
+                }
+            }
+            acc[..n_new].copy_from_slice(&scratch[..n_new]);
+            n_acc = n_new;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let group_by = self.arena_slice(&flat[..n_flat])?;
+        let grouping_sets = if explicit { self.arena_slice(&acc[..n_acc])? } else { &[][..] };
+        Ok((group_by, grouping_sets))
+    }
+
+    /// Interns a grouping expression into `flat` (deduplicated by structural
+    /// equality) and returns its single-bit mask.
+    fn intern_group(
+        &mut self,
+        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        n_flat: &mut usize,
+        e: &'a Expr<'a>,
+    ) -> Result<u64, ParseError> {
+        for (i, existing) in flat[..*n_flat].iter().enumerate() {
+            if **existing == *e {
+                return Ok(1u64 << i);
+            }
+        }
+        if *n_flat == MAX_LIST {
+            return Err(self.limit("GROUP BY list", MAX_LIST));
+        }
+        let bit = 1u64 << *n_flat;
+        flat[*n_flat] = e;
+        *n_flat += 1;
+        Ok(bit)
+    }
+
+    /// Parses a single grouping term — either a bare expression or a
+    /// parenthesized `(a, b, ...)` compound (one grouping level spanning
+    /// several columns) — and returns the OR of its column bits.
+    fn grouping_term(
+        &mut self,
+        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        n_flat: &mut usize,
+    ) -> Result<u64, ParseError> {
+        // A parenthesized list groups several columns into one level. A bare
+        // parenthesized single expression is just that expression.
+        if self.peeked == Tok::Op("(") && self.paren_is_group_list()? {
+            self.advance()?;
+            let mut mask = 0u64;
+            if self.peeked != Tok::Op(")") {
+                loop {
+                    let e = self.expression(0)?;
+                    mask |= self.intern_group(flat, n_flat, e)?;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+            }
+            self.expect_op(")")?;
+            Ok(mask)
+        } else {
+            let e = self.expression(0)?;
+            self.intern_group(flat, n_flat, e)
+        }
+    }
+
+    /// Parses a comma-separated list of grouping terms (inside `ROLLUP(...)` /
+    /// `CUBE(...)`), storing one mask per term. Returns the term count.
+    fn grouping_term_list(
+        &mut self,
+        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        n_flat: &mut usize,
+        terms: &mut [u64; MAX_LIST],
+    ) -> Result<usize, ParseError> {
+        let mut n = 0usize;
+        loop {
+            if n == MAX_LIST {
+                return Err(self.limit("GROUP BY list", MAX_LIST));
+            }
+            terms[n] = self.grouping_term(flat, n_flat)?;
+            n += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Parses one member of a `GROUPING SETS (...)` list into `elem` — a single
+    /// set `(a, b)` / `()` / bare expr, or a nested `ROLLUP`/`CUBE` that
+    /// expands to several sets.
+    fn grouping_set_member(
+        &mut self,
+        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        n_flat: &mut usize,
+        elem: &mut [u64; MAX_GROUPING_SETS],
+        n_elem: &mut usize,
+    ) -> Result<(), ParseError> {
+        if self.peeked == Tok::Ident("rollup") || self.peeked == Tok::Ident("cube") {
+            let is_cube = self.peeked == Tok::Ident("cube");
+            self.advance()?;
+            self.expect_op("(")?;
+            let mut terms = [0u64; MAX_LIST];
+            let n_terms = self.grouping_term_list(flat, n_flat, &mut terms)?;
+            self.expect_op(")")?;
+            if is_cube {
+                if n_terms > 20 {
+                    return Err(self.err_here("CUBE with too many columns"));
+                }
+                for subset in 0u32..(1u32 << n_terms) {
+                    let mut m = 0u64;
+                    for (t, &tm) in terms[..n_terms].iter().enumerate() {
+                        if subset & (1 << t) != 0 {
+                            m |= tm;
+                        }
+                    }
+                    push_mask(elem, n_elem, m, || self.err_here("too many grouping sets"))?;
+                }
+            } else {
+                for keep in (0..=n_terms).rev() {
+                    let mut m = 0u64;
+                    for &tm in &terms[..keep] {
+                        m |= tm;
+                    }
+                    push_mask(elem, n_elem, m, || self.err_here("too many grouping sets"))?;
+                }
+            }
+            Ok(())
+        } else {
+            let m = self.grouping_term(flat, n_flat)?;
+            push_mask(elem, n_elem, m, || self.err_here("too many grouping sets"))
+        }
+    }
+
+    /// With `(` peeked at grouping-term position, reports whether it opens a
+    /// multi-column grouping list — `()` or `(a, b, ...)` — as opposed to a
+    /// scalar parenthesized expression like `(a + b)` or `(x + 1) * 2`. It
+    /// scans a cloned lexer to the matching close paren: a top-level comma is
+    /// never valid inside a scalar `( ... )`, so seeing one (or an immediate
+    /// close, the empty grand-total level) unambiguously marks a grouping list.
+    fn paren_is_group_list(&self) -> Result<bool, ParseError> {
+        let mut lexer = self.lexer.clone();
+        let mut depth = 1usize; // the peeked `(` is already consumed by the real lexer
+        let mut tokens = 0usize;
+        loop {
+            let tok = lexer.next_token()?;
+            tokens += 1;
+            match tok {
+                Tok::Op("(") | Tok::Op("[") => depth += 1,
+                Tok::Op(")") | Tok::Op("]") => {
+                    depth -= 1;
+                    // Matching close with no top-level comma: an empty list
+                    // `()` (the first token closed it) is a grand-total level;
+                    // anything else was a scalar `( ... )`.
+                    if depth == 0 {
+                        return Ok(tokens == 1);
+                    }
+                }
+                Tok::Op(",") if depth == 1 => return Ok(true),
+                Tok::Eof => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+
     fn arena_slice<T: Copy>(&self, items: &[T]) -> Result<&'a [T], ParseError> {
         self.arena
             .alloc_slice_copy(items)
@@ -2664,6 +2907,46 @@ mod tests {
             let SelectItem::Expr { alias, .. } = s.items[2] else { panic!() };
             assert_eq!(alias, Some("half"));
             assert!(p.next_stmt().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn grouping_sets_expansion() {
+        // Plain GROUP BY: no explicit sets, all columns implied.
+        with_parser("SELECT a FROM t GROUP BY a, b", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            assert_eq!(s.group_by.len(), 2);
+            assert!(s.grouping_sets.is_empty());
+        });
+        // ROLLUP(a, b) -> {a,b}, {a}, {} (bits index group_by = [a, b]).
+        with_parser("SELECT a FROM t GROUP BY ROLLUP(a, b)", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            assert_eq!(s.group_by.len(), 2);
+            assert_eq!(s.grouping_sets, &[0b11, 0b01, 0b00]);
+        });
+        // CUBE(a, b) -> all four subsets.
+        with_parser("SELECT a FROM t GROUP BY CUBE(a, b)", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let mut got = s.grouping_sets.to_vec();
+            got.sort_unstable();
+            assert_eq!(got, vec![0b00, 0b01, 0b10, 0b11]);
+        });
+        // Explicit GROUPING SETS, including the empty grand-total set.
+        with_parser("SELECT a FROM t GROUP BY GROUPING SETS ((a, b), (a), ())", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            assert_eq!(s.grouping_sets, &[0b11, 0b01, 0b00]);
+        });
+        // Cross product: a, ROLLUP(b, c) -> a always set, times {bc},{b},{}.
+        with_parser("SELECT a FROM t GROUP BY a, ROLLUP(b, c)", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            assert_eq!(s.group_by.len(), 3); // a, b, c
+            assert_eq!(s.grouping_sets, &[0b111, 0b011, 0b001]);
+        });
+        // A parenthesized scalar must not be read as a grouping list.
+        with_parser("SELECT a FROM t GROUP BY (a + 1) * 2", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            assert_eq!(s.group_by.len(), 1);
+            assert!(s.grouping_sets.is_empty());
         });
     }
 

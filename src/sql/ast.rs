@@ -90,6 +90,12 @@ pub struct Select<'a> {
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],
+    /// Grouping sets for `ROLLUP`/`CUBE`/`GROUPING SETS`. Each element is a
+    /// bitmask over `group_by` indices selecting the columns that group in that
+    /// set (bit *i* set = `group_by[i]` participates; a cleared bit means that
+    /// column is NULL in the set's output rows). Empty means a plain
+    /// `GROUP BY`: a single implicit set of all `group_by` columns.
+    pub grouping_sets: &'a [u64],
     pub having: Option<&'a Expr<'a>>,
     pub order_by: &'a [OrderBy<'a>],
     pub limit: Option<&'a Expr<'a>>,

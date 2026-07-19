@@ -91,8 +91,10 @@ pub const NO_PARAMS: &[Datum<'static>] = &[];
 /// or node identity (aggregates, subqueries).
 #[derive(Clone, Copy)]
 pub struct EvalHooks<'h, 'a> {
-    /// (group-by expressions, this group's key values).
-    pub group: Option<(&'h [&'h Expr<'h>], &'h [Datum<'a>])>,
+    /// (group-by expressions, this group's key values, active-column bitmask).
+    /// The bitmask selects which `group_by` columns participate in the current
+    /// grouping set (all bits set for a plain `GROUP BY`); it drives `GROUPING()`.
+    pub group: Option<(&'h [&'h Expr<'h>], &'h [Datum<'a>], u64)>,
     /// (aggregate-call nodes by address, this group's results).
     pub aggs: Option<(&'h [*const Expr<'h>], &'h [Datum<'a>])>,
     /// (subquery nodes by address, their pre-evaluated results).
@@ -309,9 +311,30 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    // GROUPING(arg, ...): each argument contributes one bit (1 if that column
+    // is NOT part of the current grouping set), most significant first.
+    if let Expr::Call { name, args, .. } = expression
+        && name.eq_ignore_ascii_case("grouping")
+    {
+        let Some((exprs, _, mask)) = hooks.group else {
+            return Err(sql_err!(
+                "42803",
+                "GROUPING must be used with grouping sets or GROUP BY"
+            ));
+        };
+        let mut result = 0i32;
+        for arg in args.iter() {
+            let idx = exprs.iter().position(|g| **g == **arg).ok_or_else(|| {
+                sql_err!("42803", "arguments to GROUPING must be grouping expressions of the associated query level")
+            })?;
+            let grouped = mask & (1u64 << idx) != 0;
+            result = (result << 1) | i32::from(!grouped);
+        }
+        return Ok(Datum::Int4(result));
+    }
     // Group-key substitution: any expression equal to a GROUP BY key
     // evaluates to the group's value.
-    if let Some((exprs, values)) = hooks.group {
+    if let Some((exprs, values, _mask)) = hooks.group {
         for (g, v) in exprs.iter().zip(values) {
             if **g == *expression {
                 return Ok(*v);

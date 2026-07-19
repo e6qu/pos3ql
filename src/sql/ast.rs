@@ -130,9 +130,10 @@ pub struct TableRef<'a> {
     /// Table function: `FROM func(args) alias`. When set, `table` is the
     /// function name and these are its argument expressions.
     pub func_args: Option<&'a [&'a Expr<'a>]>,
-    /// Column-alias for a table function (`func(args) alias(col)`): renames its
-    /// single output column.
-    pub col_alias: Option<&'a str>,
+    /// Column-alias list (`alias(c1, c2, ...)`): renames the output columns of a
+    /// derived table or a table function. A table function has a single output
+    /// column, so it accepts exactly one name.
+    pub col_alias: Option<&'a [&'a str]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

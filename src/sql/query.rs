@@ -211,7 +211,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, txid, arena)?;
+        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         // Materialize the subquery rows, self-describing-encoded, into a
         // doubling arena vector.
         const EMPTY: &[u8] = &[];
@@ -294,7 +294,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, txid, arena)?;
+        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_ref);
         // No rows: this scope is never scanned, only described. An empty row
@@ -5367,6 +5367,7 @@ fn synth_derived_def<'a>(
     storage: &'a Storage,
     sub: &'a Select<'a>,
     exposed: &'a str,
+    col_alias: Option<&'a [&'a str]>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a TableDef, SqlError> {
@@ -5387,6 +5388,22 @@ fn synth_derived_def<'a>(
             "derived table \"{}\" has too many columns",
             exposed
         ));
+    }
+    // A column-alias list renames the output columns; PostgreSQL requires it to
+    // supply no more names than the derived table has columns.
+    if let Some(aliases) = col_alias {
+        if aliases.len() > n_cols {
+            return Err(sql_err!(
+                "42P10",
+                "table \"{}\" has {} columns available but {} columns specified",
+                exposed,
+                n_cols,
+                aliases.len()
+            ));
+        }
+        for (i, alias) in aliases.iter().enumerate() {
+            descs[i].name = alias;
+        }
     }
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
@@ -5441,8 +5458,19 @@ fn table_func_def<'a>(
         ));
     }
     let name = tref.alias.unwrap_or(if is_gs { "generate_series" } else { "unnest" });
+    // A table function has a single output column, so at most one alias.
+    if let Some(aliases) = tref.col_alias
+        && aliases.len() > 1
+    {
+        return Err(sql_err!(
+            "42P10",
+            "table \"{}\" has 1 columns available but {} columns specified",
+            name,
+            aliases.len()
+        ));
+    }
     // The column takes the explicit column-alias if given, else the table name.
-    let col_name = tref.col_alias.unwrap_or(name);
+    let col_name = tref.col_alias.and_then(|a| a.first().copied()).unwrap_or(name);
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,

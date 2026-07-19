@@ -647,13 +647,16 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("subquery in FROM must have an alias"));
             }
             self.advance()?;
+            // Optional column-alias list `alias(c1, c2, ...)` renames the
+            // derived table's output columns.
+            let col_alias = self.column_alias_list()?;
             return Ok(TableRef {
                 schema: None,
                 table: "",
                 alias: Some(word),
                 subquery: Some(boxed),
                 func_args: None,
-                col_alias: None,
+                col_alias,
             });
         }
         let first = self.any_ident("table name")?;
@@ -698,18 +701,37 @@ impl<'a> Parser<'a> {
             None
         };
         // A column-alias list `alias(col, ...)` after a table function renames
-        // its output columns. Our table functions have a single output column,
-        // so accept exactly one name (more would not map to any column).
-        let mut col_alias = None;
-        if func_args.is_some() && self.peeked == Tok::Op("(") {
-            self.advance()?;
-            col_alias = Some(self.any_ident("column alias")?);
-            if self.eat_op(",")? {
-                return Err(self.err_here("a table function has a single output column"));
-            }
-            self.expect_op(")")?;
-        }
+        // its output columns (the count is validated against the function's
+        // arity at planning time, where PostgreSQL's 42P10 error is raised).
+        let col_alias = if func_args.is_some() {
+            self.column_alias_list()?
+        } else {
+            None
+        };
         Ok(TableRef { schema, table, alias, subquery: None, func_args, col_alias })
+    }
+
+    /// Parses an optional column-alias list `(col1, col2, ...)` following a FROM
+    /// item's correlation name. Returns `None` when there is no list.
+    fn column_alias_list(&mut self) -> Result<Option<&'a [&'a str]>, ParseError> {
+        if self.peeked != Tok::Op("(") {
+            return Ok(None);
+        }
+        self.advance()?;
+        let mut cols: [&'a str; MAX_LIST] = [""; MAX_LIST];
+        let mut n = 0;
+        loop {
+            if n == MAX_LIST {
+                return Err(self.limit("column aliases", MAX_LIST));
+            }
+            cols[n] = self.any_ident("column alias")?;
+            n += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(Some(self.arena_slice(&cols[..n])?))
     }
 
     #[expect(clippy::wrong_self_convention, reason = "parses the FROM clause; not a conversion")]
@@ -2490,6 +2512,28 @@ mod tests {
             let SelectItem::Expr { alias, .. } = s.items[2] else { panic!() };
             assert_eq!(alias, Some("half"));
             assert!(p.next_stmt().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn derived_table_column_alias_list() {
+        with_parser("SELECT * FROM (VALUES (1,'a')) AS v(id, name)", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let base = &s.from.unwrap().base;
+            assert_eq!(base.alias, Some("v"));
+            assert_eq!(base.col_alias, Some(&["id", "name"][..]));
+            assert!(base.subquery.is_some());
+        });
+    }
+
+    #[test]
+    fn table_function_column_alias() {
+        with_parser("SELECT * FROM generate_series(1,3) AS g(x)", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let base = &s.from.unwrap().base;
+            assert_eq!(base.alias, Some("g"));
+            assert_eq!(base.col_alias, Some(&["x"][..]));
+            assert!(base.func_args.is_some());
         });
     }
 

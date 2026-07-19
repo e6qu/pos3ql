@@ -1908,6 +1908,28 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return self.plain_call(dir, &[first]);
         }
+        if name.eq_ignore_ascii_case("position") {
+            // SQL-standard `position(substr IN string)` -> strpos(string, substr)
+            // (strpos takes the haystack first, the needle second). Parse the
+            // needle above IN's precedence (4) so the IN keyword is not consumed
+            // as an `x IN (...)` operator.
+            let needle = self.expr(5)?;
+            if self.eat_ident("in")? {
+                let haystack = self.expr(0)?;
+                self.expect_op(")")?;
+                return self.plain_call("strpos", &[haystack, needle]);
+            }
+            let mut cargs = [needle, needle];
+            let mut cn = 1;
+            while self.eat_op(",")? {
+                if cn < cargs.len() {
+                    cargs[cn] = self.expr(0)?;
+                }
+                cn += 1;
+            }
+            self.expect_op(")")?;
+            return self.plain_call(name, &cargs[..cn.min(cargs.len())]);
+        }
         if self.peeked == Tok::Op("*") {
             self.advance()?;
             self.expect_op(")")?;

@@ -1240,10 +1240,7 @@ fn call<'a>(
             }
             let mut out = StackStr::<8192>::new();
             let mut pos = 0usize;
-            loop {
-                let Some((s, e)) = super::regex::find(pat, src, pos, ci)? else {
-                    break;
-                };
+            while let Some((s, e)) = super::regex::find(pat, src, pos, ci)? {
                 if out.write_str(&src[pos..s]).is_err() {
                     return Err(sql_err!("54000", "regexp_replace result too large"));
                 }
@@ -2244,23 +2241,17 @@ fn call<'a>(
             Ok(Datum::Numeric(super::to_char::to_number(s, fmt, arena)?))
         }
         "make_date" | "make_time" | "make_timestamp" => {
-            let want = if name == "make_date" {
-                3
-            } else if name == "make_time" {
-                3
-            } else {
-                6
-            };
+            let want = if name == "make_timestamp" { 6 } else { 3 };
             arity(want)?;
             // The seconds field is a double; every other field is an integer.
             let sec_idx = if name == "make_date" { usize::MAX } else { want - 1 };
             let mut ints = [0i64; 6];
-            for i in 0..want {
+            for (i, slot) in ints[..want].iter_mut().enumerate() {
                 if i == sec_idx {
                     continue;
                 }
                 match int_arg(name, args, i, arena, params, row, hooks)? {
-                    Some(v) => ints[i] = v,
+                    Some(v) => *slot = v,
                     None => return Ok(Datum::Null),
                 }
             }

@@ -1133,7 +1133,7 @@ fn finish_from_lsf<'a>(
 // reduction-then-series structure, computed here with the module's exact
 // add/sub/mul/div primitives at a guarded working scale, then rounded.
 
-const LN10: f64 = 2.302585092994046;
+const LN10: f64 = core::f64::consts::LN_10;
 /// Significant digits PostgreSQL keeps in a transcendental result before its
 /// leading digit is accounted for (`NUMERIC_MIN_SIG_DIGITS`).
 const MIN_SIG_DIGITS: i32 = 16;
@@ -1319,8 +1319,7 @@ fn exp_var<'a>(arg: &Numeric, rscale: u16, arena: &'a Arena) -> Result<Numeric<'
     // Taylor: sum = 1 + xr + xr^2/2! + xr^3/3! + ...
     let mut sum = one(arena)?;
     let mut term = one(arena)?;
-    let mut i: i64 = 1;
-    for _ in 0..(wscale as usize * 4 + 60) {
+    for i in 1..=(wscale as i64 * 4 + 60) {
         // term *= xr / i
         term = mul_scale(&term, &xr, wscale, arena)?;
         let denom = Numeric::from_i64(i, arena)?;
@@ -1329,7 +1328,6 @@ fn exp_var<'a>(arg: &Numeric, rscale: u16, arena: &'a Arena) -> Result<Numeric<'
             break;
         }
         sum = add(&sum, &term, arena)?;
-        i += 1;
     }
     // Square back ndiv2 times.
     for _ in 0..ndiv2 {

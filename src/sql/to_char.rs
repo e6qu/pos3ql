@@ -178,8 +178,8 @@ fn render<'a>(
 
     let mut fracbuf = [b'0'; MAX_OUT];
     let fb = fracpart.as_bytes();
-    for k in 0..frac_digits {
-        fracbuf[k] = *fb.get(k).unwrap_or(&b'0');
+    for (k, slot) in fracbuf[..frac_digits].iter_mut().enumerate() {
+        *slot = *fb.get(k).unwrap_or(&b'0');
     }
     let fracstr = &fracbuf[..frac_digits];
 
@@ -358,10 +358,8 @@ fn render<'a>(
 
     // A leading sign with no integer digits and no point still needs emitting
     // (e.g. a bare `S` with only literals); a trailing sign appends at the end.
-    if !sign_emitted {
-        if let Some(sc) = sign_char {
-            emit(&mut out, &mut olen, sc)?;
-        }
+    if !sign_emitted && let Some(sc) = sign_char {
+        emit(&mut out, &mut olen, sc)?;
     }
 
     let text = core::str::from_utf8(&out[..olen]).expect("ascii output");

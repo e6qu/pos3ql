@@ -459,11 +459,11 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         guc: &mut GucState,
-        resp: &mut Responder,
+        responder: &mut Responder,
     ) -> Result<(), WireFull> {
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
-            Err(e) => return report_parse_error(resp, &e),
+            Err(e) => return report_parse_error(responder, &e),
         };
         // The whole message runs in one implicit transaction unless an
         // explicit block is open — an error undoes the entire message,
@@ -474,13 +474,13 @@ impl Engine {
             match parser.next_stmt() {
                 Ok(Some(statement)) => {
                     executed_any = true;
-                    if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, guc, resp)? {
+                    if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, guc, responder)? {
                         if txn.is_explicit() {
                             txn.failed = true;
                         } else {
                             self.rollback_txn(txn);
                         }
-                        resp.error(e.sqlstate, e.message.as_str())?;
+                        responder.error(e.sqlstate, e.message.as_str())?;
                         return Ok(());
                     }
                 }
@@ -491,17 +491,17 @@ impl Engine {
                     } else {
                         self.rollback_txn(txn);
                     }
-                    return report_parse_error(resp, &e);
+                    return report_parse_error(responder, &e);
                 }
             }
         }
         if !executed_any {
-            resp.empty_query_response()?;
+            responder.empty_query_response()?;
         }
         // Implicit transactions commit at end of message.
         if txn.mode == TxnMode::Implicit
             && let Err(e) = self.commit_txn(txn) {
-                resp.error(e.sqlstate, e.message.as_str())?;
+                responder.error(e.sqlstate, e.message.as_str())?;
             }
         Ok(())
     }
@@ -518,20 +518,20 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         guc: &mut GucState,
-        resp: &mut Responder,
+        responder: &mut Responder,
     ) -> Result<bool, WireFull> {
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
-                report_parse_error(resp, &e)?;
+                report_parse_error(responder, &e)?;
                 return Ok(false);
             }
         };
         self.ensure_txn(txn, TxnMode::Implicit);
         let outcome = match parser.next_stmt() {
-            Ok(Some(statement)) => self.execute_stmt(&statement, arena, params, txn, sqlprep, guc, resp)?,
+            Ok(Some(statement)) => self.execute_stmt(&statement, arena, params, txn, sqlprep, guc, responder)?,
             Ok(None) => {
-                resp.empty_query_response()?;
+                responder.empty_query_response()?;
                 Ok(())
             }
             Err(e) => {
@@ -540,7 +540,7 @@ impl Engine {
                 } else {
                     self.rollback_txn(txn);
                 }
-                report_parse_error(resp, &e)?;
+                report_parse_error(responder, &e)?;
                 return Ok(false);
             }
         };
@@ -548,7 +548,7 @@ impl Engine {
             Ok(()) => {
                 if txn.mode == TxnMode::Implicit
                     && let Err(e) = self.commit_txn(txn) {
-                        resp.error(e.sqlstate, e.message.as_str())?;
+                        responder.error(e.sqlstate, e.message.as_str())?;
                         return Ok(false);
                     }
                 Ok(true)
@@ -559,7 +559,7 @@ impl Engine {
                 } else {
                     self.rollback_txn(txn);
                 }
-                resp.error(e.sqlstate, e.message.as_str())?;
+                responder.error(e.sqlstate, e.message.as_str())?;
                 Ok(false)
             }
         }
@@ -696,25 +696,25 @@ impl Engine {
         text: &str,
         arena: &Arena,
         txn: &TxnState,
-        resp: &mut Responder,
+        responder: &mut Responder,
     ) -> Result<bool, WireFull> {
-        // resp already carries the portal's result-format flag when this is
+        // responder already carries the portal's result-format flag when this is
         // a portal Describe (set by the caller).
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
-                report_parse_error(resp, &e)?;
+                report_parse_error(responder, &e)?;
                 return Ok(false);
             }
         };
         let statement = match parser.next_stmt() {
             Ok(Some(statement)) => statement,
             Ok(None) => {
-                resp.no_data()?;
+                responder.no_data()?;
                 return Ok(true);
             }
             Err(e) => {
-                report_parse_error(resp, &e)?;
+                report_parse_error(responder, &e)?;
                 return Ok(false);
             }
         };
@@ -724,7 +724,7 @@ impl Engine {
                 let s = match query::expand_ctes(s, &self.storage, arena) {
                     Ok(x) => x,
                     Err(e) => {
-                        resp.error(e.sqlstate, e.message.as_str())?;
+                        responder.error(e.sqlstate, e.message.as_str())?;
                         return Ok(false);
                     }
                 };
@@ -734,7 +734,7 @@ impl Engine {
                         match query::QueryScope::resolve_schema(&self.storage, from, txn.txid, arena) {
                             Ok(scope) => query::describe_scope_items(s.items, &scope, &mut columns),
                             Err(e) => {
-                                resp.error(e.sqlstate, e.message.as_str())?;
+                                responder.error(e.sqlstate, e.message.as_str())?;
                                 return Ok(false);
                             }
                         }
@@ -743,21 +743,21 @@ impl Engine {
                 };
                 match described {
                     Ok(n) => {
-                        resp.row_description(&columns[..n])?;
+                        responder.row_description(&columns[..n])?;
                         Ok(true)
                     }
                     Err(e) => {
-                        resp.error(e.sqlstate, e.message.as_str())?;
+                        responder.error(e.sqlstate, e.message.as_str())?;
                         Ok(false)
                     }
                 }
             }
             Stmt::Show(name) => {
-                resp.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
+                responder.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
                 Ok(true)
             }
             _ => {
-                resp.no_data()?;
+                responder.no_data()?;
                 Ok(true)
             }
         }
@@ -773,7 +773,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         guc: &mut GucState,
-        resp: &mut Responder,
+        responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         // Reclaim the shared execution arena from the previous statement: its
         // materialized rows have already been paged to the wire.
@@ -783,7 +783,7 @@ impl Engine {
         query::arm_timeout(guc.statement_timeout_ms());
         // Render output with the current session settings (a SET earlier in the
         // same batch takes effect here).
-        resp.set_render(guc.render());
+        responder.set_render(guc.render());
         // Inside a failed explicit block only COMMIT/ROLLBACK (and ROLLBACK TO
         // SAVEPOINT, which recovers the block) act.
         if txn.failed
@@ -823,19 +823,19 @@ impl Engine {
                 // arena, which outlives it — so the work arena can be reset
                 // per statement while the AST persists across the message.
                 if s.from.is_none() {
-                    query::constant_select(&self.storage, txn.txid, s, &self.work, params, resp)
+                    query::constant_select(&self.storage, txn.txid, s, &self.work, params, responder)
                 } else {
-                    query::select_query(&self.storage, txn.txid, s, &self.work, params, resp)
+                    query::select_query(&self.storage, txn.txid, s, &self.work, params, responder)
                 }
             }
             Stmt::SetQuery(q) => {
-                query::set_query(&self.storage, txn.txid, q, &self.work, params, resp)
+                query::set_query(&self.storage, txn.txid, q, &self.work, params, responder)
             }
             Stmt::CreateTable(c) => {
-                exec::create_table(&mut self.storage, &mut self.wal, txn, c, arena, resp)
+                exec::create_table(&mut self.storage, &mut self.wal, txn, c, arena, responder)
             }
             Stmt::DropTable(d) => {
-                exec::drop_table(&mut self.storage, &mut self.wal, txn, d, resp)
+                exec::drop_table(&mut self.storage, &mut self.wal, txn, d, responder)
             }
             Stmt::CreateView { name, or_replace, sql } => exec::create_view(
                 &mut self.storage,
@@ -845,10 +845,10 @@ impl Engine {
                 *or_replace,
                 sql,
                 arena,
-                resp,
+                responder,
             ),
             Stmt::DropView { name, if_exists } => {
-                exec::drop_view(&mut self.storage, &mut self.wal, txn, name, *if_exists, resp)
+                exec::drop_view(&mut self.storage, &mut self.wal, txn, name, *if_exists, responder)
             }
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
                 &mut self.storage,
@@ -858,10 +858,10 @@ impl Engine {
                 table,
                 columns,
                 *unique,
-                resp,
+                responder,
             ),
             Stmt::DropIndex { name, if_exists } => {
-                exec::drop_index(&mut self.storage, &mut self.wal, txn, name, *if_exists, resp)
+                exec::drop_index(&mut self.storage, &mut self.wal, txn, name, *if_exists, responder)
             }
             Stmt::Insert(i) => {
                 // DML on an auto-updatable view rewrites to its base table.
@@ -885,7 +885,7 @@ impl Engine {
                     Ok(None) => i,
                     Err(e) => return Ok(Err(e)),
                 };
-                exec::insert(&mut self.storage, txn, i, arena, params, resp)
+                exec::insert(&mut self.storage, txn, i, arena, params, responder)
             }
             Stmt::Update(u) => {
                 let u = match query::resolve_view_for_dml(&self.storage, u.table, arena) {
@@ -909,7 +909,7 @@ impl Engine {
                     Ok(None) => u,
                     Err(e) => return Ok(Err(e)),
                 };
-                exec::update(&mut self.storage, txn, &mut self.scratch, u, arena, params, resp)
+                exec::update(&mut self.storage, txn, &mut self.scratch, u, arena, params, responder)
             }
             Stmt::Delete(d) => {
                 let d = match query::resolve_view_for_dml(&self.storage, d.table, arena) {
@@ -932,23 +932,23 @@ impl Engine {
                     Ok(None) => d,
                     Err(e) => return Ok(Err(e)),
                 };
-                exec::delete(&mut self.storage, txn, &mut self.scratch, d, arena, params, resp)
+                exec::delete(&mut self.storage, txn, &mut self.scratch, d, arena, params, responder)
             }
             Stmt::Begin => {
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
-                    resp.warning(
+                    responder.warning(
                         "25001",
                         "there is already a transaction in progress",
                     )?;
                 }
                 self.ensure_txn(txn, TxnMode::Explicit);
-                resp.command_complete("BEGIN")?;
+                responder.command_complete("BEGIN")?;
                 Ok(Ok(()))
             }
             Stmt::Commit => {
                 if !txn.is_explicit() {
-                    resp.warning("25P01", "there is no transaction in progress")?;
+                    responder.warning("25P01", "there is no transaction in progress")?;
                 }
                 let tag = if txn.failed { "ROLLBACK" } else { "COMMIT" };
                 if txn.failed {
@@ -956,17 +956,17 @@ impl Engine {
                 } else if let Err(e) = self.commit_txn(txn) {
                     return Ok(Err(e));
                 }
-                resp.command_complete(tag)?;
+                responder.command_complete(tag)?;
                 // Later statements in this message get a fresh implicit txn.
                 self.ensure_txn(txn, TxnMode::Implicit);
                 Ok(Ok(()))
             }
             Stmt::Rollback => {
                 if !txn.is_explicit() {
-                    resp.warning("25P01", "there is no transaction in progress")?;
+                    responder.warning("25P01", "there is no transaction in progress")?;
                 }
                 self.rollback_txn(txn);
-                resp.command_complete("ROLLBACK")?;
+                responder.command_complete("ROLLBACK")?;
                 self.ensure_txn(txn, TxnMode::Implicit);
                 Ok(Ok(()))
             }
@@ -981,7 +981,7 @@ impl Engine {
                 if let Err(e) = txn.savepoint(name, mark) {
                     return Ok(Err(e));
                 }
-                resp.command_complete("SAVEPOINT")?;
+                responder.command_complete("SAVEPOINT")?;
                 Ok(Ok(()))
             }
             Stmt::ReleaseSavepoint(name) => {
@@ -994,7 +994,7 @@ impl Engine {
                 match txn.savepoint_index(name) {
                     Some(index) => {
                         txn.release_savepoints_from(index);
-                        resp.command_complete("RELEASE")?;
+                        responder.command_complete("RELEASE")?;
                         Ok(Ok(()))
                     }
                     None => Ok(Err(sql_err!(
@@ -1019,25 +1019,25 @@ impl Engine {
                     )));
                 };
                 self.rollback_to_savepoint(txn, index);
-                resp.command_complete("ROLLBACK")?;
+                responder.command_complete("ROLLBACK")?;
                 Ok(Ok(()))
             }
             Stmt::Set { name, value } => match guc.set(name, value) {
                 Ok(()) => {
-                    resp.command_complete("SET")?;
+                    responder.command_complete("SET")?;
                     Ok(Ok(()))
                 }
                 Err(e) => Ok(Err(e)),
             },
             Stmt::SetTransaction => {
-                resp.command_complete("SET")?;
+                responder.command_complete("SET")?;
                 Ok(Ok(()))
             }
-            Stmt::Show(name) => self.show(name, guc, resp),
-            Stmt::ShowAll => self.show_all(guc, resp),
+            Stmt::Show(name) => self.show(name, guc, responder),
+            Stmt::ShowAll => self.show_all(guc, responder),
             Stmt::Checkpoint => match self.checkpoint() {
                 Ok(_) => {
-                    resp.command_complete("CHECKPOINT")?;
+                    responder.command_complete("CHECKPOINT")?;
                     Ok(Ok(()))
                 }
                 Err(e) => Ok(Err(e)),
@@ -1064,7 +1064,7 @@ impl Engine {
                     &mut self.scratch,
                     a,
                     arena,
-                    resp,
+                    responder,
                 )?;
                 match out {
                     Ok(()) => {
@@ -1098,7 +1098,7 @@ impl Engine {
                 }
                 match sqlprep.store(name, sql, &types[..param_types.len()]) {
                     Ok(()) => {
-                        resp.command_complete("PREPARE")?;
+                        responder.command_complete("PREPARE")?;
                         Ok(Ok(()))
                     }
                     Err(e) => Ok(Err(e)),
@@ -1184,7 +1184,7 @@ impl Engine {
                         txn,
                         sqlprep,
                         guc,
-                        resp,
+                        responder,
                     ),
                     Ok(None) => Ok(Ok(())),
                     Err(e) => Ok(Err(SqlError {
@@ -1209,7 +1209,7 @@ impl Engine {
                     }
                     None => sqlprep.clear(),
                 }
-                resp.command_complete("DEALLOCATE")?;
+                responder.command_complete("DEALLOCATE")?;
                 Ok(Ok(()))
             }
         }
@@ -1219,7 +1219,7 @@ impl Engine {
         &mut self,
         name: &str,
         guc: &GucState,
-        resp: &mut Responder,
+        responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         // Session GUCs come from the per-session store; the rest are fixed
         // server parameters.
@@ -1236,9 +1236,9 @@ impl Engine {
                 }))
             }
         };
-        resp.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
-        resp.data_row(&[Datum::Text(value)])?;
-        resp.command_complete("SHOW")?;
+        responder.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
+        responder.data_row(&[Datum::Text(value)])?;
+        responder.command_complete("SHOW")?;
         Ok(Ok(()))
     }
 
@@ -1247,7 +1247,7 @@ impl Engine {
     fn show_all(
         &mut self,
         guc: &GucState,
-        resp: &mut Responder,
+        responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         const NAMES: &[&str] = &[
             "application_name",
@@ -1269,17 +1269,17 @@ impl Engine {
             "TimeZone",
             "transaction_isolation",
         ];
-        resp.row_description(&[
+        responder.row_description(&[
             ColDesc::new("name", types::oid::TEXT, -1),
             ColDesc::new("setting", types::oid::TEXT, -1),
             ColDesc::new("description", types::oid::TEXT, -1),
         ])?;
         for &name in NAMES {
             if let Some(v) = fixed_setting(name).or_else(|| guc.get(name)) {
-                resp.data_row(&[Datum::Text(name), Datum::Text(v), Datum::Text("")])?;
+                responder.data_row(&[Datum::Text(name), Datum::Text(v), Datum::Text("")])?;
             }
         }
-        resp.command_complete("SHOW")?;
+        responder.command_complete("SHOW")?;
         Ok(Ok(()))
     }
 }
@@ -1297,8 +1297,8 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
     }
 }
 
-fn report_parse_error(resp: &mut Responder, e: &ParseError) -> Result<(), WireFull> {
-    resp.error(sqlstate::SYNTAX_ERROR, e.message.as_str())
+fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), WireFull> {
+    responder.error(sqlstate::SYNTAX_ERROR, e.message.as_str())
 }
 
 /// Reapplies one journal record to storage during recovery.
@@ -1413,9 +1413,9 @@ mod tests {
         let mut txn = TxnState::new(budget, 1024).unwrap();
         let mut pool = test_pool(budget);
         let mut guc = GucState::new();
-        let mut resp = Responder::new(&mut buffer);
+        let mut responder = Responder::new(&mut buffer);
         engine
-            .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut guc, &mut resp)
+            .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut guc, &mut responder)
             .unwrap();
         buffer.readable().to_vec()
     }
@@ -1620,9 +1620,9 @@ mod tests {
         let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
         let mut pool = test_pool(budget);
         let mut guc = GucState::new();
-        let mut resp = Responder::new(&mut buffer);
+        let mut responder = Responder::new(&mut buffer);
         engine
-            .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut resp)
+            .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut responder)
             .unwrap();
         String::from_utf8_lossy(buffer.readable()).to_string()
     }
@@ -2457,9 +2457,9 @@ mod tests {
         let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
         let mut pool = test_pool(budget);
         let mut guc = GucState::new();
-        let mut resp = Responder::new(&mut buffer);
+        let mut responder = Responder::new(&mut buffer);
         engine
-            .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut resp)
+            .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut responder)
             .unwrap();
         buffer.readable().to_vec()
     }

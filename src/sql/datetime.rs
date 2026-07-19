@@ -16,35 +16,36 @@ pub const PG_EPOCH_DAYS: i64 = 10_957;
 /// Seconds between the unix and PostgreSQL epochs.
 pub const PG_EPOCH_SECS: i64 = 946_684_800;
 
-pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+pub fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let shifted = days_since_epoch + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_index = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let day_of_year = (153 * month_index + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
-fn days_in_month(y: i64, m: u32) -> u32 {
-    match m {
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
                 29
             } else {
                 28
@@ -72,17 +73,17 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
             s
         )
     };
-    let t = s.trim();
-    let mut parts = t.splitn(3, '-');
-    let (y, m, d) = (
+    let trimmed = s.trim();
+    let mut parts = trimmed.splitn(3, '-');
+    let (year, month, day) = (
         parts.next().and_then(|p| p.parse::<i64>().ok()).ok_or_else(bad)?,
         parts.next().and_then(|p| p.parse::<u32>().ok()).ok_or_else(bad)?,
         parts.next().and_then(|p| p.parse::<u32>().ok()).ok_or_else(bad)?,
     );
-    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return Err(out_of_range());
     }
-    let days = days_from_civil(y, m, d) - PG_EPOCH_DAYS;
+    let days = days_from_civil(year, month, day) - PG_EPOCH_DAYS;
     i32::try_from(days).map_err(|_| out_of_range())
 }
 
@@ -188,18 +189,18 @@ fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32
     }
     let table: &[&str] = if abbr { &MONTH_ABBR } else { &MONTH_FULL };
     for (i, name) in table.iter().enumerate() {
-        let nb = name.as_bytes();
-        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
-            *input_position += nb.len();
+        let name_bytes = name.as_bytes();
+        if *input_position + name_bytes.len() <= bytes.len() && bytes[*input_position..*input_position + name_bytes.len()].eq_ignore_ascii_case(name_bytes) {
+            *input_position += name_bytes.len();
             return Some(i as u32 + 1);
         }
     }
     // `MON` also accepts the full name; `MONTH` also accepts the abbreviation.
     let other: &[&str] = if abbr { &MONTH_FULL } else { &MONTH_ABBR };
     for (i, name) in other.iter().enumerate() {
-        let nb = name.as_bytes();
-        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
-            *input_position += nb.len();
+        let name_bytes = name.as_bytes();
+        if *input_position + name_bytes.len() <= bytes.len() && bytes[*input_position..*input_position + name_bytes.len()].eq_ignore_ascii_case(name_bytes) {
+            *input_position += name_bytes.len();
             return Some(i as u32 + 1);
         }
     }
@@ -221,33 +222,40 @@ pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
 
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
 /// the fields as PostgreSQL `make_date` does.
-pub fn make_date(y: i64, m: i64, d: i64) -> Result<i32, SqlError> {
+pub fn make_date(year: i64, month: i64, day: i64) -> Result<i32, SqlError> {
     let range = || sql_err!("22008", "date field value out of range");
-    if !(1..=12).contains(&m) {
+    if !(1..=12).contains(&month) {
         return Err(range());
     }
-    let (mu, du) = (m as u32, d);
-    if du < 1 || du as u32 > days_in_month(y, mu) {
+    let month_u32 = month as u32;
+    if day < 1 || day as u32 > days_in_month(year, month_u32) {
         return Err(range());
     }
-    let days = days_from_civil(y, mu, du as u32) - PG_EPOCH_DAYS;
+    let days = days_from_civil(year, month_u32, day as u32) - PG_EPOCH_DAYS;
     i32::try_from(days).map_err(|_| range())
 }
 
 /// Constructs a time-of-day (microseconds since midnight) from hour/minute and
 /// a fractional second, validating fields as PostgreSQL `make_time` does.
-pub fn make_time(h: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
+pub fn make_time(hour: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
     let range = || sql_err!("22008", "time field value out of range");
-    if !(0..=23).contains(&h) || !(0..=59).contains(&minute) || !(0.0..60.0).contains(&sec) {
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0.0..60.0).contains(&sec) {
         return Err(range());
     }
-    Ok(((h * 60 + minute) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
+    Ok(((hour * 60 + minute) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
 }
 
 /// Constructs a timestamp (microseconds since 2000-01-01) from its fields.
-pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
-    let days = make_date(y, m, d)? as i64;
-    let time_of_day = make_time(h, minute, sec)?;
+pub fn make_timestamp(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    sec: f64,
+) -> Result<i64, SqlError> {
+    let days = make_date(year, month, day)? as i64;
+    let time_of_day = make_time(hour, minute, sec)?;
     Ok(days * 86_400_000_000 + time_of_day)
 }
 

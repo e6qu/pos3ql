@@ -330,16 +330,16 @@ impl<'a> Numeric<'a> {
 
         // Trim trailing zero base-digits (they don't affect value; dscale
         // keeps display width).
-        let mut nb = n_base;
-        while nb > 0 && buffer[nb - 1] == 0 {
-            nb -= 1;
+        let mut base_length = n_base;
+        while base_length > 0 && buffer[base_length - 1] == 0 {
+            base_length -= 1;
         }
         // Trim leading zero base-digits.
         let mut lead = 0;
-        while lead < nb && buffer[lead] == 0 {
+        while lead < base_length && buffer[lead] == 0 {
             lead += 1;
         }
-        let ndigits = nb - lead;
+        let ndigits = base_length - lead;
         if ndigits == 0 {
             return Ok(Numeric {
                 sign: Sign::Pos,
@@ -353,7 +353,7 @@ impl<'a> Numeric<'a> {
             sign: if neg { Sign::Neg } else { Sign::Pos },
             weight,
             dscale,
-            digits: pack(&buffer[lead..nb], arena)?,
+            digits: pack(&buffer[lead..base_length], arena)?,
         })
     }
 
@@ -384,15 +384,15 @@ impl<'a> Numeric<'a> {
         }
         let weight = (n - 1) as i16;
         // Trim trailing zero digits.
-        let mut nb = n;
-        while nb > 0 && buffer[nb - 1] == 0 {
-            nb -= 1;
+        let mut base_length = n;
+        while base_length > 0 && buffer[base_length - 1] == 0 {
+            base_length -= 1;
         }
         Ok(Numeric {
             sign: if neg { Sign::Neg } else { Sign::Pos },
             weight,
             dscale: 0,
-            digits: pack(&buffer[..nb], arena)?,
+            digits: pack(&buffer[..base_length], arena)?,
         })
     }
 
@@ -417,15 +417,15 @@ impl<'a> Numeric<'a> {
             n += 1;
         }
         // MSD-first into buffer; trim trailing zero digits.
-        let mut nb = n;
-        while nb > 0 && rev[0] == 0 {
+        let mut base_length = n;
+        while base_length > 0 && rev[0] == 0 {
             // trailing (least-significant) zero: drop from the low end
-            for k in 0..nb - 1 {
+            for k in 0..base_length - 1 {
                 rev[k] = rev[k + 1];
             }
-            nb -= 1;
+            base_length -= 1;
         }
-        for k in 0..nb {
+        for k in 0..base_length {
             let d = rev[n - 1 - k];
             buffer[k * 2..k * 2 + 2].copy_from_slice(&d.to_le_bytes());
         }
@@ -433,7 +433,7 @@ impl<'a> Numeric<'a> {
             sign: if neg { Sign::Neg } else { Sign::Pos },
             weight: (n - 1) as i16,
             dscale: 0,
-            digits: &buffer[..nb * 2],
+            digits: &buffer[..base_length * 2],
         }
     }
 
@@ -850,25 +850,25 @@ pub fn mul<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
         });
     }
     let na = a.ndigits();
-    let nb = b.ndigits();
-    if na + nb + 1 > MAX_NDIGITS * 2 {
+    let base_length = b.ndigits();
+    if na + base_length + 1 > MAX_NDIGITS * 2 {
         return Err(overflow());
     }
     // Schoolbook multiply into an LSF accumulator.
     let mut buffer: DigitBuf = [0; MAX_NDIGITS * 2 + 4];
     // a.digits[i] has base-weight a.weight-i; product term weight = sum.
-    // Use LSF indexing with lo = (a.weight - (na-1)) + (b.weight - (nb-1)).
-    let lo = (a.weight as i32 - (na as i32 - 1)) + (b.weight as i32 - (nb as i32 - 1));
+    // Use LSF indexing with lo = (a.weight - (na-1)) + (b.weight - (base_length-1)).
+    let lo = (a.weight as i32 - (na as i32 - 1)) + (b.weight as i32 - (base_length as i32 - 1));
     for i in 0..na {
         let da = a.digit(i) as i32;
-        for j in 0..nb {
+        for j in 0..base_length {
             // weight of this term = (a.weight-i)+(b.weight-j)
             let w = (a.weight as i32 - i as i32) + (b.weight as i32 - j as i32);
             let index = (w - lo) as usize;
             buffer[index] += da * b.digit(j) as i32;
         }
     }
-    let n = na + nb;
+    let n = na + base_length;
     let mut carry = 0;
     for slot in buffer.iter_mut().take(n + 1) {
         *slot += carry;
@@ -948,9 +948,9 @@ fn div_with_scale<'a>(
     // Significant decimal digits (no leading/trailing zeros) and the weight
     // of the least-significant digit, so each operand is `int * 10^lsw`.
     let mut na = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
-    let mut nb = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
+    let mut base_length = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
     let (na_len, na_lsw) = sig_decimal(a, &mut na);
-    let (nb_len, nb_lsw) = sig_decimal(b, &mut nb);
+    let (nb_len, nb_lsw) = sig_decimal(b, &mut base_length);
 
     // result = (na_int / nb_int) * 10^(na_lsw - nb_lsw). To get `rscale`
     // fractional digits plus one guard, we want the integer quotient
@@ -972,7 +972,7 @@ fn div_with_scale<'a>(
     let mut dividend = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
     dividend[..na_len].copy_from_slice(&na[..na_len]);
     let mut divisor = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
-    divisor[..nb_len].copy_from_slice(&nb[..nb_len]);
+    divisor[..nb_len].copy_from_slice(&base_length[..nb_len]);
     // Both pad with trailing zeros (arrays are zeroed).
 
     // Q = dividend / divisor (integer long division), MSD-first, no leading

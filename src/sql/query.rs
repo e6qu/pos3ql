@@ -1850,7 +1850,7 @@ fn window_select<'a>(
     params: &[Datum<'a>],
     limit: u64,
     offset: u64,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     if !statement.group_by.is_empty() || statement.having.is_some() || statement.distinct {
         return sql_fail(sql_err!(
@@ -1897,11 +1897,11 @@ fn window_select<'a>(
         if emitted >= limit {
             break;
         }
-        resp.data_row(proj_rows[i])?;
+        responder.data_row(proj_rows[i])?;
         emitted += 1;
     }
     let tag = stack_format!(48, "SELECT {}", emitted);
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 
@@ -3265,7 +3265,7 @@ pub fn select_query<'a>(
     statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let from = statement.from.as_ref().expect("FROM-less handled by caller");
     // Catalog relations (pg_catalog / information_schema) are synthesized and
@@ -3351,7 +3351,7 @@ pub fn select_query<'a>(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    resp.row_description(&columns[..n_cols])?;
+    responder.row_description(&columns[..n_cols])?;
 
     let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
         Ok(l) => l,
@@ -3366,7 +3366,7 @@ pub fn select_query<'a>(
     // PostgreSQL does — so a per-row error in an unreturned row does not
     // surface (constant errors already surfaced via the plan-time check).
     if limit == 0 {
-        resp.command_complete("SELECT 0")?;
+        responder.command_complete("SELECT 0")?;
         return sql_ok();
     }
 
@@ -3389,7 +3389,7 @@ pub fn select_query<'a>(
         }
         return window_select(
             storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, arena, params,
-            limit, offset, resp,
+            limit, offset, responder,
         );
     }
 
@@ -3426,7 +3426,7 @@ pub fn select_query<'a>(
             &hooks,
             limit,
             offset,
-            resp,
+            responder,
         );
     }
 
@@ -3510,7 +3510,7 @@ pub fn select_query<'a>(
                     };
                     let mut projected = [Datum::Null; MAX_PROJ];
                     let n = project_row(statement.items, &scope, row, arena, params, use_hooks, &mut projected)?;
-                    if let Err(w) = resp.data_row(&projected[..n]) {
+                    if let Err(w) = responder.data_row(&projected[..n]) {
                         wire_full = true;
                         wire_result = Err(w);
                         return Ok(false);
@@ -3527,7 +3527,7 @@ pub fn select_query<'a>(
             return sql_fail(e);
         }
         let tag = stack_format!(48, "SELECT {}", emitted);
-        resp.command_complete(tag.as_str())?;
+        responder.command_complete(tag.as_str())?;
         return sql_ok();
     }
 
@@ -3544,7 +3544,7 @@ pub fn select_query<'a>(
     // Materialize: visible columns + hidden ORDER BY keys.
     materialized_select(
         storage, &scope, from, txid, statement, arena, params, &hooks, correlated, &outer_subs.base,
-        limit, offset, resp,
+        limit, offset, responder,
     )
 }
 
@@ -3934,7 +3934,7 @@ pub fn set_query<'a>(
     q: &'a SetQuery<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     // Column names + types from the first leaf, unified across every leaf.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -3966,7 +3966,7 @@ pub fn set_query<'a>(
         Err(e) => return sql_fail(e),
     };
 
-    resp.row_description(&columns[..n_cols])?;
+    responder.row_description(&columns[..n_cols])?;
     let mut emitted = 0u64;
     for (i, row) in rows.iter().enumerate() {
         if (i as u64) < offset {
@@ -3979,13 +3979,13 @@ pub fn set_query<'a>(
         for (c, slot) in out[..n_cols].iter_mut().enumerate() {
             *slot = super::exec::decode_projected_pub(row, c);
         }
-        if resp.data_row(&out[..n_cols]).is_err() {
+        if responder.data_row(&out[..n_cols]).is_err() {
             return Err(WireFull);
         }
         emitted += 1;
     }
     let tag = stack_format!(48, "SELECT {}", emitted);
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 
@@ -4334,7 +4334,7 @@ pub fn constant_select<'a>(
     statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     if let Err(e) = check_select_constants(statement, arena) {
         return sql_fail(e);
@@ -4369,7 +4369,7 @@ pub fn constant_select<'a>(
             Err(e) => return sql_fail(e),
         },
     };
-    resp.row_description(&columns[..n])?;
+    responder.row_description(&columns[..n])?;
     let mut rows = 0u64;
     for k in 1..=count {
         let khooks = if srf_call.is_some() {
@@ -4394,11 +4394,11 @@ pub fn constant_select<'a>(
                 Err(e) => return sql_fail(e),
             }
         }
-        resp.data_row(&values[..n])?;
+        responder.data_row(&values[..n])?;
         rows += 1;
     }
     let tag = stack_format!(32, "SELECT {}", rows);
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 
@@ -5067,7 +5067,7 @@ fn grouped_select<'a>(
     hooks: &EvalHooks<'_, 'a>,
     limit: u64,
     offset: u64,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let (out_rows, width) =
         match grouped_rows(storage, scope, from, txid, statement, agg_nodes, arena, params, hooks) {
@@ -5083,11 +5083,11 @@ fn grouped_select<'a>(
         for (i, slot) in out.iter_mut().take(width).enumerate() {
             *slot = super::exec::decode_projected_pub(row, i);
         }
-        resp.data_row(&out[..width])?;
+        responder.data_row(&out[..width])?;
         emitted += 1;
     }
     let tag = stack_format!(48, "SELECT {}", emitted);
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 
@@ -5350,7 +5350,7 @@ fn materialized_select<'a>(
     base: &SubqueryValues<'a, 'a>,
     limit: u64,
     offset: u64,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let (rows, width) = match materialized_rows(
         storage, scope, from, txid, statement, arena, params, hooks, correlated, base,
@@ -5367,11 +5367,11 @@ fn materialized_select<'a>(
         for (i, slot) in out.iter_mut().take(width).enumerate() {
             *slot = super::exec::decode_projected_pub(row, i);
         }
-        resp.data_row(&out[..width])?;
+        responder.data_row(&out[..width])?;
         emitted += 1;
     }
     let tag = stack_format!(48, "SELECT {}", emitted);
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 

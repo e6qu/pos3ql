@@ -81,7 +81,7 @@ pub fn create_table(
     txn: &mut TxnState,
     statement: &CreateTable,
     arena: &Arena,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let mut def = match build_def(statement.name, statement.columns, arena) {
         Ok(d) => d,
@@ -104,14 +104,14 @@ pub fn create_table(
             }
         }
         Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
-            resp.notice(
+            responder.notice(
                 "42P07",
                 stack_format!(128, "relation \"{}\" already exists, skipping", statement.name).as_str(),
             )?;
         }
         Err(e) => return sql_fail(e),
     }
-    resp.command_complete("CREATE TABLE")?;
+    responder.command_complete("CREATE TABLE")?;
     sql_ok()
 }
 
@@ -340,8 +340,8 @@ fn attach_constraints(
                 }
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
-                for &ci in &indices[..n] {
-                    def.columns[ci as usize].not_null = true;
+                for &column_index in &indices[..n] {
+                    def.columns[column_index as usize].not_null = true;
                 }
                 if n == 1 {
                     def.columns[indices[0] as usize].primary = true;
@@ -530,8 +530,8 @@ fn attach_fkey(
             ));
         }
         n_parent = pk_n;
-        for (i, &ci) in pk[..pk_n].iter().enumerate() {
-            pcol_names[i] = parent_def.columns()[ci as usize].name.as_str();
+        for (i, &column_index) in pk[..pk_n].iter().enumerate() {
+            pcol_names[i] = parent_def.columns()[column_index as usize].name.as_str();
         }
     } else {
         n_parent = parent_cols.len();
@@ -555,14 +555,14 @@ fn attach_fkey(
     }
     // Types must match between each child and parent column.
     for i in 0..n_child {
-        let ct = def.columns()[child_idxs[i] as usize].ctype;
-        let pt = parent_def.columns()[parent_idxs[i] as usize].ctype;
-        if ct.storage() != pt.storage() {
+        let column_type = def.columns()[child_idxs[i] as usize].ctype;
+        let parent_type = parent_def.columns()[parent_idxs[i] as usize].ctype;
+        if column_type.storage() != parent_type.storage() {
             return Err(sql_err!(
                 "42804",
                 "foreign key constraint cannot be implemented: column types {} and {} are incompatible",
-                ct.name(),
-                pt.name()
+                column_type.name(),
+                parent_type.name()
             ));
         }
     }
@@ -991,9 +991,9 @@ fn tuple_uniqueness(
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(storage.heap.get(loc), schema, &mut other)?;
             let all_eq = columns.iter().all(|&c| {
-                let ci = c as usize;
-                !other[ci].is_null()
-                    && compare_datums(&values[ci], &other[ci])
+                let column_index = c as usize;
+                !other[column_index].is_null()
+                    && compare_datums(&values[column_index], &other[column_index])
                         .map(|o| o.is_eq())
                         .unwrap_or(false)
             });
@@ -1157,9 +1157,9 @@ fn check_fk_parent_referenced(
     old_values: &[Datum],
     txid: u32,
 ) -> Result<(), SqlError> {
-    for ci in 0..storage.table_count() {
-        let cdef = storage.table(ci).def;
-        if !storage.table(ci).visible_to(txid) {
+    for column_index in 0..storage.table_count() {
+        let cdef = storage.table(column_index).def;
+        if !storage.table(column_index).visible_to(txid) {
             continue;
         }
         let mut cschema = [ColType::Bool; MAX_COLUMNS];
@@ -1169,7 +1169,7 @@ fn check_fk_parent_referenced(
                 continue;
             }
             // Does any child row reference the parent's current key tuple?
-            let table = storage.table(ci);
+            let table = storage.table(column_index);
             for (_, state) in table.rows.iter() {
                 let Some(loc) = state.visible_to(txid) else { continue };
                 let mut crow = [Datum::Null; MAX_COLUMNS];
@@ -1199,12 +1199,12 @@ fn check_fk_parent_referenced(
 
 /// Whether any visible table has a foreign key referencing `name`.
 fn table_is_referenced(storage: &Storage, name: &str, txid: u32) -> bool {
-    for ci in 0..storage.table_count() {
-        if !storage.table(ci).visible_to(txid) {
+    for column_index in 0..storage.table_count() {
+        if !storage.table(column_index).visible_to(txid) {
             continue;
         }
         if storage
-            .table(ci)
+            .table(column_index)
             .def
             .fkeys()
             .iter()
@@ -1225,11 +1225,11 @@ fn referenced_key_changed(
     new: &[Datum],
     txid: u32,
 ) -> bool {
-    for ci in 0..storage.table_count() {
-        if !storage.table(ci).visible_to(txid) {
+    for column_index in 0..storage.table_count() {
+        if !storage.table(column_index).visible_to(txid) {
             continue;
         }
-        let cdef = storage.table(ci).def;
+        let cdef = storage.table(column_index).def;
         for fk in cdef.fkeys() {
             if fk.parent.as_str() != parent_name {
                 continue;
@@ -1256,7 +1256,7 @@ pub fn drop_table(
     wal: &mut Wal,
     txn: &mut TxnState,
     statement: &DropTable,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     match storage.find_visible(statement.name, txn.txid) {
         Some(index) => {
@@ -1281,14 +1281,14 @@ pub fn drop_table(
             storage.drop_indexes_for(statement.name);
         }
         None if statement.if_exists => {
-            resp.notice(
+            responder.notice(
                 sqlstate::UNDEFINED_TABLE,
                 stack_format!(128, "table \"{}\" does not exist, skipping", statement.name).as_str(),
             )?;
         }
         None => return sql_fail(undefined_table(statement.name)),
     }
-    resp.command_complete("DROP TABLE")?;
+    responder.command_complete("DROP TABLE")?;
     sql_ok()
 }
 
@@ -1304,7 +1304,7 @@ pub fn create_view(
     or_replace: bool,
     sql: &str,
     arena: &Arena,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     use core::fmt::Write;
     let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
@@ -1348,7 +1348,7 @@ pub fn create_view(
         }
         Err(e) => return sql_fail(e),
     }
-    resp.command_complete("CREATE VIEW")?;
+    responder.command_complete("CREATE VIEW")?;
     sql_ok()
 }
 
@@ -1359,7 +1359,7 @@ pub fn drop_view(
     txn: &mut super::txn::TxnState,
     name: &str,
     if_exists: bool,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     if storage.find_view(name).is_some() {
         let lsn = storage.bump_lsn();
@@ -1372,14 +1372,14 @@ pub fn drop_view(
             return sql_fail(e);
         }
     } else if if_exists {
-        resp.notice(
+        responder.notice(
             "42P01",
             stack_format!(128, "view \"{}\" does not exist, skipping", name).as_str(),
         )?;
     } else {
         return sql_fail(sql_err!("42P01", "view \"{}\" does not exist", name));
     }
-    resp.command_complete("DROP VIEW")?;
+    responder.command_complete("DROP VIEW")?;
     sql_ok()
 }
 
@@ -1396,13 +1396,13 @@ pub fn create_index(
     table: &str,
     column_names: &[&str],
     unique: bool,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{IndexDef, MAX_INDEX_COLS};
-    let Some(ti) = storage.find_visible(table, txn.txid) else {
+    let Some(table_index) = storage.find_visible(table, txn.txid) else {
         return sql_fail(undefined_table(table));
     };
-    let tdef = storage.table(ti).def;
+    let tdef = storage.table(table_index).def;
     if column_names.is_empty() || column_names.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1412,14 +1412,14 @@ pub fn create_index(
     }
     let mut columns = [0u16; MAX_INDEX_COLS];
     for (i, column_name) in column_names.iter().enumerate() {
-        let Some(ci) = tdef.column_index(column_name) else {
+        let Some(column_index) = tdef.column_index(column_name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
                 column_name
             ));
         };
-        columns[i] = ci as u16;
+        columns[i] = column_index as u16;
     }
     let n_cols = columns.len();
     let sqlname = match SqlName::parse(name) {
@@ -1444,7 +1444,7 @@ pub fn create_index(
         // registered index (all borrows shared); a conflict is deferred so the
         // rollback drop_index (a mutable borrow) runs after the scan.
         let mut conflict: Option<SqlError> = None;
-        for (&rowid, state) in storage.table(ti).rows.iter() {
+        for (&rowid, state) in storage.table(table_index).rows.iter() {
             let Some(loc) = state.committed else { continue };
             let mut values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) =
@@ -1455,7 +1455,7 @@ pub fn create_index(
             }
             if let Err(e) = check_unique_indexes(
                 storage,
-                ti,
+                table_index,
                 &tdef,
                 &schema[..tdef.n_columns],
                 &values[..tdef.n_columns],
@@ -1479,7 +1479,7 @@ pub fn create_index(
     if let Err(e) = txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32)) {
         return sql_fail(e);
     }
-    resp.command_complete("CREATE INDEX")?;
+    responder.command_complete("CREATE INDEX")?;
     sql_ok()
 }
 
@@ -1490,7 +1490,7 @@ pub fn drop_index(
     txn: &mut super::txn::TxnState,
     name: &str,
     if_exists: bool,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     if storage.index_exists(name) {
         let lsn = storage.bump_lsn();
@@ -1503,14 +1503,14 @@ pub fn drop_index(
             return sql_fail(e);
         }
     } else if if_exists {
-        resp.notice(
+        responder.notice(
             "42P01",
             stack_format!(128, "index \"{}\" does not exist, skipping", name).as_str(),
         )?;
     } else {
         return sql_fail(sql_err!("42P01", "index \"{}\" does not exist", name));
     }
-    resp.command_complete("DROP INDEX")?;
+    responder.command_complete("DROP INDEX")?;
     sql_ok()
 }
 
@@ -1520,7 +1520,7 @@ pub fn insert(
     statement: &Insert,
     arena: &Arena,
     params: &[Datum],
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
         return sql_fail(undefined_table(statement.table));
@@ -1557,7 +1557,7 @@ pub fn insert(
     if !statement.returning.is_empty() {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_items(statement.returning, Some(&def), &mut columns) {
-            Ok(n) => resp.row_description(&columns[..n])?,
+            Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
@@ -1654,13 +1654,13 @@ pub fn insert(
                 return sql_fail(e);
             }
             if !statement.returning.is_empty()
-                && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, resp)? {
+                && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder)? {
                     return sql_fail(e);
                 }
             inserted += 1;
         }
         let tag = stack_format!(48, "INSERT 0 {}", inserted);
-        resp.command_complete(tag.as_str())?;
+        responder.command_complete(tag.as_str())?;
         return sql_ok();
     }
 
@@ -1728,13 +1728,13 @@ pub fn insert(
             return sql_fail(e);
         }
         if !statement.returning.is_empty()
-            && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, resp)? {
+            && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder)? {
                 return sql_fail(e);
             }
         inserted += 1;
     }
     let tag = stack_format!(48, "INSERT 0 {}", inserted);
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 
@@ -1745,7 +1745,7 @@ fn emit_projected(
     items: &[SelectItem],
     arena: &Arena,
     params: &[Datum],
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let context = RowCtx { def, values };
     let mut projected = [Datum::Null; MAX_PROJ];
@@ -1767,7 +1767,7 @@ fn emit_projected(
             },
         }
     }
-    resp.data_row(&projected[..n])?;
+    responder.data_row(&projected[..n])?;
     Ok(Ok(()))
 }
 
@@ -1778,7 +1778,7 @@ pub fn update(
     statement: &Update,
     arena: &Arena,
     params: &[Datum],
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
         return sql_fail(undefined_table(statement.table));
@@ -1829,7 +1829,7 @@ pub fn update(
     if !statement.returning.is_empty() {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_items(statement.returning, Some(&def), &mut columns) {
-            Ok(n) => resp.row_description(&columns[..n])?,
+            Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
@@ -1953,7 +1953,7 @@ pub fn update(
                 statement.returning,
                 arena,
                 params,
-                resp,
+                responder,
             )? {
                 return sql_fail(e);
             }
@@ -1961,7 +1961,7 @@ pub fn update(
         updated += 1;
     }
     let tag = stack_format!(48, "UPDATE {}", updated);
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 
@@ -1972,7 +1972,7 @@ pub fn delete(
     statement: &Delete,
     arena: &Arena,
     params: &[Datum],
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
         return sql_fail(undefined_table(statement.table));
@@ -2004,7 +2004,7 @@ pub fn delete(
     if !statement.returning.is_empty() {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_items(statement.returning, Some(&def), &mut columns) {
-            Ok(n) => resp.row_description(&columns[..n])?,
+            Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
@@ -2035,7 +2035,7 @@ pub fn delete(
                     statement.returning,
                     arena,
                     params,
-                    resp,
+                    responder,
                 )?
             {
                 return sql_fail(e);
@@ -2052,7 +2052,7 @@ pub fn delete(
         }
     }
     let tag = stack_format!(48, "DELETE {}", scratch.len());
-    resp.command_complete(tag.as_str())?;
+    responder.command_complete(tag.as_str())?;
     sql_ok()
 }
 
@@ -2067,7 +2067,7 @@ pub fn alter_table(
     scratch: &mut FixedVec<(u64, RowLoc)>,
     statement: &AlterTable,
     arena: &Arena,
-    resp: &mut Responder,
+    responder: &mut Responder,
 ) -> Outcome {
     let Some(table_index) = storage.find_table(statement.table) else {
         return sql_fail(undefined_table(statement.table));
@@ -2280,7 +2280,7 @@ pub fn alter_table(
             state.committed = Some(new_loc);
         }
     }
-    resp.command_complete("ALTER TABLE")?;
+    responder.command_complete("ALTER TABLE")?;
     sql_ok()
 }
 

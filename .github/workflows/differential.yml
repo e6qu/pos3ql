@@ -5,6 +5,12 @@ name: Differential
 # unit-test CI (ci.yml) cannot give: tens of thousands of vendored
 # sqllogictest blocks plus thousands of generated statements, all validated
 # against PostgreSQL as the oracle.
+#
+# Sharded so every job fits the 15-minute cap while total coverage is
+# preserved: four shards each replay a quarter of the vendored sqllogictest
+# corpus's query blocks (all files, all statements, on every shard), and a fifth
+# shard runs the full generative fuzzer. Every shard also runs the fast gates
+# (wire probe, psycopg driver, curated SQL corpus).
 
 on:
   push:
@@ -19,11 +25,39 @@ concurrency:
 
 jobs:
   differential:
+    name: differential (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Hard ceiling: the whole differential suite (corpora + fuzzer) finishes in
-    # minutes; this cap guarantees a pathological query can never wedge CI for
-    # hours, even if a per-statement guard is missing on one engine.
-    timeout-minutes: 40
+    # Hard ceiling on every CI job: 15 minutes. Each shard runs at most a third
+    # of the sqllogictest corpus or the fuzzer alone, so all finish well under
+    # this cap; the cap still guarantees a pathological query can never wedge CI.
+    timeout-minutes: 15
+
+    strategy:
+      # Report every shard's result rather than cancelling siblings on the
+      # first failure — a divergence in one shard should not hide others.
+      fail-fast: false
+      matrix:
+        include:
+          - shard: slt-1
+            run_slt: "1"
+            query_shard: "0"
+            run_fuzz: "0"
+          - shard: slt-2
+            run_slt: "1"
+            query_shard: "1"
+            run_fuzz: "0"
+          - shard: slt-3
+            run_slt: "1"
+            query_shard: "2"
+            run_fuzz: "0"
+          - shard: slt-4
+            run_slt: "1"
+            query_shard: "3"
+            run_fuzz: "0"
+          - shard: fuzz
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
 
     services:
       postgres:
@@ -64,17 +98,23 @@ jobs:
           PGPORT: "5432"
           PGUSER: postgres
           P3_PORT: "15599"
-          # Replay the whole vendored sqllogictest corpus (~11k blocks).
+          # Replay the whole vendored sqllogictest corpus (~11k blocks): each of
+          # the four slt shards runs all files and all statements but a quarter of
+          # the query blocks, so even one pathologically slow file (select4's
+          # joins) is balanced under the cap. SLT_LIMIT is the per-file block cap
+          # (all).
           SLT_LIMIT: "50000"
-          # Generative fuzzer: thousands of distinct statements, deterministic.
+          SLT_QUERY_SHARDS: "4"
+          SLT_QUERY_SHARD: ${{ matrix.query_shard }}
+          RUN_SLT: ${{ matrix.run_slt }}
+          RUN_FUZZ: ${{ matrix.run_fuzz }}
+          # The fuzzer runs alone on its own shard, so it keeps the full
+          # deterministic sweep. Ignored on the slt shards (RUN_FUZZ=0).
           FUZZ_COUNT: "10000"
           FUZZ_SEED: "1"
-          # Ratchet budget for the fuzzer's known error-timing/semantic edge
-          # cases (see BUGS.md B-039). Baseline at count=10000 seed=1 is ~34
-          # after nine fidelity fixes (boolean/CASE simplification, insertion-
-          # order scan, cost-ordered + type-aware WHERE conjuncts, analyze-
-          # before-fold, WHERE/projection interleaving); the residual is
+          # Ratchet budget: allowed fuzz divergences before failing (see BUGS.md
+          # B-039). A ceiling, not an exact target — the residual divergences are
           # PostgreSQL-implementation-specific (unspecified within-row operand
-          # order, plan-dependent projection placement). Ratchet toward it.
+          # order, plan-dependent projection placement). Ratchet toward zero.
           FUZZ_BUDGET: "31"
         run: bash tests/external/ci_diff.sh

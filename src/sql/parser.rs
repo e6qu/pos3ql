@@ -17,6 +17,12 @@ pub const MAX_ROWS: usize = 256;
 
 /// Words that cannot appear as a bare column reference; mirrors the
 /// reserved entries of PostgreSQL's keyword table that this grammar uses.
+/// Whether a numeric token carries a `0x`/`0o`/`0b` base prefix.
+fn is_base_prefixed(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() > 2 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+}
+
 fn is_reserved(word: &str) -> bool {
     matches!(
         word,
@@ -641,13 +647,16 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("subquery in FROM must have an alias"));
             }
             self.advance()?;
+            // Optional column-alias list `alias(c1, c2, ...)` renames the
+            // derived table's output columns.
+            let col_alias = self.column_alias_list()?;
             return Ok(TableRef {
                 schema: None,
                 table: "",
                 alias: Some(word),
                 subquery: Some(boxed),
                 func_args: None,
-                col_alias: None,
+                col_alias,
             });
         }
         let first = self.any_ident("table name")?;
@@ -692,18 +701,37 @@ impl<'a> Parser<'a> {
             None
         };
         // A column-alias list `alias(col, ...)` after a table function renames
-        // its output columns. Our table functions have a single output column,
-        // so accept exactly one name (more would not map to any column).
-        let mut col_alias = None;
-        if func_args.is_some() && self.peeked == Tok::Op("(") {
-            self.advance()?;
-            col_alias = Some(self.any_ident("column alias")?);
-            if self.eat_op(",")? {
-                return Err(self.err_here("a table function has a single output column"));
-            }
-            self.expect_op(")")?;
-        }
+        // its output columns (the count is validated against the function's
+        // arity at planning time, where PostgreSQL's 42P10 error is raised).
+        let col_alias = if func_args.is_some() {
+            self.column_alias_list()?
+        } else {
+            None
+        };
         Ok(TableRef { schema, table, alias, subquery: None, func_args, col_alias })
+    }
+
+    /// Parses an optional column-alias list `(col1, col2, ...)` following a FROM
+    /// item's correlation name. Returns `None` when there is no list.
+    fn column_alias_list(&mut self) -> Result<Option<&'a [&'a str]>, ParseError> {
+        if self.peeked != Tok::Op("(") {
+            return Ok(None);
+        }
+        self.advance()?;
+        let mut cols: [&'a str; MAX_LIST] = [""; MAX_LIST];
+        let mut n = 0;
+        loop {
+            if n == MAX_LIST {
+                return Err(self.limit("column aliases", MAX_LIST));
+            }
+            cols[n] = self.any_ident("column alias")?;
+            n += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(Some(self.arena_slice(&cols[..n])?))
     }
 
     #[expect(clippy::wrong_self_convention, reason = "parses the FROM clause; not a conversion")]
@@ -1609,9 +1637,12 @@ impl<'a> Parser<'a> {
         match tok {
             Tok::Num(text) => {
                 self.advance()?;
-                let looks_integral = !text.contains(['.', 'e', 'E']);
+                // Base-prefixed literals (0x/0o/0b) are always integers; a plain
+                // token is integral unless it has a decimal point or exponent.
+                let prefixed = is_base_prefixed(text);
+                let looks_integral = prefixed || !text.contains(['.', 'e', 'E']);
                 if looks_integral
-                    && let Ok(v) = text.parse::<i64>() {
+                    && let Some(v) = super::eval::parse_int_literal(text) {
                         return self.arena_expr(Expr::Int(v));
                     }
                 // Decimal / exponent literals are NUMERIC in PostgreSQL; keep
@@ -1661,9 +1692,9 @@ impl<'a> Parser<'a> {
                 // `-2147483648` is int4 (INT4_MIN fits), not int8. Decimal
                 // literals negate through the normal Neg path (numeric).
                 if let Tok::Num(text) = self.peeked {
-                    let integral = !text.contains(['.', 'e', 'E']);
+                    let integral = is_base_prefixed(text) || !text.contains(['.', 'e', 'E']);
                     if integral
-                        && let Ok(v) = text.parse::<i64>() {
+                        && let Some(v) = super::eval::parse_int_literal(text) {
                             self.advance()?;
                             return self.arena_expr(Expr::Int(-v));
                         }
@@ -1699,6 +1730,7 @@ impl<'a> Parser<'a> {
                     args: self.arena_slice(&[field_lit, source])?,
                     star: false,
                     distinct: false,
+                    filter: None,
                     order_by: &[],
                     over: None,
                 })
@@ -1864,6 +1896,7 @@ impl<'a> Parser<'a> {
                         distinct: false,
                         order_by: &[],
                         over: None,
+                        filter: None,
                     });
                 }
                 self.arena_expr(Expr::Column { qualifier: None, name })
@@ -1890,7 +1923,7 @@ impl<'a> Parser<'a> {
     /// Builds a simple function call `name(args)` (no star/distinct/over).
     fn plain_call(&mut self, name: &'a str, args: &[&'a Expr<'a>]) -> Result<&'a Expr<'a>, ParseError> {
         let args = self.arena_slice(args)?;
-        self.arena_expr(Expr::Call { name, args, star: false, distinct: false, order_by: &[], over: None })
+        self.arena_expr(Expr::Call { name, args, star: false, distinct: false, order_by: &[], over: None, filter: None })
     }
 
     fn call(&mut self, name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
@@ -1982,6 +2015,7 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Op("*") {
             self.advance()?;
             self.expect_op(")")?;
+            let filter = self.parse_filter()?;
             let over = self.parse_over()?;
             return self.arena_expr(Expr::Call {
                 name,
@@ -1990,6 +2024,7 @@ impl<'a> Parser<'a> {
                 distinct: false,
                 order_by: &[],
                 over,
+                filter,
             });
         }
         // `agg(DISTINCT expr)` — deduplicate argument values before aggregating.
@@ -2023,9 +2058,23 @@ impl<'a> Parser<'a> {
             &[]
         };
         self.expect_op(")")?;
+        let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = self.arena_slice(&args[..n])?;
-        self.arena_expr(Expr::Call { name, args, star: false, distinct, order_by, over })
+        self.arena_expr(Expr::Call { name, args, star: false, distinct, order_by, over, filter })
+    }
+
+    /// Parses an optional aggregate `FILTER (WHERE cond)` clause.
+    fn parse_filter(&mut self) -> Result<Option<&'a Expr<'a>>, ParseError> {
+        if self.peeked != Tok::Ident("filter") {
+            return Ok(None);
+        }
+        self.advance()?;
+        self.expect_op("(")?;
+        self.expect_ident("where")?;
+        let cond = self.expr(0)?;
+        self.expect_op(")")?;
+        Ok(Some(cond))
     }
 
     /// Parses a comma-separated ORDER BY item list (the `ORDER BY` keyword
@@ -2198,6 +2247,12 @@ impl<'a> Parser<'a> {
             Tok::Op("<<") => Some(BinaryOp::Shl),
             Tok::Op(">>") => Some(BinaryOp::Shr),
             Tok::Op("^") => Some(BinaryOp::Pow),
+            Tok::Op("@>") => Some(BinaryOp::Contains),
+            Tok::Op("<@") => Some(BinaryOp::ContainedBy),
+            Tok::Op("&&") => Some(BinaryOp::Overlaps),
+            Tok::Op("&<") => Some(BinaryOp::NotRightOf),
+            Tok::Op("&>") => Some(BinaryOp::NotLeftOf),
+            Tok::Op("-|-") => Some(BinaryOp::Adjacent),
             Tok::Ident("and") => Some(BinaryOp::And),
             Tok::Ident("or") => Some(BinaryOp::Or),
             _ => None,
@@ -2475,6 +2530,28 @@ mod tests {
             let SelectItem::Expr { alias, .. } = s.items[2] else { panic!() };
             assert_eq!(alias, Some("half"));
             assert!(p.next_stmt().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn derived_table_column_alias_list() {
+        with_parser("SELECT * FROM (VALUES (1,'a')) AS v(id, name)", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let base = &s.from.unwrap().base;
+            assert_eq!(base.alias, Some("v"));
+            assert_eq!(base.col_alias, Some(&["id", "name"][..]));
+            assert!(base.subquery.is_some());
+        });
+    }
+
+    #[test]
+    fn table_function_column_alias() {
+        with_parser("SELECT * FROM generate_series(1,3) AS g(x)", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let base = &s.from.unwrap().base;
+            assert_eq!(base.alias, Some("g"));
+            assert_eq!(base.col_alias, Some(&["x"][..]));
+            assert!(base.func_args.is_some());
         });
     }
 

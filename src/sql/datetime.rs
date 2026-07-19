@@ -523,6 +523,132 @@ pub fn add_interval(micros_epoch: i64, iv: super::types::Interval) -> i64 {
     m + iv.days as i64 * DAY_US + iv.micros
 }
 
+/// `interval * factor` (and `interval / factor` when `div`), matching
+/// PostgreSQL's `interval_mul`/`interval_div`: a fractional number of months
+/// spills into days (30-day months) and a fractional number of days spills into
+/// the time field.
+pub fn interval_scale(iv: super::types::Interval, factor: f64, div: bool) -> super::types::Interval {
+    let f = if div { 1.0 / factor } else { factor };
+    const DAYS_PER_MONTH: f64 = 30.0;
+    let month_double = iv.months as f64 * f;
+    let months = month_double as i32;
+    let month_remainder_days = (month_double - months as f64) * DAYS_PER_MONTH;
+    let day_double = iv.days as f64 * f;
+    let days_whole = day_double as i32;
+    let sec_remainder = (day_double - days_whole as f64 + month_remainder_days
+        - month_remainder_days as i64 as f64)
+        * 86_400.0;
+    // Round the spilled seconds to microsecond precision.
+    let sec_remainder = (sec_remainder * 1_000_000.0).round() / 1_000_000.0;
+    let days = days_whole + month_remainder_days as i64 as i32;
+    let micros = (iv.micros as f64 * f + sec_remainder * 1_000_000.0).round() as i64;
+    super::types::Interval { months, days, micros }
+}
+
+/// `justify_hours`: carry whole days out of the time field.
+pub fn justify_hours(mut iv: super::types::Interval) -> super::types::Interval {
+    let wholeday = (iv.micros / DAY_US) as i32;
+    iv.micros -= wholeday as i64 * DAY_US;
+    iv.days += wholeday;
+    if iv.days > 0 && iv.micros < 0 {
+        iv.micros += DAY_US;
+        iv.days -= 1;
+    } else if iv.days < 0 && iv.micros > 0 {
+        iv.micros -= DAY_US;
+        iv.days += 1;
+    }
+    iv
+}
+
+/// `justify_days`: carry whole 30-day months out of the day field.
+pub fn justify_days(mut iv: super::types::Interval) -> super::types::Interval {
+    let wholemonth = iv.days / 30;
+    iv.days -= wholemonth * 30;
+    iv.months += wholemonth;
+    if iv.months > 0 && iv.days < 0 {
+        iv.days += 30;
+        iv.months -= 1;
+    } else if iv.months < 0 && iv.days > 0 {
+        iv.days -= 30;
+        iv.months += 1;
+    }
+    iv
+}
+
+/// `justify_interval`: normalize so months/days/time share a sign.
+pub fn justify_interval(iv: super::types::Interval) -> super::types::Interval {
+    let mut r = justify_hours(iv);
+    let wholemonth = r.days / 30;
+    r.days -= wholemonth * 30;
+    r.months += wholemonth;
+    if r.months > 0 && (r.days < 0 || (r.days == 0 && r.micros < 0)) {
+        r.days += 30;
+        r.months -= 1;
+    } else if r.months < 0 && (r.days > 0 || (r.days == 0 && r.micros > 0)) {
+        r.days -= 30;
+        r.months += 1;
+    }
+    if r.days > 0 && r.micros < 0 {
+        r.micros += DAY_US;
+        r.days -= 1;
+    } else if r.days < 0 && r.micros > 0 {
+        r.micros -= DAY_US;
+        r.days += 1;
+    }
+    r
+}
+
+/// `age(ts1, ts2)`: the symbolic (calendar) interval between two timestamps
+/// (micros from the PostgreSQL epoch), matching PostgreSQL's `timestamp_age` —
+/// field-wise subtraction with calendar borrow using the earlier date's month
+/// length.
+pub fn age_between(ts1: i64, ts2: i64) -> super::types::Interval {
+    // Compute the positive age (larger minus smaller) with calendar borrow,
+    // then negate if the arguments were in the other order — PostgreSQL's
+    // `timestamp_age` normalizes the borrow to non-negative fields and recovers
+    // the sign at the end.
+    let neg = ts1 < ts2;
+    let (hi, lo) = if neg { (ts2, ts1) } else { (ts1, ts2) };
+    let (yh, moh, dh, ush) = decompose(hi);
+    let (yl, mol, dl, usl) = decompose(lo);
+    let mut usec = ush - usl;
+    let mut mday = dh as i64 - dl as i64;
+    let mut mon = moh as i64 - mol as i64;
+    let mut year = yh - yl;
+    if usec < 0 {
+        usec += DAY_US;
+        mday -= 1;
+    }
+    while mday < 0 {
+        // Borrow a month's worth of days from the earlier date's own month.
+        mday += days_in_month(yl, mol) as i64;
+        mon -= 1;
+    }
+    while mon < 0 {
+        mon += 12;
+        year -= 1;
+    }
+    let iv = super::types::Interval {
+        months: (year * 12 + mon) as i32,
+        days: mday as i32,
+        micros: usec,
+    };
+    if neg {
+        super::types::Interval { months: -iv.months, days: -iv.days, micros: -iv.micros }
+    } else {
+        iv
+    }
+}
+
+/// Splits a timestamp (micros from the PG epoch) into (year, month, day,
+/// microseconds-within-day).
+fn decompose(ts: i64) -> (i64, u32, u32, i64) {
+    let days = ts.div_euclid(DAY_US);
+    let tod = ts.rem_euclid(DAY_US);
+    let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    (y, m, d, tod)
+}
+
 const DAY_US: i64 = 86_400_000_000;
 const DOW: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MON: [&str; 12] = [
@@ -706,6 +832,50 @@ pub fn now_micros() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::types::Interval;
+
+    fn iv(months: i32, days: i32, micros: i64) -> Interval {
+        Interval { months, days, micros }
+    }
+
+    // Reference values captured from PostgreSQL 18.4.
+    #[test]
+    fn interval_scale_matches_pg() {
+        // interval '1 month' * 1.5 = 1 mon 15 days (fractional month -> days).
+        assert_eq!(interval_scale(iv(1, 0, 0), 1.5, false), iv(1, 15, 0));
+        // interval '1 day' / 2 = 12:00:00 (fractional day -> time).
+        assert_eq!(interval_scale(iv(0, 1, 0), 2.0, true), iv(0, 0, 43_200_000_000));
+        // interval '10 days' / 3 = 3 days 08:00:00.
+        assert_eq!(interval_scale(iv(0, 10, 0), 3.0, true), iv(0, 3, 28_800_000_000));
+        // interval '2 hours' * 2.5 = 05:00:00.
+        assert_eq!(interval_scale(iv(0, 0, 7_200_000_000), 2.5, false), iv(0, 0, 18_000_000_000));
+    }
+
+    #[test]
+    fn justify_matches_pg() {
+        // 36 hours -> 1 day 12:00:00.
+        assert_eq!(justify_hours(iv(0, 0, 129_600_000_000)), iv(0, 1, 43_200_000_000));
+        // 35 days -> 1 mon 5 days.
+        assert_eq!(justify_days(iv(0, 35, 0)), iv(1, 5, 0));
+        // 1 mon -1 hour -> 29 days 23:00:00.
+        assert_eq!(justify_interval(iv(1, 0, -3_600_000_000)), iv(0, 29, 82_800_000_000));
+    }
+
+    #[test]
+    fn age_matches_pg() {
+        let ts = |s: &str| parse_timestamp(s, false).unwrap();
+        assert_eq!(age_between(ts("2024-06-15"), ts("2020-01-10")), iv(53, 5, 0));
+        // Reversed arguments negate every field.
+        assert_eq!(age_between(ts("2020-01-10"), ts("2024-06-15")), iv(-53, -5, 0));
+        // Day borrow uses the earlier date's own month length.
+        assert_eq!(age_between(ts("2024-03-01"), ts("2024-01-31")), iv(1, 1, 0));
+        assert_eq!(age_between(ts("2000-01-01"), ts("1999-02-05")), iv(10, 24, 0));
+        // Time-of-day borrow into days.
+        assert_eq!(
+            age_between(ts("2024-01-01 10:00"), ts("2023-12-15 14:30")),
+            iv(0, 16, 70_200_000_000)
+        );
+    }
 
     // Reference outputs captured from PostgreSQL 18.4 for
     // date '2024-01-15', timestamp '2024-01-15 14:30:00[.5]',

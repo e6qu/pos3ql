@@ -18,6 +18,7 @@ pub mod prep;
 pub mod query;
 pub mod txn;
 pub mod types;
+pub mod range;
 pub mod to_char;
 pub mod tz;
 
@@ -777,6 +778,9 @@ impl Engine {
         // Reclaim the shared execution arena from the previous statement: its
         // materialized rows have already been paged to the wire.
         self.work.reset();
+        // Arm this statement's `statement_timeout` deadline (0 clears it); each
+        // statement re-arms, so no explicit disarm is needed.
+        query::arm_timeout(guc.statement_timeout_ms());
         // Render output with the current session settings (a SET earlier in the
         // same batch takes effect here).
         resp.set_render(guc.render());
@@ -1776,7 +1780,10 @@ mod tests {
         assert!(run("SET row_security = off; SHOW row_security").contains("off"));
         // Rejected loudly — never accepted-and-ignored.
         assert!(run("SET extra_float_digits = 9").contains("22023"), "out of range");
-        assert!(run("SET statement_timeout = 5000").contains("0A000"), "unenforced timeout");
+        // statement_timeout is now accepted (enforced at scan boundaries); a
+        // malformed value is still rejected loudly.
+        assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5000"));
+        assert!(run("SET statement_timeout = 'bogus'").contains("22023"), "bad timeout");
         assert!(run("SET bytea_output = 'escape'").contains("0A000"), "unsupported format");
     }
 

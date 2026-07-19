@@ -30,6 +30,52 @@ use super::types::{ColDesc, ColType, Datum};
 
 pub const MAX_JOIN_TABLES: usize = 9; // base + 8 joins
 const MAX_AGGS: usize = 16;
+
+use core::cell::Cell;
+std::thread_local! {
+    /// Wall-clock deadline (micros since 2000-01-01) for the running statement;
+    /// 0 means no `statement_timeout` is armed. Single-threaded per connection.
+    static DEADLINE: Cell<i64> = const { Cell::new(0) };
+    /// Amortizes the clock read in [`check_timeout`] to roughly 1 in 1024 calls.
+    static TICK: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Arms `statement_timeout` for the current statement (`timeout_ms == 0` clears
+/// it). Call [`disarm_timeout`] when the statement completes.
+pub fn arm_timeout(timeout_ms: u64) {
+    let dl = if timeout_ms == 0 {
+        0
+    } else {
+        super::datetime::now_micros().saturating_add(timeout_ms as i64 * 1000)
+    };
+    DEADLINE.with(|d| d.set(dl));
+}
+
+/// Clears any armed statement deadline.
+pub fn disarm_timeout() {
+    DEADLINE.with(|d| d.set(0));
+}
+
+/// Errors 57014 if the armed statement deadline has passed. Called at scan
+/// boundaries; the clock is only read about once per 1024 calls.
+pub fn check_timeout() -> Result<(), SqlError> {
+    let dl = DEADLINE.with(|d| d.get());
+    if dl == 0 {
+        return Ok(());
+    }
+    let t = TICK.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    });
+    if !t.is_multiple_of(1024) {
+        return Ok(());
+    }
+    if super::datetime::now_micros() >= dl {
+        return Err(sql_err!("57014", "canceling statement due to statement timeout"));
+    }
+    Ok(())
+}
 const MAX_WINDOWS: usize = 16;
 /// Maximum ORDER BY / PARTITION BY keys in one window clause.
 const MAX_WIN_KEYS: usize = 8;
@@ -165,7 +211,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, txid, arena)?;
+        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         // Materialize the subquery rows, self-describing-encoded, into a
         // doubling arena vector.
         const EMPTY: &[u8] = &[];
@@ -248,7 +294,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, txid, arena)?;
+        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_ref);
         // No rows: this scope is never scanned, only described. An empty row
@@ -315,7 +361,7 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
-        let def_ref = table_func_def(tref, arena)?;
+        let def_ref = table_func_def(tref, arena, params)?;
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
@@ -648,6 +694,7 @@ fn scan_source<'a>(
                 .map_err(|_| arena_full())?;
             ordered.sort_unstable_by_key(|l| l.offset);
             for (this, &loc) in ordered.iter().enumerate() {
+                check_timeout()?;
                 bound[depth] = Some(storage.heap.get(loc));
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
@@ -1255,7 +1302,7 @@ fn subst_expr<'a>(
             operand: subst_expr(operand, ctx, arena)?,
             negated: *negated,
         },
-        Expr::Call { name, args, star, distinct, order_by, over } => {
+        Expr::Call { name, args, star, distinct, order_by, over, filter } => {
             let mut ob = [OrderBy { expr: &Expr::Null, descending: false, nulls_first: false };
                 super::parser::MAX_LIST];
             if order_by.len() > ob.len() {
@@ -1282,6 +1329,10 @@ fn subst_expr<'a>(
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
                 }
             };
+            let filter = match filter {
+                None => None,
+                Some(f) => Some(subst_expr(f, ctx, arena)?),
+            };
             Expr::Call {
                 name,
                 args: subst_expr_slice(args, ctx, arena)?,
@@ -1289,6 +1340,7 @@ fn subst_expr<'a>(
                 distinct: *distinct,
                 order_by,
                 over,
+                filter,
             }
         }
         Expr::InList { operand, list, negated } => Expr::InList {
@@ -2311,6 +2363,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Bytea | ColType::Numeric => {
             Datum::Text("")
         }
+        ColType::Range(kind) => Datum::Range { text: "empty", kind },
     }
 }
 
@@ -2441,7 +2494,10 @@ fn run_subquery<'a>(
         return Ok((&*out, v.is_null(), subquery_witness(item, Some(&scope))));
     }
 
-    // Plain scan: collect item values. Two passes (count then fill).
+    // Plain scan: collect item values (and ORDER BY keys). Two passes (count
+    // then fill), then sort and apply OFFSET/LIMIT so a subquery's own ORDER BY
+    // / LIMIT is honored (element order matters for ARRAY(...) and scalar).
+    let n_keys = select.order_by.len();
     let mut count = 0usize;
     scan_source(
         storage,
@@ -2458,11 +2514,9 @@ fn run_subquery<'a>(
             Ok(true)
         },
     )?;
-    let out = arena
-        .alloc_slice_with(count, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
+    let vals = arena.alloc_slice_with(count, |_| Datum::Null).map_err(|_| arena_full())?;
+    let keys = arena.alloc_slice_with(count * n_keys, |_| Datum::Null).map_err(|_| arena_full())?;
     let mut at = 0usize;
-    let mut saw_null = false;
     scan_source(
         storage,
         &scope,
@@ -2475,15 +2529,53 @@ fn run_subquery<'a>(
         outer,
         &mut |row| {
             let cr = Chained { inner: row, outer };
-            let v = eval_full(item, arena, params, &cr, &hooks)?;
-            if v.is_null() {
-                saw_null = true;
+            vals[at] = eval_full(item, arena, params, &cr, &hooks)?;
+            for (k, o) in select.order_by.iter().enumerate() {
+                // A positional `ORDER BY 1` sorts by the single output column.
+                let key = match o.expr {
+                    Expr::Int(_) => vals[at],
+                    e => eval_full(e, arena, params, &cr, &hooks)?,
+                };
+                keys[at * n_keys + k] = key;
             }
-            out[at] = v;
             at += 1;
             Ok(true)
         },
     )?;
+
+    // Stable insertion sort of row indices by the ORDER BY keys.
+    let order = arena.alloc_slice_with(count, |i| i).map_err(|_| arena_full())?;
+    if n_keys > 0 {
+        for x in 1..count {
+            let mut y = x;
+            while y > 0 {
+                let a = &keys[order[y - 1] * n_keys..order[y - 1] * n_keys + n_keys];
+                let b = &keys[order[y] * n_keys..order[y] * n_keys + n_keys];
+                if cmp_key_rows(a, b, select.order_by) == core::cmp::Ordering::Greater {
+                    order.swap(y - 1, y);
+                    y -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Apply OFFSET/LIMIT over the ordered rows.
+    let offset = super::exec::eval_offset_pub(select.offset, arena, params)? as usize;
+    let limit = super::exec::eval_limit_pub(select.limit, arena, params)?;
+    let start = offset.min(count);
+    let n = ((count - start) as u64).min(limit) as usize;
+    let mut saw_null = false;
+    let out = arena
+        .alloc_slice_with(n, |i| {
+            let v = vals[order[start + i]];
+            if v.is_null() {
+                saw_null = true;
+            }
+            v
+        })
+        .map_err(|_| arena_full())?;
     Ok((&*out, saw_null, subquery_witness(item, Some(&scope))))
 }
 
@@ -2733,9 +2825,15 @@ impl<'a> AggState<'a> {
         row: &impl ColumnLookup<'a>,
         hooks: &EvalHooks<'_, 'a>,
     ) -> Result<(), SqlError> {
-        let Expr::Call { args, .. } = node else {
+        let Expr::Call { args, filter, .. } = node else {
             unreachable!("validated in init");
         };
+        // `FILTER (WHERE cond)` excludes rows where the condition is not true.
+        if let Some(cond) = filter
+            && !matches!(eval_full(cond, arena, params, row, hooks)?, Datum::Bool(true))
+        {
+            return Ok(());
+        }
         if self.star {
             self.count += 1;
             return Ok(());
@@ -3318,7 +3416,7 @@ pub fn select_query<'a>(
         let where_in_scan = if correlated.is_empty() { stmt.where_clause } else { None };
         // A set-returning `_pg_expandarray(arr)` expands each row into one output
         // row per array element.
-        let srf_arg = find_expandarray_arg(stmt.items);
+        let srf_call = find_srf(stmt.items);
         let scan = scan_source(
             storage,
             &scope,
@@ -3364,13 +3462,9 @@ pub fn select_query<'a>(
                     }
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
-                let count = match srf_arg {
+                let count = match srf_call {
                     None => 1,
-                    Some(arg) => match eval_full(arg, arena, params, row, row_hooks)? {
-                        Datum::Array { raw, .. } => super::array::len(raw),
-                        Datum::Null => 0,
-                        _ => 1,
-                    },
+                    Some(c) => srf_count(c, arena, params, row, row_hooks)?,
                 };
                 for k in 1..=count {
                     if emitted >= limit {
@@ -3381,7 +3475,7 @@ pub fn select_query<'a>(
                         continue;
                     }
                     let srf_hooks;
-                    let use_hooks: &EvalHooks = if srf_arg.is_some() {
+                    let use_hooks: &EvalHooks = if srf_call.is_some() {
                         srf_hooks = EvalHooks { srf_index: Some(k), ..*row_hooks };
                         &srf_hooks
                     } else {
@@ -3413,7 +3507,7 @@ pub fn select_query<'a>(
     // A set-returning function combined with a top-level DISTINCT/ORDER BY is
     // not supported directly; wrapping it in a subquery (as JDBC does) routes it
     // through the materializer, which does expand it.
-    if find_expandarray_arg(stmt.items).is_some() {
+    if find_srf(stmt.items).is_some() {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "a set-returning function with a top-level DISTINCT/ORDER BY is not supported; \
@@ -4176,28 +4270,43 @@ pub fn constant_select<'a>(
     };
     let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
 
-    let mut values = [Datum::Null; MAX_PROJ];
-    for (i, item) in stmt.items.iter().enumerate() {
-        let SelectItem::Expr { expr, .. } = item else {
-            unreachable!("wildcard rejected by describe_items");
-        };
-        match eval_full(expr, arena, params, &super::eval::NoColumns, &hooks) {
-            Ok(v) => values[i] = v,
+    // A set-returning function in the select list expands the single virtual
+    // row into one output row per element/value.
+    let srf_call = find_srf(stmt.items);
+    let count = match srf_call {
+        None => 1,
+        Some(c) => match srf_count(c, arena, params, &super::eval::NoColumns, &hooks) {
+            Ok(n) => n,
             Err(e) => return sql_fail(e),
-        }
-    }
-    let mut emit_row = true;
-    if let Some(w) = stmt.where_clause {
-        match where_passes(w, arena, params, &super::eval::NoColumns, &hooks) {
-            Ok(pass) => emit_row = pass,
-            Err(e) => return sql_fail(e),
-        }
-    }
+        },
+    };
     resp.row_description(&cols[..n])?;
     let mut rows = 0u64;
-    if emit_row {
+    for k in 1..=count {
+        let khooks = if srf_call.is_some() {
+            EvalHooks { srf_index: Some(k), ..hooks }
+        } else {
+            hooks
+        };
+        let mut values = [Datum::Null; MAX_PROJ];
+        for (i, item) in stmt.items.iter().enumerate() {
+            let SelectItem::Expr { expr, .. } = item else {
+                unreachable!("wildcard rejected by describe_items");
+            };
+            match eval_full(expr, arena, params, &super::eval::NoColumns, &khooks) {
+                Ok(v) => values[i] = v,
+                Err(e) => return sql_fail(e),
+            }
+        }
+        if let Some(w) = stmt.where_clause {
+            match where_passes(w, arena, params, &super::eval::NoColumns, &khooks) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) => return sql_fail(e),
+            }
+        }
         resp.data_row(&values[..n])?;
-        rows = 1;
+        rows += 1;
     }
     let tag = stack_format!(32, "SELECT {}", rows);
     resp.command_complete(tag.as_str())?;
@@ -4293,24 +4402,38 @@ pub fn select_into_rows<'a>(
     }
 
     let Some(from) = &stmt.from else {
-        // FROM-less: one row (or zero, when WHERE is false).
+        // FROM-less: one row (or zero, when WHERE is false), unless a
+        // set-returning function in the list expands it to several.
         let subs =
             prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
         let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
-        if let Some(w) = stmt.where_clause
-            && !where_passes(w, arena, params, &super::eval::NoColumns, &hooks)? {
-                return Ok(());
-            }
-        let mut vals = [Datum::Null; MAX_PROJ];
-        let mut n = 0;
-        for item in stmt.items {
-            let SelectItem::Expr { expr, .. } = item else {
-                return Err(sql_err!("42601", "SELECT * with no tables specified is not valid"));
+        let srf_call = find_srf(stmt.items);
+        let count = match srf_call {
+            None => 1,
+            Some(c) => srf_count(c, arena, params, &super::eval::NoColumns, &hooks)?,
+        };
+        for k in 1..=count {
+            let khooks = if srf_call.is_some() {
+                EvalHooks { srf_index: Some(k), ..hooks }
+            } else {
+                hooks
             };
-            vals[n] = eval_full(expr, arena, params, &super::eval::NoColumns, &hooks)?;
-            n += 1;
+            if let Some(w) = stmt.where_clause
+                && !where_passes(w, arena, params, &super::eval::NoColumns, &khooks)?
+            {
+                continue;
+            }
+            let mut vals = [Datum::Null; MAX_PROJ];
+            let mut n = 0;
+            for item in stmt.items {
+                let SelectItem::Expr { expr, .. } = item else {
+                    return Err(sql_err!("42601", "SELECT * with no tables specified is not valid"));
+                };
+                vals[n] = eval_full(expr, arena, params, &super::eval::NoColumns, &khooks)?;
+                n += 1;
+            }
+            emit(&vals[..n])?;
         }
-        emit(&vals[..n])?;
         return Ok(());
     };
 
@@ -4364,7 +4487,7 @@ pub fn select_into_rows<'a>(
 
     // A set-returning `_pg_expandarray(arr)` in the projection expands each
     // source row into one output row per array element.
-    let srf_arg = find_expandarray_arg(stmt.items);
+    let srf_call = find_srf(stmt.items);
     scan_source(
         storage, &scope, from, txid, where_in_scan, arena, params, &hooks, None,
         &mut |row| {
@@ -4388,17 +4511,13 @@ pub fn select_into_rows<'a>(
                 &row_hooks_owned
             };
             let mut projected = [Datum::Null; MAX_PROJ];
-            match srf_arg {
+            match srf_call {
                 None => {
                     let n = project_row(stmt.items, &scope, row, arena, params, row_hooks, &mut projected)?;
                     emit(&projected[..n])?;
                 }
-                Some(arg) => {
-                    let count = match eval_full(arg, arena, params, row, row_hooks)? {
-                        Datum::Array { raw, .. } => super::array::len(raw),
-                        Datum::Null => 0,
-                        _ => 1,
-                    };
+                Some(c) => {
+                    let count = srf_count(c, arena, params, row, row_hooks)?;
                     for k in 1..=count {
                         let srf_hooks = EvalHooks { srf_index: Some(k), ..*row_hooks };
                         let n = project_row(stmt.items, &scope, row, arena, params, &srf_hooks, &mut projected)?;
@@ -4411,16 +4530,22 @@ pub fn select_into_rows<'a>(
     )
 }
 
-/// The single argument of the first `_pg_expandarray(arr)` call in the select
-/// list, if any — the source array whose length drives row expansion.
-fn find_expandarray_arg<'a>(items: &[SelectItem<'a>]) -> Option<&'a Expr<'a>> {
+/// Whether `name` is one of the supported set-returning functions.
+fn is_srf_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("_pg_expandarray")
+        || name.eq_ignore_ascii_case("unnest")
+        || name.eq_ignore_ascii_case("generate_series")
+}
+
+/// Finds a set-returning function call among the SELECT items (the whole call
+/// node, so the caller can compute its row count), or None for a single row.
+fn find_srf<'a>(items: &[SelectItem<'a>]) -> Option<&'a Expr<'a>> {
     fn walk<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
         match e {
-            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
-                args.first().copied()
-            }
+            Expr::Call { name, .. } if is_srf_name(name) => Some(e),
             Expr::Field { base, .. } => walk(base),
             Expr::Cast { operand, .. } => walk(operand),
+            Expr::Unary { operand, .. } => walk(operand),
             Expr::Binary { left, right, .. } => walk(left).or_else(|| walk(right)),
             Expr::Call { args, .. } => args.iter().find_map(|a| walk(a)),
             _ => None,
@@ -4430,6 +4555,65 @@ fn find_expandarray_arg<'a>(items: &[SelectItem<'a>]) -> Option<&'a Expr<'a>> {
         SelectItem::Expr { expr, .. } => walk(expr),
         SelectItem::Wildcard => None,
     })
+}
+
+/// Number of output rows a set-returning call yields for the current source row.
+fn srf_count<'a, R: ColumnLookup<'a>>(
+    call: &'a Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<usize, SqlError> {
+    let Expr::Call { name, args, .. } = call else {
+        return Ok(1);
+    };
+    let as_i64 = |d: &Datum| -> Option<i64> {
+        match d {
+            Datum::Int4(v) => Some(*v as i64),
+            Datum::Int8(v) => Some(*v),
+            _ => None,
+        }
+    };
+    if name.eq_ignore_ascii_case("generate_series") {
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!("42883", "generate_series(...) argument count"));
+        }
+        let start = eval_full(args[0], arena, params, row, hooks)?;
+        let stop = eval_full(args[1], arena, params, row, hooks)?;
+        let step = if args.len() == 3 {
+            eval_full(args[2], arena, params, row, hooks)?
+        } else {
+            Datum::Int4(1)
+        };
+        if start.is_null() || stop.is_null() || step.is_null() {
+            return Ok(0);
+        }
+        let (Some(s), Some(e), Some(st)) = (as_i64(&start), as_i64(&stop), as_i64(&step)) else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "generate_series is supported for integer arguments"
+            ));
+        };
+        if st == 0 {
+            return Err(sql_err!("22023", "step size cannot equal zero"));
+        }
+        let n = if st > 0 {
+            if e < s { 0 } else { (e - s) / st + 1 }
+        } else if e > s {
+            0
+        } else {
+            (s - e) / (-st) + 1
+        };
+        Ok(n as usize)
+    } else {
+        // unnest / _pg_expandarray over an array.
+        match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Array { raw, .. } => Ok(super::array::len(raw)),
+            Datum::Null => Ok(0),
+            _ => Ok(1),
+        }
+    }
 }
 
 /// Projects one source row through the select items.
@@ -5194,6 +5378,7 @@ fn synth_derived_def<'a>(
     storage: &'a Storage,
     sub: &'a Select<'a>,
     exposed: &'a str,
+    col_alias: Option<&'a [&'a str]>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a TableDef, SqlError> {
@@ -5214,6 +5399,22 @@ fn synth_derived_def<'a>(
             "derived table \"{}\" has too many columns",
             exposed
         ));
+    }
+    // A column-alias list renames the output columns; PostgreSQL requires it to
+    // supply no more names than the derived table has columns.
+    if let Some(aliases) = col_alias {
+        if aliases.len() > n_cols {
+            return Err(sql_err!(
+                "42P10",
+                "table \"{}\" has {} columns available but {} columns specified",
+                exposed,
+                n_cols,
+                aliases.len()
+            ));
+        }
+        for (i, alias) in aliases.iter().enumerate() {
+            descs[i].name = alias;
+        }
     }
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
@@ -5253,17 +5454,34 @@ fn synth_derived_def<'a>(
 /// Synthesizes the single-column `TableDef` for a supported table function
 /// (`FROM func(args) alias`). The output column is named after the alias (or the
 /// function name), so a bare reference to the alias resolves to the value.
-fn table_func_def<'a>(tref: &'a TableRef<'a>, arena: &'a Arena) -> Result<&'a TableDef, SqlError> {
-    if !tref.table.eq_ignore_ascii_case("generate_series") {
+fn table_func_def<'a>(
+    tref: &'a TableRef<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<&'a TableDef, SqlError> {
+    let is_gs = tref.table.eq_ignore_ascii_case("generate_series");
+    let is_unnest = tref.table.eq_ignore_ascii_case("unnest");
+    if !is_gs && !is_unnest {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
             tref.table
         ));
     }
-    let name = tref.alias.unwrap_or("generate_series");
+    let name = tref.alias.unwrap_or(if is_gs { "generate_series" } else { "unnest" });
+    // A table function has a single output column, so at most one alias.
+    if let Some(aliases) = tref.col_alias
+        && aliases.len() > 1
+    {
+        return Err(sql_err!(
+            "42P10",
+            "table \"{}\" has 1 columns available but {} columns specified",
+            name,
+            aliases.len()
+        ));
+    }
     // The column takes the explicit column-alias if given, else the table name.
-    let col_name = tref.col_alias.unwrap_or(name);
+    let col_name = tref.col_alias.and_then(|a| a.first().copied()).unwrap_or(name);
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
@@ -5274,8 +5492,21 @@ fn table_func_def<'a>(tref: &'a TableRef<'a>, arena: &'a Arena) -> Result<&'a Ta
         auto_increment: false,
         default_value: None,
     };
+    // generate_series yields int8; unnest yields the array's element type.
+    let ctype = if is_gs {
+        ColType::Int8
+    } else {
+        let args = tref.func_args.unwrap_or(&[]);
+        match args.first() {
+            Some(e) => match super::eval::eval(e, arena, params, &super::eval::NoColumns)? {
+                Datum::Array { elem, .. } => elem.to_coltype(),
+                _ => ColType::Text,
+            },
+            None => ColType::Text,
+        }
+    };
     let mut columns = [blank; MAX_COLUMNS];
-    columns[0] = ColumnMeta { name: SqlName::parse(col_name)?, ctype: ColType::Int8, ..blank };
+    columns[0] = ColumnMeta { name: SqlName::parse(col_name)?, ctype, ..blank };
     let def = TableDef {
         name: SqlName::parse(name)?,
         columns,
@@ -5295,6 +5526,22 @@ fn table_func_rows<'a>(
     params: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
+    // unnest(array): one row per element.
+    if tref.table.eq_ignore_ascii_case("unnest") {
+        let (elem, raw) = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Array { elem, raw } => (elem, raw),
+            Datum::Null => return Ok(&[]),
+            _ => return Err(sql_err!("42883", "unnest requires an array argument")),
+        };
+        let count = super::array::len(raw);
+        const EMPTY: &[u8] = &[];
+        let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
+        for (i, slot) in rows.iter_mut().enumerate() {
+            let v = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+            *slot = super::exec::encode_projected_pub(&[v], arena)?;
+        }
+        return Ok(&*rows);
+    }
     if args.len() != 2 && args.len() != 3 {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,

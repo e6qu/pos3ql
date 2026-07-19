@@ -130,9 +130,10 @@ pub struct TableRef<'a> {
     /// Table function: `FROM func(args) alias`. When set, `table` is the
     /// function name and these are its argument expressions.
     pub func_args: Option<&'a [&'a Expr<'a>]>,
-    /// Column-alias for a table function (`func(args) alias(col)`): renames its
-    /// single output column.
-    pub col_alias: Option<&'a str>,
+    /// Column-alias list (`alias(c1, c2, ...)`): renames the output columns of a
+    /// derived table or a table function. A table function has a single output
+    /// column, so it accepts exactly one name.
+    pub col_alias: Option<&'a [&'a str]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -356,6 +357,9 @@ pub enum Expr<'a> {
         order_by: &'a [OrderBy<'a>],
         /// `OVER (...)` window clause, when the call is a window function.
         over: Option<&'a WindowSpec<'a>>,
+        /// `FILTER (WHERE cond)` on an aggregate: rows where `cond` is not true
+        /// are excluded from that aggregate.
+        filter: Option<&'a Expr<'a>>,
     },
     /// `expr [NOT] IN (list)`.
     InList {
@@ -438,6 +442,13 @@ impl Expr<'_> {
     /// aggregate reference. PostgreSQL evaluates these at plan time, so
     /// their errors (division by zero, overflow) surface eagerly.
     pub fn is_constant(&self) -> bool {
+        /// Set-returning functions expand to multiple rows and are never a
+        /// foldable constant.
+        fn is_set_returning(name: &str) -> bool {
+            name.eq_ignore_ascii_case("unnest")
+                || name.eq_ignore_ascii_case("generate_series")
+                || name.eq_ignore_ascii_case("_pg_expandarray")
+        }
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
             | Expr::NumericLit(_) | Expr::Str(_) => true,
@@ -462,10 +473,13 @@ impl Expr<'_> {
                     && whens.iter().all(|(c, r)| c.is_constant() && r.is_constant())
                     && otherwise.map(|e| e.is_constant()).unwrap_or(true)
             }
-            // Aggregates and window functions are never constant; other calls
-            // are constant when their arguments are (pure scalar functions).
-            Expr::Call { args, over, .. } => {
-                over.is_none() && !self.is_aggregate() && args.iter().all(|a| a.is_constant())
+            // Aggregates, window functions, and set-returning functions are
+            // never constant; other calls are constant when their arguments are.
+            Expr::Call { name, args, over, .. } => {
+                over.is_none()
+                    && !self.is_aggregate()
+                    && !is_set_returning(name)
+                    && args.iter().all(|a| a.is_constant())
             }
             Expr::Array(items) => items.iter().all(|e| e.is_constant()),
             Expr::Subscript { base, index } => base.is_constant() && index.is_constant(),
@@ -511,6 +525,16 @@ pub enum BinaryOp {
     Shr,
     /// `^` exponentiation (double precision).
     Pow,
+    /// `@>` contains, `<@` contained by, `&&` overlaps (ranges).
+    Contains,
+    ContainedBy,
+    Overlaps,
+    /// `&<` does not extend right, `&>` does not extend left, `-|-` adjacent
+    /// (ranges). `<<`/`>>` reuse `Shl`/`Shr`; `+`/`-`/`*` reuse the arithmetic
+    /// operators (dispatched on range operands).
+    NotRightOf,
+    NotLeftOf,
+    Adjacent,
 }
 
 impl BinaryOp {
@@ -521,6 +545,9 @@ impl BinaryOp {
             Self::Or => 1,
             Self::And => 2,
             Self::Eq | Self::NotEq | Self::Lt | Self::LtEq | Self::Gt | Self::GtEq => 4,
+            // Containment/overlap/adjacency operators bind like comparisons.
+            Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
+            Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
             Self::Concat => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,
             // matching PostgreSQL (they are non-standard, mid-precedence).

@@ -2374,6 +2374,12 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         1021 | 1022 => ColType::Array(super::types::ArrElem::Float8),
         1009 | 1015 | 1002 | 1014 => ColType::Array(super::types::ArrElem::Text),
         1231 => ColType::Array(super::types::ArrElem::Numeric),
+        3904 => ColType::Range(super::types::RangeKind::Int4),
+        3926 => ColType::Range(super::types::RangeKind::Int8),
+        3906 => ColType::Range(super::types::RangeKind::Num),
+        3912 => ColType::Range(super::types::RangeKind::Date),
+        3908 => ColType::Range(super::types::RangeKind::Ts),
+        3910 => ColType::Range(super::types::RangeKind::Tstz),
         _ => return None,
     })
 }
@@ -2463,6 +2469,11 @@ impl ColTypeResolver for DefCols<'_> {
 
 /// Whether two concrete types have a comparison operator, per PostgreSQL:
 /// same type, both numeric-tower, or both in the date/time family.
+/// Whether an OID names a range type (so range operators apply).
+fn is_range_oid(oid: i32) -> bool {
+    matches!(coltype_of_oid(oid), Some(ColType::Range(_)))
+}
+
 fn comparable(a: ColType, b: ColType) -> bool {
     use ColType::*;
     if a == b {
@@ -2528,6 +2539,15 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     of(ColType::Bool)
                 }
                 And | Or => of(ColType::Bool),
+                Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
+                    of(ColType::Bool)
+                }
+                // Range set operators (`+`/`-`/`*` on ranges) return a range of
+                // the same type; shifts on ranges (`<<`/`>>`) return boolean.
+                Add | Sub | Mul if is_range_oid(lo) || is_range_oid(ro) => {
+                    (if is_range_oid(lo) { lo } else { ro }, -1)
+                }
+                Shl | Shr if is_range_oid(lo) || is_range_oid(ro) => of(ColType::Bool),
                 // `||` concatenates arrays when either side is an array (the
                 // array type is preserved), otherwise it is text concatenation.
                 Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => {
@@ -2598,6 +2618,13 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                         if matches!(op, Add) && lo == oid::INTERVAL && is_dt(ro) {
                             return Ok(of(if ro == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
                         }
+                    }
+                    // interval * number / number * interval / interval / number.
+                    if (matches!(op, Mul) && lo == oid::INTERVAL && numeric(ro))
+                        || (matches!(op, Mul) && numeric(lo) && ro == oid::INTERVAL)
+                        || (matches!(op, Div) && lo == oid::INTERVAL && numeric(ro))
+                    {
+                        return Ok(of(ColType::Interval));
                     }
                     let l_ok = lo == oid::UNKNOWN || numeric(lo);
                     let r_ok = ro == oid::UNKNOWN || numeric(ro);
@@ -2844,9 +2871,47 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             // arithmetic (e.g. `current_date - 1`) type-checks correctly.
             "to_date" => of(ColType::Date),
             "to_timestamp" => of(ColType::Timestamptz),
+            "generate_series" => {
+                let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                if a == Some(oid::INT8) { of(ColType::Int8) } else { of(ColType::Int4) }
+            }
+            "unnest" => {
+                // The element type of the array argument.
+                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                    Some(o) => match coltype_of_oid(o) {
+                        Some(ColType::Array(elem)) => of(elem.to_coltype()),
+                        _ => of(ColType::Text),
+                    },
+                    None => of(ColType::Text),
+                }
+            }
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),
+            "age" | "justify_hours" | "justify_days" | "justify_interval" => {
+                of(ColType::Interval)
+            }
+            "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
+                of(ColType::Range(super::types::RangeKind::from_name(name).expect("range name")))
+            }
+            "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => of(ColType::Bool),
+            "range_merge" => {
+                // Same range type as its arguments.
+                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                    Some(o) if is_range_oid(o) => (o, -1),
+                    _ => (oid::TEXT, -1),
+                }
+            }
+            "lower" | "upper" => {
+                // A range argument yields its element type; otherwise text.
+                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                    Some(o) => match coltype_of_oid(o) {
+                        Some(ColType::Range(kind)) => of(kind.elem_type()),
+                        _ => (oid::TEXT, -1),
+                    },
+                    None => (oid::TEXT, -1),
+                }
+            }
             "current_date" => of(ColType::Date),
             "current_time" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),
@@ -2967,6 +3032,8 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
             Datum::Bytea(b) => 4 + b.len(),
             // sign(1) weight(2) dscale(2) ndigits(2) + packed digits
             Datum::Numeric(nm) => 7 + nm.digits.len(),
+            // kind(1) + len(4) + text
+            Datum::Range { text, .. } => 5 + text.len(),
         };
     }
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
@@ -3074,6 +3141,13 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
                 out[at + 8..at + 8 + nm.digits.len()].copy_from_slice(nm.digits);
                 at += 8 + nm.digits.len();
             }
+            Datum::Range { text, kind } => {
+                out[at] = 16;
+                out[at + 1] = kind.code();
+                out[at + 2..at + 6].copy_from_slice(&(text.len() as u32).to_le_bytes());
+                out[at + 6..at + 6 + text.len()].copy_from_slice(text.as_bytes());
+                at += 6 + text.len();
+            }
         }
     }
     Ok(&*out)
@@ -3148,6 +3222,12 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
                 let elem = crate::sql::types::ArrElem::from_code(bytes[at]).unwrap_or(crate::sql::types::ArrElem::Int4);
                 let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
                 (Datum::Array { elem, raw: &bytes[at + 5..at + 5 + len] }, 5 + len)
+            }
+            16 => {
+                let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
+                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+                let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+                (Datum::Range { text: s, kind }, 5 + len)
             }
             9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
             10 => {

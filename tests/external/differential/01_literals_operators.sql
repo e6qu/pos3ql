@@ -12,3 +12,14 @@ SELECT 'hello' LIKE 'h%', 'hello' LIKE '_e_lo', 'HELLO' ILIKE 'he%', 'x' NOT LIK
 SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END;
 SELECT CASE 3 WHEN 1 THEN 'one' WHEN 3 THEN 'three' END;
 SELECT CASE 3 WHEN 9 THEN 'nine' END;
+-- array concatenation and its operator resolution
+SELECT ARRAY[1,2] || 3, ARRAY[1,2] || ARRAY[3,4], 0 || ARRAY[1,2];
+SELECT ARRAY['a','b'] || 'c'::text, ARRAY['a','b'] || '{c,d}';
+SELECT ARRAY[1,2] || '{3,4}';
+-- an unknown literal is cast to the array type (parsed as an array literal)
+SELECT ARRAY['a','b'] || 'c';
+SELECT ARRAY[1,2] || '3';
+-- NULL resolution depends on the NULL operand's static type
+SELECT ARRAY['a'] || NULL, NULL || ARRAY['a'];
+SELECT ARRAY[1] || NULL::int, ARRAY[1] || NULL::int[];
+SELECT ARRAY[1] || NULL::text;

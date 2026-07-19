@@ -17,3 +17,17 @@ SELECT name FROM dept3 WHERE id NOT IN (SELECT did FROM emp3) ORDER BY name;
 SELECT name FROM dept3 WHERE id NOT IN (SELECT did FROM emp3 WHERE did IS NOT NULL) ORDER BY name;
 DROP TABLE emp3;
 DROP TABLE dept3;
+-- derived tables and table functions with column-alias lists
+SELECT id, name FROM (VALUES (1,'a'),(2,'b')) AS v(id,name) ORDER BY id;
+SELECT id FROM (VALUES (1),(2),(3)) AS v(id) WHERE id > 1 ORDER BY id;
+SELECT a + b AS s FROM (SELECT 10, 20) AS v(a, b);
+SELECT y FROM (SELECT 1 AS x) AS v(y);
+SELECT sum(n) FROM (VALUES (10),(20),(30)) AS t(n);
+SELECT x FROM generate_series(1, 3) AS g(x) ORDER BY x;
+SELECT * FROM (VALUES (1, 2)) AS v(a, b, c);
+SELECT * FROM generate_series(1, 3) AS g(x, y);
+-- aggregate FILTER (WHERE ...)
+SELECT count(*) FILTER (WHERE x > 1), sum(x) FILTER (WHERE x < 3) FROM generate_series(1,3) AS g(x);
+SELECT sum(x), sum(x) FILTER (WHERE x % 2 = 0) FROM generate_series(1,5) AS g(x);
+SELECT count(*), count(*) FILTER (WHERE false) FROM generate_series(1,3) AS g(x);
+SELECT string_agg(x::text, ',') FILTER (WHERE x <> 2) FROM generate_series(1,3) AS g(x);

@@ -195,7 +195,8 @@ def table_names(sql):
     return names
 
 
-def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist):
+def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist,
+                 qshard=0, qshards=1):
     stats = {"match": 0, "unsupported": 0, "divergence": 0, "blocks": 0}
     blocks = list(parse(path))
 
@@ -210,9 +211,19 @@ def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist):
             except psycopg.Error:
                 pass
 
+    # Query-block sharding, to balance the read-only bulk across parallel CI
+    # jobs while every shard runs all the (cheap, state-building) statement
+    # blocks: a query is executed only when its per-file index selects this
+    # shard. Statements — which the queries depend on — always run.
+    qcount = 0
     for b in blocks:
         if limit and stats["blocks"] >= limit:
             break
+        if b.kind == "query" and qshards > 1:
+            take = (qcount % qshards) == qshard
+            qcount += 1
+            if not take:
+                continue
         stats["blocks"] += 1
         pg_res = run_one(pg, b.sql)
         p3_res = run_one(p3, b.sql)
@@ -288,8 +299,14 @@ def main():
     ap.add_argument("--max-print", type=int, default=25)
     ap.add_argument("--stmt-timeout-ms", type=int, default=60000,
                     help="per-statement timeout; 0 disables")
+    ap.add_argument("--query-shards", type=int, default=1,
+                    help="split each file's query blocks across this many shards")
+    ap.add_argument("--query-shard", type=int, default=0,
+                    help="0-based index of the query shard this run replays")
     ap.add_argument("files", nargs="+")
     args = ap.parse_args()
+    if not 0 <= args.query_shard < args.query_shards:
+        ap.error("--query-shard must be in [0, --query-shards)")
 
     pg_conn = psycopg.connect(host=args.host, port=args.pg, user="postgres",
                               autocommit=True, sslmode="disable")
@@ -316,7 +333,8 @@ def main():
     divergences = []
     unsupp_hist = {}
     for path in args.files:
-        s = process_file(path, pg, p3, args.limit, divergences, args.max_print, unsupp_hist)
+        s = process_file(path, pg, p3, args.limit, divergences, args.max_print,
+                         unsupp_hist, args.query_shard, args.query_shards)
         for k in total:
             total[k] += s[k]
         print(f"  {path}: {s['blocks']} blocks  "

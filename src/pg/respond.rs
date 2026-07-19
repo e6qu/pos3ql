@@ -397,6 +397,12 @@ impl<'b> Responder<'b> {
                     }
                     m.bytes(text.as_bytes());
                 }
+                Datum::Range { text, .. } => {
+                    // The binary range wire format is elaborate; send the
+                    // canonical text (correct for the common text-format path).
+                    m.i32(text.len() as i32);
+                    m.bytes(text.as_bytes());
+                }
                 Datum::Float8(x) => {
                     m.i32(8);
                     m.bytes(&x.to_bits().to_be_bytes());

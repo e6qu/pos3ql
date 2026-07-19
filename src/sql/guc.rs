@@ -108,6 +108,9 @@ pub struct GucState {
     client_min_messages: MsgLevel,
     extra_float_digits: StackStr<8>,
     lock_timeout: StackStr<24>,
+    /// statement_timeout in milliseconds (0 = disabled), enforced at scan
+    /// boundaries during execution.
+    statement_timeout: StackStr<24>,
     row_security: StackStr<4>,
 }
 
@@ -129,6 +132,7 @@ impl GucState {
             client_min_messages: MsgLevel::Notice,
             extra_float_digits: StackStr::new(),
             lock_timeout: StackStr::new(),
+            statement_timeout: StackStr::new(),
             row_security: StackStr::new(),
         };
         let _ = write!(g.datestyle, "ISO, MDY");
@@ -137,8 +141,14 @@ impl GucState {
         let _ = write!(g.search_path, "\"$user\", public");
         let _ = write!(g.extra_float_digits, "1");
         let _ = write!(g.lock_timeout, "0");
+        let _ = write!(g.statement_timeout, "0");
         let _ = write!(g.row_security, "on");
         g
+    }
+
+    /// The current statement_timeout in milliseconds (0 = disabled).
+    pub fn statement_timeout_ms(&self) -> u64 {
+        parse_timeout_ms(self.statement_timeout.as_str()).unwrap_or(0)
     }
 
     /// Applies `SET name = raw`. `raw` is the raw source text of the value
@@ -259,9 +269,23 @@ impl GucState {
             // any value is trivially satisfied.
             return store(&mut self.lock_timeout, if is_default { "0" } else { v });
         }
-        if name.eq_ignore_ascii_case("statement_timeout")
-            || name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
-        {
+        if name.eq_ignore_ascii_case("statement_timeout") {
+            // Enforced at scan boundaries during execution.
+            if is_default {
+                return store(&mut self.statement_timeout, "0");
+            }
+            if parse_timeout_ms(v).is_none() {
+                return Err(sql_err!(
+                    "22023",
+                    "invalid value for parameter \"statement_timeout\": \"{}\"",
+                    v
+                ));
+            }
+            return store(&mut self.statement_timeout, v);
+        }
+        if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
+            // No idle-in-transaction reaper yet, so only the disabled value is
+            // honored; a non-zero value would be a silent no-op.
             if is_default || v == "0" {
                 return Ok(());
             }
@@ -327,9 +351,9 @@ impl GucState {
             Some(self.lock_timeout.as_str())
         } else if name.eq_ignore_ascii_case("row_security") {
             Some(self.row_security.as_str())
-        } else if name.eq_ignore_ascii_case("statement_timeout")
-            || name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
-        {
+        } else if name.eq_ignore_ascii_case("statement_timeout") {
+            Some(self.statement_timeout.as_str())
+        } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
             Some("0")
         } else if name.eq_ignore_ascii_case("bytea_output") {
             Some("hex")
@@ -359,6 +383,27 @@ fn parse_on_off(v: &str) -> Option<bool> {
     } else {
         None
     }
+}
+
+/// Parses a `statement_timeout` value into milliseconds: a bare integer is
+/// milliseconds, or a `ms`/`s`/`min`/`h`/`d` unit suffix scales it (matching
+/// PostgreSQL). Returns None for a malformed value.
+fn parse_timeout_ms(v: &str) -> Option<u64> {
+    let t = v.trim().trim_matches('\'').trim();
+    let (num_part, mult) = if let Some(n) = t.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = t.strip_suffix("min") {
+        (n, 60_000)
+    } else if let Some(n) = t.strip_suffix('s') {
+        (n, 1000)
+    } else if let Some(n) = t.strip_suffix('h') {
+        (n, 3_600_000)
+    } else if let Some(n) = t.strip_suffix('d') {
+        (n, 86_400_000)
+    } else {
+        (t, 1)
+    };
+    num_part.trim().parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
 }
 
 fn store<const N: usize>(dst: &mut StackStr<N>, v: &str) -> Result<(), SqlError> {

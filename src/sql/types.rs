@@ -68,6 +68,8 @@ pub enum ColType {
     Uuid,
     Bytea,
     Numeric,
+    /// A range type (int4range/numrange/…), stored as canonical text.
+    Range(RangeKind),
 }
 
 impl ColType {
@@ -76,6 +78,9 @@ impl ColType {
         // `elem[]` is a one-dimensional array of a scalar element type.
         if let Some(base) = name.strip_suffix("[]") {
             return ArrElem::from_coltype(ColType::from_sql_name(base)?).map(ColType::Array);
+        }
+        if let Some(k) = RangeKind::from_name(name) {
+            return Some(Self::Range(k));
         }
         Some(match name {
             "bool" | "boolean" => Self::Bool,
@@ -129,6 +134,7 @@ impl ColType {
             Self::Uuid => oid::UUID,
             Self::Bytea => oid::BYTEA,
             Self::Numeric => oid::NUMERIC,
+            Self::Range(k) => k.oid(),
         }
     }
 
@@ -140,7 +146,7 @@ impl ColType {
             Self::Interval => 16,
             Self::Uuid => 16,
             Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
-            Self::Array(_) => -1,
+            Self::Array(_) | Self::Range(_) => -1,
         }
     }
 
@@ -178,6 +184,7 @@ impl ColType {
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
             Self::Numeric => "numeric",
+            Self::Range(k) => k.name(),
         }
     }
 
@@ -203,6 +210,7 @@ impl ColType {
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
             Self::Numeric => "numeric",
+            Self::Range(k) => k.name(),
         }
     }
 }
@@ -323,6 +331,88 @@ pub struct Interval {
     pub micros: i64,
 }
 
+/// The six built-in range types. Discrete kinds (int4/int8/date) canonicalize
+/// to `[lower, upper)`; continuous kinds (num/ts/tstz) keep their bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeKind {
+    Int4,
+    Int8,
+    Num,
+    Date,
+    Ts,
+    Tstz,
+}
+
+impl RangeKind {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "int4range" => Self::Int4,
+            "int8range" => Self::Int8,
+            "numrange" => Self::Num,
+            "daterange" => Self::Date,
+            "tsrange" => Self::Ts,
+            "tstzrange" => Self::Tstz,
+            _ => return None,
+        })
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int4 => "int4range",
+            Self::Int8 => "int8range",
+            Self::Num => "numrange",
+            Self::Date => "daterange",
+            Self::Ts => "tsrange",
+            Self::Tstz => "tstzrange",
+        }
+    }
+    pub fn oid(self) -> i32 {
+        match self {
+            Self::Int4 => 3904,
+            Self::Num => 3906,
+            Self::Ts => 3908,
+            Self::Tstz => 3910,
+            Self::Date => 3912,
+            Self::Int8 => 3926,
+        }
+    }
+    /// The element (subtype) column type.
+    pub fn elem_type(self) -> ColType {
+        match self {
+            Self::Int4 => ColType::Int4,
+            Self::Int8 => ColType::Int8,
+            Self::Num => ColType::Numeric,
+            Self::Date => ColType::Date,
+            Self::Ts => ColType::Timestamp,
+            Self::Tstz => ColType::Timestamptz,
+        }
+    }
+    /// Discrete ranges canonicalize to a half-open `[lower, upper)` form.
+    pub fn is_discrete(self) -> bool {
+        matches!(self, Self::Int4 | Self::Int8 | Self::Date)
+    }
+    /// A stable byte code for schema-less encodings.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Int4 => 0,
+            Self::Int8 => 1,
+            Self::Num => 2,
+            Self::Date => 3,
+            Self::Ts => 4,
+            Self::Tstz => 5,
+        }
+    }
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            1 => Self::Int8,
+            2 => Self::Num,
+            3 => Self::Date,
+            4 => Self::Ts,
+            5 => Self::Tstz,
+            _ => Self::Int4,
+        }
+    }
+}
+
 /// A runtime value. Text borrows from the statement arena or storage.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Datum<'a> {
@@ -351,6 +441,8 @@ pub enum Datum<'a> {
     Uuid([u8; 16]),
     Bytea(&'a [u8]),
     Numeric(Numeric<'a>),
+    /// A range value in its canonical text form (e.g. `[1,5)`, `empty`).
+    Range { text: &'a str, kind: RangeKind },
 }
 
 impl<'a> Datum<'a> {
@@ -377,6 +469,7 @@ impl<'a> Datum<'a> {
             Datum::Uuid(_) => oid::UUID,
             Datum::Bytea(_) => oid::BYTEA,
             Datum::Numeric(_) => oid::NUMERIC,
+            Datum::Range { kind, .. } => kind.oid(),
         }
     }
 }
@@ -411,6 +504,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Time(t) => f.write_str(super::datetime::format_time(*t).as_str()),
             Datum::Interval(iv) => f.write_str(super::datetime::format_interval(*iv).as_str()),
             Datum::Json { text, .. } => f.write_str(text),
+            Datum::Range { text, .. } => f.write_str(text),
             Datum::Array { elem, raw } => super::array::write(f, *elem, raw),
             Datum::Uuid(b) => {
                 for (i, byte) in b.iter().enumerate() {

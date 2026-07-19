@@ -360,6 +360,14 @@ pub fn eval_full<'a>(
         Expr::Binary { op, left, right } => {
             let l = eval_full(left, arena, params, row, hooks)?;
             let r = eval_full(right, arena, params, row, hooks)?;
+            // `array || NULL` resolution depends on the NULL operand's static
+            // type, which the datum has lost — resolve it here where the
+            // expression is still available.
+            if op == BinaryOp::Concat
+                && let Some(d) = array_null_concat(l, r, left, right, row, arena)?
+            {
+                return Ok(d);
+            }
             // Track which side is an "unknown" literal (a string literal or a
             // parameter): only those coerce to the other operand's type, as
             // PostgreSQL does. A real text value never coerces to a number.
@@ -969,6 +977,50 @@ fn call<'a>(
         | "pg_relation_is_publishable" => {
             Ok(Datum::Bool(true))
         }
+        // Set-returning functions: during expansion `hooks.srf_index` (1-based)
+        // selects which element/value this output row carries.
+        "unnest" => {
+            arity(1)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let (elem, raw) = match a {
+                Datum::Array { elem, raw } => (elem, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("unnest requires an array", &a)),
+            };
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            Ok(super::array::get(raw, elem, k - 1).unwrap_or(Datum::Null))
+        }
+        "generate_series" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?
+                as i64;
+            let start = eval_full(args[0], arena, params, row, hooks)?;
+            let step = if args.len() == 3 {
+                eval_full(args[2], arena, params, row, hooks)?
+            } else {
+                Datum::Int4(1)
+            };
+            let (Some(s), Some(st)) = (as_i64(&start), as_i64(&step)) else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "generate_series is supported for integer arguments"
+                ));
+            };
+            let v = s + (k - 1) * st;
+            // int4 unless an argument is int8 or the value overflows int4.
+            let wide = matches!(start, Datum::Int8(_)) || matches!(step, Datum::Int8(_));
+            if !wide && i32::try_from(v).is_ok() {
+                Ok(Datum::Int4(v as i32))
+            } else {
+                Ok(Datum::Int8(v))
+            }
+        }
         // Set-returning `_pg_expandarray(arr)` yields, for the current expansion
         // index k, the composite `(x, n)` = (arr[k], k), encoded as `[x, n]`.
         "_pg_expandarray" => {
@@ -1132,6 +1184,14 @@ fn call<'a>(
             arity(1)?;
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
+                // On a range, lower/upper return the corresponding bound.
+                Datum::Range { text, kind } => {
+                    if name == "upper" {
+                        super::range::upper_datum(text, kind, arena)
+                    } else {
+                        super::range::lower_datum(text, kind, arena)
+                    }
+                }
                 Datum::Text(s) => {
                     let upper = name == "upper";
                     // Two passes: measure, then fill the arena slice.
@@ -1218,6 +1278,7 @@ fn call<'a>(
                 Datum::Uuid(_) => "uuid",
                 Datum::Bytea(_) => "bytea",
                 Datum::Numeric(_) => "numeric",
+                Datum::Range { kind, .. } => kind.name(),
             }))
         }
         "trim" | "btrim" | "ltrim" | "rtrim" => {
@@ -2256,6 +2317,66 @@ fn call<'a>(
                 other => Err(type_mismatch(name, &other)),
             }
         }
+        "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
+            let kind = super::types::RangeKind::from_name(name).expect("matched a range name");
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let lo = eval_full(args[0], arena, params, row, hooks)?;
+            let hi = eval_full(args[1], arena, params, row, hooks)?;
+            let flags = if args.len() == 3 {
+                text_arg(name, args, 2, arena, params, row, hooks)?
+            } else {
+                None
+            };
+            Ok(Datum::Range { text: super::range::construct(lo, hi, flags, kind, arena)?, kind })
+        }
+        "isempty" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Range { text, .. } => Ok(Datum::Bool(super::range::is_empty(text))),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "lower_inc" | "upper_inc" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Range { text, kind } => {
+                    Ok(Datum::Bool(super::range::bound_inc(text, kind, name == "lower_inc")?))
+                }
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "lower_inf" | "upper_inf" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Range { text, kind } => Ok(Datum::Bool(if name == "lower_inf" {
+                    super::range::lower_inf(text, kind)?
+                } else {
+                    super::range::upper_inf(text, kind)?
+                })),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "range_merge" => {
+            arity(2)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let b = eval_full(args[1], arena, params, row, hooks)?;
+            if a.is_null() || b.is_null() {
+                return Ok(Datum::Null);
+            }
+            let (Datum::Range { text: at, kind: ak }, Datum::Range { text: bt, kind: bk }) = (a, b)
+            else {
+                return Err(type_mismatch(name, &a));
+            };
+            if ak != bk {
+                return Err(range_mismatch());
+            }
+            Ok(Datum::Range { text: super::range::merge(at, bt, ak, arena)?, kind: ak })
+        }
         "to_char" => {
             arity(2)?;
             let v = eval_full(args[0], arena, params, row, hooks)?;
@@ -2266,6 +2387,17 @@ fn call<'a>(
             let Datum::Text(fmt) = f else {
                 return Err(type_mismatch(name, &f));
             };
+            // Temporal values format via the date/time codes; numeric values via
+            // the number codes.
+            let micros = match v {
+                Datum::Timestamp(t) | Datum::Timestamptz(t) => Some(t),
+                Datum::Date(d) => Some(d as i64 * 86_400_000_000),
+                Datum::Time(t) => Some(t),
+                _ => None,
+            };
+            if let Some(m) = micros {
+                return Ok(Datum::Text(super::to_char::timestamp(m, fmt, arena)?));
+            }
             let n = datum_numeric(name, v, arena)?;
             Ok(Datum::Text(super::to_char::number(&n, fmt, arena)?))
         }
@@ -2278,6 +2410,20 @@ fn call<'a>(
                 return Ok(Datum::Null);
             };
             Ok(Datum::Numeric(super::to_char::to_number(s, fmt, arena)?))
+        }
+        // `to_timestamp(double)` converts a Unix epoch (seconds) to timestamptz.
+        "to_timestamp" if args.len() == 1 => {
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                d => {
+                    let Some(secs) = num_factor(&d) else {
+                        return Err(type_mismatch(name, &d));
+                    };
+                    let micros = (secs * 1_000_000.0).round() as i64
+                        - super::datetime::PG_EPOCH_DAYS * 86_400_000_000;
+                    Ok(Datum::Timestamptz(micros))
+                }
+            }
         }
         "to_date" | "to_timestamp" => {
             arity(2)?;
@@ -2326,6 +2472,45 @@ fn call<'a>(
                 _ => Ok(Datum::Timestamp(super::datetime::make_timestamp(
                     ints[0], ints[1], ints[2], ints[3], ints[4], sec,
                 )?)),
+            }
+        }
+        "age" => {
+            // `age(a, b)` is the symbolic interval a - b; `age(a)` measures from
+            // the current date at midnight.
+            if args.len() != 1 && args.len() != 2 || star {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) with {} arguments does not exist",
+                    name,
+                    args.len()
+                ));
+            }
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            if a.is_null() {
+                return Ok(Datum::Null);
+            }
+            let a = timestamp_micros(name, a)?;
+            let b = if args.len() == 2 {
+                match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Null => return Ok(Datum::Null),
+                    other => timestamp_micros(name, other)?,
+                }
+            } else {
+                let day = 86_400_000_000i64;
+                super::datetime::now_micros().div_euclid(day) * day
+            };
+            Ok(Datum::Interval(super::datetime::age_between(a, b)))
+        }
+        "justify_hours" | "justify_days" | "justify_interval" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Interval(iv) => Ok(Datum::Interval(match name {
+                    "justify_hours" => super::datetime::justify_hours(iv),
+                    "justify_days" => super::datetime::justify_days(iv),
+                    _ => super::datetime::justify_interval(iv),
+                })),
+                other => Err(type_mismatch(name, &other)),
             }
         }
         "to_hex" => {
@@ -3013,11 +3198,22 @@ fn binary<'a>(
     use BinaryOp::*;
     match op {
         And | Or => logic(op, l, r),
-        Concat => concat(l, r, arena),
-        Eq | NotEq | Lt | LtEq | Gt | GtEq => compare(op, l, r, l_unknown, r_unknown),
-        Add | Sub | Mul | Div | Mod => arithmetic(op, l, r, l_unknown, r_unknown, arena),
+        Concat => concat(l, r, l_unknown, r_unknown, arena),
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(op, l, r),
+            _ => compare(op, l, r, l_unknown, r_unknown),
+        },
+        Add | Sub | Mul | Div | Mod => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(op, l, r, arena),
+            _ => arithmetic(op, l, r, l_unknown, r_unknown, arena),
+        },
         JsonGet | JsonGetText => json_get(l, r, op == JsonGetText, arena),
-        BitAnd | BitOr | BitXor | Shl | Shr => bitwise(op, l, r),
+        Shl | Shr => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(op, l, r),
+            _ => bitwise(op, l, r),
+        },
+        BitAnd | BitOr | BitXor => bitwise(op, l, r),
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(op, l, r),
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
             // is float8); otherwise it is double-precision exponentiation.
@@ -3034,6 +3230,93 @@ fn binary<'a>(
             let (a, b) = (datum_f64("^", l)?, datum_f64("^", r)?);
             Ok(Datum::Float8(a.powf(b)))
         }
+    }
+}
+
+/// Range predicate operators: `@>` (contains), `<@` (contained by), `&&`
+/// (overlaps), `<<`/`>>` (strictly left/right), `&<`/`&>` (does not extend
+/// right/left), `-|-` (adjacent). `@>`/`<@` accept a range-vs-range or
+/// range-vs-element pair; the rest require two ranges of the same kind.
+fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    use super::range;
+    use BinaryOp::{Adjacent, ContainedBy, Contains, NotLeftOf, NotRightOf, Overlaps, Shl, Shr};
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    match op {
+        Contains => range_contains(l, r),
+        ContainedBy => range_contains(r, l),
+        _ => {
+            let (lt, lk) = as_range(&l)?;
+            let (rt, rk) = as_range(&r)?;
+            if lk != rk {
+                return Err(range_mismatch());
+            }
+            Ok(Datum::Bool(match op {
+                Overlaps => range::overlaps(lt, rt, lk)?,
+                Shl => range::strictly_before(lt, rt, lk)?,
+                Shr => range::strictly_after(lt, rt, lk)?,
+                NotRightOf => range::not_right_of(lt, rt, lk)?,
+                NotLeftOf => range::not_left_of(lt, rt, lk)?,
+                Adjacent => range::adjacent(lt, rt, lk)?,
+                _ => unreachable!("range_op only handles range predicates"),
+            }))
+        }
+    }
+}
+
+/// Range set operators returning a range: `+` (union), `-` (difference), `*`
+/// (intersection). Both operands must be ranges of the same kind.
+fn range_setop<'a>(
+    op: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::range;
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let (lt, lk) = as_range(&l)?;
+    let (rt, rk) = as_range(&r)?;
+    if lk != rk {
+        return Err(range_mismatch());
+    }
+    let text = match op {
+        BinaryOp::Add => range::union(lt, rt, lk, arena)?,
+        BinaryOp::Sub => range::difference(lt, rt, lk, arena)?,
+        BinaryOp::Mul => range::intersect(lt, rt, lk, arena)?,
+        _ => return Err(type_mismatch("range operator", &l)),
+    };
+    Ok(Datum::Range { text, kind: lk })
+}
+
+fn range_mismatch() -> SqlError {
+    sql_err!(sqlstate::UNDEFINED_FUNCTION, "operator requires matching range types")
+}
+
+/// Whether `container` (a range) contains `contained` (a range of the same kind
+/// or a bare element).
+fn range_contains<'a>(container: Datum<'a>, contained: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    let (ct, ck) = as_range(&container)?;
+    match contained {
+        Datum::Range { text, kind } => {
+            if kind != ck {
+                return Err(range_mismatch());
+            }
+            Ok(Datum::Bool(super::range::contains_range(ct, text, ck)?))
+        }
+        elem => {
+            let es = stack_format!(64, "{}", elem);
+            Ok(Datum::Bool(super::range::contains_elem(ct, ck, es.as_str())?))
+        }
+    }
+}
+
+fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), SqlError> {
+    match d {
+        Datum::Range { text, kind } => Ok((text, *kind)),
+        other => Err(type_mismatch("range operator", other)),
     }
 }
 
@@ -3170,14 +3453,69 @@ fn logic<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlE
     Ok(out.map_or(Datum::Null, Datum::Bool))
 }
 
-fn concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+/// Resolves `array || NULL` / `NULL || array`, which PostgreSQL decides from
+/// the NULL operand's static type: an untyped NULL or a NULL of the array type
+/// is the identity (returns the array), a NULL of the element type appends a
+/// NULL element, and any other type is an undefined operator. Returns `None`
+/// when this is not an array-with-NULL concatenation (fall through to `concat`).
+fn array_null_concat<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    arena: &'a Arena,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let (arr, elem, null_expr) = match (l, r) {
+        (Datum::Array { elem, .. }, Datum::Null) => (l, elem, right),
+        (Datum::Null, Datum::Array { elem, .. }) => (r, elem, left),
+        _ => return Ok(None),
+    };
+    match static_type(null_expr, row) {
+        // Untyped NULL or a NULL of the array type: identity.
+        None | Some(ColType::Array(_)) => Ok(Some(arr)),
+        // NULL of the element type: append/prepend a NULL element.
+        Some(t) if super::types::ArrElem::from_coltype(t) == Some(elem) => {
+            Ok(Some(array_concat(l, r, arena)?))
+        }
+        Some(t) => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {}[] || {}",
+            elem.to_coltype().name(),
+            t.name()
+        )),
+    }
+}
+
+fn concat<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    l_unknown: bool,
+    r_unknown: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
     // `||` on arrays concatenates: array||array, and array||element or
-    // element||array append/prepend the element.
-    if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) {
-        return array_concat(l, r, arena);
+    // element||array append/prepend the element. An *unknown literal* on the
+    // scalar side is resolved as array||array (PostgreSQL casts it to the array
+    // type), so it is parsed as an array literal and errors if malformed —
+    // matching `ARRAY['a','b'] || 'c'` (error) vs `|| 'c'::text` (append).
+    let arr_elem = match (&l, &r) {
+        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => Some(*elem),
+        _ => None,
+    };
+    if let Some(elem) = arr_elem {
+        let coerce = |d: Datum<'a>, unknown: bool| -> Result<Datum<'a>, SqlError> {
+            match d {
+                Datum::Text(s) if unknown => {
+                    Ok(Datum::Array { elem, raw: super::array::parse_literal(s, elem, arena)? })
+                }
+                other => Ok(other),
+            }
+        };
+        return array_concat(coerce(l, l_unknown)?, coerce(r, r_unknown)?, arena);
     }
     let left = cast_to_text(l, arena)?;
     let right = cast_to_text(r, arena)?;
@@ -3283,6 +3621,17 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
         (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
         (Datum::Numeric(a), Datum::Numeric(b)) => numeric::compare(a, b),
+        (Datum::Range { text: a, kind: ka }, Datum::Range { text: b, kind: kb }) => {
+            if ka != kb {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} = {}",
+                    ka.name(),
+                    kb.name()
+                ));
+            }
+            super::range::cmp_ranges(a, b, *ka)?
+        }
         // Numeric vs integer: compare exactly via numeric.
         (Datum::Numeric(_), Datum::Int4(_) | Datum::Int8(_))
         | (Datum::Int4(_) | Datum::Int8(_), Datum::Numeric(_)) => {
@@ -3351,6 +3700,52 @@ fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a>, SqlError
     })
 }
 
+/// Range comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`). Both operands
+/// must be ranges of the same kind; ordering follows PostgreSQL `range_cmp`.
+fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let sym = match op {
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::GtEq => ">=",
+        _ => unreachable!(),
+    };
+    let (Datum::Range { text: lt, kind: lk }, Datum::Range { text: rt, kind: rk }) = (l, r) else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            type_name_of(&l),
+            sym,
+            type_name_of(&r)
+        ));
+    };
+    if lk != rk {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            lk.name(),
+            sym,
+            rk.name()
+        ));
+    }
+    let ord = super::range::cmp_ranges(lt, rt, lk)?;
+    let out = match op {
+        BinaryOp::Eq => ord.is_eq(),
+        BinaryOp::NotEq => ord.is_ne(),
+        BinaryOp::Lt => ord.is_lt(),
+        BinaryOp::LtEq => ord.is_le(),
+        BinaryOp::Gt => ord.is_gt(),
+        BinaryOp::GtEq => ord.is_ge(),
+        _ => unreachable!(),
+    };
+    Ok(Datum::Bool(out))
+}
+
 fn compare<'a>(
     op: BinaryOp,
     l: Datum<'a>,
@@ -3403,6 +3798,16 @@ fn arithmetic<'a>(
                 days: a.days + s * b.days,
                 micros: a.micros + s as i64 * b.micros,
             }));
+        }
+        // `interval * number` / `number * interval` / `interval / number`.
+        (BinaryOp::Mul, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), false)));
+        }
+        (BinaryOp::Mul, _, Datum::Interval(iv)) if num_factor(&l).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&l).expect("checked"), false)));
+        }
+        (BinaryOp::Div, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), true)));
         }
         (BinaryOp::Add | BinaryOp::Sub, dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)), Datum::Interval(iv))
         | (BinaryOp::Add, Datum::Interval(iv), dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_))) => {
@@ -3704,6 +4109,14 @@ pub fn cast_to<'a>(
             Datum::Text(s) => Datum::Numeric(Numeric::parse(s, arena)?),
             _ => return Err(cast_unsupported(&v, "numeric")),
         },
+        ColType::Range(kind) => match v {
+            Datum::Range { kind: k, .. } if k == kind => v,
+            Datum::Text(s) => {
+                let p = super::range::parse(s, kind)?;
+                Datum::Range { text: super::range::canonical(&p, kind, arena)?, kind }
+            }
+            _ => return Err(cast_unsupported(&v, kind.name())),
+        },
     };
     Ok(out)
 }
@@ -3813,7 +4226,7 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
 /// Parses an integer the way PostgreSQL's integer input does: optional sign, an
 /// optional `0x`/`0o`/`0b` base prefix, and `_` digit separators (only between
 /// digits). Returns None for anything malformed or out of `i64` range.
-fn parse_int_literal(s: &str) -> Option<i64> {
+pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
     let t = s.trim();
     let (neg, rest) = match t.strip_prefix('-') {
         Some(r) => (true, r),
@@ -3853,6 +4266,28 @@ fn parse_int_literal(s: &str) -> Option<i64> {
     let cleaned = core::str::from_utf8(&buf[..n]).ok()?;
     let v = i64::from_str_radix(cleaned, radix).ok()?;
     Some(if neg { -v } else { v })
+}
+
+/// Converts a temporal datum to microseconds from the PostgreSQL epoch, as the
+/// symbolic-age functions need. A date is taken at midnight.
+fn timestamp_micros(name: &str, d: Datum) -> Result<i64, SqlError> {
+    match d {
+        Datum::Timestamp(t) | Datum::Timestamptz(t) => Ok(t),
+        Datum::Date(day) => Ok(i64::from(day) * 86_400_000_000),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
+/// A numeric scaling factor for `interval * n` / `interval / n` (integer,
+/// double, or numeric). Text and other types are not factors.
+fn num_factor(d: &Datum) -> Option<f64> {
+    match d {
+        Datum::Int4(x) => Some(f64::from(*x)),
+        Datum::Int8(x) => Some(*x as f64),
+        Datum::Float8(x) => Some(*x),
+        Datum::Numeric(n) => Some(n.to_f64()),
+        _ => None,
+    }
 }
 
 fn parse_bool(s: &str) -> Result<bool, SqlError> {
@@ -3907,6 +4342,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Array { .. } => "array",
         Datum::Uuid(_) => "uuid",
         Datum::Bytea(_) => "bytea",
+        Datum::Range { kind, .. } => kind.name(),
     }
 }
 
@@ -3941,17 +4377,17 @@ fn division_by_zero() -> SqlError {
 fn type_mismatch(op: &str, d: &Datum) -> SqlError {
     sql_err!(
         sqlstate::DATATYPE_MISMATCH,
-        "operator {} does not accept {:?}",
+        "operator {} does not accept {}",
         op,
-        d
+        type_name_of(d)
     )
 }
 
 fn cast_unsupported(from: &Datum, to: &'static str) -> SqlError {
     sql_err!(
         sqlstate::DATATYPE_MISMATCH,
-        "cannot cast {:?} to {}",
-        from,
+        "cannot cast {} to {}",
+        type_name_of(from),
         to
     )
 }

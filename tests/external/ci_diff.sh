@@ -32,6 +32,17 @@ SLT_LIMIT=${SLT_LIMIT:-20000}
 FUZZ_COUNT=${FUZZ_COUNT:-20000}
 FUZZ_SEED=${FUZZ_SEED:-1}
 FUZZ_BUDGET=${FUZZ_BUDGET:-0}
+# Sharding, so each CI job fits a wall-clock cap while total coverage is
+# preserved: the sqllogictest replay splits each file's query blocks across
+# SLT_QUERY_SHARDS shards (this run does shard SLT_QUERY_SHARD, 0-based) — every
+# shard runs all files and all statement/DDL blocks, only the read-only query
+# blocks are divided, which balances even a single huge file. RUN_SLT / RUN_FUZZ
+# gate the two slow phases so a shard can run one, the other, or both. Defaults
+# run everything in one shard, matching the unsharded behavior.
+SLT_QUERY_SHARD=${SLT_QUERY_SHARD:-0}
+SLT_QUERY_SHARDS=${SLT_QUERY_SHARDS:-1}
+RUN_SLT=${RUN_SLT:-1}
+RUN_FUZZ=${RUN_FUZZ:-1}
 
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -108,40 +119,47 @@ for f in "$EXT"/differential/*.sql; do
 done
 
 # --- vendored sqllogictest replay (real PostgreSQL is the oracle) ----------
-echo "=== sqllogictest replay ==="
-if "$PY" "$EXT/slt_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --limit "$SLT_LIMIT" \
-     vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
-     > "$WORK/slt.out" 2>&1; then
-  ok "sqllogictest replay ($(grep '^TOTAL' "$WORK/slt.out"))"
-else bad "sqllogictest replay"; tail -40 "$WORK/slt.out"; fi
+# Query-block sharded: all files, all statements; this shard runs its slice of
+# the read-only query blocks.
+if [[ "$RUN_SLT" == 1 ]]; then
+  echo "=== sqllogictest replay (query shard $SLT_QUERY_SHARD/$SLT_QUERY_SHARDS) ==="
+  if "$PY" "$EXT/slt_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --limit "$SLT_LIMIT" \
+       --query-shards "$SLT_QUERY_SHARDS" --query-shard "$SLT_QUERY_SHARD" \
+       vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
+       > "$WORK/slt.out" 2>&1; then
+    ok "sqllogictest replay ($(grep '^TOTAL' "$WORK/slt.out"))"
+  else bad "sqllogictest replay"; tail -40 "$WORK/slt.out"; fi
+fi
 
-# The corpus replay fills pos3ql's bounded table catalog to its limit, so give
-# the generative fuzzer its own fresh instance (a clean table space) rather than
-# letting its schema setup fail against a full catalog.
-echo "=== restart pos3ql (fresh table space for the fuzzer) ==="
-kill "$P3_PID" 2>/dev/null; wait "$P3_PID" 2>/dev/null
-rm -rf "${WORK}/p3data"
-./target/release/pos3ql --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
-P3_PID=$!
-for _ in $(seq 1 100); do
-  psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+if [[ "$RUN_FUZZ" == 1 ]]; then
+  # The corpus replay fills pos3ql's bounded table catalog to its limit, so give
+  # the generative fuzzer its own fresh instance (a clean table space) rather
+  # than letting its schema setup fail against a full catalog.
+  echo "=== restart pos3ql (fresh table space for the fuzzer) ==="
+  kill "$P3_PID" 2>/dev/null; wait "$P3_PID" 2>/dev/null
+  rm -rf "${WORK}/p3data"
+  ./target/release/pos3ql --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  P3_PID=$!
+  for _ in $(seq 1 100); do
+    psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
 
-# --- generative differential fuzzer (gated by a ratchet budget) ------------
-echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, budget=$FUZZ_BUDGET) ==="
-"$PY" "$EXT/fuzz_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" \
-  > "$WORK/fuzz.out" 2>&1 || true
-DIV=$(grep -oE 'divergence=[0-9]+' "$WORK/fuzz.out" | tail -1 | cut -d= -f2)
-DIV=${DIV:-unknown}
-echo "$(grep '^TOTAL' "$WORK/fuzz.out")"
-if [[ ! "$DIV" =~ ^[0-9]+$ ]]; then
-  # No divergence count means the fuzzer crashed before finishing — show why.
-  bad "fuzzer produced no divergence count (crashed)"; tail -40 "$WORK/fuzz.out"
-elif (( DIV <= FUZZ_BUDGET )); then
-  ok "fuzzer within budget ($DIV <= $FUZZ_BUDGET)"
-else
-  bad "fuzzer over budget ($DIV > $FUZZ_BUDGET)"; grep -A3 DIVERGENCE "$WORK/fuzz.out" | head -60
+  # --- generative differential fuzzer (gated by a ratchet budget) ----------
+  echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, budget=$FUZZ_BUDGET) ==="
+  "$PY" "$EXT/fuzz_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" \
+    > "$WORK/fuzz.out" 2>&1 || true
+  DIV=$(grep -oE 'divergence=[0-9]+' "$WORK/fuzz.out" | tail -1 | cut -d= -f2)
+  DIV=${DIV:-unknown}
+  echo "$(grep '^TOTAL' "$WORK/fuzz.out")"
+  if [[ ! "$DIV" =~ ^[0-9]+$ ]]; then
+    # No divergence count means the fuzzer crashed before finishing — show why.
+    bad "fuzzer produced no divergence count (crashed)"; tail -40 "$WORK/fuzz.out"
+  elif (( DIV <= FUZZ_BUDGET )); then
+    ok "fuzzer within budget ($DIV <= $FUZZ_BUDGET)"
+  else
+    bad "fuzzer over budget ($DIV > $FUZZ_BUDGET)"; grep -A3 DIVERGENCE "$WORK/fuzz.out" | head -60
+  fi
 fi
 
 echo ""

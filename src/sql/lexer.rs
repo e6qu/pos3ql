@@ -73,12 +73,14 @@ impl<'a> Lexer<'a> {
                 Ok(Tok::Op(op))
             }
             '-' => {
-                // JSON accessors `->` and `->>`, else the minus operator.
+                // JSON accessors `->`/`->>`, range adjacency `-|-`, else minus.
                 let rest = self.rest();
                 let op = if rest.starts_with("->>") {
                     "->>"
                 } else if rest.starts_with("->") {
                     "->"
+                } else if rest.starts_with("-|-") {
+                    "-|-"
                 } else {
                     "-"
                 };
@@ -99,7 +101,7 @@ impl<'a> Lexer<'a> {
                     Err(self.error("unexpected ':'"))
                 }
             }
-            '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#' => self.operator(),
+            '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#' | '@' => self.operator(),
             '\'' => self.plain_string(),
             '"' => self.quoted_ident(),
             '$' => self.dollar(),
@@ -113,8 +115,8 @@ impl<'a> Lexer<'a> {
         let rest = self.rest();
         // Longer operators first: the POSIX regex match family before `~`.
         for op in [
-            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "<", ">", "=", "~", "|",
-            "&", "#", "^",
+            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "@>", "<@", "&<", "&>",
+            "&&", "<", ">", "=", "~", "|", "&", "#", "^",
         ] {
             if rest.starts_with(op) {
                 self.at += op.len();
@@ -167,7 +169,20 @@ impl<'a> Lexer<'a> {
         let start = self.at;
         let bytes = self.text.as_bytes();
         let mut i = self.at;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
+        // Non-decimal integer literals: `0x1F` / `0o17` / `0b1010` (with `_`
+        // digit separators). The parser validates the digits.
+        if bytes[i] == b'0'
+            && i + 1 < bytes.len()
+            && matches!(bytes[i + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+        {
+            i += 2;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            self.at = i;
+            return Ok(Tok::Num(&self.text[start..i]));
+        }
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
             i += 1;
         }
         if i < bytes.len() && bytes[i] == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)

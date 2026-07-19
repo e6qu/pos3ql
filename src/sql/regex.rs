@@ -2,17 +2,18 @@
 //! `~*` operators — enough for application predicates and the introspection
 //! queries `psql` issues (which wrap object names as `^(name)$`).
 //!
-//! Supported: literals, `.`, anchors `^` and `$`, quantifiers `*` `+` `?`,
-//! bracket expressions `[...]` (ranges and a leading `^` negation), grouping
-//! `(...)`, alternation `|`, and `\` escaping. Bounded repetition `{m,n}` is
-//! not supported and is rejected loudly.
+//! Supported: literals, `.`, anchors `^` and `$`, quantifiers `*` `+` `?` and
+//! bounded `{m}`/`{m,}`/`{m,n}` (each optionally non-greedy with a trailing
+//! `?`), bracket expressions `[...]` (ranges and a leading `^` negation),
+//! shorthand classes `\d \w \s` (and negations), grouping `(...)` with capture
+//! tracking, alternation `|`, and `\` escaping.
 //!
 //! The matcher is a bounded backtracking recursion in continuation-passing
 //! style (no allocation); a step budget guards against pathological blow-up.
 
 use core::cell::Cell;
 
-use super::eval::{sqlstate, SqlError};
+use super::eval::SqlError;
 use crate::sql_err;
 
 /// Whether `pattern` matches anywhere in `text` (POSIX `~` semantics).
@@ -39,9 +40,12 @@ pub fn regex_search(pattern: &str, text: &str, case_insensitive: bool) -> Result
     }
 }
 
-/// Finds the leftmost-longest match at or after byte offset `from`, returning
-/// its `(start, end)` byte range. A `^`-anchored pattern matches only at the
-/// very start of `text`. Used by `regexp_replace`.
+/// Finds the leftmost match at or after byte offset `from`, returning its
+/// `(start, end)` byte range. At the leftmost matching position the match
+/// length follows the RE's overall length preference: longest normally,
+/// shortest when the pattern's first quantified atom is non-greedy (`*?` etc.),
+/// per PostgreSQL's ARE rules. A `^`-anchored pattern matches only at the very
+/// start of `text`. Used by `regexp_replace` and `regexp_matches`.
 pub fn find(
     pattern: &str,
     text: &str,
@@ -51,16 +55,20 @@ pub fn find(
     validate(pattern)?;
     let anchored = pattern.starts_with('^');
     let pat = if anchored { &pattern[1..] } else { pattern };
+    let prefer_longest = pattern_prefers_longest(pat);
     let budget = Cell::new(3_000_000u32);
-    // Longest match anchored at `start`: a continuation that records the
-    // maximum consumed length and always returns false forces the matcher to
-    // explore every match length (POSIX leftmost-longest).
-    let longest_at = |start: usize| -> Result<Option<usize>, SqlError> {
+    // Best match anchored at `start`: a continuation that records the preferred
+    // consumed length and always returns false forces the matcher to explore
+    // every match length.
+    let best_at = |start: usize| -> Result<Option<usize>, SqlError> {
         let sub = &text[start..];
         let best = Cell::new(None::<usize>);
         let accept = |rest: &str| {
             let consumed = sub.len() - rest.len();
-            if best.get().is_none_or(|b| consumed > b) {
+            let better = best
+                .get()
+                .is_none_or(|b| if prefer_longest { consumed > b } else { consumed < b });
+            if better {
                 best.set(Some(consumed));
             }
             Ok(false)
@@ -71,13 +79,13 @@ pub fn find(
     if anchored {
         // `^` matches only at the absolute start of the string.
         if from == 0 {
-            return Ok(longest_at(0)?.map(|len| (0, len)));
+            return Ok(best_at(0)?.map(|len| (0, len)));
         }
         return Ok(None);
     }
     let mut start = from;
     loop {
-        if let Some(len) = longest_at(start)? {
+        if let Some(len) = best_at(start)? {
             return Ok(Some((start, start + len)));
         }
         match text[start..].chars().next() {
@@ -227,11 +235,12 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
                     return Err(sql_err!("2201B", "invalid regular expression: unbalanced ("));
                 }
             }
-            b'{' => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "bounded repetition {{m,n}} is not supported"
-                ))
+            b'{' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                // Validate the bound's shape here so a malformed one errors up
+                // front (parse_bound re-parses it during matching). A `{` not
+                // followed by a digit is a literal character.
+                let (_, _, used) = parse_bound(&pattern[i..])?;
+                i += used - 1;
             }
             _ => {}
         }
@@ -282,7 +291,7 @@ fn m(
         let close = matching_paren(pat);
         let body = &pat[1..close];
         let after = &pat[close + 1..];
-        let (quant, rest) = split_quant(after);
+        let (quant, rest) = parse_quant(after)?;
         let group = rec.and_then(|r| r.group_of(pat));
         let entry_len = text.len();
         // Continuation after a single, non-repeated group match: record the
@@ -295,42 +304,21 @@ fn m(
         };
         return match quant {
             None => m(body, text, case_insensitive, budget, rec, &cont),
-            Some(b'?') => {
-                if m(body, text, case_insensitive, budget, rec, &cont)? {
-                    Ok(true)
-                } else {
-                    // Group skipped: it does not participate, so no recording.
-                    m(rest, text, case_insensitive, budget, rec, k)
-                }
-            }
-            _ => {
-                let min = if quant == Some(b'+') { 1 } else { 0 };
+            Some(q) => {
                 // The repetition records each iteration (last wins); the
                 // downstream continuation does not re-record the whole span.
                 let after_reps = move |t: &str| m(rest, t, case_insensitive, budget, rec, k);
-                rep_group(body, text, case_insensitive, budget, min, rec, group, &after_reps)
+                rep_group(body, text, case_insensitive, budget, q, rec, group, &after_reps)
             }
         };
     }
     // A single atom (literal / '.' / escaped / class) plus optional quantifier.
     let (atom, after) = take_atom(pat);
-    let (quant, rest) = split_quant(after);
+    let (quant, rest) = parse_quant(after)?;
     let cont = move |t: &str| m(rest, t, case_insensitive, budget, rec, k);
     match quant {
-        Some(b'*') | Some(b'+') => {
-            let min = if quant == Some(b'+') { 1 } else { 0 };
-            rep_atom(atom, text, case_insensitive, budget, min, &cont)
-        }
-        Some(b'?') => {
-            if let Some(c) = text.chars().next()
-                && atom_matches(atom, c, case_insensitive)
-                && cont(&text[c.len_utf8()..])?
-            {
-                return Ok(true);
-            }
-            cont(text)
-        }
-        _ => {
+        Some(q) => rep_atom(atom, text, case_insensitive, budget, q, &cont),
+        None => {
             if let Some(c) = text.chars().next()
                 && atom_matches(atom, c, case_insensitive)
             {
@@ -342,62 +330,84 @@ fn m(
     }
 }
 
-/// Greedy repetition of a single `atom`, at least `min` times, then `cont`.
+/// Repetition of a single `atom` within `[q.min, q.max]` occurrences, then
+/// `cont`. Greedy prefers more occurrences; non-greedy prefers fewer.
 fn rep_atom(
     atom: &str,
     text: &str,
     case_insensitive: bool,
     budget: &Cell<u32>,
-    min: u32,
+    q: Quant,
     cont: &dyn Fn(&str) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     step(budget)?;
-    if let Some(c) = text.chars().next()
-        && atom_matches(atom, c, case_insensitive)
-        && rep_atom(atom, &text[c.len_utf8()..], case_insensitive, budget, min.saturating_sub(1), cont)?
-    {
-        return Ok(true);
-    }
-    if min == 0 {
-        cont(text)
+    let consume_one = || -> Result<bool, SqlError> {
+        if q.max == 0 {
+            return Ok(false);
+        }
+        if let Some(c) = text.chars().next()
+            && atom_matches(atom, c, case_insensitive)
+        {
+            rep_atom(atom, &text[c.len_utf8()..], case_insensitive, budget, q.step_down(), cont)
+        } else {
+            Ok(false)
+        }
+    };
+    if q.greedy {
+        if consume_one()? {
+            return Ok(true);
+        }
+        if q.min == 0 { cont(text) } else { Ok(false) }
     } else {
-        Ok(false)
+        if q.min == 0 && cont(text)? {
+            return Ok(true);
+        }
+        consume_one()
     }
 }
 
-/// Greedy repetition of a group `body`, at least `min` times, then `cont`. Each
-/// iteration records the group's span (so the last iteration wins, matching
-/// PostgreSQL/POSIX capture semantics for a repeated group).
+/// Repetition of a group `body` within `[q.min, q.max]` occurrences, then
+/// `cont`. Each iteration records the group's span (the last iteration wins,
+/// matching PostgreSQL/POSIX capture semantics for a repeated group).
 #[expect(clippy::too_many_arguments, reason = "capture recording threads context")]
 fn rep_group(
     body: &str,
     text: &str,
     case_insensitive: bool,
     budget: &Cell<u32>,
-    min: u32,
+    q: Quant,
     rec: Option<&Recorder>,
     group: Option<usize>,
     cont: &dyn Fn(&str) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     step(budget)?;
     let start_len = text.len();
-    let more = |t: &str| {
-        // Guard against an empty-body infinite loop.
-        if t.len() == start_len {
+    let one_iteration = || -> Result<bool, SqlError> {
+        if q.max == 0 {
             return Ok(false);
         }
-        if let (Some(r), Some(g)) = (rec, group) {
-            r.record(g, r.consumed(start_len), r.consumed(t.len()));
-        }
-        rep_group(body, t, case_insensitive, budget, min.saturating_sub(1), rec, group, cont)
+        let more = |t: &str| {
+            // Guard against an empty-body infinite loop.
+            if t.len() == start_len {
+                return Ok(false);
+            }
+            if let (Some(r), Some(g)) = (rec, group) {
+                r.record(g, r.consumed(start_len), r.consumed(t.len()));
+            }
+            rep_group(body, t, case_insensitive, budget, q.step_down(), rec, group, cont)
+        };
+        m(body, text, case_insensitive, budget, rec, &more)
     };
-    if m(body, text, case_insensitive, budget, rec, &more)? {
-        return Ok(true);
-    }
-    if min == 0 {
-        cont(text)
+    if q.greedy {
+        if one_iteration()? {
+            return Ok(true);
+        }
+        if q.min == 0 { cont(text) } else { Ok(false) }
     } else {
-        Ok(false)
+        if q.min == 0 && cont(text)? {
+            return Ok(true);
+        }
+        one_iteration()
     }
 }
 
@@ -453,12 +463,122 @@ fn matching_paren(pat: &str) -> usize {
     b.len() // validate() guarantees balance, so this is unreachable
 }
 
-/// Splits an optional trailing quantifier byte offset the front of `pat`.
-fn split_quant(pat: &str) -> (Option<u8>, &str) {
-    match pat.as_bytes().first() {
-        Some(&q) if q == b'*' || q == b'+' || q == b'?' => (Some(q), &pat[1..]),
-        _ => (None, pat),
+/// A parsed quantifier: occurrence bounds plus the length preference.
+/// `max == u32::MAX` means unbounded.
+#[derive(Clone, Copy)]
+struct Quant {
+    min: u32,
+    max: u32,
+    greedy: bool,
+}
+
+impl Quant {
+    /// The bounds after consuming one occurrence.
+    fn step_down(self) -> Quant {
+        Quant {
+            min: self.min.saturating_sub(1),
+            max: if self.max == u32::MAX { u32::MAX } else { self.max - 1 },
+            greedy: self.greedy,
+        }
     }
+}
+
+/// PostgreSQL caps `{m,n}` bounds at 255 (DUPMAX).
+const MAX_REPEAT: u32 = 255;
+
+/// Parses an optional quantifier at the front of `pat`: `*` `+` `?` or a bound
+/// `{m}` / `{m,}` / `{m,n}`, each optionally followed by `?` for non-greedy
+/// (shortest-preference), per PostgreSQL's ARE syntax.
+fn parse_quant(pat: &str) -> Result<(Option<Quant>, &str), SqlError> {
+    let b = pat.as_bytes();
+    let (mut q, mut used) = match b.first() {
+        Some(b'*') => (Quant { min: 0, max: u32::MAX, greedy: true }, 1),
+        Some(b'+') => (Quant { min: 1, max: u32::MAX, greedy: true }, 1),
+        Some(b'?') => (Quant { min: 0, max: 1, greedy: true }, 1),
+        // `{` opens a bound only when followed by a digit (PostgreSQL treats a
+        // bare `{` as a literal character).
+        Some(b'{') if b.get(1).is_some_and(u8::is_ascii_digit) => {
+            let (min, max, after) = parse_bound(pat)?;
+            (Quant { min, max, greedy: true }, after)
+        }
+        _ => return Ok((None, pat)),
+    };
+    if b.get(used) == Some(&b'?') {
+        q.greedy = false;
+        used += 1;
+    }
+    Ok((Some(q), &pat[used..]))
+}
+
+/// Parses `{m}` / `{m,}` / `{m,n}` starting at `pat[0] == '{'`; returns
+/// `(min, max, bytes_used)`. Bounds are validated exactly as PostgreSQL does:
+/// integers, `m <= n`, both at most 255.
+fn parse_bound(pat: &str) -> Result<(u32, u32, usize), SqlError> {
+    let bad = || sql_err!("2201B", "invalid regular expression: invalid repetition count(s)");
+    let b = pat.as_bytes();
+    let mut i = 1;
+    let read_int = |i: &mut usize| -> Option<u32> {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i == start {
+            return None;
+        }
+        pat[start..*i].parse::<u32>().ok()
+    };
+    let min = read_int(&mut i).ok_or_else(bad)?;
+    let max = match b.get(i) {
+        Some(b'}') => min,
+        Some(b',') => {
+            i += 1;
+            if b.get(i) == Some(&b'}') {
+                u32::MAX
+            } else {
+                read_int(&mut i).ok_or_else(bad)?
+            }
+        }
+        _ => return Err(bad()),
+    };
+    if b.get(i) != Some(&b'}') {
+        return Err(bad());
+    }
+    i += 1;
+    if min > MAX_REPEAT || (max != u32::MAX && (max > MAX_REPEAT || min > max)) {
+        return Err(bad());
+    }
+    Ok((min, max, i))
+}
+
+/// The length preference of the RE as a whole: per PostgreSQL's ARE rules, the
+/// whole match prefers the length preference of the first quantified atom in
+/// the pattern (greedy when there is none).
+fn pattern_prefers_longest(pat: &str) -> bool {
+    let b = pat.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' => {
+                i += 1;
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+            }
+            b'*' | b'+' | b'?' => {
+                return b.get(i + 1) != Some(&b'?');
+            }
+            b'{' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                while i < b.len() && b[i] != b'}' {
+                    i += 1;
+                }
+                return b.get(i + 1) != Some(&b'?');
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Splits offset the first atom of `pat`: a single char, `.`, an escaped char, or
@@ -609,8 +729,43 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_constructs_rejected() {
-        assert!(regex_search("a{2}", "aa", false).is_err());
+    fn bounded_repetition() {
+        // All expectations verified against PostgreSQL 18.4.
+        assert!(m("^a{2}$", "aa"));
+        assert!(!m("^a{2}$", "a"));
+        assert!(!m("^a{2}$", "aaa"));
+        assert!(m("^a{2,}$", "aaaa"));
+        assert!(!m("^a{2,}$", "a"));
+        assert!(m("^a{1,3}$", "aa"));
+        assert!(!m("^a{1,3}$", "aaaa"));
+        assert!(m("^(ab){2}$", "abab"));
+        assert!(!m("^(ab){2}$", "ababab"));
+        assert!(m("^[0-9]{4}-[0-9]{2}$", "2024-06"));
+        // Zero-minimum bound.
+        assert!(m("^a{0,2}$", ""));
+        assert!(m("^a{0,2}$", "aa"));
+        // A `{` not followed by a digit is a literal (PostgreSQL behavior).
+        assert!(m("a{", "xa{y"));
+        assert!(m("^a\\{$", "a{"));
+        // Malformed / out-of-range bounds are loud errors.
+        assert!(regex_search("a{2,1}", "a", false).is_err());
+        assert!(regex_search("a{999}", "a", false).is_err());
+        assert!(regex_search("a{2x}", "a", false).is_err());
+    }
+
+    #[test]
+    fn non_greedy_quantifiers() {
+        use super::find;
+        // Boolean search is unaffected by greediness.
+        assert!(m("a+?", "aaa"));
+        assert!(m("a*?b", "aab"));
+        // find(): a leading non-greedy quantifier makes the whole match
+        // shortest-preference (PostgreSQL ARE rule).
+        assert_eq!(find("a+?", "aaa", 0, false).unwrap(), Some((0, 1)));
+        assert_eq!(find("a+", "aaa", 0, false).unwrap(), Some((0, 3)));
+        assert_eq!(find("a??", "aaa", 0, false).unwrap(), Some((0, 0)));
+        assert_eq!(find("a{2,3}?", "aaaa", 0, false).unwrap(), Some((0, 2)));
+        assert_eq!(find("a{2,3}", "aaaa", 0, false).unwrap(), Some((0, 3)));
     }
 
     #[test]

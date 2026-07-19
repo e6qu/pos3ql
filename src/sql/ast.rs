@@ -109,11 +109,27 @@ pub struct Select<'a> {
     pub set_body: Option<&'a SetTree<'a>>,
 }
 
-/// One `WITH name AS (SELECT ...)` common table expression.
+/// One `WITH name [(col, ...)] AS (SELECT ...)` common table expression.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cte<'a> {
     pub name: &'a str,
+    /// Optional output-column rename list (`WITH t(n) AS ...`); empty = none.
+    pub columns: &'a [&'a str],
+    /// The WITH clause carried the RECURSIVE keyword (a self-referencing body
+    /// is executed by fixpoint iteration rather than inline expansion).
+    pub recursive: bool,
     pub query: &'a Select<'a>,
+}
+
+/// The materialized rows of a recursive CTE, bound during CTE expansion so a
+/// `FROM cte_name` reference resolves to a pre-computed row set instead of an
+/// inline subquery. Rows are projected-encoded; column types are carried as
+/// `(type oid, typlen)` pairs so this stays free of storage-layer types.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaterializedCte<'a> {
+    pub column_names: &'a [&'a str],
+    pub column_types: &'a [(i32, i16)],
+    pub rows: &'a [&'a [u8]],
 }
 
 /// A base table plus a chain of joins (nested-loop order).
@@ -140,6 +156,9 @@ pub struct TableRef<'a> {
     /// derived table or a table function. A table function has a single output
     /// column, so it accepts exactly one name.
     pub col_alias: Option<&'a [&'a str]>,
+    /// Materialized recursive-CTE reference: when set, this FROM item reads the
+    /// pre-computed row set instead of a table or subquery.
+    pub cte: Option<&'a MaterializedCte<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

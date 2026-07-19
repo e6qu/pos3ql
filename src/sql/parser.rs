@@ -455,12 +455,10 @@ impl<'a> Parser<'a> {
     /// A top-level query: a set-operation tree of SELECTs, then the trailing
     /// ORDER BY / LIMIT / OFFSET that apply to the whole result. A lone SELECT
     /// (no set operator) folds those clauses back into itself.
-    /// `WITH name AS (SELECT ...), ... <SELECT body>` (non-recursive).
+    /// `WITH [RECURSIVE] name [(col, ...)] AS (SELECT ...), ... <SELECT body>`.
     fn with_query(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("with")?;
-        if self.eat_ident("recursive")? {
-            return Err(self.err_here("WITH RECURSIVE is not supported"));
-        }
+        let recursive = self.eat_ident("recursive")?;
         let placeholder: &'a Select<'a> = self
             .arena
             .alloc(Select {
@@ -478,13 +476,15 @@ impl<'a> Parser<'a> {
                 set_body: None,
             })
             .map_err(|_| self.err_here("statement too large for SQL arena"))?;
-        let mut ctes = [Cte { name: "", query: placeholder }; MAX_CTES];
+        let mut ctes = [Cte { name: "", columns: &[], recursive: false, query: placeholder }; MAX_CTES];
         let mut n = 0;
         loop {
             if n == MAX_CTES {
                 return Err(self.limit("WITH list", MAX_CTES));
             }
             let name = self.any_ident("CTE name")?;
+            // Optional output-column rename list `name(c1, c2, ...)`.
+            let columns = self.column_alias_list()?.unwrap_or(&[]);
             self.expect_ident("as")?;
             self.expect_op("(")?;
             let q = self.select()?;
@@ -493,7 +493,7 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc(q)
                 .map_err(|_| self.err_here("statement too large for SQL arena"))?;
-            ctes[n] = Cte { name, query: boxed };
+            ctes[n] = Cte { name, columns, recursive, query: boxed };
             n += 1;
             if !self.eat_op(",")? {
                 break;
@@ -667,6 +667,7 @@ impl<'a> Parser<'a> {
                 subquery: Some(boxed),
                 func_args: None,
                 col_alias,
+                cte: None,
             });
         }
         let first = self.any_ident("table name")?;
@@ -718,7 +719,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(TableRef { schema, table, alias, subquery: None, func_args, col_alias })
+        Ok(TableRef { schema, table, alias, subquery: None, func_args, col_alias, cte: None })
     }
 
     /// Parses an optional column-alias list `(col1, col2, ...)` following a FROM
@@ -748,7 +749,7 @@ impl<'a> Parser<'a> {
     fn from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
         let base = self.table_ref()?;
         let dummy = Join {
-            table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None },
+            table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None, cte: None },
             kind: JoinKind::Inner,
             on: None,
         };

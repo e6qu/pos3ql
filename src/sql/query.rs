@@ -19,8 +19,8 @@ use crate::storage::{ColumnMeta, SqlName, Storage, TableDef, MAX_COLUMNS};
 use crate::storage::rowenc;
 
 use super::ast::{
-    Expr, FromClause, Join, JoinKind, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree,
-    TableRef,
+    Cte, Expr, FromClause, Join, JoinKind, MaterializedCte, OrderBy, Select, SelectItem, SetOp,
+    SetQuery, SetTree, TableRef,
 };
 use super::eval::{
     compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError, SubqueryValues,
@@ -171,7 +171,7 @@ impl<'d> QueryScope<'d> {
     }
 
     fn add_ref(&mut self, storage: &'d Storage, tref: &TableRef<'d>) -> Result<(), SqlError> {
-        if tref.subquery.is_some() || tref.func_args.is_some() {
+        if tref.subquery.is_some() || tref.func_args.is_some() || tref.cte.is_some() {
             // Materialized separately by the executor; the schema-only resolve
             // path (no arena) cannot synthesize derived or function columns.
             return Err(sql_err!(
@@ -180,6 +180,67 @@ impl<'d> QueryScope<'d> {
             ));
         }
         self.add(storage, tref.table, tref.alias, 0)
+    }
+
+    /// Registers a materialized recursive CTE reference: a synthesized
+    /// `TableDef` from the CTE's column names/types, plus its precomputed rows.
+    /// `materialize` false = schema only (Describe path).
+    fn add_materialized<'a>(
+        &mut self,
+        tref: &'a TableRef<'a>,
+        m: &'a MaterializedCte<'a>,
+        arena: &'a Arena,
+        materialize: bool,
+    ) -> Result<(), SqlError>
+    where
+        'a: 'd,
+    {
+        let exposed = tref.alias.unwrap_or(tref.table);
+        if self.names[..self.n].contains(&exposed) {
+            return Err(sql_err!(
+                "42712",
+                "table name \"{}\" specified more than once",
+                exposed
+            ));
+        }
+        let ncols = m.column_names.len();
+        if ncols > MAX_COLUMNS {
+            return Err(sql_err!("54011", "too many columns"));
+        }
+        if let Some(aliases) = tref.col_alias
+            && aliases.len() > ncols
+        {
+            return Err(sql_err!(
+                "42P10",
+                "table \"{}\" has {} columns available but {} columns specified",
+                exposed,
+                ncols,
+                aliases.len()
+            ));
+        }
+        let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+        for (i, slot) in columns.iter_mut().enumerate().take(ncols) {
+            let name = tref
+                .col_alias
+                .and_then(|a| a.get(i).copied())
+                .unwrap_or(m.column_names[i]);
+            let ctype =
+                super::exec::coltype_of_oid(m.column_types[i].0).unwrap_or(ColType::Text);
+            *slot = ColumnMeta { name: SqlName::parse(name)?, ctype, ..ColumnMeta::EMPTY };
+        }
+        let def = TableDef {
+            name: SqlName::parse(exposed)?,
+            columns,
+            n_columns: ncols,
+            ..TableDef::empty()
+        };
+        let def_reference = arena.alloc(def).map_err(|_| arena_full())?;
+        self.names[self.n] = exposed;
+        self.defs[self.n] = Some(&*def_reference);
+        self.derived[self.n] = Some(if materialize { m.rows } else { &[] });
+        self.slots[self.n] = usize::MAX;
+        self.n += 1;
+        Ok(())
     }
 
     /// Add one FROM item, materializing a derived table if `tref` is a subquery.
@@ -194,6 +255,9 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
+        if let Some(m) = tref.cte {
+            return self.add_materialized(tref, m, arena, true);
+        }
         if tref.func_args.is_some() {
             return self.add_table_func(tref, arena, params, true);
         }
@@ -277,6 +341,9 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
+        if let Some(m) = tref.cte {
+            return self.add_materialized(tref, m, arena, false);
+        }
         if tref.func_args.is_some() {
             return self.add_table_func(tref, arena, &[], false);
         }
@@ -1049,37 +1116,435 @@ pub fn expand_ctes<'a>(
         return Err(sql_err!("54023", "too many WITH entries"));
     }
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
-    let mut resolved: [(&'a str, &'a Select<'a>); super::parser::MAX_CTES] =
-        [("", sel); super::parser::MAX_CTES];
+    let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); super::parser::MAX_CTES] =
+        [("", sel, &[]); super::parser::MAX_CTES];
     let mut n = 0;
     for cte in sel.with {
-        if resolved[..n].iter().any(|(name, _)| *name == cte.name) {
+        if resolved[..n].iter().any(|(name, _, _)| *name == cte.name) {
             return Err(sql_err!("42712", "WITH query name \"{}\" specified more than once", cte.name));
         }
-        let context = Subst { ctes: &resolved[..n], storage, depth: 0 };
-        let q = subst_select(cte.query, context, arena)?;
-        resolved[n] = (cte.name, q);
+        let context = Subst { ctes: &resolved[..n], materialized: &[], storage, depth: 0 };
+        // A self-referencing recursive CTE cannot be inlined; this schema-only
+        // path (Describe / view validation) binds its non-recursive term,
+        // which carries the CTE's column shape. Execution goes through
+        // `expand_ctes_exec`, which materializes the fixpoint.
+        let q = if cte.recursive && select_references(cte.query, cte.name) > 0 {
+            let (base, _, _) = recursive_parts(cte.query, cte.name)?;
+            let wrapped = wrap_set_tree(base, arena)?;
+            subst_select(wrapped, context, arena)?
+        } else {
+            subst_select(cte.query, context, arena)?
+        };
+        resolved[n] = (cte.name, q, cte.columns);
         n += 1;
     }
     // Substitute the body against all CTEs (the WITH list is dropped by
     // subst_select, which never copies it) and expand any view references.
-    let context = Subst { ctes: &resolved[..n], storage, depth: 0 };
+    let context = Subst { ctes: &resolved[..n], materialized: &[], storage, depth: 0 };
     subst_select(sel, context, arena)
 }
 
-type CteBindings<'a> = [(&'a str, &'a Select<'a>)];
+/// Like [`expand_ctes`], but for execution: a self-referencing recursive CTE is
+/// materialized to a fixpoint (base term, then the recursive term iterated with
+/// the CTE name bound to the previous iteration's rows) and its references
+/// resolve to the finished row set.
+pub fn expand_ctes_exec<'a>(
+    sel: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<&'a Select<'a>, SqlError> {
+    if sel.with.is_empty() && !storage.has_any_view() {
+        return Ok(sel);
+    }
+    if sel.with.len() > super::parser::MAX_CTES {
+        return Err(sql_err!("54023", "too many WITH entries"));
+    }
+    let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); super::parser::MAX_CTES] =
+        [("", sel, &[]); super::parser::MAX_CTES];
+    let mut n = 0;
+    let mut materialized: [(&'a str, &'a MaterializedCte<'a>); super::parser::MAX_CTES] =
+        [("", &EMPTY_CTE); super::parser::MAX_CTES];
+    let mut nm = 0;
+    for cte in sel.with {
+        if resolved[..n].iter().any(|(name, _, _)| *name == cte.name)
+            || materialized[..nm].iter().any(|(name, _)| *name == cte.name)
+        {
+            return Err(sql_err!("42712", "WITH query name \"{}\" specified more than once", cte.name));
+        }
+        let context = Subst {
+            ctes: &resolved[..n],
+            materialized: &materialized[..nm],
+            storage,
+            depth: 0,
+        };
+        if cte.recursive && select_references(cte.query, cte.name) > 0 {
+            let m = materialize_recursive(cte, context, storage, txid, arena, params)?;
+            materialized[nm] = (cte.name, m);
+            nm += 1;
+        } else {
+            let q = subst_select(cte.query, context, arena)?;
+            resolved[n] = (cte.name, q, cte.columns);
+            n += 1;
+        }
+    }
+    let context = Subst {
+        ctes: &resolved[..n],
+        materialized: &materialized[..nm],
+        storage,
+        depth: 0,
+    };
+    subst_select(sel, context, arena)
+}
 
-/// Threaded through the FROM-reference rewrite: CTE bindings in scope, storage
-/// (to resolve view names), and the current view-expansion depth (a cycle /
+static EMPTY_CTE: MaterializedCte<'static> =
+    MaterializedCte { column_names: &[], column_types: &[], rows: &[] };
+
+type CteBindings<'a> = [(&'a str, &'a Select<'a>, &'a [&'a str])];
+
+/// Threaded through the FROM-reference rewrite: CTE bindings in scope (query
+/// plus optional column-rename list), materialized recursive CTEs, storage (to
+/// resolve view names), and the current view-expansion depth (a cycle /
 /// runaway-nesting guard).
 #[derive(Clone, Copy)]
 struct Subst<'c, 'a> {
     ctes: &'c CteBindings<'a>,
+    materialized: &'c [(&'a str, &'a MaterializedCte<'a>)],
     storage: &'a Storage,
     depth: u32,
 }
 
 const MAX_VIEW_DEPTH: u32 = 12;
+
+/// Number of references to the unqualified table name `name` anywhere in a
+/// select — FROM items (recursing into derived-table subqueries), the set-op
+/// body, and expression subqueries.
+fn select_references(s: &Select, name: &str) -> usize {
+    if let Some(tree) = s.set_body {
+        return set_tree_references(tree, name);
+    }
+    let mut count = 0usize;
+    if let Some(f) = &s.from {
+        count += tref_references(&f.base, name);
+        for j in f.joins {
+            count += tref_references(&j.table, name);
+            if let Some(on) = j.on {
+                count += expr_references(on, name);
+            }
+        }
+    }
+    for it in s.items {
+        if let SelectItem::Expr { expression, .. } = it {
+            count += expr_references(expression, name);
+        }
+    }
+    if let Some(w) = s.where_clause {
+        count += expr_references(w, name);
+    }
+    if let Some(h) = s.having {
+        count += expr_references(h, name);
+    }
+    for g in s.group_by {
+        count += expr_references(g, name);
+    }
+    count
+}
+
+fn tref_references(t: &TableRef, name: &str) -> usize {
+    if let Some(sub) = t.subquery {
+        return select_references(sub, name);
+    }
+    usize::from(t.schema.is_none() && t.func_args.is_none() && t.table == name)
+}
+
+fn set_tree_references(tree: &SetTree, name: &str) -> usize {
+    match tree {
+        SetTree::Select(s) => select_references(s, name),
+        SetTree::Op { left, right, .. } => {
+            set_tree_references(left, name) + set_tree_references(right, name)
+        }
+    }
+}
+
+/// Number of references to `name` inside expression subqueries of `e`.
+fn expr_references(e: &Expr, name: &str) -> usize {
+    match e {
+        Expr::Subquery(s) | Expr::Exists(s) | Expr::ArraySubquery(s) => select_references(s, name),
+        Expr::InSubquery { operand, select, .. } => {
+            expr_references(operand, name) + select_references(select, name)
+        }
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
+            expr_references(operand, name)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_references(left, name) + expr_references(right, name)
+        }
+        Expr::Call { args, .. } => args.iter().map(|a| expr_references(a, name)).sum(),
+        Expr::InList { operand, list, .. } => {
+            expr_references(operand, name)
+                + list.iter().map(|x| expr_references(x, name)).sum::<usize>()
+        }
+        Expr::Between { operand, low, high, .. } => {
+            expr_references(operand, name)
+                + expr_references(low, name)
+                + expr_references(high, name)
+        }
+        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+            expr_references(operand, name) + expr_references(pattern, name)
+        }
+        Expr::Case { operand, whens, otherwise } => {
+            operand.map_or(0, |o| expr_references(o, name))
+                + whens
+                    .iter()
+                    .map(|(c, r)| expr_references(c, name) + expr_references(r, name))
+                    .sum::<usize>()
+                + otherwise.map_or(0, |o| expr_references(o, name))
+        }
+        Expr::Array(items) => items.iter().map(|x| expr_references(x, name)).sum(),
+        Expr::Subscript { base, index } => {
+            expr_references(base, name) + expr_references(index, name)
+        }
+        Expr::Field { base, .. } => expr_references(base, name),
+        Expr::AnyAll { operand, array, .. } => {
+            expr_references(operand, name) + expr_references(array, name)
+        }
+        _ => 0,
+    }
+}
+
+/// Number of *direct* FROM references to `name` in the top-level selects of a
+/// set tree (base table or join item; a reference inside a derived-table
+/// subquery or an expression subquery does not count).
+fn direct_references(tree: &SetTree, name: &str) -> usize {
+    let direct = |t: &TableRef| -> usize {
+        usize::from(
+            t.schema.is_none()
+                && t.subquery.is_none()
+                && t.func_args.is_none()
+                && t.table == name,
+        )
+    };
+    match tree {
+        SetTree::Select(s) => {
+            let mut count = 0;
+            if let Some(f) = &s.from {
+                count += direct(&f.base);
+                for j in f.joins {
+                    count += direct(&j.table);
+                }
+            }
+            count
+        }
+        SetTree::Op { left, right, .. } => {
+            direct_references(left, name) + direct_references(right, name)
+        }
+    }
+}
+
+/// Splits a recursive CTE body into `(non-recursive term, recursive term,
+/// union-all)`, enforcing PostgreSQL's required shape.
+fn recursive_parts<'a>(
+    q: &'a Select<'a>,
+    name: &str,
+) -> Result<(&'a SetTree<'a>, &'a SetTree<'a>, bool), SqlError> {
+    let Some(&SetTree::Op { operator: SetOp::Union, all, left, right }) = q.set_body else {
+        return Err(sql_err!(
+            "42P19",
+            "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] recursive-term",
+            name
+        ));
+    };
+    if !q.order_by.is_empty() || q.limit.is_some() || q.offset.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "ORDER BY/LIMIT in a recursive query body is not supported"
+        ));
+    }
+    if set_tree_references(left, name) > 0 {
+        return Err(sql_err!(
+            "42P19",
+            "recursive reference to query \"{}\" must not appear within its non-recursive term",
+            name
+        ));
+    }
+    Ok((left, right, all))
+}
+
+/// Wraps a set tree as a `Select` (a lone leaf is returned as-is).
+fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Select<'a>, SqlError> {
+    if let SetTree::Select(s) = tree {
+        return Ok(s);
+    }
+    let sel = Select {
+        items: &[],
+        distinct: false,
+        from: None,
+        where_clause: None,
+        group_by: &[],
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with: &[],
+        set_body: Some(tree),
+    };
+    Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
+}
+
+/// Materializes a self-referencing recursive CTE to its fixpoint: the
+/// non-recursive term's rows first, then the recursive term evaluated
+/// repeatedly with the CTE name bound to the previous iteration's rows,
+/// accumulating until an iteration adds nothing (UNION deduplicates against
+/// everything seen; UNION ALL keeps duplicates and stops on an empty
+/// iteration). Row storage is arena-bounded: runaway recursion fails loudly
+/// with arena exhaustion, and the statement timeout is honored per iteration.
+fn materialize_recursive<'a>(
+    cte: &'a Cte<'a>,
+    outer: Subst<'_, 'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    let (base_tree, recursive_tree, union_all) = recursive_parts(cte.query, cte.name)?;
+    // References to earlier CTEs inline now; the self-reference stays a bare
+    // table name (it is not in `outer`'s bindings) for per-iteration binding.
+    let base_tree = subst_set_tree(base_tree, outer, arena)?;
+    let recursive_tree = subst_set_tree(recursive_tree, outer, arena)?;
+    let total = set_tree_references(recursive_tree, cte.name);
+    let direct = direct_references(recursive_tree, cte.name);
+    if total > direct {
+        return Err(sql_err!(
+            "42P19",
+            "recursive reference to query \"{}\" must not appear within a subquery",
+            cte.name
+        ));
+    }
+    if direct > 1 {
+        return Err(sql_err!(
+            "42P19",
+            "recursive reference to query \"{}\" must not appear more than once",
+            cte.name
+        ));
+    }
+    // Column names and types come from the non-recursive term, with the CTE's
+    // rename list applied.
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena)?;
+    if cte.columns.len() > ncols {
+        return Err(sql_err!(
+            "42P10",
+            "WITH query \"{}\" has {} columns available but {} columns specified",
+            cte.name,
+            ncols,
+            cte.columns.len()
+        ));
+    }
+    let column_names: &'a [&'a str] = {
+        let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
+        for (i, slot) in names.iter_mut().enumerate().take(ncols) {
+            *slot = cte.columns.get(i).copied().unwrap_or(described[i].name);
+        }
+        arena.alloc_slice_copy(&names[..ncols]).map_err(|_| arena_full())?
+    };
+    let column_types: &'a [(i32, i16)] = {
+        let mut types = [(0i32, 0i16); MAX_PROJ];
+        for (i, slot) in types.iter_mut().enumerate().take(ncols) {
+            *slot = (described[i].type_oid, described[i].typlen);
+        }
+        arena.alloc_slice_copy(&types[..ncols]).map_err(|_| arena_full())?
+    };
+
+    // Base rows; UNION (without ALL) deduplicates them among themselves.
+    // Projected-row encoding is order-preserving-for-equality, so byte equality
+    // is row equality.
+    let (base_rows, _, _) = materialize_set_body(storage, txid, base_tree, arena, params)?;
+    const EMPTY: &[u8] = &[];
+    let mut all_rows: &'a [&'a [u8]] = if union_all {
+        base_rows
+    } else {
+        let deduped = arena
+            .alloc_slice_with(base_rows.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        let mut kept = 0usize;
+        for &r in base_rows.iter() {
+            if !deduped[..kept].contains(&r) {
+                deduped[kept] = r;
+                kept += 1;
+            }
+        }
+        &deduped[..kept]
+    };
+    let mut working: &'a [&'a [u8]] = all_rows;
+
+    while !working.is_empty() {
+        check_timeout()?;
+        // Bind the CTE name to the previous iteration's rows and evaluate the
+        // recursive term.
+        let working_cte = arena
+            .alloc(MaterializedCte { column_names, column_types, rows: working })
+            .map_err(|_| arena_full())?;
+        let binding = [(cte.name, &*working_cte)];
+        let context = Subst { ctes: &[], materialized: &binding, storage, depth: 0 };
+        let step_tree = subst_set_tree(recursive_tree, context, arena)?;
+        // The recursive term's column types must agree with the non-recursive
+        // term's (PostgreSQL unifies them; a mismatch is a loud error).
+        let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
+        if stepn != ncols {
+            return Err(sql_err!(
+                "42601",
+                "each UNION query must have the same number of columns"
+            ));
+        }
+        for c in 0..ncols {
+            if step_desc[c].type_oid != column_types[c].0 {
+                return Err(sql_err!(
+                    "42804",
+                    "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
+                    cte.name,
+                    c + 1,
+                    column_types[c].0,
+                    step_desc[c].type_oid
+                ));
+            }
+        }
+        let (step_rows, _, _) = materialize_set_body(storage, txid, step_tree, arena, params)?;
+        // Keep the rows this iteration added: all of them under UNION ALL, only
+        // never-seen ones under UNION.
+        let fresh: &'a [&'a [u8]] = if union_all {
+            step_rows
+        } else {
+            let kept_rows = arena
+                .alloc_slice_with(step_rows.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            let mut kept = 0usize;
+            for &r in step_rows.iter() {
+                if !all_rows.contains(&r) && !kept_rows[..kept].contains(&r) {
+                    kept_rows[kept] = r;
+                    kept += 1;
+                }
+            }
+            &kept_rows[..kept]
+        };
+        if fresh.is_empty() {
+            break;
+        }
+        let combined = arena
+            .alloc_slice_with(all_rows.len() + fresh.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        combined[..all_rows.len()].copy_from_slice(all_rows);
+        combined[all_rows.len()..].copy_from_slice(fresh);
+        all_rows = combined;
+        working = fresh;
+    }
+
+    Ok(&*arena
+        .alloc(MaterializedCte { column_names, column_types, rows: all_rows })
+        .map_err(|_| arena_full())?)
+}
 
 fn subst_select<'a>(
     s: &'a Select<'a>,
@@ -1190,18 +1655,40 @@ fn subst_tableref<'a>(
             ..*t
         });
     }
+    // An unqualified name matching a materialized (recursive) CTE resolves to
+    // its precomputed row set.
+    if t.schema.is_none()
+        && t.func_args.is_none()
+        && let Some((_, m)) = context.materialized.iter().find(|(name, _)| *name == t.table)
+    {
+        return Ok(TableRef {
+            schema: None,
+            table: t.table,
+            alias: Some(t.alias.unwrap_or(t.table)),
+            subquery: None,
+            func_args: None,
+            col_alias: t.col_alias,
+            cte: Some(m),
+        });
+    }
     // An unqualified name matching a CTE becomes a derived table over the
     // (already-substituted) CTE query, exposed under its alias or CTE name.
+    // The CTE's own column-rename list applies unless the reference carries an
+    // explicit one (`FROM t AS x(c1, ...)`).
     if t.schema.is_none()
-        && let Some((_, q)) = context.ctes.iter().find(|(name, _)| *name == t.table)
+        && let Some((_, q, columns)) = context.ctes.iter().find(|(name, _, _)| *name == t.table)
     {
+        let renames = t
+            .col_alias
+            .or(if columns.is_empty() { None } else { Some(columns) });
         return Ok(TableRef {
             schema: None,
             table: "",
             alias: Some(t.alias.unwrap_or(t.table)),
             subquery: Some(q),
             func_args: None,
-            col_alias: None,
+            col_alias: renames,
+            cte: None,
         });
     }
     // A name matching a view (and not shadowed by a CTE or table) expands to a
@@ -1221,6 +1708,7 @@ fn subst_tableref<'a>(
         // The view body has its own scope: no outer CTEs, deeper view depth.
         let inner = Subst {
             ctes: &[],
+            materialized: &[],
             storage: context.storage,
             depth: context.depth + 1,
         };
@@ -1232,6 +1720,7 @@ fn subst_tableref<'a>(
             subquery: Some(expanded),
             func_args: None,
             col_alias: None,
+            cte: None,
         });
     }
     Ok(*t)
@@ -2922,7 +3411,7 @@ impl Default for AggState<'_> {
 
 impl<'a> AggState<'a> {
     fn init(&mut self, node: &'a Expr<'a>) -> Result<(), SqlError> {
-        let Expr::Call { name, star, distinct, order_by, .. } = node else {
+        let Expr::Call { name, star, distinct, order_by, args, .. } = node else {
             return Err(sql_err!("42803", "not an aggregate"));
         };
         self.kind = match *name {
@@ -2957,10 +3446,16 @@ impl<'a> AggState<'a> {
         // so their result is identical regardless of input order).
         if !order_by.is_empty() && self.kind == AggKind::StringAgg {
             if *distinct {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "string_agg with both DISTINCT and ORDER BY is not supported yet"
-                ));
+                // With DISTINCT, PostgreSQL permits ORDER BY only on the
+                // aggregated expression itself.
+                let sorts_by_argument =
+                    order_by.len() == 1 && args.first().is_some_and(|a| **a == *order_by[0].expression);
+                if !sorts_by_argument {
+                    return Err(sql_err!(
+                        "42P10",
+                        "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+                    ));
+                }
             }
             self.ordered = true;
             self.ord_spec = order_by;
@@ -3161,6 +3656,14 @@ impl<'a> AggState<'a> {
             }
             let enc =
                 super::exec::encode_projected_pub(&tuple[..1 + self.ord_spec.len()], arena)?;
+            // DISTINCT (the sort key is the value itself, enforced in init):
+            // encoded-tuple equality is value equality, so skip duplicates.
+            if self.distinct && self.ord_len > 0 {
+                let seen = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
+                if seen.contains(&enc) {
+                    return Ok(());
+                }
+            }
             self.push_ordered(enc, arena)?;
             self.count += 1;
             return Ok(());

@@ -2460,6 +2460,45 @@ fn call<'a>(
                 )?)),
             }
         }
+        "age" => {
+            // `age(a, b)` is the symbolic interval a - b; `age(a)` measures from
+            // the current date at midnight.
+            if args.len() != 1 && args.len() != 2 || star {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) with {} arguments does not exist",
+                    name,
+                    args.len()
+                ));
+            }
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            if a.is_null() {
+                return Ok(Datum::Null);
+            }
+            let a = timestamp_micros(name, a)?;
+            let b = if args.len() == 2 {
+                match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Null => return Ok(Datum::Null),
+                    other => timestamp_micros(name, other)?,
+                }
+            } else {
+                let day = 86_400_000_000i64;
+                super::datetime::now_micros().div_euclid(day) * day
+            };
+            Ok(Datum::Interval(super::datetime::age_between(a, b)))
+        }
+        "justify_hours" | "justify_days" | "justify_interval" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Interval(iv) => Ok(Datum::Interval(match name {
+                    "justify_hours" => super::datetime::justify_hours(iv),
+                    "justify_days" => super::datetime::justify_days(iv),
+                    _ => super::datetime::justify_interval(iv),
+                })),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
         "to_hex" => {
             arity(1)?;
             let s = match eval_full(args[0], arena, params, row, hooks)? {
@@ -3746,6 +3785,16 @@ fn arithmetic<'a>(
                 micros: a.micros + s as i64 * b.micros,
             }));
         }
+        // `interval * number` / `number * interval` / `interval / number`.
+        (BinaryOp::Mul, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), false)));
+        }
+        (BinaryOp::Mul, _, Datum::Interval(iv)) if num_factor(&l).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&l).expect("checked"), false)));
+        }
+        (BinaryOp::Div, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), true)));
+        }
         (BinaryOp::Add | BinaryOp::Sub, dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)), Datum::Interval(iv))
         | (BinaryOp::Add, Datum::Interval(iv), dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_))) => {
             let base = match dt {
@@ -4203,6 +4252,28 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
     let cleaned = core::str::from_utf8(&buf[..n]).ok()?;
     let v = i64::from_str_radix(cleaned, radix).ok()?;
     Some(if neg { -v } else { v })
+}
+
+/// Converts a temporal datum to microseconds from the PostgreSQL epoch, as the
+/// symbolic-age functions need. A date is taken at midnight.
+fn timestamp_micros(name: &str, d: Datum) -> Result<i64, SqlError> {
+    match d {
+        Datum::Timestamp(t) | Datum::Timestamptz(t) => Ok(t),
+        Datum::Date(day) => Ok(i64::from(day) * 86_400_000_000),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
+/// A numeric scaling factor for `interval * n` / `interval / n` (integer,
+/// double, or numeric). Text and other types are not factors.
+fn num_factor(d: &Datum) -> Option<f64> {
+    match d {
+        Datum::Int4(x) => Some(f64::from(*x)),
+        Datum::Int8(x) => Some(*x as f64),
+        Datum::Float8(x) => Some(*x),
+        Datum::Numeric(n) => Some(n.to_f64()),
+        _ => None,
+    }
 }
 
 fn parse_bool(s: &str) -> Result<bool, SqlError> {

@@ -2619,6 +2619,13 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                             return Ok(of(if ro == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
                         }
                     }
+                    // interval * number / number * interval / interval / number.
+                    if (matches!(op, Mul) && lo == oid::INTERVAL && numeric(ro))
+                        || (matches!(op, Mul) && numeric(lo) && ro == oid::INTERVAL)
+                        || (matches!(op, Div) && lo == oid::INTERVAL && numeric(ro))
+                    {
+                        return Ok(of(ColType::Interval));
+                    }
                     let l_ok = lo == oid::UNKNOWN || numeric(lo);
                     let r_ok = ro == oid::UNKNOWN || numeric(ro);
                     if (!l_ok || !r_ok)
@@ -2881,6 +2888,9 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),
+            "age" | "justify_hours" | "justify_days" | "justify_interval" => {
+                of(ColType::Interval)
+            }
             "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
                 of(ColType::Range(super::types::RangeKind::from_name(name).expect("range name")))
             }

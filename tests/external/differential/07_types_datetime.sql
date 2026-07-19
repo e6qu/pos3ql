@@ -13,3 +13,14 @@ SELECT max(t), min(d) FROM ev7;
 SELECT id FROM ev7 WHERE u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
 SELECT '2023-02-29'::date;
 DROP TABLE ev7;
+-- interval scaling and justification
+SELECT interval '1 day' * 3, interval '1 month' * 1.5, interval '2 hours' * 2.5;
+SELECT interval '1 day' / 2, interval '10 days' / 3, 2 * interval '3 hours';
+SELECT justify_hours(interval '36 hours'), justify_days(interval '35 days');
+SELECT justify_interval(interval '1 mon -1 hour');
+-- age (symbolic calendar interval)
+SELECT age(timestamp '2024-06-15', timestamp '2020-01-10');
+SELECT age(timestamp '2020-01-10', timestamp '2024-06-15');
+SELECT age(timestamp '2024-03-01', timestamp '2024-01-31');
+SELECT age(timestamp '2024-01-01 10:00', timestamp '2023-12-15 14:30');
+SELECT age(date '2000-01-01', date '1999-02-05');

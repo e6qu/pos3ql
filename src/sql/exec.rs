@@ -2534,6 +2534,7 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     of(ColType::Bool)
                 }
                 And | Or => of(ColType::Bool),
+                Contains | ContainedBy | Overlaps => of(ColType::Bool),
                 // `||` concatenates arrays when either side is an array (the
                 // array type is preserved), otherwise it is text concatenation.
                 Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => {

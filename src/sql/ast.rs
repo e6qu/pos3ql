@@ -521,6 +521,10 @@ pub enum BinaryOp {
     Shr,
     /// `^` exponentiation (double precision).
     Pow,
+    /// `@>` contains, `<@` contained by, `&&` overlaps (ranges).
+    Contains,
+    ContainedBy,
+    Overlaps,
 }
 
 impl BinaryOp {
@@ -531,6 +535,8 @@ impl BinaryOp {
             Self::Or => 1,
             Self::And => 2,
             Self::Eq | Self::NotEq | Self::Lt | Self::LtEq | Self::Gt | Self::GtEq => 4,
+            // Containment/overlap operators bind like comparisons.
+            Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
             Self::Concat => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,
             // matching PostgreSQL (they are non-standard, mid-precedence).

@@ -632,6 +632,77 @@ pub fn compare(a: &Numeric, b: &Numeric) -> Ordering {
     }
 }
 
+/// Compares two plain decimal literals (`[+-]?digits[.digits]`) by value,
+/// allocation-free — used where no arena is available (range sort/compare).
+/// Returns `None` if either string is not a plain decimal (e.g. contains an
+/// exponent); the caller then fails loudly rather than guessing.
+pub fn cmp_decimal_str(a: &str, b: &str) -> Option<Ordering> {
+    let (asign, aint, afrac) = split_decimal(a)?;
+    let (bsign, bint, bfrac) = split_decimal(b)?;
+    let a_zero = aint.is_empty() && afrac.is_empty();
+    let b_zero = bint.is_empty() && bfrac.is_empty();
+    if a_zero && b_zero {
+        return Some(Ordering::Equal);
+    }
+    let mag = cmp_decimal_magnitude(aint, afrac, bint, bfrac);
+    // Signed ordering: treat a genuine zero as non-negative.
+    let aneg = asign && !a_zero;
+    let bneg = bsign && !b_zero;
+    Some(match (aneg, bneg) {
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+        (false, false) => mag,
+        (true, true) => mag.reverse(),
+    })
+}
+
+/// Splits a plain decimal into (negative, integer-digits, fraction-digits) with
+/// leading integer zeros and trailing fraction zeros removed. `None` if the
+/// input is not a plain decimal literal.
+fn split_decimal(s: &str) -> Option<(bool, &str, &str)> {
+    let t = s.trim();
+    let (neg, rest) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let (int, frac) = match rest.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (rest, ""),
+    };
+    if !int.bytes().all(|c| c.is_ascii_digit()) || !frac.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    Some((neg, int, frac))
+}
+
+/// Compares magnitudes given normalized integer and fraction digit strings.
+fn cmp_decimal_magnitude(aint: &str, afrac: &str, bint: &str, bfrac: &str) -> Ordering {
+    if aint.len() != bint.len() {
+        return aint.len().cmp(&bint.len());
+    }
+    match aint.cmp(bint) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    let n = afrac.len().max(bfrac.len());
+    let ab = afrac.as_bytes();
+    let bb = bfrac.as_bytes();
+    for i in 0..n {
+        let da = ab.get(i).copied().unwrap_or(b'0');
+        let db = bb.get(i).copied().unwrap_or(b'0');
+        if da != db {
+            return da.cmp(&db);
+        }
+    }
+    Ordering::Equal
+}
+
 fn compare_magnitude(a: &Numeric, b: &Numeric) -> Ordering {
     if a.weight != b.weight {
         return a.weight.cmp(&b.weight);
@@ -1687,4 +1758,25 @@ mod tests {
         assert_eq!(p("-42.5", &a).to_i64().unwrap(), -43);
     }
 
+    #[test]
+    fn decimal_str_compare_is_value_based() {
+        use Ordering::{Equal, Greater, Less};
+        let c = cmp_decimal_str;
+        // Trailing/leading zeros do not change value.
+        assert_eq!(c("1.0", "1.00"), Some(Equal));
+        assert_eq!(c("01", "1"), Some(Equal));
+        assert_eq!(c("0", "0.0"), Some(Equal));
+        assert_eq!(c("-0", "0"), Some(Equal));
+        // Magnitude and sign.
+        assert_eq!(c("2", "10"), Some(Less));
+        assert_eq!(c("1.5", "1.25"), Some(Greater));
+        assert_eq!(c("-3", "2"), Some(Less));
+        assert_eq!(c("-3", "-5"), Some(Greater));
+        assert_eq!(c("100", "99.999"), Some(Greater));
+        // Fractional-only difference.
+        assert_eq!(c("1.2", "1.20001"), Some(Less));
+        // Not a plain decimal → None (caller fails loudly).
+        assert_eq!(c("1e3", "1000"), None);
+        assert_eq!(c("abc", "1"), None);
+    }
 }

@@ -3110,10 +3110,14 @@ fn binary<'a>(
     match op {
         And | Or => logic(op, l, r),
         Concat => concat(l, r, arena),
-        Eq | NotEq | Lt | LtEq | Gt | GtEq => compare(op, l, r, l_unknown, r_unknown),
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(op, l, r),
+            _ => compare(op, l, r, l_unknown, r_unknown),
+        },
         Add | Sub | Mul | Div | Mod => arithmetic(op, l, r, l_unknown, r_unknown, arena),
         JsonGet | JsonGetText => json_get(l, r, op == JsonGetText, arena),
         BitAnd | BitOr | BitXor | Shl | Shr => bitwise(op, l, r),
+        Contains | ContainedBy | Overlaps => range_op(op, l, r),
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
             // is float8); otherwise it is double-precision exponentiation.
@@ -3130,6 +3134,60 @@ fn binary<'a>(
             let (a, b) = (datum_f64("^", l)?, datum_f64("^", r)?);
             Ok(Datum::Float8(a.powf(b)))
         }
+    }
+}
+
+/// Range containment/overlap operators: `@>` (contains), `<@` (contained by),
+/// `&&` (overlaps). `@>`/`<@` accept a range-vs-range or range-vs-element pair.
+fn range_op<'a>(
+    op: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    match op {
+        BinaryOp::Contains => range_contains(l, r),
+        BinaryOp::ContainedBy => range_contains(r, l),
+        BinaryOp::Overlaps => {
+            let (lt, lk) = as_range(&l)?;
+            let (rt, rk) = as_range(&r)?;
+            if lk != rk {
+                return Err(range_mismatch());
+            }
+            Ok(Datum::Bool(super::range::overlaps(lt, rt, lk)?))
+        }
+        _ => unreachable!("range_op only handles containment/overlap"),
+    }
+}
+
+fn range_mismatch() -> SqlError {
+    sql_err!(sqlstate::UNDEFINED_FUNCTION, "operator requires matching range types")
+}
+
+/// Whether `container` (a range) contains `contained` (a range of the same kind
+/// or a bare element).
+fn range_contains<'a>(container: Datum<'a>, contained: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    let (ct, ck) = as_range(&container)?;
+    match contained {
+        Datum::Range { text, kind } => {
+            if kind != ck {
+                return Err(range_mismatch());
+            }
+            Ok(Datum::Bool(super::range::contains_range(ct, text, ck)?))
+        }
+        elem => {
+            let es = stack_format!(64, "{}", elem);
+            Ok(Datum::Bool(super::range::contains_elem(ct, ck, es.as_str())?))
+        }
+    }
+}
+
+fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), SqlError> {
+    match d {
+        Datum::Range { text, kind } => Ok((text, *kind)),
+        other => Err(type_mismatch("range operator", other)),
     }
 }
 
@@ -3379,6 +3437,17 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
         (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
         (Datum::Numeric(a), Datum::Numeric(b)) => numeric::compare(a, b),
+        (Datum::Range { text: a, kind: ka }, Datum::Range { text: b, kind: kb }) => {
+            if ka != kb {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} = {}",
+                    ka.name(),
+                    kb.name()
+                ));
+            }
+            super::range::cmp_ranges(a, b, *ka)?
+        }
         // Numeric vs integer: compare exactly via numeric.
         (Datum::Numeric(_), Datum::Int4(_) | Datum::Int8(_))
         | (Datum::Int4(_) | Datum::Int8(_), Datum::Numeric(_)) => {
@@ -3445,6 +3514,52 @@ fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a>, SqlError
         Datum::Uuid(_) => Datum::Uuid(parse_uuid(s)?),
         _ => v,
     })
+}
+
+/// Range comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`). Both operands
+/// must be ranges of the same kind; ordering follows PostgreSQL `range_cmp`.
+fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let sym = match op {
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::GtEq => ">=",
+        _ => unreachable!(),
+    };
+    let (Datum::Range { text: lt, kind: lk }, Datum::Range { text: rt, kind: rk }) = (l, r) else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            type_name_of(&l),
+            sym,
+            type_name_of(&r)
+        ));
+    };
+    if lk != rk {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            lk.name(),
+            sym,
+            rk.name()
+        ));
+    }
+    let ord = super::range::cmp_ranges(lt, rt, lk)?;
+    let out = match op {
+        BinaryOp::Eq => ord.is_eq(),
+        BinaryOp::NotEq => ord.is_ne(),
+        BinaryOp::Lt => ord.is_lt(),
+        BinaryOp::LtEq => ord.is_le(),
+        BinaryOp::Gt => ord.is_gt(),
+        BinaryOp::GtEq => ord.is_ge(),
+        _ => unreachable!(),
+    };
+    Ok(Datum::Bool(out))
 }
 
 fn compare<'a>(

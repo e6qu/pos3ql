@@ -5,7 +5,8 @@
 //! canonicalized to the half-open `[lower, upper)` form, as PostgreSQL does.
 //!
 //! Allocation-free: intermediate bound text lives in fixed stack buffers, and
-//! numeric comparisons borrow the caller's arena (no post-startup heap).
+//! bound comparison (including numeric) works directly on the text with no
+//! post-startup heap, so the ordering/containment operators need no arena.
 
 use core::cmp::Ordering;
 use core::fmt::Write as _;
@@ -71,7 +72,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
         return alloc(arena, "empty");
     }
     if let (Some(lo), Some(hi)) = (p.lower, p.upper)
-        && cmp_elem(lo, hi, kind, arena)? == Ordering::Greater
+        && cmp_elem(lo, hi, kind)? == Ordering::Greater
     {
         return Err(sql_err!(
             "22000",
@@ -100,7 +101,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
             }
         };
         if let (Some(l), Some(h)) = (lo, hi)
-            && cmp_elem(l, h, kind, arena)? != Ordering::Less
+            && cmp_elem(l, h, kind)? != Ordering::Less
         {
             return alloc(arena, "empty");
         }
@@ -111,7 +112,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
     }
     // Continuous: empty when bounds are equal and not both inclusive.
     if let (Some(lo), Some(hi)) = (p.lower, p.upper)
-        && cmp_elem(lo, hi, kind, arena)? == Ordering::Equal
+        && cmp_elem(lo, hi, kind)? == Ordering::Equal
         && !(p.lower_inc && p.upper_inc)
     {
         return alloc(arena, "empty");
@@ -152,7 +153,7 @@ fn elem_text<'a>(d: Datum, kind: RangeKind, arena: &'a Arena) -> Result<Option<&
     let s = stack_format!(64, "{}", d);
     let owned = alloc(arena, s.as_str())?;
     // Validate it parses for this kind.
-    cmp_elem(owned, owned, kind, arena)?;
+    cmp_elem(owned, owned, kind)?;
     Ok(Some(owned))
 }
 
@@ -180,7 +181,7 @@ fn incr_into(v: &str, kind: RangeKind, buf: &mut StackStr<48>) -> Result<(), Sql
 }
 
 /// Compares two bound element texts under `kind`'s subtype ordering.
-fn cmp_elem(a: &str, b: &str, kind: RangeKind, arena: &Arena) -> Result<Ordering, SqlError> {
+fn cmp_elem(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
     Ok(match kind {
         RangeKind::Int4 | RangeKind::Int8 => {
             let x: i64 = a.trim().parse().map_err(|_| bad(kind, a))?;
@@ -193,11 +194,10 @@ fn cmp_elem(a: &str, b: &str, kind: RangeKind, arena: &Arena) -> Result<Ordering
             .cmp(&super::datetime::parse_timestamp(b.trim(), false)?),
         RangeKind::Tstz => super::datetime::parse_timestamp(a.trim(), true)?
             .cmp(&super::datetime::parse_timestamp(b.trim(), true)?),
-        RangeKind::Num => {
-            let x = Numeric::parse(a.trim(), arena)?;
-            let y = Numeric::parse(b.trim(), arena)?;
-            numeric::compare(&x, &y)
-        }
+        RangeKind::Num => match numeric::cmp_decimal_str(a.trim(), b.trim()) {
+            Some(o) => o,
+            None => return Err(bad(kind, a)),
+        },
     })
 }
 
@@ -246,25 +246,20 @@ pub fn bound_inc(text: &str, kind: RangeKind, lower: bool) -> Result<bool, SqlEr
 }
 
 /// `range @> element`.
-pub fn contains_elem(
-    text: &str,
-    kind: RangeKind,
-    elem: &str,
-    arena: &Arena,
-) -> Result<bool, SqlError> {
+pub fn contains_elem(text: &str, kind: RangeKind, elem: &str) -> Result<bool, SqlError> {
     let p = parse(text, kind)?;
     if p.empty {
         return Ok(false);
     }
     if let Some(lo) = p.lower {
-        match cmp_elem(elem, lo, kind, arena)? {
+        match cmp_elem(elem, lo, kind)? {
             Ordering::Less => return Ok(false),
             Ordering::Equal if !p.lower_inc => return Ok(false),
             _ => {}
         }
     }
     if let Some(hi) = p.upper {
-        match cmp_elem(elem, hi, kind, arena)? {
+        match cmp_elem(elem, hi, kind)? {
             Ordering::Greater => return Ok(false),
             Ordering::Equal if !p.upper_inc => return Ok(false),
             _ => {}
@@ -274,12 +269,7 @@ pub fn contains_elem(
 }
 
 /// `outer @> inner` (range contains range).
-pub fn contains_range(
-    outer: &str,
-    inner: &str,
-    kind: RangeKind,
-    arena: &Arena,
-) -> Result<bool, SqlError> {
+pub fn contains_range(outer: &str, inner: &str, kind: RangeKind) -> Result<bool, SqlError> {
     let (po, pi) = (parse(outer, kind)?, parse(inner, kind)?);
     if pi.empty {
         return Ok(true);
@@ -287,45 +277,153 @@ pub fn contains_range(
     if po.empty {
         return Ok(false);
     }
-    Ok(lower_le(&po, &pi, kind, arena)? && upper_ge(&po, &pi, kind, arena)?)
+    Ok(lower_le(&po, &pi, kind)? && upper_ge(&po, &pi, kind)?)
 }
 
 /// `a && b` (ranges overlap).
-pub fn overlaps(a: &str, b: &str, kind: RangeKind, arena: &Arena) -> Result<bool, SqlError> {
+pub fn overlaps(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
     let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
     if pa.empty || pb.empty {
         return Ok(false);
     }
-    Ok(!(strictly_left(&pa, &pb, kind, arena)? || strictly_left(&pb, &pa, kind, arena)?))
+    Ok(!(strictly_left(&pa, &pb, kind)? || strictly_left(&pb, &pa, kind)?))
 }
 
-fn strictly_left(a: &Parsed, b: &Parsed, kind: RangeKind, arena: &Arena) -> Result<bool, SqlError> {
+fn strictly_left(a: &Parsed, b: &Parsed, kind: RangeKind) -> Result<bool, SqlError> {
     let (Some(au), Some(bl)) = (a.upper, b.lower) else {
         return Ok(false);
     };
-    Ok(match cmp_elem(au, bl, kind, arena)? {
+    Ok(match cmp_elem(au, bl, kind)? {
         Ordering::Less => true,
         Ordering::Equal => !(a.upper_inc && b.lower_inc),
         Ordering::Greater => false,
     })
 }
 
-fn lower_le(outer: &Parsed, inner: &Parsed, kind: RangeKind, arena: &Arena) -> Result<bool, SqlError> {
+fn lower_le(outer: &Parsed, inner: &Parsed, kind: RangeKind) -> Result<bool, SqlError> {
     let Some(ol) = outer.lower else { return Ok(true) };
     let Some(il) = inner.lower else { return Ok(false) };
-    Ok(match cmp_elem(ol, il, kind, arena)? {
+    Ok(match cmp_elem(ol, il, kind)? {
         Ordering::Less => true,
         Ordering::Equal => outer.lower_inc || !inner.lower_inc,
         Ordering::Greater => false,
     })
 }
 
-fn upper_ge(outer: &Parsed, inner: &Parsed, kind: RangeKind, arena: &Arena) -> Result<bool, SqlError> {
+fn upper_ge(outer: &Parsed, inner: &Parsed, kind: RangeKind) -> Result<bool, SqlError> {
     let Some(ou) = outer.upper else { return Ok(true) };
     let Some(iu) = inner.upper else { return Ok(false) };
-    Ok(match cmp_elem(ou, iu, kind, arena)? {
+    Ok(match cmp_elem(ou, iu, kind)? {
         Ordering::Greater => true,
         Ordering::Equal => outer.upper_inc || !inner.upper_inc,
         Ordering::Less => false,
     })
+}
+
+/// Total order over ranges, matching PostgreSQL `range_cmp`: empty sorts before
+/// any non-empty range; otherwise compare lower bounds, then upper bounds, with
+/// an infinite bound and bound inclusivity broken exactly as PostgreSQL does.
+/// Comparison is on bound *values* (not canonical text), so `numrange(1.0,5.0)`
+/// and `numrange(1.00,5.0)` compare equal.
+pub fn cmp_ranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    match (pa.empty, pb.empty) {
+        (true, true) => return Ok(Ordering::Equal),
+        (true, false) => return Ok(Ordering::Less),
+        (false, true) => return Ok(Ordering::Greater),
+        (false, false) => {}
+    }
+    let lo = cmp_bound(pa.lower, pa.lower_inc, pb.lower, pb.lower_inc, true, kind)?;
+    if lo != Ordering::Equal {
+        return Ok(lo);
+    }
+    cmp_bound(pa.upper, pa.upper_inc, pb.upper, pb.upper_inc, false, kind)
+}
+
+/// Compares one bound of two ranges. `None` value denotes an infinite bound;
+/// `lower` selects the direction so infinities and inclusivity ties resolve the
+/// way PostgreSQL's `range_cmp_bounds` does.
+fn cmp_bound(
+    av: Option<&str>,
+    ainc: bool,
+    bv: Option<&str>,
+    binc: bool,
+    lower: bool,
+    kind: RangeKind,
+) -> Result<Ordering, SqlError> {
+    match (av, bv) {
+        (None, None) => Ok(Ordering::Equal),
+        (None, Some(_)) => Ok(if lower { Ordering::Less } else { Ordering::Greater }),
+        (Some(_), None) => Ok(if lower { Ordering::Greater } else { Ordering::Less }),
+        (Some(x), Some(y)) => Ok(match cmp_elem(x, y, kind)? {
+            Ordering::Equal => match (ainc, binc) {
+                (true, false) => {
+                    if lower {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if lower {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                _ => Ordering::Equal,
+            },
+            other => other,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use RangeKind::{Int4, Num};
+
+    #[test]
+    fn cmp_ranges_orders_by_bounds() {
+        // Lower bound decides first, then upper bound.
+        assert_eq!(cmp_ranges("[1,5)", "[1,6)", Int4).unwrap(), Ordering::Less);
+        assert_eq!(cmp_ranges("[1,5)", "[2,3)", Int4).unwrap(), Ordering::Less);
+        assert_eq!(cmp_ranges("[1,10)", "[1,5)", Int4).unwrap(), Ordering::Greater);
+        assert_eq!(cmp_ranges("[1,5)", "[1,5)", Int4).unwrap(), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_ranges_empty_sorts_first() {
+        assert_eq!(cmp_ranges("empty", "[1,2)", Int4).unwrap(), Ordering::Less);
+        assert_eq!(cmp_ranges("[1,2)", "empty", Int4).unwrap(), Ordering::Greater);
+        assert_eq!(cmp_ranges("empty", "empty", Int4).unwrap(), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_ranges_infinite_bounds() {
+        // Unbounded lower is smallest; unbounded upper is largest.
+        assert_eq!(cmp_ranges("(,5)", "[1,5)", Int4).unwrap(), Ordering::Less);
+        assert_eq!(cmp_ranges("[1,)", "[1,10)", Int4).unwrap(), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_ranges_numrange_is_value_based() {
+        // 1.0 and 1.00 are equal by value, so equal ranges compare equal.
+        assert_eq!(cmp_ranges("[1.0,5.0)", "[1.00,5.0)", Num).unwrap(), Ordering::Equal);
+        assert_eq!(cmp_ranges("[1.0,5.0)", "[1.0,5.1)", Num).unwrap(), Ordering::Less);
+        assert_eq!(cmp_ranges("[-5.0,-1.0)", "[-5.0,-0.5)", Num).unwrap(), Ordering::Less);
+    }
+
+    #[test]
+    fn contains_and_overlaps() {
+        assert!(contains_elem("[1,10)", Int4, "5").unwrap());
+        assert!(!contains_elem("[1,10)", Int4, "10").unwrap());
+        assert!(contains_range("[1,10)", "[2,5)", Int4).unwrap());
+        assert!(!contains_range("[1,10)", "[5,15)", Int4).unwrap());
+        assert!(overlaps("[1,5)", "[4,10)", Int4).unwrap());
+        assert!(!overlaps("[1,5)", "[6,10)", Int4).unwrap());
+        // Every range contains the empty range; the empty range overlaps nothing.
+        assert!(contains_range("[1,5)", "empty", Int4).unwrap());
+        assert!(!overlaps("[1,5)", "empty", Int4).unwrap());
+    }
 }

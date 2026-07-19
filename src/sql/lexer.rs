@@ -99,7 +99,7 @@ impl<'a> Lexer<'a> {
                     Err(self.error("unexpected ':'"))
                 }
             }
-            '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#' => self.operator(),
+            '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#' | '@' => self.operator(),
             '\'' => self.plain_string(),
             '"' => self.quoted_ident(),
             '$' => self.dollar(),
@@ -113,8 +113,8 @@ impl<'a> Lexer<'a> {
         let rest = self.rest();
         // Longer operators first: the POSIX regex match family before `~`.
         for op in [
-            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "<", ">", "=", "~", "|",
-            "&", "#", "^",
+            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "@>", "<@", "&&", "<",
+            ">", "=", "~", "|", "&", "#", "^",
         ] {
             if rest.starts_with(op) {
                 self.at += op.len();

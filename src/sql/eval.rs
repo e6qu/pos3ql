@@ -710,11 +710,11 @@ pub fn eval_full<'a>(
         }
         Expr::AnyAll { operand, op, array, all } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
-            let arr = eval_full(array, arena, params, row, hooks)?;
-            let (elem, raw) = match arr {
+            let array = eval_full(array, arena, params, row, hooks)?;
+            let (elem, raw) = match array {
                 Datum::Array { elem, raw } => (elem, raw),
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("ANY/ALL requires an array", &arr)),
+                _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
             };
             let n = super::array::len(raw);
             let mut saw_null = false;
@@ -1021,8 +1021,8 @@ fn call<'a>(
                 Ok(Datum::Int8(v))
             }
         }
-        // Set-returning `_pg_expandarray(arr)` yields, for the current expansion
-        // index k, the composite `(x, n)` = (arr[k], k), encoded as `[x, n]`.
+        // Set-returning `_pg_expandarray(array)` yields, for the current expansion
+        // index k, the composite `(x, n)` = (array[k], k), encoded as `[x, n]`.
         "_pg_expandarray" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
@@ -2505,10 +2505,10 @@ fn call<'a>(
             arity(1)?;
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
-                Datum::Interval(iv) => Ok(Datum::Interval(match name {
-                    "justify_hours" => super::datetime::justify_hours(iv),
-                    "justify_days" => super::datetime::justify_days(iv),
-                    _ => super::datetime::justify_interval(iv),
+                Datum::Interval(interval) => Ok(Datum::Interval(match name {
+                    "justify_hours" => super::datetime::justify_hours(interval),
+                    "justify_days" => super::datetime::justify_days(interval),
+                    _ => super::datetime::justify_interval(interval),
                 })),
                 other => Err(type_mismatch(name, &other)),
             }
@@ -2663,11 +2663,11 @@ fn call<'a>(
             } else {
                 None
             };
-            if let Some(iv) = int_val {
+            if let Some(interval) = int_val {
                 return Ok(if name == "extract" {
-                    Datum::Numeric(Numeric::from_i64(iv, arena)?)
+                    Datum::Numeric(Numeric::from_i64(interval, arena)?)
                 } else {
-                    Datum::Float8(iv as f64)
+                    Datum::Float8(interval as f64)
                 });
             }
             // Fractional fields, scaled to microseconds.
@@ -3466,14 +3466,14 @@ fn array_null_concat<'a>(
     row: &impl ColumnLookup<'a>,
     arena: &'a Arena,
 ) -> Result<Option<Datum<'a>>, SqlError> {
-    let (arr, elem, null_expr) = match (l, r) {
+    let (array, elem, null_expr) = match (l, r) {
         (Datum::Array { elem, .. }, Datum::Null) => (l, elem, right),
         (Datum::Null, Datum::Array { elem, .. }) => (r, elem, left),
         _ => return Ok(None),
     };
     match static_type(null_expr, row) {
         // Untyped NULL or a NULL of the array type: identity.
-        None | Some(ColType::Array(_)) => Ok(Some(arr)),
+        None | Some(ColType::Array(_)) => Ok(Some(array)),
         // NULL of the element type: append/prepend a NULL element.
         Some(t) if super::types::ArrElem::from_coltype(t) == Some(elem) => {
             Ok(Some(array_concat(l, r, arena)?))
@@ -3574,13 +3574,13 @@ fn compare_numeric_int(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlE
     let mut buf = [0u8; 20];
     match (l, r) {
         (Datum::Numeric(n), other) => {
-            let iv = as_i64(other).expect("integer side");
-            let t = Numeric::from_i64_stack(iv, &mut buf);
+            let interval = as_i64(other).expect("integer side");
+            let t = Numeric::from_i64_stack(interval, &mut buf);
             Ok(numeric::compare(n, &t))
         }
         (other, Datum::Numeric(n)) => {
-            let iv = as_i64(other).expect("integer side");
-            let t = Numeric::from_i64_stack(iv, &mut buf);
+            let interval = as_i64(other).expect("integer side");
+            let t = Numeric::from_i64_stack(interval, &mut buf);
             Ok(numeric::compare(&t, n))
         }
         _ => unreachable!("compare_numeric_int only for numeric/int pairs"),
@@ -3800,26 +3800,26 @@ fn arithmetic<'a>(
             }));
         }
         // `interval * number` / `number * interval` / `interval / number`.
-        (BinaryOp::Mul, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), false)));
+        (BinaryOp::Mul, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(interval, num_factor(&r).expect("checked"), false)));
         }
-        (BinaryOp::Mul, _, Datum::Interval(iv)) if num_factor(&l).is_some() => {
-            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&l).expect("checked"), false)));
+        (BinaryOp::Mul, _, Datum::Interval(interval)) if num_factor(&l).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(interval, num_factor(&l).expect("checked"), false)));
         }
-        (BinaryOp::Div, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), true)));
+        (BinaryOp::Div, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(interval, num_factor(&r).expect("checked"), true)));
         }
-        (BinaryOp::Add | BinaryOp::Sub, dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)), Datum::Interval(iv))
-        | (BinaryOp::Add, Datum::Interval(iv), dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_))) => {
+        (BinaryOp::Add | BinaryOp::Sub, dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)), Datum::Interval(interval))
+        | (BinaryOp::Add, Datum::Interval(interval), dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_))) => {
             let base = match dt {
                 Datum::Timestamp(t) | Datum::Timestamptz(t) => t,
                 Datum::Date(d) => d as i64 * 86_400_000_000,
                 _ => unreachable!(),
             };
             let signed = if op == BinaryOp::Sub {
-                super::types::Interval { months: -iv.months, days: -iv.days, micros: -iv.micros }
+                super::types::Interval { months: -interval.months, days: -interval.days, micros: -interval.micros }
             } else {
-                iv
+                interval
             };
             let out = super::datetime::add_interval(base, signed);
             // date ± interval yields timestamp in PostgreSQL; timestamptz stays tz.

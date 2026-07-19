@@ -2300,11 +2300,11 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 self.expect_op("]")?;
             }
-            let arr = self
+            let array = self
                 .arena
                 .alloc_str(stack_format!(72, "{}[]", name).as_str())
                 .map_err(|_| self.err_here("type name too long"))?;
-            return Ok((arr, -1));
+            return Ok((array, -1));
         }
         Ok((name, type_mod))
     }

@@ -3096,11 +3096,11 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
                 out[at + 1..at + 9].copy_from_slice(&x.to_le_bytes());
                 at += 9;
             }
-            Datum::Interval(iv) => {
+            Datum::Interval(interval) => {
                 out[at] = 13;
-                out[at + 1..at + 5].copy_from_slice(&iv.months.to_le_bytes());
-                out[at + 5..at + 9].copy_from_slice(&iv.days.to_le_bytes());
-                out[at + 9..at + 17].copy_from_slice(&iv.micros.to_le_bytes());
+                out[at + 1..at + 5].copy_from_slice(&interval.months.to_le_bytes());
+                out[at + 5..at + 9].copy_from_slice(&interval.days.to_le_bytes());
+                out[at + 9..at + 17].copy_from_slice(&interval.micros.to_le_bytes());
                 at += 17;
             }
             Datum::Json { text, jsonb } => {

@@ -492,13 +492,13 @@ fn name_case(code: &[u8]) -> Case {
 pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
     use crate::sql::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};
     let days = micros.div_euclid(86_400_000_000);
-    let tod = micros.rem_euclid(86_400_000_000);
+    let time_of_day = micros.rem_euclid(86_400_000_000);
     let adays = days + PG_EPOCH_DAYS;
     let (y, mo, d) = civil_from_days(adays);
-    let hh24 = (tod / 3_600_000_000) as u32;
-    let mi = ((tod / 60_000_000) % 60) as u32;
-    let ss = ((tod / 1_000_000) % 60) as u32;
-    let us = (tod % 1_000_000) as u32;
+    let hh24 = (time_of_day / 3_600_000_000) as u32;
+    let mi = ((time_of_day / 60_000_000) % 60) as u32;
+    let ss = ((time_of_day / 1_000_000) % 60) as u32;
+    let us = (time_of_day % 1_000_000) as u32;
     let dow = day_of_week(days); // 0=Sun..6=Sat (PG-epoch day count)
     let doy = (adays - days_from_civil(y, 1, 1) + 1) as u32;
     let hh12 = if hh24.is_multiple_of(12) { 12 } else { hh24 % 12 };

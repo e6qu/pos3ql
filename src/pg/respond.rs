@@ -380,12 +380,12 @@ impl<'b> Responder<'b> {
                     m.i32(8);
                     m.bytes(&x.to_be_bytes());
                 }
-                Datum::Interval(iv) => {
+                Datum::Interval(interval) => {
                     // PostgreSQL binary interval: int64 micros, int32 days, int32 months.
                     m.i32(16);
-                    m.bytes(&iv.micros.to_be_bytes());
-                    m.bytes(&iv.days.to_be_bytes());
-                    m.bytes(&iv.months.to_be_bytes());
+                    m.bytes(&interval.micros.to_be_bytes());
+                    m.bytes(&interval.days.to_be_bytes());
+                    m.bytes(&interval.months.to_be_bytes());
                 }
                 Datum::Json { text, jsonb } => {
                     // json binary is the text; jsonb prefixes a version byte (1).

@@ -211,7 +211,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
+        let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         // Materialize the subquery rows, self-describing-encoded, into a
         // doubling arena vector.
         const EMPTY: &[u8] = &[];
@@ -242,7 +242,7 @@ impl<'d> QueryScope<'d> {
             unsafe { core::slice::from_raw_parts(store, len) }
         };
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -294,9 +294,9 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
+        let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
@@ -328,7 +328,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref: &'a TableDef = arena.alloc(synth.def).map_err(|_| arena_full())?;
+        let def_reference: &'a TableDef = arena.alloc(synth.def).map_err(|_| arena_full())?;
         let rows: &'a [&'a [u8]] = if materialize {
             const EMPTY: &[u8] = &[];
             let encoded = arena
@@ -342,7 +342,7 @@ impl<'d> QueryScope<'d> {
             &[]
         };
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -361,7 +361,7 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
-        let def_ref = table_func_def(tref, arena, params)?;
+        let def_reference = table_func_def(tref, arena, params)?;
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
@@ -373,7 +373,7 @@ impl<'d> QueryScope<'d> {
         let rows: &'a [&'a [u8]] =
             if materialize { table_func_rows(tref, arena, params)? } else { &[] };
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -819,14 +819,14 @@ fn scan_source<'a>(
     for (pos, &t) in order.iter().enumerate() {
         inv_order[t] = pos;
     }
-    let mut pd_bufs: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
+    let mut pushdown_buffers: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
         [[&Expr::Null; MAX_CONJUNCTS]; MAX_JOIN_TABLES];
     let mut pd_n = [0usize; MAX_JOIN_TABLES];
     if all_inner && scope.n >= 2 && let Some(w) = where_clause {
-        let mut conj: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
+        let mut conjunct: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
         let mut n = 0;
         let conjuncts: &[&Expr] =
-            if flatten_and(w, &mut conj, &mut n) { &conj[..n] } else { core::slice::from_ref(&w) };
+            if flatten_and(w, &mut conjunct, &mut n) { &conjunct[..n] } else { core::slice::from_ref(&w) };
         for &c in conjuncts {
             // The execution depth at which a conjunct is fully bound is the
             // latest execution position of any table it references (under
@@ -840,13 +840,13 @@ fn scan_source<'a>(
                     .max()
                     .unwrap_or(0);
                 if d < scope.n && pd_n[d] < MAX_CONJUNCTS {
-                    pd_bufs[d][pd_n[d]] = c;
+                    pushdown_buffers[d][pd_n[d]] = c;
                     pd_n[d] += 1;
                 }
             }
         }
     }
-    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] = core::array::from_fn(|d| &pd_bufs[d][..pd_n[d]]);
+    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] = core::array::from_fn(|d| &pushdown_buffers[d][..pd_n[d]]);
 
     let mut bound = [None; MAX_JOIN_TABLES];
     level(
@@ -3441,7 +3441,7 @@ pub fn select_query<'a>(
         // hooks (which include the correlated results); otherwise the scan
         // applies WHERE directly for the common, faster path.
         let where_in_scan = if correlated.is_empty() { stmt.where_clause } else { None };
-        // A set-returning `_pg_expandarray(arr)` expands each row into one output
+        // A set-returning `_pg_expandarray(array)` expands each row into one output
         // row per array element.
         let srf_call = find_srf(stmt.items);
         let scan = scan_source(
@@ -3613,10 +3613,10 @@ fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [usize; MAX_JO
     let mut masks = [0u16; MAX_CONJUNCTS];
     let mut n_masks = 0;
     if let Some(w) = where_clause {
-        let mut conj: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
+        let mut conjunct: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
         let mut nc = 0;
         let conjuncts: &[&Expr] =
-            if flatten_and(w, &mut conj, &mut nc) { &conj[..nc] } else { core::slice::from_ref(&w) };
+            if flatten_and(w, &mut conjunct, &mut nc) { &conjunct[..nc] } else { core::slice::from_ref(&w) };
         for &c in conjuncts {
             if let Some(m) = expr_tables(c, scope)
                 && n_masks < MAX_CONJUNCTS
@@ -3806,14 +3806,14 @@ fn reorder_qual<'a>(
     scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    let mut conj: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
+    let mut conjunct: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
     let mut n = 0;
-    if !flatten_and(pred, &mut conj, &mut n) || n <= 1 {
+    if !flatten_and(pred, &mut conjunct, &mut n) || n <= 1 {
         return Ok(pred);
     }
     let cols = ScopeCols(scope);
     let mut cost = [0u32; MAX_CONJUNCTS];
-    for (i, c) in conj[..n].iter().enumerate() {
+    for (i, c) in conjunct[..n].iter().enumerate() {
         cost[i] = qual_cost(c, &cols);
     }
     let mut order = [0usize; MAX_CONJUNCTS];
@@ -3828,10 +3828,10 @@ fn reorder_qual<'a>(
         }
     }
     // Rebuild a left-deep AND in cost order.
-    let mut acc = conj[order[0]];
+    let mut acc = conjunct[order[0]];
     for &i in &order[1..n] {
         acc = arena
-            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conj[i] })
+            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conjunct[i] })
             .map_err(|_| arena_full())?;
     }
     Ok(acc)
@@ -4574,7 +4574,7 @@ pub fn select_into_rows<'a>(
     }
     let where_in_scan = if correlated.is_empty() { stmt.where_clause } else { None };
 
-    // A set-returning `_pg_expandarray(arr)` in the projection expands each
+    // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
     let srf_call = find_srf(stmt.items);
     scan_source(
@@ -5471,15 +5471,15 @@ fn synth_derived_def<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a TableDef, SqlError> {
-    let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => describe_set_body(storage, tree, txid, &mut descs, arena)?,
+        Some(tree) => describe_set_body(storage, tree, txid, &mut descriptors, arena)?,
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
-                describe_scope_items(sub.items, &ss, &mut descs)?
+                describe_scope_items(sub.items, &ss, &mut descriptors)?
             }
-            None => describe_items(sub.items, None, &mut descs)?,
+            None => describe_items(sub.items, None, &mut descriptors)?,
         },
     };
     if n_cols > MAX_COLUMNS {
@@ -5502,7 +5502,7 @@ fn synth_derived_def<'a>(
             ));
         }
         for (i, alias) in aliases.iter().enumerate() {
-            descs[i].name = alias;
+            descriptors[i].name = alias;
         }
     }
     let blank = ColumnMeta {
@@ -5517,16 +5517,16 @@ fn synth_derived_def<'a>(
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {
-        let ct = super::exec::coltype_of_oid(descs[i].type_oid).ok_or_else(|| {
+        let ct = super::exec::coltype_of_oid(descriptors[i].type_oid).ok_or_else(|| {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "derived table column \"{}\" type (oid {}) is not supported",
-                descs[i].name,
-                descs[i].type_oid
+                descriptors[i].name,
+                descriptors[i].type_oid
             )
         })?;
         columns[i] = ColumnMeta {
-            name: SqlName::parse(descs[i].name)?,
+            name: SqlName::parse(descriptors[i].name)?,
             ctype: ct,
             ..blank
         };

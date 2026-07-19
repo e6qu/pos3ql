@@ -87,10 +87,10 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[..4].copy_from_slice(&x.to_le_bytes());
                 take = 4;
             }
-            Datum::Interval(iv) => {
-                rest[..4].copy_from_slice(&iv.months.to_le_bytes());
-                rest[4..8].copy_from_slice(&iv.days.to_le_bytes());
-                rest[8..16].copy_from_slice(&iv.micros.to_le_bytes());
+            Datum::Interval(interval) => {
+                rest[..4].copy_from_slice(&interval.months.to_le_bytes());
+                rest[4..8].copy_from_slice(&interval.days.to_le_bytes());
+                rest[8..16].copy_from_slice(&interval.micros.to_le_bytes());
                 take = 16;
             }
             Datum::Timestamp(x) | Datum::Timestamptz(x) | Datum::Time(x) => {

@@ -17,6 +17,12 @@ pub const MAX_ROWS: usize = 256;
 
 /// Words that cannot appear as a bare column reference; mirrors the
 /// reserved entries of PostgreSQL's keyword table that this grammar uses.
+/// Whether a numeric token carries a `0x`/`0o`/`0b` base prefix.
+fn is_base_prefixed(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() > 2 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+}
+
 fn is_reserved(word: &str) -> bool {
     matches!(
         word,
@@ -1609,9 +1615,12 @@ impl<'a> Parser<'a> {
         match tok {
             Tok::Num(text) => {
                 self.advance()?;
-                let looks_integral = !text.contains(['.', 'e', 'E']);
+                // Base-prefixed literals (0x/0o/0b) are always integers; a plain
+                // token is integral unless it has a decimal point or exponent.
+                let prefixed = is_base_prefixed(text);
+                let looks_integral = prefixed || !text.contains(['.', 'e', 'E']);
                 if looks_integral
-                    && let Ok(v) = text.parse::<i64>() {
+                    && let Some(v) = super::eval::parse_int_literal(text) {
                         return self.arena_expr(Expr::Int(v));
                     }
                 // Decimal / exponent literals are NUMERIC in PostgreSQL; keep
@@ -1661,9 +1670,9 @@ impl<'a> Parser<'a> {
                 // `-2147483648` is int4 (INT4_MIN fits), not int8. Decimal
                 // literals negate through the normal Neg path (numeric).
                 if let Tok::Num(text) = self.peeked {
-                    let integral = !text.contains(['.', 'e', 'E']);
+                    let integral = is_base_prefixed(text) || !text.contains(['.', 'e', 'E']);
                     if integral
-                        && let Ok(v) = text.parse::<i64>() {
+                        && let Some(v) = super::eval::parse_int_literal(text) {
                             self.advance()?;
                             return self.arena_expr(Expr::Int(-v));
                         }

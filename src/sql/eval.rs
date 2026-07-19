@@ -3868,7 +3868,7 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
 /// Parses an integer the way PostgreSQL's integer input does: optional sign, an
 /// optional `0x`/`0o`/`0b` base prefix, and `_` digit separators (only between
 /// digits). Returns None for anything malformed or out of `i64` range.
-fn parse_int_literal(s: &str) -> Option<i64> {
+pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
     let t = s.trim();
     let (neg, rest) = match t.strip_prefix('-') {
         Some(r) => (true, r),

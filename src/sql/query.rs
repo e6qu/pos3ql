@@ -4390,24 +4390,38 @@ pub fn select_into_rows<'a>(
     }
 
     let Some(from) = &stmt.from else {
-        // FROM-less: one row (or zero, when WHERE is false).
+        // FROM-less: one row (or zero, when WHERE is false), unless a
+        // set-returning function in the list expands it to several.
         let subs =
             prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
         let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
-        if let Some(w) = stmt.where_clause
-            && !where_passes(w, arena, params, &super::eval::NoColumns, &hooks)? {
-                return Ok(());
-            }
-        let mut vals = [Datum::Null; MAX_PROJ];
-        let mut n = 0;
-        for item in stmt.items {
-            let SelectItem::Expr { expr, .. } = item else {
-                return Err(sql_err!("42601", "SELECT * with no tables specified is not valid"));
+        let srf_call = find_srf(stmt.items);
+        let count = match srf_call {
+            None => 1,
+            Some(c) => srf_count(c, arena, params, &super::eval::NoColumns, &hooks)?,
+        };
+        for k in 1..=count {
+            let khooks = if srf_call.is_some() {
+                EvalHooks { srf_index: Some(k), ..hooks }
+            } else {
+                hooks
             };
-            vals[n] = eval_full(expr, arena, params, &super::eval::NoColumns, &hooks)?;
-            n += 1;
+            if let Some(w) = stmt.where_clause
+                && !where_passes(w, arena, params, &super::eval::NoColumns, &khooks)?
+            {
+                continue;
+            }
+            let mut vals = [Datum::Null; MAX_PROJ];
+            let mut n = 0;
+            for item in stmt.items {
+                let SelectItem::Expr { expr, .. } = item else {
+                    return Err(sql_err!("42601", "SELECT * with no tables specified is not valid"));
+                };
+                vals[n] = eval_full(expr, arena, params, &super::eval::NoColumns, &khooks)?;
+                n += 1;
+            }
+            emit(&vals[..n])?;
         }
-        emit(&vals[..n])?;
         return Ok(());
     };
 

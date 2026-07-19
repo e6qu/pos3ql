@@ -3298,17 +3298,21 @@ fn range_mismatch() -> SqlError {
 /// Whether `container` (a range) contains `contained` (a range of the same kind
 /// or a bare element).
 fn range_contains<'a>(container: Datum<'a>, contained: Datum<'a>) -> Result<Datum<'a>, SqlError> {
-    let (ct, ck) = as_range(&container)?;
+    let (container_text, container_kind) = as_range(&container)?;
     match contained {
         Datum::Range { text, kind } => {
-            if kind != ck {
+            if kind != container_kind {
                 return Err(range_mismatch());
             }
-            Ok(Datum::Bool(super::range::contains_range(ct, text, ck)?))
+            Ok(Datum::Bool(super::range::contains_range(container_text, text, container_kind)?))
         }
-        elem => {
-            let es = stack_format!(64, "{}", elem);
-            Ok(Datum::Bool(super::range::contains_elem(ct, ck, es.as_str())?))
+        element => {
+            let element_text = stack_format!(64, "{}", element);
+            Ok(Datum::Bool(super::range::contains_elem(
+                container_text,
+                container_kind,
+                element_text.as_str(),
+            )?))
         }
     }
 }

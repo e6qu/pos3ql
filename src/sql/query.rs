@@ -608,8 +608,8 @@ fn scan_source<'a>(
             let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
             let row = assemble(scope, bound, order, depth, &mut buffers)?;
             if let Some(w) = where_clause {
-                let cr = Chained { inner: &row, outer };
-                if !where_passes(w, arena, params, &cr, hooks)? {
+                let chained_row = Chained { inner: &row, outer };
+                if !where_passes(w, arena, params, &chained_row, hooks)? {
                     return Ok(true);
                 }
             }
@@ -626,8 +626,8 @@ fn scan_source<'a>(
                 && let Some(on) = join.on {
                     let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
                     let row = assemble(scope, bound, order, depth + 1, &mut buffers)?;
-                    let cr = Chained { inner: &row, outer };
-                    return match eval_full(on, arena, params, &cr, hooks)? {
+                    let chained_row = Chained { inner: &row, outer };
+                    return match eval_full(on, arena, params, &chained_row, hooks)? {
                         Datum::Bool(true) => Ok(true),
                         Datum::Bool(false) | Datum::Null => Ok(false),
                         _ => Err(sql_err!(
@@ -878,8 +878,8 @@ fn scan_source<'a>(
             let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
             let row = assemble(scope, &b, &order, scope.n, &mut buffers)?;
             if let Some(w) = where_clause {
-                let cr = Chained { inner: &row, outer };
-                if !where_passes(w, arena, params, &cr, hooks)? {
+                let chained_row = Chained { inner: &row, outer };
+                if !where_passes(w, arena, params, &chained_row, hooks)? {
                     return Ok(true);
                 }
             }
@@ -2555,13 +2555,13 @@ fn run_subquery<'a>(
         &hooks,
         outer,
         &mut |row| {
-            let cr = Chained { inner: row, outer };
-            vals[at] = eval_full(item, arena, params, &cr, &hooks)?;
+            let chained_row = Chained { inner: row, outer };
+            vals[at] = eval_full(item, arena, params, &chained_row, &hooks)?;
             for (k, o) in select.order_by.iter().enumerate() {
                 // A positional `ORDER BY 1` sorts by the single output column.
                 let key = match o.expr {
                     Expr::Int(_) => vals[at],
-                    e => eval_full(e, arena, params, &cr, &hooks)?,
+                    e => eval_full(e, arena, params, &chained_row, &hooks)?,
                 };
                 keys[at * n_keys + k] = key;
             }
@@ -2695,9 +2695,9 @@ fn fold_aggregates<'a>(
         hooks,
         outer_arg,
         &mut |row| {
-            let cr = Chained { inner: row, outer: outer_arg };
+            let chained_row = Chained { inner: row, outer: outer_arg };
             for (i, (_, node)) in agg_nodes.iter().enumerate() {
-                states[i].update(node, arena, params, &cr, hooks)?;
+                states[i].update(node, arena, params, &chained_row, hooks)?;
             }
             Ok(true)
         },
@@ -4233,16 +4233,16 @@ fn combine_sets<'a>(
                 while j < r.len() && r[j] < row {
                     j += 1;
                 }
-                let mut cr = 0;
+                let mut chained_row = 0;
                 while j < r.len() && r[j] == row {
-                    cr += 1;
+                    chained_row += 1;
                     j += 1;
                 }
                 let times = match (op, all) {
-                    (SetOp::Intersect, true) => cl.min(cr),
-                    (SetOp::Intersect, false) => usize::from(cr > 0),
-                    (SetOp::Except, true) => cl.saturating_sub(cr),
-                    (SetOp::Except, false) => usize::from(cr == 0),
+                    (SetOp::Intersect, true) => cl.min(chained_row),
+                    (SetOp::Intersect, false) => usize::from(chained_row > 0),
+                    (SetOp::Except, true) => cl.saturating_sub(chained_row),
+                    (SetOp::Except, false) => usize::from(chained_row == 0),
                     _ => unreachable!(),
                 };
                 push(row, times);
@@ -5439,8 +5439,8 @@ pub fn first_from_match<'a>(
         &hooks,
         Some(target),
         &mut |jr| {
-            let cr = Chained { inner: jr, outer: Some(target) };
-            on_match(&cr)?;
+            let chained_row = Chained { inner: jr, outer: Some(target) };
+            on_match(&chained_row)?;
             found = true;
             Ok(false) // stop at the first match (PostgreSQL uses one arbitrary row)
         },

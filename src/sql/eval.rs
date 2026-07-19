@@ -3716,10 +3716,55 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
                 Err(overflow(target))
             }
         }
-        Datum::Text(s) => s.trim().parse().map_err(|_| bad_text(s, target)),
+        Datum::Text(s) => parse_int_literal(s).ok_or_else(|| bad_text(s, target)),
         Datum::Null => unreachable!("null handled by caller"),
         other => Err(cast_unsupported(other, target)),
     }
+}
+
+/// Parses an integer the way PostgreSQL's integer input does: optional sign, an
+/// optional `0x`/`0o`/`0b` base prefix, and `_` digit separators (only between
+/// digits). Returns None for anything malformed or out of `i64` range.
+fn parse_int_literal(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (radix, digits) = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        (16, r)
+    } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+        (8, r)
+    } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+        (2, r)
+    } else {
+        (10, rest)
+    };
+    let db = digits.as_bytes();
+    if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
+        return None;
+    }
+    let mut buf = [0u8; 80];
+    let mut n = 0;
+    let mut prev_underscore = false;
+    for &c in db {
+        if c == b'_' {
+            if prev_underscore {
+                return None; // `__` is not allowed
+            }
+            prev_underscore = true;
+            continue;
+        }
+        prev_underscore = false;
+        if n >= buf.len() {
+            return None;
+        }
+        buf[n] = c;
+        n += 1;
+    }
+    let cleaned = core::str::from_utf8(&buf[..n]).ok()?;
+    let v = i64::from_str_radix(cleaned, radix).ok()?;
+    Some(if neg { -v } else { v })
 }
 
 fn parse_bool(s: &str) -> Result<bool, SqlError> {

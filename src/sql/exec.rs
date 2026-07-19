@@ -2528,6 +2528,14 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     of(ColType::Bool)
                 }
                 And | Or => of(ColType::Bool),
+                // `||` concatenates arrays when either side is an array (the
+                // array type is preserved), otherwise it is text concatenation.
+                Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => {
+                    (lo, -1)
+                }
+                Concat if coltype_of_oid(ro).is_some_and(|t| matches!(t, ColType::Array(_))) => {
+                    (ro, -1)
+                }
                 // `^` stays numeric when an operand is numeric (and none is a
                 // float); otherwise it is double precision.
                 Pow => {
@@ -2563,6 +2571,13 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     // int + date -> date.
                     if lo == oid::DATE && ro == oid::DATE && matches!(op, Sub) {
                         return Ok(of(ColType::Int4));
+                    }
+                    // timestamp - timestamp -> interval.
+                    if matches!(op, Sub)
+                        && (lo == oid::TIMESTAMP && ro == oid::TIMESTAMP
+                            || lo == oid::TIMESTAMPTZ && ro == oid::TIMESTAMPTZ)
+                    {
+                        return Ok(of(ColType::Interval));
                     }
                     if lo == oid::DATE && matches!(op, Add | Sub) && int_like(ro) {
                         return Ok(of(ColType::Date));

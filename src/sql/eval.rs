@@ -3135,6 +3135,11 @@ fn concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>,
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
+    // `||` on arrays concatenates: array||array, and array||element or
+    // element||array append/prepend the element.
+    if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) {
+        return array_concat(l, r, arena);
+    }
     let left = cast_to_text(l, arena)?;
     let right = cast_to_text(r, arena)?;
     let bytes = arena
@@ -3149,6 +3154,40 @@ fn concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>,
     Ok(Datum::Text(unsafe {
         core::str::from_utf8_unchecked(bytes)
     }))
+}
+
+/// Concatenates two operands where at least one is an array, following
+/// PostgreSQL's `array || array`, `array || element`, and `element || array`.
+fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let elem = match (&l, &r) {
+        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => *elem,
+        _ => unreachable!("caller ensures one side is an array"),
+    };
+    let mut items = [Datum::Null; 4096];
+    let mut n = 0usize;
+    for side in [l, r] {
+        match side {
+            Datum::Array { raw, elem: e } => {
+                for i in 0..super::array::len(raw) {
+                    if n >= items.len() {
+                        return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
+                    }
+                    items[n] = super::array::get(raw, e, i).ok_or_else(|| {
+                        sql_err!("XX000", "corrupt array element")
+                    })?;
+                    n += 1;
+                }
+            }
+            scalar => {
+                if n >= items.len() {
+                    return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
+                }
+                items[n] = scalar;
+                n += 1;
+            }
+        }
+    }
+    Ok(Datum::Array { elem, raw: super::array::build(&items[..n], arena)? })
 }
 
 /// Total order used by comparisons and ORDER BY. NULL handling differs
@@ -3350,6 +3389,16 @@ fn arithmetic<'a>(
     match (op, l, r) {
         (BinaryOp::Sub, Datum::Date(a), Datum::Date(b)) => {
             return Ok(Datum::Int4(a - b));
+        }
+        // timestamp - timestamp -> interval (days + time, no month folding).
+        (BinaryOp::Sub, Datum::Timestamp(a), Datum::Timestamp(b))
+        | (BinaryOp::Sub, Datum::Timestamptz(a), Datum::Timestamptz(b)) => {
+            let diff = a - b;
+            return Ok(Datum::Interval(super::types::Interval {
+                months: 0,
+                days: (diff / 86_400_000_000) as i32,
+                micros: diff % 86_400_000_000,
+            }));
         }
         (BinaryOp::Add | BinaryOp::Sub, Datum::Date(a), _) if as_i64(&r).is_some() => {
             let days = as_i64(&r).expect("checked");

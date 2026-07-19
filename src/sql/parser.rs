@@ -1602,6 +1602,34 @@ impl<'a> Parser<'a> {
                 let ilike = self.peeked == Tok::Ident("ilike");
                 if ilike || self.peeked == Tok::Ident("like") {
                     self.advance()?;
+                    // `x LIKE ANY/ALL (array)` — quantified pattern match.
+                    if matches!(
+                        self.peeked,
+                        Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")
+                    ) {
+                        let all = self.peeked == Tok::Ident("all");
+                        self.advance()?;
+                        self.expect_op("(")?;
+                        let array = self.expression(0)?;
+                        self.expect_op(")")?;
+                        let operator = if ilike { BinaryOp::ILike } else { BinaryOp::Like };
+                        // NOT LIKE ANY == NOT (LIKE ALL), and vice versa.
+                        let inner = self.arena_expr(Expr::AnyAll {
+                            operand: left,
+                            operator,
+                            array,
+                            all: if negated { !all } else { all },
+                        })?;
+                        left = if negated {
+                            self.arena_expr(Expr::Unary {
+                                operator: super::ast::UnaryOp::Not,
+                                operand: inner,
+                            })?
+                        } else {
+                            inner
+                        };
+                        continue;
+                    }
                     let pattern = self.expression(5)?;
                     left = self.arena_expr(Expr::Like {
                         operand: left,

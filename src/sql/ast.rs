@@ -535,6 +535,10 @@ pub enum BinaryOp {
     NotRightOf,
     NotLeftOf,
     Adjacent,
+    /// Pattern match, used only as the operator of a quantified `LIKE ANY/ALL`
+    /// (`ILike` is the case-insensitive form). Plain `x LIKE y` uses `Expr::Like`.
+    Like,
+    ILike,
 }
 
 impl BinaryOp {
@@ -548,6 +552,7 @@ impl BinaryOp {
             // Containment/overlap/adjacency operators bind like comparisons.
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
+            Self::Like | Self::ILike => 4,
             Self::Concat => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,
             // matching PostgreSQL (they are non-standard, mid-precedence).

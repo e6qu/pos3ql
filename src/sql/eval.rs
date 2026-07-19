@@ -714,6 +714,15 @@ pub fn eval_full<'a>(
             let (element, raw) = match array {
                 Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
+                // An unknown literal on the array side (`= ANY('{1,2}')`) is cast
+                // to an array of the left operand's element type, as PostgreSQL
+                // resolves it.
+                Datum::Text(s) => {
+                    let element =
+                        super::types::ArrElem::from_datum(&lhs).unwrap_or(super::types::ArrElem::Text);
+                    let raw = super::array::parse_literal(s, element, arena)?;
+                    (element, raw)
+                }
                 _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
             };
             let n = super::array::len(raw);
@@ -3306,6 +3315,15 @@ fn binary<'a>(
         },
         BitAnd | BitOr | BitXor => bitwise(operator, l, r),
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(operator, l, r),
+        // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
+        Like | ILike => {
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = cast_to_text(l, arena)?;
+            let pattern = cast_to_text(r, arena)?;
+            Ok(Datum::Bool(like_match(text, pattern, operator == ILike)))
+        }
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
             // is float8); otherwise it is double-precision exponentiation.

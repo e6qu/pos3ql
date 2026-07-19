@@ -2541,7 +2541,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                             }
                     of(ColType::Bool)
                 }
-                And | Or => of(ColType::Bool),
+                And | Or | Like | ILike => of(ColType::Bool),
                 Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
                     of(ColType::Bool)
                 }

@@ -25,11 +25,11 @@ pub fn regex_search(pattern: &str, text: &str, case_insensitive: bool) -> Result
     // matches a substring; a trailing `$` in the pattern enforces the end.
     let accept = |_rest: &str| Ok(true);
     if anchored {
-        return m(pat, text, case_insensitive, &budget, &accept);
+        return m(pat, text, case_insensitive, &budget, None, &accept);
     }
     let mut rest = text;
     loop {
-        if m(pat, rest, case_insensitive, &budget, &accept)? {
+        if m(pat, rest, case_insensitive, &budget, None, &accept)? {
             return Ok(true);
         }
         match rest.chars().next() {
@@ -65,7 +65,7 @@ pub fn find(
             }
             Ok(false)
         };
-        m(pat, sub, case_insensitive, &budget, &accept)?;
+        m(pat, sub, case_insensitive, &budget, None, &accept)?;
         Ok(best.get())
     };
     if anchored {
@@ -85,6 +85,116 @@ pub fn find(
             Some(c) => start += c.len_utf8(),
         }
     }
+}
+
+/// Maximum capture groups tracked for `regexp_matches`.
+pub const MAX_GROUPS: usize = 16;
+
+/// A whole-match byte span `(start, end)` plus the number of capturing groups.
+pub type MatchSpan = ((usize, usize), usize);
+
+/// Records the byte span each capturing group matched, keyed by the byte offset
+/// of its opening `(` in the (leading-`^`-stripped) pattern.
+struct Recorder<'a> {
+    /// `pat.as_ptr() as usize` for the stripped pattern, so a sub-slice's group
+    /// index can be recovered from its address.
+    pat_base: usize,
+    /// Length of the suffix being matched, for computing consumed byte offsets.
+    text_total: usize,
+    /// Opening-paren byte offsets, in group order (index + 1 = group number).
+    group_starts: &'a [usize],
+    /// Per-group `(start, end)` spans relative to the matched suffix; `(-1, -1)`
+    /// until the group participates.
+    spans: &'a [Cell<(i64, i64)>],
+}
+
+impl Recorder<'_> {
+    /// The 1-based group number of the group whose `(` begins `pat`.
+    fn group_of(&self, pat: &str) -> Option<usize> {
+        let offset = pat.as_ptr() as usize - self.pat_base;
+        self.group_starts.iter().position(|&s| s == offset).map(|i| i + 1)
+    }
+    /// Byte offset consumed so far, given the remaining suffix length.
+    fn consumed(&self, remaining_len: usize) -> i64 {
+        (self.text_total - remaining_len) as i64
+    }
+    fn record(&self, group: usize, start: i64, end: i64) {
+        if group >= 1 && group <= self.spans.len() {
+            self.spans[group - 1].set((start, end));
+        }
+    }
+}
+
+/// Byte offsets of each capturing `(` in `pat` (escapes and `[...]` skipped),
+/// in group order. Returns the group count.
+fn group_starts(pat: &str, out: &mut [usize; MAX_GROUPS]) -> usize {
+    let b = pat.as_bytes();
+    let mut i = 0;
+    let mut n = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' => {
+                i += 1;
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                if n < out.len() {
+                    out[n] = i;
+                }
+                n += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Finds the leftmost-longest match at or after `from` and records each
+/// capturing group's byte span into `spans_out` (absolute offsets into `text`;
+/// `(-1, -1)` for a group that did not participate). Returns the whole match's
+/// `(start, end)` and the number of capturing groups, or `None` for no match.
+pub fn find_captures(
+    pattern: &str,
+    text: &str,
+    from: usize,
+    case_insensitive: bool,
+    spans_out: &mut [(i64, i64); MAX_GROUPS],
+) -> Result<Option<MatchSpan>, SqlError> {
+    validate(pattern)?;
+    let anchored = pattern.starts_with('^');
+    let pat = if anchored { &pattern[1..] } else { pattern };
+    let mut starts = [0usize; MAX_GROUPS];
+    let ng = group_starts(pat, &mut starts);
+    if ng > MAX_GROUPS {
+        return Err(sql_err!("54000", "too many capture groups in regular expression"));
+    }
+    // Locate the leftmost-longest whole match first (POSIX semantics).
+    let Some((mstart, mend)) = find(pattern, text, from, case_insensitive)? else {
+        return Ok(None);
+    };
+    // Re-match anchored at the match start, recording group spans on the first
+    // greedy path that consumes exactly the whole match.
+    let sub = &text[mstart..];
+    let target = mend - mstart;
+    let spans: [Cell<(i64, i64)>; MAX_GROUPS] = core::array::from_fn(|_| Cell::new((-1, -1)));
+    let budget = Cell::new(3_000_000u32);
+    let recorder = Recorder {
+        pat_base: pat.as_ptr() as usize,
+        text_total: sub.len(),
+        group_starts: &starts[..ng],
+        spans: &spans[..ng],
+    };
+    let accept = |rest: &str| Ok(sub.len() - rest.len() == target);
+    m(pat, sub, case_insensitive, &budget, Some(&recorder), &accept)?;
+    for (i, span) in spans[..ng].iter().enumerate() {
+        let (a, b) = span.get();
+        spans_out[i] = if a < 0 { (-1, -1) } else { (a + mstart as i64, b + mstart as i64) };
+    }
+    Ok(Some(((mstart, mend), ng)))
 }
 
 /// Rejects unsupported constructs so a pattern is never matched incorrectly.
@@ -149,15 +259,16 @@ fn m(
     text: &str,
     case_insensitive: bool,
     budget: &Cell<u32>,
+    rec: Option<&Recorder>,
     k: &dyn Fn(&str) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     step(budget)?;
     // Top-level alternation: try each branch.
     if let Some(bar) = top_level_bar(pat) {
-        if m(&pat[..bar], text, case_insensitive, budget, k)? {
+        if m(&pat[..bar], text, case_insensitive, budget, rec, k)? {
             return Ok(true);
         }
-        return m(&pat[bar + 1..], text, case_insensitive, budget, k);
+        return m(&pat[bar + 1..], text, case_insensitive, budget, rec, k);
     }
     if pat.is_empty() {
         return k(text);
@@ -172,26 +283,39 @@ fn m(
         let body = &pat[1..close];
         let after = &pat[close + 1..];
         let (quant, rest) = split_quant(after);
-        let cont = move |t: &str| m(rest, t, case_insensitive, budget, k);
+        let group = rec.and_then(|r| r.group_of(pat));
+        let entry_len = text.len();
+        // Continuation after a single, non-repeated group match: record the
+        // group's span, then match the remainder.
+        let cont = move |t: &str| {
+            if let (Some(r), Some(g)) = (rec, group) {
+                r.record(g, r.consumed(entry_len), r.consumed(t.len()));
+            }
+            m(rest, t, case_insensitive, budget, rec, k)
+        };
         return match quant {
-            None => m(body, text, case_insensitive, budget, &cont),
+            None => m(body, text, case_insensitive, budget, rec, &cont),
             Some(b'?') => {
-                if m(body, text, case_insensitive, budget, &cont)? {
+                if m(body, text, case_insensitive, budget, rec, &cont)? {
                     Ok(true)
                 } else {
-                    cont(text)
+                    // Group skipped: it does not participate, so no recording.
+                    m(rest, text, case_insensitive, budget, rec, k)
                 }
             }
             _ => {
                 let min = if quant == Some(b'+') { 1 } else { 0 };
-                rep_group(body, text, case_insensitive, budget, min, &cont)
+                // The repetition records each iteration (last wins); the
+                // downstream continuation does not re-record the whole span.
+                let after_reps = move |t: &str| m(rest, t, case_insensitive, budget, rec, k);
+                rep_group(body, text, case_insensitive, budget, min, rec, group, &after_reps)
             }
         };
     }
     // A single atom (literal / '.' / escaped / class) plus optional quantifier.
     let (atom, after) = take_atom(pat);
     let (quant, rest) = split_quant(after);
-    let cont = move |t: &str| m(rest, t, case_insensitive, budget, k);
+    let cont = move |t: &str| m(rest, t, case_insensitive, budget, rec, k);
     match quant {
         Some(b'*') | Some(b'+') => {
             let min = if quant == Some(b'+') { 1 } else { 0 };
@@ -241,13 +365,18 @@ fn rep_atom(
     }
 }
 
-/// Greedy repetition of a group `body`, at least `min` times, then `cont`.
+/// Greedy repetition of a group `body`, at least `min` times, then `cont`. Each
+/// iteration records the group's span (so the last iteration wins, matching
+/// PostgreSQL/POSIX capture semantics for a repeated group).
+#[expect(clippy::too_many_arguments, reason = "capture recording threads context")]
 fn rep_group(
     body: &str,
     text: &str,
     case_insensitive: bool,
     budget: &Cell<u32>,
     min: u32,
+    rec: Option<&Recorder>,
+    group: Option<usize>,
     cont: &dyn Fn(&str) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     step(budget)?;
@@ -257,9 +386,12 @@ fn rep_group(
         if t.len() == start_len {
             return Ok(false);
         }
-        rep_group(body, t, case_insensitive, budget, min.saturating_sub(1), cont)
+        if let (Some(r), Some(g)) = (rec, group) {
+            r.record(g, r.consumed(start_len), r.consumed(t.len()));
+        }
+        rep_group(body, t, case_insensitive, budget, min.saturating_sub(1), rec, group, cont)
     };
-    if m(body, text, case_insensitive, budget, &more)? {
+    if m(body, text, case_insensitive, budget, rec, &more)? {
         return Ok(true);
     }
     if min == 0 {
@@ -372,7 +504,18 @@ fn atom_matches(atom: &str, ch: char, case_insensitive: bool) -> bool {
     let b = atom.as_bytes();
     match b.first() {
         Some(b'.') if atom.len() == 1 => true,
-        Some(b'\\') => atom[1..].chars().next().map(|c| eq_ci(c, ch, case_insensitive)).unwrap_or(false),
+        Some(b'\\') => match atom[1..].chars().next() {
+            // Perl-style shorthand classes (PostgreSQL ARE): \d \w \s and their
+            // negations; any other escape is the literal character.
+            Some('d') => ch.is_ascii_digit(),
+            Some('D') => !ch.is_ascii_digit(),
+            Some('w') => ch.is_ascii_alphanumeric() || ch == '_',
+            Some('W') => !(ch.is_ascii_alphanumeric() || ch == '_'),
+            Some('s') => ch.is_ascii_whitespace(),
+            Some('S') => !ch.is_ascii_whitespace(),
+            Some(c) => eq_ci(c, ch, case_insensitive),
+            None => false,
+        },
         Some(b'[') => class_matches(atom, ch, case_insensitive),
         Some(_) => atom.chars().next().map(|c| eq_ci(c, ch, case_insensitive)).unwrap_or(false),
         None => false,
@@ -468,5 +611,30 @@ mod tests {
     #[test]
     fn unsupported_constructs_rejected() {
         assert!(regex_search("a{2}", "aa", false).is_err());
+    }
+
+    #[test]
+    fn captures_record_group_spans() {
+        use super::{find_captures, MAX_GROUPS};
+        let mut spans = [(-1i64, -1i64); MAX_GROUPS];
+        // Two groups: substrings "abc" (0..3) and "123" (4..7).
+        let r = find_captures("([a-z]+)-([0-9]+)", "abc-123", 0, false, &mut spans).unwrap();
+        assert_eq!(r, Some(((0, 7), 2)));
+        assert_eq!(spans[0], (0, 3));
+        assert_eq!(spans[1], (4, 7));
+        // No groups: the whole match is reported, group count 0.
+        let mut s2 = [(-1i64, -1i64); MAX_GROUPS];
+        let r2 = find_captures("[0-9]+", "abc123", 0, false, &mut s2).unwrap();
+        assert_eq!(r2, Some(((3, 6), 0)));
+        // A repeated group keeps its last iteration.
+        let mut s3 = [(-1i64, -1i64); MAX_GROUPS];
+        let r3 = find_captures("(ab)+", "ababab", 0, false, &mut s3).unwrap();
+        assert_eq!(r3, Some(((0, 6), 1)));
+        assert_eq!(s3[0], (4, 6));
+        // 'g'-style second match starts after the first.
+        let mut s4 = [(-1i64, -1i64); MAX_GROUPS];
+        let r4 = find_captures("([0-9]+)", "a1b22", 3, false, &mut s4).unwrap();
+        assert_eq!(r4, Some(((3, 5), 1)));
+        assert_eq!(s4[0], (3, 5));
     }
 }

@@ -1131,6 +1131,69 @@ fn call<'a>(
                 Ok(Datum::Int8(v))
             }
         }
+        // Set-returning `regexp_matches(string, pattern [, flags])`: for the
+        // current expansion index k, the capture groups of the k-th match as a
+        // text[] (or the whole match when the pattern has no groups). NULLs
+        // (arguments or non-participating groups) follow PostgreSQL.
+        "regexp_matches" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            let (Some(string), Some(pattern)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let flags = if args.len() == 3 {
+                text_arg(name, args, 2, arena, params, row, hooks)?.unwrap_or("")
+            } else {
+                ""
+            };
+            let (global, ci) = regexp_flags(flags)?;
+            let mut spans = [(-1i64, -1i64); super::regex::MAX_GROUPS];
+            let mut from = 0usize;
+            let mut count = 0usize;
+            loop {
+                let Some(((mstart, mend), ng)) =
+                    super::regex::find_captures(pattern, string, from, ci, &mut spans)?
+                else {
+                    return Ok(Datum::Null);
+                };
+                count += 1;
+                if count == k {
+                    // No capture groups: the whole match is the single element.
+                    let mut elems = [Datum::Null; super::regex::MAX_GROUPS];
+                    let n = if ng == 0 {
+                        elems[0] = Datum::Text(&string[mstart..mend]);
+                        1
+                    } else {
+                        for (i, span) in spans[..ng].iter().enumerate() {
+                            elems[i] = if span.0 < 0 {
+                                Datum::Null
+                            } else {
+                                Datum::Text(&string[span.0 as usize..span.1 as usize])
+                            };
+                        }
+                        ng
+                    };
+                    return Ok(Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(&elems[..n], arena)?,
+                    });
+                }
+                if !global {
+                    return Ok(Datum::Null);
+                }
+                from = if mend > mstart { mend } else { mend + 1 };
+                if from > string.len() {
+                    return Ok(Datum::Null);
+                }
+            }
+        }
         // Set-returning `_pg_expandarray(array)` yields, for the current expansion
         // index k, the composite `(x, n)` = (array[k], k), encoded as `[x, n]`.
         "_pg_expandarray" => {
@@ -3588,6 +3651,22 @@ fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), Sql
         Datum::Range { text, kind } => Ok((text, *kind)),
         other => Err(type_mismatch("range operator", other)),
     }
+}
+
+/// Parses PostgreSQL regex flags into `(global, case_insensitive)`; an unknown
+/// flag is a loud error.
+pub fn regexp_flags(flags: &str) -> Result<(bool, bool), SqlError> {
+    let mut global = false;
+    let mut case_insensitive = false;
+    for f in flags.chars() {
+        match f {
+            'g' => global = true,
+            'i' => case_insensitive = true,
+            'c' => case_insensitive = false,
+            _ => return Err(sql_err!("22023", "invalid regular expression option: \"{}\"", f)),
+        }
+    }
+    Ok((global, case_insensitive))
 }
 
 fn as_multirange<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), SqlError> {

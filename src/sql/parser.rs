@@ -1414,14 +1414,17 @@ impl<'a> Parser<'a> {
     fn expr(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
         let mut left = self.prefix()?;
         loop {
-            // Postfix: `::type` and `IS [NOT] NULL` bind tightest.
+            // Postfix `::type` binds tightest.
             if self.peeked == Tok::Op("::") {
                 self.advance()?;
                 let (type_name, type_mod) = self.type_name_mod()?;
                 left = self.arena_expr(Expr::Cast { operand: left, type_name, type_mod })?;
                 continue;
             }
-            if self.peeked == Tok::Ident("is") {
+            // `IS [NOT] NULL` binds looser than arithmetic and comparison (like
+            // PostgreSQL), so it applies only at the comparison precedence level
+            // and below — `1 - 2 IS NOT NULL` is `(1 - 2) IS NOT NULL`.
+            if min_prec <= 4 && self.peeked == Tok::Ident("is") {
                 self.advance()?;
                 let negated = self.eat_ident("not")?;
                 self.expect_ident("null")?;

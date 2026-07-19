@@ -2812,6 +2812,13 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "string_agg" => of(ColType::Text),
             "extract" => of(ColType::Numeric),
             "date_part" => of(ColType::Float8),
+            // Paren-less temporal functions carry a proper type so date/time
+            // arithmetic (e.g. `current_date - 1`) type-checks correctly.
+            "current_date" => of(ColType::Date),
+            "current_time" => of(ColType::Time),
+            "localtimestamp" => of(ColType::Timestamp),
+            "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
+            | "clock_timestamp" => of(ColType::Timestamptz),
             "date_trunc" => {
                 // Returns the timestamp type of its second argument.
                 let a = args.get(1).map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);

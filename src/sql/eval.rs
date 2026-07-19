@@ -1868,18 +1868,23 @@ fn call<'a>(
                 let Some(n) = int_arg(name, args, 1, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let scale = n.max(0) as usize;
-                return match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Null => Ok(Datum::Null),
-                    Datum::Numeric(v) => Ok(Datum::Numeric(v.round_scale(scale, mode, arena)?)),
-                    Datum::Int4(x) => Ok(Datum::Numeric(
-                        Numeric::from_i64(x as i64, arena)?.round_scale(scale, mode, arena)?,
-                    )),
-                    Datum::Int8(x) => Ok(Datum::Numeric(
-                        Numeric::from_i64(x, arena)?.round_scale(scale, mode, arena)?,
-                    )),
-                    other => Err(type_mismatch(name, &other)),
+                let v = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Numeric(v) => v,
+                    Datum::Int4(x) => Numeric::from_i64(x as i64, arena)?,
+                    Datum::Int8(x) => Numeric::from_i64(x, arena)?,
+                    other => return Err(type_mismatch(name, &other)),
                 };
+                let result = if n >= 0 {
+                    v.round_scale(n as usize, mode, arena)?
+                } else {
+                    // A negative scale rounds to the left of the point: round
+                    // v / 10^|n| to an integer, then scale back up.
+                    let pow = Numeric::parse(stack_format!(24, "1e{}", -n).as_str(), arena)?;
+                    let scaled = numeric::div(&v, &pow, arena)?.round_scale(0, mode, arena)?;
+                    numeric::mul(&scaled, &pow, arena)?
+                };
+                return Ok(Datum::Numeric(result));
             }
             if star || args.len() != 1 {
                 return Err(arity_err(name, args.len()));

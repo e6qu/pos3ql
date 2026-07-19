@@ -2505,6 +2505,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         }
         ColType::Range(kind) => Datum::Range { text: "empty", kind },
         ColType::Bit { varying } => Datum::Bit { bits: "", varying },
+        ColType::Multirange(kind) => Datum::Multirange { text: "{}", kind },
     }
 }
 

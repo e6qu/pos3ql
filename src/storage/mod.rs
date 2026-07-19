@@ -100,6 +100,7 @@ impl OwnedDatum {
             | Datum::Json { .. }
             | Datum::Array { .. }
             | Datum::Range { .. }
+            | Datum::Multirange { .. }
             | Datum::Bit { .. }
             | Datum::Uuid(_)
             | Datum::Bytea(_) => {

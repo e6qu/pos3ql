@@ -24,3 +24,5 @@ SELECT age(timestamp '2020-01-10', timestamp '2024-06-15');
 SELECT age(timestamp '2024-03-01', timestamp '2024-01-31');
 SELECT age(timestamp '2024-01-01 10:00', timestamp '2023-12-15 14:30');
 SELECT age(date '2000-01-01', date '1999-02-05');
+-- to_timestamp(epoch): Unix seconds -> timestamptz
+SELECT to_timestamp(0), to_timestamp(1700000000), to_timestamp(1700000000.5), to_timestamp(-100000);

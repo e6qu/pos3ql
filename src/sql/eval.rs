@@ -2411,6 +2411,20 @@ fn call<'a>(
             };
             Ok(Datum::Numeric(super::to_char::to_number(s, fmt, arena)?))
         }
+        // `to_timestamp(double)` converts a Unix epoch (seconds) to timestamptz.
+        "to_timestamp" if args.len() == 1 => {
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                d => {
+                    let Some(secs) = num_factor(&d) else {
+                        return Err(type_mismatch(name, &d));
+                    };
+                    let micros = (secs * 1_000_000.0).round() as i64
+                        - super::datetime::PG_EPOCH_DAYS * 86_400_000_000;
+                    Ok(Datum::Timestamptz(micros))
+                }
+            }
+        }
         "to_date" | "to_timestamp" => {
             arity(2)?;
             let (Some(s), Some(fmt)) = (

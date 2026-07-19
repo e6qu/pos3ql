@@ -2507,7 +2507,7 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
         Expr::Column { qualifier, name } => of(cols.resolve(*qualifier, name)?),
         Expr::Unary { op, operand } => match op {
             super::ast::UnaryOp::Not => of(ColType::Bool),
-            super::ast::UnaryOp::Neg => infer_type_res(operand, cols)?,
+            super::ast::UnaryOp::Neg | super::ast::UnaryOp::BitNot => infer_type_res(operand, cols)?,
         },
         Expr::Binary { op, left, right } => {
             use super::ast::BinaryOp::*;
@@ -2528,6 +2528,20 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     of(ColType::Bool)
                 }
                 And | Or => of(ColType::Bool),
+                // `^` stays numeric when an operand is numeric (and none is a
+                // float); otherwise it is double precision.
+                Pow => {
+                    if (lo == oid::NUMERIC || ro == oid::NUMERIC)
+                        && lo != oid::FLOAT8
+                        && ro != oid::FLOAT8
+                        && lo != oid::FLOAT4
+                        && ro != oid::FLOAT4
+                    {
+                        of(ColType::Numeric)
+                    } else {
+                        of(ColType::Float8)
+                    }
+                }
                 Concat => (oid::TEXT, -1),
                 // `json -> k` keeps the json/jsonb type; `->>` yields text.
                 JsonGet => (if lo == oid::JSONB { oid::JSONB } else { oid::JSON }, -1),
@@ -2814,6 +2828,9 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "date_part" => of(ColType::Float8),
             // Paren-less temporal functions carry a proper type so date/time
             // arithmetic (e.g. `current_date - 1`) type-checks correctly.
+            "make_date" => of(ColType::Date),
+            "make_time" => of(ColType::Time),
+            "make_timestamp" => of(ColType::Timestamp),
             "current_date" => of(ColType::Date),
             "current_time" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),

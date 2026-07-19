@@ -86,6 +86,38 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
     i32::try_from(days).map_err(|_| out_of_range())
 }
 
+/// Constructs a date (days since 2000-01-01) from year/month/day, validating
+/// the fields as PostgreSQL `make_date` does.
+pub fn make_date(y: i64, m: i64, d: i64) -> Result<i32, SqlError> {
+    let range = || sql_err!("22008", "date field value out of range");
+    if !(1..=12).contains(&m) {
+        return Err(range());
+    }
+    let (mu, du) = (m as u32, d);
+    if du < 1 || du as u32 > days_in_month(y, mu) {
+        return Err(range());
+    }
+    let days = days_from_civil(y, mu, du as u32) - PG_EPOCH_DAYS;
+    i32::try_from(days).map_err(|_| range())
+}
+
+/// Constructs a time-of-day (microseconds since midnight) from hour/minute and
+/// a fractional second, validating fields as PostgreSQL `make_time` does.
+pub fn make_time(h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+    let range = || sql_err!("22008", "time field value out of range");
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0.0..60.0).contains(&sec) {
+        return Err(range());
+    }
+    Ok(((h * 60 + mi) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
+}
+
+/// Constructs a timestamp (microseconds since 2000-01-01) from its fields.
+pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+    let days = make_date(y, m, d)? as i64;
+    let tod = make_time(h, mi, sec)?;
+    Ok(days * 86_400_000_000 + tod)
+}
+
 /// Parses `YYYY-MM-DD[ |T]HH:MM[:SS[.ffffff]][Z|±HH[:MM]]` into
 /// microseconds since 2000-01-01 UTC. `require_tz_shift` applies the zone
 /// offset (timestamptz); plain timestamp ignores any suffix.
@@ -604,6 +636,25 @@ mod tests {
         assert!(parse_date("2023-02-29").is_err());
         assert!(parse_date("2023-13-01").is_err());
         assert!(parse_date("not-a-date").is_err());
+    }
+
+    #[test]
+    fn make_constructors_match_parsing() {
+        // make_date agrees with parse_date, and validates its fields.
+        assert_eq!(make_date(2024, 6, 15).unwrap(), parse_date("2024-06-15").unwrap());
+        assert_eq!(make_date(2000, 1, 1).unwrap(), 0);
+        assert!(make_date(2024, 13, 1).is_err());
+        assert!(make_date(2024, 2, 30).is_err());
+        // make_time counts microseconds since midnight.
+        assert_eq!(make_time(12, 30, 0.0).unwrap(), ((12 * 60 + 30) * 60) * 1_000_000);
+        assert_eq!(make_time(0, 0, 45.5).unwrap(), 45_500_000);
+        assert!(make_time(24, 0, 0.0).is_err());
+        assert!(make_time(0, 0, 60.0).is_err());
+        // make_timestamp combines the two.
+        assert_eq!(
+            make_timestamp(2024, 6, 15, 12, 30, 0.0).unwrap(),
+            make_date(2024, 6, 15).unwrap() as i64 * 86_400_000_000 + make_time(12, 30, 0.0).unwrap()
+        );
     }
 
     #[test]

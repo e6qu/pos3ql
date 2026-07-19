@@ -1624,6 +1624,11 @@ impl<'a> Parser<'a> {
                 }
                 Ok(base)
             }
+            Tok::Op("~") => {
+                self.advance()?;
+                let operand = self.expr(8)?;
+                self.arena_expr(Expr::Unary { op: UnaryOp::BitNot, operand })
+            }
             Tok::Op("-") => {
                 self.advance()?;
                 // Fold a leading minus into an integer literal, as PostgreSQL
@@ -2147,6 +2152,7 @@ impl<'a> Parser<'a> {
             Tok::Op("#") => Some(BinaryOp::BitXor),
             Tok::Op("<<") => Some(BinaryOp::Shl),
             Tok::Op(">>") => Some(BinaryOp::Shr),
+            Tok::Op("^") => Some(BinaryOp::Pow),
             Tok::Ident("and") => Some(BinaryOp::And),
             Tok::Ident("or") => Some(BinaryOp::Or),
             _ => None,

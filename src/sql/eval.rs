@@ -2243,6 +2243,47 @@ fn call<'a>(
             };
             Ok(Datum::Numeric(super::to_char::to_number(s, fmt, arena)?))
         }
+        "make_date" | "make_time" | "make_timestamp" => {
+            let want = if name == "make_date" {
+                3
+            } else if name == "make_time" {
+                3
+            } else {
+                6
+            };
+            arity(want)?;
+            // The seconds field is a double; every other field is an integer.
+            let sec_idx = if name == "make_date" { usize::MAX } else { want - 1 };
+            let mut ints = [0i64; 6];
+            for i in 0..want {
+                if i == sec_idx {
+                    continue;
+                }
+                match int_arg(name, args, i, arena, params, row, hooks)? {
+                    Some(v) => ints[i] = v,
+                    None => return Ok(Datum::Null),
+                }
+            }
+            let sec = if sec_idx == usize::MAX {
+                0.0
+            } else {
+                match num_f64(name, args, sec_idx, arena, params, row, hooks)? {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                }
+            };
+            match name {
+                "make_date" => {
+                    Ok(Datum::Date(super::datetime::make_date(ints[0], ints[1], ints[2])?))
+                }
+                "make_time" => {
+                    Ok(Datum::Time(super::datetime::make_time(ints[0], ints[1], sec)?))
+                }
+                _ => Ok(Datum::Timestamp(super::datetime::make_timestamp(
+                    ints[0], ints[1], ints[2], ints[3], ints[4], sec,
+                )?)),
+            }
+        }
         "to_hex" => {
             arity(1)?;
             let s = match eval_full(args[0], arena, params, row, hooks)? {
@@ -2901,8 +2942,11 @@ fn unary<'a>(op: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
             ..n
         })),
         (UnaryOp::Not, Datum::Bool(b)) => Ok(Datum::Bool(!b)),
+        (UnaryOp::BitNot, Datum::Int4(x)) => Ok(Datum::Int4(!x)),
+        (UnaryOp::BitNot, Datum::Int8(x)) => Ok(Datum::Int8(!x)),
         (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
         (UnaryOp::Not, other) => Err(type_mismatch("NOT", &other)),
+        (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
     }
 }
 
@@ -2930,6 +2974,22 @@ fn binary<'a>(
         Add | Sub | Mul | Div | Mod => arithmetic(op, l, r, l_unknown, r_unknown, arena),
         JsonGet | JsonGetText => json_get(l, r, op == JsonGetText, arena),
         BitAnd | BitOr | BitXor | Shl | Shr => bitwise(op, l, r),
+        Pow => {
+            // PostgreSQL `^` stays numeric when an operand is numeric (and none
+            // is float8); otherwise it is double-precision exponentiation.
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let any_numeric = matches!(l, Datum::Numeric(_)) || matches!(r, Datum::Numeric(_));
+            let any_float = matches!(l, Datum::Float8(_)) || matches!(r, Datum::Float8(_));
+            if any_numeric && !any_float {
+                let a = datum_numeric("^", l, arena)?;
+                let b = datum_numeric("^", r, arena)?;
+                return Ok(Datum::Numeric(numeric::pow(&a, &b, arena)?));
+            }
+            let (a, b) = (datum_f64("^", l)?, datum_f64("^", r)?);
+            Ok(Datum::Float8(a.powf(b)))
+        }
     }
 }
 

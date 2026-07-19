@@ -212,6 +212,12 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
+        // NOT propagates a folded boolean, so `NOT (x AND FALSE)` simplifies to
+        // TRUE — which lets a CASE truncate exactly as PostgreSQL's plan-time
+        // simplification does.
+        Expr::Unary { operator: super::ast::UnaryOp::Not, operand } => {
+            Ok(fold_check(operand, arena)?.map(|b| !b))
+        }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::IsNull { operand, .. } => {
@@ -2614,8 +2620,12 @@ fn call<'a>(
             if let Some(m) = micros {
                 return Ok(Datum::Text(super::to_char::timestamp(m, fmt, arena)?));
             }
+            // A float8 input keeps its own sign bit even when the value rounds
+            // to zero (covers -0.0 and small negatives) — PostgreSQL behavior.
+            let float_negative = matches!(v, Datum::Float8(x) if x.is_sign_negative());
+            let float_source = if let Datum::Float8(x) = v { Some(x) } else { None };
             let n = datum_numeric(name, v, arena)?;
-            Ok(Datum::Text(super::to_char::number(&n, fmt, arena)?))
+            Ok(Datum::Text(super::to_char::number(&n, fmt, float_negative, float_source, arena)?))
         }
         "to_number" => {
             arity(2)?;

@@ -6,7 +6,7 @@
 //! `PR`, `V`, `EEEE`, `RN`, `TH`) are rejected loudly rather than misformatted.
 
 use super::eval::SqlError;
-use super::numeric::{Numeric, RoundMode, Sign};
+use super::numeric::{Numeric, RoundMode};
 use crate::mem::arena::Arena;
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
@@ -41,7 +41,17 @@ enum SignKind {
 }
 
 /// Formats `value` per `fmt`, returning an arena-allocated string.
-pub fn number<'a>(value: &Numeric, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+/// `float_source` carries the original float8 when the input was one:
+/// PostgreSQL formats a float8 from its binary value with C's `%.*f`
+/// (round-half-even on the true binary expansion), while a numeric input
+/// rounds half-away-from-zero on its decimal value.
+pub fn number<'a>(
+    value: &Numeric,
+    fmt: &str,
+    negative_sign_override: bool,
+    float_source: Option<f64>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
     let mut toks = [Tok::Nine; MAX_TOKS];
     let mut ntok = 0usize;
     let mut fm = false;
@@ -153,6 +163,8 @@ pub fn number<'a>(value: &Numeric, fmt: &str, arena: &'a Arena) -> Result<&'a st
         has_point,
         int_digits,
         frac_digits,
+        negative_sign_override,
+        float_source,
         arena,
     )
 }
@@ -167,16 +179,31 @@ fn render<'a>(
     has_point: bool,
     int_digits: usize,
     frac_digits: usize,
+    negative_sign_override: bool,
+    float_source: Option<f64>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    // Round to the number of fractional positions the format provides.
-    let rounded = value.round_scale(frac_digits, RoundMode::HalfAwayZero, arena)?;
-    let text = stack_format!(512, "{}", rounded);
+    // Round to the number of fractional positions the format provides. A
+    // finite float8 input formats from its binary value with round-half-even
+    // (C's `%.*f`, so `-120.975` — really `-120.97499…` — gives `-120.97`);
+    // a numeric input rounds half-away-from-zero on its decimal value. Both
+    // verified against PostgreSQL 18.4.
+    let text = match float_source {
+        Some(x) if x.is_finite() => stack_format!(512, "{:.*}", frac_digits, x),
+        _ => {
+            let rounded = value.round_scale(frac_digits, RoundMode::HalfAwayZero, arena)?;
+            stack_format!(512, "{}", rounded)
+        }
+    };
     let s = text.as_str();
     let body = s.strip_prefix('-').unwrap_or(s);
     let (intpart, fracpart) = body.split_once('.').unwrap_or((body, ""));
-    let neg = rounded.sign == Sign::Neg && !rounded.is_zero();
-    let whole_zero = rounded.is_zero();
+    let body_zero = body.bytes().all(|b| !b.is_ascii_digit() || b == b'0');
+    // A numeric that rounds to zero loses its sign, but a float8 input keeps
+    // its own sign bit even at zero (`to_char(-0.001::float8, 'FM999.99')` →
+    // `-0.` while the numeric form gives `0.`) — verified against PostgreSQL.
+    let neg = (s.starts_with('-') && !body_zero) || negative_sign_override;
+    let whole_zero = body_zero;
 
     let mut fracbuf = [b'0'; MAX_OUT];
     let fb = fracpart.as_bytes();
@@ -629,7 +656,7 @@ mod tests {
     }
 
     fn tc(v: &str, f: &str, a: &Arena) -> String {
-        number(&Numeric::parse(v, a).unwrap(), f, a).unwrap().to_string()
+        number(&Numeric::parse(v, a).unwrap(), f, false, None, a).unwrap().to_string()
     }
 
     #[test]
@@ -690,8 +717,8 @@ mod tests {
     #[test]
     fn unsupported_codes_are_loud() {
         let a = arena();
-        assert!(number(&Numeric::parse("5", &a).unwrap(), "999MI", &a).is_err());
-        assert!(number(&Numeric::parse("5", &a).unwrap(), "RN", &a).is_err());
-        assert!(number(&Numeric::parse("5", &a).unwrap(), "9EEEE", &a).is_err());
+        assert!(number(&Numeric::parse("5", &a).unwrap(), "999MI", false, None, &a).is_err());
+        assert!(number(&Numeric::parse("5", &a).unwrap(), "RN", false, None, &a).is_err());
+        assert!(number(&Numeric::parse("5", &a).unwrap(), "9EEEE", false, None, &a).is_err());
     }
 }

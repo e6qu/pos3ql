@@ -3482,6 +3482,27 @@ mod tests {
     }
 
     #[test]
+    fn statement_timeout_cancels_long_statement() {
+        let (mut e, mut b) = test_engine();
+        run_with(&mut e, &mut b, "CREATE TABLE big (n int)");
+        run_with(&mut e, &mut b, "INSERT INTO big SELECT * FROM generate_series(1, 300)");
+        // A three-way cross join is ~27M iterations — far longer than 1 ms.
+        // (SET and the query share one batch: the test harness makes a fresh
+        // session per call, and a SET takes effect within its batch.)
+        assert!(String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "SET statement_timeout = 1; SELECT count(*) FROM big a, big b, big c"
+        ))
+        .contains("57014"));
+        // With the timeout disabled the same query shape runs normally.
+        assert_eq!(
+            data_rows(&run_with(&mut e, &mut b, "SELECT count(*) FROM big")),
+            ["300"]
+        );
+    }
+
+    #[test]
     fn string_agg_aggregate() {
         // Values validated against PostgreSQL 18.4. Without an aggregate
         // ORDER BY, PostgreSQL leaves the concatenation order unspecified; our

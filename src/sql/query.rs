@@ -30,6 +30,52 @@ use super::types::{ColDesc, ColType, Datum};
 
 pub const MAX_JOIN_TABLES: usize = 9; // base + 8 joins
 const MAX_AGGS: usize = 16;
+
+use core::cell::Cell;
+std::thread_local! {
+    /// Wall-clock deadline (micros since 2000-01-01) for the running statement;
+    /// 0 means no `statement_timeout` is armed. Single-threaded per connection.
+    static DEADLINE: Cell<i64> = const { Cell::new(0) };
+    /// Amortizes the clock read in [`check_timeout`] to roughly 1 in 1024 calls.
+    static TICK: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Arms `statement_timeout` for the current statement (`timeout_ms == 0` clears
+/// it). Call [`disarm_timeout`] when the statement completes.
+pub fn arm_timeout(timeout_ms: u64) {
+    let dl = if timeout_ms == 0 {
+        0
+    } else {
+        super::datetime::now_micros().saturating_add(timeout_ms as i64 * 1000)
+    };
+    DEADLINE.with(|d| d.set(dl));
+}
+
+/// Clears any armed statement deadline.
+pub fn disarm_timeout() {
+    DEADLINE.with(|d| d.set(0));
+}
+
+/// Errors 57014 if the armed statement deadline has passed. Called at scan
+/// boundaries; the clock is only read about once per 1024 calls.
+pub fn check_timeout() -> Result<(), SqlError> {
+    let dl = DEADLINE.with(|d| d.get());
+    if dl == 0 {
+        return Ok(());
+    }
+    let t = TICK.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    });
+    if !t.is_multiple_of(1024) {
+        return Ok(());
+    }
+    if super::datetime::now_micros() >= dl {
+        return Err(sql_err!("57014", "canceling statement due to statement timeout"));
+    }
+    Ok(())
+}
 const MAX_WINDOWS: usize = 16;
 /// Maximum ORDER BY / PARTITION BY keys in one window clause.
 const MAX_WIN_KEYS: usize = 8;
@@ -648,6 +694,7 @@ fn scan_source<'a>(
                 .map_err(|_| arena_full())?;
             ordered.sort_unstable_by_key(|l| l.offset);
             for (this, &loc) in ordered.iter().enumerate() {
+                check_timeout()?;
                 bound[depth] = Some(storage.heap.get(loc));
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;

@@ -23,3 +23,11 @@ SELECT ARRAY[1,2] || '3';
 SELECT ARRAY['a'] || NULL, NULL || ARRAY['a'];
 SELECT ARRAY[1] || NULL::int, ARRAY[1] || NULL::int[];
 SELECT ARRAY[1] || NULL::text;
+-- SIMILAR TO (SQL regular expressions)
+SELECT 'abc' SIMILAR TO 'a%', 'abc' SIMILAR TO 'a_c', 'abc' SIMILAR TO '(a|b)%', 'abc' SIMILAR TO 'xyz';
+SELECT 'hello' NOT SIMILAR TO 'h%', 'a.c' SIMILAR TO 'a.c', 'axc' SIMILAR TO 'a.c';
+SELECT 'abc123' SIMILAR TO '[a-z]+[0-9]+', 'foobar' SIMILAR TO '%(bar|baz)';
+-- LIKE ANY/ALL and unknown-literal arrays in ANY/ALL
+SELECT 'foo' LIKE ANY(ARRAY['f%','b%']), 'foo' LIKE ALL(ARRAY['f%','%o']), 'FOO' ILIKE ANY(ARRAY['f%']);
+SELECT 'foo' NOT LIKE ANY(ARRAY['f%','b%']), 'foo' NOT LIKE ALL(ARRAY['x%','y%']);
+SELECT 5 = ANY('{2,4,5}'), 3 = ANY('{2,4,5}'), 5 > ALL('{1,2,3}'), 'foo' LIKE ANY('{f%,b%}');

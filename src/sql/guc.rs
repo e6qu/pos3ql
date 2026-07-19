@@ -512,7 +512,7 @@ fn is_utc(v: &str) -> bool {
 /// abbreviation), or None for a named/DST zone we do not model. Matches
 /// PostgreSQL's inverted sign conventions: `Etc/GMT+5` is UTC-5 and a bare
 /// `+05:30` is UTC-5:30.
-fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
+pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
     use super::timezone::Timezone;
     let t = v.trim();
     if is_utc(t) || t.eq_ignore_ascii_case("z") || t.eq_ignore_ascii_case("zulu") {

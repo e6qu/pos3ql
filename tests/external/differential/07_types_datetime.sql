@@ -26,3 +26,19 @@ SELECT age(timestamp '2024-01-01 10:00', timestamp '2023-12-15 14:30');
 SELECT age(date '2000-01-01', date '1999-02-05');
 -- to_timestamp(epoch): Unix seconds -> timestamptz
 SELECT to_timestamp(0), to_timestamp(1700000000), to_timestamp(1700000000.5), to_timestamp(-100000);
+-- AT TIME ZONE (timestamp <-> timestamptz), with DST and offset zones
+SELECT timestamp '2024-01-01 12:00' AT TIME ZONE 'UTC';
+SELECT timestamptz '2024-01-01 12:00+00' AT TIME ZONE 'America/New_York';
+SELECT timestamp '2024-07-01 12:00' AT TIME ZONE 'America/New_York';
+SELECT timestamp '2024-06-01 12:00' AT TIME ZONE '+05';
+SELECT timestamptz '2024-06-01 12:00+00' AT TIME ZONE 'Etc/GMT-3';
+SELECT timezone('UTC', timestamptz '2024-01-01 00:00+00');
+-- make_interval: positional and named-argument field composition
+SELECT make_interval(1, 2, 3, 4, 5, 6, 7.5);
+SELECT make_interval(years => 2, months => 6);
+SELECT make_interval(days => 10, hours => 3, mins => 30, secs => 15.25);
+SELECT make_interval(weeks => 2);
+SELECT make_interval(secs => 90.5);
+SELECT make_interval();
+SELECT make_interval(mins => -90);
+SELECT make_interval(1, 2) + make_interval(hours => 5);

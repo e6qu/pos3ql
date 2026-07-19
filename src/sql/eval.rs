@@ -91,8 +91,10 @@ pub const NO_PARAMS: &[Datum<'static>] = &[];
 /// or node identity (aggregates, subqueries).
 #[derive(Clone, Copy)]
 pub struct EvalHooks<'h, 'a> {
-    /// (group-by expressions, this group's key values).
-    pub group: Option<(&'h [&'h Expr<'h>], &'h [Datum<'a>])>,
+    /// (group-by expressions, this group's key values, active-column bitmask).
+    /// The bitmask selects which `group_by` columns participate in the current
+    /// grouping set (all bits set for a plain `GROUP BY`); it drives `GROUPING()`.
+    pub group: Option<(&'h [&'h Expr<'h>], &'h [Datum<'a>], u64)>,
     /// (aggregate-call nodes by address, this group's results).
     pub aggs: Option<(&'h [*const Expr<'h>], &'h [Datum<'a>])>,
     /// (subquery nodes by address, their pre-evaluated results).
@@ -309,9 +311,30 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    // GROUPING(arg, ...): each argument contributes one bit (1 if that column
+    // is NOT part of the current grouping set), most significant first.
+    if let Expr::Call { name, args, .. } = expression
+        && name.eq_ignore_ascii_case("grouping")
+    {
+        let Some((exprs, _, mask)) = hooks.group else {
+            return Err(sql_err!(
+                "42803",
+                "GROUPING must be used with grouping sets or GROUP BY"
+            ));
+        };
+        let mut result = 0i32;
+        for arg in args.iter() {
+            let idx = exprs.iter().position(|g| **g == **arg).ok_or_else(|| {
+                sql_err!("42803", "arguments to GROUPING must be grouping expressions of the associated query level")
+            })?;
+            let grouped = mask & (1u64 << idx) != 0;
+            result = (result << 1) | i32::from(!grouped);
+        }
+        return Ok(Datum::Int4(result));
+    }
     // Group-key substitution: any expression equal to a GROUP BY key
     // evaluates to the group's value.
-    if let Some((exprs, values)) = hooks.group {
+    if let Some((exprs, values, _mask)) = hooks.group {
         for (g, v) in exprs.iter().zip(values) {
             if **g == *expression {
                 return Ok(*v);
@@ -714,6 +737,15 @@ pub fn eval_full<'a>(
             let (element, raw) = match array {
                 Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
+                // An unknown literal on the array side (`= ANY('{1,2}')`) is cast
+                // to an array of the left operand's element type, as PostgreSQL
+                // resolves it.
+                Datum::Text(s) => {
+                    let element =
+                        super::types::ArrElem::from_datum(&lhs).unwrap_or(super::types::ArrElem::Text);
+                    let raw = super::array::parse_literal(s, element, arena)?;
+                    (element, raw)
+                }
                 _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
             };
             let n = super::array::len(raw);
@@ -748,6 +780,57 @@ fn unify_arr_elem(a: super::types::ArrElem, b: super::types::ArrElem) -> super::
         (Text, _) | (_, Text) => Text,
         _ => a,
     }
+}
+
+/// Translates a SQL `SIMILAR TO` pattern into a POSIX regular expression
+/// anchored to the whole string. `%`/`_` become `.*`/`.`; the SIMILAR TO
+/// metacharacters (`| * + ? ( ) [ ] { }`) pass through; characters that are
+/// literal in SIMILAR TO but special in POSIX (`. ^ $`) are escaped; `\` escapes
+/// the next character. Inside a `[...]` bracket expression everything is literal.
+fn similar_to_posix(pattern: &str, buffer: &mut crate::util::StackStr<256>) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let _ = buffer.write_char('^');
+    let mut chars = pattern.chars();
+    let mut in_bracket = false;
+    while let Some(c) = chars.next() {
+        if in_bracket {
+            let _ = buffer.write_char(c);
+            if c == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                let _ = buffer.write_char('\\');
+                if let Some(next) = chars.next() {
+                    let _ = buffer.write_char(next);
+                }
+            }
+            '%' => {
+                let _ = buffer.write_str(".*");
+            }
+            '_' => {
+                let _ = buffer.write_char('.');
+            }
+            '.' | '^' | '$' => {
+                let _ = buffer.write_char('\\');
+                let _ = buffer.write_char(c);
+            }
+            '[' => {
+                let _ = buffer.write_char('[');
+                in_bracket = true;
+            }
+            _ => {
+                let _ = buffer.write_char(c);
+            }
+        }
+    }
+    let _ = buffer.write_char('$');
+    if buffer.is_truncated() {
+        return Err(sql_err!("22026", "SIMILAR TO pattern is too long"));
+    }
+    Ok(())
 }
 
 /// SQL LIKE: `%` matches any run (including empty), `_` exactly one
@@ -2474,6 +2557,86 @@ fn call<'a>(
                 )?)),
             }
         }
+        "make_interval" => {
+            // Seven positional fields (the parser desugars named arguments):
+            // years, months, weeks, days, hours, mins (integers) and secs
+            // (double precision). Years fold into months and weeks into days,
+            // matching PostgreSQL's interval field composition.
+            arity(7)?;
+            let mut ints = [0i64; 6];
+            for (i, slot) in ints.iter_mut().enumerate() {
+                match int_arg(name, args, i, arena, params, row, hooks)? {
+                    Some(v) => *slot = v,
+                    None => return Ok(Datum::Null),
+                }
+            }
+            let secs = match num_f64(name, args, 6, arena, params, row, hooks)? {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let months = ints[0]
+                .checked_mul(12)
+                .and_then(|y| y.checked_add(ints[1]))
+                .and_then(|m| i32::try_from(m).ok());
+            let days = ints[2]
+                .checked_mul(7)
+                .and_then(|w| w.checked_add(ints[3]))
+                .and_then(|d| i32::try_from(d).ok());
+            let (Some(months), Some(days)) = (months, days) else {
+                return Err(sql_err!("22008", "interval field value out of range"));
+            };
+            let sec_micros = (secs * 1_000_000.0).round();
+            let micros = ints[4]
+                .checked_mul(3_600_000_000)
+                .and_then(|h| ints[5].checked_mul(60_000_000).and_then(|m| h.checked_add(m)))
+                .filter(|_| sec_micros.is_finite() && sec_micros.abs() < 9.2e18)
+                .and_then(|hm| hm.checked_add(sec_micros as i64));
+            let Some(micros) = micros else {
+                return Err(sql_err!("22008", "interval field value out of range"));
+            };
+            Ok(Datum::Interval(super::types::Interval { months, days, micros }))
+        }
+        "similar_to" => {
+            // `x SIMILAR TO p`: the SQL regular-expression pattern is translated
+            // to a POSIX regex anchored to the whole string, then matched by the
+            // shared regex engine.
+            arity(2)?;
+            let (Some(text), Some(pattern)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let mut posix = crate::util::StackStr::<256>::new();
+            similar_to_posix(pattern, &mut posix)?;
+            Ok(Datum::Bool(super::regex::regex_search(posix.as_str(), text, false)?))
+        }
+        "timezone" => {
+            // `timezone(zone, ts)` == `ts AT TIME ZONE zone`. A plain timestamp
+            // is read as wall-clock time in `zone` and becomes the timestamptz
+            // instant; a timestamptz instant becomes the wall-clock timestamp in
+            // `zone`. The zone's offset can shift with DST, so it is resolved at
+            // the relevant instant.
+            arity(2)?;
+            let Some(zone_name) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let zone = super::guc::parse_timezone(zone_name).ok_or_else(|| sql_err!("22023", "time zone \"{}\" not recognized", zone_name))?;
+            match eval_full(args[1], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Timestamptz(utc) => {
+                    let (offset_seconds, _) = zone.resolve(utc);
+                    Ok(Datum::Timestamp(utc + i64::from(offset_seconds) * 1_000_000))
+                }
+                Datum::Timestamp(wall_clock) => {
+                    // Resolve the offset at the wall-clock instant (exact away
+                    // from the sub-hour DST transition windows).
+                    let (offset_seconds, _) = zone.resolve(wall_clock);
+                    Ok(Datum::Timestamptz(wall_clock - i64::from(offset_seconds) * 1_000_000))
+                }
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
         "age" => {
             // `age(a, b)` is the symbolic interval a - b; `age(a)` measures from
             // the current date at midnight.
@@ -3214,6 +3377,15 @@ fn binary<'a>(
         },
         BitAnd | BitOr | BitXor => bitwise(operator, l, r),
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(operator, l, r),
+        // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
+        Like | ILike => {
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = cast_to_text(l, arena)?;
+            let pattern = cast_to_text(r, arena)?;
+            Ok(Datum::Bool(like_match(text, pattern, operator == ILike)))
+        }
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
             // is float8); otherwise it is double-precision exponentiation.

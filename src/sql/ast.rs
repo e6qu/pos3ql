@@ -90,6 +90,12 @@ pub struct Select<'a> {
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],
+    /// Grouping sets for `ROLLUP`/`CUBE`/`GROUPING SETS`. Each element is a
+    /// bitmask over `group_by` indices selecting the columns that group in that
+    /// set (bit *i* set = `group_by[i]` participates; a cleared bit means that
+    /// column is NULL in the set's output rows). Empty means a plain
+    /// `GROUP BY`: a single implicit set of all `group_by` columns.
+    pub grouping_sets: &'a [u64],
     pub having: Option<&'a Expr<'a>>,
     pub order_by: &'a [OrderBy<'a>],
     pub limit: Option<&'a Expr<'a>>,
@@ -433,7 +439,7 @@ impl Expr<'_> {
         matches!(
             self,
             Expr::Call { name, .. }
-                if matches!(*name, "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "string_agg")
+                if matches!(*name, "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "string_agg" | "percentile_cont" | "percentile_disc" | "mode")
         )
     }
 
@@ -535,6 +541,10 @@ pub enum BinaryOp {
     NotRightOf,
     NotLeftOf,
     Adjacent,
+    /// Pattern match, used only as the operator of a quantified `LIKE ANY/ALL`
+    /// (`ILike` is the case-insensitive form). Plain `x LIKE y` uses `Expr::Like`.
+    Like,
+    ILike,
 }
 
 impl BinaryOp {
@@ -548,6 +558,7 @@ impl BinaryOp {
             // Containment/overlap/adjacency operators bind like comparisons.
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
+            Self::Like | Self::ILike => 4,
             Self::Concat => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,
             // matching PostgreSQL (they are non-standard, mid-precedence).

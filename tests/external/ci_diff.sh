@@ -33,12 +33,14 @@ FUZZ_COUNT=${FUZZ_COUNT:-20000}
 FUZZ_SEED=${FUZZ_SEED:-1}
 FUZZ_BUDGET=${FUZZ_BUDGET:-0}
 # Sharding, so each CI job fits a wall-clock cap while total coverage is
-# preserved: the sqllogictest corpus is split across SLT_SHARD_TOTAL shards
-# (this run does shard SLT_SHARD_INDEX, 1-based), and each of RUN_SLT / RUN_FUZZ
-# gates its (slow) phase so a shard can run one, the other, or both. Defaults
+# preserved: the sqllogictest replay splits each file's query blocks across
+# SLT_QUERY_SHARDS shards (this run does shard SLT_QUERY_SHARD, 0-based) — every
+# shard runs all files and all statement/DDL blocks, only the read-only query
+# blocks are divided, which balances even a single huge file. RUN_SLT / RUN_FUZZ
+# gate the two slow phases so a shard can run one, the other, or both. Defaults
 # run everything in one shard, matching the unsharded behavior.
-SLT_SHARD_INDEX=${SLT_SHARD_INDEX:-1}
-SLT_SHARD_TOTAL=${SLT_SHARD_TOTAL:-1}
+SLT_QUERY_SHARD=${SLT_QUERY_SHARD:-0}
+SLT_QUERY_SHARDS=${SLT_QUERY_SHARDS:-1}
 RUN_SLT=${RUN_SLT:-1}
 RUN_FUZZ=${RUN_FUZZ:-1}
 
@@ -117,22 +119,14 @@ for f in "$EXT"/differential/*.sql; do
 done
 
 # --- vendored sqllogictest replay (real PostgreSQL is the oracle) ----------
-# Sharded by file: this shard replays every SLT_SHARD_TOTAL-th `.test` file.
+# Query-block sharded: all files, all statements; this shard runs its slice of
+# the read-only query blocks.
 if [[ "$RUN_SLT" == 1 ]]; then
-  SLT_ALL=()
-  for f in vendor/test/sqllogictest/test/*.test \
-           vendor/test/sqllogictest/test/evidence/*.test; do
-    [[ -e "$f" ]] && SLT_ALL+=("$f")
-  done
-  SLT_FILES=()
-  for i in "${!SLT_ALL[@]}"; do
-    (( i % SLT_SHARD_TOTAL == SLT_SHARD_INDEX - 1 )) && SLT_FILES+=("${SLT_ALL[$i]}")
-  done
-  echo "=== sqllogictest replay (shard $SLT_SHARD_INDEX/$SLT_SHARD_TOTAL, ${#SLT_FILES[@]} files) ==="
-  if (( ${#SLT_FILES[@]} == 0 )); then
-    bad "sqllogictest replay (no files for shard $SLT_SHARD_INDEX/$SLT_SHARD_TOTAL)"
-  elif "$PY" "$EXT/slt_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --limit "$SLT_LIMIT" \
-       "${SLT_FILES[@]}" > "$WORK/slt.out" 2>&1; then
+  echo "=== sqllogictest replay (query shard $SLT_QUERY_SHARD/$SLT_QUERY_SHARDS) ==="
+  if "$PY" "$EXT/slt_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --limit "$SLT_LIMIT" \
+       --query-shards "$SLT_QUERY_SHARDS" --query-shard "$SLT_QUERY_SHARD" \
+       vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
+       > "$WORK/slt.out" 2>&1; then
     ok "sqllogictest replay ($(grep '^TOTAL' "$WORK/slt.out"))"
   else bad "sqllogictest replay"; tail -40 "$WORK/slt.out"; fi
 fi

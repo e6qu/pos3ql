@@ -7,9 +7,10 @@ name: Differential
 # against PostgreSQL as the oracle.
 #
 # Sharded so every job fits the 15-minute cap while total coverage is
-# preserved: three shards each replay a third of the vendored sqllogictest
-# corpus, and a fourth shard runs the full generative fuzzer. Every shard also
-# runs the fast gates (wire probe, psycopg driver, curated SQL corpus).
+# preserved: four shards each replay a quarter of the vendored sqllogictest
+# corpus's query blocks (all files, all statements, on every shard), and a fifth
+# shard runs the full generative fuzzer. Every shard also runs the fast gates
+# (wire probe, psycopg driver, curated SQL corpus).
 
 on:
   push:
@@ -39,19 +40,23 @@ jobs:
         include:
           - shard: slt-1
             run_slt: "1"
-            slt_index: "1"
+            query_shard: "0"
             run_fuzz: "0"
           - shard: slt-2
             run_slt: "1"
-            slt_index: "2"
+            query_shard: "1"
             run_fuzz: "0"
           - shard: slt-3
             run_slt: "1"
-            slt_index: "3"
+            query_shard: "2"
+            run_fuzz: "0"
+          - shard: slt-4
+            run_slt: "1"
+            query_shard: "3"
             run_fuzz: "0"
           - shard: fuzz
             run_slt: "0"
-            slt_index: "1"
+            query_shard: "0"
             run_fuzz: "1"
 
     services:
@@ -93,11 +98,14 @@ jobs:
           PGPORT: "5432"
           PGUSER: postgres
           P3_PORT: "15599"
-          # Replay the whole vendored sqllogictest corpus (~11k blocks) across
-          # the three slt shards; SLT_LIMIT is the per-file block cap (all).
+          # Replay the whole vendored sqllogictest corpus (~11k blocks): each of
+          # the four slt shards runs all files and all statements but a quarter of
+          # the query blocks, so even one pathologically slow file (select4's
+          # joins) is balanced under the cap. SLT_LIMIT is the per-file block cap
+          # (all).
           SLT_LIMIT: "50000"
-          SLT_SHARD_TOTAL: "3"
-          SLT_SHARD_INDEX: ${{ matrix.slt_index }}
+          SLT_QUERY_SHARDS: "4"
+          SLT_QUERY_SHARD: ${{ matrix.query_shard }}
           RUN_SLT: ${{ matrix.run_slt }}
           RUN_FUZZ: ${{ matrix.run_fuzz }}
           # The fuzzer runs alone on its own shard, so it keeps the full

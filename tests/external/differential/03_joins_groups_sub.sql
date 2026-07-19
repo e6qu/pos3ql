@@ -31,3 +31,8 @@ SELECT count(*) FILTER (WHERE x > 1), sum(x) FILTER (WHERE x < 3) FROM generate_
 SELECT sum(x), sum(x) FILTER (WHERE x % 2 = 0) FROM generate_series(1,5) AS g(x);
 SELECT count(*), count(*) FILTER (WHERE false) FROM generate_series(1,3) AS g(x);
 SELECT string_agg(x::text, ',') FILTER (WHERE x <> 2) FROM generate_series(1,3) AS g(x);
+-- value/positional window functions
+SELECT x, ntile(3) OVER (ORDER BY x) FROM generate_series(1, 10) AS g(x) ORDER BY x;
+SELECT x, first_value(x) OVER (ORDER BY x), last_value(x) OVER () FROM generate_series(1, 4) AS g(x) ORDER BY x;
+SELECT x, nth_value(x, 2) OVER (ORDER BY x) FROM generate_series(1, 4) AS g(x) ORDER BY x;
+SELECT x, first_value(x * 10) OVER (PARTITION BY x % 2 ORDER BY x) FROM generate_series(1, 6) AS g(x) ORDER BY x;

@@ -1628,6 +1628,115 @@ fn compute_window<'a>(
                     Datum::Null
                 };
             }
+        } else if matches!(*name, "first_value" | "last_value" | "nth_value" | "ntile") {
+            // Value/positional window functions over the default frame
+            // (UNBOUNDED PRECEDING TO CURRENT ROW when there is an ORDER BY,
+            // else the whole partition).
+            let peer_end = |from: usize| -> Result<usize, SqlError> {
+                // Index of the last row peered with `from` under the ORDER BY
+                // (itself when there is no ORDER BY).
+                if spec.order_by.is_empty() {
+                    return Ok(m - 1);
+                }
+                let mut e = from;
+                while e + 1 < m {
+                    let same = spec.order_by.iter().try_fold(true, |acc, o| {
+                        Ok::<bool, SqlError>(acc && {
+                            let ra = window_row(scope, rows[p[e]], offs);
+                            let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                            let rb = window_row(scope, rows[p[e + 1]], offs);
+                            let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                            match (va.is_null(), vb.is_null()) {
+                                (true, true) => true,
+                                (true, false) | (false, true) => false,
+                                (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                            }
+                        })
+                    })?;
+                    if same {
+                        e += 1;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(e)
+            };
+            match *name {
+                "ntile" => {
+                    let buckets = {
+                        let r = window_row(scope, rows[p[0]], offs);
+                        match eval_full(args[0], arena, params, &r, hooks)? {
+                            Datum::Int4(v) => v as i64,
+                            Datum::Int8(v) => v,
+                            _ => 1,
+                        }
+                    }
+                    .max(1);
+                    let base = m as i64 / buckets;
+                    let larger = m as i64 % buckets; // first `larger` buckets get one extra row
+                    let mut index = 0usize;
+                    for bucket in 1..=buckets {
+                        let size = base + if bucket <= larger { 1 } else { 0 };
+                        for _ in 0..size {
+                            out[p[index]] = Datum::Int8(bucket);
+                            index += 1;
+                        }
+                    }
+                }
+                "first_value" => {
+                    // Frame start is always the partition start.
+                    let r = window_row(scope, rows[p[0]], offs);
+                    let value = eval_full(args[0], arena, params, &r, hooks)?;
+                    for &row_index in p {
+                        out[row_index] = value;
+                    }
+                }
+                "last_value" => {
+                    // Frame end is the current row's peer-group end.
+                    let mut j = 0usize;
+                    while j < m {
+                        let end = peer_end(j)?;
+                        let r = window_row(scope, rows[p[end]], offs);
+                        let value = eval_full(args[0], arena, params, &r, hooks)?;
+                        for &row_index in &p[j..=end] {
+                            out[row_index] = value;
+                        }
+                        j = end + 1;
+                    }
+                }
+                _ => {
+                    // nth_value(expr, n): the nth row of the frame (1-based from
+                    // the frame start); NULL until the frame has reached it.
+                    let nth = {
+                        let r = window_row(scope, rows[p[0]], offs);
+                        match eval_full(args[1], arena, params, &r, hooks)? {
+                            Datum::Int4(v) => v as usize,
+                            Datum::Int8(v) => v as usize,
+                            _ => 1,
+                        }
+                    };
+                    let nth_value = if nth >= 1 && nth <= m {
+                        let r = window_row(scope, rows[p[nth - 1]], offs);
+                        Some(eval_full(args[0], arena, params, &r, hooks)?)
+                    } else {
+                        None
+                    };
+                    let mut j = 0usize;
+                    while j < m {
+                        let end = peer_end(j)?;
+                        // The frame includes rows p[0..=end]; nth is present iff
+                        // nth-1 <= end.
+                        let value = match nth_value {
+                            Some(v) if nth >= 1 && nth - 1 <= end => v,
+                            _ => Datum::Null,
+                        };
+                        for &row_index in &p[j..=end] {
+                            out[row_index] = value;
+                        }
+                        j = end + 1;
+                    }
+                }
+            }
         } else {
             // Aggregate window function. Default frame:
             //  - no ORDER BY: the whole partition (same value for every row);

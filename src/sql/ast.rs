@@ -479,6 +479,8 @@ impl Expr<'_> {
 pub enum UnaryOp {
     Neg,
     Not,
+    /// `~` bitwise NOT (integers).
+    BitNot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,6 +509,8 @@ pub enum BinaryOp {
     BitXor,
     Shl,
     Shr,
+    /// `^` exponentiation (double precision).
+    Pow,
 }
 
 impl BinaryOp {
@@ -525,8 +529,10 @@ impl BinaryOp {
             Self::Shl | Self::Shr => 5,
             Self::Add | Self::Sub => 6,
             Self::Mul | Self::Div | Self::Mod => 7,
+            // Exponentiation binds tighter than multiplication.
+            Self::Pow => 8,
             // JSON accessors bind tightest among binary operators.
-            Self::JsonGet | Self::JsonGetText => 8,
+            Self::JsonGet | Self::JsonGetText => 9,
         }
     }
 }

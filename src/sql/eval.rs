@@ -6,6 +6,7 @@
 use crate::mem::arena::Arena;
 use crate::stack_format;
 use crate::util::StackStr;
+use core::fmt::Write as _;
 
 use super::ast::{BinaryOp, Expr, UnaryOp};
 use super::numeric::{self, Numeric};
@@ -924,6 +925,45 @@ fn call<'a>(
                 _ => Err(type_mismatch("array_lower requires an array", &a)),
             }
         }
+        "array_position" => {
+            // 1-based index of the first element equal to the target (NULL-safe),
+            // or NULL if absent.
+            arity(2)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let target = eval_full(args[1], arena, params, row, hooks)?;
+            let (elem, raw) = match a {
+                Datum::Array { elem, raw } => (elem, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("array_position requires an array", &a)),
+            };
+            for i in 0..super::array::len(raw) {
+                let el = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+                let hit = if target.is_null() {
+                    el.is_null()
+                } else if el.is_null() {
+                    false
+                } else {
+                    compare_datums(&el, &target)?.is_eq()
+                };
+                if hit {
+                    return Ok(Datum::Int4((i + 1) as i32));
+                }
+            }
+            Ok(Datum::Null)
+        }
+        "jsonb_array_length" | "json_array_length" => {
+            arity(1)?;
+            let s = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch(name, &other)),
+            };
+            match super::json::parse(s, arena)? {
+                super::json::Json::Array(items) => Ok(Datum::Int4(items.len() as i32)),
+                _ => Err(sql_err!("22023", "cannot get array length of a scalar")),
+            }
+        }
         "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible"
         | "has_table_privilege" | "has_column_privilege" | "has_schema_privilege"
         | "pg_relation_is_publishable" => {
@@ -1204,6 +1244,216 @@ fn call<'a>(
             }
             Ok(Datum::Text(out))
         }
+        "regexp_replace" => {
+            // regexp_replace(source, pattern, replacement [, flags]).
+            if !(3..=4).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let (Some(src), Some(pat), Some(rep)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+                text_arg(name, args, 2, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let mut global = false;
+            let mut ci = false;
+            if args.len() == 4 {
+                let Some(flags) = text_arg(name, args, 3, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                for f in flags.chars() {
+                    match f {
+                        'g' => global = true,
+                        'i' => ci = true,
+                        'c' => ci = false,
+                        _ => {
+                            return Err(sql_err!(
+                                "22023",
+                                "invalid regular expression option: \"{}\"",
+                                f
+                            ))
+                        }
+                    }
+                }
+            }
+            let mut out = StackStr::<8192>::new();
+            let mut pos = 0usize;
+            while let Some((s, e)) = super::regex::find(pat, src, pos, ci)? {
+                if out.write_str(&src[pos..s]).is_err() {
+                    return Err(sql_err!("54000", "regexp_replace result too large"));
+                }
+                expand_replacement(&mut out, rep, &src[s..e])?;
+                if e == s {
+                    // Empty match: emit one source char and advance past it so
+                    // the scan makes progress (PostgreSQL inserts between chars).
+                    match src[e..].chars().next() {
+                        Some(c) => {
+                            let _ = out.write_char(c);
+                            pos = e + c.len_utf8();
+                        }
+                        None => {
+                            pos = e;
+                            break;
+                        }
+                    }
+                } else {
+                    pos = e;
+                }
+                if !global {
+                    break;
+                }
+            }
+            if out.write_str(&src[pos..]).is_err() {
+                return Err(sql_err!("54000", "regexp_replace result too large"));
+            }
+            Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+        }
+        "regexp_count" | "regexp_instr" | "regexp_substr" => {
+            // (source, pattern [, start [, flags]]). `start` is a 1-based
+            // character position; `flags` may contain 'i' (case-insensitive).
+            if !(2..=4).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let (Some(src), Some(pat)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let start_char = if args.len() >= 3 {
+                match int_arg(name, args, 2, arena, params, row, hooks)? {
+                    Some(v) => v.max(1),
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                1
+            };
+            let mut ci = false;
+            if args.len() == 4 {
+                let Some(flags) = text_arg(name, args, 3, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                ci = flags.contains('i');
+            }
+            let begin = char_index_to_byte(src, (start_char - 1) as usize);
+            if name == "regexp_count" {
+                let mut count = 0i32;
+                let mut pos = begin;
+                while let Some((s, e)) = super::regex::find(pat, src, pos, ci)? {
+                    count += 1;
+                    pos = if e == s {
+                        match src[e..].chars().next() {
+                            Some(c) => e + c.len_utf8(),
+                            None => break,
+                        }
+                    } else {
+                        e
+                    };
+                }
+                return Ok(Datum::Int4(count));
+            }
+            match super::regex::find(pat, src, begin, ci)? {
+                None if name == "regexp_instr" => Ok(Datum::Int4(0)),
+                None => Ok(Datum::Null),
+                Some((s, _)) if name == "regexp_instr" => {
+                    Ok(Datum::Int4(byte_to_char_1based(src, s)))
+                }
+                Some((s, e)) => {
+                    Ok(Datum::Text(arena.alloc_str(&src[s..e]).map_err(|_| arena_full())?))
+                }
+            }
+        }
+        "string_to_array" => {
+            // (string, delimiter [, null_string]) -> text[]. A NULL delimiter
+            // splits into individual characters; elements equal to null_string
+            // become NULL.
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let delim = text_arg(name, args, 1, arena, params, row, hooks)?;
+            let null_str = if args.len() == 3 {
+                text_arg(name, args, 2, arena, params, row, hooks)?
+            } else {
+                None
+            };
+            let mut items: [Datum; 1024] = [Datum::Null; 1024];
+            let mut n = 0usize;
+            // Collect the split pieces (slices of `s`, so they share its
+            // lifetime); a piece equal to null_string becomes NULL.
+            let mut pieces: [&str; 1024] = [""; 1024];
+            match delim {
+                Some("") => {
+                    pieces[0] = s;
+                    n = 1;
+                }
+                Some(d) if !s.is_empty() => {
+                    for piece in s.split(d) {
+                        if n >= pieces.len() {
+                            return Err(sql_err!("54000", "string_to_array result too large"));
+                        }
+                        pieces[n] = piece;
+                        n += 1;
+                    }
+                }
+                Some(_) => {} // empty input yields an empty array
+                None => {
+                    for (i, c) in s.char_indices() {
+                        if n >= pieces.len() {
+                            return Err(sql_err!("54000", "string_to_array result too large"));
+                        }
+                        pieces[n] = &s[i..i + c.len_utf8()];
+                        n += 1;
+                    }
+                }
+            }
+            for (k, &piece) in pieces[..n].iter().enumerate() {
+                items[k] = if null_str == Some(piece) {
+                    Datum::Null
+                } else {
+                    Datum::Text(piece)
+                };
+            }
+            Ok(Datum::Array {
+                elem: super::types::ArrElem::Text,
+                raw: super::array::build(&items[..n], arena)?,
+            })
+        }
+        "overlay" => {
+            // overlay(s placing r from n [for l]): replace l characters of s
+            // starting at 1-based position n with r (l defaults to length(r)).
+            if !(3..=4).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let (Some(s), Some(r)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let Some(n) = int_arg(name, args, 2, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let l = if args.len() == 4 {
+                match int_arg(name, args, 3, arena, params, row, hooks)? {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                r.chars().count() as i64
+            };
+            // Prefix = first (n-1) chars of s; suffix = s from char (n-1+l).
+            let prefix_chars = (n - 1).max(0) as usize;
+            let skip_to = (n - 1 + l).max(0) as usize;
+            let prefix_end = s.char_indices().nth(prefix_chars).map_or(s.len(), |(b, _)| b);
+            let suffix_start = s.char_indices().nth(skip_to).map_or(s.len(), |(b, _)| b);
+            let suffix_start = suffix_start.max(prefix_end);
+            let total = prefix_end + r.len() + (s.len() - suffix_start);
+            alloc_text(arena, &[&s[..prefix_end], r, &s[suffix_start..]], total)
+        }
         "substr" | "substring" => {
             if star || !(2..=3).contains(&args.len()) {
                 return Err(arity_err(name, args.len()));
@@ -1441,6 +1691,9 @@ fn call<'a>(
             let Some(n) = int_arg(name, args, 0, arena, params, row, hooks)? else {
                 return Ok(Datum::Null);
             };
+            if n == 0 {
+                return Err(sql_err!("54000", "null character not permitted"));
+            }
             let c = u32::try_from(n)
                 .ok()
                 .and_then(char::from_u32)
@@ -1570,9 +1823,33 @@ fn call<'a>(
             if star || args.is_empty() {
                 return Err(arity_err(name, args.len()));
             }
+            // PostgreSQL types the result as the common type of all arguments,
+            // so `least(1, 2.5)` is numeric even when the int wins. The rank
+            // comes from each argument's *static* type (so a NULL float8 still
+            // makes the result float8, as PostgreSQL does), falling back to the
+            // runtime value for expressions whose static type is unknown.
+            let rank = |d: &Datum| match d {
+                Datum::Int4(_) => 1,
+                Datum::Int8(_) => 2,
+                Datum::Numeric(_) => 3,
+                Datum::Float8(_) => 4,
+                _ => 0,
+            };
+            let static_rank = |t: ColType| match t {
+                ColType::Int4 => 1,
+                ColType::Int8 => 2,
+                ColType::Numeric => 3,
+                ColType::Float8 => 4,
+                _ => 0,
+            };
             let mut best: Option<Datum> = None;
+            let mut widest = 0u8;
             for a in args {
+                if let Some(t) = static_type(a, row) {
+                    widest = widest.max(static_rank(t));
+                }
                 let v = eval_full(a, arena, params, row, hooks)?;
+                widest = widest.max(rank(&v));
                 if v.is_null() {
                     continue;
                 }
@@ -1580,16 +1857,28 @@ fn call<'a>(
                     None => v,
                     Some(cur) => {
                         let ord = compare_datums(&cur, &v)?;
-                        let take_v = if name == "greatest" {
-                            ord.is_lt()
-                        } else {
-                            ord.is_gt()
-                        };
+                        let take_v = if name == "greatest" { ord.is_lt() } else { ord.is_gt() };
                         if take_v { v } else { cur }
                     }
                 });
             }
-            Ok(best.unwrap_or(Datum::Null))
+            let best = best.unwrap_or(Datum::Null);
+            Ok(match (widest, best) {
+                (4, d) => Datum::Float8(match d {
+                    Datum::Int4(x) => x as f64,
+                    Datum::Int8(x) => x as f64,
+                    Datum::Numeric(n) => n.to_f64(),
+                    Datum::Float8(f) => f,
+                    other => return Ok(other),
+                }),
+                (3, d) => match d {
+                    Datum::Int4(x) => Datum::Numeric(Numeric::from_i64(x as i64, arena)?),
+                    Datum::Int8(x) => Datum::Numeric(Numeric::from_i64(x, arena)?),
+                    other => other,
+                },
+                (2, Datum::Int4(x)) => Datum::Int8(x as i64),
+                (_, d) => d,
+            })
         }
         "nullif" => {
             arity(2)?;
@@ -1615,18 +1904,23 @@ fn call<'a>(
                 let Some(n) = int_arg(name, args, 1, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let scale = n.max(0) as usize;
-                return match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Null => Ok(Datum::Null),
-                    Datum::Numeric(v) => Ok(Datum::Numeric(v.round_scale(scale, mode, arena)?)),
-                    Datum::Int4(x) => Ok(Datum::Numeric(
-                        Numeric::from_i64(x as i64, arena)?.round_scale(scale, mode, arena)?,
-                    )),
-                    Datum::Int8(x) => Ok(Datum::Numeric(
-                        Numeric::from_i64(x, arena)?.round_scale(scale, mode, arena)?,
-                    )),
-                    other => Err(type_mismatch(name, &other)),
+                let v = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Numeric(v) => v,
+                    Datum::Int4(x) => Numeric::from_i64(x as i64, arena)?,
+                    Datum::Int8(x) => Numeric::from_i64(x, arena)?,
+                    other => return Err(type_mismatch(name, &other)),
                 };
+                let result = if n >= 0 {
+                    v.round_scale(n as usize, mode, arena)?
+                } else {
+                    // A negative scale rounds to the left of the point: round
+                    // v / 10^|n| to an integer, then scale back up.
+                    let pow = Numeric::parse(stack_format!(24, "1e{}", -n).as_str(), arena)?;
+                    let scaled = numeric::div(&v, &pow, arena)?.round_scale(0, mode, arena)?;
+                    numeric::mul(&scaled, &pow, arena)?
+                };
+                return Ok(Datum::Numeric(result));
             }
             if star || args.len() != 1 {
                 return Err(arity_err(name, args.len()));
@@ -1675,9 +1969,26 @@ fn call<'a>(
         }
         "sqrt" | "exp" | "ln" => {
             arity(1)?;
-            let Some(x) = num_f64(name, args, 0, arena, params, row, hooks)? else {
+            // A numeric argument keeps the numeric domain (arbitrary precision);
+            // int/float arguments follow PostgreSQL and return double precision.
+            let d = eval_full(args[0], arena, params, row, hooks)?;
+            if d.is_null() {
                 return Ok(Datum::Null);
-            };
+            }
+            if let Datum::Numeric(n) = d {
+                if name == "sqrt" && n.sign == super::numeric::Sign::Neg && !n.is_zero() {
+                    return Err(sql_err!("2201F", "cannot take square root of a negative number"));
+                }
+                if name == "ln" && (n.sign == super::numeric::Sign::Neg || n.is_zero()) {
+                    return Err(sql_err!("2201E", "cannot take logarithm of a non-positive number"));
+                }
+                return Ok(Datum::Numeric(match name {
+                    "sqrt" => numeric::sqrt(&n, arena)?,
+                    "exp" => numeric::exp(&n, arena)?,
+                    _ => numeric::ln(&n, arena)?,
+                }));
+            }
+            let x = datum_f64(name, d)?;
             if name == "sqrt" && x < 0.0 {
                 return Err(sql_err!("2201F", "cannot take square root of a negative number"));
             }
@@ -1690,14 +2001,67 @@ fn call<'a>(
                 _ => x.ln(),
             }))
         }
+        "log" | "log10" => {
+            // log(x)/log10(x) are base-10; log(b, x) is base-b. A numeric
+            // argument stays numeric (arbitrary precision); int/float go double.
+            let two_arg = name == "log" && args.len() == 2;
+            if !two_arg && args.len() != 1 {
+                return Err(arity_err(name, args.len()));
+            }
+            if two_arg {
+                let db = eval_full(args[0], arena, params, row, hooks)?;
+                let dv = eval_full(args[1], arena, params, row, hooks)?;
+                if db.is_null() || dv.is_null() {
+                    return Ok(Datum::Null);
+                }
+                if matches!(db, Datum::Numeric(_)) || matches!(dv, Datum::Numeric(_)) {
+                    let b = datum_numeric(name, db, arena)?;
+                    let v = datum_numeric(name, dv, arena)?;
+                    log_domain_check(&v)?;
+                    log_domain_check(&b)?;
+                    return Ok(Datum::Numeric(numeric::logb(&b, &v, arena)?));
+                }
+                let (b, v) = (datum_f64(name, db)?, datum_f64(name, dv)?);
+                return Ok(Datum::Float8(v.log(b)));
+            }
+            let d = eval_full(args[0], arena, params, row, hooks)?;
+            if d.is_null() {
+                return Ok(Datum::Null);
+            }
+            if let Datum::Numeric(n) = d {
+                log_domain_check(&n)?;
+                return Ok(Datum::Numeric(numeric::log10(&n, arena)?));
+            }
+            Ok(Datum::Float8(datum_f64(name, d)?.log10()))
+        }
         "power" | "pow" => {
             arity(2)?;
-            let (Some(a), Some(bb)) = (
-                num_f64(name, args, 0, arena, params, row, hooks)?,
-                num_f64(name, args, 1, arena, params, row, hooks)?,
-            ) else {
+            let da = eval_full(args[0], arena, params, row, hooks)?;
+            let db = eval_full(args[1], arena, params, row, hooks)?;
+            if da.is_null() || db.is_null() {
                 return Ok(Datum::Null);
-            };
+            }
+            // A numeric argument keeps the numeric domain, but a float argument
+            // wins (double precision is preferred), so both go to the f64 path.
+            let any_numeric = matches!(da, Datum::Numeric(_)) || matches!(db, Datum::Numeric(_));
+            let any_float = matches!(da, Datum::Float8(_)) || matches!(db, Datum::Float8(_));
+            if any_numeric && !any_float {
+                let a = datum_numeric(name, da, arena)?;
+                let b = datum_numeric(name, db, arena)?;
+                return Ok(Datum::Numeric(numeric::pow(&a, &b, arena)?));
+            }
+            let (a, bb) = (datum_f64(name, da)?, datum_f64(name, db)?);
+            // PostgreSQL rejects the cases whose real result is undefined,
+            // rather than returning NaN/Inf as libm's powf would.
+            if a < 0.0 && bb.fract() != 0.0 {
+                return Err(sql_err!(
+                    "2201F",
+                    "a negative number raised to a non-integer power yields a complex result"
+                ));
+            }
+            if a == 0.0 && bb < 0.0 {
+                return Err(sql_err!("2201F", "zero raised to a negative power is undefined"));
+            }
             Ok(Datum::Float8(a.powf(bb)))
         }
         "mod" => {
@@ -1706,6 +2070,13 @@ fn call<'a>(
             let b = eval_full(args[1], arena, params, row, hooks)?;
             if a.is_null() || b.is_null() {
                 return Ok(Datum::Null);
+            }
+            // A numeric operand keeps the numeric domain (matching the `%`
+            // operator); mixed integer widths pick the wider integer type.
+            if matches!(a, Datum::Numeric(_)) || matches!(b, Datum::Numeric(_)) {
+                let x = datum_numeric(name, a, arena)?;
+                let y = datum_numeric(name, b, arena)?;
+                return Ok(Datum::Numeric(numeric::rem(&x, &y, arena)?));
             }
             let (x, y, wide) = match (a, b) {
                 (Datum::Int4(x), Datum::Int4(y)) => (x as i64, y as i64, false),
@@ -1760,6 +2131,202 @@ fn call<'a>(
             } else {
                 Datum::Int4(i32::try_from(out).map_err(|_| range())?)
             })
+        }
+        "width_bucket" => {
+            // 4-arg form: which of `count` equal-width buckets over [low, high]
+            // the operand falls in (0 below, count+1 at/above). Numeric args use
+            // exact numeric arithmetic; a float argument uses double precision.
+            arity(4)?;
+            let op = eval_full(args[0], arena, params, row, hooks)?;
+            let lo = eval_full(args[1], arena, params, row, hooks)?;
+            let hi = eval_full(args[2], arena, params, row, hooks)?;
+            let Some(cnt) = int_arg(name, args, 3, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            if op.is_null() || lo.is_null() || hi.is_null() {
+                return Ok(Datum::Null);
+            }
+            if cnt <= 0 {
+                return Err(sql_err!("2201G", "count must be greater than zero"));
+            }
+            let any_float = matches!(op, Datum::Float8(_))
+                || matches!(lo, Datum::Float8(_))
+                || matches!(hi, Datum::Float8(_));
+            if any_float {
+                let (o, l, h) = (datum_f64(name, op)?, datum_f64(name, lo)?, datum_f64(name, hi)?);
+                if l == h {
+                    return Err(sql_err!("22004", "lower and upper bounds cannot be equal"));
+                }
+                let b = width_bucket_f64(o, l, h, cnt);
+                return Ok(Datum::Int4(b));
+            }
+            let (o, l, h) = (
+                datum_numeric(name, op, arena)?,
+                datum_numeric(name, lo, arena)?,
+                datum_numeric(name, hi, arena)?,
+            );
+            Ok(Datum::Int4(width_bucket_numeric(&o, &l, &h, cnt, arena)?))
+        }
+        "format" => {
+            if args.is_empty() {
+                return Err(arity_err(name, 0));
+            }
+            let Some(fmt) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let mut out = StackStr::<4096>::new();
+            let mut argi = 1usize;
+            let bytes = fmt.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] != b'%' {
+                    let _ = out.write_char(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                let Some(&spec) = bytes.get(i) else {
+                    return Err(sql_err!("22023", "unterminated format specifier"));
+                };
+                i += 1;
+                if spec == b'%' {
+                    let _ = out.write_char('%');
+                    continue;
+                }
+                if argi >= args.len() {
+                    return Err(sql_err!("22023", "too few arguments for format()"));
+                }
+                let v = eval_full(args[argi], arena, params, row, hooks)?;
+                argi += 1;
+                match spec {
+                    b's' => format_append_str(&mut out, v, arena)?,
+                    b'I' => format_append_ident(&mut out, v)?,
+                    b'L' => format_append_literal(&mut out, v, arena)?,
+                    other => {
+                        return Err(sql_err!(
+                            "22023",
+                            "unrecognized format() type specifier \"{}\"",
+                            other as char
+                        ))
+                    }
+                }
+            }
+            Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+        }
+        "div" => {
+            // Integer quotient trunc(y/x) in the numeric domain (integer args
+            // are promoted to numeric, as PostgreSQL's `div(numeric,numeric)`).
+            arity(2)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let b = eval_full(args[1], arena, params, row, hooks)?;
+            if a.is_null() || b.is_null() {
+                return Ok(Datum::Null);
+            }
+            let (x, y) = (datum_numeric(name, a, arena)?, datum_numeric(name, b, arena)?);
+            Ok(Datum::Numeric(numeric::trunc_div(&x, &y, arena)?))
+        }
+        "scale" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Numeric(n) => Ok(Datum::Int4(n.dscale as i32)),
+                Datum::Int4(_) | Datum::Int8(_) => Ok(Datum::Int4(0)),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "min_scale" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Numeric(n) => Ok(Datum::Int4(n.min_scale() as i32)),
+                Datum::Int4(_) | Datum::Int8(_) => Ok(Datum::Int4(0)),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "trim_scale" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Numeric(n) => Ok(Datum::Numeric(n.round_scale(
+                    n.min_scale() as usize,
+                    super::numeric::RoundMode::Trunc,
+                    arena,
+                )?)),
+                d @ (Datum::Int4(_) | Datum::Int8(_)) => Ok(d),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "to_char" => {
+            arity(2)?;
+            let v = eval_full(args[0], arena, params, row, hooks)?;
+            let f = eval_full(args[1], arena, params, row, hooks)?;
+            if v.is_null() || f.is_null() {
+                return Ok(Datum::Null);
+            }
+            let Datum::Text(fmt) = f else {
+                return Err(type_mismatch(name, &f));
+            };
+            let n = datum_numeric(name, v, arena)?;
+            Ok(Datum::Text(super::to_char::number(&n, fmt, arena)?))
+        }
+        "to_number" => {
+            arity(2)?;
+            let (Some(s), Some(fmt)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            Ok(Datum::Numeric(super::to_char::to_number(s, fmt, arena)?))
+        }
+        "to_date" | "to_timestamp" => {
+            arity(2)?;
+            let (Some(s), Some(fmt)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            if name == "to_date" {
+                Ok(Datum::Date(super::datetime::to_date(s, fmt)?))
+            } else {
+                Ok(Datum::Timestamptz(super::datetime::to_timestamp(s, fmt)?))
+            }
+        }
+        "make_date" | "make_time" | "make_timestamp" => {
+            let want = if name == "make_timestamp" { 6 } else { 3 };
+            arity(want)?;
+            // The seconds field is a double; every other field is an integer.
+            let sec_idx = if name == "make_date" { usize::MAX } else { want - 1 };
+            let mut ints = [0i64; 6];
+            for (i, slot) in ints[..want].iter_mut().enumerate() {
+                if i == sec_idx {
+                    continue;
+                }
+                match int_arg(name, args, i, arena, params, row, hooks)? {
+                    Some(v) => *slot = v,
+                    None => return Ok(Datum::Null),
+                }
+            }
+            let sec = if sec_idx == usize::MAX {
+                0.0
+            } else {
+                match num_f64(name, args, sec_idx, arena, params, row, hooks)? {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                }
+            };
+            match name {
+                "make_date" => {
+                    Ok(Datum::Date(super::datetime::make_date(ints[0], ints[1], ints[2])?))
+                }
+                "make_time" => {
+                    Ok(Datum::Time(super::datetime::make_time(ints[0], ints[1], sec)?))
+                }
+                _ => Ok(Datum::Timestamp(super::datetime::make_timestamp(
+                    ints[0], ints[1], ints[2], ints[3], ints[4], sec,
+                )?)),
+            }
         }
         "to_hex" => {
             arity(1)?;
@@ -2072,6 +2639,219 @@ fn num_f64<'a>(
     }
 }
 
+/// f64 view of an already-evaluated numeric-category datum.
+fn datum_f64(name: &str, d: Datum<'_>) -> Result<f64, SqlError> {
+    match d {
+        Datum::Int4(v) => Ok(v as f64),
+        Datum::Int8(v) => Ok(v as f64),
+        Datum::Float8(v) => Ok(v),
+        Datum::Numeric(n) => Ok(n.to_f64()),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
+/// `width_bucket` for double-precision bounds; `count` buckets over [low,high]
+/// (or reversed when high < low), 0 below and count+1 at/above the range.
+fn width_bucket_f64(op: f64, lo: f64, hi: f64, count: i64) -> i32 {
+    let c = count as f64;
+    let bucket = if lo < hi {
+        if op < lo {
+            0
+        } else if op >= hi {
+            count + 1
+        } else {
+            ((op - lo) / (hi - lo) * c).floor() as i64 + 1
+        }
+    } else if op > lo {
+        0
+    } else if op <= hi {
+        count + 1
+    } else {
+        ((lo - op) / (lo - hi) * c).floor() as i64 + 1
+    };
+    bucket as i32
+}
+
+/// `width_bucket` with exact numeric arithmetic (matching PostgreSQL's numeric
+/// form), using an integer quotient so bucket boundaries land exactly.
+fn width_bucket_numeric(
+    op: &Numeric,
+    lo: &Numeric,
+    hi: &Numeric,
+    count: i64,
+    arena: &Arena,
+) -> Result<i32, SqlError> {
+    use super::numeric::{compare, mul, sub, trunc_div};
+    use core::cmp::Ordering;
+    if compare(lo, hi) == Ordering::Equal {
+        return Err(sql_err!("22004", "lower and upper bounds cannot be equal"));
+    }
+    let cnt = Numeric::from_i64(count, arena)?;
+    let ascending = compare(lo, hi) == Ordering::Less;
+    let (below, at_or_above) = if ascending {
+        (compare(op, lo) == Ordering::Less, compare(op, hi) != Ordering::Less)
+    } else {
+        (compare(op, lo) == Ordering::Greater, compare(op, hi) != Ordering::Greater)
+    };
+    if below {
+        return Ok(0);
+    }
+    if at_or_above {
+        return Ok((count + 1) as i32);
+    }
+    // floor((|op-lo| * count) / |hi-lo|) + 1
+    let (num_a, den) = if ascending {
+        (sub(op, lo, arena)?, sub(hi, lo, arena)?)
+    } else {
+        (sub(lo, op, arena)?, sub(lo, hi, arena)?)
+    };
+    let q = trunc_div(&mul(&num_a, &cnt, arena)?, &den, arena)?;
+    Ok((q.to_i64()? + 1) as i32)
+}
+
+/// `format()` `%s`: the argument's text (NULL renders as empty).
+fn format_append_str<'a>(
+    out: &mut StackStr<4096>,
+    v: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if !v.is_null() {
+        let _ = out.write_str(datum_to_text(v, arena)?);
+    }
+    Ok(())
+}
+
+/// `format()` `%I`: a SQL identifier, double-quoted only when it is not a bare
+/// lowercase identifier.
+fn format_append_ident(out: &mut StackStr<4096>, v: Datum<'_>) -> Result<(), SqlError> {
+    if v.is_null() {
+        return Err(sql_err!("22004", "null value cannot be formatted as SQL identifier"));
+    }
+    let s = match v {
+        Datum::Text(s) => s,
+        other => return Err(type_mismatch("format", &other)),
+    };
+    let bare = !s.is_empty()
+        && s.bytes().enumerate().all(|(i, c)| {
+            c == b'_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit())
+        });
+    if bare {
+        let _ = out.write_str(s);
+    } else {
+        let _ = out.write_char('"');
+        for c in s.chars() {
+            if c == '"' {
+                let _ = out.write_char('"');
+            }
+            let _ = out.write_char(c);
+        }
+        let _ = out.write_char('"');
+    }
+    Ok(())
+}
+
+/// `format()` `%L`: a SQL literal — `NULL` for null, otherwise single-quoted
+/// with embedded quotes doubled.
+fn format_append_literal<'a>(
+    out: &mut StackStr<4096>,
+    v: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if v.is_null() {
+        let _ = out.write_str("NULL");
+        return Ok(());
+    }
+    let s = datum_to_text(v, arena)?;
+    let _ = out.write_char('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            let _ = out.write_char('\'');
+        }
+        let _ = out.write_char(c);
+    }
+    let _ = out.write_char('\'');
+    Ok(())
+}
+
+/// Byte offset of the 0-based character index `n` in `s` (clamped to the end).
+fn char_index_to_byte(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(b, _)| b)
+}
+
+/// 1-based character position of byte offset `b` in `s`.
+fn byte_to_char_1based(s: &str, b: usize) -> i32 {
+    s[..b].chars().count() as i32 + 1
+}
+
+/// Expands a `regexp_replace` replacement string into `out`: `\&` is the whole
+/// match, `\\` a literal backslash, `\` + other the literal character.
+/// Capture-group backreferences (`\1`..`\9`) are rejected loudly — this engine
+/// does not track capture positions.
+fn expand_replacement(
+    out: &mut StackStr<8192>,
+    rep: &str,
+    whole: &str,
+) -> Result<(), SqlError> {
+    let bytes = rep.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            // Copy a whole UTF-8 char.
+            let c = rep[i..].chars().next().unwrap();
+            let _ = out.write_char(c);
+            i += c.len_utf8();
+            continue;
+        }
+        match bytes.get(i + 1) {
+            Some(b'&') => {
+                let _ = out.write_str(whole);
+                i += 2;
+            }
+            Some(b'\\') => {
+                let _ = out.write_char('\\');
+                i += 2;
+            }
+            Some(d) if d.is_ascii_digit() => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "capture-group backreferences in regexp_replace are not supported"
+                ));
+            }
+            Some(&c) => {
+                let _ = out.write_char(c as char);
+                i += 2;
+            }
+            None => {
+                let _ = out.write_char('\\');
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a non-positive logarithm argument the way PostgreSQL does.
+fn log_domain_check(n: &Numeric) -> Result<(), SqlError> {
+    if n.is_zero() {
+        return Err(sql_err!("2201E", "cannot take logarithm of zero"));
+    }
+    if n.sign == super::numeric::Sign::Neg {
+        return Err(sql_err!("2201E", "cannot take logarithm of a negative number"));
+    }
+    Ok(())
+}
+
+/// Numeric view of an already-evaluated integer/numeric datum.
+fn datum_numeric<'a>(name: &str, d: Datum<'a>, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    match d {
+        Datum::Numeric(n) => Ok(n),
+        Datum::Int4(v) => Numeric::from_i64(v as i64, arena),
+        Datum::Int8(v) => Numeric::from_i64(v, arena),
+        Datum::Float8(v) => Numeric::parse(stack_format!(64, "{}", v).as_str(), arena),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
 /// Text form of a datum for concat-family functions.
 fn datum_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
@@ -2206,8 +2986,11 @@ fn unary<'a>(op: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
             ..n
         })),
         (UnaryOp::Not, Datum::Bool(b)) => Ok(Datum::Bool(!b)),
+        (UnaryOp::BitNot, Datum::Int4(x)) => Ok(Datum::Int4(!x)),
+        (UnaryOp::BitNot, Datum::Int8(x)) => Ok(Datum::Int8(!x)),
         (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
         (UnaryOp::Not, other) => Err(type_mismatch("NOT", &other)),
+        (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
     }
 }
 
@@ -2235,6 +3018,22 @@ fn binary<'a>(
         Add | Sub | Mul | Div | Mod => arithmetic(op, l, r, l_unknown, r_unknown, arena),
         JsonGet | JsonGetText => json_get(l, r, op == JsonGetText, arena),
         BitAnd | BitOr | BitXor | Shl | Shr => bitwise(op, l, r),
+        Pow => {
+            // PostgreSQL `^` stays numeric when an operand is numeric (and none
+            // is float8); otherwise it is double-precision exponentiation.
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let any_numeric = matches!(l, Datum::Numeric(_)) || matches!(r, Datum::Numeric(_));
+            let any_float = matches!(l, Datum::Float8(_)) || matches!(r, Datum::Float8(_));
+            if any_numeric && !any_float {
+                let a = datum_numeric("^", l, arena)?;
+                let b = datum_numeric("^", r, arena)?;
+                return Ok(Datum::Numeric(numeric::pow(&a, &b, arena)?));
+            }
+            let (a, b) = (datum_f64("^", l)?, datum_f64("^", r)?);
+            Ok(Datum::Float8(a.powf(b)))
+        }
     }
 }
 
@@ -2375,6 +3174,11 @@ fn concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>,
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
+    // `||` on arrays concatenates: array||array, and array||element or
+    // element||array append/prepend the element.
+    if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) {
+        return array_concat(l, r, arena);
+    }
     let left = cast_to_text(l, arena)?;
     let right = cast_to_text(r, arena)?;
     let bytes = arena
@@ -2389,6 +3193,40 @@ fn concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>,
     Ok(Datum::Text(unsafe {
         core::str::from_utf8_unchecked(bytes)
     }))
+}
+
+/// Concatenates two operands where at least one is an array, following
+/// PostgreSQL's `array || array`, `array || element`, and `element || array`.
+fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let elem = match (&l, &r) {
+        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => *elem,
+        _ => unreachable!("caller ensures one side is an array"),
+    };
+    let mut items = [Datum::Null; 4096];
+    let mut n = 0usize;
+    for side in [l, r] {
+        match side {
+            Datum::Array { raw, elem: e } => {
+                for i in 0..super::array::len(raw) {
+                    if n >= items.len() {
+                        return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
+                    }
+                    items[n] = super::array::get(raw, e, i).ok_or_else(|| {
+                        sql_err!("XX000", "corrupt array element")
+                    })?;
+                    n += 1;
+                }
+            }
+            scalar => {
+                if n >= items.len() {
+                    return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
+                }
+                items[n] = scalar;
+                n += 1;
+            }
+        }
+    }
+    Ok(Datum::Array { elem, raw: super::array::build(&items[..n], arena)? })
 }
 
 /// Total order used by comparisons and ORDER BY. NULL handling differs
@@ -2591,6 +3429,16 @@ fn arithmetic<'a>(
         (BinaryOp::Sub, Datum::Date(a), Datum::Date(b)) => {
             return Ok(Datum::Int4(a - b));
         }
+        // timestamp - timestamp -> interval (days + time, no month folding).
+        (BinaryOp::Sub, Datum::Timestamp(a), Datum::Timestamp(b))
+        | (BinaryOp::Sub, Datum::Timestamptz(a), Datum::Timestamptz(b)) => {
+            let diff = a - b;
+            return Ok(Datum::Interval(super::types::Interval {
+                months: 0,
+                days: (diff / 86_400_000_000) as i32,
+                micros: diff % 86_400_000_000,
+            }));
+        }
         (BinaryOp::Add | BinaryOp::Sub, Datum::Date(a), _) if as_i64(&r).is_some() => {
             let days = as_i64(&r).expect("checked");
             return date_shift(a, days, op == BinaryOp::Sub);
@@ -2643,6 +3491,16 @@ fn arithmetic<'a>(
             _ => unreachable!(),
         };
         return Ok(Datum::Numeric(out));
+    }
+    // PostgreSQL defines no modulo operator for double precision, so `%` with
+    // a float8 operand is undefined even though `+`/`-`/`*`/`/` are not.
+    if op == BinaryOp::Mod && either_float {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} % {}",
+            type_name_of(&l),
+            type_name_of(&r)
+        ));
     }
     if let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) {
         let out = match op {
@@ -2946,10 +3804,55 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
                 Err(overflow(target))
             }
         }
-        Datum::Text(s) => s.trim().parse().map_err(|_| bad_text(s, target)),
+        Datum::Text(s) => parse_int_literal(s).ok_or_else(|| bad_text(s, target)),
         Datum::Null => unreachable!("null handled by caller"),
         other => Err(cast_unsupported(other, target)),
     }
+}
+
+/// Parses an integer the way PostgreSQL's integer input does: optional sign, an
+/// optional `0x`/`0o`/`0b` base prefix, and `_` digit separators (only between
+/// digits). Returns None for anything malformed or out of `i64` range.
+fn parse_int_literal(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (radix, digits) = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        (16, r)
+    } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+        (8, r)
+    } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+        (2, r)
+    } else {
+        (10, rest)
+    };
+    let db = digits.as_bytes();
+    if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
+        return None;
+    }
+    let mut buf = [0u8; 80];
+    let mut n = 0;
+    let mut prev_underscore = false;
+    for &c in db {
+        if c == b'_' {
+            if prev_underscore {
+                return None; // `__` is not allowed
+            }
+            prev_underscore = true;
+            continue;
+        }
+        prev_underscore = false;
+        if n >= buf.len() {
+            return None;
+        }
+        buf[n] = c;
+        n += 1;
+    }
+    let cleaned = core::str::from_utf8(&buf[..n]).ok()?;
+    let v = i64::from_str_radix(cleaned, radix).ok()?;
+    Some(if neg { -v } else { v })
 }
 
 fn parse_bool(s: &str) -> Result<bool, SqlError> {

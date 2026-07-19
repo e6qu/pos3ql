@@ -2507,7 +2507,7 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
         Expr::Column { qualifier, name } => of(cols.resolve(*qualifier, name)?),
         Expr::Unary { op, operand } => match op {
             super::ast::UnaryOp::Not => of(ColType::Bool),
-            super::ast::UnaryOp::Neg => infer_type_res(operand, cols)?,
+            super::ast::UnaryOp::Neg | super::ast::UnaryOp::BitNot => infer_type_res(operand, cols)?,
         },
         Expr::Binary { op, left, right } => {
             use super::ast::BinaryOp::*;
@@ -2528,6 +2528,28 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     of(ColType::Bool)
                 }
                 And | Or => of(ColType::Bool),
+                // `||` concatenates arrays when either side is an array (the
+                // array type is preserved), otherwise it is text concatenation.
+                Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => {
+                    (lo, -1)
+                }
+                Concat if coltype_of_oid(ro).is_some_and(|t| matches!(t, ColType::Array(_))) => {
+                    (ro, -1)
+                }
+                // `^` stays numeric when an operand is numeric (and none is a
+                // float); otherwise it is double precision.
+                Pow => {
+                    if (lo == oid::NUMERIC || ro == oid::NUMERIC)
+                        && lo != oid::FLOAT8
+                        && ro != oid::FLOAT8
+                        && lo != oid::FLOAT4
+                        && ro != oid::FLOAT4
+                    {
+                        of(ColType::Numeric)
+                    } else {
+                        of(ColType::Float8)
+                    }
+                }
                 Concat => (oid::TEXT, -1),
                 // `json -> k` keeps the json/jsonb type; `->>` yields text.
                 JsonGet => (if lo == oid::JSONB { oid::JSONB } else { oid::JSON }, -1),
@@ -2549,6 +2571,13 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     // int + date -> date.
                     if lo == oid::DATE && ro == oid::DATE && matches!(op, Sub) {
                         return Ok(of(ColType::Int4));
+                    }
+                    // timestamp - timestamp -> interval.
+                    if matches!(op, Sub)
+                        && (lo == oid::TIMESTAMP && ro == oid::TIMESTAMP
+                            || lo == oid::TIMESTAMPTZ && ro == oid::TIMESTAMPTZ)
+                    {
+                        return Ok(of(ColType::Interval));
                     }
                     if lo == oid::DATE && matches!(op, Add | Sub) && int_like(ro) {
                         return Ok(of(ColType::Date));
@@ -2709,8 +2738,42 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     }
                 t.unwrap_or_else(|| of(ColType::Int8))
             }
+            // Functions returning the common type of their arguments (numeric
+            // tower: float8 > numeric > int8 > int4), so a NULL of a wider type
+            // still widens the result — matching PostgreSQL and the runtime
+            // promotion in `greatest`/`least`.
+            "greatest" | "least" => {
+                let rank = |o: i32| {
+                    if o == oid::FLOAT8 || o == oid::FLOAT4 {
+                        4
+                    } else if o == oid::NUMERIC {
+                        3
+                    } else if o == oid::INT8 {
+                        2
+                    } else if o == oid::INT4 {
+                        1
+                    } else {
+                        0
+                    }
+                };
+                let mut best: Option<(i32, i16)> = None;
+                for a in args.iter() {
+                    let t = infer_type_res(a, cols)?;
+                    best = Some(match best {
+                        None => t,
+                        Some(p) => {
+                            if rank(t.0) > rank(p.0) {
+                                t
+                            } else {
+                                p
+                            }
+                        }
+                    });
+                }
+                best.unwrap_or(of(ColType::Int8))
+            }
             // Functions that return the type of their first argument.
-            "coalesce" | "abs" | "greatest" | "least" | "nullif" => {
+            "coalesce" | "abs" | "nullif" => {
                 if let Some(first) = args.first() {
                     infer_type_res(first, cols)?
                 } else {
@@ -2719,10 +2782,28 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             }
             "length" | "char_length" | "character_length" | "octet_length" | "strpos"
             | "ascii" => of(ColType::Int4),
-            // Math: sqrt/exp/ln/power return double; floor/ceil/trunc/round/sign
-            // return numeric for a numeric argument and double otherwise; mod
-            // returns the integer type of its arguments.
-            "sqrt" | "exp" | "ln" | "power" | "pow" => of(ColType::Float8),
+            // Math: sqrt/exp/ln/power stay numeric for a numeric argument (and
+            // no float argument outranking it), else double; floor/ceil/trunc/
+            // round/sign are numeric for a numeric argument and double
+            // otherwise; mod returns the integer type of its arguments.
+            "sqrt" | "exp" | "ln" | "power" | "pow" | "log" | "log10" => {
+                let mut numeric = false;
+                let mut float = false;
+                for a in args.iter() {
+                    match infer_type_res(a, cols)?.0 {
+                        oid::NUMERIC => numeric = true,
+                        oid::FLOAT8 | oid::FLOAT4 => float = true,
+                        _ => {}
+                    }
+                }
+                if numeric && !float { of(ColType::Numeric) } else { of(ColType::Float8) }
+            }
+            "div" | "trim_scale" | "to_number" => of(ColType::Numeric),
+            "scale" | "min_scale" | "width_bucket" | "regexp_count" | "regexp_instr"
+            | "array_position" | "jsonb_array_length" | "json_array_length" => of(ColType::Int4),
+            "regexp_substr" => of(ColType::Text),
+            "string_to_array" => of(ColType::Array(super::types::ArrElem::Text)),
+            "format" | "overlay" | "regexp_replace" => of(ColType::Text),
             "floor" | "ceil" | "ceiling" | "sign" => {
                 let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
                 if a == Some(oid::NUMERIC) { of(ColType::Numeric) } else { of(ColType::Float8) }
@@ -2738,13 +2819,16 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "mod" | "gcd" | "lcm" => {
                 let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
                 let b = args.get(1).map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
-                if a == Some(oid::INT8) || b == Some(oid::INT8) {
+                // `mod` keeps a numeric operand's type; gcd/lcm are integer-only.
+                if *name == "mod" && (a == Some(oid::NUMERIC) || b == Some(oid::NUMERIC)) {
+                    of(ColType::Numeric)
+                } else if a == Some(oid::INT8) || b == Some(oid::INT8) {
                     of(ColType::Int8)
                 } else {
                     of(ColType::Int4)
                 }
             }
-            "to_hex" | "md5" => of(ColType::Text),
+            "to_hex" | "md5" | "to_char" => of(ColType::Text),
             "factorial" => of(ColType::Numeric),
             "bit_length" => of(ColType::Int4),
             "starts_with" => of(ColType::Bool),
@@ -2756,6 +2840,18 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "string_agg" => of(ColType::Text),
             "extract" => of(ColType::Numeric),
             "date_part" => of(ColType::Float8),
+            // Paren-less temporal functions carry a proper type so date/time
+            // arithmetic (e.g. `current_date - 1`) type-checks correctly.
+            "to_date" => of(ColType::Date),
+            "to_timestamp" => of(ColType::Timestamptz),
+            "make_date" => of(ColType::Date),
+            "make_time" => of(ColType::Time),
+            "make_timestamp" => of(ColType::Timestamp),
+            "current_date" => of(ColType::Date),
+            "current_time" => of(ColType::Time),
+            "localtimestamp" => of(ColType::Timestamp),
+            "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
+            | "clock_timestamp" => of(ColType::Timestamptz),
             "date_trunc" => {
                 // Returns the timestamp type of its second argument.
                 let a = args.get(1).map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);

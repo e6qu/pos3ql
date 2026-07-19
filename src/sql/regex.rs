@@ -39,6 +39,54 @@ pub fn regex_search(pattern: &str, text: &str, ci: bool) -> Result<bool, SqlErro
     }
 }
 
+/// Finds the leftmost-longest match at or after byte offset `from`, returning
+/// its `(start, end)` byte range. A `^`-anchored pattern matches only at the
+/// very start of `text`. Used by `regexp_replace`.
+pub fn find(
+    pattern: &str,
+    text: &str,
+    from: usize,
+    ci: bool,
+) -> Result<Option<(usize, usize)>, SqlError> {
+    validate(pattern)?;
+    let anchored = pattern.starts_with('^');
+    let pat = if anchored { &pattern[1..] } else { pattern };
+    let budget = Cell::new(3_000_000u32);
+    // Longest match anchored at `start`: a continuation that records the
+    // maximum consumed length and always returns false forces the matcher to
+    // explore every match length (POSIX leftmost-longest).
+    let longest_at = |start: usize| -> Result<Option<usize>, SqlError> {
+        let sub = &text[start..];
+        let best = Cell::new(None::<usize>);
+        let accept = |rest: &str| {
+            let consumed = sub.len() - rest.len();
+            if best.get().is_none_or(|b| consumed > b) {
+                best.set(Some(consumed));
+            }
+            Ok(false)
+        };
+        m(pat, sub, ci, &budget, &accept)?;
+        Ok(best.get())
+    };
+    if anchored {
+        // `^` matches only at the absolute start of the string.
+        if from == 0 {
+            return Ok(longest_at(0)?.map(|len| (0, len)));
+        }
+        return Ok(None);
+    }
+    let mut start = from;
+    loop {
+        if let Some(len) = longest_at(start)? {
+            return Ok(Some((start, start + len)));
+        }
+        match text[start..].chars().next() {
+            None => return Ok(None),
+            Some(c) => start += c.len_utf8(),
+        }
+    }
+}
+
 /// Rejects unsupported constructs so a pattern is never matched incorrectly.
 fn validate(pattern: &str) -> Result<(), SqlError> {
     let bytes = pattern.as_bytes();

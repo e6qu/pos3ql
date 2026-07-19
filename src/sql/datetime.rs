@@ -86,6 +86,171 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
     i32::try_from(days).map_err(|_| out_of_range())
 }
 
+const MONTH_ABBR: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+const MONTH_FULL: [&str; 12] = [
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december",
+];
+
+/// Parses `input` guided by a `to_date`/`to_timestamp` format string into
+/// `(year, month, day, hour, minute, second)`. Supports the common field codes
+/// (`YYYY`/`YYY`/`YY`/`Y`, `MM`, `DD`, `HH24`/`HH12`/`HH`, `MI`, `SS`,
+/// `MON`/`MONTH`) with any non-code characters treated as skippable separators;
+/// unrecognized letter codes are rejected loudly.
+pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i64, i64), SqlError> {
+    let bad = || sql_err!("22007", "invalid value for input string");
+    let (mut y, mut mo, mut d, mut h, mut mi, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
+    let ib = input.as_bytes();
+    let fb = fmt.as_bytes();
+    let mut ip = 0usize;
+    let mut fi = 0usize;
+    // Reads up to `width` decimal digits (skipping leading spaces) into an int.
+    let read_num = |ip: &mut usize, width: usize| -> Option<i64> {
+        while *ip < ib.len() && ib[*ip] == b' ' {
+            *ip += 1;
+        }
+        let start = *ip;
+        let mut v: i64 = 0;
+        while *ip < ib.len() && *ip - start < width && ib[*ip].is_ascii_digit() {
+            v = v * 10 + (ib[*ip] - b'0') as i64;
+            *ip += 1;
+        }
+        if *ip == start { None } else { Some(v) }
+    };
+    let starts_with_ci = |bytes: &[u8], at: usize, word: &[u8]| -> bool {
+        at + word.len() <= bytes.len()
+            && bytes[at..at + word.len()].eq_ignore_ascii_case(word)
+    };
+    while fi < fb.len() {
+        let up = fb[fi].to_ascii_uppercase();
+        // Longest field codes first.
+        if starts_with_ci(fb, fi, b"HH24") || starts_with_ci(fb, fi, b"HH12") {
+            h = read_num(&mut ip, 2).ok_or_else(bad)?;
+            fi += 4;
+        } else if starts_with_ci(fb, fi, b"YYYY") {
+            y = read_num(&mut ip, 4).ok_or_else(bad)?;
+            fi += 4;
+        } else if starts_with_ci(fb, fi, b"MONTH") {
+            mo = read_month(input, &mut ip, false).ok_or_else(bad)?;
+            fi += 5;
+        } else if starts_with_ci(fb, fi, b"MON") {
+            mo = read_month(input, &mut ip, true).ok_or_else(bad)?;
+            fi += 3;
+        } else if starts_with_ci(fb, fi, b"YYY") {
+            y = read_num(&mut ip, 3).ok_or_else(bad)?;
+            fi += 3;
+        } else if up == b'H' && starts_with_ci(fb, fi, b"HH") {
+            h = read_num(&mut ip, 2).ok_or_else(bad)?;
+            fi += 2;
+        } else if starts_with_ci(fb, fi, b"YY") {
+            let v = read_num(&mut ip, 2).ok_or_else(bad)?;
+            y = if v < 70 { 2000 + v } else { 1900 + v };
+            fi += 2;
+        } else if starts_with_ci(fb, fi, b"MM") {
+            mo = read_num(&mut ip, 2).ok_or_else(bad)? as u32;
+            fi += 2;
+        } else if starts_with_ci(fb, fi, b"DD") {
+            d = read_num(&mut ip, 2).ok_or_else(bad)? as u32;
+            fi += 2;
+        } else if starts_with_ci(fb, fi, b"MI") {
+            mi = read_num(&mut ip, 2).ok_or_else(bad)?;
+            fi += 2;
+        } else if starts_with_ci(fb, fi, b"SS") {
+            s = read_num(&mut ip, 2).ok_or_else(bad)?;
+            fi += 2;
+        } else if up == b'Y' {
+            y = read_num(&mut ip, 1).ok_or_else(bad)?;
+            fi += 1;
+        } else if up.is_ascii_alphabetic() {
+            return Err(sql_err!("22007", "unsupported to_date/to_timestamp code"));
+        } else {
+            // Separator: skip one non-alphanumeric input character if present.
+            if ip < ib.len() && !ib[ip].is_ascii_alphanumeric() {
+                ip += 1;
+            }
+            fi += 1;
+        }
+    }
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return Err(sql_err!("22008", "date/time field value out of range"));
+    }
+    Ok((y, mo, d, h, mi, s))
+}
+
+/// Reads a month name (abbreviated when `abbr`, else full) at `*ip`, returning
+/// the 1-based month.
+fn read_month(input: &str, ip: &mut usize, abbr: bool) -> Option<u32> {
+    let bytes = input.as_bytes();
+    while *ip < bytes.len() && bytes[*ip] == b' ' {
+        *ip += 1;
+    }
+    let table: &[&str] = if abbr { &MONTH_ABBR } else { &MONTH_FULL };
+    for (i, name) in table.iter().enumerate() {
+        let nb = name.as_bytes();
+        if *ip + nb.len() <= bytes.len() && bytes[*ip..*ip + nb.len()].eq_ignore_ascii_case(nb) {
+            *ip += nb.len();
+            return Some(i as u32 + 1);
+        }
+    }
+    // `MON` also accepts the full name; `MONTH` also accepts the abbreviation.
+    let other: &[&str] = if abbr { &MONTH_FULL } else { &MONTH_ABBR };
+    for (i, name) in other.iter().enumerate() {
+        let nb = name.as_bytes();
+        if *ip + nb.len() <= bytes.len() && bytes[*ip..*ip + nb.len()].eq_ignore_ascii_case(nb) {
+            *ip += nb.len();
+            return Some(i as u32 + 1);
+        }
+    }
+    None
+}
+
+/// `to_date`: parses a formatted date into days since 2000-01-01.
+pub fn to_date(input: &str, fmt: &str) -> Result<i32, SqlError> {
+    let (y, mo, d, _, _, _) = parse_formatted(input, fmt)?;
+    make_date(y, mo as i64, d as i64)
+}
+
+/// `to_timestamp`: parses a formatted timestamp into microseconds since
+/// 2000-01-01.
+pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
+    let (y, mo, d, h, mi, s) = parse_formatted(input, fmt)?;
+    make_timestamp(y, mo as i64, d as i64, h, mi, s as f64)
+}
+
+/// Constructs a date (days since 2000-01-01) from year/month/day, validating
+/// the fields as PostgreSQL `make_date` does.
+pub fn make_date(y: i64, m: i64, d: i64) -> Result<i32, SqlError> {
+    let range = || sql_err!("22008", "date field value out of range");
+    if !(1..=12).contains(&m) {
+        return Err(range());
+    }
+    let (mu, du) = (m as u32, d);
+    if du < 1 || du as u32 > days_in_month(y, mu) {
+        return Err(range());
+    }
+    let days = days_from_civil(y, mu, du as u32) - PG_EPOCH_DAYS;
+    i32::try_from(days).map_err(|_| range())
+}
+
+/// Constructs a time-of-day (microseconds since midnight) from hour/minute and
+/// a fractional second, validating fields as PostgreSQL `make_time` does.
+pub fn make_time(h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+    let range = || sql_err!("22008", "time field value out of range");
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0.0..60.0).contains(&sec) {
+        return Err(range());
+    }
+    Ok(((h * 60 + mi) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
+}
+
+/// Constructs a timestamp (microseconds since 2000-01-01) from its fields.
+pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+    let days = make_date(y, m, d)? as i64;
+    let tod = make_time(h, mi, sec)?;
+    Ok(days * 86_400_000_000 + tod)
+}
+
 /// Parses `YYYY-MM-DD[ |T]HH:MM[:SS[.ffffff]][Z|±HH[:MM]]` into
 /// microseconds since 2000-01-01 UTC. `require_tz_shift` applies the zone
 /// offset (timestamptz); plain timestamp ignores any suffix.
@@ -604,6 +769,41 @@ mod tests {
         assert!(parse_date("2023-02-29").is_err());
         assert!(parse_date("2023-13-01").is_err());
         assert!(parse_date("not-a-date").is_err());
+    }
+
+    #[test]
+    fn make_constructors_match_parsing() {
+        // make_date agrees with parse_date, and validates its fields.
+        assert_eq!(make_date(2024, 6, 15).unwrap(), parse_date("2024-06-15").unwrap());
+        assert_eq!(make_date(2000, 1, 1).unwrap(), 0);
+        assert!(make_date(2024, 13, 1).is_err());
+        assert!(make_date(2024, 2, 30).is_err());
+        // make_time counts microseconds since midnight.
+        assert_eq!(make_time(12, 30, 0.0).unwrap(), ((12 * 60 + 30) * 60) * 1_000_000);
+        assert_eq!(make_time(0, 0, 45.5).unwrap(), 45_500_000);
+        assert!(make_time(24, 0, 0.0).is_err());
+        assert!(make_time(0, 0, 60.0).is_err());
+        // make_timestamp combines the two.
+        assert_eq!(
+            make_timestamp(2024, 6, 15, 12, 30, 0.0).unwrap(),
+            make_date(2024, 6, 15).unwrap() as i64 * 86_400_000_000 + make_time(12, 30, 0.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn to_date_parses_formats() {
+        let d = parse_date("2024-06-15").unwrap();
+        assert_eq!(to_date("2024-06-15", "YYYY-MM-DD").unwrap(), d);
+        assert_eq!(to_date("15/06/2024", "DD/MM/YYYY").unwrap(), d);
+        assert_eq!(to_date("06-15-2024", "MM-DD-YYYY").unwrap(), d);
+        assert_eq!(to_date("240615", "YYMMDD").unwrap(), d);
+        assert_eq!(to_date("2024-6-5", "YYYY-MM-DD").unwrap(), parse_date("2024-06-05").unwrap());
+        assert_eq!(to_date("Jun 15 2024", "Mon DD YYYY").unwrap(), d);
+        assert_eq!(
+            to_timestamp("2024-06-15 12:30:45", "YYYY-MM-DD HH24:MI:SS").unwrap(),
+            parse_timestamp("2024-06-15 12:30:45", false).unwrap()
+        );
+        assert!(to_date("2024-13-01", "YYYY-MM-DD").is_err());
     }
 
     #[test]

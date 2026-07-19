@@ -882,28 +882,32 @@ fn div_with_scale<'a>(
     let (nb_len, nb_lsw) = sig_decimal(b, &mut nb);
 
     // result = (na_int / nb_int) * 10^(na_lsw - nb_lsw). To get `rscale`
-    // fractional digits plus one guard, scale the dividend so the integer
-    // quotient already carries them: Q = (na_int * 10^shift) / nb_int, and
-    // result = Q * 10^-(rscale+1).
+    // fractional digits plus one guard, we want the integer quotient
+    // Q = (na_int / nb_int) * 10^shift so that result = Q * 10^-(rscale+1).
+    // A positive shift pads the dividend; a negative shift pads the divisor,
+    // which preserves the integer quotient instead of dropping it to zero.
     let p = rscale as i32 + 1;
     let shift = na_lsw - nb_lsw + p;
-    if shift < 0 {
-        // The exact result needs fewer than `rscale` fractional digits; a
-        // zero-padded numerator still divides correctly with shift 0.
-        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
-    }
-    let dlen = na_len + shift as usize;
-    if dlen > MAX_NDIGITS * DEC_DIGITS + 4 {
+    let (num_pad, den_pad) = if shift >= 0 {
+        (shift as usize, 0usize)
+    } else {
+        (0usize, (-shift) as usize)
+    };
+    let dlen = na_len + num_pad;
+    let blen = nb_len + den_pad;
+    if dlen > MAX_NDIGITS * DEC_DIGITS + 4 || blen > MAX_NDIGITS * DEC_DIGITS + 4 {
         return Err(overflow());
     }
     let mut dividend = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
     dividend[..na_len].copy_from_slice(&na[..na_len]);
-    // trailing zeros already present (array zeroed)
+    let mut divisor = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
+    divisor[..nb_len].copy_from_slice(&nb[..nb_len]);
+    // Both pad with trailing zeros (arrays are zeroed).
 
-    // Q = dividend / nb_int (integer long division), MSD-first, no leading
+    // Q = dividend / divisor (integer long division), MSD-first, no leading
     // zeros. Q's least-significant digit has weight -(rscale+1).
     let mut q = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
-    let qlen = long_divide(&dividend[..dlen], &nb[..nb_len], &mut q);
+    let qlen = long_divide(&dividend[..dlen], &divisor[..blen], &mut q);
     if qlen == 0 {
         return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
     }
@@ -1121,6 +1125,411 @@ fn finish_from_lsf<'a>(
     Ok(Numeric { sign, weight, dscale, digits: pack(&out[..ndigits], arena)? })
 }
 
+// --- Transcendental functions (sqrt, ln, exp, pow) --------------------------
+//
+// PostgreSQL keeps these in the numeric domain (arbitrary precision), unlike
+// the float path. Each mirrors the corresponding routine in PostgreSQL's
+// numeric.c: the same result-scale (`rscale`) selection and the same
+// reduction-then-series structure, computed here with the module's exact
+// add/sub/mul/div primitives at a guarded working scale, then rounded.
+
+const LN10: f64 = core::f64::consts::LN_10;
+/// Significant digits PostgreSQL keeps in a transcendental result before its
+/// leading digit is accounted for (`NUMERIC_MIN_SIG_DIGITS`).
+const MIN_SIG_DIGITS: i32 = 16;
+const MAX_DISPLAY_SCALE: i32 = 1000;
+
+impl Numeric<'_> {
+    /// Decimal weight of the leading significant digit: `0.5`→-1, `5`→0,
+    /// `50`→1, `500`→2. Zero is defined as 0. This is `var->weight*DEC_DIGITS`
+    /// adjusted for how many decimal digits the most-significant base-10000
+    /// digit actually occupies.
+    fn dec_weight(&self) -> i32 {
+        if self.is_zero() || self.is_nan() {
+            return 0;
+        }
+        let msd = self.digit(0);
+        let msd_digits = if msd >= 1000 {
+            4
+        } else if msd >= 100 {
+            3
+        } else if msd >= 10 {
+            2
+        } else {
+            1
+        };
+        self.weight as i32 * DEC_DIGITS as i32 + (msd_digits - 1)
+    }
+
+    /// Whether the value is an exact integer (no fractional part).
+    fn is_integer(&self) -> bool {
+        if self.is_zero() {
+            return true;
+        }
+        // The least-significant stored base digit sits at weight
+        // `weight-(ndigits-1)`; a value is integral when that is >= 0.
+        self.weight as i32 - (self.ndigits() as i32 - 1) >= 0
+    }
+}
+
+fn two<'a>(arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    Numeric::from_i64(2, arena)
+}
+fn one<'a>(arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    Numeric::from_i64(1, arena)
+}
+
+/// `sqrt(arg)` in the numeric domain (arg must be >= 0; caller checks).
+/// PostgreSQL `sqrt_var`: rscale is chosen from the input weight, the value is
+/// refined by Newton's method, and the result is rounded to that scale.
+pub fn sqrt<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if arg.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    // sweight = (weight+1)*DEC_DIGITS/2 - 1; rscale = MIN_SIG_DIGITS - sweight.
+    let sweight = (arg.weight as i32 + 1) * DEC_DIGITS as i32 / 2 - 1;
+    let rscale = (MIN_SIG_DIGITS - sweight)
+        .max(arg.dscale as i32)
+        .clamp(0, MAX_DISPLAY_SCALE) as u16;
+    if arg.is_zero() {
+        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
+    }
+    let wscale = rscale + 8;
+    let half = Numeric::parse("0.5", arena)?;
+    // Initial guess from the f64 square root (accurate to ~15 digits).
+    let mut x = Numeric::parse(crate::stack_format!(64, "{}", arg.to_f64().sqrt()).as_str(), arena)?;
+    newton_sqrt(arg, &mut x, &half, wscale, arena)?;
+    x.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+}
+
+/// `ln(arg)` in the numeric domain (arg must be > 0; caller checks).
+/// PostgreSQL `ln_var`: reduce the argument toward 1 by repeated square roots,
+/// then sum the `atanh` series `2*(z + z^3/3 + z^5/5 + ...)`, `z=(x-1)/(x+1)`.
+pub fn ln<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if arg.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    let rscale = ln_rscale(arg);
+    ln_var(arg, rscale, arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+}
+
+/// Result scale for `ln`, following PostgreSQL `estimate_ln_dweight`.
+fn ln_rscale(arg: &Numeric) -> u16 {
+    // ln_dweight ~ decimal weight of ln(arg).
+    let ln_dweight = {
+        let v = arg.to_f64();
+        if (0.9..=1.1).contains(&v) {
+            // Near 1: ln(x) ~ (x-1); take the decimal weight of |x-1|.
+            let d = (v - 1.0).abs();
+            if d == 0.0 { 0 } else { d.log10().floor() as i32 }
+        } else {
+            let dweight = arg.dec_weight();
+            if dweight == 0 {
+                0
+            } else {
+                ((dweight as f64 * LN10).abs()).log10().floor() as i32
+            }
+        }
+    };
+    (MIN_SIG_DIGITS - ln_dweight)
+        .max(arg.dscale as i32)
+        .clamp(0, MAX_DISPLAY_SCALE) as u16
+}
+
+/// Core `ln` at an explicit working scale (no final rounding to display scale).
+fn ln_var<'a>(arg: &Numeric, rscale: u16, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    let wscale = rscale + 10;
+    let one_v = one(arena)?;
+    let lo = Numeric::parse("0.9", arena)?;
+    let hi = Numeric::parse("1.1", arena)?;
+    // Reduce x into [0.9, 1.1] by repeated square roots; each root doubles the
+    // factor by which the series result must be multiplied.
+    let mut x = *arg;
+    let mut fact = one(arena)?;
+    let sqrt_scale = wscale + 4;
+    let mut guard = 0;
+    while compare(&x, &lo) == Ordering::Less || compare(&x, &hi) == Ordering::Greater {
+        x = sqrt_to_scale(&x, sqrt_scale, arena)?;
+        fact = add(&fact, &fact, arena)?; // fact *= 2
+        guard += 1;
+        if guard > 200 {
+            break;
+        }
+    }
+    // z = (x-1)/(x+1)
+    let xm1 = sub(&x, &one_v, arena)?;
+    let xp1 = add(&x, &one_v, arena)?;
+    let z = div_with_scale(&xm1, &xp1, wscale, true, arena)?;
+    let zsq = mul_scale(&z, &z, wscale, arena)?;
+    // series: sum = z + z^3/3 + z^5/5 + ...
+    let mut sum = z;
+    let mut cur = z; // z^(2k+1)
+    let mut k: i64 = 3;
+    for _ in 0..(wscale as usize * 4 + 40) {
+        cur = mul_scale(&cur, &zsq, wscale, arena)?;
+        let denom = Numeric::from_i64(k, arena)?;
+        let term = div_with_scale(&cur, &denom, wscale, true, arena)?;
+        if term.is_zero() {
+            break;
+        }
+        sum = add(&sum, &term, arena)?;
+        k += 2;
+    }
+    // ln(arg) = 2 * fact * sum
+    let two_v = two(arena)?;
+    let r = mul_scale(&sum, &two_v, wscale, arena)?;
+    mul_scale(&r, &fact, wscale, arena)
+}
+
+/// `exp(arg)` in the numeric domain. PostgreSQL `exp_var`: halve the argument
+/// until small, sum the Taylor series, then square the result back.
+pub fn exp<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if arg.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    let val = arg.to_f64();
+    // rscale = MIN_SIG_DIGITS - trunc(val/ln10) (result decimal weight).
+    let rscale = (MIN_SIG_DIGITS - (val / LN10) as i32)
+        .max(arg.dscale as i32)
+        .clamp(0, MAX_DISPLAY_SCALE) as u16;
+    exp_var(arg, rscale, arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+}
+
+/// Core `exp` at an explicit display scale.
+fn exp_var<'a>(arg: &Numeric, rscale: u16, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    // Count halvings needed to bring |arg| under 0.01 (bounds the series length
+    // and the error before squaring back).
+    let val = arg.to_f64().abs();
+    let mut ndiv2 = 0u32;
+    let mut v = val;
+    while v > 0.01 {
+        v /= 2.0;
+        ndiv2 += 1;
+        if ndiv2 > 200 {
+            break;
+        }
+    }
+    let wscale = rscale + 10 + ndiv2 as u16;
+    // xr = arg / 2^ndiv2
+    let mut xr = *arg;
+    let two_v = two(arena)?;
+    for _ in 0..ndiv2 {
+        xr = div_with_scale(&xr, &two_v, wscale, true, arena)?;
+    }
+    // Taylor: sum = 1 + xr + xr^2/2! + xr^3/3! + ...
+    let mut sum = one(arena)?;
+    let mut term = one(arena)?;
+    for i in 1..=(wscale as i64 * 4 + 60) {
+        // term *= xr / i
+        term = mul_scale(&term, &xr, wscale, arena)?;
+        let denom = Numeric::from_i64(i, arena)?;
+        term = div_with_scale(&term, &denom, wscale, true, arena)?;
+        if term.is_zero() {
+            break;
+        }
+        sum = add(&sum, &term, arena)?;
+    }
+    // Square back ndiv2 times.
+    for _ in 0..ndiv2 {
+        sum = mul_scale(&sum, &sum, wscale, arena)?;
+    }
+    Ok(sum)
+}
+
+/// `log10(arg)` (base-10 logarithm) in the numeric domain (arg must be > 0;
+/// caller checks). Computed as `ln(arg)/ln(10)` at the same result scale as
+/// `ln`, matching PostgreSQL.
+pub fn log10<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if arg.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    let ten = Numeric::from_i64(10, arena)?;
+    logb(&ten, arg, arena)
+}
+
+/// `log(base, value)` = `ln(value)/ln(base)` in the numeric domain (both must
+/// be > 0; caller checks). The result scale follows `value`, as PostgreSQL.
+pub fn logb<'a>(base: &Numeric, value: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if base.is_nan() || value.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    let rscale = ln_rscale(value);
+    let wscale = rscale + 12;
+    let lnv = ln_var(value, wscale, arena)?;
+    let lnb = ln_var(base, wscale, arena)?;
+    if lnb.is_zero() {
+        return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
+    }
+    div_with_scale(&lnv, &lnb, rscale + 2, true, arena)?
+        .round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+}
+
+/// `trunc(a / b)` toward zero (the `div` function): an exact integer quotient
+/// as a scale-0 numeric.
+pub fn trunc_div<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if a.is_nan() || b.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    if b.is_zero() {
+        return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
+    }
+    div_with_scale(a, b, 0, false, arena)
+}
+
+impl Numeric<'_> {
+    /// The minimum display scale that preserves this value (its significant
+    /// fractional digit count) — PostgreSQL `min_scale`.
+    pub fn min_scale(&self) -> u16 {
+        if self.is_zero() || self.is_nan() {
+            return 0;
+        }
+        let text = crate::stack_format!(2100, "{}", self);
+        let s = text.as_str();
+        match s.split_once('.') {
+            Some((_, frac)) => frac.trim_end_matches('0').len() as u16,
+            None => 0,
+        }
+    }
+}
+
+/// `pow(base, exp)` in the numeric domain, with PostgreSQL's domain rules and
+/// result-scale selection. Integer exponents are evaluated exactly by repeated
+/// squaring; other exponents use `exp(exp * ln(base))`.
+pub fn pow<'a>(base: &Numeric, exp: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if base.is_nan() || exp.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    // Domain rules matching PostgreSQL numeric_power.
+    if base.is_zero() {
+        if exp.sign == Sign::Neg {
+            return Err(sql_err!("2201F", "zero raised to a negative power is undefined"));
+        }
+        // The logarithm is undefined at zero, so the result weight is 0: both
+        // `0^0 = 1` and `0^positive = 0` carry MIN_SIG_DIGITS fractional places.
+        let rscale = MIN_SIG_DIGITS.max(base.dscale as i32).clamp(0, MAX_DISPLAY_SCALE) as u16;
+        if exp.is_zero() {
+            return one(arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena);
+        }
+        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
+    }
+    if base.sign == Sign::Neg && !exp.is_integer() {
+        return Err(sql_err!(
+            "2201F",
+            "a negative number raised to a non-integer power yields a complex result"
+        ));
+    }
+    // Result decimal weight ~ exp * log10(|base|); rscale = MIN_SIG - that.
+    // A zero exponent makes the product zero regardless of the base.
+    let logval = if exp.is_zero() {
+        0.0
+    } else {
+        exp.to_f64() * base.to_f64().abs().ln() / LN10
+    };
+    let rscale = (MIN_SIG_DIGITS - logval as i32)
+        .max(base.dscale as i32)
+        .clamp(0, MAX_DISPLAY_SCALE) as u16;
+
+    if exp.is_zero() {
+        return one(arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena); // x^0 = 1
+    }
+    if exp.is_integer() {
+        let n = exp.to_i64()?;
+        return pow_int(base, n, rscale, arena);
+    }
+    // base^exp = exp(exp * ln(base)), base > 0 here.
+    let wscale = rscale + 12;
+    let lnb = ln_var(base, wscale, arena)?;
+    let prod = mul_scale(&lnb, exp, wscale, arena)?;
+    exp_var(&prod, rscale, arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+}
+
+/// `base^n` for an integer exponent, evaluated exactly by binary exponentiation
+/// (negative exponents invert at the result scale), then rounded to `rscale`.
+fn pow_int<'a>(
+    base: &Numeric,
+    n: i64,
+    rscale: u16,
+    arena: &'a Arena,
+) -> Result<Numeric<'a>, SqlError> {
+    let mut acc = one(arena)?;
+    let mut b = *base;
+    let mut e = n.unsigned_abs();
+    // Exact repeated squaring (mul is exact, so the magnitude is exact).
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = mul(&acc, &b, arena)?;
+        }
+        e >>= 1;
+        if e > 0 {
+            b = mul(&b, &b, arena)?;
+        }
+    }
+    if n < 0 {
+        // 1 / base^|n| at the display scale (+1 guard, then round).
+        let one_v = one(arena)?;
+        let q = div_with_scale(&one_v, &acc, rscale + 2, true, arena)?;
+        q.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+    } else {
+        acc.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+    }
+}
+
+/// `sqrt` to an explicit working scale, used by `ln_var`'s range reduction.
+fn sqrt_to_scale<'a>(
+    arg: &Numeric,
+    wscale: u16,
+    arena: &'a Arena,
+) -> Result<Numeric<'a>, SqlError> {
+    if arg.is_zero() {
+        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: wscale, digits: &[] });
+    }
+    let half = Numeric::parse("0.5", arena)?;
+    let mut x = Numeric::parse(crate::stack_format!(64, "{}", arg.to_f64().sqrt()).as_str(), arena)?;
+    newton_sqrt(arg, &mut x, &half, wscale, arena)?;
+    Ok(x)
+}
+
+/// Newton's method for `sqrt(arg)` refined in place from an initial guess `x`,
+/// iterating `x <- (x + arg/x)/2` at `wscale` until it stops changing (or
+/// oscillates between two rounded values).
+fn newton_sqrt<'a>(
+    arg: &Numeric,
+    x: &mut Numeric<'a>,
+    half: &Numeric,
+    wscale: u16,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut prev = Numeric::ZERO;
+    for _ in 0..80 {
+        let q = div_with_scale(arg, x, wscale, true, arena)?;
+        let s = add(x, &q, arena)?;
+        let next = mul_scale(&s, half, wscale, arena)?;
+        if compare(&next, x) == Ordering::Equal || compare(&next, &prev) == Ordering::Equal {
+            *x = next;
+            break;
+        }
+        prev = *x;
+        *x = next;
+    }
+    Ok(())
+}
+
+/// Multiply, then truncate the product's stored scale to at most `wscale`
+/// fractional digits so the working precision stays bounded across iterations.
+fn mul_scale<'a>(
+    a: &Numeric,
+    b: &Numeric,
+    wscale: u16,
+    arena: &'a Arena,
+) -> Result<Numeric<'a>, SqlError> {
+    let p = mul(a, b, arena)?;
+    if p.dscale > wscale {
+        p.round_scale(wscale as usize, RoundMode::HalfAwayZero, arena)
+    } else {
+        Ok(p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,6 +1564,67 @@ mod tests {
         assert_eq!(disp(&p("1e3", &a)), "1000");
         assert_eq!(disp(&p("1.5e2", &a)), "150");
         assert_eq!(disp(&p("15e-1", &a)), "1.5");
+    }
+
+    #[test]
+    fn modulo_keeps_integer_quotient() {
+        // A dividend with more fractional digits than the divisor must still
+        // divide its integer part (regression: the quotient dropped to zero).
+        let a = arena();
+        assert_eq!(disp(&rem(&p("223.1273", &a), &p("8.45", &a), &a).unwrap()), "3.4273");
+        assert_eq!(disp(&rem(&p("10.5", &a), &p("3", &a), &a).unwrap()), "1.5");
+        assert_eq!(disp(&rem(&p("-10.5", &a), &p("3.2", &a), &a).unwrap()), "-0.9");
+        assert_eq!(disp(&rem(&p("100.0", &a), &p("7.5", &a), &a).unwrap()), "2.5");
+    }
+
+    #[test]
+    fn sqrt_matches_postgres_scale() {
+        let a = arena();
+        assert_eq!(disp(&sqrt(&p("2.0", &a), &a).unwrap()), "1.414213562373095");
+        assert_eq!(disp(&sqrt(&p("0.04", &a), &a).unwrap()), "0.20000000000000000");
+        assert_eq!(disp(&sqrt(&p("100.0", &a), &a).unwrap()), "10.000000000000000");
+        assert_eq!(disp(&sqrt(&p("12345.0", &a), &a).unwrap()), "111.1080555135405");
+        assert_eq!(disp(&sqrt(&p("0.0", &a), &a).unwrap()), "0.000000000000000");
+    }
+
+    #[test]
+    fn ln_exp_match_postgres() {
+        let a = arena();
+        assert_eq!(disp(&ln(&p("2.0", &a), &a).unwrap()), "0.6931471805599453");
+        assert_eq!(disp(&ln(&p("1000000.0", &a), &a).unwrap()), "13.815510557964274");
+        assert_eq!(disp(&exp(&p("1.0", &a), &a).unwrap()), "2.7182818284590452");
+        assert_eq!(disp(&exp(&p("-5.0", &a), &a).unwrap()), "0.006737946999085467");
+    }
+
+    #[test]
+    fn log_div_scale_match_postgres() {
+        let a = arena();
+        assert_eq!(disp(&log10(&p("100.0", &a), &a).unwrap()), "2.0000000000000000");
+        assert_eq!(disp(&log10(&p("1000000.0", &a), &a).unwrap()), "6.000000000000000");
+        assert_eq!(disp(&logb(&p("2.0", &a), &p("8.0", &a), &a).unwrap()), "3.0000000000000000");
+        // div truncates toward zero at scale 0.
+        assert_eq!(disp(&trunc_div(&p("7.0", &a), &p("2.0", &a), &a).unwrap()), "3");
+        assert_eq!(disp(&trunc_div(&p("-7", &a), &p("2", &a), &a).unwrap()), "-3");
+        // min_scale strips trailing zeros.
+        assert_eq!(p("2.500", &a).min_scale(), 1);
+        assert_eq!(p("120.0", &a).min_scale(), 0);
+        assert_eq!(p("0", &a).min_scale(), 0);
+    }
+
+    #[test]
+    fn pow_matches_postgres() {
+        let a = arena();
+        // Integer exponent: exact repeated squaring, then padded to rscale.
+        assert_eq!(disp(&pow(&p("2.0", &a), &p("10", &a), &a).unwrap()), "1024.0000000000000");
+        assert_eq!(disp(&pow(&p("10.0", &a), &p("5", &a), &a).unwrap()), "100000.00000000000");
+        // Fractional exponent via exp(exp*ln(base)).
+        assert_eq!(disp(&pow(&p("2.5", &a), &p("0.5", &a), &a).unwrap()), "1.5811388300841897");
+        // Zero exponent / zero base carry MIN_SIG_DIGITS fractional places.
+        assert_eq!(disp(&pow(&p("1.5", &a), &p("0", &a), &a).unwrap()), "1.0000000000000000");
+        assert_eq!(disp(&pow(&p("0.0", &a), &p("5", &a), &a).unwrap()), "0.0000000000000000");
+        // Domain errors.
+        assert!(pow(&p("-2.0", &a), &p("0.5", &a), &a).is_err());
+        assert!(pow(&p("0.0", &a), &p("-1", &a), &a).is_err());
     }
 
     #[test]

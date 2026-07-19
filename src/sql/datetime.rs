@@ -421,14 +421,14 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
         let u = unit.trim_end_matches('s'); // singular/plural
         match u {
             "year" | "yr" => months += (n * 12.0) as i64,
-            "month" | "month" => months += n as i64,
+            "month" | "mon" => months += n as i64,
             "week" | "wk" => days += (n * 7.0) as i64,
             "day" | "d" => days += n as i64,
             "hour" | "hr" | "h" => micros += (n * 3_600_000_000.0) as i64,
             "minute" | "min" | "m" => micros += (n * 60_000_000.0) as i64,
             "second" | "sec" | "s" => micros += (n * 1_000_000.0) as i64,
             "millisecond" | "msec" | "ms" => micros += (n * 1_000.0) as i64,
-            "microsecond" | "microseconds" | "us" => micros += n as i64,
+            "microsecond" | "usec" | "us" => micros += n as i64,
             _ => return Err(bad()),
         }
         saw = true;
@@ -469,7 +469,7 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
         }
     };
     unit(&mut out, &mut first, years, "year");
-    unit(&mut out, &mut first, mons, "month");
+    unit(&mut out, &mut first, mons, "mon");
     unit(&mut out, &mut first, interval.days, "day");
     if interval.micros != 0 || (interval.months == 0 && interval.days == 0) {
         sep(&mut out, &mut first);

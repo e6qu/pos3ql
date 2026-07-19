@@ -2417,6 +2417,9 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
         Expr::Column { name, .. } => Some(name),
+        // `SIMILAR TO` is an operator in PostgreSQL (an anonymous `?column?`),
+        // though we desugar it to a `similar_to(...)` call internally.
+        Expr::Call { name: "similar_to", .. } => None,
         Expr::Call { name, .. } => Some(name),
         Expr::Cast { type_name, .. } => {
             ColType::from_sql_name(type_name).map(ColType::internal_name)
@@ -2902,7 +2905,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
                 of(ColType::Range(super::types::RangeKind::from_name(name).expect("range name")))
             }
-            "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => of(ColType::Bool),
+            "similar_to" | "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => of(ColType::Bool),
             "range_merge" => {
                 // Same range type as its arguments.
                 match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {

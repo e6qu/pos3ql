@@ -750,6 +750,57 @@ fn unify_arr_elem(a: super::types::ArrElem, b: super::types::ArrElem) -> super::
     }
 }
 
+/// Translates a SQL `SIMILAR TO` pattern into a POSIX regular expression
+/// anchored to the whole string. `%`/`_` become `.*`/`.`; the SIMILAR TO
+/// metacharacters (`| * + ? ( ) [ ] { }`) pass through; characters that are
+/// literal in SIMILAR TO but special in POSIX (`. ^ $`) are escaped; `\` escapes
+/// the next character. Inside a `[...]` bracket expression everything is literal.
+fn similar_to_posix(pattern: &str, buffer: &mut crate::util::StackStr<256>) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let _ = buffer.write_char('^');
+    let mut chars = pattern.chars();
+    let mut in_bracket = false;
+    while let Some(c) = chars.next() {
+        if in_bracket {
+            let _ = buffer.write_char(c);
+            if c == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                let _ = buffer.write_char('\\');
+                if let Some(next) = chars.next() {
+                    let _ = buffer.write_char(next);
+                }
+            }
+            '%' => {
+                let _ = buffer.write_str(".*");
+            }
+            '_' => {
+                let _ = buffer.write_char('.');
+            }
+            '.' | '^' | '$' => {
+                let _ = buffer.write_char('\\');
+                let _ = buffer.write_char(c);
+            }
+            '[' => {
+                let _ = buffer.write_char('[');
+                in_bracket = true;
+            }
+            _ => {
+                let _ = buffer.write_char(c);
+            }
+        }
+    }
+    let _ = buffer.write_char('$');
+    if buffer.is_truncated() {
+        return Err(sql_err!("22026", "SIMILAR TO pattern is too long"));
+    }
+    Ok(())
+}
+
 /// SQL LIKE: `%` matches any run (including empty), `_` exactly one
 /// character, `\` escapes the next pattern character. Iterative
 /// two-pointer match with backtracking to the last `%`; allocation-free.
@@ -2473,6 +2524,21 @@ fn call<'a>(
                     ints[0], ints[1], ints[2], ints[3], ints[4], sec,
                 )?)),
             }
+        }
+        "similar_to" => {
+            // `x SIMILAR TO p`: the SQL regular-expression pattern is translated
+            // to a POSIX regex anchored to the whole string, then matched by the
+            // shared regex engine.
+            arity(2)?;
+            let (Some(text), Some(pattern)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let mut posix = crate::util::StackStr::<256>::new();
+            similar_to_posix(pattern, &mut posix)?;
+            Ok(Datum::Bool(super::regex::regex_search(posix.as_str(), text, false)?))
         }
         "timezone" => {
             // `timezone(zone, ts)` == `ts AT TIME ZONE zone`. A plain timestamp

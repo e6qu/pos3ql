@@ -1546,9 +1546,9 @@ impl<'a> Parser<'a> {
                     if !matches!(
                         self.peeked,
                         Tok::Ident("in") | Tok::Ident("between") | Tok::Ident("like")
-                            | Tok::Ident("ilike")
+                            | Tok::Ident("ilike") | Tok::Ident("similar")
                     ) {
-                        return Err(self.unexpected("expected IN, BETWEEN or LIKE after NOT"));
+                        return Err(self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT"));
                     }
                     true
                 } else {
@@ -1611,8 +1611,33 @@ impl<'a> Parser<'a> {
                     })?;
                     continue;
                 }
+                // `x SIMILAR TO p` — SQL regular expression; desugared to the
+                // scalar `similar_to(x, p)` (NOT wraps it in a boolean negation).
+                if self.peeked == Tok::Ident("similar") {
+                    self.advance()?;
+                    self.expect_ident("to")?;
+                    let pattern = self.expression(5)?;
+                    let call = self.arena_expr(Expr::Call {
+                        name: "similar_to",
+                        args: self.arena_slice(&[left, pattern])?,
+                        star: false,
+                        distinct: false,
+                        order_by: &[],
+                        over: None,
+                        filter: None,
+                    })?;
+                    left = if negated {
+                        self.arena_expr(Expr::Unary {
+                            operator: super::ast::UnaryOp::Not,
+                            operand: call,
+                        })?
+                    } else {
+                        call
+                    };
+                    continue;
+                }
                 if negated {
-                    return Err(self.unexpected("expected IN, BETWEEN or LIKE after NOT"));
+                    return Err(self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT"));
                 }
             }
             // POSIX regex match operators bind like comparisons.

@@ -224,8 +224,8 @@ impl Server {
     fn render_refusal(budget: &mut Budget) -> Result<([u8; 128], usize), ServerSetupError> {
         use crate::pg::respond::Responder;
         let mut buffer = crate::mem::buffer::FixedBuf::new(budget, "refusal_scratch", 128)?;
-        let mut resp = Responder::new(&mut buffer);
-        resp.error(
+        let mut responder = Responder::new(&mut buffer);
+        responder.error(
             crate::sql::eval::sqlstate::TOO_MANY_CONNECTIONS,
             "sorry, too many clients already",
         )

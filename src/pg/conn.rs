@@ -193,8 +193,8 @@ impl Conn {
         if space.is_empty() {
             // Inbound message larger than the receive buffer: a protocol
             // limit, reported before closing.
-            let mut resp = Responder::new(&mut self.send);
-            let _ = resp.error(
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "message exceeds the connection receive buffer",
             );
@@ -274,8 +274,8 @@ impl Conn {
                 result
             }
             _ => {
-                let mut resp = Responder::new(&mut self.send);
-                let _ = resp.error(
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported protocol version (this server speaks 3.0-3.2)",
                 );
@@ -336,13 +336,13 @@ impl Conn {
             }
         }
         if !user_seen {
-            let mut resp = Responder::new(&mut self.send);
-            let _ = resp.error("28000", "no PostgreSQL user name specified in startup packet");
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error("28000", "no PostgreSQL user name specified in startup packet");
             return Step::Close;
         }
         if let Some(e) = guc_error {
-            let mut resp = Responder::new(&mut self.send);
-            let _ = resp.error(e.sqlstate, e.message.as_str());
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(e.sqlstate, e.message.as_str());
             return Step::Close;
         }
 
@@ -350,9 +350,9 @@ impl Conn {
 
         // Version negotiation happens before any auth request.
         {
-            let mut resp = Responder::new(&mut self.send);
+            let mut responder = Responder::new(&mut self.send);
             if (requested_minor > wire::NEWEST_MINOR as u16 || n_unknown > 0)
-                && resp
+                && responder
                     .negotiate_protocol_version(
                         wire::NEWEST_MINOR,
                         &unknown_protocol_options[..n_unknown],
@@ -366,16 +366,16 @@ impl Conn {
         match auth.mode {
             AuthMode::Trust => self.finish_startup(cancel_key),
             AuthMode::Password => {
-                let mut resp = Responder::new(&mut self.send);
-                if resp.auth_cleartext_password().is_err() {
+                let mut responder = Responder::new(&mut self.send);
+                if responder.auth_cleartext_password().is_err() {
                     return Step::Close;
                 }
                 self.phase = Phase::AwaitPassword;
                 Step::Continue
             }
             AuthMode::ScramSha256 => {
-                let mut resp = Responder::new(&mut self.send);
-                if resp.auth_sasl_mechanisms().is_err() {
+                let mut responder = Responder::new(&mut self.send);
+                if responder.auth_sasl_mechanisms().is_err() {
                     return Step::Close;
                 }
                 self.scram = ScramFlow::new();
@@ -389,9 +389,9 @@ impl Conn {
     fn finish_startup(&mut self, cancel_key: &[u8]) -> Step {
         let minor = self.minor;
         let id = self.id;
-        let mut resp = Responder::new(&mut self.send);
+        let mut responder = Responder::new(&mut self.send);
         let mut write_all = || -> Result<(), WireFull> {
-            resp.auth_ok()?;
+            responder.auth_ok()?;
             for (k, v) in [
                 ("server_version", REPORTED_SERVER_VERSION),
                 ("server_encoding", "UTF8"),
@@ -402,12 +402,12 @@ impl Conn {
                 ("TimeZone", "Etc/UTC"),
                 ("in_hot_standby", "off"),
             ] {
-                resp.parameter_status(k, v)?;
+                responder.parameter_status(k, v)?;
             }
             // 3.0 fixes the cancel key at 4 bytes; 3.2 allows up to 256.
             let key = if minor >= 2 { cancel_key } else { &cancel_key[..4] };
-            resp.backend_key_data(id, key)?;
-            resp.ready_for_query(b'I')?;
+            responder.backend_key_data(id, key)?;
+            responder.ready_for_query(b'I')?;
             Ok(())
         };
         if write_all().is_err() {
@@ -434,8 +434,8 @@ impl Conn {
         }
         if msg_type != wire::FMSG_PASSWORD {
             // Anything else during auth is a protocol violation.
-            let mut resp = Responder::new(&mut self.send);
-            let _ = resp.error(
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(
                 sqlstate::PROTOCOL_VIOLATION,
                 "expected a password/SASL response during authentication",
             );
@@ -444,8 +444,8 @@ impl Conn {
         let payload = &self.recv.readable()[5..total];
 
         let auth_failed = |send: &mut FixedBuf| -> Step {
-            let mut resp = Responder::new(send);
-            let _ = resp.error("28P01", "password authentication failed");
+            let mut responder = Responder::new(send);
+            let _ = responder.error("28P01", "password authentication failed");
             Step::Close
         };
 
@@ -493,8 +493,8 @@ impl Conn {
                 }
                 match self.scram.first(server, client_first, &nonce) {
                     Ok(ScramStep::Continue(payload)) => {
-                        let mut resp = Responder::new(&mut self.send);
-                        if resp.auth_sasl_continue(payload.as_str()).is_err() {
+                        let mut responder = Responder::new(&mut self.send);
+                        if responder.auth_sasl_continue(payload.as_str()).is_err() {
                             return Step::Close;
                         }
                         self.phase = Phase::AwaitSaslFinal;
@@ -513,8 +513,8 @@ impl Conn {
                 match self.scram.finish(server, client_final) {
                     Ok(ScramStep::Final(sig)) => {
                         {
-                            let mut resp = Responder::new(&mut self.send);
-                            if resp.auth_sasl_final(sig.as_str()).is_err() {
+                            let mut responder = Responder::new(&mut self.send);
+                            if responder.auth_sasl_final(sig.as_str()).is_err() {
                                 return Step::Close;
                             }
                         }
@@ -550,8 +550,8 @@ impl Conn {
             if is_sync {
                 self.phase = Phase::Ready;
                 let status = self.txn.status_byte();
-                let mut resp = Responder::new(&mut self.send);
-                if resp.ready_for_query(status).is_err() {
+                let mut responder = Responder::new(&mut self.send);
+                if responder.ready_for_query(status).is_err() {
                     return Step::Close;
                 }
             }
@@ -563,8 +563,8 @@ impl Conn {
             wire::FMSG_TERMINATE => Step::Close,
             wire::FMSG_SYNC => {
                 let status = self.txn.status_byte();
-                let mut resp = Responder::new(&mut self.send);
-                match resp.ready_for_query(status) {
+                let mut responder = Responder::new(&mut self.send);
+                match responder.ready_for_query(status) {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
                 }
@@ -576,8 +576,8 @@ impl Conn {
             wire::FMSG_EXECUTE => self.handle_execute(engine, total),
             wire::FMSG_CLOSE => self.handle_close(total),
             _ => {
-                let mut resp = Responder::new(&mut self.send);
-                let _ = resp.error(sqlstate::PROTOCOL_VIOLATION, "unknown frontend message type");
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, "unknown frontend message type");
                 Step::Close
             }
         };
@@ -672,8 +672,8 @@ impl Conn {
         entry.n_params = n_params as u16;
         entry.param_oids = param_oids;
 
-        let mut resp = Responder::new(&mut self.send);
-        match resp.parse_complete() {
+        let mut responder = Responder::new(&mut self.send);
+        match responder.parse_complete() {
             Ok(()) => Step::Continue,
             Err(WireFull) => Step::Close,
         }
@@ -824,8 +824,8 @@ impl Conn {
         portal.result.clear();
         portal.executed = false;
 
-        let mut resp = Responder::new(&mut self.send);
-        match resp.bind_complete() {
+        let mut responder = Responder::new(&mut self.send);
+        match responder.bind_complete() {
             Ok(()) => Step::Continue,
             Err(WireFull) => Step::Close,
         }
@@ -883,13 +883,13 @@ impl Conn {
         let param_oids = self.prepared[slot].param_oids;
         let text = core::str::from_utf8(self.prepared[slot].text.readable())
             .expect("stored from valid UTF-8");
-        let mut resp = Responder::for_describe(&mut self.send, portal_formats);
+        let mut responder = Responder::for_describe(&mut self.send, portal_formats);
         if kind == b'S'
-            && resp.parameter_description(&param_oids[..n_params as usize]).is_err()
+            && responder.parameter_description(&param_oids[..n_params as usize]).is_err()
         {
             return Step::Close;
         }
-        match engine.describe(text, &self.arena, &self.txn, &mut resp) {
+        match engine.describe(text, &self.arena, &self.txn, &mut responder) {
             Ok(true) => Step::Continue,
             Ok(false) => {
                 self.phase = Phase::SkipToSync;
@@ -954,7 +954,7 @@ impl Conn {
             let rfmt = portal.result_formats;
             let result = if paged {
                 portal.result.clear();
-                let mut resp = Responder::for_execute(&mut portal.result, rfmt);
+                let mut responder = Responder::for_execute(&mut portal.result, rfmt);
                 engine.execute_extended(
                     text,
                     &self.arena,
@@ -962,10 +962,10 @@ impl Conn {
                     &mut self.txn,
                     &mut self.sqlprep,
                     &mut self.guc,
-                    &mut resp,
+                    &mut responder,
                 )
             } else {
-                let mut resp = Responder::for_execute(&mut self.send, rfmt);
+                let mut responder = Responder::for_execute(&mut self.send, rfmt);
                 engine.execute_extended(
                     text,
                     &self.arena,
@@ -973,7 +973,7 @@ impl Conn {
                     &mut self.txn,
                     &mut self.sqlprep,
                     &mut self.guc,
-                    &mut resp,
+                    &mut responder,
                 )
             };
             engine.maybe_checkpoint();
@@ -1018,8 +1018,8 @@ impl Conn {
             }
             if msg_type == wire::MSG_DATA_ROW && max_rows > 0 && sent >= max_rows {
                 // More rows remain: suspend the portal.
-                let mut resp = Responder::new(&mut self.send);
-                return match resp_portal_suspended(&mut resp) {
+                let mut responder = Responder::new(&mut self.send);
+                return match resp_portal_suspended(&mut responder) {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
                 };
@@ -1067,8 +1067,8 @@ impl Conn {
                 )
             }
         }
-        let mut resp = Responder::new(&mut self.send);
-        match resp.close_complete() {
+        let mut responder = Responder::new(&mut self.send);
+        match responder.close_complete() {
             Ok(()) => Step::Continue,
             Err(WireFull) => Step::Close,
         }
@@ -1079,8 +1079,8 @@ impl Conn {
         // allocates from the arena — all disjoint fields.
         let payload = &self.recv.readable()[5..total];
         let Ok(text) = MsgIn::new(payload).cstr() else {
-            let mut resp = Responder::new(&mut self.send);
-            let _ = resp.error(sqlstate::PROTOCOL_VIOLATION, "malformed Query message");
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, "malformed Query message");
             return Step::Close;
         };
         self.arena.reset();
@@ -1093,11 +1093,11 @@ impl Conn {
             let _ = stream.set_nonblocking(false);
         }
         let result = {
-            let mut resp = Responder::new(&mut self.send);
+            let mut responder = Responder::new(&mut self.send);
             if let Some(fd) = fd {
-                resp = resp.with_flush(fd);
+                responder = responder.with_flush(fd);
             }
-            engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.guc, &mut resp)
+            engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.guc, &mut responder)
         };
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.set_nonblocking(true);
@@ -1109,17 +1109,17 @@ impl Conn {
         let status = self.txn.status_byte();
         let step = match result {
             Ok(()) => {
-                let mut resp = Responder::new(&mut self.send);
-                match resp.ready_for_query(status) {
+                let mut responder = Responder::new(&mut self.send);
+                match responder.ready_for_query(status) {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
                 }
             }
             Err(WireFull) => {
-                let mut resp = Responder::new(&mut self.send);
-                let recovered = resp
+                let mut responder = Responder::new(&mut self.send);
+                let recovered = responder
                     .replace_with_overflow_error(mark)
-                    .and_then(|()| resp.ready_for_query(status));
+                    .and_then(|()| responder.ready_for_query(status));
                 match recovered {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
@@ -1156,9 +1156,9 @@ enum Step {
     Close,
 }
 
-fn resp_portal_suspended(resp: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {
+fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {
     use crate::pg::wire::{MsgOut, MSG_PORTAL_SUSPENDED};
-    MsgOut::begin(resp.buffer, MSG_PORTAL_SUSPENDED).finish()
+    MsgOut::begin(responder.buffer, MSG_PORTAL_SUSPENDED).finish()
 }
 
 /// Decodes a binary-format parameter using its declared type OID
@@ -1333,8 +1333,8 @@ fn alloc_group_digits(d: i16) -> [u8; 4] {
 /// recovery (discard until Sync). Free function so callers can hold
 /// borrows of other connection fields.
 fn ext_err(send: &mut FixedBuf, phase: &mut Phase, code: &str, message: &str) -> Step {
-    let mut resp = Responder::new(send);
-    if resp.error(code, message).is_err() {
+    let mut responder = Responder::new(send);
+    if responder.error(code, message).is_err() {
         return Step::Close;
     }
     *phase = Phase::SkipToSync;

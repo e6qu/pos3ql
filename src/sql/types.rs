@@ -75,7 +75,7 @@ pub enum ColType {
 impl ColType {
     /// Maps a SQL type name (already case-folded) to a column type.
     pub fn from_sql_name(name: &str) -> Option<Self> {
-        // `elem[]` is a one-dimensional array of a scalar element type.
+        // `element[]` is a one-dimensional array of a scalar element type.
         if let Some(base) = name.strip_suffix("[]") {
             return ArrElem::from_coltype(ColType::from_sql_name(base)?).map(ColType::Array);
         }
@@ -437,7 +437,7 @@ pub enum Datum<'a> {
     /// A one-dimensional array: the element type plus the serialized element
     /// bytes (`u16 count` then `u32 len + element encoding` per element). Kept
     /// as raw bytes so decoding from storage needs no separate allocation.
-    Array { elem: ArrElem, raw: &'a [u8] },
+    Array { element: ArrElem, raw: &'a [u8] },
     Uuid([u8; 16]),
     Bytea(&'a [u8]),
     Numeric(Numeric<'a>),
@@ -465,7 +465,7 @@ impl<'a> Datum<'a> {
             Datum::Interval(_) => oid::INTERVAL,
             Datum::Json { jsonb: false, .. } => oid::JSON,
             Datum::Json { jsonb: true, .. } => oid::JSONB,
-            Datum::Array { elem, .. } => elem.array_oid(),
+            Datum::Array { element, .. } => element.array_oid(),
             Datum::Uuid(_) => oid::UUID,
             Datum::Bytea(_) => oid::BYTEA,
             Datum::Numeric(_) => oid::NUMERIC,
@@ -505,7 +505,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Interval(interval) => f.write_str(super::datetime::format_interval(*interval).as_str()),
             Datum::Json { text, .. } => f.write_str(text),
             Datum::Range { text, .. } => f.write_str(text),
-            Datum::Array { elem, raw } => super::array::write(f, *elem, raw),
+            Datum::Array { element, raw } => super::array::write(f, *element, raw),
             Datum::Uuid(b) => {
                 for (i, byte) in b.iter().enumerate() {
                     if matches!(i, 4 | 6 | 8 | 10) {

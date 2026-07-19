@@ -4,8 +4,8 @@
 //! through a virtual network with fault injection — message loss, reorder,
 //! duplication, delay, and replica crash/restart — all from a single PRNG
 //! seed, so any failure reproduces exactly. After the run it checks the
-//! consensus invariants: replicas never disagree on a committed op, an
-//! acknowledged op is never lost, and the committed prefix is a
+//! consensus invariants: replicas never disagree on a committed operation, an
+//! acknowledged operation is never lost, and the committed prefix is a
 //! linearizable sequence.
 //!
 //! Everything is logical: virtual time is a tick counter, no wall clock, no
@@ -263,7 +263,7 @@ impl Sim {
         new.extend(self.replicas[r].take_delivered());
         for c in new {
             self.committed_log[r].push(c);
-            // The op is durably committed at a majority once any replica
+            // The operation is durably committed at a majority once any replica
             // delivers it (it required a quorum of prepare_oks), so the
             // client can consider it acknowledged.
             self.acknowledged.insert((c.client, c.request));
@@ -358,7 +358,7 @@ impl Sim {
 
     /// Safety invariants — a violation means the protocol is broken.
     fn check_invariants(&self) -> Option<String> {
-        // (1) Agreement: for every op index, all replicas that have
+        // (1) Agreement: for every operation index, all replicas that have
         // committed that far agree on the (client, request, value).
         let max_len = self
             .committed_log
@@ -376,7 +376,7 @@ impl Sim {
                             if prev.client != c.client
                                 || prev.request != c.request
                                 || prev.value != c.value
-                                || prev.op != c.op
+                                || prev.operation != c.operation
                             {
                                 return Some(format!(
                                     "AGREEMENT VIOLATED at commit index {index}: {prev:?} vs {c:?}"
@@ -387,10 +387,10 @@ impl Sim {
                 }
             }
         }
-        // (2) Monotonic op numbers within each replica's committed log.
+        // (2) Monotonic operation numbers within each replica's committed log.
         for (r, log) in self.committed_log.iter().enumerate() {
             for w in log.windows(2) {
-                if w[1].op != w[0].op + 1 {
+                if w[1].operation != w[0].operation + 1 {
                     return Some(format!(
                         "GAP/REORDER in replica {r} committed log: {:?} then {:?}",
                         w[0], w[1]

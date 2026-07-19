@@ -45,10 +45,10 @@ impl Outbox {
     }
 }
 
-/// A committed op delivered to the application, in commit order.
+/// A committed operation delivered to the application, in commit order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Committed {
-    pub op: u64,
+    pub operation: u64,
     pub client: u32,
     pub request: u32,
     pub value: u64,
@@ -59,7 +59,7 @@ pub struct Replica {
     pub n: usize,
     pub view: u64,
     pub status: Status,
-    pub op: u64,
+    pub operation: u64,
     pub commit: u64,
     /// Highest commit-number ever heard, even if our log was too short to
     /// apply it yet; applied as soon as the log catches up. This makes
@@ -70,7 +70,7 @@ pub struct Replica {
     log: [LogEntry; MAX_LOG],
     log_len: usize,
 
-    // Primary quorum tracking for the current op.
+    // Primary quorum tracking for the current operation.
     prepare_ok_from: [bool; MAX_REPLICAS],
     prepare_ok_op: u64,
 
@@ -97,7 +97,7 @@ pub const MAX_REPLICAS: usize = 7;
 #[derive(Debug, Clone, Copy)]
 struct DvcRecord {
     log_view: u64,
-    op: u64,
+    operation: u64,
     commit: u64,
     log: [LogEntry; MAX_LOG],
     log_len: usize,
@@ -111,7 +111,7 @@ impl Replica {
             n,
             view: 0,
             status: Status::Normal,
-            op: 0,
+            operation: 0,
             commit: 0,
             commit_max: 0,
             log_view: 0,
@@ -127,7 +127,7 @@ impl Replica {
             ticks_since_resend: 0,
             outbox: Outbox::new(),
             delivered: [Committed {
-                op: 0,
+                operation: 0,
                 client: 0,
                 request: 0,
                 value: 0,
@@ -198,17 +198,17 @@ impl Replica {
         {
             return true;
         }
-        self.op += 1;
+        self.operation += 1;
         let entry = LogEntry {
             view: self.view,
-            op: self.op,
+            operation: self.operation,
             client,
             request,
             value,
         };
         self.append(entry);
         // Primary counts its own vote.
-        self.reset_prepare_ok(self.op);
+        self.reset_prepare_ok(self.operation);
         self.prepare_ok_from[self.id as usize] = true;
         self.for_each_peer(|this, peer| {
             this.outbox.push(Message {
@@ -216,7 +216,7 @@ impl Replica {
                 to: peer,
                 body: MessageBody::Prepare {
                     view: this.view,
-                    op: this.op,
+                    operation: this.operation,
                     commit: this.commit,
                     entry,
                 },
@@ -248,14 +248,14 @@ impl Replica {
             // Rate-limited so recovery traffic never outruns delivery.
             self.ticks_since_resend += 1;
             let resend_period = (self.view_change_timeout / 4).max(1);
-            let (lo, hi) = if self.ticks_since_resend >= resend_period && self.op > self.commit {
+            let (lo, hi) = if self.ticks_since_resend >= resend_period && self.operation > self.commit {
                 self.ticks_since_resend = 0;
-                (self.commit + 1, self.op)
+                (self.commit + 1, self.operation)
             } else {
                 (1, 0) // empty range
             };
             for target_op in lo..=hi {
-                if let Some(entry) = self.log_slice().iter().find(|e| e.op == target_op).copied() {
+                if let Some(entry) = self.log_slice().iter().find(|e| e.operation == target_op).copied() {
                     let (view, commit) = (self.view, self.commit);
                     self.for_each_peer(|this, peer| {
                         this.outbox.push(Message {
@@ -263,7 +263,7 @@ impl Replica {
                             to: peer,
                             body: MessageBody::Prepare {
                                 view,
-                                op: entry.op,
+                                operation: entry.operation,
                                 commit,
                                 entry,
                             },
@@ -281,34 +281,34 @@ impl Replica {
         match m.body {
             MessageBody::Prepare {
                 view,
-                op,
+                operation,
                 commit,
                 entry,
-            } => self.on_prepare(m.from, view, op, commit, entry),
-            MessageBody::PrepareOk { view, op } => self.on_prepare_ok(m.from, view, op),
+            } => self.on_prepare(m.from, view, operation, commit, entry),
+            MessageBody::PrepareOk { view, operation } => self.on_prepare_ok(m.from, view, operation),
             MessageBody::Commit { view, commit } => self.on_commit_msg(view, commit),
             MessageBody::StartViewChange { view } => self.on_start_view_change(m.from, view),
             MessageBody::DoViewChange {
                 view,
                 log_view,
-                op,
+                operation,
                 commit,
                 log_len,
                 log,
-            } => self.on_do_view_change(m.from, view, log_view, op, commit, log_len, log),
+            } => self.on_do_view_change(m.from, view, log_view, operation, commit, log_len, log),
             MessageBody::StartView {
                 view,
-                op,
+                operation,
                 commit,
                 log_len,
                 log,
-            } => self.on_start_view(view, op, commit, log_len, log),
+            } => self.on_start_view(view, operation, commit, log_len, log),
         }
     }
 
     // ---- normal operation ----
 
-    fn on_prepare(&mut self, from: ReplicaId, view: u64, op: u64, commit: u64, entry: LogEntry) {
+    fn on_prepare(&mut self, from: ReplicaId, view: u64, operation: u64, commit: u64, entry: LogEntry) {
         if view < self.view {
             return;
         }
@@ -321,21 +321,21 @@ impl Replica {
             return;
         }
         self.idle_ticks = 0;
-        // In-order append: the op must directly follow ours. Acknowledge in
-        // both cases — a fresh append and a retransmission of an op we
+        // In-order append: the operation must directly follow ours. Acknowledge in
+        // both cases — a fresh append and a retransmission of an operation we
         // already hold — so a lost PrepareOk is recovered on retransmit
         // (otherwise the primary can never reach a commit quorum).
-        if op == self.op + 1 {
+        if operation == self.operation + 1 {
             self.append(entry);
-            self.op = op;
+            self.operation = operation;
         }
-        if op <= self.op {
+        if operation <= self.operation {
             self.outbox.push(Message {
                 from: self.id,
                 to: from,
                 body: MessageBody::PrepareOk {
                     view: self.view,
-                    op,
+                    operation,
                 },
             });
         }
@@ -343,12 +343,12 @@ impl Replica {
         self.advance_commit(commit);
     }
 
-    fn on_prepare_ok(&mut self, from: ReplicaId, view: u64, op: u64) {
+    fn on_prepare_ok(&mut self, from: ReplicaId, view: u64, operation: u64) {
         if view != self.view || self.status != Status::Normal || !self.is_primary() {
             return;
         }
-        if op != self.prepare_ok_op {
-            return; // stale ack for an already-committed or unknown op
+        if operation != self.prepare_ok_op {
+            return; // stale ack for an already-committed or unknown operation
         }
         self.prepare_ok_from[from as usize] = true;
         self.maybe_commit_primary();
@@ -433,7 +433,7 @@ impl Replica {
             let msg = MessageBody::DoViewChange {
                 view: self.view,
                 log_view: self.log_view,
-                op: self.op,
+                operation: self.operation,
                 commit: self.commit,
                 log_len: self.log_len as u16,
                 log: self.log,
@@ -444,7 +444,7 @@ impl Replica {
                     self.id,
                     self.view,
                     self.log_view,
-                    self.op,
+                    self.operation,
                     self.commit,
                     self.log_len as u16,
                     self.log,
@@ -465,7 +465,7 @@ impl Replica {
         from: ReplicaId,
         view: u64,
         log_view: u64,
-        op: u64,
+        operation: u64,
         commit: u64,
         log_len: u16,
         log: [LogEntry; MAX_LOG],
@@ -491,7 +491,7 @@ impl Replica {
         self.do_view_change_from[from as usize] = true;
         self.do_view_change_msgs[from as usize] = Some(DvcRecord {
             log_view,
-            op,
+            operation,
             commit,
             log,
             log_len: log_len as usize,
@@ -505,28 +505,28 @@ impl Replica {
         }
 
         // Choose the log: the DVC with the largest log_view, breaking ties
-        // by largest op. This is VSR's "most up-to-date log" rule.
+        // by largest operation. This is VSR's "most up-to-date log" rule.
         let mut best: Option<DvcRecord> = None;
         let mut max_commit = 0u64;
         for rec in self.do_view_change_msgs[..self.n].iter().flatten() {
             max_commit = max_commit.max(rec.commit);
             best = Some(match best {
                 None => *rec,
-                Some(b) if (rec.log_view, rec.op) > (b.log_view, b.op) => *rec,
+                Some(b) if (rec.log_view, rec.operation) > (b.log_view, b.operation) => *rec,
                 Some(b) => b,
             });
         }
         let best = best.expect("quorum implies at least one record");
         self.log = best.log;
         self.log_len = best.log_len;
-        self.op = best.op;
+        self.operation = best.operation;
         self.log_view = self.view;
         self.status = Status::Normal;
         self.idle_ticks = 0;
         // Commit up to the highest known commit across the quorum.
         self.advance_commit(max_commit);
         // Reset prepare bookkeeping for any uncommitted tail.
-        self.reset_prepare_ok(self.op);
+        self.reset_prepare_ok(self.operation);
         self.prepare_ok_from[self.id as usize] = true;
         // Broadcast the new view's log.
         self.for_each_peer(|this, peer| {
@@ -535,7 +535,7 @@ impl Replica {
                 to: peer,
                 body: MessageBody::StartView {
                     view: this.view,
-                    op: this.op,
+                    operation: this.operation,
                     commit: this.commit,
                     log_len: this.log_len as u16,
                     log: this.log,
@@ -547,7 +547,7 @@ impl Replica {
     fn on_start_view(
         &mut self,
         view: u64,
-        op: u64,
+        operation: u64,
         commit: u64,
         log_len: u16,
         log: [LogEntry; MAX_LOG],
@@ -558,19 +558,19 @@ impl Replica {
         self.view = view;
         self.log = log;
         self.log_len = log_len as usize;
-        self.op = op;
+        self.operation = operation;
         self.log_view = view;
         self.status = Status::Normal;
         self.idle_ticks = 0;
         self.advance_commit(commit);
         // Acknowledge any uncommitted ops so the new primary can re-commit.
-        if self.op > self.commit {
+        if self.operation > self.commit {
             self.outbox.push(Message {
                 from: self.id,
                 to: self.primary(),
                 body: MessageBody::PrepareOk {
                     view: self.view,
-                    op: self.op,
+                    operation: self.operation,
                 },
             });
         }
@@ -601,14 +601,14 @@ impl Replica {
         if target > self.commit_max {
             self.commit_max = target;
         }
-        let target = self.commit_max.min(self.op);
+        let target = self.commit_max.min(self.operation);
         while self.commit < target {
             let next = self.commit + 1;
-            // Deliver the op at index `next` (ops are 1-based, log 0-based).
-            if let Some(entry) = self.log_slice().iter().find(|e| e.op == next) {
+            // Deliver the operation at index `next` (ops are 1-based, log 0-based).
+            if let Some(entry) = self.log_slice().iter().find(|e| e.operation == next) {
                 if self.delivered_len < MAX_LOG {
                     self.delivered[self.delivered_len] = Committed {
-                        op: entry.op,
+                        operation: entry.operation,
                         client: entry.client,
                         request: entry.request,
                         value: entry.value,
@@ -617,14 +617,14 @@ impl Replica {
                 }
                 self.commit = next;
             } else {
-                break; // gap: cannot commit past a missing op
+                break; // gap: cannot commit past a missing operation
             }
         }
     }
 
-    fn reset_prepare_ok(&mut self, op: u64) {
+    fn reset_prepare_ok(&mut self, operation: u64) {
         self.prepare_ok_from = [false; MAX_REPLICAS];
-        self.prepare_ok_op = op;
+        self.prepare_ok_op = operation;
     }
 
     /// Runs `f` for each peer id, without holding a borrow of self.
@@ -682,10 +682,10 @@ mod tests {
         let mut c = cluster(3);
         assert!(c[0].on_request(1, 1, 100));
         settle(&mut c);
-        // All replicas commit the op.
+        // All replicas commit the operation.
         for r in &c {
             assert_eq!(r.commit, 1, "replica {} did not commit", r.id);
-            assert_eq!(r.op, 1);
+            assert_eq!(r.operation, 1);
         }
     }
 
@@ -700,15 +700,15 @@ mod tests {
         let mut c = cluster(3);
         c[0].on_request(7, 1, 10);
         settle(&mut c);
-        let before = c[0].op;
+        let before = c[0].operation;
         c[0].on_request(7, 1, 10); // same client+request
-        assert_eq!(c[0].op, before, "duplicate must not advance op");
+        assert_eq!(c[0].operation, before, "duplicate must not advance operation");
     }
 
     #[test]
     fn view_change_elects_new_primary_and_preserves_log() {
         let mut c = cluster(3);
-        // Commit one op under view 0 (primary 0).
+        // Commit one operation under view 0 (primary 0).
         c[0].on_request(1, 1, 55);
         settle(&mut c);
         assert!(c.iter().all(|r| r.commit == 1));
@@ -734,14 +734,14 @@ mod tests {
             let out: Vec<_> = c[m.to as usize].outbox().drain().filter(|m| m.to != 0).collect();
             queue.extend(out);
         }
-        // New view is 1, primary is replica 1, and the committed op survives.
+        // New view is 1, primary is replica 1, and the committed operation survives.
         assert_eq!(c[1].view, 1);
         assert!(c[1].is_primary());
         assert_eq!(c[1].status, Status::Normal);
-        assert!(c[1].commit >= 1, "committed op lost across view change");
+        assert!(c[1].commit >= 1, "committed operation lost across view change");
         assert!(c[2].commit >= 1);
 
-        // The new primary can accept and commit a fresh op with only 1 and 2.
+        // The new primary can accept and commit a fresh operation with only 1 and 2.
         assert!(c[1].on_request(2, 1, 66));
         let mut queue: Vec<Message> = c[1].outbox().drain().filter(|m| m.to != 0).collect();
         let mut steps = 0;

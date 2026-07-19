@@ -63,14 +63,14 @@ pub fn digest(msg: &[u8]) -> [u8; 16] {
         }
     };
 
-    let mut off = 0usize;
-    while off < padded_len {
+    let mut offset = 0usize;
+    while offset < padded_len {
         let mut m = [0u32; 16];
         for (j, word) in m.iter_mut().enumerate() {
-            let b0 = byte_at(off + j * 4) as u32;
-            let b1 = byte_at(off + j * 4 + 1) as u32;
-            let b2 = byte_at(off + j * 4 + 2) as u32;
-            let b3 = byte_at(off + j * 4 + 3) as u32;
+            let b0 = byte_at(offset + j * 4) as u32;
+            let b1 = byte_at(offset + j * 4 + 1) as u32;
+            let b2 = byte_at(offset + j * 4 + 2) as u32;
+            let b3 = byte_at(offset + j * 4 + 3) as u32;
             *word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         }
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
@@ -100,7 +100,7 @@ pub fn digest(msg: &[u8]) -> [u8; 16] {
         b0 = b0.wrapping_add(b);
         c0 = c0.wrapping_add(c);
         d0 = d0.wrapping_add(d);
-        off += 64;
+        offset += 64;
     }
 
     let mut out = [0u8; 16];

@@ -268,8 +268,8 @@ impl Server {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
             }
-            // Upload committed WAL off the commit path so request handling and
-            // S3 latency never gate each other; back off if the bucket errors.
+            // Upload committed WAL offset the commit path so request handling and
+            // S3 latency never gate each other; back offset if the bucket errors.
             if self.engine.has_pending_wal_upload() {
                 upload_backoff = if self.engine.drain_wal_upload() {
                     Duration::ZERO

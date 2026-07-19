@@ -247,7 +247,7 @@ impl FkAction {
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueKey {
     pub name: SqlName,
-    pub cols: [u16; MAX_INDEX_COLS],
+    pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
     pub is_primary: bool,
 }
@@ -255,13 +255,13 @@ pub struct UniqueKey {
 impl UniqueKey {
     pub const EMPTY: Self = UniqueKey {
         name: SqlName::EMPTY,
-        cols: [0u16; MAX_INDEX_COLS],
+        columns: [0u16; MAX_INDEX_COLS],
         n_cols: 0,
         is_primary: false,
     };
 
-    pub fn cols(&self) -> &[u16] {
-        &self.cols[..self.n_cols]
+    pub fn columns(&self) -> &[u16] {
+        &self.columns[..self.n_cols]
     }
 }
 
@@ -285,7 +285,7 @@ impl CheckConstraint {
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignKey {
     pub name: SqlName,
-    pub cols: [u16; MAX_INDEX_COLS],
+    pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
     pub parent: SqlName,
     pub parent_cols: [u16; MAX_INDEX_COLS],
@@ -297,7 +297,7 @@ pub struct ForeignKey {
 impl ForeignKey {
     pub const EMPTY: Self = ForeignKey {
         name: SqlName::EMPTY,
-        cols: [0u16; MAX_INDEX_COLS],
+        columns: [0u16; MAX_INDEX_COLS],
         n_cols: 0,
         parent: SqlName::EMPTY,
         parent_cols: [0u16; MAX_INDEX_COLS],
@@ -306,8 +306,8 @@ impl ForeignKey {
         on_update: FkAction::NoAction,
     };
 
-    pub fn cols(&self) -> &[u16] {
-        &self.cols[..self.n_cols]
+    pub fn columns(&self) -> &[u16] {
+        &self.columns[..self.n_cols]
     }
 
     pub fn parent_cols(&self) -> &[u16] {
@@ -541,7 +541,7 @@ pub const MAX_INDEX_COLS: usize = 8;
 pub struct IndexDef {
     pub name: SqlName,
     pub table: SqlName,
-    pub cols: [u16; MAX_INDEX_COLS],
+    pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
     pub unique: bool,
     pub live: bool,
@@ -611,7 +611,7 @@ impl Storage {
                 .push(IndexDef {
                     name: SqlName::parse("").expect("empty name fits"),
                     table: SqlName::parse("").expect("empty name fits"),
-                    cols: [0; MAX_INDEX_COLS],
+                    columns: [0; MAX_INDEX_COLS],
                     n_cols: 0,
                     unique: false,
                     live: false,
@@ -1173,7 +1173,7 @@ mod tests {
         c
     }
 
-    fn make_def(name: &str, cols: &[(&str, ColType, bool)]) -> TableDef {
+    fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {
         let mut def = TableDef {
             name: SqlName::parse(name).unwrap(),
             columns: [ColumnMeta {
@@ -1186,10 +1186,10 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
             }; MAX_COLUMNS],
-            n_columns: cols.len(),
+            n_columns: columns.len(),
             ..TableDef::empty()
         };
-        for (i, (n, t, nn)) in cols.iter().enumerate() {
+        for (i, (n, t, nn)) in columns.iter().enumerate() {
             def.columns[i] = ColumnMeta {
                 name: SqlName::parse(n).unwrap(),
                 ctype: *t,

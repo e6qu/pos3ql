@@ -101,96 +101,96 @@ const MONTH_FULL: [&str; 12] = [
 /// unrecognized letter codes are rejected loudly.
 pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i64, i64), SqlError> {
     let bad = || sql_err!("22007", "invalid value for input string");
-    let (mut y, mut mo, mut d, mut h, mut mi, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
-    let ib = input.as_bytes();
-    let fb = fmt.as_bytes();
-    let mut ip = 0usize;
-    let mut fi = 0usize;
+    let (mut y, mut month, mut d, mut h, mut minute, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
+    let input_bytes = input.as_bytes();
+    let format_bytes = fmt.as_bytes();
+    let mut input_position = 0usize;
+    let mut format_index = 0usize;
     // Reads up to `width` decimal digits (skipping leading spaces) into an int.
-    let read_num = |ip: &mut usize, width: usize| -> Option<i64> {
-        while *ip < ib.len() && ib[*ip] == b' ' {
-            *ip += 1;
+    let read_num = |input_position: &mut usize, width: usize| -> Option<i64> {
+        while *input_position < input_bytes.len() && input_bytes[*input_position] == b' ' {
+            *input_position += 1;
         }
-        let start = *ip;
+        let start = *input_position;
         let mut v: i64 = 0;
-        while *ip < ib.len() && *ip - start < width && ib[*ip].is_ascii_digit() {
-            v = v * 10 + (ib[*ip] - b'0') as i64;
-            *ip += 1;
+        while *input_position < input_bytes.len() && *input_position - start < width && input_bytes[*input_position].is_ascii_digit() {
+            v = v * 10 + (input_bytes[*input_position] - b'0') as i64;
+            *input_position += 1;
         }
-        if *ip == start { None } else { Some(v) }
+        if *input_position == start { None } else { Some(v) }
     };
     let starts_with_ci = |bytes: &[u8], at: usize, word: &[u8]| -> bool {
         at + word.len() <= bytes.len()
             && bytes[at..at + word.len()].eq_ignore_ascii_case(word)
     };
-    while fi < fb.len() {
-        let up = fb[fi].to_ascii_uppercase();
+    while format_index < format_bytes.len() {
+        let up = format_bytes[format_index].to_ascii_uppercase();
         // Longest field codes first.
-        if starts_with_ci(fb, fi, b"HH24") || starts_with_ci(fb, fi, b"HH12") {
-            h = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 4;
-        } else if starts_with_ci(fb, fi, b"YYYY") {
-            y = read_num(&mut ip, 4).ok_or_else(bad)?;
-            fi += 4;
-        } else if starts_with_ci(fb, fi, b"MONTH") {
-            mo = read_month(input, &mut ip, false).ok_or_else(bad)?;
-            fi += 5;
-        } else if starts_with_ci(fb, fi, b"MON") {
-            mo = read_month(input, &mut ip, true).ok_or_else(bad)?;
-            fi += 3;
-        } else if starts_with_ci(fb, fi, b"YYY") {
-            y = read_num(&mut ip, 3).ok_or_else(bad)?;
-            fi += 3;
-        } else if up == b'H' && starts_with_ci(fb, fi, b"HH") {
-            h = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"YY") {
-            let v = read_num(&mut ip, 2).ok_or_else(bad)?;
+        if starts_with_ci(format_bytes, format_index, b"HH24") || starts_with_ci(format_bytes, format_index, b"HH12") {
+            h = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"YYYY") {
+            y = read_num(&mut input_position, 4).ok_or_else(bad)?;
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"MONTH") {
+            month = read_month(input, &mut input_position, false).ok_or_else(bad)?;
+            format_index += 5;
+        } else if starts_with_ci(format_bytes, format_index, b"MON") {
+            month = read_month(input, &mut input_position, true).ok_or_else(bad)?;
+            format_index += 3;
+        } else if starts_with_ci(format_bytes, format_index, b"YYY") {
+            y = read_num(&mut input_position, 3).ok_or_else(bad)?;
+            format_index += 3;
+        } else if up == b'H' && starts_with_ci(format_bytes, format_index, b"HH") {
+            h = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"YY") {
+            let v = read_num(&mut input_position, 2).ok_or_else(bad)?;
             y = if v < 70 { 2000 + v } else { 1900 + v };
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"MM") {
-            mo = read_num(&mut ip, 2).ok_or_else(bad)? as u32;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"DD") {
-            d = read_num(&mut ip, 2).ok_or_else(bad)? as u32;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"MI") {
-            mi = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"SS") {
-            s = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 2;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"MM") {
+            month = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"DD") {
+            d = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"MI") {
+            minute = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"SS") {
+            s = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 2;
         } else if up == b'Y' {
-            y = read_num(&mut ip, 1).ok_or_else(bad)?;
-            fi += 1;
+            y = read_num(&mut input_position, 1).ok_or_else(bad)?;
+            format_index += 1;
         } else if up.is_ascii_alphabetic() {
             return Err(sql_err!("22007", "unsupported to_date/to_timestamp code"));
         } else {
             // Separator: skip one non-alphanumeric input character if present.
-            if ip < ib.len() && !ib[ip].is_ascii_alphanumeric() {
-                ip += 1;
+            if input_position < input_bytes.len() && !input_bytes[input_position].is_ascii_alphanumeric() {
+                input_position += 1;
             }
-            fi += 1;
+            format_index += 1;
         }
     }
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+    if !(1..=12).contains(&month) || d < 1 || d > days_in_month(y, month) {
         return Err(sql_err!("22008", "date/time field value out of range"));
     }
-    Ok((y, mo, d, h, mi, s))
+    Ok((y, month, d, h, minute, s))
 }
 
-/// Reads a month name (abbreviated when `abbr`, else full) at `*ip`, returning
+/// Reads a month name (abbreviated when `abbr`, else full) at `*input_position`, returning
 /// the 1-based month.
-fn read_month(input: &str, ip: &mut usize, abbr: bool) -> Option<u32> {
+fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32> {
     let bytes = input.as_bytes();
-    while *ip < bytes.len() && bytes[*ip] == b' ' {
-        *ip += 1;
+    while *input_position < bytes.len() && bytes[*input_position] == b' ' {
+        *input_position += 1;
     }
     let table: &[&str] = if abbr { &MONTH_ABBR } else { &MONTH_FULL };
     for (i, name) in table.iter().enumerate() {
         let nb = name.as_bytes();
-        if *ip + nb.len() <= bytes.len() && bytes[*ip..*ip + nb.len()].eq_ignore_ascii_case(nb) {
-            *ip += nb.len();
+        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
+            *input_position += nb.len();
             return Some(i as u32 + 1);
         }
     }
@@ -198,8 +198,8 @@ fn read_month(input: &str, ip: &mut usize, abbr: bool) -> Option<u32> {
     let other: &[&str] = if abbr { &MONTH_FULL } else { &MONTH_ABBR };
     for (i, name) in other.iter().enumerate() {
         let nb = name.as_bytes();
-        if *ip + nb.len() <= bytes.len() && bytes[*ip..*ip + nb.len()].eq_ignore_ascii_case(nb) {
-            *ip += nb.len();
+        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
+            *input_position += nb.len();
             return Some(i as u32 + 1);
         }
     }
@@ -208,15 +208,15 @@ fn read_month(input: &str, ip: &mut usize, abbr: bool) -> Option<u32> {
 
 /// `to_date`: parses a formatted date into days since 2000-01-01.
 pub fn to_date(input: &str, fmt: &str) -> Result<i32, SqlError> {
-    let (y, mo, d, _, _, _) = parse_formatted(input, fmt)?;
-    make_date(y, mo as i64, d as i64)
+    let (y, month, d, _, _, _) = parse_formatted(input, fmt)?;
+    make_date(y, month as i64, d as i64)
 }
 
 /// `to_timestamp`: parses a formatted timestamp into microseconds since
 /// 2000-01-01.
 pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
-    let (y, mo, d, h, mi, s) = parse_formatted(input, fmt)?;
-    make_timestamp(y, mo as i64, d as i64, h, mi, s as f64)
+    let (y, month, d, h, minute, s) = parse_formatted(input, fmt)?;
+    make_timestamp(y, month as i64, d as i64, h, minute, s as f64)
 }
 
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
@@ -236,25 +236,25 @@ pub fn make_date(y: i64, m: i64, d: i64) -> Result<i32, SqlError> {
 
 /// Constructs a time-of-day (microseconds since midnight) from hour/minute and
 /// a fractional second, validating fields as PostgreSQL `make_time` does.
-pub fn make_time(h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+pub fn make_time(h: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
     let range = || sql_err!("22008", "time field value out of range");
-    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0.0..60.0).contains(&sec) {
+    if !(0..=23).contains(&h) || !(0..=59).contains(&minute) || !(0.0..60.0).contains(&sec) {
         return Err(range());
     }
-    Ok(((h * 60 + mi) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
+    Ok(((h * 60 + minute) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
 }
 
 /// Constructs a timestamp (microseconds since 2000-01-01) from its fields.
-pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
     let days = make_date(y, m, d)? as i64;
-    let time_of_day = make_time(h, mi, sec)?;
+    let time_of_day = make_time(h, minute, sec)?;
     Ok(days * 86_400_000_000 + time_of_day)
 }
 
 /// Parses `YYYY-MM-DD[ |T]HH:MM[:SS[.ffffff]][Z|±HH[:MM]]` into
 /// microseconds since 2000-01-01 UTC. `require_tz_shift` applies the zone
 /// offset (timestamptz); plain timestamp ignores any suffix.
-pub fn parse_timestamp(s: &str, apply_tz: bool) -> Result<i64, SqlError> {
+pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     let bad = || {
         sql_err!(
             "22007",
@@ -275,7 +275,7 @@ pub fn parse_timestamp(s: &str, apply_tz: bool) -> Result<i64, SqlError> {
     }
 
     // Trailing zone: Z, +HH, +HH:MM, -HH, -HH:MM.
-    let (time_part, tz_secs) = if let Some(stripped) = rest.strip_suffix('Z') {
+    let (time_part, timezone_seconds) = if let Some(stripped) = rest.strip_suffix('Z') {
         (stripped, 0i64)
     } else if let Some(pos) = rest.rfind(['+', '-']) {
         if pos > 0 {
@@ -326,8 +326,8 @@ pub fn parse_timestamp(s: &str, apply_tz: bool) -> Result<i64, SqlError> {
     }
     let mut total =
         date_days * 86_400_000_000 + (h * 3600 + m * 60 + sec) * 1_000_000 + micros;
-    if apply_tz {
-        total -= tz_secs * 1_000_000;
+    if apply_timezone {
+        total -= timezone_seconds * 1_000_000;
     }
     Ok(total)
 }
@@ -373,9 +373,9 @@ pub fn parse_time(s: &str) -> Result<i64, SqlError> {
 pub fn format_time(micros: i64) -> StackStr<24> {
     use core::fmt::Write;
     let mut out = StackStr::<24>::new();
-    let secs = micros.div_euclid(1_000_000);
+    let seconds = micros.div_euclid(1_000_000);
     let frac = micros.rem_euclid(1_000_000);
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
     let _ = write!(out, "{h:02}:{m:02}:{s:02}");
     if frac != 0 {
         let mut f = frac;
@@ -475,9 +475,9 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
         sep(&mut out, &mut first);
         let neg = interval.micros < 0;
         let a = interval.micros.unsigned_abs() as i64;
-        let secs = a / 1_000_000;
+        let seconds = a / 1_000_000;
         let frac = a % 1_000_000;
-        let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+        let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
         if neg {
             let _ = write!(out, "-");
         }
@@ -695,9 +695,9 @@ pub fn format_date(days: i32) -> StackStr<16> {
     format_date_styled(days, DateStyle::default())
 }
 
-/// `with_tz` renders a timestamptz (UTC) as PostgreSQL does.
-pub fn format_timestamp(micros: i64, with_tz: bool) -> StackStr<48> {
-    format_timestamp_styled(micros, with_tz, DateStyle::default(), crate::sql::tz::Tz::utc())
+/// `with_timezone` renders a timestamptz (UTC) as PostgreSQL does.
+pub fn format_timestamp(micros: i64, with_timezone: bool) -> StackStr<48> {
+    format_timestamp_styled(micros, with_timezone, DateStyle::default(), crate::sql::timezone::Timezone::utc())
 }
 
 /// Date output honoring DateStyle. Matches PostgreSQL: ISO `YYYY-MM-DD`,
@@ -733,50 +733,50 @@ fn write_frac(out: &mut impl core::fmt::Write, frac: i64) {
     let _ = write!(out, ".{f:0width$}", width = digits);
 }
 
-/// Timestamp output honoring DateStyle. `tz_off_secs` shifts the wall clock for
+/// Timestamp output honoring DateStyle. `timezone_offset_seconds` shifts the wall clock for
 /// timestamptz (0 = UTC); the zone suffix is the ISO offset in ISO style and a
 /// zone abbreviation otherwise, matching PostgreSQL.
 pub fn format_timestamp_styled(
     micros: i64,
-    with_tz: bool,
+    with_timezone: bool,
     style: DateStyle,
-    tz: super::tz::Tz,
+    timezone: super::timezone::Timezone,
 ) -> StackStr<48> {
     // The offset and abbreviation are resolved for this specific instant, so
-    // DST is honored; a plain timestamp (no tz) always renders at wall clock.
-    let (tz_off_secs, abbrev) = if with_tz { tz.resolve(micros) } else { (0, StackStr::<8>::new()) };
-    let tz_abbrev = abbrev.as_str();
-    let local = micros + tz_off_secs as i64 * 1_000_000;
+    // DST is honored; a plain timestamp (no timezone) always renders at wall clock.
+    let (timezone_offset_seconds, abbrev) = if with_timezone { timezone.resolve(micros) } else { (0, StackStr::<8>::new()) };
+    let timezone_abbreviation = abbrev.as_str();
+    let local = micros + timezone_offset_seconds as i64 * 1_000_000;
     let days = local.div_euclid(DAY_US);
     let in_day = local.rem_euclid(DAY_US);
     let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
-    let secs = in_day / 1_000_000;
+    let seconds = in_day / 1_000_000;
     let frac = in_day % 1_000_000;
-    let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
     let dmy = style.order == FieldOrder::Dmy;
     let mut out = StackStr::<48>::new();
     use core::fmt::Write;
 
     match style.format {
         DateFormat::Iso => {
-            let _ = write!(out, "{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+            let _ = write!(out, "{y:04}-{m:02}-{d:02} {h:02}:{minute:02}:{s:02}");
             write_frac(&mut out, frac);
-            if with_tz {
-                write_iso_offset(&mut out, tz_off_secs);
+            if with_timezone {
+                write_iso_offset(&mut out, timezone_offset_seconds);
             }
         }
         DateFormat::Postgres => {
             let dow = DOW[day_of_week(days)];
             let month = MON[(m - 1) as usize];
             if dmy {
-                let _ = write!(out, "{dow} {d:02} {month} {h:02}:{mi:02}:{s:02}");
+                let _ = write!(out, "{dow} {d:02} {month} {h:02}:{minute:02}:{s:02}");
             } else {
-                let _ = write!(out, "{dow} {month} {d:02} {h:02}:{mi:02}:{s:02}");
+                let _ = write!(out, "{dow} {month} {d:02} {h:02}:{minute:02}:{s:02}");
             }
             write_frac(&mut out, frac);
             let _ = write!(out, " {y:04}");
-            if with_tz {
-                let _ = write!(out, " {tz_abbrev}");
+            if with_timezone {
+                let _ = write!(out, " {timezone_abbreviation}");
             }
         }
         DateFormat::Sql | DateFormat::German => {
@@ -787,10 +787,10 @@ pub fn format_timestamp_styled(
             } else {
                 write!(out, "{m:02}/{d:02}/{y:04}")
             };
-            let _ = write!(out, " {h:02}:{mi:02}:{s:02}");
+            let _ = write!(out, " {h:02}:{minute:02}:{s:02}");
             write_frac(&mut out, frac);
-            if with_tz {
-                let _ = write!(out, " {tz_abbrev}");
+            if with_timezone {
+                let _ = write!(out, " {timezone_abbreviation}");
             }
         }
     }
@@ -903,9 +903,9 @@ mod tests {
         ];
         for (style, d_exp, ts_exp, tsf_exp, tstz_exp) in cases {
             assert_eq!(format_date_styled(days, style).as_str(), d_exp, "{style:?} date");
-            assert_eq!(format_timestamp_styled(timestamp, false, style, crate::sql::tz::Tz::utc()).as_str(), ts_exp, "{style:?} timestamp");
-            assert_eq!(format_timestamp_styled(tsf, false, style, crate::sql::tz::Tz::utc()).as_str(), tsf_exp, "{style:?} tsf");
-            assert_eq!(format_timestamp_styled(timestamp, true, style, crate::sql::tz::Tz::utc()).as_str(), tstz_exp, "{style:?} tstz");
+            assert_eq!(format_timestamp_styled(timestamp, false, style, crate::sql::timezone::Timezone::utc()).as_str(), ts_exp, "{style:?} timestamp");
+            assert_eq!(format_timestamp_styled(tsf, false, style, crate::sql::timezone::Timezone::utc()).as_str(), tsf_exp, "{style:?} tsf");
+            assert_eq!(format_timestamp_styled(timestamp, true, style, crate::sql::timezone::Timezone::utc()).as_str(), tstz_exp, "{style:?} tstz");
         }
     }
 

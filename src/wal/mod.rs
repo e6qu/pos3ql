@@ -69,7 +69,7 @@ pub enum WalOp<'a> {
     CreateIndex {
         name: &'a str,
         table: &'a str,
-        cols: [u16; MAX_INDEX_COLS],
+        columns: [u16; MAX_INDEX_COLS],
         n_cols: usize,
         unique: bool,
     },
@@ -232,12 +232,12 @@ impl Wal {
                     break 'outer;
                 }
                 let payload = &data[HEADER_LEN..total];
-                let op = match decode_op(kind, payload) {
-                    Some(op) => op,
+                let operation = match decode_op(kind, payload) {
+                    Some(operation) => operation,
                     None => break 'outer,
                 };
                 if lsn > floor {
-                    apply(lsn, op).map_err(WalSetupError::Replay)?;
+                    apply(lsn, operation).map_err(WalSetupError::Replay)?;
                 }
                 self.last_lsn = lsn;
                 self.write_offset += total as u64;
@@ -263,8 +263,8 @@ impl Wal {
     /// Appends one record to the in-memory batch. Never writes to the file:
     /// a batch either fits `wal_buffer_bytes` entirely or the transaction
     /// fails — so the journal only ever contains whole transactions.
-    pub fn append(&mut self, lsn: u64, op: &WalOp) -> Result<(), SqlError> {
-        let payload_len = encoded_payload_len(op);
+    pub fn append(&mut self, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
+        let payload_len = encoded_payload_len(operation);
         let total = HEADER_LEN + payload_len;
         if self.buffer.capacity() - self.buffer.len() < total {
             return Err(sql_err!(
@@ -293,8 +293,8 @@ impl Wal {
         let mut ok = self.buffer.append(&[0u8; 4]); // crc, patched below
         ok &= self.buffer.append(&(payload_len as u32).to_le_bytes());
         ok &= self.buffer.append(&lsn.to_le_bytes());
-        ok &= self.buffer.append(&[op_kind(op), 0, 0, 0, 0, 0, 0, 0]);
-        ok &= append_payload(&mut self.buffer, op);
+        ok &= self.buffer.append(&[op_kind(operation), 0, 0, 0, 0, 0, 0, 0]);
+        ok &= append_payload(&mut self.buffer, operation);
         assert!(ok, "record size was checked against buffer capacity");
 
         let filled = self.buffer.filled_mut();
@@ -399,8 +399,8 @@ fn die(msg: &str) -> ! {
     std::process::abort();
 }
 
-fn op_kind(op: &WalOp) -> u8 {
-    match op {
+fn op_kind(operation: &WalOp) -> u8 {
+    match operation {
         WalOp::CreateTable(_) => KIND_CREATE,
         WalOp::DropTable(_) => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
@@ -412,8 +412,8 @@ fn op_kind(op: &WalOp) -> u8 {
     }
 }
 
-fn encoded_payload_len(op: &WalOp) -> usize {
-    match op {
+fn encoded_payload_len(operation: &WalOp) -> usize {
+    match operation {
         WalOp::CreateTable(def) => {
             let mut n = 1 + def.name.as_str().len() + 2;
             for c in def.columns() {
@@ -452,11 +452,11 @@ fn encoded_payload_len(op: &WalOp) -> usize {
     }
 }
 
-fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
+fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
     let name_bytes = |buffer: &mut FixedBuf, s: &str| -> bool {
         buffer.append(&[s.len() as u8]) && buffer.append(s.as_bytes())
     };
-    match op {
+    match operation {
         WalOp::CreateTable(def) => {
             let mut ok = name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
@@ -475,7 +475,7 @@ fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
             for uk in def.uniques() {
                 ok &= name_bytes(buffer, uk.name.as_str());
                 ok &= buffer.append(&[u8::from(uk.is_primary), uk.n_cols as u8]);
-                for &c in uk.cols() {
+                for &c in uk.columns() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
             }
@@ -492,7 +492,7 @@ fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
             for fk in def.fkeys() {
                 ok &= name_bytes(buffer, fk.name.as_str());
                 ok &= buffer.append(&[fk.n_cols as u8]);
-                for &c in fk.cols() {
+                for &c in fk.columns() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
                 ok &= name_bytes(buffer, fk.parent.as_str());
@@ -520,11 +520,11 @@ fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
                 && buffer.append(sql.as_bytes())
         }
         WalOp::DropView(name) => name_bytes(buffer, name),
-        WalOp::CreateIndex { name, table, cols, n_cols, unique } => {
+        WalOp::CreateIndex { name, table, columns, n_cols, unique } => {
             let mut ok = name_bytes(buffer, name)
                 && name_bytes(buffer, table)
                 && buffer.append(&[u8::from(*unique), *n_cols as u8]);
-            for c in &cols[..*n_cols] {
+            for c in &columns[..*n_cols] {
                 ok &= buffer.append(&c.to_le_bytes());
             }
             ok
@@ -614,7 +614,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 uk.name = SqlName::parse(uname).ok()?;
                 uk.is_primary = meta[0] != 0;
                 uk.n_cols = n;
-                for c in uk.cols.iter_mut().take(n) {
+                for c in uk.columns.iter_mut().take(n) {
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
@@ -628,7 +628,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             }
             def.n_checks = n_checks;
             for k in 0..n_checks {
-                let cname = take_name(&mut at)?;
+                let constraint_name = take_name(&mut at)?;
                 let elen =
                     u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
                 at += 2;
@@ -636,7 +636,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += elen;
                 let text = core::str::from_utf8(raw).ok()?;
                 let mut check = CheckConstraint::EMPTY;
-                check.name = SqlName::parse(cname).ok()?;
+                check.name = SqlName::parse(constraint_name).ok()?;
                 core::fmt::Write::write_str(&mut check.expression, text).ok()?;
                 if check.expression.is_truncated() {
                     return None;
@@ -660,12 +660,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let mut fk = ForeignKey::EMPTY;
                 fk.name = SqlName::parse(fname).ok()?;
                 fk.n_cols = nc;
-                for c in fk.cols.iter_mut().take(nc) {
+                for c in fk.columns.iter_mut().take(nc) {
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
-                let pname = take_name(&mut at)?;
-                fk.parent = SqlName::parse(pname).ok()?;
+                let parent_name = take_name(&mut at)?;
+                fk.parent = SqlName::parse(parent_name).ok()?;
                 let np = *payload.get(at)? as usize;
                 at += 1;
                 if np > MAX_INDEX_COLS {
@@ -729,15 +729,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if n_cols > MAX_INDEX_COLS {
                 return None;
             }
-            let mut cols = [0u16; MAX_INDEX_COLS];
-            for c in cols.iter_mut().take(n_cols) {
+            let mut columns = [0u16; MAX_INDEX_COLS];
+            for c in columns.iter_mut().take(n_cols) {
                 *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                 at += 2;
             }
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 name,
                 table,
-                cols,
+                columns,
                 n_cols,
                 unique,
             })
@@ -993,8 +993,8 @@ mod tests {
         // round-trip covers every constraint kind.
         let mut uk = UniqueKey::EMPTY;
         uk.name = SqlName::parse("t_id_v_key").unwrap();
-        uk.cols[0] = 0;
-        uk.cols[1] = 1;
+        uk.columns[0] = 0;
+        uk.columns[1] = 1;
         uk.n_cols = 2;
         def.uniques[0] = uk;
         def.n_uniques = 1;
@@ -1005,7 +1005,7 @@ mod tests {
         def.n_checks = 1;
         let mut fk = ForeignKey::EMPTY;
         fk.name = SqlName::parse("t_id_fkey").unwrap();
-        fk.cols[0] = 0;
+        fk.columns[0] = 0;
         fk.n_cols = 1;
         fk.parent = SqlName::parse("parent").unwrap();
         fk.parent_cols[0] = 3;
@@ -1022,8 +1022,8 @@ mod tests {
 
     fn collect_replay_from(wal: &mut Wal, floor: u64) -> Vec<String> {
         let mut seen = Vec::new();
-        wal.replay(floor, |lsn, op| {
-            seen.push(format!("{lsn}:{op:?}"));
+        wal.replay(floor, |lsn, operation| {
+            seen.push(format!("{lsn}:{operation:?}"));
             Ok(())
         })
         .unwrap();

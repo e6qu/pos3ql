@@ -68,14 +68,14 @@ impl<'a> Lexer<'a> {
         };
         match c {
             '(' | ')' | ',' | ';' | '+' | '*' | '%' | '^' | '.' | '[' | ']' => {
-                let op = &self.text[self.at..self.at + 1];
+                let operator = &self.text[self.at..self.at + 1];
                 self.at += 1;
-                Ok(Tok::Op(op))
+                Ok(Tok::Op(operator))
             }
             '-' => {
                 // JSON accessors `->`/`->>`, range adjacency `-|-`, else minus.
                 let rest = self.rest();
-                let op = if rest.starts_with("->>") {
+                let operator = if rest.starts_with("->>") {
                     "->>"
                 } else if rest.starts_with("->") {
                     "->"
@@ -84,14 +84,14 @@ impl<'a> Lexer<'a> {
                 } else {
                     "-"
                 };
-                self.at += op.len();
-                Ok(Tok::Op(&self.text[self.at - op.len()..self.at]))
+                self.at += operator.len();
+                Ok(Tok::Op(&self.text[self.at - operator.len()..self.at]))
             }
             '/' => {
                 // Comment starters were consumed above, so this is an operator.
-                let op = &self.text[self.at..self.at + 1];
+                let operator = &self.text[self.at..self.at + 1];
                 self.at += 1;
-                Ok(Tok::Op(op))
+                Ok(Tok::Op(operator))
             }
             ':' => {
                 if rest.starts_with("::") {
@@ -114,13 +114,13 @@ impl<'a> Lexer<'a> {
     fn operator(&mut self) -> Result<Tok<'a>, LexError> {
         let rest = self.rest();
         // Longer operators first: the POSIX regex match family before `~`.
-        for op in [
+        for operator in [
             "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "@>", "<@", "&<", "&>",
             "&&", "<", ">", "=", "~", "|", "&", "#", "^",
         ] {
-            if rest.starts_with(op) {
-                self.at += op.len();
-                return Ok(Tok::Op(&self.text[self.at - op.len()..self.at]));
+            if rest.starts_with(operator) {
+                self.at += operator.len();
+                return Ok(Tok::Op(&self.text[self.at - operator.len()..self.at]));
             }
         }
         Err(self.error("unknown operator"))

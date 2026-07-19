@@ -308,7 +308,7 @@ mod tests {
         }
 
         // Pump only the survivors (1 and 2). They must elect a new primary
-        // and keep the committed op.
+        // and keep the committed operation.
         let start = Instant::now();
         let mut new_primary = None;
         while start.elapsed() < Duration::from_secs(4) {
@@ -350,12 +350,12 @@ mod tests {
         for node in &nodes[1..] {
             assert!(
                 node.applied.iter().any(|c| c.value == 100),
-                "survivor {} lost the pre-failover op",
+                "survivor {} lost the pre-failover operation",
                 node.id()
             );
             assert!(
                 node.applied.iter().any(|c| c.value == 200),
-                "survivor {} missing the post-failover op",
+                "survivor {} missing the post-failover operation",
                 node.id()
             );
         }

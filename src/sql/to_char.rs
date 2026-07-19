@@ -40,8 +40,8 @@ enum SignKind {
     S,
 }
 
-/// Formats `val` per `fmt`, returning an arena-allocated string.
-pub fn number<'a>(val: &Numeric, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+/// Formats `value` per `fmt`, returning an arena-allocated string.
+pub fn number<'a>(value: &Numeric, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
     let mut toks = [Tok::Nine; MAX_TOKS];
     let mut ntok = 0usize;
     let mut fm = false;
@@ -145,7 +145,7 @@ pub fn number<'a>(val: &Numeric, fmt: &str, arena: &'a Arena) -> Result<&'a str,
     }
 
     render(
-        val,
+        value,
         &toks[..ntok],
         fm,
         sign_kind,
@@ -159,7 +159,7 @@ pub fn number<'a>(val: &Numeric, fmt: &str, arena: &'a Arena) -> Result<&'a str,
 
 #[allow(clippy::too_many_arguments)]
 fn render<'a>(
-    val: &Numeric,
+    value: &Numeric,
     toks: &[Tok],
     fm: bool,
     sign_kind: SignKind,
@@ -170,7 +170,7 @@ fn render<'a>(
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     // Round to the number of fractional positions the format provides.
-    let rounded = val.round_scale(frac_digits, RoundMode::HalfAwayZero, arena)?;
+    let rounded = value.round_scale(frac_digits, RoundMode::HalfAwayZero, arena)?;
     let text = stack_format!(512, "{}", rounded);
     let s = text.as_str();
     let body = s.strip_prefix('-').unwrap_or(s);
@@ -494,9 +494,9 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
     let days = micros.div_euclid(86_400_000_000);
     let time_of_day = micros.rem_euclid(86_400_000_000);
     let adays = days + PG_EPOCH_DAYS;
-    let (y, mo, d) = civil_from_days(adays);
+    let (y, month, d) = civil_from_days(adays);
     let hh24 = (time_of_day / 3_600_000_000) as u32;
-    let mi = ((time_of_day / 60_000_000) % 60) as u32;
+    let minute = ((time_of_day / 60_000_000) % 60) as u32;
     let ss = ((time_of_day / 1_000_000) % 60) as u32;
     let us = (time_of_day % 1_000_000) as u32;
     let dow = day_of_week(days); // 0=Sun..6=Sat (PG-epoch day count)
@@ -551,10 +551,10 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
             num(&mut out, y, 4, fm);
             i += 4;
         } else if m(b"MONTH") {
-            name(&mut out, MONTH_FULL[(mo - 1) as usize], name_case(&rest[..5]), 9, fm);
+            name(&mut out, MONTH_FULL[(month - 1) as usize], name_case(&rest[..5]), 9, fm);
             i += 5;
         } else if m(b"MON") {
-            name(&mut out, MONTH_ABBR[(mo - 1) as usize], name_case(&rest[..3]), 3, fm);
+            name(&mut out, MONTH_ABBR[(month - 1) as usize], name_case(&rest[..3]), 3, fm);
             i += 3;
         } else if m(b"DAY") {
             name(&mut out, DAY_FULL[dow], name_case(&rest[..3]), 9, fm);
@@ -575,10 +575,10 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
             num(&mut out, y % 100, 2, fm);
             i += 2;
         } else if m(b"MI") {
-            num(&mut out, mi as i64, 2, fm);
+            num(&mut out, minute as i64, 2, fm);
             i += 2;
         } else if m(b"MM") {
-            num(&mut out, mo as i64, 2, fm);
+            num(&mut out, month as i64, 2, fm);
             i += 2;
         } else if m(b"MS") {
             num(&mut out, (us / 1000) as i64, 3, fm);
@@ -600,7 +600,7 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
             name(&mut out, mer, name_case(&rest[..2]), 0, true);
             i += 2;
         } else if m(b"Q") {
-            num(&mut out, ((mo - 1) / 3 + 1) as i64, 1, fm);
+            num(&mut out, ((month - 1) / 3 + 1) as i64, 1, fm);
             i += 1;
         } else if m(b"D") {
             num(&mut out, (dow + 1) as i64, 1, fm);

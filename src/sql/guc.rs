@@ -18,7 +18,7 @@ use super::eval::SqlError;
 /// it: a message is delivered to the client only when its own severity is at or
 /// above this level. Declaration order is the rank (low to high).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MsgLevel {
+pub enum MessageLevel {
     Debug5,
     Debug4,
     Debug3,
@@ -30,45 +30,45 @@ pub enum MsgLevel {
     Error,
 }
 
-impl MsgLevel {
+impl MessageLevel {
     /// Whether a message of severity `msg` is shown at this threshold.
-    pub fn allows(self, msg: MsgLevel) -> bool {
+    pub fn allows(self, msg: MessageLevel) -> bool {
         msg >= self
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            MsgLevel::Debug5 => "debug5",
-            MsgLevel::Debug4 => "debug4",
-            MsgLevel::Debug3 => "debug3",
-            MsgLevel::Debug2 => "debug2",
-            MsgLevel::Debug1 => "debug1",
-            MsgLevel::Log => "log",
-            MsgLevel::Notice => "notice",
-            MsgLevel::Warning => "warning",
-            MsgLevel::Error => "error",
+            MessageLevel::Debug5 => "debug5",
+            MessageLevel::Debug4 => "debug4",
+            MessageLevel::Debug3 => "debug3",
+            MessageLevel::Debug2 => "debug2",
+            MessageLevel::Debug1 => "debug1",
+            MessageLevel::Log => "log",
+            MessageLevel::Notice => "notice",
+            MessageLevel::Warning => "warning",
+            MessageLevel::Error => "error",
         }
     }
 
-    fn parse(s: &str) -> Option<MsgLevel> {
+    fn parse(s: &str) -> Option<MessageLevel> {
         // `debug` with no digit is an accepted alias for debug2 in PostgreSQL.
         for lvl in [
-            MsgLevel::Debug5,
-            MsgLevel::Debug4,
-            MsgLevel::Debug3,
-            MsgLevel::Debug2,
-            MsgLevel::Debug1,
-            MsgLevel::Log,
-            MsgLevel::Notice,
-            MsgLevel::Warning,
-            MsgLevel::Error,
+            MessageLevel::Debug5,
+            MessageLevel::Debug4,
+            MessageLevel::Debug3,
+            MessageLevel::Debug2,
+            MessageLevel::Debug1,
+            MessageLevel::Log,
+            MessageLevel::Notice,
+            MessageLevel::Warning,
+            MessageLevel::Error,
         ] {
             if s.eq_ignore_ascii_case(lvl.as_str()) {
                 return Some(lvl);
             }
         }
         if s.eq_ignore_ascii_case("debug") {
-            return Some(MsgLevel::Debug2);
+            return Some(MessageLevel::Debug2);
         }
         None
     }
@@ -78,21 +78,21 @@ impl MsgLevel {
 /// GUCs, handed to the wire layer so DateStyle, TimeZone, and
 /// client_min_messages affect output.
 #[derive(Debug, Clone, Copy)]
-pub struct RenderCtx {
+pub struct RenderContext {
     pub datestyle: DateStyle,
     /// The session time zone; resolves offset + abbreviation per timestamp so
     /// DST is honored.
-    pub tz: super::tz::Tz,
+    pub parsed_timezone: super::timezone::Timezone,
     /// The client_min_messages threshold: NOTICE/WARNING below it are dropped.
-    pub min_message_level: MsgLevel,
+    pub min_message_level: MessageLevel,
 }
 
-impl Default for RenderCtx {
+impl Default for RenderContext {
     fn default() -> Self {
-        RenderCtx {
+        RenderContext {
             datestyle: DateStyle::default(),
-            tz: super::tz::Tz::utc(),
-            min_message_level: MsgLevel::Notice,
+            parsed_timezone: super::timezone::Timezone::utc(),
+            min_message_level: MessageLevel::Notice,
         }
     }
 }
@@ -101,11 +101,11 @@ pub struct GucState {
     datestyle: StackStr<48>,
     timezone: StackStr<64>,
     /// Parsed current time zone, so rendering does not re-parse it.
-    tz: super::tz::Tz,
+    parsed_timezone: super::timezone::Timezone,
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
     search_path: StackStr<128>,
-    client_min_messages: MsgLevel,
+    client_min_messages: MessageLevel,
     extra_float_digits: StackStr<8>,
     lock_timeout: StackStr<24>,
     /// statement_timeout in milliseconds (0 = disabled), enforced at scan
@@ -125,11 +125,11 @@ impl GucState {
         let mut g = Self {
             datestyle: StackStr::new(),
             timezone: StackStr::new(),
-            tz: super::tz::Tz::utc(),
+            parsed_timezone: super::timezone::Timezone::utc(),
             client_encoding: StackStr::new(),
             application_name: StackStr::new(),
             search_path: StackStr::new(),
-            client_min_messages: MsgLevel::Notice,
+            client_min_messages: MessageLevel::Notice,
             extra_float_digits: StackStr::new(),
             lock_timeout: StackStr::new(),
             statement_timeout: StackStr::new(),
@@ -173,13 +173,13 @@ impl GucState {
         if name.eq_ignore_ascii_case("timezone") {
             // UTC, fixed numeric offsets, Etc/GMT±N, and named IANA zones (with
             // DST) are honored; an unknown zone is rejected loudly.
-            let tz = if is_default {
-                super::tz::Tz::utc()
+            let timezone = if is_default {
+                super::timezone::Timezone::utc()
             } else {
                 parse_timezone(v).ok_or_else(|| unsupported_value("TimeZone", v))?
             };
             store(&mut self.timezone, if is_default { "UTC" } else { v })?;
-            self.tz = tz;
+            self.parsed_timezone = timezone;
             return Ok(());
         }
         if name.eq_ignore_ascii_case("client_encoding") {
@@ -211,9 +211,9 @@ impl GucState {
             // Filters which NOTICE/WARNING messages reach the client. The
             // default is `notice`; an unrecognized level errors like PostgreSQL.
             self.client_min_messages = if is_default {
-                MsgLevel::Notice
+                MessageLevel::Notice
             } else {
-                MsgLevel::parse(v).ok_or_else(|| {
+                MessageLevel::parse(v).ok_or_else(|| {
                     sql_err!(
                         "22023",
                         "invalid value for parameter \"client_min_messages\": \"{}\"",
@@ -285,7 +285,7 @@ impl GucState {
         }
         if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
             // No idle-in-transaction reaper yet, so only the disabled value is
-            // honored; a non-zero value would be a silent no-op.
+            // honored; a non-zero value would be a silent no-operator.
             if is_default || v == "0" {
                 return Ok(());
             }
@@ -306,7 +306,7 @@ impl GucState {
             ));
         }
         if name.eq_ignore_ascii_case("row_security") {
-            // No row-level-security policies exist, so `on` and `off` select
+            // No row-level-security policies exist, so `on` and `offset` select
             // the same rows; the value is validated and retained for SHOW.
             let on = if is_default {
                 true
@@ -363,18 +363,18 @@ impl GucState {
     }
 
     /// Value-rendering settings for the wire layer (DateStyle + zone).
-    pub fn render(&self) -> RenderCtx {
+    pub fn render(&self) -> RenderContext {
         let (format, ord) = parse_full(self.datestyle.as_str());
         let order = if ord == Order3::Dmy { FieldOrder::Dmy } else { FieldOrder::Mdy };
-        RenderCtx {
+        RenderContext {
             datestyle: DateStyle { format, order },
-            tz: self.tz,
+            parsed_timezone: self.parsed_timezone,
             min_message_level: self.client_min_messages,
         }
     }
 }
 
-/// Parses a PostgreSQL boolean GUC value (on/off/true/false/1/0), allocation-free.
+/// Parses a PostgreSQL boolean GUC value (on/offset/true/false/1/0), allocation-free.
 fn parse_on_off(v: &str) -> Option<bool> {
     if ["on", "true", "yes", "1"].iter().any(|s| v.eq_ignore_ascii_case(s)) {
         Some(true)
@@ -512,15 +512,15 @@ fn is_utc(v: &str) -> bool {
 /// abbreviation), or None for a named/DST zone we do not model. Matches
 /// PostgreSQL's inverted sign conventions: `Etc/GMT+5` is UTC-5 and a bare
 /// `+05:30` is UTC-5:30.
-fn parse_timezone(v: &str) -> Option<super::tz::Tz> {
-    use super::tz::Tz;
+fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
+    use super::timezone::Timezone;
     let t = v.trim();
     if is_utc(t) || t.eq_ignore_ascii_case("z") || t.eq_ignore_ascii_case("zulu") {
-        return Some(Tz::utc());
+        return Some(Timezone::utc());
     }
     // A named IANA zone (with DST) from the embedded set.
-    if let Some(tz) = super::tz::lookup(t) {
-        return Some(tz);
+    if let Some(timezone) = super::timezone::lookup(t) {
+        return Some(timezone);
     }
     // Etc/GMT±N and GMT±N: the sign is inverted; the abbreviation PostgreSQL
     // shows is the resulting ISO offset (e.g. Etc/GMT+5 -> "-05").
@@ -533,14 +533,14 @@ fn parse_timezone(v: &str) -> Option<super::tz::Tz> {
     };
     if let Some(rest) = etc {
         if rest.is_empty() {
-            return Some(Tz::utc());
+            return Some(Timezone::utc());
         }
-        let off = -parse_hms(rest)?;
-        return Some(Tz::fixed(off, super::datetime::iso_offset_string(off).as_str()));
+        let offset = -parse_hms(rest)?;
+        return Some(Timezone::fixed(offset, super::datetime::iso_offset_string(offset).as_str()));
     }
     // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
     if t.starts_with('+') || t.starts_with('-') {
-        return Some(Tz::fixed(-parse_hms(t)?, ""));
+        return Some(Timezone::fixed(-parse_hms(t)?, ""));
     }
     None
 }

@@ -330,7 +330,7 @@ fn attach_constraints(
     let mut has_primary = def.columns().iter().any(|c| c.primary);
     for con in constraints {
         match con {
-            TableConstraint::PrimaryKey { name, cols } => {
+            TableConstraint::PrimaryKey { name, columns } => {
                 if has_primary {
                     return Err(sql_err!(
                         "42P16",
@@ -339,23 +339,23 @@ fn attach_constraints(
                     ));
                 }
                 has_primary = true;
-                let (idxs, n) = resolve_cols(def, cols)?;
-                for &ci in &idxs[..n] {
+                let (indices, n) = resolve_cols(def, columns)?;
+                for &ci in &indices[..n] {
                     def.columns[ci as usize].not_null = true;
                 }
                 if n == 1 {
-                    def.columns[idxs[0] as usize].primary = true;
-                    def.columns[idxs[0] as usize].unique = true;
+                    def.columns[indices[0] as usize].primary = true;
+                    def.columns[indices[0] as usize].unique = true;
                 } else {
-                    add_unique_key(def, *name, "pkey", &idxs, n, true)?;
+                    add_unique_key(def, *name, "pkey", &indices, n, true)?;
                 }
             }
-            TableConstraint::Unique { name, cols } => {
-                let (idxs, n) = resolve_cols(def, cols)?;
+            TableConstraint::Unique { name, columns } => {
+                let (indices, n) = resolve_cols(def, columns)?;
                 if n == 1 {
-                    def.columns[idxs[0] as usize].unique = true;
+                    def.columns[indices[0] as usize].unique = true;
                 } else {
-                    add_unique_key(def, *name, "key", &idxs, n, false)?;
+                    add_unique_key(def, *name, "key", &indices, n, false)?;
                 }
             }
             TableConstraint::Check { name, expression, text } => {
@@ -374,13 +374,13 @@ fn attach_constraints(
                         crate::storage::MAX_CHECKS
                     ));
                 }
-                let cname = match name {
+                let constraint_name = match name {
                     Some(n) => SqlName::parse(n)?,
                     None => SqlName::parse(
                         stack_format!(64, "{}_check", def.name.as_str()).as_str(),
                     )?,
                 };
-                let mut c = CheckConstraint { name: cname, expression: crate::util::StackStr::new() };
+                let mut c = CheckConstraint { name: constraint_name, expression: crate::util::StackStr::new() };
                 let _ = core::fmt::Write::write_str(&mut c.expression, text);
                 if c.expression.is_truncated() {
                     return Err(sql_err!(
@@ -393,14 +393,14 @@ fn attach_constraints(
             }
             TableConstraint::ForeignKey {
                 name,
-                cols,
+                columns,
                 parent,
                 parent_cols,
                 on_delete,
                 on_update,
             } => {
                 attach_fkey(
-                    storage, def, *name, cols, parent, parent_cols, *on_delete, *on_update, txid,
+                    storage, def, *name, columns, parent, parent_cols, *on_delete, *on_update, txid,
                     arena,
                 )?;
             }
@@ -413,7 +413,7 @@ fn attach_constraints(
 /// key, otherwise `<table>_<col1>_<col2>_<suffix>` over every key column.
 fn auto_key_name(
     def: &TableDef,
-    cols: &[u16],
+    columns: &[u16],
     suffix: &str,
     include_cols: bool,
 ) -> Result<SqlName, SqlError> {
@@ -421,7 +421,7 @@ fn auto_key_name(
     let mut nm = crate::util::StackStr::<64>::new();
     let _ = write!(nm, "{}", def.name.as_str());
     if include_cols {
-        for &c in cols {
+        for &c in columns {
             let _ = write!(nm, "_{}", def.columns()[c as usize].name.as_str());
         }
     }
@@ -439,7 +439,7 @@ fn add_unique_key(
     def: &mut TableDef,
     name: Option<&str>,
     suffix: &str,
-    idxs: &[u16; MAX_INDEX_COLS],
+    indices: &[u16; MAX_INDEX_COLS],
     n: usize,
     is_primary: bool,
 ) -> Result<(), SqlError> {
@@ -453,11 +453,11 @@ fn add_unique_key(
     let kname = match name {
         Some(nm) => SqlName::parse(nm)?,
         // A primary key is `<table>_pkey`; a unique key lists every column.
-        None => auto_key_name(def, &idxs[..n], suffix, !is_primary)?,
+        None => auto_key_name(def, &indices[..n], suffix, !is_primary)?,
     };
     let mut k = UniqueKey::EMPTY;
     k.name = kname;
-    k.cols[..n].copy_from_slice(&idxs[..n]);
+    k.columns[..n].copy_from_slice(&indices[..n]);
     k.n_cols = n;
     k.is_primary = is_primary;
     def.uniques[def.n_uniques] = k;
@@ -573,7 +573,7 @@ fn attach_fkey(
     };
     let mut fk = ForeignKey::EMPTY;
     fk.name = fname;
-    fk.cols[..n_child].copy_from_slice(&child_idxs[..n_child]);
+    fk.columns[..n_child].copy_from_slice(&child_idxs[..n_child]);
     fk.n_cols = n_child;
     fk.parent = SqlName::parse(parent)?;
     fk.parent_cols[..n_parent].copy_from_slice(&parent_idxs[..n_parent]);
@@ -592,7 +592,7 @@ fn primary_key_cols(def: &TableDef) -> ([u16; MAX_INDEX_COLS], usize) {
     for uk in def.uniques() {
         if uk.is_primary {
             let n = uk.n_cols.min(MAX_INDEX_COLS);
-            out[..n].copy_from_slice(&uk.cols()[..n]);
+            out[..n].copy_from_slice(&uk.columns()[..n]);
             return (out, n);
         }
     }
@@ -606,19 +606,19 @@ fn primary_key_cols(def: &TableDef) -> ([u16; MAX_INDEX_COLS], usize) {
     (out, n)
 }
 
-/// Whether `cols` (as a set) exactly matches some unique key of the table: a
+/// Whether `columns` (as a set) exactly matches some unique key of the table: a
 /// single UNIQUE/PRIMARY column flag, or a multi-column key constraint.
-fn is_unique_key(def: &TableDef, cols: &[u16]) -> bool {
-    if cols.len() == 1 {
-        let c = &def.columns()[cols[0] as usize];
+fn is_unique_key(def: &TableDef, columns: &[u16]) -> bool {
+    if columns.len() == 1 {
+        let c = &def.columns()[columns[0] as usize];
         if c.unique || c.primary {
             return true;
         }
     }
     def.uniques().iter().any(|uk| {
-        uk.n_cols == cols.len() && {
-            let a = uk.cols();
-            cols.iter().all(|c| a.contains(c)) && a.iter().all(|c| cols.contains(c))
+        uk.n_cols == columns.len() && {
+            let a = uk.columns();
+            columns.iter().all(|c| a.contains(c)) && a.iter().all(|c| columns.contains(c))
         }
     })
 }
@@ -691,7 +691,7 @@ fn find_conflict(
             }
         }
         for index in storage.unique_indexes_for(table_name) {
-            let icols = &index.cols[..index.n_cols];
+            let icols = &index.columns[..index.n_cols];
             if !icols.iter().any(|&c| values[c as usize].is_null())
                 && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
             {
@@ -932,7 +932,7 @@ pub fn check_unique_indexes(
 ) -> Result<(), SqlError> {
     let table_name = def.name.as_str();
     for index in storage.unique_indexes_for(table_name) {
-        let icols = &index.cols[..index.n_cols];
+        let icols = &index.columns[..index.n_cols];
         tuple_uniqueness(
             storage, table_index, schema, icols, values, self_rowid, txid, index.name.as_str(),
         )?;
@@ -954,14 +954,14 @@ fn check_unique_keys(
 ) -> Result<(), SqlError> {
     for uk in def.uniques() {
         tuple_uniqueness(
-            storage, table_index, schema, uk.cols(), values, self_rowid, txid, uk.name.as_str(),
+            storage, table_index, schema, uk.columns(), values, self_rowid, txid, uk.name.as_str(),
         )?;
     }
     Ok(())
 }
 
 /// A candidate row conflicts if some other visible row has an equal,
-/// all-non-NULL tuple over `cols` (23505; 40001 if the conflicting row is
+/// all-non-NULL tuple over `columns` (23505; 40001 if the conflicting row is
 /// another transaction's uncommitted write). A NULL in any key column of the
 /// candidate makes it distinct, never a conflict.
 #[allow(clippy::too_many_arguments)]
@@ -969,13 +969,13 @@ fn tuple_uniqueness(
     storage: &Storage,
     table_index: usize,
     schema: &[ColType],
-    cols: &[u16],
+    columns: &[u16],
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
     constraint_name: &str,
 ) -> Result<(), SqlError> {
-    if cols.iter().any(|&c| values[c as usize].is_null()) {
+    if columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
     }
     let table = storage.table(table_index);
@@ -990,7 +990,7 @@ fn tuple_uniqueness(
             let Some(loc) = loc else { continue };
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(storage.heap.get(loc), schema, &mut other)?;
-            let all_eq = cols.iter().all(|&c| {
+            let all_eq = columns.iter().all(|&c| {
                 let ci = c as usize;
                 !other[ci].is_null()
                     && compare_datums(&values[ci], &other[ci])
@@ -1084,7 +1084,7 @@ fn check_fk_child(
     txid: u32,
 ) -> Result<(), SqlError> {
     for fk in def.fkeys() {
-        if fk.cols().iter().any(|&c| values[c as usize].is_null()) {
+        if fk.columns().iter().any(|&c| values[c as usize].is_null()) {
             continue;
         }
         let Some(pi) = storage.find_visible(fk.parent.as_str(), txid) else {
@@ -1103,7 +1103,7 @@ fn check_fk_child(
             pi,
             &pschema[..pdef.n_columns],
             fk.parent_cols(),
-            fk.cols(),
+            fk.columns(),
             values,
             txid,
         )? {
@@ -1174,10 +1174,10 @@ fn check_fk_parent_referenced(
                 let Some(loc) = state.visible_to(txid) else { continue };
                 let mut crow = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(storage.heap.get(loc), &cschema[..cdef.n_columns], &mut crow)?;
-                if fk.cols().iter().any(|&c| crow[c as usize].is_null()) {
+                if fk.columns().iter().any(|&c| crow[c as usize].is_null()) {
                     continue;
                 }
-                let refers = fk.cols().iter().zip(fk.parent_cols()).all(|(&cc, &pc)| {
+                let refers = fk.columns().iter().zip(fk.parent_cols()).all(|(&cc, &pc)| {
                     let cv = &crow[cc as usize];
                     let pv = &old_values[pc as usize];
                     !pv.is_null() && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
@@ -1394,7 +1394,7 @@ pub fn create_index(
     txn: &mut super::txn::TxnState,
     name: &str,
     table: &str,
-    columns: &[&str],
+    column_names: &[&str],
     unique: bool,
     resp: &mut Responder,
 ) -> Outcome {
@@ -1403,34 +1403,34 @@ pub fn create_index(
         return sql_fail(undefined_table(table));
     };
     let tdef = storage.table(ti).def;
-    if columns.is_empty() || columns.len() > MAX_INDEX_COLS {
+    if column_names.is_empty() || column_names.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "an index must have 1..={} columns",
             MAX_INDEX_COLS
         ));
     }
-    let mut cols = [0u16; MAX_INDEX_COLS];
-    for (i, cn) in columns.iter().enumerate() {
-        let Some(ci) = tdef.column_index(cn) else {
+    let mut columns = [0u16; MAX_INDEX_COLS];
+    for (i, column_name) in column_names.iter().enumerate() {
+        let Some(ci) = tdef.column_index(column_name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
-                cn
+                column_name
             ));
         };
-        cols[i] = ci as u16;
+        columns[i] = ci as u16;
     }
     let n_cols = columns.len();
     let sqlname = match SqlName::parse(name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let tname = match SqlName::parse(table) {
+    let table_name = match SqlName::parse(table) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let def = IndexDef { name: sqlname, table: tname, cols, n_cols, unique, live: true };
+    let def = IndexDef { name: sqlname, table: table_name, columns, n_cols, unique, live: true };
     // Register first so the UNIQUE validation below sees this index; on any
     // failure the registration is rolled back.
     let slot = match storage.create_index(def) {
@@ -1472,7 +1472,7 @@ pub fn create_index(
         }
     }
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::CreateIndex { name, table, cols, n_cols, unique }) {
+    if let Err(e) = wal.append(lsn, &WalOp::CreateIndex { name, table, columns, n_cols, unique }) {
         storage.drop_index_slot(slot);
         return sql_fail(e);
     }
@@ -1555,9 +1555,9 @@ pub fn insert(
 
     // RETURNING sends its RowDescription before any rows.
     if !statement.returning.is_empty() {
-        let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(statement.returning, Some(&def), &mut cols) {
-            Ok(n) => resp.row_description(&cols[..n])?,
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        match describe_items(statement.returning, Some(&def), &mut columns) {
+            Ok(n) => resp.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
@@ -1827,9 +1827,9 @@ pub fn update(
     }
 
     if !statement.returning.is_empty() {
-        let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(statement.returning, Some(&def), &mut cols) {
-            Ok(n) => resp.row_description(&cols[..n])?,
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        match describe_items(statement.returning, Some(&def), &mut columns) {
+            Ok(n) => resp.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
@@ -2002,9 +2002,9 @@ pub fn delete(
         return sql_fail(e);
     }
     if !statement.returning.is_empty() {
-        let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(statement.returning, Some(&def), &mut cols) {
-            Ok(n) => resp.row_description(&cols[..n])?,
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        match describe_items(statement.returning, Some(&def), &mut columns) {
+            Ok(n) => resp.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
@@ -2402,12 +2402,12 @@ pub(crate) fn unify_numeric_tower(a: ColType, b: ColType) -> ColType {
 /// PostgreSQL's error when an aggregate has no signature for the argument
 /// type (e.g. sum(text), max(boolean)).
 fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
-    let tname = coltype_of_oid(arg_oid).map(|t| t.name()).unwrap_or("unknown");
+    let table_name = coltype_of_oid(arg_oid).map(|t| t.name()).unwrap_or("unknown");
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "function {}({}) does not exist",
         name,
-        tname
+        table_name
     )
 }
 
@@ -2484,12 +2484,12 @@ fn comparable(a: ColType, b: ColType) -> bool {
     (numeric(a) && numeric(b)) || (datetime(a) && datetime(b))
 }
 
-fn operator_undefined(l: ColType, op: &str, r: ColType) -> SqlError {
+fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "operator does not exist: {} {} {}",
         l.name(),
-        op,
+        operator,
         r.name()
     )
 }
@@ -2505,7 +2505,7 @@ pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32,
 /// PostgreSQL's plan-time analysis: comparisons and arithmetic over
 /// incompatible types raise 42883 here, before any row is scanned. String
 /// literals and parameters are UNKNOWN and coerce to the other operand.
-pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i16), SqlError> {
+pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
     Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
@@ -2515,22 +2515,22 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
         }
         Expr::Float(_) => of(ColType::Float8),
         Expr::NumericLit(_) => of(ColType::Numeric),
-        Expr::Column { qualifier, name } => of(cols.resolve(*qualifier, name)?),
-        Expr::Unary { op, operand } => match op {
+        Expr::Column { qualifier, name } => of(columns.resolve(*qualifier, name)?),
+        Expr::Unary { operator, operand } => match operator {
             super::ast::UnaryOp::Not => of(ColType::Bool),
-            super::ast::UnaryOp::Neg | super::ast::UnaryOp::BitNot => infer_type_res(operand, cols)?,
+            super::ast::UnaryOp::Neg | super::ast::UnaryOp::BitNot => infer_type_res(operand, columns)?,
         },
-        Expr::Binary { op, left, right } => {
+        Expr::Binary { operator, left, right } => {
             use super::ast::BinaryOp::*;
-            let lo = infer_type_res(left, cols)?.0;
-            let ro = infer_type_res(right, cols)?.0;
-            match op {
+            let lo = infer_type_res(left, columns)?.0;
+            let ro = infer_type_res(right, columns)?.0;
+            match operator {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
                     // Unknown coerces; two concrete types must be comparable.
                     if lo != oid::UNKNOWN && ro != oid::UNKNOWN
                         && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
                             && !comparable(a, b) {
-                                let sym = match op {
+                                let sym = match operator {
                                     Eq => "=", NotEq => "<>", Lt => "<",
                                     LtEq => "<=", Gt => ">", _ => ">=",
                                 };
@@ -2589,40 +2589,40 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
                     let int_like = |o: i32| matches!(o, oid::INT4 | oid::INT8 | oid::UNKNOWN);
                     // Date arithmetic: date - date -> int4; date +/- int -> date;
                     // int + date -> date.
-                    if lo == oid::DATE && ro == oid::DATE && matches!(op, Sub) {
+                    if lo == oid::DATE && ro == oid::DATE && matches!(operator, Sub) {
                         return Ok(of(ColType::Int4));
                     }
                     // timestamp - timestamp -> interval.
-                    if matches!(op, Sub)
+                    if matches!(operator, Sub)
                         && (lo == oid::TIMESTAMP && ro == oid::TIMESTAMP
                             || lo == oid::TIMESTAMPTZ && ro == oid::TIMESTAMPTZ)
                     {
                         return Ok(of(ColType::Interval));
                     }
-                    if lo == oid::DATE && matches!(op, Add | Sub) && int_like(ro) {
+                    if lo == oid::DATE && matches!(operator, Add | Sub) && int_like(ro) {
                         return Ok(of(ColType::Date));
                     }
-                    if ro == oid::DATE && matches!(op, Add) && int_like(lo) {
+                    if ro == oid::DATE && matches!(operator, Add) && int_like(lo) {
                         return Ok(of(ColType::Date));
                     }
                     // Interval arithmetic: date/timestamp ± interval -> the
                     // timestamp type; interval ± interval -> interval.
                     let is_dt = |o: i32| matches!(o, oid::DATE | oid::TIMESTAMP | oid::TIMESTAMPTZ);
-                    if matches!(op, Add | Sub) {
+                    if matches!(operator, Add | Sub) {
                         if lo == oid::INTERVAL && ro == oid::INTERVAL {
                             return Ok(of(ColType::Interval));
                         }
                         if is_dt(lo) && ro == oid::INTERVAL {
                             return Ok(of(if lo == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
                         }
-                        if matches!(op, Add) && lo == oid::INTERVAL && is_dt(ro) {
+                        if matches!(operator, Add) && lo == oid::INTERVAL && is_dt(ro) {
                             return Ok(of(if ro == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
                         }
                     }
                     // interval * number / number * interval / interval / number.
-                    if (matches!(op, Mul) && lo == oid::INTERVAL && numeric(ro))
-                        || (matches!(op, Mul) && numeric(lo) && ro == oid::INTERVAL)
-                        || (matches!(op, Div) && lo == oid::INTERVAL && numeric(ro))
+                    if (matches!(operator, Mul) && lo == oid::INTERVAL && numeric(ro))
+                        || (matches!(operator, Mul) && numeric(lo) && ro == oid::INTERVAL)
+                        || (matches!(operator, Div) && lo == oid::INTERVAL && numeric(ro))
                     {
                         return Ok(of(ColType::Interval));
                     }
@@ -2630,7 +2630,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
                     let r_ok = ro == oid::UNKNOWN || numeric(ro);
                     if (!l_ok || !r_ok)
                         && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro)) {
-                            let sym = match op {
+                            let sym = match operator {
                                 Add => "+", Sub => "-", Mul => "*", Div => "/", _ => "%",
                             };
                             return Err(operator_undefined(a, sym, b));
@@ -2660,7 +2660,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
             // OID (so `attrelid = 'tbl'::regclass` compares OIDs, as pgx and
             // most tools introspect), while `oid::regclass` renders as the name.
             if type_name.eq_ignore_ascii_case("regclass") {
-                let src = infer_type_res(operand, cols)?.0;
+                let src = infer_type_res(operand, columns)?.0;
                 return Ok(if src == oid::TEXT || src == oid::UNKNOWN {
                     of(ColType::Int4)
                 } else {
@@ -2677,7 +2677,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
         Expr::Case { whens, otherwise, .. } => {
             let mut acc: Option<ColType> = None;
             let mut consider = |e: &Expr| -> Result<(), SqlError> {
-                let (o, _) = infer_type_res(e, cols)?;
+                let (o, _) = infer_type_res(e, columns)?;
                 if let Some(t) = coltype_of_oid(o) {
                     acc = Some(match acc {
                         None => t,
@@ -2707,16 +2707,16 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
         Expr::InSubquery { .. } | Expr::Exists(_) => of(ColType::Bool),
         Expr::AnyAll { .. } => of(ColType::Bool),
         Expr::Array(items) => {
-            let elem = items
+            let element = items
                 .first()
-                .and_then(|e| infer_type_res(e, cols).ok())
+                .and_then(|e| infer_type_res(e, columns).ok())
                 .and_then(|(o, _)| coltype_of_oid(o))
                 .and_then(super::types::ArrElem::from_coltype)
                 .unwrap_or(super::types::ArrElem::Int4);
-            of(ColType::Array(elem))
+            of(ColType::Array(element))
         }
         Expr::Subscript { base, .. } => {
-            match coltype_of_oid(infer_type_res(base, cols)?.0) {
+            match coltype_of_oid(infer_type_res(base, columns)?.0) {
                 Some(ColType::Array(e)) => of(e.to_coltype()),
                 _ => (oid::UNKNOWN, -2),
             }
@@ -2737,18 +2737,18 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
             }
             "array_length" | "cardinality" | "array_upper" | "array_lower" => of(ColType::Int4),
             "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
-                args.first().map(|a| infer_type_res(a, cols)).transpose()?.unwrap_or((oid::INT4, 4))
+                args.first().map(|a| infer_type_res(a, columns)).transpose()?.unwrap_or((oid::INT4, 4))
             }
             // Window-only functions.
             "row_number" | "rank" | "dense_rank" | "ntile" => of(ColType::Int8),
             "lag" | "lead" | "first_value" | "last_value" | "nth_value" => args
                 .first()
-                .map(|a| infer_type_res(a, cols))
+                .map(|a| infer_type_res(a, columns))
                 .transpose()?
                 .unwrap_or_else(|| of(ColType::Int8)),
             "count" => of(ColType::Int8),
             "sum" | "avg" => {
-                let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                 match a {
                     Some(oid::INT4) if *name == "sum" => of(ColType::Int8),
                     Some(oid::INT4) | Some(oid::INT8) | Some(oid::NUMERIC) => of(ColType::Numeric),
@@ -2758,7 +2758,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
                 }
             }
             "min" | "max" => {
-                let t = args.first().map(|a| infer_type_res(a, cols)).transpose()?;
+                let t = args.first().map(|a| infer_type_res(a, columns)).transpose()?;
                 if let Some((o, _)) = t
                     && (o == oid::BOOL || o == oid::UUID) {
                         return Err(agg_undefined(name, o));
@@ -2785,7 +2785,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
                 };
                 let mut best: Option<(i32, i16)> = None;
                 for a in args.iter() {
-                    let t = infer_type_res(a, cols)?;
+                    let t = infer_type_res(a, columns)?;
                     best = Some(match best {
                         None => t,
                         Some(p) => {
@@ -2802,7 +2802,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
             // Functions that return the type of their first argument.
             "coalesce" | "abs" | "nullif" => {
                 if let Some(first) = args.first() {
-                    infer_type_res(first, cols)?
+                    infer_type_res(first, columns)?
                 } else {
                     of(ColType::Int8)
                 }
@@ -2817,7 +2817,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
                 let mut numeric = false;
                 let mut float = false;
                 for a in args.iter() {
-                    match infer_type_res(a, cols)?.0 {
+                    match infer_type_res(a, columns)?.0 {
                         oid::NUMERIC => numeric = true,
                         oid::FLOAT8 | oid::FLOAT4 => float = true,
                         _ => {}
@@ -2832,20 +2832,20 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
             "string_to_array" => of(ColType::Array(super::types::ArrElem::Text)),
             "format" | "overlay" | "regexp_replace" => of(ColType::Text),
             "floor" | "ceil" | "ceiling" | "sign" => {
-                let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                 if a == Some(oid::NUMERIC) { of(ColType::Numeric) } else { of(ColType::Float8) }
             }
             "round" | "trunc" => {
                 if args.len() == 2 {
                     of(ColType::Numeric)
                 } else {
-                    let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                    let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                     if a == Some(oid::NUMERIC) { of(ColType::Numeric) } else { of(ColType::Float8) }
                 }
             }
             "mod" | "gcd" | "lcm" => {
-                let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
-                let b = args.get(1).map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let b = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                 // `mod` keeps a numeric operand's type; gcd/lcm are integer-only.
                 if *name == "mod" && (a == Some(oid::NUMERIC) || b == Some(oid::NUMERIC)) {
                     of(ColType::Numeric)
@@ -2872,14 +2872,14 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
             "to_date" => of(ColType::Date),
             "to_timestamp" => of(ColType::Timestamptz),
             "generate_series" => {
-                let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                 if a == Some(oid::INT8) { of(ColType::Int8) } else { of(ColType::Int4) }
             }
             "unnest" => {
                 // The element type of the array argument.
-                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {
                     Some(o) => match coltype_of_oid(o) {
-                        Some(ColType::Array(elem)) => of(elem.to_coltype()),
+                        Some(ColType::Array(element)) => of(element.to_coltype()),
                         _ => of(ColType::Text),
                     },
                     None => of(ColType::Text),
@@ -2897,14 +2897,14 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
             "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => of(ColType::Bool),
             "range_merge" => {
                 // Same range type as its arguments.
-                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {
                     Some(o) if is_range_oid(o) => (o, -1),
                     _ => (oid::TEXT, -1),
                 }
             }
             "lower" | "upper" => {
                 // A range argument yields its element type; otherwise text.
-                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {
                     Some(o) => match coltype_of_oid(o) {
                         Some(ColType::Range(kind)) => of(kind.elem_type()),
                         _ => (oid::TEXT, -1),
@@ -2919,7 +2919,7 @@ pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(
             | "clock_timestamp" => of(ColType::Timestamptz),
             "date_trunc" => {
                 // Returns the timestamp type of its second argument.
-                let a = args.get(1).map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                let a = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                 if a == Some(oid::TIMESTAMPTZ) {
                     of(ColType::Timestamptz)
                 } else {
@@ -3110,9 +3110,9 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
                 out[at + 6..at + 6 + text.len()].copy_from_slice(text.as_bytes());
                 at += 6 + text.len();
             }
-            Datum::Array { elem, raw } => {
+            Datum::Array { element, raw } => {
                 out[at] = 15;
-                out[at + 1] = elem.code();
+                out[at + 1] = element.code();
                 out[at + 2..at + 6].copy_from_slice(&(raw.len() as u32).to_le_bytes());
                 out[at + 6..at + 6 + raw.len()].copy_from_slice(raw);
                 at += 6 + raw.len();
@@ -3219,9 +3219,9 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
                 (Datum::Json { text: s, jsonb }, 5 + len)
             }
             15 => {
-                let elem = crate::sql::types::ArrElem::from_code(bytes[at]).unwrap_or(crate::sql::types::ArrElem::Int4);
+                let element = crate::sql::types::ArrElem::from_code(bytes[at]).unwrap_or(crate::sql::types::ArrElem::Int4);
                 let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-                (Datum::Array { elem, raw: &bytes[at + 5..at + 5 + len] }, 5 + len)
+                (Datum::Array { element, raw: &bytes[at + 5..at + 5 + len] }, 5 + len)
             }
             16 => {
                 let kind = crate::sql::types::RangeKind::from_code(bytes[at]);

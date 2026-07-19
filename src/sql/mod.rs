@@ -20,7 +20,7 @@ pub mod txn;
 pub mod types;
 pub mod range;
 pub mod to_char;
-pub mod tz;
+pub mod timezone;
 
 use crate::checkpoint::{Checkpointer, CheckpointSetupError};
 use crate::config::Config;
@@ -89,7 +89,7 @@ pub struct Engine {
     ckpt: Option<Checkpointer>,
     wal_upload: bool,
     /// When set, a commit blocks until its WAL batch is uploaded (RPO=0 to
-    /// S3). Otherwise the upload is drained off the commit path.
+    /// S3). Otherwise the upload is drained offset the commit path.
     wal_upload_sync: bool,
     /// Backpressure threshold: once this many bytes of committed WAL await
     /// asynchronous upload, the next commit drains synchronously.
@@ -140,7 +140,7 @@ impl Engine {
             None => 0,
         };
         let mut wal = Wal::open(config, budget)?;
-        wal.replay(floor, |lsn, op| apply_wal_op(&mut storage, lsn, op))?;
+        wal.replay(floor, |lsn, operator| apply_wal_op(&mut storage, lsn, operator))?;
         // RPO=0: replay any WAL segments in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
         if let Some(c) = ckpt.as_mut() {
@@ -148,7 +148,7 @@ impl Engine {
             let applied_to = c
                 .replay_wal_segments(seg_floor, |lsn, record| {
                     match crate::wal::decode_record(record) {
-                        Some(op) => apply_wal_op(&mut storage, lsn, op),
+                        Some(operator) => apply_wal_op(&mut storage, lsn, operator),
                         None => Err(SqlError {
                             sqlstate: "XX000",
                             message: stack_format!(192, "corrupt uploaded WAL record"),
@@ -383,11 +383,11 @@ impl Engine {
         self.wal_upload && !self.wal_upload_sync && self.wal.pending_batch_bytes() > 0
     }
 
-    /// Uploads the committed WAL batch awaiting asynchronous upload, off the
+    /// Uploads the committed WAL batch awaiting asynchronous upload, offset the
     /// commit path. Returns whether the drain succeeded (or had nothing to do);
     /// a failure is logged, not propagated — the data is already durable on
     /// local disk, so a bucket hiccup must not disturb request processing. The
-    /// caller backs off before retrying so a persistently-down bucket does not
+    /// caller backs offset before retrying so a persistently-down bucket does not
     /// spin the event loop.
     pub fn drain_wal_upload(&mut self) -> bool {
         if !self.has_pending_wal_upload() {
@@ -615,7 +615,7 @@ impl Engine {
                 let slot = self.storage.find_visible(ins.table, txid);
                 let def = slot.map(|s| &self.storage.table(s).def);
                 for row in ins.rows {
-                    for (i, val) in row.iter().enumerate() {
+                    for (i, value) in row.iter().enumerate() {
                         let ty = def.and_then(|d| {
                             let ci = if ins.columns.is_empty() {
                                 (i < d.n_columns).then_some(i)
@@ -625,15 +625,15 @@ impl Engine {
                             ci.map(|ci| d.columns()[ci].ctype.oid())
                         });
                         if let Some(ty) = ty {
-                            set(oids, val, ty);
+                            set(oids, value, ty);
                         }
                     }
                 }
             }
             Stmt::Update(u) => {
-                for (col, val) in u.assignments {
+                for (col, value) in u.assignments {
                     if let Some(ty) = self.column_oid(u.table, col, txid) {
-                        set(oids, val, ty);
+                        set(oids, value, ty);
                     }
                 }
                 if let Some(w) = u.where_clause {
@@ -667,8 +667,8 @@ impl Engine {
         oids: &mut [i32; MAX_BIND_PARAMS],
     ) {
         use ast::BinaryOp::*;
-        if let Expr::Binary { op, left, right } = expression {
-            match op {
+        if let Expr::Binary { operator, left, right } = expression {
+            match operator {
                 And | Or => {
                     self.infer_where_params(table, left, txid, oids);
                     self.infer_where_params(table, right, txid, oids);
@@ -728,22 +728,22 @@ impl Engine {
                         return Ok(false);
                     }
                 };
-                let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
+                let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
                 let described = match &s.from {
                     Some(from) => {
                         match query::QueryScope::resolve_schema(&self.storage, from, txn.txid, arena) {
-                            Ok(scope) => query::describe_scope_items(s.items, &scope, &mut cols),
+                            Ok(scope) => query::describe_scope_items(s.items, &scope, &mut columns),
                             Err(e) => {
                                 resp.error(e.sqlstate, e.message.as_str())?;
                                 return Ok(false);
                             }
                         }
                     }
-                    None => exec::describe_items(s.items, None, &mut cols),
+                    None => exec::describe_items(s.items, None, &mut columns),
                 };
                 match described {
                     Ok(n) => {
-                        resp.row_description(&cols[..n])?;
+                        resp.row_description(&columns[..n])?;
                         Ok(true)
                     }
                     Err(e) => {
@@ -1302,8 +1302,8 @@ fn report_parse_error(resp: &mut Responder, e: &ParseError) -> Result<(), WireFu
 }
 
 /// Reapplies one journal record to storage during recovery.
-fn apply_wal_op(storage: &mut Storage, lsn: u64, op: WalOp) -> Result<(), SqlError> {
-    match op {
+fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
+    match operator {
         WalOp::CreateTable(def) => {
             storage.create_table(def)?;
         }
@@ -1354,11 +1354,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, op: WalOp) -> Result<(), SqlErr
         WalOp::DropView(name) => {
             storage.drop_view(name);
         }
-        WalOp::CreateIndex { name, table, cols, n_cols, unique } => {
+        WalOp::CreateIndex { name, table, columns, n_cols, unique } => {
             storage.create_index(crate::storage::IndexDef {
                 name: crate::storage::SqlName::parse(name)?,
                 table: crate::storage::SqlName::parse(table)?,
-                cols,
+                columns,
                 n_cols,
                 unique,
                 live: true,
@@ -3301,7 +3301,7 @@ mod tests {
 
     #[test]
     fn grouped_row_sources() {
-        // GROUP BY / aggregates as a row source: derived tables, CTEs, set-op
+        // GROUP BY / aggregates as a row source: derived tables, CTEs, set-operator
         // branches, and INSERT ... SELECT. Values validated against PG 18.4.
         let (mut e, mut b) = test_engine();
         run_with(&mut e, &mut b, "CREATE TABLE t (g int, v int)");

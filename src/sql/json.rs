@@ -208,8 +208,8 @@ impl<'a> P<'a> {
                 return Err(bad());
             }
             self.at += 1;
-            let val = self.value(depth + 1)?;
-            members[n] = (key, val);
+            let value = self.value(depth + 1)?;
+            members[n] = (key, value);
             n += 1;
             self.ws();
             match self.b.get(self.at) {

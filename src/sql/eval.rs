@@ -192,7 +192,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
         // so the sibling's constant errors are never surfaced.
-        Expr::Binary { op: BinaryOp::And, left, right } => {
+        Expr::Binary { operator: BinaryOp::And, left, right } => {
             if fold_check(left, arena)? == Some(false) {
                 return Ok(Some(false));
             }
@@ -201,7 +201,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
-        Expr::Binary { op: BinaryOp::Or, left, right } => {
+        Expr::Binary { operator: BinaryOp::Or, left, right } => {
             if fold_check(left, arena)? == Some(true) {
                 return Ok(Some(true));
             }
@@ -338,11 +338,11 @@ pub fn eval_full<'a>(
                 "there is no parameter ${}",
                 n
             )),
-        Expr::Unary { op, operand } => {
+        Expr::Unary { operator, operand } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
-            unary(op, v)
+            unary(operator, v)
         }
-        Expr::Binary { op: BinaryOp::And, left, right } => {
+        Expr::Binary { operator: BinaryOp::And, left, right } => {
             // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
             // scan qual in a cost order that is not fixed, so a FALSE operand
             // determines the result even when the *other* operand would error at
@@ -352,18 +352,18 @@ pub fn eval_full<'a>(
             // we get here, so anything that reaches this point is per-row.
             eval_logic_short_circuit(BinaryOp::And, left, right, arena, params, row, hooks)
         }
-        Expr::Binary { op: BinaryOp::Or, left, right } => {
+        Expr::Binary { operator: BinaryOp::Or, left, right } => {
             // Dual of AND: a definite TRUE on either side yields TRUE and
             // absorbs the sibling's runtime error (PostgreSQL's `x OR TRUE`).
             eval_logic_short_circuit(BinaryOp::Or, left, right, arena, params, row, hooks)
         }
-        Expr::Binary { op, left, right } => {
+        Expr::Binary { operator, left, right } => {
             let l = eval_full(left, arena, params, row, hooks)?;
             let r = eval_full(right, arena, params, row, hooks)?;
             // `array || NULL` resolution depends on the NULL operand's static
             // type, which the datum has lost — resolve it here where the
             // expression is still available.
-            if op == BinaryOp::Concat
+            if operator == BinaryOp::Concat
                 && let Some(d) = array_null_concat(l, r, left, right, row, arena)?
             {
                 return Ok(d);
@@ -371,7 +371,7 @@ pub fn eval_full<'a>(
             // Track which side is an "unknown" literal (a string literal or a
             // parameter): only those coerce to the other operand's type, as
             // PostgreSQL does. A real text value never coerces to a number.
-            binary(op, l, r, is_unknown_literal(left), is_unknown_literal(right), arena)
+            binary(operator, l, r, is_unknown_literal(left), is_unknown_literal(right), arena)
         }
         Expr::Cast { operand, type_name, type_mod } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
@@ -519,7 +519,7 @@ pub fn eval_full<'a>(
         }
         Expr::Case { operand, whens, otherwise } => {
             let scrutinee = match operand {
-                Some(op) => Some(eval_full(op, arena, params, row, hooks)?),
+                Some(operator) => Some(eval_full(operator, arena, params, row, hooks)?),
                 None => None,
             };
             // PostgreSQL unifies all branch result types to one common type;
@@ -644,23 +644,23 @@ pub fn eval_full<'a>(
             if items.len() > vals.len() {
                 return Err(sql_err!("54000", "array constructor too large"));
             }
-            let mut elem: Option<super::types::ArrElem> = None;
+            let mut element: Option<super::types::ArrElem> = None;
             for (i, e) in items.iter().enumerate() {
                 let v = eval_full(e, arena, params, row, hooks)?;
                 if let Some(el) = super::types::ArrElem::from_datum(&v) {
-                    elem = Some(elem.map_or(el, |acc| unify_arr_elem(acc, el)));
+                    element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
                 }
                 vals[i] = v;
             }
-            let elem = elem.unwrap_or(super::types::ArrElem::Int4);
+            let element = element.unwrap_or(super::types::ArrElem::Int4);
             // Coerce each element to the unified type.
-            let ct = elem.to_coltype();
+            let ct = element.to_coltype();
             for v in vals.iter_mut().take(items.len()) {
                 if !v.is_null() {
                     *v = cast_to(*v, ct, arena)?;
                 }
             }
-            Ok(Datum::Array { elem, raw: super::array::build(&vals[..items.len()], arena)? })
+            Ok(Datum::Array { element, raw: super::array::build(&vals[..items.len()], arena)? })
         }
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
@@ -672,12 +672,12 @@ pub fn eval_full<'a>(
                 _ => return Err(type_mismatch("array subscript must be integer", &i)),
             };
             match b {
-                Datum::Array { elem, raw } => {
+                Datum::Array { element, raw } => {
                     // PostgreSQL array subscripts are 1-based.
                     if index < 1 {
                         return Ok(Datum::Null);
                     }
-                    Ok(super::array::get(raw, elem, (index - 1) as usize).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, element, (index - 1) as usize).unwrap_or(Datum::Null))
                 }
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
@@ -690,7 +690,7 @@ pub fn eval_full<'a>(
             let b = eval_full(base, arena, params, row, hooks)?;
             match b {
                 Datum::Null => Ok(Datum::Null),
-                Datum::Array { elem, raw } => {
+                Datum::Array { element, raw } => {
                     let index = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
                     {
                         0
@@ -703,24 +703,24 @@ pub fn eval_full<'a>(
                             field
                         ));
                     };
-                    Ok(super::array::get(raw, elem, index).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, element, index).unwrap_or(Datum::Null))
                 }
                 _ => Err(type_mismatch("field access on a non-composite value", &b)),
             }
         }
-        Expr::AnyAll { operand, op, array, all } => {
+        Expr::AnyAll { operand, operator, array, all } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let array = eval_full(array, arena, params, row, hooks)?;
-            let (elem, raw) = match array {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match array {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
             };
             let n = super::array::len(raw);
             let mut saw_null = false;
             for i in 0..n {
-                let el = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
-                match binary(op, lhs, el, false, false, arena)? {
+                let el = super::array::get(raw, element, i).unwrap_or(Datum::Null);
+                match binary(operator, lhs, el, false, false, arena)? {
                     Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
                     Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
                     Datum::Null => saw_null = true,
@@ -888,7 +888,7 @@ fn call<'a>(
                 &[Datum::Text("public")]
             };
             Ok(Datum::Array {
-                elem: super::types::ArrElem::Text,
+                element: super::types::ArrElem::Text,
                 raw: super::array::build(elems, arena)?,
             })
         }
@@ -939,13 +939,13 @@ fn call<'a>(
             arity(2)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
             let target = eval_full(args[1], arena, params, row, hooks)?;
-            let (elem, raw) = match a {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match a {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("array_position requires an array", &a)),
             };
             for i in 0..super::array::len(raw) {
-                let el = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+                let el = super::array::get(raw, element, i).unwrap_or(Datum::Null);
                 let hit = if target.is_null() {
                     el.is_null()
                 } else if el.is_null() {
@@ -982,15 +982,15 @@ fn call<'a>(
         "unnest" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
-            let (elem, raw) = match a {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match a {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("unnest requires an array", &a)),
             };
             let k = hooks
                 .srf_index
                 .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
-            Ok(super::array::get(raw, elem, k - 1).unwrap_or(Datum::Null))
+            Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
         }
         "generate_series" => {
             if !(2..=3).contains(&args.len()) {
@@ -1026,22 +1026,22 @@ fn call<'a>(
         "_pg_expandarray" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
-            let (elem, raw) = match a {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match a {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("_pg_expandarray requires an array", &a)),
             };
             let k = hooks.srf_index.unwrap_or(1);
-            let x = super::array::get(raw, elem, k - 1).unwrap_or(Datum::Null);
+            let x = super::array::get(raw, element, k - 1).unwrap_or(Datum::Null);
             let comp = [x, Datum::Int4(k as i32)];
             Ok(Datum::Array {
-                elem: super::types::ArrElem::Int4,
+                element: super::types::ArrElem::Int4,
                 raw: super::array::build(&comp, arena)?,
             })
         }
         "pg_get_indexdef" => {
             // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole
-            // `btree (cols)` definition; `(oid, n, _)` with n>0 returns the name
+            // `btree (columns)` definition; `(oid, n, _)` with n>0 returns the name
             // of the n-th (1-based) indexed column (used by JDBC getIndexInfo).
             let Some(cat) = hooks.catalog else {
                 return Ok(Datum::Null);
@@ -1121,9 +1121,9 @@ fn call<'a>(
             } else {
                 None
             };
-            let (elem, raw) = match a {
+            let (element, raw) = match a {
                 Datum::Null => return Ok(Datum::Null),
-                Datum::Array { elem, raw } => (elem, raw),
+                Datum::Array { element, raw } => (element, raw),
                 other => return Err(type_mismatch("array_to_string", &other)),
             };
             let delim = match delim {
@@ -1135,7 +1135,7 @@ fn call<'a>(
             // Renders the i-th element as text, or `None` to omit it (a NULL
             // element with no null-string replacement).
             let elem_text = |i: usize| -> Result<Option<&'a str>, SqlError> {
-                match super::array::get(raw, elem, i) {
+                match super::array::get(raw, element, i) {
                     Some(Datum::Null) | None => Ok(nullrep),
                     Some(v) => match cast_to(v, ColType::Text, arena)? {
                         Datum::Text(s) => Ok(Some(s)),
@@ -1318,7 +1318,7 @@ fn call<'a>(
                 return Ok(Datum::Null);
             };
             let mut global = false;
-            let mut ci = false;
+            let mut case_insensitive = false;
             if args.len() == 4 {
                 let Some(flags) = text_arg(name, args, 3, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
@@ -1326,8 +1326,8 @@ fn call<'a>(
                 for f in flags.chars() {
                     match f {
                         'g' => global = true,
-                        'i' => ci = true,
-                        'c' => ci = false,
+                        'i' => case_insensitive = true,
+                        'c' => case_insensitive = false,
                         _ => {
                             return Err(sql_err!(
                                 "22023",
@@ -1340,7 +1340,7 @@ fn call<'a>(
             }
             let mut out = StackStr::<8192>::new();
             let mut pos = 0usize;
-            while let Some((s, e)) = super::regex::find(pat, src, pos, ci)? {
+            while let Some((s, e)) = super::regex::find(pat, src, pos, case_insensitive)? {
                 if out.write_str(&src[pos..s]).is_err() {
                     return Err(sql_err!("54000", "regexp_replace result too large"));
                 }
@@ -1390,18 +1390,18 @@ fn call<'a>(
             } else {
                 1
             };
-            let mut ci = false;
+            let mut case_insensitive = false;
             if args.len() == 4 {
                 let Some(flags) = text_arg(name, args, 3, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                ci = flags.contains('i');
+                case_insensitive = flags.contains('i');
             }
             let begin = char_index_to_byte(src, (start_char - 1) as usize);
             if name == "regexp_count" {
                 let mut count = 0i32;
                 let mut pos = begin;
-                while let Some((s, e)) = super::regex::find(pat, src, pos, ci)? {
+                while let Some((s, e)) = super::regex::find(pat, src, pos, case_insensitive)? {
                     count += 1;
                     pos = if e == s {
                         match src[e..].chars().next() {
@@ -1414,7 +1414,7 @@ fn call<'a>(
                 }
                 return Ok(Datum::Int4(count));
             }
-            match super::regex::find(pat, src, begin, ci)? {
+            match super::regex::find(pat, src, begin, case_insensitive)? {
                 None if name == "regexp_instr" => Ok(Datum::Int4(0)),
                 None => Ok(Datum::Null),
                 Some((s, _)) if name == "regexp_instr" => {
@@ -1479,7 +1479,7 @@ fn call<'a>(
                 };
             }
             Ok(Datum::Array {
-                elem: super::types::ArrElem::Text,
+                element: super::types::ArrElem::Text,
                 raw: super::array::build(&items[..n], arena)?,
             })
         }
@@ -2198,23 +2198,23 @@ fn call<'a>(
             // the operand falls in (0 below, count+1 at/above). Numeric args use
             // exact numeric arithmetic; a float argument uses double precision.
             arity(4)?;
-            let op = eval_full(args[0], arena, params, row, hooks)?;
+            let operator = eval_full(args[0], arena, params, row, hooks)?;
             let lo = eval_full(args[1], arena, params, row, hooks)?;
             let hi = eval_full(args[2], arena, params, row, hooks)?;
             let Some(cnt) = int_arg(name, args, 3, arena, params, row, hooks)? else {
                 return Ok(Datum::Null);
             };
-            if op.is_null() || lo.is_null() || hi.is_null() {
+            if operator.is_null() || lo.is_null() || hi.is_null() {
                 return Ok(Datum::Null);
             }
             if cnt <= 0 {
                 return Err(sql_err!("2201G", "count must be greater than zero"));
             }
-            let any_float = matches!(op, Datum::Float8(_))
+            let any_float = matches!(operator, Datum::Float8(_))
                 || matches!(lo, Datum::Float8(_))
                 || matches!(hi, Datum::Float8(_));
             if any_float {
-                let (o, l, h) = (datum_f64(name, op)?, datum_f64(name, lo)?, datum_f64(name, hi)?);
+                let (o, l, h) = (datum_f64(name, operator)?, datum_f64(name, lo)?, datum_f64(name, hi)?);
                 if l == h {
                     return Err(sql_err!("22004", "lower and upper bounds cannot be equal"));
                 }
@@ -2222,7 +2222,7 @@ fn call<'a>(
                 return Ok(Datum::Int4(b));
             }
             let (o, l, h) = (
-                datum_numeric(name, op, arena)?,
+                datum_numeric(name, operator, arena)?,
                 datum_numeric(name, lo, arena)?,
                 datum_numeric(name, hi, arena)?,
             );
@@ -2416,10 +2416,10 @@ fn call<'a>(
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
                 d => {
-                    let Some(secs) = num_factor(&d) else {
+                    let Some(seconds) = num_factor(&d) else {
                         return Err(type_mismatch(name, &d));
                     };
-                    let micros = (secs * 1_000_000.0).round() as i64
+                    let micros = (seconds * 1_000_000.0).round() as i64
                         - super::datetime::PG_EPOCH_DAYS * 86_400_000_000;
                     Ok(Datum::Timestamptz(micros))
                 }
@@ -2623,8 +2623,8 @@ fn call<'a>(
             };
             use super::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS, PG_EPOCH_SECS};
             let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
-            let (secs, frac) = (in_day / 1_000_000, in_day % 1_000_000);
-            let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+            let (seconds, frac) = (in_day / 1_000_000, in_day % 1_000_000);
+            let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
             let eq = |k: &str| field.eq_ignore_ascii_case(k);
             let dow0 = day_of_week(days) as i64;
             // Integer-valued fields.
@@ -2637,7 +2637,7 @@ fn call<'a>(
             } else if eq("hour") || eq("hours") {
                 Some(h)
             } else if eq("minute") || eq("minutes") {
-                Some(mi)
+                Some(minute)
             } else if eq("dow") {
                 Some(dow0)
             } else if eq("isodow") {
@@ -2713,8 +2713,8 @@ fn call<'a>(
             use super::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};
             let (days, in_day) = (t.div_euclid(86_400_000_000), t.rem_euclid(86_400_000_000));
             let (y, m, _d) = civil_from_days(days + PG_EPOCH_DAYS);
-            let (secs, _frac) = (in_day / 1_000_000, in_day % 1_000_000);
-            let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+            let (seconds, _frac) = (in_day / 1_000_000, in_day % 1_000_000);
+            let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
             let eq = |k: &str| field.eq_ignore_ascii_case(k);
             // (new day count since epoch, seconds within the day).
             let (new_days, sod): (i64, i64) = if eq("year") || eq("years") {
@@ -2732,9 +2732,9 @@ fn call<'a>(
             } else if eq("hour") || eq("hours") {
                 (days, h * 3600)
             } else if eq("minute") || eq("minutes") {
-                (days, h * 3600 + mi * 60)
+                (days, h * 3600 + minute * 60)
             } else if eq("second") || eq("seconds") {
-                (days, h * 3600 + mi * 60 + s)
+                (days, h * 3600 + minute * 60 + s)
             } else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2837,22 +2837,22 @@ fn datum_f64(name: &str, d: Datum<'_>) -> Result<f64, SqlError> {
 
 /// `width_bucket` for double-precision bounds; `count` buckets over [low,high]
 /// (or reversed when high < low), 0 below and count+1 at/above the range.
-fn width_bucket_f64(op: f64, lo: f64, hi: f64, count: i64) -> i32 {
+fn width_bucket_f64(operator: f64, lo: f64, hi: f64, count: i64) -> i32 {
     let c = count as f64;
     let bucket = if lo < hi {
-        if op < lo {
+        if operator < lo {
             0
-        } else if op >= hi {
+        } else if operator >= hi {
             count + 1
         } else {
-            ((op - lo) / (hi - lo) * c).floor() as i64 + 1
+            ((operator - lo) / (hi - lo) * c).floor() as i64 + 1
         }
-    } else if op > lo {
+    } else if operator > lo {
         0
-    } else if op <= hi {
+    } else if operator <= hi {
         count + 1
     } else {
-        ((lo - op) / (lo - hi) * c).floor() as i64 + 1
+        ((lo - operator) / (lo - hi) * c).floor() as i64 + 1
     };
     bucket as i32
 }
@@ -2860,7 +2860,7 @@ fn width_bucket_f64(op: f64, lo: f64, hi: f64, count: i64) -> i32 {
 /// `width_bucket` with exact numeric arithmetic (matching PostgreSQL's numeric
 /// form), using an integer quotient so bucket boundaries land exactly.
 fn width_bucket_numeric(
-    op: &Numeric,
+    operator: &Numeric,
     lo: &Numeric,
     hi: &Numeric,
     count: i64,
@@ -2874,9 +2874,9 @@ fn width_bucket_numeric(
     let cnt = Numeric::from_i64(count, arena)?;
     let ascending = compare(lo, hi) == Ordering::Less;
     let (below, at_or_above) = if ascending {
-        (compare(op, lo) == Ordering::Less, compare(op, hi) != Ordering::Less)
+        (compare(operator, lo) == Ordering::Less, compare(operator, hi) != Ordering::Less)
     } else {
-        (compare(op, lo) == Ordering::Greater, compare(op, hi) != Ordering::Greater)
+        (compare(operator, lo) == Ordering::Greater, compare(operator, hi) != Ordering::Greater)
     };
     if below {
         return Ok(0);
@@ -2884,11 +2884,11 @@ fn width_bucket_numeric(
     if at_or_above {
         return Ok((count + 1) as i32);
     }
-    // floor((|op-lo| * count) / |hi-lo|) + 1
+    // floor((|operator-lo| * count) / |hi-lo|) + 1
     let (num_a, den) = if ascending {
-        (sub(op, lo, arena)?, sub(hi, lo, arena)?)
+        (sub(operator, lo, arena)?, sub(hi, lo, arena)?)
     } else {
-        (sub(lo, op, arena)?, sub(lo, hi, arena)?)
+        (sub(lo, operator, arena)?, sub(lo, hi, arena)?)
     };
     let q = trunc_div(&mul(&num_a, &cnt, arena)?, &den, arena)?;
     Ok((q.to_i64()? + 1) as i32)
@@ -3127,10 +3127,10 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Str(_) => Some(ColType::Text),
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
-        Expr::Unary { op: UnaryOp::Neg, operand } => static_type(operand, row),
-        Expr::Unary { op: UnaryOp::Not, .. } | Expr::IsNull { .. }
+        Expr::Unary { operator: UnaryOp::Neg, operand } => static_type(operand, row),
+        Expr::Unary { operator: UnaryOp::Not, .. } | Expr::IsNull { .. }
         | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } | Expr::Match { .. } => Some(ColType::Bool),
-        Expr::Binary { op, left, right } => match op {
+        Expr::Binary { operator, left, right } => match operator {
             BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
             | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or => Some(ColType::Bool),
             BinaryOp::Concat => Some(ColType::Text),
@@ -3145,8 +3145,8 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
     }
 }
 
-fn unary<'a>(op: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
-    match (op, v) {
+fn unary<'a>(operator: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    match (operator, v) {
         (_, Datum::Null) => Ok(Datum::Null),
         (UnaryOp::Neg, Datum::Int4(x)) => x
             .checked_neg()
@@ -3188,7 +3188,7 @@ fn is_unknown_literal(expression: &Expr) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn binary<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     l_unknown: bool,
@@ -3196,24 +3196,24 @@ fn binary<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
-    match op {
-        And | Or => logic(op, l, r),
+    match operator {
+        And | Or => logic(operator, l, r),
         Concat => concat(l, r, l_unknown, r_unknown, arena),
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(op, l, r),
-            _ => compare(op, l, r, l_unknown, r_unknown),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
+            _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub | Mul | Div | Mod => match (l, r) {
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(op, l, r, arena),
-            _ => arithmetic(op, l, r, l_unknown, r_unknown, arena),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(operator, l, r, arena),
+            _ => arithmetic(operator, l, r, l_unknown, r_unknown, arena),
         },
-        JsonGet | JsonGetText => json_get(l, r, op == JsonGetText, arena),
+        JsonGet | JsonGetText => json_get(l, r, operator == JsonGetText, arena),
         Shl | Shr => match (l, r) {
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(op, l, r),
-            _ => bitwise(op, l, r),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r),
+            _ => bitwise(operator, l, r),
         },
-        BitAnd | BitOr | BitXor => bitwise(op, l, r),
-        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(op, l, r),
+        BitAnd | BitOr | BitXor => bitwise(operator, l, r),
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(operator, l, r),
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
             // is float8); otherwise it is double-precision exponentiation.
@@ -3237,13 +3237,13 @@ fn binary<'a>(
 /// (overlaps), `<<`/`>>` (strictly left/right), `&<`/`&>` (does not extend
 /// right/left), `-|-` (adjacent). `@>`/`<@` accept a range-vs-range or
 /// range-vs-element pair; the rest require two ranges of the same kind.
-fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn range_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     use super::range;
     use BinaryOp::{Adjacent, ContainedBy, Contains, NotLeftOf, NotRightOf, Overlaps, Shl, Shr};
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
-    match op {
+    match operator {
         Contains => range_contains(l, r),
         ContainedBy => range_contains(r, l),
         _ => {
@@ -3252,7 +3252,7 @@ fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, S
             if lk != rk {
                 return Err(range_mismatch());
             }
-            Ok(Datum::Bool(match op {
+            Ok(Datum::Bool(match operator {
                 Overlaps => range::overlaps(lt, rt, lk)?,
                 Shl => range::strictly_before(lt, rt, lk)?,
                 Shr => range::strictly_after(lt, rt, lk)?,
@@ -3268,7 +3268,7 @@ fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, S
 /// Range set operators returning a range: `+` (union), `-` (difference), `*`
 /// (intersection). Both operands must be ranges of the same kind.
 fn range_setop<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     arena: &'a Arena,
@@ -3282,7 +3282,7 @@ fn range_setop<'a>(
     if lk != rk {
         return Err(range_mismatch());
     }
-    let text = match op {
+    let text = match operator {
         BinaryOp::Add => range::union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::intersect(lt, rt, lk, arena)?,
@@ -3325,7 +3325,7 @@ fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), Sql
 }
 
 /// Integer bitwise operators (`& | # << >>`). Both operands must be integers.
-fn bitwise<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
     let int = |d: &Datum| -> Result<i64, SqlError> {
         match d {
@@ -3338,7 +3338,7 @@ fn bitwise<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, Sq
         return Ok(Datum::Null);
     }
     let (a, b) = (int(&l)?, int(&r)?);
-    let v = match op {
+    let v = match operator {
         BitAnd => a & b,
         BitOr => a | b,
         BitXor => a ^ b,
@@ -3404,7 +3404,7 @@ fn json_get<'a>(
 /// statically FALSE. `fold_check` decides statically (surfacing a constant
 /// operand's own error left-first, exactly as plan-time folding does).
 fn eval_logic_short_circuit<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     left: &Expr<'a>,
     right: &Expr<'a>,
     arena: &'a Arena,
@@ -3412,9 +3412,9 @@ fn eval_logic_short_circuit<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let absorbing = matches!(op, BinaryOp::Or);
+    let absorbing = matches!(operator, BinaryOp::Or);
     // Left first: a statically-determined left settles the result (absorbing) or
-    // hands off to the right (non-absorbing), matching plan-time folding order.
+    // hands offset to the right (non-absorbing), matching plan-time folding order.
     match fold_check(left, arena)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
         Some(_) => return eval_full(right, arena, params, row, hooks),
@@ -3432,11 +3432,11 @@ fn eval_logic_short_circuit<'a>(
         return Ok(Datum::Bool(absorbing));
     }
     let r = eval_full(right, arena, params, row, hooks)?;
-    logic(op, l, r)
+    logic(operator, l, r)
 }
 
 /// SQL three-valued AND/OR.
-fn logic<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn logic<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     let as_bool = |d: &Datum| -> Result<Option<bool>, SqlError> {
         match d {
             Datum::Null => Ok(None),
@@ -3445,7 +3445,7 @@ fn logic<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlE
         }
     };
     let (a, b) = (as_bool(&l)?, as_bool(&r)?);
-    let out = match (op, a, b) {
+    let out = match (operator, a, b) {
         (BinaryOp::And, Some(false), _) | (BinaryOp::And, _, Some(false)) => Some(false),
         (BinaryOp::And, Some(true), Some(true)) => Some(true),
         (BinaryOp::And, _, _) => None,
@@ -3470,22 +3470,22 @@ fn array_null_concat<'a>(
     row: &impl ColumnLookup<'a>,
     arena: &'a Arena,
 ) -> Result<Option<Datum<'a>>, SqlError> {
-    let (array, elem, null_expr) = match (l, r) {
-        (Datum::Array { elem, .. }, Datum::Null) => (l, elem, right),
-        (Datum::Null, Datum::Array { elem, .. }) => (r, elem, left),
+    let (array, element, null_expr) = match (l, r) {
+        (Datum::Array { element, .. }, Datum::Null) => (l, element, right),
+        (Datum::Null, Datum::Array { element, .. }) => (r, element, left),
         _ => return Ok(None),
     };
     match static_type(null_expr, row) {
         // Untyped NULL or a NULL of the array type: identity.
         None | Some(ColType::Array(_)) => Ok(Some(array)),
         // NULL of the element type: append/prepend a NULL element.
-        Some(t) if super::types::ArrElem::from_coltype(t) == Some(elem) => {
+        Some(t) if super::types::ArrElem::from_coltype(t) == Some(element) => {
             Ok(Some(array_concat(l, r, arena)?))
         }
         Some(t) => Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
             "operator does not exist: {}[] || {}",
-            elem.to_coltype().name(),
+            element.to_coltype().name(),
             t.name()
         )),
     }
@@ -3507,14 +3507,14 @@ fn concat<'a>(
     // type), so it is parsed as an array literal and errors if malformed —
     // matching `ARRAY['a','b'] || 'c'` (error) vs `|| 'c'::text` (append).
     let arr_elem = match (&l, &r) {
-        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => Some(*elem),
+        (Datum::Array { element, .. }, _) | (_, Datum::Array { element, .. }) => Some(*element),
         _ => None,
     };
-    if let Some(elem) = arr_elem {
+    if let Some(element) = arr_elem {
         let coerce = |d: Datum<'a>, unknown: bool| -> Result<Datum<'a>, SqlError> {
             match d {
                 Datum::Text(s) if unknown => {
-                    Ok(Datum::Array { elem, raw: super::array::parse_literal(s, elem, arena)? })
+                    Ok(Datum::Array { element, raw: super::array::parse_literal(s, element, arena)? })
                 }
                 other => Ok(other),
             }
@@ -3540,15 +3540,15 @@ fn concat<'a>(
 /// Concatenates two operands where at least one is an array, following
 /// PostgreSQL's `array || array`, `array || element`, and `element || array`.
 fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let elem = match (&l, &r) {
-        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => *elem,
+    let element = match (&l, &r) {
+        (Datum::Array { element, .. }, _) | (_, Datum::Array { element, .. }) => *element,
         _ => unreachable!("caller ensures one side is an array"),
     };
     let mut items = [Datum::Null; 4096];
     let mut n = 0usize;
     for side in [l, r] {
         match side {
-            Datum::Array { raw, elem: e } => {
+            Datum::Array { raw, element: e } => {
                 for i in 0..super::array::len(raw) {
                     if n >= items.len() {
                         return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
@@ -3568,7 +3568,7 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             }
         }
     }
-    Ok(Datum::Array { elem, raw: super::array::build(&items[..n], arena)? })
+    Ok(Datum::Array { element, raw: super::array::build(&items[..n], arena)? })
 }
 
 /// Total order used by comparisons and ORDER BY. NULL handling differs
@@ -3603,12 +3603,12 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         | (Datum::Timestamptz(a), Datum::Timestamp(b)) => a.cmp(b),
         (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
         (Datum::Json { text: a, .. }, Datum::Json { text: b, .. }) => a.cmp(b),
-        (Datum::Array { elem, raw: ra }, Datum::Array { raw: rb, .. }) => {
+        (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             // Element-wise, then by length (PostgreSQL array ordering).
             let (na, nb) = (super::array::len(ra), super::array::len(rb));
             for i in 0..na.min(nb) {
-                let x = super::array::get(ra, *elem, i).unwrap_or(Datum::Null);
-                let y = super::array::get(rb, *elem, i).unwrap_or(Datum::Null);
+                let x = super::array::get(ra, *element, i).unwrap_or(Datum::Null);
+                let y = super::array::get(rb, *element, i).unwrap_or(Datum::Null);
                 let c = compare_datums(&x, &y)?;
                 if !c.is_eq() {
                     return Ok(c);
@@ -3706,11 +3706,11 @@ fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a>, SqlError
 
 /// Range comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`). Both operands
 /// must be ranges of the same kind; ordering follows PostgreSQL `range_cmp`.
-fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn compare_ranges<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
-    let sym = match op {
+    let sym = match operator {
         BinaryOp::Eq => "=",
         BinaryOp::NotEq => "<>",
         BinaryOp::Lt => "<",
@@ -3738,7 +3738,7 @@ fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<
         ));
     }
     let ord = super::range::cmp_ranges(lt, rt, lk)?;
-    let out = match op {
+    let out = match operator {
         BinaryOp::Eq => ord.is_eq(),
         BinaryOp::NotEq => ord.is_ne(),
         BinaryOp::Lt => ord.is_lt(),
@@ -3751,7 +3751,7 @@ fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<
 }
 
 fn compare<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     l_unknown: bool,
@@ -3763,7 +3763,7 @@ fn compare<'a>(
     let l = if l_unknown { coerce_unknown(l, &r)? } else { l };
     let r = if r_unknown { coerce_unknown(r, &l)? } else { r };
     let ord = compare_datums(&l, &r)?;
-    let out = match op {
+    let out = match operator {
         BinaryOp::Eq => ord.is_eq(),
         BinaryOp::NotEq => ord.is_ne(),
         BinaryOp::Lt => ord.is_lt(),
@@ -3777,7 +3777,7 @@ fn compare<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn arithmetic<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     l_unknown: bool,
@@ -3794,9 +3794,9 @@ fn arithmetic<'a>(
     // which would otherwise coerce a date to a bare day count.
     // Interval arithmetic: date/timestamp ± interval -> timestamp; interval
     // ± interval -> interval. Months add calendar months (day clamped).
-    match (op, l, r) {
+    match (operator, l, r) {
         (BinaryOp::Add | BinaryOp::Sub, Datum::Interval(a), Datum::Interval(b)) => {
-            let s: i32 = if op == BinaryOp::Sub { -1 } else { 1 };
+            let s: i32 = if operator == BinaryOp::Sub { -1 } else { 1 };
             return Ok(Datum::Interval(super::types::Interval {
                 months: a.months + s * b.months,
                 days: a.days + s * b.days,
@@ -3820,13 +3820,13 @@ fn arithmetic<'a>(
                 Datum::Date(d) => d as i64 * 86_400_000_000,
                 _ => unreachable!(),
             };
-            let signed = if op == BinaryOp::Sub {
+            let signed = if operator == BinaryOp::Sub {
                 super::types::Interval { months: -interval.months, days: -interval.days, micros: -interval.micros }
             } else {
                 interval
             };
             let out = super::datetime::add_interval(base, signed);
-            // date ± interval yields timestamp in PostgreSQL; timestamptz stays tz.
+            // date ± interval yields timestamp in PostgreSQL; timestamptz stays timezone.
             return Ok(match dt {
                 Datum::Timestamptz(_) => Datum::Timestamptz(out),
                 _ => Datum::Timestamp(out),
@@ -3834,7 +3834,7 @@ fn arithmetic<'a>(
         }
         _ => {}
     }
-    match (op, l, r) {
+    match (operator, l, r) {
         (BinaryOp::Sub, Datum::Date(a), Datum::Date(b)) => {
             return Ok(Datum::Int4(a - b));
         }
@@ -3850,7 +3850,7 @@ fn arithmetic<'a>(
         }
         (BinaryOp::Add | BinaryOp::Sub, Datum::Date(a), _) if as_i64(&r).is_some() => {
             let days = as_i64(&r).expect("checked");
-            return date_shift(a, days, op == BinaryOp::Sub);
+            return date_shift(a, days, operator == BinaryOp::Sub);
         }
         // `int + date` is commutative with `date + int`; `int - date` is not
         // defined in PostgreSQL, so only Add is accepted here.
@@ -3860,14 +3860,14 @@ fn arithmetic<'a>(
         }
         _ => {}
     }
-    // PostgreSQL numeric-promotion: int op int -> int; if either side is
+    // PostgreSQL numeric-promotion: int operator int -> int; if either side is
     // numeric (and neither is float8) -> numeric; if either is float8 ->
     // float8.
     let either_numeric = matches!(l, Datum::Numeric(_)) || matches!(r, Datum::Numeric(_));
     let either_float = matches!(l, Datum::Float8(_)) || matches!(r, Datum::Float8(_));
-    // Integer op integer stays integral.
+    // Integer operator integer stays integral.
     if let (Some(a), Some(b)) = (as_i64(&l), as_i64(&r)) {
-        let out = match op {
+        let out = match operator {
             BinaryOp::Add => a.checked_add(b),
             BinaryOp::Sub => a.checked_sub(b),
             BinaryOp::Mul => a.checked_mul(b),
@@ -3891,7 +3891,7 @@ fn arithmetic<'a>(
     if either_numeric && !either_float {
         let a = to_numeric(&l, arena)?;
         let b = to_numeric(&r, arena)?;
-        let out = match op {
+        let out = match operator {
             BinaryOp::Add => numeric::add(&a, &b, arena)?,
             BinaryOp::Sub => numeric::sub(&a, &b, arena)?,
             BinaryOp::Mul => numeric::mul(&a, &b, arena)?,
@@ -3903,7 +3903,7 @@ fn arithmetic<'a>(
     }
     // PostgreSQL defines no modulo operator for double precision, so `%` with
     // a float8 operand is undefined even though `+`/`-`/`*`/`/` are not.
-    if op == BinaryOp::Mod && either_float {
+    if operator == BinaryOp::Mod && either_float {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
             "operator does not exist: {} % {}",
@@ -3912,7 +3912,7 @@ fn arithmetic<'a>(
         ));
     }
     if let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) {
-        let out = match op {
+        let out = match operator {
             BinaryOp::Add => a + b,
             BinaryOp::Sub => a - b,
             BinaryOp::Mul => a * b,
@@ -3934,7 +3934,7 @@ fn arithmetic<'a>(
     }
     // No arithmetic operator is defined for this operand pair (e.g. int - date,
     // text + int). PostgreSQL reports this as "operator does not exist" (42883).
-    let sym = match op {
+    let sym = match operator {
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
@@ -3964,7 +3964,7 @@ fn date_shift<'a>(date: i32, days: i64, sub: bool) -> Result<Datum<'a>, SqlError
     }
 }
 
-/// int4 op int4 yields int4 (with range check), as in PostgreSQL.
+/// int4 operator int4 yields int4 (with range check), as in PostgreSQL.
 fn narrow_int<'a>(v: i64, l: &Datum, r: &Datum) -> Result<Datum<'a>, SqlError> {
     let both_int4 = matches!(l, Datum::Int4(_)) && matches!(r, Datum::Int4(_));
     if both_int4 {
@@ -4086,9 +4086,9 @@ pub fn cast_to<'a>(
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
         },
-        ColType::Array(elem) => match v {
-            Datum::Array { elem: e, .. } if e == elem => v,
-            Datum::Text(s) => Datum::Array { elem, raw: super::array::parse_literal(s, elem, arena)? },
+        ColType::Array(element) => match v {
+            Datum::Array { element: e, .. } if e == element => v,
+            Datum::Text(s) => Datum::Array { element, raw: super::array::parse_literal(s, element, arena)? },
             _ => return Err(cast_unsupported(&v, "array")),
         },
         ColType::Uuid => match v {
@@ -4378,11 +4378,11 @@ fn division_by_zero() -> SqlError {
     sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero")
 }
 
-fn type_mismatch(op: &str, d: &Datum) -> SqlError {
+fn type_mismatch(operator: &str, d: &Datum) -> SqlError {
     sql_err!(
         sqlstate::DATATYPE_MISMATCH,
         "operator {} does not accept {}",
-        op,
+        operator,
         type_name_of(d)
     )
 }

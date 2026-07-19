@@ -70,7 +70,7 @@ pub enum SetOp {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SetTree<'a> {
     Select(&'a Select<'a>),
-    Op { op: SetOp, all: bool, left: &'a SetTree<'a>, right: &'a SetTree<'a> },
+    Op { operator: SetOp, all: bool, left: &'a SetTree<'a>, right: &'a SetTree<'a> },
 }
 
 /// A set-operation query plus the trailing ORDER BY / LIMIT / OFFSET that apply
@@ -193,11 +193,11 @@ pub struct CreateTable<'a> {
 pub enum TableConstraint<'a> {
     PrimaryKey {
         name: Option<&'a str>,
-        cols: &'a [&'a str],
+        columns: &'a [&'a str],
     },
     Unique {
         name: Option<&'a str>,
-        cols: &'a [&'a str],
+        columns: &'a [&'a str],
     },
     Check {
         name: Option<&'a str>,
@@ -208,7 +208,7 @@ pub enum TableConstraint<'a> {
     },
     ForeignKey {
         name: Option<&'a str>,
-        cols: &'a [&'a str],
+        columns: &'a [&'a str],
         parent: &'a str,
         /// Referenced columns; empty means "the parent's primary key".
         parent_cols: &'a [&'a str],
@@ -328,11 +328,11 @@ pub enum Expr<'a> {
     },
     Param(u32),
     Unary {
-        op: UnaryOp,
+        operator: UnaryOp,
         operand: &'a Expr<'a>,
     },
     Binary {
-        op: BinaryOp,
+        operator: BinaryOp,
         left: &'a Expr<'a>,
         right: &'a Expr<'a>,
     },
@@ -418,10 +418,10 @@ pub enum Expr<'a> {
     /// the `_pg_expandarray` set function, whose result exposes `.x` (element)
     /// and `.n` (1-based ordinal).
     Field { base: &'a Expr<'a>, field: &'a str },
-    /// `operand op ANY/ALL (array)` — quantified comparison.
+    /// `operand operator ANY/ALL (array)` — quantified comparison.
     AnyAll {
         operand: &'a Expr<'a>,
-        op: BinaryOp,
+        operator: BinaryOp,
         array: &'a Expr<'a>,
         all: bool,
     },

@@ -317,13 +317,13 @@ impl Checkpointer {
                     let mut uk = crate::storage::UniqueKey::EMPTY;
                     uk.is_primary = is_primary != 0;
                     uk.n_cols = n_cols;
-                    for c in uk.cols.iter_mut().take(n_cols) {
+                    for c in uk.columns.iter_mut().take(n_cols) {
                         *c = parse_field(words.next(), "ukey col")?;
                     }
-                    let hname = words
+                    let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("ukey name missing"))?;
-                    uk.name = sql_name(&decode_hex_name(hname)?)?;
+                    uk.name = sql_name(&decode_hex_name(hex_name)?)?;
                     let i = def.n_uniques;
                     def.uniques[i] = uk;
                     def.n_uniques += 1;
@@ -335,14 +335,14 @@ impl Checkpointer {
                     if def.n_checks >= crate::storage::MAX_CHECKS {
                         return Err(CheckpointSetupError::Corrupt("too many chk lines"));
                     }
-                    let hname = words
+                    let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("chk name missing"))?;
                     let hexpr = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("chk expression missing"))?;
                     let mut check = crate::storage::CheckConstraint::EMPTY;
-                    check.name = sql_name(&decode_hex_name(hname)?)?;
+                    check.name = sql_name(&decode_hex_name(hex_name)?)?;
                     let expression = decode_hex_name(hexpr)?;
                     use core::fmt::Write;
                     let _ = write!(check.expression, "{expression}");
@@ -366,7 +366,7 @@ impl Checkpointer {
                     }
                     let mut fk = crate::storage::ForeignKey::EMPTY;
                     fk.n_cols = n_cols;
-                    for c in fk.cols.iter_mut().take(n_cols) {
+                    for c in fk.columns.iter_mut().take(n_cols) {
                         *c = parse_field(words.next(), "fkey col")?;
                     }
                     let n_parent: usize = parse_field(words.next(), "fkey nparent")?;
@@ -383,13 +383,13 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("bad fkey on_delete"))?;
                     fk.on_update = crate::storage::FkAction::from_code(ou)
                         .ok_or(CheckpointSetupError::Corrupt("bad fkey on_update"))?;
-                    let hname = words
+                    let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("fkey name missing"))?;
                     let hparent = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("fkey parent missing"))?;
-                    fk.name = sql_name(&decode_hex_name(hname)?)?;
+                    fk.name = sql_name(&decode_hex_name(hex_name)?)?;
                     fk.parent = sql_name(&decode_hex_name(hparent)?)?;
                     let i = def.n_fkeys;
                     def.fkeys[i] = fk;
@@ -444,23 +444,23 @@ impl Checkpointer {
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
                         return Err(CheckpointSetupError::Corrupt("bad index ncols"));
                     }
-                    let mut cols = [0u16; crate::storage::MAX_INDEX_COLS];
-                    for c in cols.iter_mut().take(n_cols) {
+                    let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+                    for c in columns.iter_mut().take(n_cols) {
                         *c = parse_field(words.next(), "idx col")?;
                     }
-                    let hname = words
+                    let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("idx name missing"))?;
                     let htable = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("idx table missing"))?;
-                    let name = decode_hex_name(hname)?;
+                    let name = decode_hex_name(hex_name)?;
                     let table = decode_hex_name(htable)?;
                     storage
                         .create_index(crate::storage::IndexDef {
                             name: sql_name(&name)?,
                             table: sql_name(&table)?,
-                            cols,
+                            columns,
                             n_cols,
                             unique: unique != 0,
                             live: true,
@@ -658,13 +658,13 @@ impl Checkpointer {
             // `ukey <is_primary> <ncols> <c0..cN> <hex-name>`
             for uk in table.def.uniques() {
                 use core::fmt::Write;
-                let mut cols = StackStr::<64>::new();
-                for c in uk.cols() {
-                    let _ = write!(cols, "{c} ");
+                let mut columns = StackStr::<64>::new();
+                for c in uk.columns() {
+                    let _ = write!(columns, "{c} ");
                 }
-                let mut hname = StackStr::<130>::new();
+                let mut hex_name = StackStr::<130>::new();
                 for b in uk.name.as_str().as_bytes() {
-                    let _ = write!(hname, "{b:02x}");
+                    let _ = write!(hex_name, "{b:02x}");
                 }
                 write_manifest(
                     &mut self.manifest_buf,
@@ -672,17 +672,17 @@ impl Checkpointer {
                         "ukey {} {} {}{}",
                         u8::from(uk.is_primary),
                         uk.n_cols,
-                        cols.as_str(),
-                        hname.as_str()
+                        columns.as_str(),
+                        hex_name.as_str()
                     ),
                 )?;
             }
             // `chk <hex-name> <hex-predicate>`
             for check in table.def.checks() {
                 use core::fmt::Write;
-                let mut hname = StackStr::<130>::new();
+                let mut hex_name = StackStr::<130>::new();
                 for b in check.name.as_str().as_bytes() {
-                    let _ = write!(hname, "{b:02x}");
+                    let _ = write!(hex_name, "{b:02x}");
                 }
                 let mut hexpr = StackStr::<{ 2 * crate::storage::CHECK_SQL_MAX }>::new();
                 for b in check.expression.as_str().as_bytes() {
@@ -690,23 +690,23 @@ impl Checkpointer {
                 }
                 write_manifest(
                     &mut self.manifest_buf,
-                    format_args!("chk {} {}", hname.as_str(), hexpr.as_str()),
+                    format_args!("chk {} {}", hex_name.as_str(), hexpr.as_str()),
                 )?;
             }
             // `fkey <ncols> <c..> <nparent> <p..> <on_delete> <on_update> <hex-name> <hex-parent>`
             for fk in table.def.fkeys() {
                 use core::fmt::Write;
-                let mut cols = StackStr::<64>::new();
-                for c in fk.cols() {
-                    let _ = write!(cols, "{c} ");
+                let mut columns = StackStr::<64>::new();
+                for c in fk.columns() {
+                    let _ = write!(columns, "{c} ");
                 }
                 let mut pcols = StackStr::<64>::new();
                 for c in fk.parent_cols() {
                     let _ = write!(pcols, "{c} ");
                 }
-                let mut hname = StackStr::<130>::new();
+                let mut hex_name = StackStr::<130>::new();
                 for b in fk.name.as_str().as_bytes() {
-                    let _ = write!(hname, "{b:02x}");
+                    let _ = write!(hex_name, "{b:02x}");
                 }
                 let mut hparent = StackStr::<130>::new();
                 for b in fk.parent.as_str().as_bytes() {
@@ -717,12 +717,12 @@ impl Checkpointer {
                     format_args!(
                         "fkey {} {}{} {}{} {} {} {}",
                         fk.n_cols,
-                        cols.as_str(),
+                        columns.as_str(),
                         fk.n_parent_cols,
                         pcols.as_str(),
                         fk.on_delete.code(),
                         fk.on_update.code(),
-                        hname.as_str(),
+                        hex_name.as_str(),
                         hparent.as_str()
                     ),
                 )?;
@@ -840,13 +840,13 @@ impl Checkpointer {
         // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
         for index in storage.live_indexes() {
             use core::fmt::Write;
-            let mut cols = StackStr::<128>::new();
-            for c in &index.cols[..index.n_cols] {
-                let _ = write!(cols, "{c} ");
+            let mut columns = StackStr::<128>::new();
+            for c in &index.columns[..index.n_cols] {
+                let _ = write!(columns, "{c} ");
             }
-            let mut hname = StackStr::<130>::new();
+            let mut hex_name = StackStr::<130>::new();
             for b in index.name.as_str().as_bytes() {
-                let _ = write!(hname, "{b:02x}");
+                let _ = write!(hex_name, "{b:02x}");
             }
             let mut htable = StackStr::<130>::new();
             for b in index.table.as_str().as_bytes() {
@@ -858,8 +858,8 @@ impl Checkpointer {
                     "idx {} {} {}{} {}",
                     u8::from(index.unique),
                     index.n_cols,
-                    cols.as_str(),
-                    hname.as_str(),
+                    columns.as_str(),
+                    hex_name.as_str(),
                     htable.as_str()
                 ),
             )?;

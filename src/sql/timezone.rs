@@ -1,11 +1,11 @@
-//! Time zones with DST. A [`Tz`] resolves the UTC offset and abbreviation for
+//! Time zones with DST. A [`Timezone`] resolves the UTC offset and abbreviation for
 //! a specific instant, so `timestamptz` output is correct across daylight-time
 //! transitions. Fixed-offset zones (UTC, `+05:30`) are the degenerate case
 //! with no transitions.
 //!
 //! DST rules follow the POSIX form (the `Mm.w.d` transition: month, week,
 //! day-of-week, local seconds-after-midnight). This is exact for current rules;
-//! it does not model historical rule changes (PostgreSQL's full tz database
+//! it does not model historical rule changes (PostgreSQL's full timezone database
 //! does), which only affects timestamps from before a zone's present rule.
 
 use core::fmt::Write;
@@ -15,14 +15,14 @@ use crate::util::StackStr;
 
 const DAY_US: i64 = 86_400_000_000;
 
-/// One DST transition: the `week`-th `dow` (0 = Sunday) of `month`, at `secs`
+/// One DST transition: the `week`-th `dow` (0 = Sunday) of `month`, at `seconds`
 /// after local midnight. `week` 5 means "last".
 #[derive(Debug, Clone, Copy)]
 pub struct Trans {
     month: u32,
     week: u32,
     dow: usize,
-    secs: i64,
+    seconds: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,7 +35,7 @@ pub struct Dst {
 
 /// A resolved time zone.
 #[derive(Debug, Clone, Copy)]
-pub struct Tz {
+pub struct Timezone {
     std_off: i32,
     dst_off: i32,
     std_abbrev: StackStr<8>,
@@ -43,16 +43,16 @@ pub struct Tz {
     dst: Option<Dst>,
 }
 
-impl Tz {
+impl Timezone {
     /// A fixed-offset zone (no DST): UTC, `Etc/GMT±N`, bare numeric offsets.
-    pub fn fixed(off_secs: i32, abbrev: &str) -> Tz {
+    pub fn fixed(off_secs: i32, abbrev: &str) -> Timezone {
         let mut a = StackStr::new();
         let _ = write!(a, "{abbrev}");
-        Tz { std_off: off_secs, dst_off: off_secs, std_abbrev: a, dst_abbrev: a, dst: None }
+        Timezone { std_off: off_secs, dst_off: off_secs, std_abbrev: a, dst_abbrev: a, dst: None }
     }
 
-    pub fn utc() -> Tz {
-        Tz::fixed(0, "UTC")
+    pub fn utc() -> Timezone {
+        Timezone::fixed(0, "UTC")
     }
 
     /// The offset (seconds east of UTC) and abbreviation in effect at `utc`
@@ -89,7 +89,7 @@ fn trans_instant(year: i64, t: Trans, off_secs: i32) -> i64 {
         dom -= 7; // "last" (week 5) or an overshoot clamps to the final occurrence
     }
     let day = days_from_civil(year, t.month, dom as u32) - PG_EPOCH_DAYS;
-    (day * DAY_US + t.secs * 1_000_000) - off_secs as i64 * 1_000_000
+    (day * DAY_US + t.seconds * 1_000_000) - off_secs as i64 * 1_000_000
 }
 
 fn days_in_month(y: i64, m: u32) -> u32 {
@@ -108,20 +108,20 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 
 const H: i32 = 3600;
 
-fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst>) -> Tz {
+fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst>) -> Timezone {
     let mut s = StackStr::new();
     let _ = write!(s, "{std_ab}");
     let mut d = StackStr::new();
     let _ = write!(d, "{dst_ab}");
-    Tz { std_off, dst_off, std_abbrev: s, dst_abbrev: d, dst }
+    Timezone { std_off, dst_off, std_abbrev: s, dst_abbrev: d, dst }
 }
 
 /// US rule (2007+): spring 2nd Sunday March 02:00 std, fall 1st Sunday
 /// November 02:00 dst.
 fn us() -> Dst {
     Dst {
-        start: Trans { month: 3, week: 2, dow: 0, secs: 2 * 3600 },
-        end: Trans { month: 11, week: 1, dow: 0, secs: 2 * 3600 },
+        start: Trans { month: 3, week: 2, dow: 0, seconds: 2 * 3600 },
+        end: Trans { month: 11, week: 1, dow: 0, seconds: 2 * 3600 },
     }
 }
 
@@ -131,8 +131,8 @@ fn eu(std_off_hours: i32) -> Dst {
     let start_local = (1 + std_off_hours) * 3600; // 01:00 UTC in std local time
     let end_local = (1 + std_off_hours + 1) * 3600; // 01:00 UTC in dst local time
     Dst {
-        start: Trans { month: 3, week: 5, dow: 0, secs: start_local as i64 },
-        end: Trans { month: 10, week: 5, dow: 0, secs: end_local as i64 },
+        start: Trans { month: 3, week: 5, dow: 0, seconds: start_local as i64 },
+        end: Trans { month: 10, week: 5, dow: 0, seconds: end_local as i64 },
     }
 }
 
@@ -140,22 +140,22 @@ fn eu(std_off_hours: i32) -> Dst {
 /// April 03:00 dst (southern hemisphere — DST spans the new year).
 fn au() -> Dst {
     Dst {
-        start: Trans { month: 10, week: 1, dow: 0, secs: 2 * 3600 },
-        end: Trans { month: 4, week: 1, dow: 0, secs: 3 * 3600 },
+        start: Trans { month: 10, week: 1, dow: 0, seconds: 2 * 3600 },
+        end: Trans { month: 4, week: 1, dow: 0, seconds: 3 * 3600 },
     }
 }
 
 /// New Zealand rule: last Sunday September 02:00 std, 1st Sunday April 03:00 dst.
 fn nz() -> Dst {
     Dst {
-        start: Trans { month: 9, week: 5, dow: 0, secs: 2 * 3600 },
-        end: Trans { month: 4, week: 1, dow: 0, secs: 3 * 3600 },
+        start: Trans { month: 9, week: 5, dow: 0, seconds: 2 * 3600 },
+        end: Trans { month: 4, week: 1, dow: 0, seconds: 3 * 3600 },
     }
 }
 
 /// Looks up an IANA zone name (case-insensitive). Returns the resolved zone, or
 /// `None` if it is not in the embedded set.
-pub fn lookup(name: &str) -> Option<Tz> {
+pub fn lookup(name: &str) -> Option<Timezone> {
     let n = name;
     let eq = |a: &str| n.eq_ignore_ascii_case(a);
     // North America
@@ -255,8 +255,8 @@ mod tests {
     use super::*;
     use crate::sql::datetime::days_from_civil;
 
-    fn ts(y: i64, mo: u32, d: u32, h: i64) -> i64 {
-        (days_from_civil(y, mo, d) - PG_EPOCH_DAYS) * DAY_US + h * 3_600_000_000
+    fn ts(y: i64, month: u32, d: u32, h: i64) -> i64 {
+        (days_from_civil(y, month, d) - PG_EPOCH_DAYS) * DAY_US + h * 3_600_000_000
     }
 
     #[test]
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn fixed_zones() {
-        assert_eq!(Tz::utc().resolve(ts(2021, 7, 1, 0)).0, 0);
+        assert_eq!(Timezone::utc().resolve(ts(2021, 7, 1, 0)).0, 0);
         let kolkata = lookup("Asia/Kolkata").unwrap();
         assert_eq!(kolkata.resolve(ts(2021, 7, 1, 0)).0, 5 * H + 1800);
     }

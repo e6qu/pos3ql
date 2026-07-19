@@ -912,7 +912,7 @@ fn scan_source<'a>(
 /// Expands a query's non-recursive `WITH` CTEs into derived tables: every
 /// FROM reference to a CTE name (in the body and in nested subqueries) is
 /// rewritten to `(cte_query) alias`, so the ordinary derived-table executor
-/// runs the whole thing. Returns the CTE-free select. A no-op when there are
+/// runs the whole thing. Returns the CTE-free select. A no-operator when there are
 /// no CTEs. Each CTE is substituted against the CTEs declared before it.
 /// A view that PostgreSQL treats as auto-updatable: a single base table, no
 /// aggregation/DISTINCT/GROUP BY/HAVING/LIMIT/joins, and every output column a
@@ -961,7 +961,7 @@ pub fn resolve_view_for_dml<'a>(
         return Err(not_updatable());
     }
     let base = from.base.table;
-    let mut cols = [""; MAX_PROJ];
+    let mut columns = [""; MAX_PROJ];
     let mut n = 0;
     for it in sel.items {
         match it {
@@ -974,7 +974,7 @@ pub fn resolve_view_for_dml<'a>(
                         return Err(not_updatable());
                     }
                     // Copy into the arena so it does not borrow storage.
-                    cols[n] = arena.alloc_str(c.name.as_str()).map_err(|_| arena_full())?;
+                    columns[n] = arena.alloc_str(c.name.as_str()).map_err(|_| arena_full())?;
                     n += 1;
                 }
             }
@@ -987,13 +987,13 @@ pub fn resolve_view_for_dml<'a>(
                 if n == MAX_PROJ {
                     return Err(not_updatable());
                 }
-                cols[n] = cn;
+                columns[n] = cn;
                 n += 1;
             }
             _ => return Err(not_updatable()),
         }
     }
-    let columns = arena.alloc_slice_copy(&cols[..n]).map_err(|_| arena_full())?;
+    let columns = arena.alloc_slice_copy(&columns[..n]).map_err(|_| arena_full())?;
     Ok(Some(UpdatableView { base, where_clause: sel.where_clause, columns }))
 }
 
@@ -1006,7 +1006,7 @@ pub fn and_where<'a>(
     match (view_where, dml_where) {
         (None, w) | (w, None) => Ok(w),
         (Some(a), Some(b)) => {
-            let e = Expr::Binary { op: super::ast::BinaryOp::And, left: a, right: b };
+            let e = Expr::Binary { operator: super::ast::BinaryOp::And, left: a, right: b };
             Ok(Some(&*arena.alloc(e).map_err(|_| arena_full())?))
         }
     }
@@ -1022,15 +1022,15 @@ pub fn validate_view<'a>(
 ) -> Result<(), SqlError> {
     let sel = super::parser::parse_view_select(sql, arena)?;
     let sel = expand_ctes(sel, storage, arena)?;
-    let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     match &sel.from {
         Some(from) => {
             // Committed catalog: a view's referents are validated as visible now.
             let scope = QueryScope::resolve_schema(storage, from, 0, arena)?;
-            describe_scope_items(sel.items, &scope, &mut cols)?;
+            describe_scope_items(sel.items, &scope, &mut columns)?;
         }
         None => {
-            describe_items(sel.items, None, &mut cols)?;
+            describe_items(sel.items, None, &mut columns)?;
         }
     }
     Ok(())
@@ -1135,7 +1135,7 @@ fn subst_select<'a>(
 }
 
 /// Substitutes parameters through every leaf SELECT of a set-operation tree,
-/// mirroring [`subst_select`] for a set-op subquery body.
+/// mirroring [`subst_select`] for a set-operator subquery body.
 fn subst_set_tree<'a>(
     tree: &'a SetTree<'a>,
     context: Subst<'_, 'a>,
@@ -1143,8 +1143,8 @@ fn subst_set_tree<'a>(
 ) -> Result<&'a SetTree<'a>, SqlError> {
     let out = match tree {
         SetTree::Select(s) => SetTree::Select(subst_select(s, context, arena)?),
-        SetTree::Op { op, all, left, right } => SetTree::Op {
-            op: *op,
+        SetTree::Op { operator, all, left, right } => SetTree::Op {
+            operator: *operator,
             all: *all,
             left: subst_set_tree(left, context, arena)?,
             right: subst_set_tree(right, context, arena)?,
@@ -1311,12 +1311,12 @@ fn subst_expr<'a>(
             select: subst_select(select, context, arena)?,
             negated: *negated,
         },
-        Expr::Unary { op, operand } => Expr::Unary {
-            op: *op,
+        Expr::Unary { operator, operand } => Expr::Unary {
+            operator: *operator,
             operand: subst_expr(operand, context, arena)?,
         },
-        Expr::Binary { op, left, right } => Expr::Binary {
-            op: *op,
+        Expr::Binary { operator, left, right } => Expr::Binary {
+            operator: *operator,
             left: subst_expr(left, context, arena)?,
             right: subst_expr(right, context, arena)?,
         },
@@ -1466,9 +1466,9 @@ fn window_row<'r, 'a>(
     offs: &[usize],
 ) -> JoinRow<'r, 'a, 'a> {
     let mut values: [Option<&[Datum]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
-    for (t, off) in offs.iter().enumerate().take(scope.n) {
+    for (t, offset) in offs.iter().enumerate().take(scope.n) {
         let nc = scope.defs[t].expect("resolved").n_columns;
-        values[t] = Some(&flat[*off..*off + nc]);
+        values[t] = Some(&flat[*offset..*offset + nc]);
     }
     JoinRow { scope, values }
 }
@@ -1606,7 +1606,7 @@ fn compute_window<'a>(
             }
         } else if is_offset {
             let sign: isize = if *name == "lag" { -1 } else { 1 };
-            let off: isize = if args.len() >= 2 {
+            let offset: isize = if args.len() >= 2 {
                 let r = window_row(scope, rows[p[0]], offs);
                 match eval_full(args[1], arena, params, &r, hooks)? {
                     Datum::Int4(v) => v as isize,
@@ -1617,7 +1617,7 @@ fn compute_window<'a>(
                 1
             };
             for j in 0..m {
-                let src = j as isize + sign * off;
+                let src = j as isize + sign * offset;
                 out[p[j]] = if src >= 0 && (src as usize) < m {
                     let r = window_row(scope, rows[p[src as usize]], offs);
                     eval_full(args[0], arena, params, &r, hooks)?
@@ -1774,11 +1774,11 @@ fn project_window_rows<'a>(
             let flat = arena
                 .alloc_slice_with(total.max(1), |_| Datum::Null)
                 .map_err(|_| arena_full())?;
-            for (t, off) in offs.iter().enumerate().take(scope.n) {
+            for (t, offset) in offs.iter().enumerate().take(scope.n) {
                 let def = scope.defs[t].expect("resolved");
                 let vals = row.values[t].expect("bound");
                 for c in 0..def.n_columns {
-                    flat[off + c] = if vals.is_empty() { Datum::Null } else { vals[c] };
+                    flat[offset + c] = if vals.is_empty() { Datum::Null } else { vals[c] };
                 }
             }
             rows[at] = &flat[..total];
@@ -2381,7 +2381,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Interval => Datum::Interval(crate::sql::types::Interval { months: 0, days: 0, micros: 0 }),
         ColType::Json => Datum::Json { text: "null", jsonb: false },
         ColType::Jsonb => Datum::Json { text: "null", jsonb: true },
-        ColType::Array(elem) => Datum::Array { elem, raw: &[0, 0] },
+        ColType::Array(element) => Datum::Array { element, raw: &[0, 0] },
         ColType::Float4 | ColType::Float8 => Datum::Float8(0.0),
         ColType::Date => Datum::Date(0),
         ColType::Timestamp => Datum::Timestamp(0),
@@ -2650,10 +2650,10 @@ fn build_array_scalar<'a>(
     witness: &Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let elem = super::types::ArrElem::from_datum(witness)
+    let element = super::types::ArrElem::from_datum(witness)
         .or_else(|| values.iter().find_map(super::types::ArrElem::from_datum))
         .unwrap_or(super::types::ArrElem::Text);
-    let ct = elem.to_coltype();
+    let ct = element.to_coltype();
     let buffer = arena
         .alloc_slice_with(values.len(), |i| values[i])
         .map_err(|_| arena_full())?;
@@ -2662,7 +2662,7 @@ fn build_array_scalar<'a>(
             *v = super::eval::cast_to(*v, ct, arena)?;
         }
     }
-    Ok(Datum::Array { elem, raw: super::array::build(buffer, arena)? })
+    Ok(Datum::Array { element, raw: super::array::build(buffer, arena)? })
 }
 
 /// Streams the source once, folding every aggregate node's state.
@@ -2971,11 +2971,11 @@ impl<'a> AggState<'a> {
                 "string_agg requires exactly two arguments"
             ));
         }
-        let val = eval_full(args[0], arena, params, row, hooks)?;
-        if val.is_null() {
+        let value = eval_full(args[0], arena, params, row, hooks)?;
+        if value.is_null() {
             return Ok(());
         }
-        let Datum::Text(val_str) = val else {
+        let Datum::Text(val_str) = value else {
             return Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "string_agg value must be text"
@@ -3038,13 +3038,13 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
-    /// Append `val` to the string_agg buffer, prefixing `sep` for every element
+    /// Append `value` to the string_agg buffer, prefixing `sep` for every element
     /// after the first (first = buffer still empty).
-    fn append_str_elem(&mut self, sep: &str, val: &str, arena: &'a Arena) -> Result<(), SqlError> {
+    fn append_str_elem(&mut self, sep: &str, value: &str, arena: &'a Arena) -> Result<(), SqlError> {
         if self.str_len > 0 {
             self.push_bytes(sep.as_bytes(), arena)?;
         }
-        self.push_bytes(val.as_bytes(), arena)?;
+        self.push_bytes(value.as_bytes(), arena)?;
         Ok(())
     }
 
@@ -3095,7 +3095,7 @@ impl<'a> AggState<'a> {
     }
 
     /// Sort the DISTINCT buffer, drop adjacent duplicates, and fold the unique
-    /// values through `accumulate` (bumping `count` per unique value). A no-op
+    /// values through `accumulate` (bumping `count` per unique value). A no-operator
     /// for non-distinct aggregates.
     fn fold_distinct(&mut self, arena: &'a Arena) -> Result<(), SqlError> {
         if !self.distinct || self.vals_len == 0 {
@@ -3307,9 +3307,9 @@ pub fn select_query<'a>(
     // PostgreSQL), not only when a row reaches them. SELECT items are also
     // type-checked by describe below.
     {
-        let cols = ScopeCols(&scope);
+        let columns = ScopeCols(&scope);
         let check = |e: &Expr| -> Result<(), SqlError> {
-            super::exec::infer_type_res(e, &cols).map(|_| ())
+            super::exec::infer_type_res(e, &columns).map(|_| ())
         };
         let analyze = || -> Result<(), SqlError> {
             // SELECT-list items first: PostgreSQL analyzes types before it folds
@@ -3346,12 +3346,12 @@ pub fn select_query<'a>(
     }
 
     // Result description.
-    let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = match describe_scope_items(statement.items, &scope, &mut cols) {
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let n_cols = match describe_scope_items(statement.items, &scope, &mut columns) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    resp.row_description(&cols[..n_cols])?;
+    resp.row_description(&columns[..n_cols])?;
 
     let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
         Ok(l) => l,
@@ -3680,7 +3680,7 @@ fn conjunct_passes<'a>(
 /// Flattens a top-level `AND` chain into `out`, returning the count, or `None`
 /// if it would overflow (caller then evaluates the predicate whole).
 fn flatten_and<'e, 'a>(e: &'e Expr<'a>, out: &mut [&'e Expr<'a>], n: &mut usize) -> bool {
-    if let Expr::Binary { op: super::ast::BinaryOp::And, left, right } = e {
+    if let Expr::Binary { operator: super::ast::BinaryOp::And, left, right } = e {
         return flatten_and(left, out, n) && flatten_and(right, out, n);
     }
     if *n == out.len() {
@@ -3708,11 +3708,11 @@ fn is_error_safe(e: &Expr) -> bool {
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => true,
-        Expr::Binary { op, left, right } => match op {
+        Expr::Binary { operator, left, right } => match operator {
             Add | Sub | Mul | Div | Mod => false,
             _ => is_error_safe(left) && is_error_safe(right),
         },
-        Expr::Unary { op, operand } => matches!(op, UnaryOp::Not) && is_error_safe(operand),
+        Expr::Unary { operator, operand } => matches!(operator, UnaryOp::Not) && is_error_safe(operand),
         Expr::IsNull { operand, .. } => is_error_safe(operand),
         Expr::InList { operand, list, .. } => {
             is_error_safe(operand) && list.iter().all(|e| is_error_safe(e))
@@ -3772,23 +3772,23 @@ fn fold_null<'a>(
         {
             Ok(&*arena.alloc(Expr::Bool(*negated)).map_err(|_| arena_full())?)
         }
-        Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } => {
+        Expr::Binary { operator: operator @ (BinaryOp::And | BinaryOp::Or), left, right } => {
             let (l, r) = (fold_null(left, scope, arena)?, fold_null(right, scope, arena)?);
             if core::ptr::eq(l, *left) && core::ptr::eq(r, *right) {
                 Ok(e)
             } else {
                 Ok(&*arena
-                    .alloc(Expr::Binary { op: *op, left: l, right: r })
+                    .alloc(Expr::Binary { operator: *operator, left: l, right: r })
                     .map_err(|_| arena_full())?)
             }
         }
-        Expr::Unary { op: UnaryOp::Not, operand } => {
+        Expr::Unary { operator: UnaryOp::Not, operand } => {
             let o = fold_null(operand, scope, arena)?;
             if core::ptr::eq(o, *operand) {
                 Ok(e)
             } else {
                 Ok(&*arena
-                    .alloc(Expr::Unary { op: UnaryOp::Not, operand: o })
+                    .alloc(Expr::Unary { operator: UnaryOp::Not, operand: o })
                     .map_err(|_| arena_full())?)
             }
         }
@@ -3811,10 +3811,10 @@ fn reorder_qual<'a>(
     if !flatten_and(pred, &mut conjunct, &mut n) || n <= 1 {
         return Ok(pred);
     }
-    let cols = ScopeCols(scope);
+    let columns = ScopeCols(scope);
     let mut cost = [0u32; MAX_CONJUNCTS];
     for (i, c) in conjunct[..n].iter().enumerate() {
-        cost[i] = qual_cost(c, &cols);
+        cost[i] = qual_cost(c, &columns);
     }
     let mut order = [0usize; MAX_CONJUNCTS];
     for (i, slot) in order[..n].iter_mut().enumerate() {
@@ -3831,7 +3831,7 @@ fn reorder_qual<'a>(
     let mut acc = conjunct[order[0]];
     for &i in &order[1..n] {
         acc = arena
-            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conjunct[i] })
+            .alloc(Expr::Binary { operator: super::ast::BinaryOp::And, left: acc, right: conjunct[i] })
             .map_err(|_| arena_full())?;
     }
     Ok(acc)
@@ -3842,7 +3842,7 @@ fn reorder_qual<'a>(
 /// operator, comparison, function, and cast counts one unit; the boolean
 /// connectives AND/OR/NOT are control flow and cost nothing; subqueries
 /// dominate. Only relative order matters.
-fn qual_cost(e: &Expr, cols: &dyn super::exec::ColTypeResolver) -> u32 {
+fn qual_cost(e: &Expr, columns: &dyn super::exec::ColTypeResolver) -> u32 {
     use super::ast::{BinaryOp, UnaryOp};
     // PostgreSQL folds a constant subexpression to a single Const at plan time,
     // so it costs nothing at scan time and is evaluated first.
@@ -3852,55 +3852,55 @@ fn qual_cost(e: &Expr, cols: &dyn super::exec::ColTypeResolver) -> u32 {
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
-        Expr::Binary { op: BinaryOp::And | BinaryOp::Or, left, right } => {
-            qual_cost(left, cols) + qual_cost(right, cols)
+        Expr::Binary { operator: BinaryOp::And | BinaryOp::Or, left, right } => {
+            qual_cost(left, columns) + qual_cost(right, columns)
         }
-        Expr::Binary { op, left, right } => {
+        Expr::Binary { operator, left, right } => {
             // A comparison that mixes a *runtime* integer side with a
             // float/numeric side widens the integer with a cast, which
             // PostgreSQL counts (`(b % 0)::numeric < 0.21` costs more than the
             // int-only `100 = a % id`); a constant int operand is folded and
             // cast for free.
-            let cast = if matches!(op, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
+            let cast = if matches!(operator, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
                 | BinaryOp::GtEq | BinaryOp::Eq | BinaryOp::NotEq)
-                && widening_cast(left, right, cols)
+                && widening_cast(left, right, columns)
             {
                 1
             } else {
                 0
             };
-            1 + cast + qual_cost(left, cols) + qual_cost(right, cols)
+            1 + cast + qual_cost(left, columns) + qual_cost(right, columns)
         }
-        Expr::Unary { op: UnaryOp::Not, operand } => qual_cost(operand, cols),
-        Expr::Unary { operand, .. } => 1 + qual_cost(operand, cols),
-        Expr::IsNull { operand, .. } => 1 + qual_cost(operand, cols),
-        Expr::Cast { operand, .. } => 1 + qual_cost(operand, cols),
-        Expr::Field { base, .. } => qual_cost(base, cols),
-        Expr::Subscript { base, index } => 1 + qual_cost(base, cols) + qual_cost(index, cols),
+        Expr::Unary { operator: UnaryOp::Not, operand } => qual_cost(operand, columns),
+        Expr::Unary { operand, .. } => 1 + qual_cost(operand, columns),
+        Expr::IsNull { operand, .. } => 1 + qual_cost(operand, columns),
+        Expr::Cast { operand, .. } => 1 + qual_cost(operand, columns),
+        Expr::Field { base, .. } => qual_cost(base, columns),
+        Expr::Subscript { base, index } => 1 + qual_cost(base, columns) + qual_cost(index, columns),
         Expr::InList { operand, list, .. } => {
             // PostgreSQL expands `x IN (a, b, ...)` to `x=a OR x=b OR ...`, one
             // comparison per element, so the cost grows with the list length.
             list.len() as u32
-                + qual_cost(operand, cols)
-                + list.iter().map(|e| qual_cost(e, cols)).sum::<u32>()
+                + qual_cost(operand, columns)
+                + list.iter().map(|e| qual_cost(e, columns)).sum::<u32>()
         }
         Expr::Between { operand, low, high, .. } => {
-            2 + qual_cost(operand, cols) + qual_cost(low, cols) + qual_cost(high, cols)
+            2 + qual_cost(operand, columns) + qual_cost(low, columns) + qual_cost(high, columns)
         }
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            1 + qual_cost(operand, cols) + qual_cost(pattern, cols)
+            1 + qual_cost(operand, columns) + qual_cost(pattern, columns)
         }
         Expr::AnyAll { operand, array, .. } => {
-            1 + qual_cost(operand, cols) + qual_cost(array, cols)
+            1 + qual_cost(operand, columns) + qual_cost(array, columns)
         }
-        Expr::Call { args, .. } => 1 + args.iter().map(|e| qual_cost(e, cols)).sum::<u32>(),
-        Expr::Array(elems) => elems.iter().map(|e| qual_cost(e, cols)).sum::<u32>(),
+        Expr::Call { args, .. } => 1 + args.iter().map(|e| qual_cost(e, columns)).sum::<u32>(),
+        Expr::Array(elems) => elems.iter().map(|e| qual_cost(e, columns)).sum::<u32>(),
         Expr::Case { operand, whens, otherwise } => {
-            let mut c = operand.map_or(0, |o| qual_cost(o, cols));
+            let mut c = operand.map_or(0, |o| qual_cost(o, columns));
             for (w, t) in *whens {
-                c += 1 + qual_cost(w, cols) + qual_cost(t, cols);
+                c += 1 + qual_cost(w, columns) + qual_cost(t, columns);
             }
-            c + otherwise.map_or(0, |o| qual_cost(o, cols))
+            c + otherwise.map_or(0, |o| qual_cost(o, columns))
         }
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
         | Expr::ArraySubquery(_) => 1000,
@@ -3911,10 +3911,10 @@ fn qual_cost(e: &Expr, cols: &dyn super::exec::ColTypeResolver) -> u32 {
 /// float/numeric (a cast PostgreSQL charges). True when one side is an integer
 /// expression that is not a compile-time constant and the other side resolves
 /// to float/numeric.
-fn widening_cast(l: &Expr, r: &Expr, cols: &dyn super::exec::ColTypeResolver) -> bool {
+fn widening_cast(l: &Expr, r: &Expr, columns: &dyn super::exec::ColTypeResolver) -> bool {
     use super::exec::infer_type_res;
     use super::types::oid;
-    let ty = |e: &Expr| infer_type_res(e, cols).map(|(o, _)| o).unwrap_or(oid::UNKNOWN);
+    let ty = |e: &Expr| infer_type_res(e, columns).map(|(o, _)| o).unwrap_or(oid::UNKNOWN);
     let wide = |o: i32| matches!(o, oid::FLOAT8 | oid::FLOAT4 | oid::NUMERIC);
     let narrow = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8);
     let (lt, rt) = (ty(l), ty(r));
@@ -3937,13 +3937,13 @@ pub fn set_query<'a>(
     resp: &mut Responder,
 ) -> Outcome {
     // Column names + types from the first leaf, unified across every leaf.
-    let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = match describe_set_body(storage, q.body, txid, &mut cols, arena) {
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let n_cols = match describe_set_body(storage, q.body, txid, &mut columns, arena) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
     let mut target = [ColType::Bool; MAX_PROJ];
-    for (c, col) in cols[..n_cols].iter().enumerate() {
+    for (c, col) in columns[..n_cols].iter().enumerate() {
         target[c] = super::exec::coltype_of_oid(col.type_oid).unwrap_or(ColType::Text);
     }
 
@@ -3954,7 +3954,7 @@ pub fn set_query<'a>(
     };
 
     // ORDER BY (by output column position or name), then LIMIT/OFFSET.
-    if let Err(e) = sort_set_rows(rows, q.order_by, &cols[..n_cols]) {
+    if let Err(e) = sort_set_rows(rows, q.order_by, &columns[..n_cols]) {
         return sql_fail(e);
     }
     let limit = match super::exec::eval_limit_pub(q.limit, arena, params) {
@@ -3966,7 +3966,7 @@ pub fn set_query<'a>(
         Err(e) => return sql_fail(e),
     };
 
-    resp.row_description(&cols[..n_cols])?;
+    resp.row_description(&columns[..n_cols])?;
     let mut emitted = 0u64;
     for (i, row) in rows.iter().enumerate() {
         if (i as u64) < offset {
@@ -4016,14 +4016,14 @@ fn describe_leaf<'a>(
     storage: &'a Storage,
     s: &'a Select<'a>,
     txid: u32,
-    cols: &mut [ColDesc<'a>],
+    columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
     match &s.from {
-        None => super::exec::describe_items(s.items, None, cols),
+        None => super::exec::describe_items(s.items, None, columns),
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(s.items, &scope, cols)
+            describe_scope_items(s.items, &scope, columns)
         }
     }
 }
@@ -4054,31 +4054,31 @@ fn eval_set_tree<'a>(
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
         SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, target),
-        SetTree::Op { op, all, left, right } => {
+        SetTree::Op { operator, all, left, right } => {
             let l = eval_set_tree(left, storage, txid, arena, params, target)?;
             let r = eval_set_tree(right, storage, txid, arena, params, target)?;
-            combine_sets(*op, *all, l, r, arena)
+            combine_sets(*operator, *all, l, r, arena)
         }
     }
 }
 
 /// Describes a set-operation body: column names/types come from the first leaf,
 /// then each column's type is unified across every leaf (same count required).
-/// On success `cols[..n]` carries the final unified OIDs/lengths. Shared by the
+/// On success `columns[..n]` carries the final unified OIDs/lengths. Shared by the
 /// derived-table, subquery, and INSERT-source paths.
 fn describe_set_body<'a>(
     storage: &'a Storage,
     tree: &'a SetTree<'a>,
     txid: u32,
-    cols: &mut [ColDesc<'a>],
+    columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
     let mut leaves: [Option<&Select>; MAX_SET_LEAVES] = [None; MAX_SET_LEAVES];
     let mut n_leaves = 0;
     collect_set_leaves(tree, &mut leaves, &mut n_leaves)?;
-    let n_cols = describe_leaf(storage, leaves[0].expect(">=1 leaf"), txid, cols, arena)?;
+    let n_cols = describe_leaf(storage, leaves[0].expect(">=1 leaf"), txid, columns, arena)?;
     let mut target = [ColType::Bool; MAX_PROJ];
-    for (c, col) in cols[..n_cols].iter().enumerate() {
+    for (c, col) in columns[..n_cols].iter().enumerate() {
         target[c] = super::exec::coltype_of_oid(col.type_oid).unwrap_or(ColType::Text);
     }
     for leaf in leaves[1..n_leaves].iter() {
@@ -4105,7 +4105,7 @@ fn describe_set_body<'a>(
             }
         }
     }
-    for (c, col) in cols[..n_cols].iter_mut().enumerate() {
+    for (c, col) in columns[..n_cols].iter_mut().enumerate() {
         col.type_oid = target[c].oid();
         col.typlen = target[c].typlen();
     }
@@ -4125,11 +4125,11 @@ fn materialize_set_body<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<MaterializedSet<'a>, SqlError> {
-    let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = describe_set_body(storage, tree, txid, &mut cols, arena)?;
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let n = describe_set_body(storage, tree, txid, &mut columns, arena)?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
     for c in 0..n {
-        tgt[c] = super::exec::coltype_of_oid(cols[c].type_oid).unwrap_or(ColType::Text);
+        tgt[c] = super::exec::coltype_of_oid(columns[c].type_oid).unwrap_or(ColType::Text);
     }
     let target = arena.alloc_slice_copy(&tgt[..n]).map_err(|_| arena_full())?;
     let rows = eval_set_tree(tree, storage, txid, arena, params, target)?;
@@ -4175,7 +4175,7 @@ fn eval_set_leaf<'a>(
 /// Combines two encoded-row multisets. Both inputs are sorted here (set ops are
 /// unordered until the final ORDER BY), then merged by equal runs.
 fn combine_sets<'a>(
-    op: SetOp,
+    operator: SetOp,
     all: bool,
     l: &'a mut [&'a [u8]],
     r: &'a mut [&'a [u8]],
@@ -4194,7 +4194,7 @@ fn combine_sets<'a>(
             n += 1;
         }
     };
-    match op {
+    match operator {
         SetOp::Union if all => {
             for &row in l.iter().chain(r.iter()) {
                 push(row, 1);
@@ -4238,7 +4238,7 @@ fn combine_sets<'a>(
                     chained_row += 1;
                     j += 1;
                 }
-                let times = match (op, all) {
+                let times = match (operator, all) {
                     (SetOp::Intersect, true) => cl.min(chained_row),
                     (SetOp::Intersect, false) => usize::from(chained_row > 0),
                     (SetOp::Except, true) => cl.saturating_sub(chained_row),
@@ -4258,7 +4258,7 @@ fn combine_sets<'a>(
 fn sort_set_rows(
     rows: &mut [&[u8]],
     order_by: &[super::ast::OrderBy],
-    cols: &[ColDesc],
+    columns: &[ColDesc],
 ) -> Result<(), SqlError> {
     if order_by.is_empty() {
         return Ok(());
@@ -4268,9 +4268,9 @@ fn sort_set_rows(
     let mut nk = 0;
     for ob in order_by {
         let index = match ob.expression {
-            Expr::Int(n) if *n >= 1 && (*n as usize) <= cols.len() => (*n as usize) - 1,
+            Expr::Int(n) if *n >= 1 && (*n as usize) <= columns.len() => (*n as usize) - 1,
             Expr::Column { name, qualifier: None } => {
-                match cols.iter().position(|c| c.name == *name) {
+                match columns.iter().position(|c| c.name == *name) {
                     Some(i) => i,
                     None => {
                         return Err(sql_err!(
@@ -4339,8 +4339,8 @@ pub fn constant_select<'a>(
     if let Err(e) = check_select_constants(statement, arena) {
         return sql_fail(e);
     }
-    let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = match describe_items(statement.items, None, &mut cols) {
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let n = match describe_items(statement.items, None, &mut columns) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -4369,7 +4369,7 @@ pub fn constant_select<'a>(
             Err(e) => return sql_fail(e),
         },
     };
-    resp.row_description(&cols[..n])?;
+    resp.row_description(&columns[..n])?;
     let mut rows = 0u64;
     for k in 1..=count {
         let khooks = if srf_call.is_some() {
@@ -5588,7 +5588,7 @@ fn table_func_def<'a>(
         let args = tref.func_args.unwrap_or(&[]);
         match args.first() {
             Some(e) => match super::eval::eval(e, arena, params, &super::eval::NoColumns)? {
-                Datum::Array { elem, .. } => elem.to_coltype(),
+                Datum::Array { element, .. } => element.to_coltype(),
                 _ => ColType::Text,
             },
             None => ColType::Text,
@@ -5617,8 +5617,8 @@ fn table_func_rows<'a>(
     let args = tref.func_args.expect("table function carries arguments");
     // unnest(array): one row per element.
     if tref.table.eq_ignore_ascii_case("unnest") {
-        let (elem, raw) = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
-            Datum::Array { elem, raw } => (elem, raw),
+        let (element, raw) = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Array { element, raw } => (element, raw),
             Datum::Null => return Ok(&[]),
             _ => return Err(sql_err!("42883", "unnest requires an array argument")),
         };
@@ -5626,7 +5626,7 @@ fn table_func_rows<'a>(
         const EMPTY: &[u8] = &[];
         let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
         for (i, slot) in rows.iter_mut().enumerate() {
-            let v = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+            let v = super::array::get(raw, element, i).unwrap_or(Datum::Null);
             *slot = super::exec::encode_projected_pub(&[v], arena)?;
         }
         return Ok(&*rows);

@@ -360,6 +360,14 @@ pub fn eval_full<'a>(
         Expr::Binary { op, left, right } => {
             let l = eval_full(left, arena, params, row, hooks)?;
             let r = eval_full(right, arena, params, row, hooks)?;
+            // `array || NULL` resolution depends on the NULL operand's static
+            // type, which the datum has lost — resolve it here where the
+            // expression is still available.
+            if op == BinaryOp::Concat
+                && let Some(d) = array_null_concat(l, r, left, right, row, arena)?
+            {
+                return Ok(d);
+            }
             // Track which side is an "unknown" literal (a string literal or a
             // parameter): only those coerce to the other operand's type, as
             // PostgreSQL does. A real text value never coerces to a number.
@@ -3137,7 +3145,7 @@ fn binary<'a>(
     use BinaryOp::*;
     match op {
         And | Or => logic(op, l, r),
-        Concat => concat(l, r, arena),
+        Concat => concat(l, r, l_unknown, r_unknown, arena),
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(op, l, r),
             _ => compare(op, l, r, l_unknown, r_unknown),
@@ -3392,14 +3400,69 @@ fn logic<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlE
     Ok(out.map_or(Datum::Null, Datum::Bool))
 }
 
-fn concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+/// Resolves `array || NULL` / `NULL || array`, which PostgreSQL decides from
+/// the NULL operand's static type: an untyped NULL or a NULL of the array type
+/// is the identity (returns the array), a NULL of the element type appends a
+/// NULL element, and any other type is an undefined operator. Returns `None`
+/// when this is not an array-with-NULL concatenation (fall through to `concat`).
+fn array_null_concat<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    arena: &'a Arena,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let (arr, elem, null_expr) = match (l, r) {
+        (Datum::Array { elem, .. }, Datum::Null) => (l, elem, right),
+        (Datum::Null, Datum::Array { elem, .. }) => (r, elem, left),
+        _ => return Ok(None),
+    };
+    match static_type(null_expr, row) {
+        // Untyped NULL or a NULL of the array type: identity.
+        None | Some(ColType::Array(_)) => Ok(Some(arr)),
+        // NULL of the element type: append/prepend a NULL element.
+        Some(t) if super::types::ArrElem::from_coltype(t) == Some(elem) => {
+            Ok(Some(array_concat(l, r, arena)?))
+        }
+        Some(t) => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {}[] || {}",
+            elem.to_coltype().name(),
+            t.name()
+        )),
+    }
+}
+
+fn concat<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    l_unknown: bool,
+    r_unknown: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
     // `||` on arrays concatenates: array||array, and array||element or
-    // element||array append/prepend the element.
-    if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) {
-        return array_concat(l, r, arena);
+    // element||array append/prepend the element. An *unknown literal* on the
+    // scalar side is resolved as array||array (PostgreSQL casts it to the array
+    // type), so it is parsed as an array literal and errors if malformed —
+    // matching `ARRAY['a','b'] || 'c'` (error) vs `|| 'c'::text` (append).
+    let arr_elem = match (&l, &r) {
+        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => Some(*elem),
+        _ => None,
+    };
+    if let Some(elem) = arr_elem {
+        let coerce = |d: Datum<'a>, unknown: bool| -> Result<Datum<'a>, SqlError> {
+            match d {
+                Datum::Text(s) if unknown => {
+                    Ok(Datum::Array { elem, raw: super::array::parse_literal(s, elem, arena)? })
+                }
+                other => Ok(other),
+            }
+        };
+        return array_concat(coerce(l, l_unknown)?, coerce(r, r_unknown)?, arena);
     }
     let left = cast_to_text(l, arena)?;
     let right = cast_to_text(r, arena)?;

@@ -7,7 +7,7 @@ series as the phase that finds or fixes the bug.
 
 See [docs/terminology.md](docs/terminology.md) for the glossary and naming
 rules; architecture is in [README.md](README.md), the roadmap in
-[PLAN.md](PLAN.md).
+[PLAN.md](PLAN.md), and standing directives in [AGENTS.md](AGENTS.md).
 
 | ID | Status | Found | Description | Repro | Fixed in |
 |----|--------|-------|-------------|-------|----------|

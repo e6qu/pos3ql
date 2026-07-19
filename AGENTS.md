@@ -2,6 +2,10 @@
 
 Instructions for any agent (human or AI) working in this repository.
 
+**Project documents** (all cross-linked): [README.md](README.md) — architecture
+and quick start · [PLAN.md](PLAN.md) — roadmap · [BUGS.md](BUGS.md) — known bugs
+· [docs/terminology.md](docs/terminology.md) — glossary and naming rules.
+
 ## The Boyscout Rule — HARD RULE, ALWAYS IN EFFECT
 
 **Leave every file better than you found it. If you encounter something broken — anything — you fix it, even if it looks unrelated to the task at hand.**

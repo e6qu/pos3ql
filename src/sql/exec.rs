@@ -79,15 +79,15 @@ pub fn create_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    stmt: &CreateTable,
+    statement: &CreateTable,
     arena: &Arena,
     resp: &mut Responder,
 ) -> Outcome {
-    let mut def = match build_def(stmt.name, stmt.columns, arena) {
+    let mut def = match build_def(statement.name, statement.columns, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    if let Err(e) = attach_constraints(storage, &mut def, stmt.constraints, txn.txid, arena) {
+    if let Err(e) = attach_constraints(storage, &mut def, statement.constraints, txn.txid, arena) {
         return sql_fail(e);
     }
     match storage.create_table_in(def, txn.txid) {
@@ -103,10 +103,10 @@ pub fn create_table(
                 return sql_fail(e);
             }
         }
-        Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && stmt.if_not_exists => {
+        Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
             resp.notice(
                 "42P07",
-                stack_format!(128, "relation \"{}\" already exists, skipping", stmt.name).as_str(),
+                stack_format!(128, "relation \"{}\" already exists, skipping", statement.name).as_str(),
             )?;
         }
         Err(e) => return sql_fail(e),
@@ -773,9 +773,9 @@ fn handle_conflict(
             .and_then(|s| s.visible_to(txn.txid))
             .ok_or_else(|| sql_err!("XX000", "conflict row vanished"))?;
         rowenc::decode(storage.heap.get(loc), schema, &mut existing)?;
-        let ctx = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
+        let context = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
         if let Some(cond) = oc.update_where
-            && !matches!(eval(cond, arena, params, &ctx)?, Datum::Bool(true))
+            && !matches!(eval(cond, arena, params, &context)?, Datum::Bool(true))
         {
             return Ok(ConflictOutcome::Skip); // WHERE excluded this row
         }
@@ -790,7 +790,7 @@ fn handle_conflict(
                     def.name.as_str()
                 ));
             };
-            let v = eval(expr, arena, params, &ctx)?;
+            let v = eval(expr, arena, params, &context)?;
             new_values[target] = coerce(v, &def.columns()[target], arena)?;
         }
         check_not_null(def, &new_values)?;
@@ -1059,10 +1059,10 @@ fn check_row_checks(
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
-    let ctx = RowCtx { def, values };
+    let context = RowCtx { def, values };
     for (i, c) in def.checks().iter().enumerate() {
         let Some(expr) = checks[i] else { continue };
-        if matches!(eval(expr, arena, params, &ctx)?, Datum::Bool(false)) {
+        if matches!(eval(expr, arena, params, &context)?, Datum::Bool(false)) {
             return Err(sql_err!(
                 "23514",
                 "new row for relation \"{}\" violates check constraint \"{}\"",
@@ -1255,21 +1255,21 @@ pub fn drop_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    stmt: &DropTable,
+    statement: &DropTable,
     resp: &mut Responder,
 ) -> Outcome {
-    match storage.find_visible(stmt.name, txn.txid) {
+    match storage.find_visible(statement.name, txn.txid) {
         Some(index) => {
             if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
                 let _ = other;
                 return sql_fail(sql_err!(
                     "40001",
                     "could not serialize access due to concurrent DDL on \"{}\"",
-                    stmt.name
+                    statement.name
                 ));
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::DropTable(stmt.name)) {
+            if let Err(e) = wal.append(lsn, &WalOp::DropTable(statement.name)) {
                 return sql_fail(e);
             }
             if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(index as u32)) {
@@ -1278,15 +1278,15 @@ pub fn drop_table(
             storage.drop_table_in(index, txn.txid);
             // A table's indexes are dropped with it (no separate journal record;
             // DropTable replay re-applies this).
-            storage.drop_indexes_for(stmt.name);
+            storage.drop_indexes_for(statement.name);
         }
-        None if stmt.if_exists => {
+        None if statement.if_exists => {
             resp.notice(
                 sqlstate::UNDEFINED_TABLE,
-                stack_format!(128, "table \"{}\" does not exist, skipping", stmt.name).as_str(),
+                stack_format!(128, "table \"{}\" does not exist, skipping", statement.name).as_str(),
             )?;
         }
-        None => return sql_fail(undefined_table(stmt.name)),
+        None => return sql_fail(undefined_table(statement.name)),
     }
     resp.command_complete("DROP TABLE")?;
     sql_ok()
@@ -1307,9 +1307,9 @@ pub fn create_view(
     resp: &mut Responder,
 ) -> Outcome {
     use core::fmt::Write;
-    let mut buf = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
-    let _ = write!(buf, "{sql}");
-    if buf.is_truncated() {
+    let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+    let _ = write!(buffer, "{sql}");
+    if buffer.is_truncated() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "view definition exceeds {} bytes",
@@ -1318,14 +1318,14 @@ pub fn create_view(
     }
     // Validate the definition now (tables/views exist, columns resolve), as
     // PostgreSQL does at CREATE VIEW time.
-    if let Err(e) = super::query::validate_view(buf.as_str(), storage, arena) {
+    if let Err(e) = super::query::validate_view(buffer.as_str(), storage, arena) {
         return sql_fail(e);
     }
     let sqlname = match SqlName::parse(name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    match storage.create_view(sqlname, buf, or_replace) {
+    match storage.create_view(sqlname, buffer, or_replace) {
         Ok((new_slot, old_slot)) => {
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(lsn, &WalOp::CreateView { name, sql }) {
@@ -1517,13 +1517,13 @@ pub fn drop_index(
 pub fn insert(
     storage: &mut Storage,
     txn: &mut TxnState,
-    stmt: &Insert,
+    statement: &Insert,
     arena: &Arena,
     params: &[Datum],
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(stmt.table, txn.txid) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
     let checks = match parse_checks(&def, arena) {
@@ -1533,30 +1533,30 @@ pub fn insert(
 
     // Column list → target indices.
     let mut targets = [0usize; MAX_COLUMNS];
-    let n_targets = if stmt.columns.is_empty() {
+    let n_targets = if statement.columns.is_empty() {
         for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
             *t = i;
         }
         def.n_columns
     } else {
-        for (i, name) in stmt.columns.iter().enumerate() {
+        for (i, name) in statement.columns.iter().enumerate() {
             let Some(col) = def.column_index(name) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" of relation \"{}\" does not exist",
                     name,
-                    stmt.table
+                    statement.table
                 ));
             };
             targets[i] = col;
         }
-        stmt.columns.len()
+        statement.columns.len()
     };
 
     // RETURNING sends its RowDescription before any rows.
-    if !stmt.returning.is_empty() {
+    if !statement.returning.is_empty() {
         let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(stmt.returning, Some(&def), &mut cols) {
+        match describe_items(statement.returning, Some(&def), &mut cols) {
             Ok(n) => resp.row_description(&cols[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -1565,7 +1565,7 @@ pub fn insert(
     // INSERT ... SELECT: materialize the source rows into the arena first
     // (reading storage immutably), then insert them (mutably) — the source may
     // read the very table being written, so the two phases must not overlap.
-    if let Some(sel) = stmt.select {
+    if let Some(sel) = statement.select {
         // Pass 1: count.
         let mut count = 0usize;
         if let Err(e) = super::query::select_into_rows(
@@ -1627,7 +1627,7 @@ pub fn insert(
             {
                 let mut sch = [ColType::Bool; MAX_COLUMNS];
                 def.schema(&mut sch);
-                match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &stmt.on_conflict, &checks, arena, params) {
+                match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &checks, arena, params) {
                     Ok(ConflictOutcome::Store) => {}
                     Ok(ConflictOutcome::Skip) => continue,
                     Ok(ConflictOutcome::Updated) => { inserted += 1; continue; }
@@ -1653,8 +1653,8 @@ pub fn insert(
             if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
                 return sql_fail(e);
             }
-            if !stmt.returning.is_empty()
-                && let Err(e) = emit_projected(&def, &values[..def.n_columns], stmt.returning, arena, params, resp)? {
+            if !statement.returning.is_empty()
+                && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, resp)? {
                     return sql_fail(e);
                 }
             inserted += 1;
@@ -1665,7 +1665,7 @@ pub fn insert(
     }
 
     let mut inserted = 0u64;
-    for row_exprs in stmt.rows {
+    for row_exprs in statement.rows {
         if row_exprs.len() > n_targets {
             return sql_fail(sql_err!(
                 sqlstate::SYNTAX_ERROR,
@@ -1701,7 +1701,7 @@ pub fn insert(
         {
             let mut sch = [ColType::Bool; MAX_COLUMNS];
             def.schema(&mut sch);
-            match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &stmt.on_conflict, &checks, arena, params) {
+            match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &checks, arena, params) {
                 Ok(ConflictOutcome::Store) => {}
                 Ok(ConflictOutcome::Skip) => continue,
                 Ok(ConflictOutcome::Updated) => { inserted += 1; continue; }
@@ -1727,8 +1727,8 @@ pub fn insert(
         if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
             return sql_fail(e);
         }
-        if !stmt.returning.is_empty()
-            && let Err(e) = emit_projected(&def, &values[..def.n_columns], stmt.returning, arena, params, resp)? {
+        if !statement.returning.is_empty()
+            && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, resp)? {
                 return sql_fail(e);
             }
         inserted += 1;
@@ -1747,18 +1747,18 @@ fn emit_projected(
     params: &[Datum],
     resp: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
-    let ctx = RowCtx { def, values };
+    let context = RowCtx { def, values };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0;
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                for v in ctx.values {
+                for v in context.values {
                     projected[n] = *v;
                     n += 1;
                 }
             }
-            SelectItem::Expr { expr, .. } => match eval(expr, arena, params, &ctx) {
+            SelectItem::Expr { expr, .. } => match eval(expr, arena, params, &context) {
                 Ok(v) => {
                     projected[n] = v;
                     n += 1;
@@ -1775,13 +1775,13 @@ pub fn update(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowLoc)>,
-    stmt: &Update,
+    statement: &Update,
     arena: &Arena,
     params: &[Datum],
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(stmt.table, txn.txid) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
     let checks = match parse_checks(&def, arena) {
@@ -1794,20 +1794,20 @@ pub fn update(
 
     // Resolve assignment targets once.
     let mut targets = [0usize; MAX_COLUMNS];
-    for (i, (name, _)) in stmt.assignments.iter().enumerate() {
+    for (i, (name, _)) in statement.assignments.iter().enumerate() {
         let Some(col) = def.column_index(name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" of relation \"{}\" does not exist",
                 name,
-                stmt.table
+                statement.table
             ));
         };
         targets[i] = col;
     }
 
     let subs = match super::query::subquery_hooks(
-        &[stmt.where_clause],
+        &[statement.where_clause],
         storage,
         txn.txid,
         arena,
@@ -1817,18 +1817,18 @@ pub fn update(
         Err(e) => return sql_fail(e),
     };
     let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
-    let collect = if let Some(from) = stmt.from {
-        collect_join_matches(storage, table_index, &def, schema, from, stmt.where_clause, arena, params, txn.txid, scratch)
+    let collect = if let Some(from) = statement.from {
+        collect_join_matches(storage, table_index, &def, schema, from, statement.where_clause, arena, params, txn.txid, scratch)
     } else {
-        collect_matches(storage, table_index, txn.txid, schema, stmt.where_clause, arena, params, &hooks, scratch)
+        collect_matches(storage, table_index, txn.txid, schema, statement.where_clause, arena, params, &hooks, scratch)
     };
     if let Err(e) = collect {
         return sql_fail(e);
     }
 
-    if !stmt.returning.is_empty() {
+    if !statement.returning.is_empty() {
         let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(stmt.returning, Some(&def), &mut cols) {
+        match describe_items(statement.returning, Some(&def), &mut cols) {
             Ok(n) => resp.row_description(&cols[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -1846,15 +1846,15 @@ pub fn update(
             }
             let mut new_values = [Datum::Null; MAX_COLUMNS];
             new_values[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
-            let ctx = RowCtx { def: &def, values: &values[..def.n_columns] };
-            if let Some(from) = stmt.from {
+            let context = RowCtx { def: &def, values: &values[..def.n_columns] };
+            if let Some(from) = statement.from {
                 // UPDATE ... FROM: evaluate the assignments against the target
                 // row joined with the first matching FROM row.
                 let mut set_err: Option<SqlError> = None;
                 let r = super::query::first_from_match(
-                    storage, from, txn.txid, stmt.where_clause, arena, params, &ctx,
+                    storage, from, txn.txid, statement.where_clause, arena, params, &context,
                     &mut |combined| {
-                        for (a, (_, expr)) in stmt.assignments.iter().enumerate() {
+                        for (a, (_, expr)) in statement.assignments.iter().enumerate() {
                             let v = eval(expr, arena, params, &combined)?;
                             new_values[targets[a]] = coerce(v, &def.columns()[targets[a]], arena)?;
                         }
@@ -1869,8 +1869,8 @@ pub fn update(
                     return sql_fail(e);
                 }
             } else {
-                for (a, (_, expr)) in stmt.assignments.iter().enumerate() {
-                    let v = match eval(expr, arena, params, &ctx) {
+                for (a, (_, expr)) in statement.assignments.iter().enumerate() {
+                    let v = match eval(expr, arena, params, &context) {
                         Ok(v) => v,
                         Err(e) => return sql_fail(e),
                     };
@@ -1903,13 +1903,13 @@ pub fn update(
             // it (NO ACTION / RESTRICT).
             if referenced_key_changed(
                 storage,
-                stmt.table,
+                statement.table,
                 &values[..def.n_columns],
                 &new_values[..def.n_columns],
                 txn.txid,
             ) && let Err(e) = check_fk_parent_referenced(
                 storage,
-                stmt.table,
+                statement.table,
                 &values[..def.n_columns],
                 txn.txid,
             ) {
@@ -1942,7 +1942,7 @@ pub fn update(
             }
             Err(e) => return sql_fail(e),
         }
-        if !stmt.returning.is_empty() {
+        if !statement.returning.is_empty() {
             let mut new_values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(storage.heap.get(new_loc), schema, &mut new_values) {
                 return sql_fail(e);
@@ -1950,7 +1950,7 @@ pub fn update(
             if let Err(e) = emit_projected(
                 &def,
                 &new_values[..def.n_columns],
-                stmt.returning,
+                statement.returning,
                 arena,
                 params,
                 resp,
@@ -1969,13 +1969,13 @@ pub fn delete(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowLoc)>,
-    stmt: &Delete,
+    statement: &Delete,
     arena: &Arena,
     params: &[Datum],
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(stmt.table, txn.txid) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -1983,7 +1983,7 @@ pub fn delete(
     let schema = &schema[..def.n_columns];
 
     let subs = match super::query::subquery_hooks(
-        &[stmt.where_clause],
+        &[statement.where_clause],
         storage,
         txn.txid,
         arena,
@@ -1993,25 +1993,25 @@ pub fn delete(
         Err(e) => return sql_fail(e),
     };
     let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
-    let collect = if let Some(using) = stmt.using {
-        collect_join_matches(storage, table_index, &def, schema, using, stmt.where_clause, arena, params, txn.txid, scratch)
+    let collect = if let Some(using) = statement.using {
+        collect_join_matches(storage, table_index, &def, schema, using, statement.where_clause, arena, params, txn.txid, scratch)
     } else {
-        collect_matches(storage, table_index, txn.txid, schema, stmt.where_clause, arena, params, &hooks, scratch)
+        collect_matches(storage, table_index, txn.txid, schema, statement.where_clause, arena, params, &hooks, scratch)
     };
     if let Err(e) = collect {
         return sql_fail(e);
     }
-    if !stmt.returning.is_empty() {
+    if !statement.returning.is_empty() {
         let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(stmt.returning, Some(&def), &mut cols) {
+        match describe_items(statement.returning, Some(&def), &mut cols) {
             Ok(n) => resp.row_description(&cols[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
-    let referenced = table_is_referenced(storage, stmt.table, txn.txid);
+    let referenced = table_is_referenced(storage, statement.table, txn.txid);
     for i in 0..scratch.len() {
         let (rowid, old_loc) = scratch[i];
-        if !stmt.returning.is_empty() || referenced {
+        if !statement.returning.is_empty() || referenced {
             let mut old_values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(storage.heap.get(old_loc), schema, &mut old_values) {
                 return sql_fail(e);
@@ -2021,18 +2021,18 @@ pub fn delete(
             if referenced
                 && let Err(e) = check_fk_parent_referenced(
                     storage,
-                    stmt.table,
+                    statement.table,
                     &old_values[..def.n_columns],
                     txn.txid,
                 )
             {
                 return sql_fail(e);
             }
-            if !stmt.returning.is_empty()
+            if !statement.returning.is_empty()
                 && let Err(e) = emit_projected(
                     &def,
                     &old_values[..def.n_columns],
-                    stmt.returning,
+                    statement.returning,
                     arena,
                     params,
                     resp,
@@ -2065,12 +2065,12 @@ pub fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
     scratch: &mut FixedVec<(u64, RowLoc)>,
-    stmt: &AlterTable,
+    statement: &AlterTable,
     arena: &Arena,
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_table(stmt.table) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_table(statement.table) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
 
@@ -2084,7 +2084,7 @@ pub fn alter_table(
         return sql_fail(sql_err!(
             "55P03",
             "table \"{}\" has uncommitted changes; retry when idle",
-            stmt.table
+            statement.table
         ));
     }
 
@@ -2092,7 +2092,7 @@ pub fn alter_table(
     let mut new_def = def;
     let mut added: Option<(usize, Datum)> = None; // (index, fill value)
     let mut dropped: Option<usize> = None;
-    match &stmt.action {
+    match &statement.action {
         AlterAction::RenameTable(new_name) => {
             if storage.find_table(new_name).is_some() {
                 return sql_fail(sql_err!(
@@ -2148,7 +2148,7 @@ pub fn alter_table(
                         sqlstate::NOT_NULL_VIOLATION,
                         "column \"{}\" of relation \"{}\" contains null values",
                         c.name,
-                        stmt.table
+                        statement.table
                     ))
                 }
                 None => Datum::Null,
@@ -2232,7 +2232,7 @@ pub fn alter_table(
                     }
                 }
                 let len = rowenc::encoded_len(&out[..n_out]);
-                let buf = match arena.alloc_slice_with(len, |_| 0u8) {
+                let buffer = match arena.alloc_slice_with(len, |_| 0u8) {
                     Ok(b) => b,
                     Err(_) => {
                         return sql_fail(sql_err!(
@@ -2241,8 +2241,8 @@ pub fn alter_table(
                         ))
                     }
                 };
-                rowenc::encode(&out[..n_out], buf);
-                &*buf
+                rowenc::encode(&out[..n_out], buffer);
+                &*buffer
             };
             let (loc, slice) = match storage.heap.append(new_bytes.len()) {
                 Ok(x) => x,
@@ -3300,8 +3300,8 @@ fn row_matches<'a>(
     };
     let mut values = [Datum::Null; MAX_COLUMNS];
     rowenc::decode(storage.heap.get(loc), schema, &mut values)?;
-    let ctx = RowCtx { def, values: &values[..def.n_columns] };
-    match super::eval::eval_full(w, arena, params, &ctx, hooks)? {
+    let context = RowCtx { def, values: &values[..def.n_columns] };
+    match super::eval::eval_full(w, arena, params, &context, hooks)? {
         Datum::Bool(true) => Ok(true),
         Datum::Bool(false) | Datum::Null => Ok(false),
         _ => Err(sql_err!(
@@ -3366,9 +3366,9 @@ fn collect_join_matches<'a>(
         };
         let mut tv = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(storage.heap.get(loc), schema, &mut tv)?;
-        let ctx = RowCtx { def, values: &tv[..def.n_columns] };
+        let context = RowCtx { def, values: &tv[..def.n_columns] };
         let found = super::query::first_from_match(
-            storage, from, txid, where_clause, arena, params, &ctx, &mut |_| Ok(()),
+            storage, from, txid, where_clause, arena, params, &context, &mut |_| Ok(()),
         )?;
         if found {
             scratch.push((rowid, loc)).map_err(|_| {
@@ -3480,11 +3480,11 @@ fn bpchar_fit<'a>(
     }
     // Blank-pad to n characters (a space is one byte).
     let total = s.len() + (n - clen);
-    let buf = arena
+    let buffer = arena
         .alloc_slice_with(total, |_| b' ')
         .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "padded value too large"))?;
-    buf[..s.len()].copy_from_slice(s.as_bytes());
-    Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buf) }))
+    buffer[..s.len()].copy_from_slice(s.as_bytes());
+    Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buffer) }))
 }
 
 pub fn apply_typmod<'a>(

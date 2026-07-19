@@ -161,20 +161,20 @@ fn alloc<'a>(arena: &'a Arena, s: &str) -> Result<&'a str, SqlError> {
     arena.alloc_str(s).map_err(|_| sql_err!("53200", "out of memory"))
 }
 
-/// Increments a discrete bound value by one (int/date) into `buf`.
-fn incr_into(v: &str, kind: RangeKind, buf: &mut StackStr<48>) -> Result<(), SqlError> {
-    buf.clear();
+/// Increments a discrete bound value by one (int/date) into `buffer`.
+fn incr_into(v: &str, kind: RangeKind, buffer: &mut StackStr<48>) -> Result<(), SqlError> {
+    buffer.clear();
     match kind {
         RangeKind::Int4 | RangeKind::Int8 => {
             let n: i64 = v.trim().parse().map_err(|_| bad(kind, v))?;
-            let _ = write!(buf, "{}", n + 1);
+            let _ = write!(buffer, "{}", n + 1);
         }
         RangeKind::Date => {
             let d = super::datetime::parse_date(v.trim())?;
-            let _ = write!(buf, "{}", super::datetime::format_date(d + 1).as_str());
+            let _ = write!(buffer, "{}", super::datetime::format_date(d + 1).as_str());
         }
         _ => {
-            let _ = write!(buf, "{}", v);
+            let _ = write!(buffer, "{}", v);
         }
     }
     Ok(())

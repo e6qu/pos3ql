@@ -22,28 +22,28 @@ const ENTRY_LEN: usize = 8 + 8 + 4 + 4 + 8; // view, op, client, request, value
 pub const MAX_ENCODED: usize = 4 + 1 + 2 + 8 * 4 + 2 + MAX_LOG * ENTRY_LEN;
 
 struct Writer<'a> {
-    buf: &'a mut [u8],
+    buffer: &'a mut [u8],
     at: usize,
 }
 
 impl<'a> Writer<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, at: 0 }
+    fn new(buffer: &'a mut [u8]) -> Self {
+        Self { buffer, at: 0 }
     }
     fn u8(&mut self, v: u8) {
-        self.buf[self.at] = v;
+        self.buffer[self.at] = v;
         self.at += 1;
     }
     fn u16(&mut self, v: u16) {
-        self.buf[self.at..self.at + 2].copy_from_slice(&v.to_be_bytes());
+        self.buffer[self.at..self.at + 2].copy_from_slice(&v.to_be_bytes());
         self.at += 2;
     }
     fn u32(&mut self, v: u32) {
-        self.buf[self.at..self.at + 4].copy_from_slice(&v.to_be_bytes());
+        self.buffer[self.at..self.at + 4].copy_from_slice(&v.to_be_bytes());
         self.at += 4;
     }
     fn u64(&mut self, v: u64) {
-        self.buf[self.at..self.at + 8].copy_from_slice(&v.to_be_bytes());
+        self.buffer[self.at..self.at + 8].copy_from_slice(&v.to_be_bytes());
         self.at += 8;
     }
     fn entry(&mut self, e: &LogEntry) {
@@ -55,16 +55,16 @@ impl<'a> Writer<'a> {
     }
 }
 
-/// Encodes `msg` into `buf`, returning the number of bytes written, or
+/// Encodes `msg` into `buffer`, returning the number of bytes written, or
 /// `None` if the buffer is too small. `from`/`to` are carried in the frame.
-pub fn encode(msg: &Message, buf: &mut [u8]) -> Option<usize> {
-    if buf.len() < MAX_ENCODED {
+pub fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
+    if buffer.len() < MAX_ENCODED {
         // Encoders always get a MAX_ENCODED-sized buffer; refuse otherwise
         // rather than risk a partial frame.
         return None;
     }
     // Reserve 4 bytes for the length prefix; body starts at 4.
-    let mut w = Writer::new(buf);
+    let mut w = Writer::new(buffer);
     w.at = 4;
     w.u8(msg.from);
     w.u8(msg.to);
@@ -129,33 +129,33 @@ pub fn encode(msg: &Message, buf: &mut [u8]) -> Option<usize> {
     }
     let total = w.at;
     let body_len = (total - 4) as u32;
-    buf[0..4].copy_from_slice(&body_len.to_be_bytes());
+    buffer[0..4].copy_from_slice(&body_len.to_be_bytes());
     Some(total)
 }
 
 struct Reader<'a> {
-    buf: &'a [u8],
+    buffer: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
     fn u8(&mut self) -> Option<u8> {
-        let v = *self.buf.get(self.at)?;
+        let v = *self.buffer.get(self.at)?;
         self.at += 1;
         Some(v)
     }
     fn u16(&mut self) -> Option<u16> {
-        let b = self.buf.get(self.at..self.at + 2)?;
+        let b = self.buffer.get(self.at..self.at + 2)?;
         self.at += 2;
         Some(u16::from_be_bytes([b[0], b[1]]))
     }
     fn u32(&mut self) -> Option<u32> {
-        let b = self.buf.get(self.at..self.at + 4)?;
+        let b = self.buffer.get(self.at..self.at + 4)?;
         self.at += 4;
         Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
     fn u64(&mut self) -> Option<u64> {
-        let b = self.buf.get(self.at..self.at + 8)?;
+        let b = self.buffer.get(self.at..self.at + 8)?;
         self.at += 8;
         Some(u64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
@@ -172,24 +172,24 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// If `buf` begins with a complete frame, decodes it and returns
+/// If `buffer` begins with a complete frame, decodes it and returns
 /// `(message, bytes_consumed)`. Returns `Ok(None)` when more bytes are
 /// needed, and `Err(())` on a malformed frame (the caller drops the peer).
 #[allow(clippy::result_unit_err)]
-pub fn decode(buf: &[u8]) -> Result<Option<(Message, usize)>, ()> {
-    if buf.len() < 4 {
+pub fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
+    if buffer.len() < 4 {
         return Ok(None);
     }
-    let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let body_len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
     if body_len == 0 || body_len > MAX_ENCODED {
         return Err(());
     }
     let total = 4 + body_len;
-    if buf.len() < total {
+    if buffer.len() < total {
         return Ok(None);
     }
     let mut r = Reader {
-        buf: &buf[..total],
+        buffer: &buffer[..total],
         at: 4,
     };
     let mut parse = || -> Option<Message> {
@@ -269,9 +269,9 @@ mod tests {
     use super::*;
 
     fn roundtrip(m: Message) {
-        let mut buf = [0u8; MAX_ENCODED];
-        let n = encode(&m, &mut buf).expect("encode");
-        let (decoded, consumed) = decode(&buf[..n]).expect("decode ok").expect("complete");
+        let mut buffer = [0u8; MAX_ENCODED];
+        let n = encode(&m, &mut buffer).expect("encode");
+        let (decoded, consumed) = decode(&buffer[..n]).expect("decode ok").expect("complete");
         assert_eq!(consumed, n);
         assert_eq!(decoded, m);
     }
@@ -347,11 +347,11 @@ mod tests {
             to: 1,
             body: MessageBody::Commit { view: 1, commit: 1 },
         };
-        let mut buf = [0u8; MAX_ENCODED];
-        let n = encode(&m, &mut buf).unwrap();
+        let mut buffer = [0u8; MAX_ENCODED];
+        let n = encode(&m, &mut buffer).unwrap();
         // A prefix shorter than the full frame decodes to "need more".
-        assert_eq!(decode(&buf[..n - 1]), Ok(None));
-        assert_eq!(decode(&buf[..3]), Ok(None));
+        assert_eq!(decode(&buffer[..n - 1]), Ok(None));
+        assert_eq!(decode(&buffer[..3]), Ok(None));
     }
 
     #[test]
@@ -366,27 +366,27 @@ mod tests {
             to: 2,
             body: MessageBody::PrepareOk { view: 1, op: 3 },
         };
-        let mut buf = [0u8; MAX_ENCODED * 2];
-        let n1 = encode(&a, &mut buf).unwrap();
+        let mut buffer = [0u8; MAX_ENCODED * 2];
+        let n1 = encode(&a, &mut buffer).unwrap();
         let mut second = [0u8; MAX_ENCODED];
         let n2 = encode(&b, &mut second).unwrap();
-        buf[n1..n1 + n2].copy_from_slice(&second[..n2]);
+        buffer[n1..n1 + n2].copy_from_slice(&second[..n2]);
 
-        let (m1, c1) = decode(&buf[..n1 + n2]).unwrap().unwrap();
+        let (m1, c1) = decode(&buffer[..n1 + n2]).unwrap().unwrap();
         assert_eq!(m1, a);
-        let (m2, c2) = decode(&buf[c1..n1 + n2]).unwrap().unwrap();
+        let (m2, c2) = decode(&buffer[c1..n1 + n2]).unwrap().unwrap();
         assert_eq!(m2, b);
         assert_eq!(c1 + c2, n1 + n2);
     }
 
     #[test]
     fn garbage_tag_is_rejected() {
-        let mut buf = [0u8; MAX_ENCODED];
-        buf[0..4].copy_from_slice(&4u32.to_be_bytes());
-        buf[4] = 0; // from
-        buf[5] = 1; // to
-        buf[6] = 99; // unknown tag
-        buf[7] = 0;
-        assert_eq!(decode(&buf[..8]), Err(()));
+        let mut buffer = [0u8; MAX_ENCODED];
+        buffer[0..4].copy_from_slice(&4u32.to_be_bytes());
+        buffer[4] = 0; // from
+        buffer[5] = 1; // to
+        buffer[6] = 99; // unknown tag
+        buffer[7] = 0;
+        assert_eq!(decode(&buffer[..8]), Err(()));
     }
 }

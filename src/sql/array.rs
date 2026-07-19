@@ -124,22 +124,22 @@ fn read_field<'a>(
     let b = inner.as_bytes();
     if b.get(i) == Some(&b'"') {
         // Quoted: gather with \" and \\ unescaping into the arena.
-        let mut buf = crate::util::StackStr::<1024>::new();
+        let mut buffer = crate::util::StackStr::<1024>::new();
         let mut j = i + 1;
         while j < b.len() {
             match b[j] {
                 b'"' => {
                     let s = arena
-                        .alloc_str(buf.as_str())
+                        .alloc_str(buffer.as_str())
                         .map_err(|_| arena_full())?;
                     return Ok((s, true, j + 1));
                 }
                 b'\\' if j + 1 < b.len() => {
-                    let _ = core::fmt::Write::write_char(&mut buf, b[j + 1] as char);
+                    let _ = core::fmt::Write::write_char(&mut buffer, b[j + 1] as char);
                     j += 2;
                 }
                 c => {
-                    let _ = core::fmt::Write::write_char(&mut buf, c as char);
+                    let _ = core::fmt::Write::write_char(&mut buffer, c as char);
                     j += 1;
                 }
             }

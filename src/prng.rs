@@ -149,8 +149,8 @@ mod tests {
     fn generation_does_not_allocate() {
         let mut rng = Pcg32::new(3, 3);
         crate::mem::guard::forbid_alloc(|| {
-            let mut buf = [0u8; 64];
-            rng.fill_bytes(&mut buf);
+            let mut buffer = [0u8; 64];
+            rng.fill_bytes(&mut buffer);
             let _ = rng.next_u64();
             let _ = rng.next_bounded(17);
         });

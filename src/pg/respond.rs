@@ -1,7 +1,7 @@
 //! Backend message construction: the typed layer between the engine and
 //! the raw send buffer.
 
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 use crate::sql::types::{ColDesc, Datum};
 use crate::stack_format;
 
@@ -38,7 +38,7 @@ impl ResultFmt {
 }
 
 pub struct Responder<'b> {
-    pub buf: &'b mut FixedBuf,
+    pub buffer: &'b mut FixedBuf,
     /// Extended-protocol Execute must not resend RowDescription (the
     /// client got it from Describe).
     suppress_row_description: bool,
@@ -54,9 +54,9 @@ pub struct Responder<'b> {
 }
 
 impl<'b> Responder<'b> {
-    pub fn new(buf: &'b mut FixedBuf) -> Self {
+    pub fn new(buffer: &'b mut FixedBuf) -> Self {
         Self {
-            buf,
+            buffer,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             flush_fd: None,
@@ -64,9 +64,9 @@ impl<'b> Responder<'b> {
         }
     }
 
-    pub fn for_execute(buf: &'b mut FixedBuf, formats: ResultFmt) -> Self {
+    pub fn for_execute(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
-            buf,
+            buffer,
             suppress_row_description: true,
             formats,
             flush_fd: None,
@@ -76,9 +76,9 @@ impl<'b> Responder<'b> {
 
     /// Describe on a portal: RowDescription is emitted with the portal's
     /// result-format codes so the client decodes DataRows correctly.
-    pub fn for_describe(buf: &'b mut FixedBuf, formats: ResultFmt) -> Self {
+    pub fn for_describe(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
-            buf,
+            buffer,
             suppress_row_description: false,
             formats,
             flush_fd: None,
@@ -111,13 +111,13 @@ impl<'b> Responder<'b> {
         let Some(fd) = self.flush_fd else {
             return false;
         };
-        while !self.buf.is_empty() {
-            let data = self.buf.readable();
+        while !self.buffer.is_empty() {
+            let data = self.buffer.readable();
             let n = unsafe {
                 libc::write(fd, data.as_ptr().cast(), data.len())
             };
             if n > 0 {
-                self.buf.consume(n as usize);
+                self.buffer.consume(n as usize);
             } else if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -137,45 +137,45 @@ impl<'b> Responder<'b> {
         &mut self,
         build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
     ) -> Result<(), WireFull> {
-        let mark = self.buf.mark();
-        match build(self.buf) {
+        let mark = self.buffer.mark();
+        match build(self.buffer) {
             Ok(()) => Ok(()),
             Err(WireFull) => {
                 if self.flush_fd.is_none() {
                     return Err(WireFull);
                 }
-                self.buf.truncate_to(mark);
-                if self.buf.is_empty() {
+                self.buffer.truncate_to(mark);
+                if self.buffer.is_empty() {
                     // The message alone exceeds the whole buffer.
                     return Err(WireFull);
                 }
                 if !self.drain_to_fd() {
                     return Err(WireFull);
                 }
-                build(self.buf)
+                build(self.buffer)
             }
         }
     }
 
     pub fn parse_complete(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buf, wire::MSG_PARSE_COMPLETE).finish()
+        MsgOut::begin(self.buffer, wire::MSG_PARSE_COMPLETE).finish()
     }
 
     pub fn bind_complete(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buf, wire::MSG_BIND_COMPLETE).finish()
+        MsgOut::begin(self.buffer, wire::MSG_BIND_COMPLETE).finish()
     }
 
     pub fn close_complete(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buf, wire::MSG_CLOSE_COMPLETE).finish()
+        MsgOut::begin(self.buffer, wire::MSG_CLOSE_COMPLETE).finish()
     }
 
     pub fn no_data(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buf, wire::MSG_NO_DATA).finish()
+        MsgOut::begin(self.buffer, wire::MSG_NO_DATA).finish()
     }
 
     /// All parameters are described as text for now.
     pub fn parameter_description(&mut self, oids: &[i32]) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_PARAMETER_DESCRIPTION);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_PARAMETER_DESCRIPTION);
         m.i16(oids.len() as i16);
         for &oid in oids {
             m.i32(oid);
@@ -184,19 +184,19 @@ impl<'b> Responder<'b> {
     }
 
     pub fn auth_ok(&mut self) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_AUTHENTICATION);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
         m.i32(wire::AUTH_OK);
         m.finish()
     }
 
     pub fn auth_cleartext_password(&mut self) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_AUTHENTICATION);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
         m.i32(wire::AUTH_CLEARTEXT);
         m.finish()
     }
 
     pub fn auth_sasl_mechanisms(&mut self) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_AUTHENTICATION);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
         m.i32(wire::AUTH_SASL);
         m.cstr("SCRAM-SHA-256");
         m.u8(0); // end of mechanism list
@@ -204,27 +204,27 @@ impl<'b> Responder<'b> {
     }
 
     pub fn auth_sasl_continue(&mut self, payload: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_AUTHENTICATION);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
         m.i32(wire::AUTH_SASL_CONTINUE);
         m.bytes(payload.as_bytes());
         m.finish()
     }
 
     pub fn auth_sasl_final(&mut self, payload: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_AUTHENTICATION);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
         m.i32(wire::AUTH_SASL_FINAL);
         m.bytes(payload.as_bytes());
         m.finish()
     }
 
     pub fn parameter_status(&mut self, name: &str, value: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_PARAMETER_STATUS);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_PARAMETER_STATUS);
         m.cstr(name).cstr(value);
         m.finish()
     }
 
     pub fn backend_key_data(&mut self, pid: i32, key: &[u8]) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_BACKEND_KEY_DATA);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_BACKEND_KEY_DATA);
         m.i32(pid).bytes(key);
         m.finish()
     }
@@ -234,7 +234,7 @@ impl<'b> Responder<'b> {
         newest_minor: i32,
         unrecognized_options: &[&str],
     ) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_NEGOTIATE_VERSION);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_NEGOTIATE_VERSION);
         m.i32(newest_minor);
         m.i32(unrecognized_options.len() as i32);
         for opt in unrecognized_options {
@@ -244,7 +244,7 @@ impl<'b> Responder<'b> {
     }
 
     pub fn ready_for_query(&mut self, tx_status: u8) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_READY_FOR_QUERY);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_READY_FOR_QUERY);
         m.u8(tx_status);
         m.finish()
     }
@@ -254,8 +254,8 @@ impl<'b> Responder<'b> {
             return Ok(());
         }
         let formats = self.formats;
-        self.with_retry(|buf| {
-            let mut m = MsgOut::begin(buf, wire::MSG_ROW_DESCRIPTION);
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
             m.i16(cols.len() as i16);
             for (i, c) in cols.iter().enumerate() {
                 m.cstr(c.name);
@@ -273,17 +273,17 @@ impl<'b> Responder<'b> {
     pub fn data_row(&mut self, values: &[Datum]) -> Result<(), WireFull> {
         let formats = self.formats;
         let render = self.render;
-        self.with_retry(|buf| Self::build_data_row(buf, values, formats, render))
+        self.with_retry(|buffer| Self::build_data_row(buffer, values, formats, render))
     }
 
     /// Emits one row, each column in its Bind-requested text or binary format.
     fn build_data_row(
-        buf: &mut FixedBuf,
+        buffer: &mut FixedBuf,
         values: &[Datum],
         formats: ResultFmt,
         render: crate::sql::guc::RenderCtx,
     ) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(buf, wire::MSG_DATA_ROW);
+        let mut m = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
         m.i16(values.len() as i16);
         for (i, v) in values.iter().enumerate() {
             if v.is_null() {
@@ -451,13 +451,13 @@ impl<'b> Responder<'b> {
     }
 
     pub fn command_complete(&mut self, tag: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_COMMAND_COMPLETE);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
         m.cstr(tag);
         m.finish()
     }
 
     pub fn empty_query_response(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buf, wire::MSG_EMPTY_QUERY_RESPONSE).finish()
+        MsgOut::begin(self.buffer, wire::MSG_EMPTY_QUERY_RESPONSE).finish()
     }
 
     /// NoticeResponse at NOTICE severity. Dropped when `client_min_messages`
@@ -495,7 +495,7 @@ impl<'b> Responder<'b> {
         if !self.render.min_message_level.allows(level) {
             return Ok(());
         }
-        let mut m = MsgOut::begin(self.buf, wire::MSG_NOTICE_RESPONSE);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_NOTICE_RESPONSE);
         m.u8(b'S');
         m.cstr(severity);
         m.u8(b'V');
@@ -511,7 +511,7 @@ impl<'b> Responder<'b> {
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
     pub fn error(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buf, wire::MSG_ERROR_RESPONSE);
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_ERROR_RESPONSE);
         m.u8(b'S');
         m.cstr("ERROR");
         m.u8(b'V');
@@ -527,7 +527,7 @@ impl<'b> Responder<'b> {
     /// Rolls back everything after `mark` and reports the error instead;
     /// used when a response overflows the send buffer.
     pub fn replace_with_overflow_error(&mut self, mark: usize) -> Result<(), WireFull> {
-        self.buf.truncate_to(mark);
+        self.buffer.truncate_to(mark);
         self.error(
             crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "response does not fit in the connection send buffer",
@@ -544,15 +544,15 @@ mod tests {
     #[test]
     fn select_one_wire_bytes() {
         let mut budget = Budget::new(1 << 16);
-        let mut buf = FixedBuf::new(&mut budget, "test", 1024).unwrap();
-        let mut r = Responder::new(&mut buf);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 1024).unwrap();
+        let mut r = Responder::new(&mut buffer);
         r.row_description(&[ColDesc::new("?column?", oid::INT4, 4)])
             .unwrap();
         r.data_row(&[Datum::Int4(1)]).unwrap();
         r.command_complete("SELECT 1").unwrap();
         r.ready_for_query(b'I').unwrap();
 
-        let bytes = buf.readable();
+        let bytes = buffer.readable();
         // RowDescription: T, len, 1 column
         assert_eq!(bytes[0], b'T');
         // DataRow holds the text "1"
@@ -567,10 +567,10 @@ mod tests {
     #[test]
     fn error_response_fields() {
         let mut budget = Budget::new(1 << 16);
-        let mut buf = FixedBuf::new(&mut budget, "test", 256).unwrap();
-        let mut r = Responder::new(&mut buf);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
+        let mut r = Responder::new(&mut buffer);
         r.error("42601", "syntax error").unwrap();
-        let bytes = buf.readable();
+        let bytes = buffer.readable();
         assert_eq!(bytes[0], b'E');
         let text = core::str::from_utf8(&bytes[5..]).unwrap();
         assert!(text.contains("42601"));

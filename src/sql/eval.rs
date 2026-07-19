@@ -1804,22 +1804,22 @@ fn call<'a>(
             // Padding is `fill` repeated, cut to `pad_count` characters.
             let pad_len: usize = fill.chars().cycle().take(pad_count).map(char::len_utf8).sum();
             let total = pad_len + s.len();
-            let buf = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
+            let buffer = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
             let mut at = 0;
-            let write_pad = |buf: &mut [u8], at: &mut usize| {
+            let write_pad = |buffer: &mut [u8], at: &mut usize| {
                 for c in fill.chars().cycle().take(pad_count) {
-                    *at += c.encode_utf8(&mut buf[*at..]).len();
+                    *at += c.encode_utf8(&mut buffer[*at..]).len();
                 }
             };
             if name == "lpad" {
-                write_pad(buf, &mut at);
-                buf[at..at + s.len()].copy_from_slice(s.as_bytes());
+                write_pad(buffer, &mut at);
+                buffer[at..at + s.len()].copy_from_slice(s.as_bytes());
             } else {
-                buf[at..at + s.len()].copy_from_slice(s.as_bytes());
+                buffer[at..at + s.len()].copy_from_slice(s.as_bytes());
                 at += s.len();
-                write_pad(buf, &mut at);
+                write_pad(buffer, &mut at);
             }
-            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buf) }))
+            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buffer) }))
         }
         "split_part" => {
             arity(3)?;
@@ -1863,22 +1863,22 @@ fn call<'a>(
             // Each character of `s` that appears in `from` is replaced by the
             // char at the same index in `to`, or removed if `to` is shorter.
             let out_cap: usize = s.chars().map(|c| c.len_utf8()).sum();
-            let buf = arena.alloc_slice_with(out_cap.max(1), |_| 0u8).map_err(|_| arena_full())?;
+            let buffer = arena.alloc_slice_with(out_cap.max(1), |_| 0u8).map_err(|_| arena_full())?;
             let mut at = 0;
             for c in s.chars() {
                 match from.chars().position(|f| f == c) {
                     Some(i) => {
                         if let Some(r) = to.chars().nth(i) {
-                            at += r.encode_utf8(&mut buf[at..]).len();
+                            at += r.encode_utf8(&mut buffer[at..]).len();
                         }
                         // else: removed.
                     }
                     None => {
-                        at += c.encode_utf8(&mut buf[at..]).len();
+                        at += c.encode_utf8(&mut buffer[at..]).len();
                     }
                 }
             }
-            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(&buf[..at]) }))
+            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(&buffer[..at]) }))
         }
         "greatest" | "least" => {
             if star || args.is_empty() {
@@ -3386,13 +3386,13 @@ fn json_get<'a>(
         if let super::json::Json::Str(s) = child {
             return Ok(Datum::Text(s));
         }
-        let mut buf = crate::util::StackStr::<8192>::new();
-        let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&child)));
-        return Ok(Datum::Text(arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?));
+        let mut buffer = crate::util::StackStr::<8192>::new();
+        let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
+        return Ok(Datum::Text(arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?));
     }
-    let mut buf = crate::util::StackStr::<8192>::new();
-    let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&child)));
-    Ok(Datum::Json { text: arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?, jsonb })
+    let mut buffer = crate::util::StackStr::<8192>::new();
+    let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
+    Ok(Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb })
 }
 
 /// Evaluates `left AND right` / `left OR right` with PostgreSQL's short-circuit
@@ -3575,16 +3575,16 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
 /// between the two, so NULL never reaches here.
 /// Exact comparison between a Numeric and an integer, allocation-free.
 fn compare_numeric_int(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlError> {
-    let mut buf = [0u8; 20];
+    let mut buffer = [0u8; 20];
     match (l, r) {
         (Datum::Numeric(n), other) => {
             let interval = as_i64(other).expect("integer side");
-            let t = Numeric::from_i64_stack(interval, &mut buf);
+            let t = Numeric::from_i64_stack(interval, &mut buffer);
             Ok(numeric::compare(n, &t))
         }
         (other, Datum::Numeric(n)) => {
             let interval = as_i64(other).expect("integer side");
-            let t = Numeric::from_i64_stack(interval, &mut buf);
+            let t = Numeric::from_i64_stack(interval, &mut buffer);
             Ok(numeric::compare(&t, n))
         }
         _ => unreachable!("compare_numeric_int only for numeric/int pairs"),
@@ -4077,12 +4077,12 @@ pub fn cast_to<'a>(
             Datum::Json { jsonb: true, .. } => v,
             Datum::Json { text, jsonb: false } | Datum::Text(text) => {
                 let tree = super::json::parse(text, arena)?;
-                let mut buf = crate::util::StackStr::<8192>::new();
-                let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&tree)));
-                if buf.is_truncated() {
+                let mut buffer = crate::util::StackStr::<8192>::new();
+                let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&tree)));
+                if buffer.is_truncated() {
                     return Err(sql_err!("54000", "jsonb value exceeds the supported size"));
                 }
-                Datum::Json { text: arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?, jsonb: true }
+                Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb: true }
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
         },
@@ -4249,7 +4249,7 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
     if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
         return None;
     }
-    let mut buf = [0u8; 80];
+    let mut buffer = [0u8; 80];
     let mut n = 0;
     let mut prev_underscore = false;
     for &c in db {
@@ -4261,13 +4261,13 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
             continue;
         }
         prev_underscore = false;
-        if n >= buf.len() {
+        if n >= buffer.len() {
             return None;
         }
-        buf[n] = c;
+        buffer[n] = c;
         n += 1;
     }
-    let cleaned = core::str::from_utf8(&buf[..n]).ok()?;
+    let cleaned = core::str::from_utf8(&buffer[..n]).ok()?;
     let v = i64::from_str_radix(cleaned, radix).ok()?;
     Some(if neg { -v } else { v })
 }

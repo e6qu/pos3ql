@@ -27,7 +27,7 @@ const H0: [u32; 8] = [
 
 pub struct Sha256 {
     state: [u32; 8],
-    buf: [u8; 64],
+    buffer: [u8; 64],
     buf_len: usize,
     total: u64,
 }
@@ -36,7 +36,7 @@ impl Sha256 {
     pub fn new() -> Self {
         Self {
             state: H0,
-            buf: [0; 64],
+            buffer: [0; 64],
             buf_len: 0,
             total: 0,
         }
@@ -46,11 +46,11 @@ impl Sha256 {
         self.total = self.total.wrapping_add(data.len() as u64);
         if self.buf_len > 0 {
             let take = data.len().min(64 - self.buf_len);
-            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buffer[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len == 64 {
-                let block = self.buf;
+                let block = self.buffer;
                 self.compress(&block);
                 self.buf_len = 0;
             }
@@ -61,7 +61,7 @@ impl Sha256 {
             data = rest;
         }
         if !data.is_empty() {
-            self.buf[..data.len()].copy_from_slice(data);
+            self.buffer[..data.len()].copy_from_slice(data);
             self.buf_len = data.len();
         }
     }
@@ -73,7 +73,7 @@ impl Sha256 {
             self.update(&[0]);
         }
         // The length update above must not count the padding.
-        let mut block = self.buf;
+        let mut block = self.buffer;
         block[56..64].copy_from_slice(&bit_len.to_be_bytes());
         self.compress(&block);
         let mut out = [0u8; 32];

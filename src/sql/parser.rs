@@ -81,11 +81,11 @@ pub fn parse_view_select<'a>(
         message: crate::stack_format!(192, "invalid view definition: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
-    let stmt = parser
+    let statement = parser
         .next_stmt()
         .map_err(|e| to_sql(e.message.as_str()))?
         .ok_or_else(|| to_sql("empty"))?;
-    match stmt {
+    match statement {
         Stmt::Select(s) => arena.alloc(s).map(|r| &*r).map_err(|_| super::eval::SqlError {
             sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
             message: crate::stack_format!(192, "view too large for SQL arena"),
@@ -139,9 +139,9 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Eof {
             return Ok(None);
         }
-        let stmt = self.statement()?;
+        let statement = self.statement()?;
         match self.peeked {
-            Tok::Op(";") | Tok::Eof => Ok(Some(stmt)),
+            Tok::Op(";") | Tok::Eof => Ok(Some(statement)),
             _ => Err(self.unexpected("expected ';'")),
         }
     }

@@ -472,9 +472,9 @@ impl Engine {
         let mut executed_any = false;
         loop {
             match parser.next_stmt() {
-                Ok(Some(stmt)) => {
+                Ok(Some(statement)) => {
                     executed_any = true;
-                    if let Err(e) = self.execute_stmt(&stmt, arena, NO_PARAMS, txn, sqlprep, guc, resp)? {
+                    if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, guc, resp)? {
                         if txn.is_explicit() {
                             txn.failed = true;
                         } else {
@@ -529,7 +529,7 @@ impl Engine {
         };
         self.ensure_txn(txn, TxnMode::Implicit);
         let outcome = match parser.next_stmt() {
-            Ok(Some(stmt)) => self.execute_stmt(&stmt, arena, params, txn, sqlprep, guc, resp)?,
+            Ok(Some(statement)) => self.execute_stmt(&statement, arena, params, txn, sqlprep, guc, resp)?,
             Ok(None) => {
                 resp.empty_query_response()?;
                 Ok(())
@@ -583,8 +583,8 @@ impl Engine {
             Ok(p) => p,
             Err(_) => return oids,
         };
-        if let Ok(Some(stmt)) = parser.next_stmt() {
-            self.infer_stmt_params(&stmt, txn.txid, &mut oids);
+        if let Ok(Some(statement)) = parser.next_stmt() {
+            self.infer_stmt_params(&statement, txn.txid, &mut oids);
         }
         // A client's explicit (non-zero) parameter type overrides inference.
         for (i, &c) in client_oids.iter().enumerate().take(MAX_BIND_PARAMS) {
@@ -603,14 +603,14 @@ impl Engine {
         Some(def.columns()[idx].ctype.oid())
     }
 
-    fn infer_stmt_params(&self, stmt: &Stmt, txid: u32, oids: &mut [i32; MAX_BIND_PARAMS]) {
+    fn infer_stmt_params(&self, statement: &Stmt, txid: u32, oids: &mut [i32; MAX_BIND_PARAMS]) {
         let set = |oids: &mut [i32; MAX_BIND_PARAMS], e: &Expr, ty: i32| {
             if let Expr::Param(n) = e
                 && *n >= 1 && (*n as usize) <= MAX_BIND_PARAMS {
                     oids[*n as usize - 1] = ty;
                 }
         };
-        match stmt {
+        match statement {
             Stmt::Insert(ins) => {
                 let slot = self.storage.find_visible(ins.table, txid);
                 let def = slot.map(|s| &self.storage.table(s).def);
@@ -707,8 +707,8 @@ impl Engine {
                 return Ok(false);
             }
         };
-        let stmt = match parser.next_stmt() {
-            Ok(Some(stmt)) => stmt,
+        let statement = match parser.next_stmt() {
+            Ok(Some(statement)) => statement,
             Ok(None) => {
                 resp.no_data()?;
                 return Ok(true);
@@ -718,7 +718,7 @@ impl Engine {
                 return Ok(false);
             }
         };
-        match &stmt {
+        match &statement {
             Stmt::Select(s) => {
                 // Describe the CTE-expanded query so derived columns resolve.
                 let s = match query::expand_ctes(s, &self.storage, arena) {
@@ -767,7 +767,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
         &mut self,
-        stmt: &Stmt,
+        statement: &Stmt,
         arena: &Arena,
         params: &[Datum],
         txn: &mut TxnState,
@@ -787,7 +787,7 @@ impl Engine {
         // Inside a failed explicit block only COMMIT/ROLLBACK (and ROLLBACK TO
         // SAVEPOINT, which recovers the block) act.
         if txn.failed
-            && !matches!(stmt, Stmt::Commit | Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+            && !matches!(statement, Stmt::Commit | Stmt::Rollback | Stmt::RollbackToSavepoint(_))
         {
             return Ok(Err(SqlError {
                 sqlstate: "25P02",
@@ -802,7 +802,7 @@ impl Engine {
         // CREATE/DROP TABLE roll back with their transaction — with the
         // divergence that uncommitted DDL is visible to other sessions
         // (PostgreSQL would block them on a lock instead).
-        if txn.is_explicit() && matches!(stmt, Stmt::Checkpoint) {
+        if txn.is_explicit() && matches!(statement, Stmt::Checkpoint) {
             return Ok(Err(SqlError {
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 message: stack_format!(
@@ -811,7 +811,7 @@ impl Engine {
                 ),
             }));
         }
-        match stmt {
+        match statement {
             Stmt::Select(s) => {
                 // WITH CTEs expand into derived tables before execution.
                 let s = match query::expand_ctes(s, &self.storage, arena) {
@@ -1177,8 +1177,8 @@ impl Engine {
                     }
                 };
                 match inner.next_stmt() {
-                    Ok(Some(stmt)) => self.execute_stmt(
-                        &stmt,
+                    Ok(Some(statement)) => self.execute_stmt(
+                        &statement,
                         arena,
                         &inner_params[..args.len()],
                         txn,
@@ -1346,10 +1346,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, op: WalOp) -> Result<(), SqlErr
             storage.table_mut(index).rows.remove(&rowid);
         }
         WalOp::CreateView { name, sql } => {
-            let mut buf = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+            let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             use core::fmt::Write;
-            let _ = write!(buf, "{sql}");
-            storage.create_view(crate::storage::SqlName::parse(name)?, buf, true)?;
+            let _ = write!(buffer, "{sql}");
+            storage.create_view(crate::storage::SqlName::parse(name)?, buffer, true)?;
         }
         WalOp::DropView(name) => {
             storage.drop_view(name);
@@ -1408,16 +1408,16 @@ mod tests {
     }
 
     fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
-        let mut buf = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+        let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
         let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
         let mut txn = TxnState::new(budget, 1024).unwrap();
         let mut pool = test_pool(budget);
         let mut guc = GucState::new();
-        let mut resp = Responder::new(&mut buf);
+        let mut resp = Responder::new(&mut buffer);
         engine
             .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut guc, &mut resp)
             .unwrap();
-        buf.readable().to_vec()
+        buffer.readable().to_vec()
     }
 
     fn test_pool(budget: &mut Budget) -> SqlPreparedPool {
@@ -1616,15 +1616,15 @@ mod tests {
         txn: &mut TxnState,
         sql_text: &str,
     ) -> String {
-        let mut buf = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+        let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
         let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
         let mut pool = test_pool(budget);
         let mut guc = GucState::new();
-        let mut resp = Responder::new(&mut buf);
+        let mut resp = Responder::new(&mut buffer);
         engine
             .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut resp)
             .unwrap();
-        String::from_utf8_lossy(buf.readable()).to_string()
+        String::from_utf8_lossy(buffer.readable()).to_string()
     }
 
     #[test]
@@ -2453,15 +2453,15 @@ mod tests {
         txn: &mut TxnState,
         sql_text: &str,
     ) -> Vec<u8> {
-        let mut buf = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+        let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
         let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
         let mut pool = test_pool(budget);
         let mut guc = GucState::new();
-        let mut resp = Responder::new(&mut buf);
+        let mut resp = Responder::new(&mut buffer);
         engine
             .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut resp)
             .unwrap();
-        buf.readable().to_vec()
+        buffer.readable().to_vec()
     }
 
     #[test]

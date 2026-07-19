@@ -4,7 +4,7 @@
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 use crate::sql_err;
 use crate::storage::SqlName;
 

@@ -19,7 +19,7 @@ use std::os::unix::fs::FileExt;
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 use crate::sql::eval::SqlError;
 use crate::sql::types::ColType;
 use crate::sql_err;
@@ -452,84 +452,84 @@ fn encoded_payload_len(op: &WalOp) -> usize {
     }
 }
 
-fn append_payload(buf: &mut FixedBuf, op: &WalOp) -> bool {
-    let name_bytes = |buf: &mut FixedBuf, s: &str| -> bool {
-        buf.append(&[s.len() as u8]) && buf.append(s.as_bytes())
+fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
+    let name_bytes = |buffer: &mut FixedBuf, s: &str| -> bool {
+        buffer.append(&[s.len() as u8]) && buffer.append(s.as_bytes())
     };
     match op {
         WalOp::CreateTable(def) => {
-            let mut ok = name_bytes(buf, def.name.as_str());
-            ok &= buf.append(&(def.n_columns as u16).to_le_bytes());
+            let mut ok = name_bytes(buffer, def.name.as_str());
+            ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
             for c in def.columns() {
-                ok &= name_bytes(buf, c.name.as_str());
+                ok &= name_bytes(buffer, c.name.as_str());
                 let flags = u8::from(c.not_null)
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3);
-                ok &= buf.append(&[type_code(c.ctype), flags]);
-                ok &= buf.append(&c.type_mod.to_le_bytes());
-                ok &= append_default(buf, &c.default_value);
+                ok &= buffer.append(&[type_code(c.ctype), flags]);
+                ok &= buffer.append(&c.type_mod.to_le_bytes());
+                ok &= append_default(buffer, &c.default_value);
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
-            ok &= buf.append(&[def.n_uniques as u8]);
+            ok &= buffer.append(&[def.n_uniques as u8]);
             for uk in def.uniques() {
-                ok &= name_bytes(buf, uk.name.as_str());
-                ok &= buf.append(&[u8::from(uk.is_primary), uk.n_cols as u8]);
+                ok &= name_bytes(buffer, uk.name.as_str());
+                ok &= buffer.append(&[u8::from(uk.is_primary), uk.n_cols as u8]);
                 for &c in uk.cols() {
-                    ok &= buf.append(&c.to_le_bytes());
+                    ok &= buffer.append(&c.to_le_bytes());
                 }
             }
             // CHECK constraints.
-            ok &= buf.append(&[def.n_checks as u8]);
+            ok &= buffer.append(&[def.n_checks as u8]);
             for check in def.checks() {
-                ok &= name_bytes(buf, check.name.as_str());
+                ok &= name_bytes(buffer, check.name.as_str());
                 let e = check.expr.as_str();
-                ok &= buf.append(&(e.len() as u16).to_le_bytes());
-                ok &= buf.append(e.as_bytes());
+                ok &= buffer.append(&(e.len() as u16).to_le_bytes());
+                ok &= buffer.append(e.as_bytes());
             }
             // FOREIGN KEY constraints.
-            ok &= buf.append(&[def.n_fkeys as u8]);
+            ok &= buffer.append(&[def.n_fkeys as u8]);
             for fk in def.fkeys() {
-                ok &= name_bytes(buf, fk.name.as_str());
-                ok &= buf.append(&[fk.n_cols as u8]);
+                ok &= name_bytes(buffer, fk.name.as_str());
+                ok &= buffer.append(&[fk.n_cols as u8]);
                 for &c in fk.cols() {
-                    ok &= buf.append(&c.to_le_bytes());
+                    ok &= buffer.append(&c.to_le_bytes());
                 }
-                ok &= name_bytes(buf, fk.parent.as_str());
-                ok &= buf.append(&[fk.n_parent_cols as u8]);
+                ok &= name_bytes(buffer, fk.parent.as_str());
+                ok &= buffer.append(&[fk.n_parent_cols as u8]);
                 for &c in fk.parent_cols() {
-                    ok &= buf.append(&c.to_le_bytes());
+                    ok &= buffer.append(&c.to_le_bytes());
                 }
-                ok &= buf.append(&[fk.on_delete.code(), fk.on_update.code()]);
+                ok &= buffer.append(&[fk.on_delete.code(), fk.on_update.code()]);
             }
             ok
         }
-        WalOp::DropTable(name) => name_bytes(buf, name),
+        WalOp::DropTable(name) => name_bytes(buffer, name),
         WalOp::Upsert { table, rowid, row } => {
-            name_bytes(buf, table)
-                && buf.append(&rowid.to_le_bytes())
-                && buf.append(&(row.len() as u32).to_le_bytes())
-                && buf.append(row)
+            name_bytes(buffer, table)
+                && buffer.append(&rowid.to_le_bytes())
+                && buffer.append(&(row.len() as u32).to_le_bytes())
+                && buffer.append(row)
         }
         WalOp::Delete { table, rowid } => {
-            name_bytes(buf, table) && buf.append(&rowid.to_le_bytes())
+            name_bytes(buffer, table) && buffer.append(&rowid.to_le_bytes())
         }
         WalOp::CreateView { name, sql } => {
-            name_bytes(buf, name)
-                && buf.append(&(sql.len() as u16).to_le_bytes())
-                && buf.append(sql.as_bytes())
+            name_bytes(buffer, name)
+                && buffer.append(&(sql.len() as u16).to_le_bytes())
+                && buffer.append(sql.as_bytes())
         }
-        WalOp::DropView(name) => name_bytes(buf, name),
+        WalOp::DropView(name) => name_bytes(buffer, name),
         WalOp::CreateIndex { name, table, cols, n_cols, unique } => {
-            let mut ok = name_bytes(buf, name)
-                && name_bytes(buf, table)
-                && buf.append(&[u8::from(*unique), *n_cols as u8]);
+            let mut ok = name_bytes(buffer, name)
+                && name_bytes(buffer, table)
+                && buffer.append(&[u8::from(*unique), *n_cols as u8]);
             for c in &cols[..*n_cols] {
-                ok &= buf.append(&c.to_le_bytes());
+                ok &= buffer.append(&c.to_le_bytes());
             }
             ok
         }
-        WalOp::DropIndex(name) => name_bytes(buf, name),
+        WalOp::DropIndex(name) => name_bytes(buffer, name),
     }
 }
 
@@ -761,10 +761,10 @@ pub fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
     }
 }
 
-pub fn append_default(buf: &mut FixedBuf, d: &Option<OwnedDatum>) -> bool {
+pub fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> bool {
     let mut scratch = [0u8; MAX_DEFAULT_ENCODED];
     let n = encode_default_bytes(d, &mut scratch);
-    buf.append(&scratch[..n])
+    buffer.append(&scratch[..n])
 }
 
 /// Largest encoded default: tag + len byte + 48 text bytes.

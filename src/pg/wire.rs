@@ -6,7 +6,7 @@
 //! (3.1 was never assigned; 3.2 changes only the BackendKeyData cancel-key
 //! length).
 
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 
 pub const PROTOCOL_3_0: i32 = 196608; // 3 << 16
 pub const PROTOCOL_3_2: i32 = 196610; // 3 << 16 | 2
@@ -61,17 +61,17 @@ pub struct WireFull;
 /// length on `finish`. Dropping without `finish` leaves garbage — callers
 /// must either finish or `truncate_to` the pre-`begin` mark.
 pub struct MsgOut<'a> {
-    buf: &'a mut FixedBuf,
+    buffer: &'a mut FixedBuf,
     len_at: usize,
     ok: bool,
 }
 
 impl<'a> MsgOut<'a> {
-    pub fn begin(buf: &'a mut FixedBuf, msg_type: u8) -> Self {
-        let ok = buf.append(&[msg_type]);
-        let len_at = buf.mark();
-        let ok = ok && buf.append(&[0, 0, 0, 0]);
-        Self { buf, len_at, ok }
+    pub fn begin(buffer: &'a mut FixedBuf, msg_type: u8) -> Self {
+        let ok = buffer.append(&[msg_type]);
+        let len_at = buffer.mark();
+        let ok = ok && buffer.append(&[0, 0, 0, 0]);
+        Self { buffer, len_at, ok }
     }
 
     pub fn u8(&mut self, v: u8) -> &mut Self {
@@ -87,7 +87,7 @@ impl<'a> MsgOut<'a> {
     }
 
     pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
-        self.ok = self.ok && self.buf.append(v);
+        self.ok = self.ok && self.buffer.append(v);
         self
     }
 
@@ -102,8 +102,8 @@ impl<'a> MsgOut<'a> {
         if !self.ok {
             return Err(WireFull);
         }
-        let len = (self.buf.mark() - self.len_at) as i32;
-        let filled = self.buf.filled_mut();
+        let len = (self.buffer.mark() - self.len_at) as i32;
+        let filled = self.buffer.filled_mut();
         filled[self.len_at..self.len_at + 4].copy_from_slice(&len.to_be_bytes());
         Ok(())
     }
@@ -172,24 +172,24 @@ mod tests {
     #[test]
     fn message_length_is_backpatched() {
         let mut budget = Budget::new(1024);
-        let mut buf = FixedBuf::new(&mut budget, "test", 64).unwrap();
-        let mut m = MsgOut::begin(&mut buf, MSG_READY_FOR_QUERY);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 64).unwrap();
+        let mut m = MsgOut::begin(&mut buffer, MSG_READY_FOR_QUERY);
         m.u8(b'I');
         m.finish().unwrap();
         // Z, len=5 (4 length + 1 payload), 'I'
-        assert_eq!(buf.readable(), &[b'Z', 0, 0, 0, 5, b'I']);
+        assert_eq!(buffer.readable(), &[b'Z', 0, 0, 0, 5, b'I']);
     }
 
     #[test]
     fn overflow_reports_wire_full_and_rolls_back() {
         let mut budget = Budget::new(1024);
-        let mut buf = FixedBuf::new(&mut budget, "test", 8).unwrap();
-        let mark = buf.mark();
-        let mut m = MsgOut::begin(&mut buf, MSG_DATA_ROW);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 8).unwrap();
+        let mark = buffer.mark();
+        let mut m = MsgOut::begin(&mut buffer, MSG_DATA_ROW);
         m.bytes(b"way too much data for this buffer");
         assert_eq!(m.finish(), Err(WireFull));
-        buf.truncate_to(mark);
-        assert!(buf.is_empty());
+        buffer.truncate_to(mark);
+        assert!(buffer.is_empty());
     }
 
     #[test]

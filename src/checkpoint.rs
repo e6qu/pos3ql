@@ -15,7 +15,7 @@ use std::io::Write as IoWrite;
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::s3::sha256::{HexDigest, Sha256};
 use crate::s3::{Precondition, S3Client, S3Error};
@@ -425,11 +425,11 @@ impl Checkpointer {
                     let sql = String::from_utf8(bytes)
                         .map_err(|_| CheckpointSetupError::Corrupt("view sql not UTF-8"))?;
                     let name = rest_of(line, 2)?;
-                    let mut buf = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+                    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
                     use core::fmt::Write;
-                    let _ = write!(buf, "{sql}");
+                    let _ = write!(buffer, "{sql}");
                     storage
-                        .create_view(sql_name(name)?, buf, true)
+                        .create_view(sql_name(name)?, buffer, true)
                         .map_err(|e| {
                             CheckpointSetupError::S3(format!(
                                 "manifest view rejected: {}",
@@ -927,7 +927,7 @@ impl Checkpointer {
 /// syscall per row.
 struct ChunkedWriter<'a> {
     stream: &'a mut std::net::TcpStream,
-    buf: [u8; 16384],
+    buffer: [u8; 16384],
     len: usize,
 }
 
@@ -935,18 +935,18 @@ impl<'a> ChunkedWriter<'a> {
     fn new(stream: &'a mut std::net::TcpStream) -> Self {
         Self {
             stream,
-            buf: [0; 16384],
+            buffer: [0; 16384],
             len: 0,
         }
     }
 
     fn write_all(&mut self, mut data: &[u8]) -> std::io::Result<()> {
         while !data.is_empty() {
-            if self.len == self.buf.len() {
+            if self.len == self.buffer.len() {
                 self.flush_buf()?;
             }
-            let take = data.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + take].copy_from_slice(&data[..take]);
+            let take = data.len().min(self.buffer.len() - self.len);
+            self.buffer[self.len..self.len + take].copy_from_slice(&data[..take]);
             self.len += take;
             data = &data[take..];
         }
@@ -954,7 +954,7 @@ impl<'a> ChunkedWriter<'a> {
     }
 
     fn flush_buf(&mut self) -> std::io::Result<()> {
-        self.stream.write_all(&self.buf[..self.len])?;
+        self.stream.write_all(&self.buffer[..self.len])?;
         self.len = 0;
         Ok(())
     }
@@ -964,9 +964,9 @@ impl<'a> ChunkedWriter<'a> {
     }
 }
 
-fn write_manifest(buf: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {
+fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {
     use core::fmt::Write;
-    writeln!(buf, "{line}").map_err(|_| {
+    writeln!(buffer, "{line}").map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "manifest exceeds its fixed buffer"

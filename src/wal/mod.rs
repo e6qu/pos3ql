@@ -901,6 +901,8 @@ fn type_code(t: ColType) -> u8 {
         ColType::Bytea => 10,
         ColType::Numeric => 11,
         ColType::Range(k) => 20 + k.code(),
+        ColType::Bit { varying: false } => 26,
+        ColType::Bit { varying: true } => 27,
     }
 }
 
@@ -922,6 +924,8 @@ fn code_type(code: u8) -> Option<ColType> {
         17 => ColType::Interval,
         18 => ColType::Json,
         19 => ColType::Jsonb,
+        26 => ColType::Bit { varying: false },
+        27 => ColType::Bit { varying: true },
         c if (20..26).contains(&c) => ColType::Range(crate::sql::types::RangeKind::from_code(c - 20)),
         c if c >= 32 => ColType::Array(crate::sql::types::ArrElem::from_code(c - 32)?),
         9 => ColType::Uuid,

@@ -26,6 +26,8 @@ pub fn encoded_len(values: &[Datum]) -> usize {
             Datum::Uuid(_) => 16,
             Datum::Text(s) => 4 + s.len(),
             Datum::Json { text, .. } | Datum::Range { text, .. } => 4 + text.len(),
+            // 4-byte payload length, 1 flag byte (varying), then the bit chars.
+            Datum::Bit { bits, .. } => 5 + bits.len(),
             Datum::Array { raw, .. } => 5 + raw.len(),
             Datum::Bytea(b) => 4 + b.len(),
             // sign(1) weight(2) dscale(2) ndigits(2) + packed digit bytes
@@ -105,6 +107,13 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[..4].copy_from_slice(&(b.len() as u32).to_le_bytes());
                 rest[4..4 + b.len()].copy_from_slice(b);
                 take = 4 + b.len();
+            }
+            Datum::Bit { bits, varying } => {
+                let payload = 1 + bits.len();
+                rest[..4].copy_from_slice(&(payload as u32).to_le_bytes());
+                rest[4] = u8::from(*varying);
+                rest[5..5 + bits.len()].copy_from_slice(bits.as_bytes());
+                take = 4 + payload;
             }
             Datum::Numeric(nm) => {
                 rest[0] = match nm.sign {
@@ -228,6 +237,20 @@ pub fn decode<'a>(
                 at += len;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Range { text: s, kind };
+            }
+            ColType::Bit { varying } => {
+                let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let payload = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                at += 4;
+                if payload == 0 {
+                    return Err(corrupt());
+                }
+                // First payload byte is the stored varying flag; the schema is
+                // authoritative for the column's declared type, so ignore it.
+                let raw = bytes.get(at + 1..at + payload).ok_or_else(corrupt)?;
+                at += payload;
+                let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
+                out[i] = Datum::Bit { bits: s, varying };
             }
             ColType::Interval => {
                 let month = bytes.get(at..at + 4).ok_or_else(corrupt)?;

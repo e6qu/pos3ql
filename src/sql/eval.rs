@@ -189,7 +189,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
     }
     match expression {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
-        | Expr::NumericLit(_) | Expr::Str(_) | Expr::Column { .. }
+        | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. }
         | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
@@ -352,6 +352,7 @@ pub fn eval_full<'a>(
         Expr::Float(v) => Ok(Datum::Float8(v)),
         Expr::NumericLit(s) => Ok(Datum::Numeric(Numeric::parse(s, arena)?)),
         Expr::Str(s) => Ok(Datum::Text(s)),
+        Expr::BitLit(s) => Ok(Datum::Bit { bits: s, varying: false }),
         Expr::Column { qualifier, name } => row.lookup(qualifier, name),
         Expr::Param(n) => params
             .get(n as usize - 1)
@@ -363,7 +364,7 @@ pub fn eval_full<'a>(
             )),
         Expr::Unary { operator, operand } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
-            unary(operator, v)
+            unary(operator, v, arena)
         }
         Expr::Binary { operator: BinaryOp::And, left, right } => {
             // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
@@ -426,6 +427,22 @@ pub fn eval_full<'a>(
                     }
                     _ => {}
                 }
+            }
+            // integer -> bit(n): the low n bits, right-aligned. This is
+            // PostgreSQL's int-to-bit conversion, distinct from bit-string
+            // length coercion (which left-aligns), so it is handled here where
+            // the source type is known.
+            if let Some(ct @ ColType::Bit { varying }) = ColType::from_sql_name(type_name)
+                && matches!(v, Datum::Int4(_) | Datum::Int8(_))
+            {
+                let _ = ct;
+                let n = if type_mod >= 4 { (type_mod - 4) as usize } else { 1 };
+                let value = match v {
+                    Datum::Int4(x) => x as u32 as u64,
+                    Datum::Int8(x) => x as u64,
+                    _ => unreachable!(),
+                };
+                return Ok(Datum::Bit { bits: int_to_bits(value, n, arena)?, varying });
             }
             let v = cast(v, type_name, arena)?;
             // `::numeric(p,s)` / `::varchar(n)`: enforce the modifier on the
@@ -624,6 +641,16 @@ pub fn eval_full<'a>(
             // against an empty or all-NULL set.
             let v = eval_full(operand, arena, params, row, hooks)?;
             let v = coerce_unknown(v, &witness)?;
+            // A bit string is comparable only to another bit string; reject a
+            // bit-vs-other membership test up front (PostgreSQL type-checks the
+            // operand against the column type even over an empty set).
+            if matches!(v, Datum::Bit { .. }) && !matches!(witness, Datum::Bit { .. } | Datum::Null) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: bit = {}",
+                    type_name_of(&witness)
+                ));
+            }
             // `x IN (subquery)` is `x = ANY (subquery)`. Over an empty set the
             // result is a constant FALSE (TRUE for NOT IN) regardless of x —
             // even a NULL x — so the empty case precedes the null short-circuit.
@@ -1260,6 +1287,8 @@ fn call<'a>(
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Text(s) => Ok(Datum::Int4(s.chars().count() as i32)),
+                // length of a bit string is its number of bits.
+                Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len() as i32)),
                 other => Err(type_mismatch("length", &other)),
             }
         }
@@ -1362,6 +1391,8 @@ fn call<'a>(
                 Datum::Bytea(_) => "bytea",
                 Datum::Numeric(_) => "numeric",
                 Datum::Range { kind, .. } => kind.name(),
+                Datum::Bit { varying: false, .. } => "bit",
+                Datum::Bit { varying: true, .. } => "bit varying",
             }))
         }
         "trim" | "btrim" | "ltrim" | "rtrim" => {
@@ -1852,6 +1883,8 @@ fn call<'a>(
                 Datum::Null => Ok(Datum::Null),
                 Datum::Text(s) => Ok(Datum::Int4(s.len() as i32)),
                 Datum::Bytea(b) => Ok(Datum::Int4(b.len() as i32)),
+                // octets needed to hold the bits.
+                Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len().div_ceil(8) as i32)),
                 other => Err(type_mismatch(name, &other)),
             }
         }
@@ -2688,10 +2721,14 @@ fn call<'a>(
         }
         "bit_length" => {
             arity(1)?;
-            let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
-                return Ok(Datum::Null);
-            };
-            Ok(Datum::Int4((s.len() as i64 * 8) as i32))
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                // A bit string's bit_length is its bit count.
+                Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len() as i32)),
+                Datum::Text(s) => Ok(Datum::Int4((s.len() as i64 * 8) as i32)),
+                Datum::Bytea(b) => Ok(Datum::Int4((b.len() as i64 * 8) as i32)),
+                other => Err(type_mismatch("bit_length", &other)),
+            }
         }
         "md5" => {
             arity(1)?;
@@ -3308,9 +3345,16 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
     }
 }
 
-fn unary<'a>(operator: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     match (operator, v) {
         (_, Datum::Null) => Ok(Datum::Null),
+        // ~bit flips every bit, preserving length and type.
+        (UnaryOp::BitNot, Datum::Bit { bits, varying }) => {
+            let out = arena
+                .alloc_slice_with(bits.len(), |i| if bits.as_bytes()[i] == b'1' { b'0' } else { b'1' })
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+        }
         (UnaryOp::Neg, Datum::Int4(x)) => x
             .checked_neg()
             .map(Datum::Int4)
@@ -3361,9 +3405,13 @@ fn binary<'a>(
     use BinaryOp::*;
     match operator {
         And | Or => logic(operator, l, r),
-        Concat => concat(l, r, l_unknown, r_unknown, arena),
+        Concat => match (l, r) {
+            (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_concat(l, r, arena),
+            _ => concat(l, r, l_unknown, r_unknown, arena),
+        },
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
+            (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub | Mul | Div | Mod => match (l, r) {
@@ -3373,9 +3421,13 @@ fn binary<'a>(
         JsonGet | JsonGetText => json_get(l, r, operator == JsonGetText, arena),
         Shl | Shr => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r),
+            (Datum::Bit { .. }, _) => bit_shift(operator, l, r, arena),
             _ => bitwise(operator, l, r),
         },
-        BitAnd | BitOr | BitXor => bitwise(operator, l, r),
+        BitAnd | BitOr | BitXor => match (l, r) {
+            (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_bitwise(operator, l, r, arena),
+            _ => bitwise(operator, l, r),
+        },
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(operator, l, r),
         // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
         Like | ILike => {
@@ -3524,6 +3576,117 @@ fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'
     } else {
         Ok(Datum::Int4(v as i32))
     }
+}
+
+/// Extracts the `'0'`/`'1'` characters of a bit-string operand, coercing an
+/// unknown text literal (`'101'`) but rejecting any other type.
+fn bit_operand<'a>(d: &Datum<'a>) -> Result<&'a str, SqlError> {
+    match d {
+        Datum::Bit { bits, .. } => Ok(bits),
+        Datum::Text(s) => validate_bits(s),
+        other => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: bit vs {}",
+            type_name_of(other)
+        )),
+    }
+}
+
+/// True when a bit operand reports as `varbit`; a concatenation or bitwise
+/// combination is `varbit` if either input is.
+fn bit_is_varying(d: &Datum) -> bool {
+    matches!(d, Datum::Bit { varying: true, .. })
+}
+
+/// `bit || bit`: concatenation, always `varbit`.
+fn bit_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let (a, b) = (bit_operand(&l)?, bit_operand(&r)?);
+    let out = arena
+        .alloc_slice_with(a.len() + b.len(), |i| {
+            if i < a.len() { a.as_bytes()[i] } else { b.as_bytes()[i - a.len()] }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying: true })
+}
+
+/// `bit & bit`, `bit | bit`, `bit # bit`: per-position boolean combination.
+/// Both operands must have equal length (PostgreSQL rejects a size mismatch).
+fn bit_bitwise<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let (a, b) = (bit_operand(&l)?, bit_operand(&r)?);
+    if a.len() != b.len() {
+        return Err(sql_err!("22026", "cannot AND/OR/XOR bit strings of different sizes"));
+    }
+    let varying = bit_is_varying(&l) || bit_is_varying(&r);
+    let out = arena
+        .alloc_slice_with(a.len(), |i| {
+            let (x, y) = (a.as_bytes()[i] == b'1', b.as_bytes()[i] == b'1');
+            let bit = match operator {
+                BinaryOp::BitAnd => x && y,
+                BinaryOp::BitOr => x || y,
+                _ => x ^ y,
+            };
+            if bit { b'1' } else { b'0' }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+}
+
+/// `bit << n` / `bit >> n`: length-preserving shift, zero-filled. A negative
+/// count shifts the other way, matching PostgreSQL.
+fn bit_shift<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let Datum::Bit { bits, varying } = l else {
+        return Err(type_mismatch("bit-string shift", &l));
+    };
+    let count = as_i64(&r).ok_or_else(|| type_mismatch("bit-string shift amount", &r))?;
+    // `<<` moves bits toward the most-significant (left) end.
+    let left = if matches!(operator, BinaryOp::Shl) { count } else { -count };
+    let len = bits.len() as i64;
+    let src = bits.as_bytes();
+    let out = arena
+        .alloc_slice_with(bits.len(), |i| {
+            let from = i as i64 + left;
+            if (0..len).contains(&from) { src[from as usize] } else { b'0' }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+}
+
+/// Comparison of two bit strings: PostgreSQL compares bit-by-bit, and when one
+/// is a prefix of the other the shorter sorts first — exactly the lexicographic
+/// order of the `'0'`/`'1'` strings.
+fn compare_bits<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let (a, b) = (bit_operand(&l)?, bit_operand(&r)?);
+    let ordering = a.cmp(b);
+    Ok(Datum::Bool(match operator {
+        BinaryOp::Eq => ordering.is_eq(),
+        BinaryOp::NotEq => ordering.is_ne(),
+        BinaryOp::Lt => ordering.is_lt(),
+        BinaryOp::LtEq => ordering.is_le(),
+        BinaryOp::Gt => ordering.is_gt(),
+        _ => ordering.is_ge(),
+    }))
 }
 
 /// `json -> key/index` and `json ->> key/index`. A missing member yields NULL;
@@ -3796,6 +3959,9 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         }
         (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
         (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
+        // Bit strings compare bit-by-bit, shorter-is-prefix sorting first —
+        // exactly lexicographic order of the '0'/'1' characters.
+        (Datum::Bit { bits: a, .. }, Datum::Bit { bits: b, .. }) => a.cmp(b),
         (Datum::Numeric(a), Datum::Numeric(b)) => numeric::compare(a, b),
         (Datum::Range { text: a, kind: ka }, Datum::Range { text: b, kind: kb }) => {
             if ka != kb {
@@ -4175,10 +4341,22 @@ pub fn cast_to<'a>(
             _ => return Err(cast_unsupported(&v, "boolean")),
         },
         ColType::Int4 => {
-            let x = to_i64_for_cast(&v, "integer")?;
-            Datum::Int4(i32::try_from(x).map_err(|_| overflow("integer"))?)
+            if let Datum::Bit { bits, .. } = v {
+                // bit -> integer: the bits are the low bits of the result
+                // (two's complement), so a full 32-bit string round-trips.
+                Datum::Int4(bits_to_uint(bits, 32, "integer")? as u32 as i32)
+            } else {
+                let x = to_i64_for_cast(&v, "integer")?;
+                Datum::Int4(i32::try_from(x).map_err(|_| overflow("integer"))?)
+            }
         }
-        ColType::Int8 => Datum::Int8(to_i64_for_cast(&v, "bigint")?),
+        ColType::Int8 => {
+            if let Datum::Bit { bits, .. } = v {
+                Datum::Int8(bits_to_uint(bits, 64, "bigint")? as i64)
+            } else {
+                Datum::Int8(to_i64_for_cast(&v, "bigint")?)
+            }
+        }
         // real/float4 collapse to float8 storage: full precision is retained so
         // text output stays shortest round-trip (true 4-byte float4 rounding
         // would need a dedicated Datum to render correctly).
@@ -4293,8 +4471,82 @@ pub fn cast_to<'a>(
             }
             _ => return Err(cast_unsupported(&v, kind.name())),
         },
+        ColType::Bit { varying } => match v {
+            Datum::Bit { bits, .. } => Datum::Bit { bits, varying },
+            Datum::Text(s) => Datum::Bit { bits: validate_bits(s)?, varying },
+            // int -> bit yields the two's-complement bits at the type's full
+            // width; `apply_cast_typmod` then keeps the low N bits for bit(N).
+            Datum::Int4(x) => Datum::Bit { bits: int_to_bits(x as u32 as u64, 32, arena)?, varying },
+            Datum::Int8(x) => Datum::Bit { bits: int_to_bits(x as u64, 64, arena)?, varying },
+            _ => return Err(cast_unsupported(&v, "bit")),
+        },
     };
     Ok(out)
+}
+
+/// Validates that every character of a bit-string literal is `0` or `1`,
+/// returning it unchanged.
+fn validate_bits(s: &str) -> Result<&str, SqlError> {
+    for c in s.bytes() {
+        if c != b'0' && c != b'1' {
+            return Err(sql_err!(
+                "22P02",
+                "\"{}\" is not a valid binary digit",
+                (c as char)
+            ));
+        }
+    }
+    Ok(s)
+}
+
+/// Interprets a `'0'`/`'1'` bit string as an unsigned integer (most significant
+/// bit first). Bit strings wider than `max_bits` overflow the target loudly.
+fn bits_to_uint(bits: &str, max_bits: usize, target: &'static str) -> Result<u64, SqlError> {
+    if bits.len() > max_bits {
+        return Err(overflow(target));
+    }
+    let mut value = 0u64;
+    for c in bits.bytes() {
+        value = (value << 1) | u64::from(c == b'1');
+    }
+    Ok(value)
+}
+
+/// Renders `value` as a `width`-bit `'0'`/`'1'` string, most significant bit
+/// first (right-aligned: the low bits occupy the rightmost positions, higher
+/// positions zero-fill). Supports widths beyond 64 bits.
+pub fn int_to_bits(value: u64, width: usize, arena: &Arena) -> Result<&str, SqlError> {
+    let out = arena
+        .alloc_slice_with(width, |i| {
+            let shift = width - 1 - i;
+            if shift < 64 && (value >> shift) & 1 != 0 { b'1' } else { b'0' }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(unsafe { core::str::from_utf8_unchecked(out) })
+}
+
+/// Fits a bit string to a declared length `n`: fixed `bit(n)` zero-pads or
+/// truncates on the right to exactly `n`; `varbit(n)` only truncates when
+/// longer. (PostgreSQL adjusts bit-string length on the right.)
+pub fn fit_bits<'a>(
+    bits: &'a str,
+    n: usize,
+    varying: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let len = bits.len();
+    if len == n || (varying && len < n) {
+        return Ok(Datum::Bit { bits, varying });
+    }
+    if len > n {
+        let out = arena.alloc_str(&bits[..n]).map_err(|_| arena_full())?;
+        return Ok(Datum::Bit { bits: out, varying });
+    }
+    // Fixed bit(n) shorter than n: zero-pad on the right.
+    let out = arena
+        .alloc_slice_with(n, |i| if i < len { bits.as_bytes()[i] } else { b'0' })
+        .map_err(|_| arena_full())?;
+    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
 }
 
 fn parse_uuid(s: &str) -> Result<[u8; 16], SqlError> {
@@ -4519,6 +4771,8 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Uuid(_) => "uuid",
         Datum::Bytea(_) => "bytea",
         Datum::Range { kind, .. } => kind.name(),
+        Datum::Bit { varying: false, .. } => "bit",
+        Datum::Bit { varying: true, .. } => "bit varying",
     }
 }
 

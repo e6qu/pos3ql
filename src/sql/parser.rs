@@ -1735,6 +1735,10 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 self.arena_expr(Expr::Str(s))
             }
+            Tok::Bit(s) => {
+                self.advance()?;
+                self.arena_expr(Expr::BitLit(s))
+            }
             Tok::Param(n) => {
                 self.advance()?;
                 self.max_param = self.max_param.max(n);
@@ -2419,6 +2423,10 @@ impl<'a> Parser<'a> {
             self.expect_ident("precision")?;
             return Ok(("float8", -1));
         }
+        // `bit varying [(n)]` is the `varbit` type.
+        if name == "bit" && self.eat_ident("varying")? {
+            name = "varbit";
+        }
         if name == "timestamp" || name == "time" {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
@@ -2514,6 +2522,15 @@ impl<'a> Parser<'a> {
                     return Err(self.unexpected("numeric scale must be between 0 and precision"));
                 }
                 Ok((((p as i32) << 16) | (s as i32)) + 4)
+            }
+            "bit" | "varbit" => {
+                if n != 1 {
+                    return Err(self.unexpected("length for bit type takes one argument"));
+                }
+                if nums[0] < 1 {
+                    return Err(self.unexpected("length for bit type must be at least 1"));
+                }
+                Ok(nums[0] as i32 + 4)
             }
             _ => Err(self.unexpected("type modifier is not supported for this type yet")),
         }

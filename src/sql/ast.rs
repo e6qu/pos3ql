@@ -327,6 +327,9 @@ pub enum Expr<'a> {
     /// time. PostgreSQL types these as numeric, not float8.
     NumericLit(&'a str),
     Str(&'a str),
+    /// Bit-string literal (`B'1010'` / `X'1F'`): the canonical `'0'`/`'1'`
+    /// characters, typed `bit(len)`.
+    BitLit(&'a str),
     Column {
         /// Optional table/alias qualifier.
         qualifier: Option<&'a str>,
@@ -457,7 +460,7 @@ impl Expr<'_> {
         }
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
-            | Expr::NumericLit(_) | Expr::Str(_) => true,
+            | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) => true,
             Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_)
             | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,

@@ -127,27 +127,70 @@ class Gen:
             return f"{self.choice(BOOL_COLS)}"
         return f"{self.text_expr()} {self.choice(['=', '<>', '<', '>'])} {self.text_expr()}"
 
+    def small_int(self):
+        return str(self.rng.randint(-3, 6))
+
+    def str_func(self):
+        """A string-valued (or string-derived) function over `s`; text results
+        compare exactly, so a divergence is a real behavioural bug."""
+        s = self.text_expr()
+        return self.choice([
+            f"upper({s})", f"lower({s})", f"initcap({s})",
+            f"length({s})", f"char_length({s})", f"octet_length({s})",
+            f"substring({s} FROM {self.small_int()})",
+            f"substring({s} FROM {self.small_int()} FOR {self.small_int()})",
+            f"left({s}, {self.small_int()})", f"right({s}, {self.small_int()})",
+            f"trim({s})", f"ltrim({s})", f"rtrim({s})",
+            f"btrim({s}, 'ae')", f"trim(both 'a' FROM {s})",
+            f"replace({s}, 'a', 'X')", f"reverse({s})",
+            f"repeat({s}, {self.rng.randint(0, 3)})",
+            f"position('p' IN {s})", f"strpos({s}, 'a')",
+            f"({s} || {self.text_expr()})",
+            f"concat({s}, {self.text_expr()}, {self.int_lit()})",
+            f"lpad({s}, {self.small_int()}, '*')", f"rpad({s}, {self.small_int()}, '*')",
+            f"split_part({s}, 'a', {self.rng.randint(1, 3)})",
+            f"to_char({self.num_expr()}, '999.99')",
+            f"ascii({s})", f"chr(65 + {self.rng.randint(0, 25)})",
+        ])
+
+    def math_func(self):
+        """A numeric function. sqrt/power/exp/ln take float8 (`r`) or integer
+        arguments only: PostgreSQL computes those in NUMERIC for a numeric
+        argument and returns numeric, which pos3ql does not yet do (tracked as
+        a subset gap), so the fuzzer stays on the float/int forms it supports."""
+        return self.choice([
+            f"abs({self.num_expr()})",
+            f"mod({self.int_operand(0)}, {self.int_operand(0)})",
+            f"power(r, {self.small_int()})", f"power({self.small_int()}, r)",
+            f"sqrt(abs(r))", f"exp(r)", f"ln(abs(r) + 1)",
+            f"floor({self.num_expr()})", f"ceil({self.num_expr()})",
+            f"round({self.num_expr()})", f"round({self.choice(['1.555','2.5','-2.5'])}, 1)",
+            f"trunc({self.num_expr()})", f"sign({self.num_expr()})",
+            f"greatest({self.num_expr()}, {self.num_expr()}, id)",
+            f"least({self.num_expr()}, {self.num_expr()})",
+            f"coalesce({self.choice(NUM_COLS)}, {self.int_lit()})",
+            f"nullif({self.choice(INT_COLS)}, {self.int_lit()})",
+            f"cast({self.int_lit()} AS float8)",
+        ])
+
     def scalar_select_item(self):
         r = self.rng.random()
-        if r < 0.4:
+        if r < 0.30:
             return self.num_expr()
-        if r < 0.55:
+        if r < 0.42:
             return self.text_expr()
-        if r < 0.7:
+        if r < 0.55:
             return self.predicate()
-        if r < 0.85:
+        if r < 0.70:
             # CASE
             arms = []
             for _ in range(self.rng.randint(1, 3)):
                 arms.append(f"WHEN {self.predicate()} THEN {self.num_expr()}")
             els = f" ELSE {self.num_expr()}" if self.maybe() else ""
             return f"CASE {' '.join(arms)}{els} END"
-        fn = self.choice(["abs", "upper", "lower", "length", "coalesce"])
-        if fn == "abs":
-            return f"abs({self.num_expr()})"
-        if fn in ("upper", "lower", "length"):
-            return f"{fn}({self.text_expr()})"
-        return f"coalesce({self.choice(NUM_COLS)}, {self.int_lit()})"
+        if r < 0.85:
+            return self.str_func()
+        return self.math_func()
 
     def agg_item(self):
         fn = self.choice(["count", "sum", "avg", "min", "max"])

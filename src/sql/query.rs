@@ -2504,6 +2504,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
             Datum::Text("")
         }
         ColType::Range(kind) => Datum::Range { text: "empty", kind },
+        ColType::Bit { varying } => Datum::Bit { bits: "", varying },
     }
 }
 
@@ -4086,7 +4087,7 @@ fn qual_cost(e: &Expr, columns: &dyn super::exec::ColTypeResolver) -> u32 {
     }
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-        | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
+        | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
         Expr::Binary { operator: BinaryOp::And | BinaryOp::Or, left, right } => {
             qual_cost(left, columns) + qual_cost(right, columns)
         }
@@ -5395,7 +5396,7 @@ fn expr_is_grouped(expression: &Expr, group_by: &[&Expr]) -> bool {
     match expression {
         Expr::Column { .. } => false,
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_) | Expr::Str(_)
-        | Expr::Param(_) | Expr::DefaultMarker | Expr::Subquery(_) | Expr::Exists(_)
+        | Expr::BitLit(_) | Expr::Param(_) | Expr::DefaultMarker | Expr::Subquery(_) | Expr::Exists(_)
         | Expr::ArraySubquery(_) => true,
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }

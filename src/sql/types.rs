@@ -26,6 +26,12 @@ pub mod oid {
     pub const JSONB: i32 = 3802;
     pub const UUID: i32 = 2950;
     pub const NUMERIC: i32 = 1700;
+    /// Fixed-length bit string `bit(n)`.
+    pub const BIT: i32 = 1560;
+    /// Variable-length bit string `bit varying(n)` / `varbit`.
+    pub const VARBIT: i32 = 1562;
+    pub const BIT_ARRAY: i32 = 1561;
+    pub const VARBIT_ARRAY: i32 = 1563;
     /// PostgreSQL's pseudo-type for a string literal / parameter before its
     /// type is resolved from context.
     pub const UNKNOWN: i32 = 705;
@@ -70,6 +76,10 @@ pub enum ColType {
     Numeric,
     /// A range type (int4range/numrange/…), stored as canonical text.
     Range(RangeKind),
+    /// A bit string. `varying` = `false` is `bit(n)` (OID 1560), `true` is
+    /// `bit varying` / `varbit` (OID 1562). Length is enforced at cast time,
+    /// not tracked here.
+    Bit { varying: bool },
 }
 
 impl ColType {
@@ -106,6 +116,8 @@ impl ColType {
             "uuid" => Self::Uuid,
             "bytea" => Self::Bytea,
             "numeric" | "decimal" | "dec" => Self::Numeric,
+            "bit" => Self::Bit { varying: false },
+            "varbit" | "bit varying" => Self::Bit { varying: true },
             _ => return None,
         })
     }
@@ -135,6 +147,8 @@ impl ColType {
             Self::Bytea => oid::BYTEA,
             Self::Numeric => oid::NUMERIC,
             Self::Range(k) => k.oid(),
+            Self::Bit { varying: false } => oid::BIT,
+            Self::Bit { varying: true } => oid::VARBIT,
         }
     }
 
@@ -146,7 +160,7 @@ impl ColType {
             Self::Interval => 16,
             Self::Uuid => 16,
             Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
-            Self::Array(_) | Self::Range(_) => -1,
+            Self::Array(_) | Self::Range(_) | Self::Bit { .. } => -1,
         }
     }
 
@@ -185,6 +199,8 @@ impl ColType {
             Self::Bytea => "bytea",
             Self::Numeric => "numeric",
             Self::Range(k) => k.name(),
+            Self::Bit { varying: false } => "bit",
+            Self::Bit { varying: true } => "varbit",
         }
     }
 
@@ -211,6 +227,8 @@ impl ColType {
             Self::Bytea => "bytea",
             Self::Numeric => "numeric",
             Self::Range(k) => k.name(),
+            Self::Bit { varying: false } => "bit",
+            Self::Bit { varying: true } => "bit varying",
         }
     }
 }
@@ -443,6 +461,10 @@ pub enum Datum<'a> {
     Numeric(Numeric<'a>),
     /// A range value in its canonical text form (e.g. `[1,5)`, `empty`).
     Range { text: &'a str, kind: RangeKind },
+    /// A bit string as a sequence of `'0'`/`'1'` characters. `varying` selects
+    /// the reported type: `false` = `bit(n)` (OID 1560), `true` = `varbit`
+    /// (OID 1562).
+    Bit { bits: &'a str, varying: bool },
 }
 
 impl<'a> Datum<'a> {
@@ -470,6 +492,8 @@ impl<'a> Datum<'a> {
             Datum::Bytea(_) => oid::BYTEA,
             Datum::Numeric(_) => oid::NUMERIC,
             Datum::Range { kind, .. } => kind.oid(),
+            Datum::Bit { varying: false, .. } => oid::BIT,
+            Datum::Bit { varying: true, .. } => oid::VARBIT,
         }
     }
 }
@@ -505,6 +529,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Interval(interval) => f.write_str(super::datetime::format_interval(*interval).as_str()),
             Datum::Json { text, .. } => f.write_str(text),
             Datum::Range { text, .. } => f.write_str(text),
+            Datum::Bit { bits, .. } => f.write_str(bits),
             Datum::Array { element, raw } => super::array::write(f, *element, raw),
             Datum::Uuid(b) => {
                 for (i, byte) in b.iter().enumerate() {

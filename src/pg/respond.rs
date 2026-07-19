@@ -403,6 +403,13 @@ impl<'b> Responder<'b> {
                     m.i32(text.len() as i32);
                     m.bytes(text.as_bytes());
                 }
+                Datum::Bit { bits, .. } => {
+                    // The binary bit-string format (int32 bit length + packed
+                    // bytes) is not emitted; the canonical `0`/`1` text is sent,
+                    // correct for the common text-format path (as for ranges).
+                    m.i32(bits.len() as i32);
+                    m.bytes(bits.as_bytes());
+                }
                 Datum::Float8(x) => {
                     m.i32(8);
                     m.bytes(&x.to_bits().to_be_bytes());

@@ -21,6 +21,8 @@ pub enum Tok<'a> {
     Num(&'a str),
     /// String literal, unescaped.
     Str(&'a str),
+    /// Bit-string literal (`B'1010'` or `X'1F'`), expanded to `'0'`/`'1'` chars.
+    Bit(&'a str),
     /// `$n` parameter placeholder, 1-based.
     Param(u32),
     /// Operator or punctuation: `+ - * / % ^ = <> != < > <= >= || :: . ( ) , ;`
@@ -137,6 +139,16 @@ impl<'a> Lexer<'a> {
         {
             self.at += 1;
             return self.escape_string();
+        }
+
+        // B'1010' bit-string and X'1F' hex-bit-string literals.
+        if (rest.starts_with('b') || rest.starts_with('B')) && rest[1..].starts_with('\'') {
+            self.at += 1;
+            return self.bit_string(false);
+        }
+        if (rest.starts_with('x') || rest.starts_with('X')) && rest[1..].starts_with('\'') {
+            self.at += 1;
+            return self.bit_string(true);
         }
 
         let len = rest
@@ -302,6 +314,60 @@ impl<'a> Lexer<'a> {
         core::str::from_utf8(out)
             .map(Tok::Str)
             .map_err(|_| LexError { at: start, message: "invalid UTF-8 after unescaping" })
+    }
+
+    /// Lexes a `B'…'` (binary) or `X'…'` (hexadecimal) bit-string literal into
+    /// its canonical `'0'`/`'1'` character form. The leading letter is already
+    /// consumed; `self.at` points at the opening quote.
+    fn bit_string(&mut self, hex: bool) -> Result<Tok<'a>, LexError> {
+        let start = self.at;
+        self.at += 1; // opening quote
+        let bytes = self.text.as_bytes();
+        let mut i = self.at;
+        loop {
+            match bytes.get(i) {
+                None => return Err(LexError { at: start, message: "unterminated bit string" }),
+                Some(b'\'') => break,
+                Some(_) => i += 1,
+            }
+        }
+        let raw = &self.text[self.at..i];
+        self.at = i + 1;
+        if !hex {
+            for c in raw.bytes() {
+                if c != b'0' && c != b'1' {
+                    return Err(LexError {
+                        at: start,
+                        message: "\"B\" bit-string literal may only contain 0 or 1",
+                    });
+                }
+            }
+            return Ok(Tok::Bit(raw));
+        }
+        // Hex: expand each hex digit to four bits, most significant first.
+        let out = self
+            .arena
+            .alloc_slice_with(raw.len() * 4, |_| 0u8)
+            .map_err(|_| self.arena_full(start))?;
+        let mut w = 0;
+        for c in raw.bytes() {
+            let nibble = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => {
+                    return Err(LexError {
+                        at: start,
+                        message: "invalid hexadecimal digit in \"X\" bit-string literal",
+                    })
+                }
+            };
+            for bit in (0..4).rev() {
+                out[w] = if nibble & (1 << bit) != 0 { b'1' } else { b'0' };
+                w += 1;
+            }
+        }
+        Ok(Tok::Bit(unsafe { core::str::from_utf8_unchecked(&out[..w]) }))
     }
 
     fn quoted_ident(&mut self) -> Result<Tok<'a>, LexError> {
@@ -475,6 +541,17 @@ mod tests {
         assert_eq!(lex_all(r"E'a\nb'"), ["Str(\"a\\nb\")"]);
         assert_eq!(lex_all("$$raw $ text$$"), ["Str(\"raw $ text\")"]);
         assert_eq!(lex_all("$q$has $$ inside$q$"), ["Str(\"has $$ inside\")"]);
+    }
+
+    #[test]
+    fn bit_string_literals() {
+        // B'…' keeps the bits; X'…' expands each hex digit to four bits.
+        assert_eq!(lex_all("B'1010'"), ["Bit(\"1010\")"]);
+        assert_eq!(lex_all("x'1f'"), ["Bit(\"00011111\")"]);
+        assert_eq!(lex_all("B''"), ["Bit(\"\")"]);
+        assert_eq!(lex_all("X'A'"), ["Bit(\"1010\")"]);
+        // A bare identifier starting with b/x is unaffected.
+        assert_eq!(lex_all("bit box"), ["Ident(\"bit\")", "Ident(\"box\")"]);
     }
 
     #[test]

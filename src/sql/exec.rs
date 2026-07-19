@@ -297,6 +297,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker => {}
         Expr::Array(items) => {
@@ -2364,6 +2365,8 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::JSONB => ColType::Jsonb,
         oid::UUID => ColType::Uuid,
         oid::BYTEA => ColType::Bytea,
+        oid::BIT => ColType::Bit { varying: false },
+        oid::VARBIT => ColType::Bit { varying: true },
         // `"char"` (internal single-byte) and `name` appear in catalog columns;
         // treat them as text so catalog-derived tables describe.
         18 | 19 => ColType::Text,
@@ -2484,7 +2487,8 @@ fn comparable(a: ColType, b: ColType) -> bool {
     }
     let numeric = |t: ColType| matches!(t, Int4 | Int8 | Numeric | Float8);
     let datetime = |t: ColType| matches!(t, Date | Timestamp | Timestamptz);
-    (numeric(a) && numeric(b)) || (datetime(a) && datetime(b))
+    let bit = |t: ColType| matches!(t, Bit { .. });
+    (numeric(a) && numeric(b)) || (datetime(a) && datetime(b)) || (bit(a) && bit(b))
 }
 
 fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
@@ -2512,6 +2516,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
     let of = |t: ColType| (t.oid(), t.typlen());
     Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
+        Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {
             if i32::try_from(*v).is_ok() { of(ColType::Int4) } else { of(ColType::Int8) }
@@ -2527,6 +2532,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             use super::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
+            let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
             match operator {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
                     // Unknown coerces; two concrete types must be comparable.
@@ -2573,13 +2579,23 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                         of(ColType::Float8)
                     }
                 }
-                Concat => (oid::TEXT, -1),
+                // Bit-string concatenation yields varbit; otherwise text.
+                Concat => {
+                    if is_bit(lo) || is_bit(ro) {
+                        (oid::VARBIT, -1)
+                    } else {
+                        (oid::TEXT, -1)
+                    }
+                }
                 // `json -> k` keeps the json/jsonb type; `->>` yields text.
                 JsonGet => (if lo == oid::JSONB { oid::JSONB } else { oid::JSON }, -1),
                 JsonGetText => (oid::TEXT, -1),
-                // Bitwise operators keep the wider integer width.
+                // On bit strings the bitwise/shift operators return a bit
+                // string; on integers they keep the wider integer width.
                 BitAnd | BitOr | BitXor | Shl | Shr => {
-                    if lo == oid::INT8 || ro == oid::INT8 {
+                    if is_bit(lo) || is_bit(ro) {
+                        (if lo == oid::VARBIT || ro == oid::VARBIT { oid::VARBIT } else { oid::BIT }, -1)
+                    } else if lo == oid::INT8 || ro == oid::INT8 {
                         of(ColType::Int8)
                     } else {
                         of(ColType::Int4)
@@ -3064,6 +3080,8 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
             Datum::Numeric(nm) => 7 + nm.digits.len(),
             // kind(1) + len(4) + text
             Datum::Range { text, .. } => 5 + text.len(),
+            // varying(1) + len(4) + bits
+            Datum::Bit { bits, .. } => 5 + bits.len(),
         };
     }
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
@@ -3178,6 +3196,13 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
                 out[at + 6..at + 6 + text.len()].copy_from_slice(text.as_bytes());
                 at += 6 + text.len();
             }
+            Datum::Bit { bits, varying } => {
+                out[at] = 17;
+                out[at + 1] = u8::from(*varying);
+                out[at + 2..at + 6].copy_from_slice(&(bits.len() as u32).to_le_bytes());
+                out[at + 6..at + 6 + bits.len()].copy_from_slice(bits.as_bytes());
+                at += 6 + bits.len();
+            }
         }
     }
     Ok(&*out)
@@ -3258,6 +3283,12 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
                 let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
                 let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
                 (Datum::Range { text: s, kind }, 5 + len)
+            }
+            17 => {
+                let varying = bytes[at] != 0;
+                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+                let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+                (Datum::Bit { bits: s, varying }, 5 + len)
             }
             9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
             10 => {
@@ -3482,6 +3513,9 @@ pub fn apply_cast_typmod<'a>(
             Ok(v)
         }
         (ColType::Bpchar, Datum::Text(s)) => bpchar_fit(s, (type_mod - 4) as usize, true, arena),
+        (ColType::Bit { varying }, Datum::Bit { bits, .. }) => {
+            super::eval::fit_bits(bits, (type_mod - 4) as usize, varying, arena)
+        }
         _ => apply_typmod(v, ctype, type_mod, arena),
     }
 }
@@ -3544,6 +3578,9 @@ pub fn apply_typmod<'a>(
             let precision = ((t >> 16) & 0xFFFF) as usize;
             let scale = (t & 0xFFFF) as usize;
             apply_numeric_typmod(&n, precision, scale, arena).map(Datum::Numeric)
+        }
+        (ColType::Bit { varying }, Datum::Bit { bits, .. }) => {
+            super::eval::fit_bits(bits, (type_mod - 4) as usize, varying, arena)
         }
         _ => Ok(v),
     }

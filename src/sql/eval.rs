@@ -2474,6 +2474,32 @@ fn call<'a>(
                 )?)),
             }
         }
+        "timezone" => {
+            // `timezone(zone, ts)` == `ts AT TIME ZONE zone`. A plain timestamp
+            // is read as wall-clock time in `zone` and becomes the timestamptz
+            // instant; a timestamptz instant becomes the wall-clock timestamp in
+            // `zone`. The zone's offset can shift with DST, so it is resolved at
+            // the relevant instant.
+            arity(2)?;
+            let Some(zone_name) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let zone = super::guc::parse_timezone(zone_name).ok_or_else(|| sql_err!("22023", "time zone \"{}\" not recognized", zone_name))?;
+            match eval_full(args[1], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Timestamptz(utc) => {
+                    let (offset_seconds, _) = zone.resolve(utc);
+                    Ok(Datum::Timestamp(utc + i64::from(offset_seconds) * 1_000_000))
+                }
+                Datum::Timestamp(wall_clock) => {
+                    // Resolve the offset at the wall-clock instant (exact away
+                    // from the sub-hour DST transition windows).
+                    let (offset_seconds, _) = zone.resolve(wall_clock);
+                    Ok(Datum::Timestamptz(wall_clock - i64::from(offset_seconds) * 1_000_000))
+                }
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
         "age" => {
             // `age(a, b)` is the symbolic interval a - b; `age(a)` measures from
             // the current date at midnight.

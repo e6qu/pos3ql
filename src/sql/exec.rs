@@ -2891,6 +2891,14 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "age" | "justify_hours" | "justify_days" | "justify_interval" => {
                 of(ColType::Interval)
             }
+            // timezone(zone, ts) == ts AT TIME ZONE zone: timestamptz <-> timestamp.
+            "timezone" => {
+                let arg = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                match arg {
+                    Some(oid::TIMESTAMPTZ) => of(ColType::Timestamp),
+                    _ => of(ColType::Timestamptz),
+                }
+            }
             "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
                 of(ColType::Range(super::types::RangeKind::from_name(name).expect("range name")))
             }

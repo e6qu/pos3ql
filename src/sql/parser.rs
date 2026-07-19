@@ -1503,6 +1503,25 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
+            // `expression AT TIME ZONE zone` — desugar to the equivalent
+            // `timezone(zone, expression)` function. The zone binds tightly
+            // (parsed above binary-operator precedence).
+            if self.peeked == Tok::Ident("at") {
+                self.advance()?;
+                self.expect_ident("time")?;
+                self.expect_ident("zone")?;
+                let zone = self.expression(8)?;
+                left = self.arena_expr(Expr::Call {
+                    name: "timezone",
+                    args: self.arena_slice(&[zone, left])?,
+                    star: false,
+                    distinct: false,
+                    order_by: &[],
+                    over: None,
+                    filter: None,
+                })?;
+                continue;
+            }
             // `left OPERATOR([schema.]operator) right`: the explicit-operator syntax
             // psql uses (e.g. `OPERATOR(pg_catalog.~)`), at comparison
             // precedence.

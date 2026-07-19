@@ -1730,6 +1730,7 @@ impl<'a> Parser<'a> {
                     args: self.arena_slice(&[field_lit, source])?,
                     star: false,
                     distinct: false,
+                    filter: None,
                     order_by: &[],
                     over: None,
                 })
@@ -1895,6 +1896,7 @@ impl<'a> Parser<'a> {
                         distinct: false,
                         order_by: &[],
                         over: None,
+                        filter: None,
                     });
                 }
                 self.arena_expr(Expr::Column { qualifier: None, name })
@@ -1921,7 +1923,7 @@ impl<'a> Parser<'a> {
     /// Builds a simple function call `name(args)` (no star/distinct/over).
     fn plain_call(&mut self, name: &'a str, args: &[&'a Expr<'a>]) -> Result<&'a Expr<'a>, ParseError> {
         let args = self.arena_slice(args)?;
-        self.arena_expr(Expr::Call { name, args, star: false, distinct: false, order_by: &[], over: None })
+        self.arena_expr(Expr::Call { name, args, star: false, distinct: false, order_by: &[], over: None, filter: None })
     }
 
     fn call(&mut self, name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
@@ -2013,6 +2015,7 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Op("*") {
             self.advance()?;
             self.expect_op(")")?;
+            let filter = self.parse_filter()?;
             let over = self.parse_over()?;
             return self.arena_expr(Expr::Call {
                 name,
@@ -2021,6 +2024,7 @@ impl<'a> Parser<'a> {
                 distinct: false,
                 order_by: &[],
                 over,
+                filter,
             });
         }
         // `agg(DISTINCT expr)` — deduplicate argument values before aggregating.
@@ -2054,9 +2058,23 @@ impl<'a> Parser<'a> {
             &[]
         };
         self.expect_op(")")?;
+        let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = self.arena_slice(&args[..n])?;
-        self.arena_expr(Expr::Call { name, args, star: false, distinct, order_by, over })
+        self.arena_expr(Expr::Call { name, args, star: false, distinct, order_by, over, filter })
+    }
+
+    /// Parses an optional aggregate `FILTER (WHERE cond)` clause.
+    fn parse_filter(&mut self) -> Result<Option<&'a Expr<'a>>, ParseError> {
+        if self.peeked != Tok::Ident("filter") {
+            return Ok(None);
+        }
+        self.advance()?;
+        self.expect_op("(")?;
+        self.expect_ident("where")?;
+        let cond = self.expr(0)?;
+        self.expect_op(")")?;
+        Ok(Some(cond))
     }
 
     /// Parses a comma-separated ORDER BY item list (the `ORDER BY` keyword

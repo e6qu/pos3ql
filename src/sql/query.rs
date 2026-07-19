@@ -1302,7 +1302,7 @@ fn subst_expr<'a>(
             operand: subst_expr(operand, ctx, arena)?,
             negated: *negated,
         },
-        Expr::Call { name, args, star, distinct, order_by, over } => {
+        Expr::Call { name, args, star, distinct, order_by, over, filter } => {
             let mut ob = [OrderBy { expr: &Expr::Null, descending: false, nulls_first: false };
                 super::parser::MAX_LIST];
             if order_by.len() > ob.len() {
@@ -1329,6 +1329,10 @@ fn subst_expr<'a>(
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
                 }
             };
+            let filter = match filter {
+                None => None,
+                Some(f) => Some(subst_expr(f, ctx, arena)?),
+            };
             Expr::Call {
                 name,
                 args: subst_expr_slice(args, ctx, arena)?,
@@ -1336,6 +1340,7 @@ fn subst_expr<'a>(
                 distinct: *distinct,
                 order_by,
                 over,
+                filter,
             }
         }
         Expr::InList { operand, list, negated } => Expr::InList {
@@ -2820,9 +2825,15 @@ impl<'a> AggState<'a> {
         row: &impl ColumnLookup<'a>,
         hooks: &EvalHooks<'_, 'a>,
     ) -> Result<(), SqlError> {
-        let Expr::Call { args, .. } = node else {
+        let Expr::Call { args, filter, .. } = node else {
             unreachable!("validated in init");
         };
+        // `FILTER (WHERE cond)` excludes rows where the condition is not true.
+        if let Some(cond) = filter
+            && !matches!(eval_full(cond, arena, params, row, hooks)?, Datum::Bool(true))
+        {
+            return Ok(());
+        }
         if self.star {
             self.count += 1;
             return Ok(());

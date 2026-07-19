@@ -26,3 +26,8 @@ SELECT sum(n) FROM (VALUES (10),(20),(30)) AS t(n);
 SELECT x FROM generate_series(1, 3) AS g(x) ORDER BY x;
 SELECT * FROM (VALUES (1, 2)) AS v(a, b, c);
 SELECT * FROM generate_series(1, 3) AS g(x, y);
+-- aggregate FILTER (WHERE ...)
+SELECT count(*) FILTER (WHERE x > 1), sum(x) FILTER (WHERE x < 3) FROM generate_series(1,3) AS g(x);
+SELECT sum(x), sum(x) FILTER (WHERE x % 2 = 0) FROM generate_series(1,5) AS g(x);
+SELECT count(*), count(*) FILTER (WHERE false) FROM generate_series(1,3) AS g(x);
+SELECT string_agg(x::text, ',') FILTER (WHERE x <> 2) FROM generate_series(1,3) AS g(x);

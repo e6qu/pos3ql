@@ -357,6 +357,9 @@ pub enum Expr<'a> {
         order_by: &'a [OrderBy<'a>],
         /// `OVER (...)` window clause, when the call is a window function.
         over: Option<&'a WindowSpec<'a>>,
+        /// `FILTER (WHERE cond)` on an aggregate: rows where `cond` is not true
+        /// are excluded from that aggregate.
+        filter: Option<&'a Expr<'a>>,
     },
     /// `expr [NOT] IN (list)`.
     InList {

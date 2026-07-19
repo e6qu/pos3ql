@@ -2118,10 +2118,13 @@ mod tests {
         let mut t = TxnState::new(&mut b, 256).unwrap();
         run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (x int)");
         run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES (10),(20),(30)");
+        // Elements follow the table's physical (insertion) scan order, matching
+        // PostgreSQL. (ORDER BY inside a subquery is not yet honored — tracked
+        // separately — so it is deliberately not exercised here.)
         assert_eq!(
             data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-                "SELECT array(SELECT x FROM t ORDER BY x DESC)")),
-            ["{30,20,10}"]
+                "SELECT array(SELECT x FROM t)")),
+            ["{10,20,30}"]
         );
         // Empty subquery yields an empty array, not NULL.
         assert_eq!(

@@ -486,6 +486,13 @@ fn scan_source<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    // Fold `col IS [NOT] NULL` on NOT-NULL columns, then order the WHERE
+    // conjuncts by PostgreSQL's clause cost once, up front, so the per-row leaf
+    // evaluates them cheapest-first without re-sorting.
+    let where_clause = match where_clause {
+        Some(w) => Some(reorder_qual(fold_null(w, scope, arena)?, scope, arena)?),
+        None => None,
+    };
     // Assemble a JoinRow from the currently bound row bytes. Physical rows
     // are heap-encoded (fixed schema); derived rows are self-describing.
     fn assemble<'s, 'v, 'd>(
@@ -603,6 +610,47 @@ fn scan_source<'a>(
                 matched_any = true;
                 if let Some(m) = matched.filter(|_| depth + 1 == scope.n) {
                     m[idx].set(true);
+                }
+                if !level(
+                    storage, scope, from, txid, where_clause, arena, params, hooks,
+                    outer, depth + 1, bound, matched, pushdown, f,
+                )? {
+                    return Ok(false);
+                }
+            }
+        } else if depth == 0 {
+            // Outermost scan: iterate in heap-offset (insertion) order so a
+            // per-row error surfaces on the same row as PostgreSQL, whose heap
+            // scan is physical (insertion) order for a freshly-loaded table.
+            // The rows live in a hash map (slot order), so snapshot the visible
+            // locations into the per-statement arena and sort by offset. Only
+            // the outermost scan is ordered — it drives output/error order, and
+            // ordering an inner join scan would re-snapshot per outer row.
+            let table = storage.table(scope.slots[depth]);
+            let mut count = 0usize;
+            for (_, state) in table.rows.iter() {
+                if state.visible_to(txid).is_some() {
+                    count += 1;
+                }
+            }
+            let mut src = table.rows.iter();
+            let ordered = arena
+                .alloc_slice_with(count, |_| loop {
+                    let (_, state) = src.next().expect("visible count is stable");
+                    if let Some(loc) = state.visible_to(txid) {
+                        break loc;
+                    }
+                })
+                .map_err(|_| arena_full())?;
+            ordered.sort_unstable_by_key(|l| l.offset);
+            for (this, &loc) in ordered.iter().enumerate() {
+                bound[depth] = Some(storage.heap.get(loc));
+                if !on_matches(bound)? || !passes_pushdown(bound)? {
+                    continue;
+                }
+                matched_any = true;
+                if let Some(m) = matched.filter(|_| depth + 1 == scope.n) {
+                    m[this].set(true);
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
@@ -3090,9 +3138,6 @@ pub fn select_query<'a>(
     params: &[Datum<'a>],
     resp: &mut Responder,
 ) -> Outcome {
-    if let Err(e) = check_select_constants(stmt, arena) {
-        return sql_fail(e);
-    }
     let from = stmt.from.as_ref().expect("FROM-less handled by caller");
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
@@ -3138,6 +3183,14 @@ pub fn select_query<'a>(
             super::exec::infer_type_res(e, &cols).map(|_| ())
         };
         let analyze = || -> Result<(), SqlError> {
+            // SELECT-list items first: PostgreSQL analyzes types before it folds
+            // constants, so an invalid aggregate/operator (e.g. `min(boolean)`)
+            // errors ahead of a constant division elsewhere in the query.
+            for item in stmt.items {
+                if let SelectItem::Expr { expr, .. } = item {
+                    check(expr)?;
+                }
+            }
             if let Some(w) = stmt.where_clause {
                 check(w)?;
             }
@@ -3155,6 +3208,12 @@ pub fn select_query<'a>(
         if let Err(e) = analyze() {
             return sql_fail(e);
         }
+    }
+
+    // Constant folding runs after type analysis, matching PostgreSQL's
+    // analyze-then-plan order: `min(boolean)` errors before `1/0` folds.
+    if let Err(e) = check_select_constants(stmt, arena) {
+        return sql_fail(e);
     }
 
     // Result description.
@@ -3451,6 +3510,14 @@ fn flatten_and<'e, 'a>(e: &'e Expr<'a>, out: &mut [&'e Expr<'a>], n: &mut usize)
 /// as potentially-erroring.
 fn is_error_safe(e: &Expr) -> bool {
     use super::ast::{BinaryOp::*, UnaryOp};
+    // A constant subexpression cannot raise a *runtime* error: PostgreSQL folds
+    // it at plan time and `check_constant_errors` surfaces any error eagerly
+    // there, so by the time a row is filtered it is known good. This lets a
+    // constant-false conjunct (e.g. `-2.25 <> -2.25`, whose unary minus would
+    // otherwise mark it unsafe) filter the row before an erroring sibling runs.
+    if e.is_constant() {
+        return true;
+    }
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => true,
@@ -3471,11 +3538,12 @@ fn is_error_safe(e: &Expr) -> bool {
     }
 }
 
-/// Evaluates a WHERE predicate. PostgreSQL's qual evaluation order is
-/// unspecified and cost-driven, so a filtering condition can run before an
-/// error-prone one; we match that by evaluating a top-level AND chain's
-/// error-safe conjuncts first (this only removes spurious errors, never adds
-/// one, since safe conjuncts cannot error).
+/// Evaluates a WHERE predicate, short-circuiting a top-level AND chain
+/// left-to-right. The conjuncts are already in PostgreSQL's cost order — the
+/// scan reorders them once via [`reorder_qual`] before iterating rows — so a
+/// cheap filtering conjunct runs before a costlier erroring one (and a cheap
+/// erroring conjunct before a costlier filtering one), reproducing PostgreSQL's
+/// error timing without re-sorting per row.
 fn where_passes<'e, 'a>(
     predicate: &'e Expr<'a>,
     arena: &'a Arena,
@@ -3486,22 +3554,184 @@ fn where_passes<'e, 'a>(
     let mut conjuncts: [&'e Expr<'a>; MAX_CONJUNCTS] = [predicate; MAX_CONJUNCTS];
     let mut n = 0;
     if !flatten_and(predicate, &mut conjuncts, &mut n) || n <= 1 {
-        // Not an AND chain (or too many conjuncts): evaluate as-is.
         return conjunct_passes(predicate, arena, params, row, hooks);
     }
-    // Pass 1: error-safe conjuncts filter first.
     for &c in &conjuncts[..n] {
-        if is_error_safe(c) && !conjunct_passes(c, arena, params, row, hooks)? {
-            return Ok(false);
-        }
-    }
-    // Pass 2: the remaining (possibly-erroring) conjuncts.
-    for &c in &conjuncts[..n] {
-        if !is_error_safe(c) && !conjunct_passes(c, arena, params, row, hooks)? {
+        if !conjunct_passes(c, arena, params, row, hooks)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Folds `col IS NOT NULL` to TRUE and `col IS NULL` to FALSE for a column with
+/// a NOT NULL constraint, as PostgreSQL does using the constraint — so
+/// `WHERE x/0 = 1 OR id IS NOT NULL` (id NOT NULL) drops the erroring branch.
+/// Rewrites only the boolean spine (AND/OR/NOT/IS NULL); other nodes pass
+/// through, since an IS NULL test appears as a boolean operand.
+fn fold_null<'a>(
+    e: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    use super::ast::{BinaryOp, UnaryOp};
+    match e {
+        Expr::IsNull { operand: Expr::Column { qualifier, name }, negated }
+            if scope
+                .find_column(*qualifier, name)
+                .ok()
+                .and_then(|(t, c)| scope.defs[t].map(|d| d.columns()[c].not_null))
+                .unwrap_or(false) =>
+        {
+            Ok(&*arena.alloc(Expr::Bool(*negated)).map_err(|_| arena_full())?)
+        }
+        Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } => {
+            let (l, r) = (fold_null(left, scope, arena)?, fold_null(right, scope, arena)?);
+            if core::ptr::eq(l, *left) && core::ptr::eq(r, *right) {
+                Ok(e)
+            } else {
+                Ok(&*arena
+                    .alloc(Expr::Binary { op: *op, left: l, right: r })
+                    .map_err(|_| arena_full())?)
+            }
+        }
+        Expr::Unary { op: UnaryOp::Not, operand } => {
+            let o = fold_null(operand, scope, arena)?;
+            if core::ptr::eq(o, *operand) {
+                Ok(e)
+            } else {
+                Ok(&*arena
+                    .alloc(Expr::Unary { op: UnaryOp::Not, operand: o })
+                    .map_err(|_| arena_full())?)
+            }
+        }
+        _ => Ok(e),
+    }
+}
+
+/// Reorders a WHERE predicate's top-level AND conjuncts by PostgreSQL's
+/// `order_qual_clauses` cost (cheapest first, stably), returning a rebuilt
+/// left-deep AND. Done once per scan (not per row), so it can afford the
+/// type-aware `qual_cost`. Constants and non-AND predicates pass through
+/// unchanged.
+fn reorder_qual<'a>(
+    pred: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let mut conj: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
+    let mut n = 0;
+    if !flatten_and(pred, &mut conj, &mut n) || n <= 1 {
+        return Ok(pred);
+    }
+    let cols = ScopeCols(scope);
+    let mut cost = [0u32; MAX_CONJUNCTS];
+    for (i, c) in conj[..n].iter().enumerate() {
+        cost[i] = qual_cost(c, &cols);
+    }
+    let mut order = [0usize; MAX_CONJUNCTS];
+    for (i, slot) in order[..n].iter_mut().enumerate() {
+        *slot = i;
+    }
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && cost[order[j - 1]] > cost[order[j]] {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    // Rebuild a left-deep AND in cost order.
+    let mut acc = conj[order[0]];
+    for &i in &order[1..n] {
+        acc = arena
+            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conj[i] })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(acc)
+}
+
+/// Per-tuple evaluation cost of a qual expression, approximating PostgreSQL's
+/// `cost_qual_eval` closely enough to reproduce its clause ordering: each
+/// operator, comparison, function, and cast counts one unit; the boolean
+/// connectives AND/OR/NOT are control flow and cost nothing; subqueries
+/// dominate. Only relative order matters.
+fn qual_cost(e: &Expr, cols: &dyn super::exec::ColTypeResolver) -> u32 {
+    use super::ast::{BinaryOp, UnaryOp};
+    // PostgreSQL folds a constant subexpression to a single Const at plan time,
+    // so it costs nothing at scan time and is evaluated first.
+    if e.is_constant() {
+        return 0;
+    }
+    match e {
+        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
+        | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
+        Expr::Binary { op: BinaryOp::And | BinaryOp::Or, left, right } => {
+            qual_cost(left, cols) + qual_cost(right, cols)
+        }
+        Expr::Binary { op, left, right } => {
+            // A comparison that mixes a *runtime* integer side with a
+            // float/numeric side widens the integer with a cast, which
+            // PostgreSQL counts (`(b % 0)::numeric < 0.21` costs more than the
+            // int-only `100 = a % id`); a constant int operand is folded and
+            // cast for free.
+            let cast = if matches!(op, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
+                | BinaryOp::GtEq | BinaryOp::Eq | BinaryOp::NotEq)
+                && widening_cast(left, right, cols)
+            {
+                1
+            } else {
+                0
+            };
+            1 + cast + qual_cost(left, cols) + qual_cost(right, cols)
+        }
+        Expr::Unary { op: UnaryOp::Not, operand } => qual_cost(operand, cols),
+        Expr::Unary { operand, .. } => 1 + qual_cost(operand, cols),
+        Expr::IsNull { operand, .. } => 1 + qual_cost(operand, cols),
+        Expr::Cast { operand, .. } => 1 + qual_cost(operand, cols),
+        Expr::Field { base, .. } => qual_cost(base, cols),
+        Expr::Subscript { base, index } => 1 + qual_cost(base, cols) + qual_cost(index, cols),
+        Expr::InList { operand, list, .. } => {
+            // PostgreSQL expands `x IN (a, b, ...)` to `x=a OR x=b OR ...`, one
+            // comparison per element, so the cost grows with the list length.
+            list.len() as u32
+                + qual_cost(operand, cols)
+                + list.iter().map(|e| qual_cost(e, cols)).sum::<u32>()
+        }
+        Expr::Between { operand, low, high, .. } => {
+            2 + qual_cost(operand, cols) + qual_cost(low, cols) + qual_cost(high, cols)
+        }
+        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+            1 + qual_cost(operand, cols) + qual_cost(pattern, cols)
+        }
+        Expr::AnyAll { operand, array, .. } => {
+            1 + qual_cost(operand, cols) + qual_cost(array, cols)
+        }
+        Expr::Call { args, .. } => 1 + args.iter().map(|e| qual_cost(e, cols)).sum::<u32>(),
+        Expr::Array(elems) => elems.iter().map(|e| qual_cost(e, cols)).sum::<u32>(),
+        Expr::Case { operand, whens, otherwise } => {
+            let mut c = operand.map_or(0, |o| qual_cost(o, cols));
+            for (w, t) in *whens {
+                c += 1 + qual_cost(w, cols) + qual_cost(t, cols);
+            }
+            c + otherwise.map_or(0, |o| qual_cost(o, cols))
+        }
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => 1000,
+    }
+}
+
+/// Whether a comparison of `l` and `r` widens a runtime integer operand to
+/// float/numeric (a cast PostgreSQL charges). True when one side is an integer
+/// expression that is not a compile-time constant and the other side resolves
+/// to float/numeric.
+fn widening_cast(l: &Expr, r: &Expr, cols: &dyn super::exec::ColTypeResolver) -> bool {
+    use super::exec::infer_type_res;
+    use super::types::oid;
+    let ty = |e: &Expr| infer_type_res(e, cols).map(|(o, _)| o).unwrap_or(oid::UNKNOWN);
+    let wide = |o: i32| matches!(o, oid::FLOAT8 | oid::FLOAT4 | oid::NUMERIC);
+    let narrow = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8);
+    let (lt, rt) = (ty(l), ty(r));
+    (narrow(lt) && !l.is_constant() && wide(rt)) || (narrow(rt) && !r.is_constant() && wide(lt))
 }
 
 const MAX_SET_LEAVES: usize = 32;
@@ -4691,25 +4921,41 @@ fn materialized_rows<'a>(
         w
     };
 
-    // Pass 1: count.
+    // Pass 1: count — and evaluate the projection and ORDER BY keys per row
+    // (discarding the values). PostgreSQL scans, filters, and projects in a
+    // single per-row pass below the Sort, so an early row's projection error
+    // surfaces before a later row's WHERE error. We materialize in two passes
+    // for a fixed-size allocation, so the count pass must reproduce that error
+    // timing rather than evaluate every WHERE before any projection.
     let mut count = 0usize;
     scan_source(
         storage, scope, from, txid, where_in_scan, arena, params, hooks,
         None,
         &mut |row| {
-            if !correlated.is_empty() {
-                let mut sc: [(*const Expr, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), Datum::Null); MAX_SUBQUERIES];
-                let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
-                let row_subs = merge_correlated(
+            let mut sc: [(*const Expr, Datum); MAX_SUBQUERIES] =
+                [(core::ptr::null(), Datum::Null); MAX_SUBQUERIES];
+            let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
+                [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+            let row_subs;
+            let row_hooks_owned;
+            let row_hooks: &EvalHooks = if correlated.is_empty() {
+                hooks
+            } else {
+                row_subs = merge_correlated(
                     correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
                 )?;
-                let row_hooks = EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None };
+                row_hooks_owned =
+                    EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None };
                 if let Some(w) = stmt.where_clause
-                    && !where_passes(w, arena, params, row, &row_hooks)? {
+                    && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                         return Ok(true);
                     }
+                &row_hooks_owned
+            };
+            let mut projected = [Datum::Null; MAX_PROJ];
+            project_row(stmt.items, scope, row, arena, params, row_hooks, &mut projected)?;
+            for oe in order_exprs.iter().take(n_order) {
+                eval_full(oe.expect("resolved"), arena, params, row, row_hooks)?;
             }
             count += 1;
             Ok(true)

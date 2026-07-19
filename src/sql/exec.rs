@@ -2785,15 +2785,35 @@ pub fn resolve_order_expr_pub<'a>(
 ) -> Result<&'a Expr<'a>, SqlError> {
     // An unqualified name that matches a SELECT-list output column binds to
     // that output column, as in PostgreSQL (output names win over input
-    // columns for a simple ORDER BY name).
+    // columns for a simple ORDER BY name). Matching two or more output columns
+    // is ambiguous (42702), matching PostgreSQL's findTargetlistEntrySQL92 —
+    // e.g. `SELECT (CASE .. ELSE b END), b ... ORDER BY b`, where the CASE
+    // inherits the name `b` from its ELSE column.
     if let Expr::Column { qualifier: None, name } = expr {
+        let mut found: Option<&'a Expr<'a>> = None;
         for item in items {
             if let SelectItem::Expr { expr: item_expr, alias } = item {
                 let out_name = alias.unwrap_or(derived_name(item_expr));
                 if out_name == *name {
-                    return Ok(item_expr);
+                    match found {
+                        // Two output columns share the name but resolve to
+                        // different expressions — ambiguous (`SELECT s, s` is
+                        // not, both being the same column).
+                        Some(f) if *f != **item_expr => {
+                            return Err(sql_err!(
+                                "42702",
+                                "ORDER BY \"{}\" is ambiguous",
+                                name
+                            ));
+                        }
+                        Some(_) => {}
+                        None => found = Some(item_expr),
+                    }
                 }
             }
+        }
+        if let Some(item_expr) = found {
+            return Ok(item_expr);
         }
     }
     let Expr::Int(n) = expr else {

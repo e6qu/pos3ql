@@ -162,74 +162,139 @@ pub fn eval<'a>(
 /// subtrees are evaluated once here; per-row evaluation (with short-circuit)
 /// handles the rest.
 pub fn check_constant_errors<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+    fold_check(expr, arena).map(|_| ())
+}
+
+/// The simplification-aware core of [`check_constant_errors`], mirroring
+/// PostgreSQL's `eval_const_expressions`: it folds constant subexpressions
+/// (surfacing their errors) but simplifies `A AND FALSE`→`FALSE`,
+/// `A OR TRUE`→`TRUE`, and constant `CASE` arms — so a constant error inside a
+/// branch that simplification *drops* is not surfaced (PostgreSQL evaluates
+/// `... WHERE FALSE AND (id > (-1 % 0))` to no rows, never folding `-1 % 0`).
+/// Returns the folded boolean value when the expression provably reduces to
+/// one, else `None`.
+fn fold_check<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, SqlError> {
+    use super::ast::BinaryOp;
     if expr.is_constant() {
-        // Evaluate to surface a division-by-zero / overflow / bad-cast error;
-        // discard the value.
-        eval(expr, arena, NO_PARAMS, &NoColumns)?;
-        return Ok(());
+        // A fully-constant subtree folds eagerly; its error surfaces here.
+        return Ok(match eval(expr, arena, NO_PARAMS, &NoColumns)? {
+            Datum::Bool(b) => Some(b),
+            _ => None,
+        });
     }
     match expr {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
         | Expr::NumericLit(_) | Expr::Str(_) | Expr::Column { .. }
-        | Expr::Param(_) | Expr::DefaultMarker => Ok(()),
+        | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
+        // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
+        // (AND) / TRUE (OR) operand settles the result and drops the sibling,
+        // so the sibling's constant errors are never surfaced.
+        Expr::Binary { op: BinaryOp::And, left, right } => {
+            if fold_check(left, arena)? == Some(false) {
+                return Ok(Some(false));
+            }
+            if fold_check(right, arena)? == Some(false) {
+                return Ok(Some(false));
+            }
+            Ok(None)
+        }
+        Expr::Binary { op: BinaryOp::Or, left, right } => {
+            if fold_check(left, arena)? == Some(true) {
+                return Ok(Some(true));
+            }
+            if fold_check(right, arena)? == Some(true) {
+                return Ok(Some(true));
+            }
+            Ok(None)
+        }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
-        | Expr::IsNull { operand, .. } => check_constant_errors(operand, arena),
+        | Expr::IsNull { operand, .. } => {
+            fold_check(operand, arena)?;
+            Ok(None)
+        }
         Expr::Binary { left, right, .. } => {
-            check_constant_errors(left, arena)?;
-            check_constant_errors(right, arena)
+            fold_check(left, arena)?;
+            fold_check(right, arena)?;
+            Ok(None)
         }
         Expr::InList { operand, list, .. } => {
-            check_constant_errors(operand, arena)?;
+            fold_check(operand, arena)?;
             for e in *list {
-                check_constant_errors(e, arena)?;
+                fold_check(e, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Between { operand, low, high, .. } => {
-            check_constant_errors(operand, arena)?;
-            check_constant_errors(low, arena)?;
-            check_constant_errors(high, arena)
+            fold_check(operand, arena)?;
+            fold_check(low, arena)?;
+            fold_check(high, arena)?;
+            Ok(None)
         }
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            check_constant_errors(operand, arena)?;
-            check_constant_errors(pattern, arena)
+            fold_check(operand, arena)?;
+            fold_check(pattern, arena)?;
+            Ok(None)
         }
         Expr::Case { operand, whens, otherwise } => {
             if let Some(o) = operand {
-                check_constant_errors(o, arena)?;
-            }
-            for (c, r) in *whens {
-                check_constant_errors(c, arena)?;
-                check_constant_errors(r, arena)?;
+                // Operand form (`CASE x WHEN v ...`): the WHENs are compared to
+                // x, not boolean conditions, so no arm is dropped by folding.
+                fold_check(o, arena)?;
+                for (c, r) in *whens {
+                    fold_check(c, arena)?;
+                    fold_check(r, arena)?;
+                }
+            } else {
+                // Searched form: a constant-FALSE WHEN drops its THEN; a
+                // constant-TRUE WHEN makes the CASE that THEN and drops the
+                // rest — matching PostgreSQL, so a division in a dead arm
+                // (`WHEN 'a' LIKE 'b' THEN 2/0`) is never folded.
+                for (c, r) in *whens {
+                    match fold_check(c, arena)? {
+                        Some(false) => continue,
+                        Some(true) => {
+                            fold_check(r, arena)?;
+                            return Ok(None);
+                        }
+                        None => {
+                            fold_check(r, arena)?;
+                        }
+                    }
+                }
             }
             if let Some(e) = otherwise {
-                check_constant_errors(e, arena)?;
+                fold_check(e, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Call { args, .. } => {
             for a in *args {
-                check_constant_errors(a, arena)?;
+                fold_check(a, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Ok(()),
+        | Expr::ArraySubquery(_) => Ok(None),
         Expr::Array(items) => {
             for e in *items {
-                check_constant_errors(e, arena)?;
+                fold_check(e, arena)?;
             }
-            Ok(())
+            Ok(None)
         }
         Expr::Subscript { base, index } => {
-            check_constant_errors(base, arena)?;
-            check_constant_errors(index, arena)
+            fold_check(base, arena)?;
+            fold_check(index, arena)?;
+            Ok(None)
         }
-        Expr::Field { base, .. } => check_constant_errors(base, arena),
+        Expr::Field { base, .. } => {
+            fold_check(base, arena)?;
+            Ok(None)
+        }
         Expr::AnyAll { operand, array, .. } => {
-            check_constant_errors(operand, arena)?;
-            check_constant_errors(array, arena)
+            fold_check(operand, arena)?;
+            fold_check(array, arena)?;
+            Ok(None)
         }
     }
 }
@@ -275,23 +340,19 @@ pub fn eval_full<'a>(
             unary(op, v)
         }
         Expr::Binary { op: BinaryOp::And, left, right } => {
-            // Short-circuit like PostgreSQL: a FALSE operand determines the
-            // result without evaluating the other (so `false AND 1/0` does
-            // not error). Three-valued logic otherwise.
-            let l = eval_full(left, arena, params, row, hooks)?;
-            if matches!(l, Datum::Bool(false)) {
-                return Ok(Datum::Bool(false));
-            }
-            let r = eval_full(right, arena, params, row, hooks)?;
-            logic(BinaryOp::And, l, r)
+            // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
+            // scan qual in a cost order that is not fixed, so a FALSE operand
+            // determines the result even when the *other* operand would error at
+            // runtime. Match that: a definite FALSE on either side yields FALSE
+            // and absorbs the sibling's runtime error. A constant erroring
+            // operand still errors — `check_constant_errors` surfaces it before
+            // we get here, so anything that reaches this point is per-row.
+            eval_logic_short_circuit(BinaryOp::And, left, right, arena, params, row, hooks)
         }
         Expr::Binary { op: BinaryOp::Or, left, right } => {
-            let l = eval_full(left, arena, params, row, hooks)?;
-            if matches!(l, Datum::Bool(true)) {
-                return Ok(Datum::Bool(true));
-            }
-            let r = eval_full(right, arena, params, row, hooks)?;
-            logic(BinaryOp::Or, l, r)
+            // Dual of AND: a definite TRUE on either side yields TRUE and
+            // absorbs the sibling's runtime error (PostgreSQL's `x OR TRUE`).
+            eval_logic_short_circuit(BinaryOp::Or, left, right, arena, params, row, hooks)
         }
         Expr::Binary { op, left, right } => {
             let l = eval_full(left, arena, params, row, hooks)?;
@@ -2231,6 +2292,46 @@ fn json_get<'a>(
     let mut buf = crate::util::StackStr::<8192>::new();
     let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&child)));
     Ok(Datum::Json { text: arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?, jsonb })
+}
+
+/// Evaluates `left AND right` / `left OR right` with PostgreSQL's short-circuit
+/// semantics. The *absorbing* value is FALSE for AND, TRUE for OR. PostgreSQL
+/// simplifies `x AND FALSE` / `x OR TRUE` at plan time — dropping `x` even when
+/// it would error, and even when the settling value is nested (`A AND (FALSE
+/// AND c)` drops `A`) — but is otherwise strict left-to-right: `(1/a=1) AND
+/// (b>0)` errors on the division, it does not swallow it because `b>0` is not
+/// statically FALSE. `fold_check` decides statically (surfacing a constant
+/// operand's own error left-first, exactly as plan-time folding does).
+fn eval_logic_short_circuit<'a>(
+    op: BinaryOp,
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let absorbing = matches!(op, BinaryOp::Or);
+    // Left first: a statically-determined left settles the result (absorbing) or
+    // hands off to the right (non-absorbing), matching plan-time folding order.
+    match fold_check(left, arena)? {
+        Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
+        Some(_) => return eval_full(right, arena, params, row, hooks),
+        None => {}
+    }
+    // Left is runtime; if the right statically folds to the absorbing value it
+    // settles the result and drops the (possibly-erroring) left.
+    match fold_check(right, arena)? {
+        Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
+        Some(_) => return eval_full(left, arena, params, row, hooks),
+        None => {}
+    }
+    let l = eval_full(left, arena, params, row, hooks)?;
+    if matches!(l, Datum::Bool(b) if b == absorbing) {
+        return Ok(Datum::Bool(absorbing));
+    }
+    let r = eval_full(right, arena, params, row, hooks)?;
+    logic(op, l, r)
 }
 
 /// SQL three-valued AND/OR.

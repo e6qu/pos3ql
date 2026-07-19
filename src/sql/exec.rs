@@ -374,13 +374,13 @@ fn attach_constraints(
                         crate::storage::MAX_CHECKS
                     ));
                 }
-                let cname = match name {
+                let constraint_name = match name {
                     Some(n) => SqlName::parse(n)?,
                     None => SqlName::parse(
                         stack_format!(64, "{}_check", def.name.as_str()).as_str(),
                     )?,
                 };
-                let mut c = CheckConstraint { name: cname, expression: crate::util::StackStr::new() };
+                let mut c = CheckConstraint { name: constraint_name, expression: crate::util::StackStr::new() };
                 let _ = core::fmt::Write::write_str(&mut c.expression, text);
                 if c.expression.is_truncated() {
                     return Err(sql_err!(
@@ -1426,11 +1426,11 @@ pub fn create_index(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let tname = match SqlName::parse(table) {
+    let table_name = match SqlName::parse(table) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let def = IndexDef { name: sqlname, table: tname, columns, n_cols, unique, live: true };
+    let def = IndexDef { name: sqlname, table: table_name, columns, n_cols, unique, live: true };
     // Register first so the UNIQUE validation below sees this index; on any
     // failure the registration is rolled back.
     let slot = match storage.create_index(def) {
@@ -2402,12 +2402,12 @@ pub(crate) fn unify_numeric_tower(a: ColType, b: ColType) -> ColType {
 /// PostgreSQL's error when an aggregate has no signature for the argument
 /// type (e.g. sum(text), max(boolean)).
 fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
-    let tname = coltype_of_oid(arg_oid).map(|t| t.name()).unwrap_or("unknown");
+    let table_name = coltype_of_oid(arg_oid).map(|t| t.name()).unwrap_or("unknown");
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "function {}({}) does not exist",
         name,
-        tname
+        table_name
     )
 }
 

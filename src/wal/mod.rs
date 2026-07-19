@@ -628,7 +628,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             }
             def.n_checks = n_checks;
             for k in 0..n_checks {
-                let cname = take_name(&mut at)?;
+                let constraint_name = take_name(&mut at)?;
                 let elen =
                     u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
                 at += 2;
@@ -636,7 +636,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += elen;
                 let text = core::str::from_utf8(raw).ok()?;
                 let mut check = CheckConstraint::EMPTY;
-                check.name = SqlName::parse(cname).ok()?;
+                check.name = SqlName::parse(constraint_name).ok()?;
                 core::fmt::Write::write_str(&mut check.expression, text).ok()?;
                 if check.expression.is_truncated() {
                     return None;
@@ -664,8 +664,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
-                let pname = take_name(&mut at)?;
-                fk.parent = SqlName::parse(pname).ok()?;
+                let parent_name = take_name(&mut at)?;
+                fk.parent = SqlName::parse(parent_name).ok()?;
                 let np = *payload.get(at)? as usize;
                 at += 1;
                 if np > MAX_INDEX_COLS {

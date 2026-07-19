@@ -365,7 +365,7 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
     };
     for (slot, table) in storage.live_tables() {
         let def = &table.def;
-        let tname = def.name.as_str();
+        let table_name = def.name.as_str();
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
         let mut mk = |columns: &[u16], is_primary: bool, is_unique: bool, name: StackStr<64>| {
@@ -387,11 +387,11 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
         // Single-column PK / UNIQUE carried as column flags.
         for (ci, col) in def.columns().iter().enumerate() {
             if col.primary {
-                let name = stack_str_64(stack_format!(64, "{}_pkey", tname).as_str());
+                let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 push(mk(&[ci as u16], true, true, name), &mut n);
             } else if col.unique {
                 let name =
-                    stack_str_64(stack_format!(64, "{}_{}_key", tname, col.name.as_str()).as_str());
+                    stack_str_64(stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str());
                 push(mk(&[ci as u16], false, true, name), &mut n);
             }
         }
@@ -400,7 +400,7 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
             push(mk(uk.columns(), uk.is_primary, true, stack_str_64(uk.name.as_str())), &mut n);
         }
         // Explicit CREATE INDEX on this table.
-        for index in storage.live_indexes().filter(|i| i.table.as_str() == tname) {
+        for index in storage.live_indexes().filter(|i| i.table.as_str() == table_name) {
             push(
                 mk(&index.columns[..index.n_cols], false, index.unique, stack_str_64(index.name.as_str())),
                 &mut n,

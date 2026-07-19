@@ -2469,6 +2469,11 @@ impl ColTypeResolver for DefCols<'_> {
 
 /// Whether two concrete types have a comparison operator, per PostgreSQL:
 /// same type, both numeric-tower, or both in the date/time family.
+/// Whether an OID names a range type (so range operators apply).
+fn is_range_oid(oid: i32) -> bool {
+    matches!(coltype_of_oid(oid), Some(ColType::Range(_)))
+}
+
 fn comparable(a: ColType, b: ColType) -> bool {
     use ColType::*;
     if a == b {
@@ -2534,7 +2539,15 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     of(ColType::Bool)
                 }
                 And | Or => of(ColType::Bool),
-                Contains | ContainedBy | Overlaps => of(ColType::Bool),
+                Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
+                    of(ColType::Bool)
+                }
+                // Range set operators (`+`/`-`/`*` on ranges) return a range of
+                // the same type; shifts on ranges (`<<`/`>>`) return boolean.
+                Add | Sub | Mul if is_range_oid(lo) || is_range_oid(ro) => {
+                    (if is_range_oid(lo) { lo } else { ro }, -1)
+                }
+                Shl | Shr if is_range_oid(lo) || is_range_oid(ro) => of(ColType::Bool),
                 // `||` concatenates arrays when either side is an array (the
                 // array type is preserved), otherwise it is text concatenation.
                 Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => {
@@ -2871,7 +2884,14 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
                 of(ColType::Range(super::types::RangeKind::from_name(name).expect("range name")))
             }
-            "isempty" | "lower_inc" | "upper_inc" => of(ColType::Bool),
+            "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => of(ColType::Bool),
+            "range_merge" => {
+                // Same range type as its arguments.
+                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                    Some(o) if is_range_oid(o) => (o, -1),
+                    _ => (oid::TEXT, -1),
+                }
+            }
             "lower" | "upper" => {
                 // A range argument yields its element type; otherwise text.
                 match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {

@@ -525,6 +525,12 @@ pub enum BinaryOp {
     Contains,
     ContainedBy,
     Overlaps,
+    /// `&<` does not extend right, `&>` does not extend left, `-|-` adjacent
+    /// (ranges). `<<`/`>>` reuse `Shl`/`Shr`; `+`/`-`/`*` reuse the arithmetic
+    /// operators (dispatched on range operands).
+    NotRightOf,
+    NotLeftOf,
+    Adjacent,
 }
 
 impl BinaryOp {
@@ -535,8 +541,9 @@ impl BinaryOp {
             Self::Or => 1,
             Self::And => 2,
             Self::Eq | Self::NotEq | Self::Lt | Self::LtEq | Self::Gt | Self::GtEq => 4,
-            // Containment/overlap operators bind like comparisons.
+            // Containment/overlap/adjacency operators bind like comparisons.
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
+            Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
             Self::Concat => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,
             // matching PostgreSQL (they are non-standard, mid-precedence).

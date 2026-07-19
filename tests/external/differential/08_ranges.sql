@@ -31,7 +31,23 @@ SELECT count(DISTINCT r) FROM rng;
 SELECT id FROM rng WHERE r @> 2 ORDER BY id;
 SELECT id FROM rng WHERE r < int4range(1, 8) ORDER BY id;
 DROP TABLE rng;
+-- set operators: intersection *, union +, difference -
+SELECT int4range(1, 10) * int4range(5, 15), int4range(1, 10) * int4range(20, 30);
+SELECT int4range(1, 10) + int4range(5, 15), int4range(1, 5) + int4range(5, 10);
+SELECT int4range(1, 10) - int4range(5, 15), int4range(1, 10) - int4range(0, 5), int4range(1, 10) - int4range(20, 30);
+SELECT numrange(1.0, 5.0) * numrange(2.0, 8.0);
+-- predicate operators: << >> &< &> -|-
+SELECT int4range(1, 10) << int4range(20, 30), int4range(1, 10) << int4range(5, 30);
+SELECT int4range(20, 30) >> int4range(1, 10);
+SELECT int4range(1, 10) &< int4range(5, 20), int4range(1, 30) &< int4range(5, 20);
+SELECT int4range(5, 20) &> int4range(1, 10);
+SELECT int4range(1, 10) -|- int4range(10, 20), int4range(1, 10) -|- int4range(11, 20);
+-- functions: range_merge, lower_inf, upper_inf
+SELECT range_merge(int4range(1, 5), int4range(10, 20));
+SELECT lower_inf(int4range(NULL, 5)), upper_inf(int4range(1, NULL)), lower_inf(int4range(1, 5));
 -- error cases
 SELECT int4range(10, 1);
 SELECT '[1,2,3)'::int4range;
 SELECT int4range(1, 5) = numrange(1, 5);
+SELECT int4range(1, 5) + int4range(10, 20);
+SELECT int4range(1, 10) - int4range(3, 6);

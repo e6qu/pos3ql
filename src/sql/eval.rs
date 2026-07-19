@@ -2341,6 +2341,34 @@ fn call<'a>(
                 other => Err(type_mismatch(name, &other)),
             }
         }
+        "lower_inf" | "upper_inf" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Range { text, kind } => Ok(Datum::Bool(if name == "lower_inf" {
+                    super::range::lower_inf(text, kind)?
+                } else {
+                    super::range::upper_inf(text, kind)?
+                })),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "range_merge" => {
+            arity(2)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let b = eval_full(args[1], arena, params, row, hooks)?;
+            if a.is_null() || b.is_null() {
+                return Ok(Datum::Null);
+            }
+            let (Datum::Range { text: at, kind: ak }, Datum::Range { text: bt, kind: bk }) = (a, b)
+            else {
+                return Err(type_mismatch(name, &a));
+            };
+            if ak != bk {
+                return Err(range_mismatch());
+            }
+            Ok(Datum::Range { text: super::range::merge(at, bt, ak, arena)?, kind: ak })
+        }
         "to_char" => {
             arity(2)?;
             let v = eval_full(args[0], arena, params, row, hooks)?;
@@ -3114,10 +3142,17 @@ fn binary<'a>(
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(op, l, r),
             _ => compare(op, l, r, l_unknown, r_unknown),
         },
-        Add | Sub | Mul | Div | Mod => arithmetic(op, l, r, l_unknown, r_unknown, arena),
+        Add | Sub | Mul | Div | Mod => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(op, l, r, arena),
+            _ => arithmetic(op, l, r, l_unknown, r_unknown, arena),
+        },
         JsonGet | JsonGetText => json_get(l, r, op == JsonGetText, arena),
-        BitAnd | BitOr | BitXor | Shl | Shr => bitwise(op, l, r),
-        Contains | ContainedBy | Overlaps => range_op(op, l, r),
+        Shl | Shr => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(op, l, r),
+            _ => bitwise(op, l, r),
+        },
+        BitAnd | BitOr | BitXor => bitwise(op, l, r),
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(op, l, r),
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
             // is float8); otherwise it is double-precision exponentiation.
@@ -3137,29 +3172,62 @@ fn binary<'a>(
     }
 }
 
-/// Range containment/overlap operators: `@>` (contains), `<@` (contained by),
-/// `&&` (overlaps). `@>`/`<@` accept a range-vs-range or range-vs-element pair.
-fn range_op<'a>(
-    op: BinaryOp,
-    l: Datum<'a>,
-    r: Datum<'a>,
-) -> Result<Datum<'a>, SqlError> {
+/// Range predicate operators: `@>` (contains), `<@` (contained by), `&&`
+/// (overlaps), `<<`/`>>` (strictly left/right), `&<`/`&>` (does not extend
+/// right/left), `-|-` (adjacent). `@>`/`<@` accept a range-vs-range or
+/// range-vs-element pair; the rest require two ranges of the same kind.
+fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    use super::range;
+    use BinaryOp::{Adjacent, ContainedBy, Contains, NotLeftOf, NotRightOf, Overlaps, Shl, Shr};
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
     match op {
-        BinaryOp::Contains => range_contains(l, r),
-        BinaryOp::ContainedBy => range_contains(r, l),
-        BinaryOp::Overlaps => {
+        Contains => range_contains(l, r),
+        ContainedBy => range_contains(r, l),
+        _ => {
             let (lt, lk) = as_range(&l)?;
             let (rt, rk) = as_range(&r)?;
             if lk != rk {
                 return Err(range_mismatch());
             }
-            Ok(Datum::Bool(super::range::overlaps(lt, rt, lk)?))
+            Ok(Datum::Bool(match op {
+                Overlaps => range::overlaps(lt, rt, lk)?,
+                Shl => range::strictly_before(lt, rt, lk)?,
+                Shr => range::strictly_after(lt, rt, lk)?,
+                NotRightOf => range::not_right_of(lt, rt, lk)?,
+                NotLeftOf => range::not_left_of(lt, rt, lk)?,
+                Adjacent => range::adjacent(lt, rt, lk)?,
+                _ => unreachable!("range_op only handles range predicates"),
+            }))
         }
-        _ => unreachable!("range_op only handles containment/overlap"),
     }
+}
+
+/// Range set operators returning a range: `+` (union), `-` (difference), `*`
+/// (intersection). Both operands must be ranges of the same kind.
+fn range_setop<'a>(
+    op: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::range;
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let (lt, lk) = as_range(&l)?;
+    let (rt, rk) = as_range(&r)?;
+    if lk != rk {
+        return Err(range_mismatch());
+    }
+    let text = match op {
+        BinaryOp::Add => range::union(lt, rt, lk, arena)?,
+        BinaryOp::Sub => range::difference(lt, rt, lk, arena)?,
+        BinaryOp::Mul => range::intersect(lt, rt, lk, arena)?,
+        _ => return Err(type_mismatch("range operator", &l)),
+    };
+    Ok(Datum::Range { text, kind: lk })
 }
 
 fn range_mismatch() -> SqlError {
@@ -4161,17 +4229,17 @@ fn division_by_zero() -> SqlError {
 fn type_mismatch(op: &str, d: &Datum) -> SqlError {
     sql_err!(
         sqlstate::DATATYPE_MISMATCH,
-        "operator {} does not accept {:?}",
+        "operator {} does not accept {}",
         op,
-        d
+        type_name_of(d)
     )
 }
 
 fn cast_unsupported(from: &Datum, to: &'static str) -> SqlError {
     sql_err!(
         sqlstate::DATATYPE_MISMATCH,
-        "cannot cast {:?} to {}",
-        from,
+        "cannot cast {} to {}",
+        type_name_of(from),
         to
     )
 }

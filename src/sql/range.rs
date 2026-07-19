@@ -378,6 +378,174 @@ fn cmp_bound(
     }
 }
 
+/// `lower_inf(r)`: the range is non-empty and has no lower bound.
+pub fn lower_inf(text: &str, kind: RangeKind) -> Result<bool, SqlError> {
+    let p = parse(text, kind)?;
+    Ok(!p.empty && p.lower.is_none())
+}
+
+/// `upper_inf(r)`: the range is non-empty and has no upper bound.
+pub fn upper_inf(text: &str, kind: RangeKind) -> Result<bool, SqlError> {
+    let p = parse(text, kind)?;
+    Ok(!p.empty && p.upper.is_none())
+}
+
+/// `a << b`: `a` lies strictly to the left of `b` (no overlap, `a` entirely
+/// below `b`). Empty ranges are never strictly left of anything.
+pub fn strictly_before(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty || pb.empty {
+        return Ok(false);
+    }
+    strictly_left(&pa, &pb, kind)
+}
+
+/// `a >> b`: `a` lies strictly to the right of `b`.
+pub fn strictly_after(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
+    strictly_before(b, a, kind)
+}
+
+/// `a &< b`: `a` does not extend to the right of `b` (`upper(a) <= upper(b)`).
+pub fn not_right_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty || pb.empty {
+        return Ok(false);
+    }
+    Ok(cmp_bound(pa.upper, pa.upper_inc, pb.upper, pb.upper_inc, false, kind)? != Ordering::Greater)
+}
+
+/// `a &> b`: `a` does not extend to the left of `b` (`lower(a) >= lower(b)`).
+pub fn not_left_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty || pb.empty {
+        return Ok(false);
+    }
+    Ok(cmp_bound(pa.lower, pa.lower_inc, pb.lower, pb.lower_inc, true, kind)? != Ordering::Less)
+}
+
+/// `a -|- b`: the ranges are adjacent (disjoint with no gap between them).
+pub fn adjacent(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty || pb.empty {
+        return Ok(false);
+    }
+    Ok(bound_adjacent(pa.upper, pa.upper_inc, pb.lower, pb.lower_inc, kind)?
+        || bound_adjacent(pb.upper, pb.upper_inc, pa.lower, pa.lower_inc, kind)?)
+}
+
+/// An upper bound and a lower bound touch (same value, exactly one inclusive),
+/// leaving no gap and no overlap.
+fn bound_adjacent(
+    uval: Option<&str>,
+    uinc: bool,
+    lval: Option<&str>,
+    linc: bool,
+    kind: RangeKind,
+) -> Result<bool, SqlError> {
+    let (Some(u), Some(l)) = (uval, lval) else {
+        return Ok(false);
+    };
+    Ok(cmp_elem(u, l, kind)? == Ordering::Equal && (uinc != linc))
+}
+
+/// `a * b`: the intersection of two ranges (empty when they do not overlap).
+pub fn intersect<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty || pb.empty || !overlaps(a, b, kind)? {
+        return alloc(arena, "empty");
+    }
+    // The more restrictive bounds: the greater lower and the lesser upper.
+    let (lo, lo_inc) = pick_lower(&pa, &pb, kind, true)?;
+    let (hi, hi_inc) = pick_upper(&pa, &pb, kind, true)?;
+    canonical(&mk(lo, lo_inc, hi, hi_inc), kind, arena)
+}
+
+/// `a + b`: the union of two ranges. PostgreSQL requires the result to be
+/// contiguous (the inputs overlap or are adjacent), else it errors.
+pub fn union<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty {
+        return canonical(&pb, kind, arena);
+    }
+    if pb.empty {
+        return canonical(&pa, kind, arena);
+    }
+    if !overlaps(a, b, kind)? && !adjacent(a, b, kind)? {
+        return Err(sql_err!("22000", "result of range union would not be contiguous"));
+    }
+    let (lo, lo_inc) = pick_lower(&pa, &pb, kind, false)?;
+    let (hi, hi_inc) = pick_upper(&pa, &pb, kind, false)?;
+    canonical(&mk(lo, lo_inc, hi, hi_inc), kind, arena)
+}
+
+/// `range_merge(a, b)`: the smallest range containing both, with no contiguity
+/// requirement (unlike `+`).
+pub fn merge<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty {
+        return canonical(&pb, kind, arena);
+    }
+    if pb.empty {
+        return canonical(&pa, kind, arena);
+    }
+    let (lo, lo_inc) = pick_lower(&pa, &pb, kind, false)?;
+    let (hi, hi_inc) = pick_upper(&pa, &pb, kind, false)?;
+    canonical(&mk(lo, lo_inc, hi, hi_inc), kind, arena)
+}
+
+/// `a - b`: `a` with the portion overlapping `b` removed. Errors when the
+/// result would not be contiguous (`b` strictly inside `a`).
+pub fn difference<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
+    if pa.empty || pb.empty || !overlaps(a, b, kind)? {
+        return canonical(&pa, kind, arena);
+    }
+    // Does `b` cover `a`'s left end / right end?
+    let left = cmp_bound(pb.lower, pb.lower_inc, pa.lower, pa.lower_inc, true, kind)? != Ordering::Greater;
+    let right = cmp_bound(pb.upper, pb.upper_inc, pa.upper, pa.upper_inc, false, kind)? != Ordering::Less;
+    match (left, right) {
+        (true, true) => alloc(arena, "empty"),
+        // `b` trims the left: keep `[b.upper, a.upper)` (inclusivity flipped).
+        (true, false) => canonical(&mk(pb.upper, !pb.upper_inc, pa.upper, pa.upper_inc), kind, arena),
+        // `b` trims the right: keep `[a.lower, b.lower)` (inclusivity flipped).
+        (false, true) => canonical(&mk(pa.lower, pa.lower_inc, pb.lower, !pb.lower_inc), kind, arena),
+        (false, false) => {
+            Err(sql_err!("22000", "result of range difference would not be contiguous"))
+        }
+    }
+}
+
+/// Builds a non-empty `Parsed` from chosen bounds.
+fn mk<'a>(lo: Option<&'a str>, lo_inc: bool, hi: Option<&'a str>, hi_inc: bool) -> Parsed<'a> {
+    Parsed { empty: false, lower: lo, upper: hi, lower_inc: lo_inc, upper_inc: hi_inc }
+}
+
+/// Chooses one range's lower bound: the greater (more restrictive) when
+/// `restrictive`, else the lesser (for union/merge).
+fn pick_lower<'a>(
+    a: &Parsed<'a>,
+    b: &Parsed<'a>,
+    kind: RangeKind,
+    restrictive: bool,
+) -> Result<(Option<&'a str>, bool), SqlError> {
+    let c = cmp_bound(a.lower, a.lower_inc, b.lower, b.lower_inc, true, kind)?;
+    let take_a = if restrictive { c == Ordering::Greater } else { c != Ordering::Greater };
+    Ok(if take_a { (a.lower, a.lower_inc) } else { (b.lower, b.lower_inc) })
+}
+
+/// Chooses one range's upper bound: the lesser (more restrictive) when
+/// `restrictive`, else the greater (for union/merge).
+fn pick_upper<'a>(
+    a: &Parsed<'a>,
+    b: &Parsed<'a>,
+    kind: RangeKind,
+    restrictive: bool,
+) -> Result<(Option<&'a str>, bool), SqlError> {
+    let c = cmp_bound(a.upper, a.upper_inc, b.upper, b.upper_inc, false, kind)?;
+    let take_a = if restrictive { c == Ordering::Less } else { c != Ordering::Less };
+    Ok(if take_a { (a.upper, a.upper_inc) } else { (b.upper, b.upper_inc) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +593,40 @@ mod tests {
         // Every range contains the empty range; the empty range overlaps nothing.
         assert!(contains_range("[1,5)", "empty", Int4).unwrap());
         assert!(!overlaps("[1,5)", "empty", Int4).unwrap());
+    }
+
+    #[test]
+    fn predicates() {
+        assert!(strictly_before("[1,10)", "[20,30)", Int4).unwrap());
+        assert!(!strictly_before("[1,10)", "[5,30)", Int4).unwrap());
+        assert!(strictly_after("[20,30)", "[1,10)", Int4).unwrap());
+        assert!(not_right_of("[1,10)", "[5,20)", Int4).unwrap());
+        assert!(!not_right_of("[1,30)", "[5,20)", Int4).unwrap());
+        assert!(not_left_of("[5,20)", "[1,10)", Int4).unwrap());
+        assert!(adjacent("[1,10)", "[10,20)", Int4).unwrap());
+        assert!(!adjacent("[1,10)", "[11,20)", Int4).unwrap());
+        assert!(lower_inf("(,5)", Int4).unwrap());
+        assert!(upper_inf("[1,)", Int4).unwrap());
+        assert!(!lower_inf("[1,5)", Int4).unwrap());
+    }
+
+    #[test]
+    fn set_operations() {
+        let a = mini_arena();
+        assert_eq!(intersect("[1,10)", "[5,15)", Int4, &a).unwrap(), "[5,10)");
+        assert_eq!(intersect("[1,10)", "[20,30)", Int4, &a).unwrap(), "empty");
+        assert_eq!(union("[1,10)", "[5,15)", Int4, &a).unwrap(), "[1,15)");
+        assert_eq!(union("[1,5)", "[5,10)", Int4, &a).unwrap(), "[1,10)");
+        assert!(union("[1,5)", "[10,20)", Int4, &a).is_err());
+        assert_eq!(difference("[1,10)", "[5,15)", Int4, &a).unwrap(), "[1,5)");
+        assert_eq!(difference("[1,10)", "[0,5)", Int4, &a).unwrap(), "[5,10)");
+        assert_eq!(difference("[1,10)", "[20,30)", Int4, &a).unwrap(), "[1,10)");
+        assert!(difference("[1,10)", "[3,6)", Int4, &a).is_err());
+        assert_eq!(merge("[1,5)", "[10,20)", Int4, &a).unwrap(), "[1,20)");
+    }
+
+    fn mini_arena() -> Arena {
+        let budget = Box::leak(Box::new(crate::mem::Budget::new(1 << 16)));
+        Arena::new(budget, "range_test", 1 << 15).unwrap()
     }
 }

@@ -73,12 +73,14 @@ impl<'a> Lexer<'a> {
                 Ok(Tok::Op(op))
             }
             '-' => {
-                // JSON accessors `->` and `->>`, else the minus operator.
+                // JSON accessors `->`/`->>`, range adjacency `-|-`, else minus.
                 let rest = self.rest();
                 let op = if rest.starts_with("->>") {
                     "->>"
                 } else if rest.starts_with("->") {
                     "->"
+                } else if rest.starts_with("-|-") {
+                    "-|-"
                 } else {
                     "-"
                 };
@@ -113,8 +115,8 @@ impl<'a> Lexer<'a> {
         let rest = self.rest();
         // Longer operators first: the POSIX regex match family before `~`.
         for op in [
-            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "@>", "<@", "&&", "<",
-            ">", "=", "~", "|", "&", "#", "^",
+            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "@>", "<@", "&<", "&>",
+            "&&", "<", ">", "=", "~", "|", "&", "#", "^",
         ] {
             if rest.starts_with(op) {
                 self.at += op.len();

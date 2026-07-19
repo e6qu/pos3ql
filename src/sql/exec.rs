@@ -2599,10 +2599,23 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                 }
             }
         }
-        Expr::Cast { type_name, .. } => match ColType::from_sql_name(type_name) {
-            Some(t) => of(t),
-            None => return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", type_name)),
-        },
+        Expr::Cast { operand, type_name, .. } => {
+            // `regclass` is oid-based: `'relname'::regclass` yields the relation
+            // OID (so `attrelid = 'tbl'::regclass` compares OIDs, as pgx and
+            // most tools introspect), while `oid::regclass` renders as the name.
+            if type_name.eq_ignore_ascii_case("regclass") {
+                let src = infer_type_res(operand, cols)?.0;
+                return Ok(if src == oid::TEXT || src == oid::UNKNOWN {
+                    of(ColType::Int4)
+                } else {
+                    of(ColType::Text)
+                });
+            }
+            match ColType::from_sql_name(type_name) {
+                Some(t) => of(t),
+                None => return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", type_name)),
+            }
+        }
         Expr::IsNull { .. } => of(ColType::Bool),
         Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } | Expr::Match { .. } => of(ColType::Bool),
         Expr::Case { whens, otherwise, .. } => {

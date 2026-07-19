@@ -127,6 +127,8 @@ pub trait CatalogAccess {
         -> Result<Option<&'a str>, SqlError>;
     /// The relation name for an OID, for rendering `oid::regclass`.
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
+    /// The OID of the relation named `name`, for `'relname'::regclass`.
+    fn reloid(&self, name: &str) -> Option<i32>;
 }
 
 /// Pre-evaluated (uncorrelated) subquery results.
@@ -369,15 +371,28 @@ pub fn eval_full<'a>(
             if type_name.eq_ignore_ascii_case("regclass")
                 && let Some(cat) = hooks.catalog
             {
-                let oid = match v {
-                    Datum::Int4(x) => Some(x),
-                    Datum::Int8(x) => Some(x as i32),
-                    _ => None,
-                };
-                if let Some(oid) = oid
-                    && let Some(name) = cat.relname(oid, arena)?
-                {
-                    return Ok(Datum::Text(name));
+                match v {
+                    // `oid::regclass` renders as the relation name.
+                    Datum::Int4(_) | Datum::Int8(_) => {
+                        let oid = if let Datum::Int8(x) = v { x as i32 } else if let Datum::Int4(x) = v { x } else { 0 };
+                        if let Some(name) = cat.relname(oid, arena)? {
+                            return Ok(Datum::Text(name));
+                        }
+                    }
+                    // `'relname'::regclass` resolves to the relation's OID, so a
+                    // catalog query's `attrelid = 'tbl'::regclass` compares OIDs
+                    // (pgx and most tools introspect this way).
+                    Datum::Text(name) => {
+                        if let Some(oid) = cat.reloid(name) {
+                            return Ok(Datum::Int4(oid));
+                        }
+                        return Err(sql_err!(
+                            "42P01",
+                            "relation \"{}\" does not exist",
+                            name
+                        ));
+                    }
+                    _ => {}
                 }
             }
             let v = cast(v, type_name, arena)?;

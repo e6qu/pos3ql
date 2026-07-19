@@ -925,6 +925,45 @@ fn call<'a>(
                 _ => Err(type_mismatch("array_lower requires an array", &a)),
             }
         }
+        "array_position" => {
+            // 1-based index of the first element equal to the target (NULL-safe),
+            // or NULL if absent.
+            arity(2)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let target = eval_full(args[1], arena, params, row, hooks)?;
+            let (elem, raw) = match a {
+                Datum::Array { elem, raw } => (elem, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("array_position requires an array", &a)),
+            };
+            for i in 0..super::array::len(raw) {
+                let el = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+                let hit = if target.is_null() {
+                    el.is_null()
+                } else if el.is_null() {
+                    false
+                } else {
+                    compare_datums(&el, &target)?.is_eq()
+                };
+                if hit {
+                    return Ok(Datum::Int4((i + 1) as i32));
+                }
+            }
+            Ok(Datum::Null)
+        }
+        "jsonb_array_length" | "json_array_length" => {
+            arity(1)?;
+            let s = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch(name, &other)),
+            };
+            match super::json::parse(s, arena)? {
+                super::json::Json::Array(items) => Ok(Datum::Int4(items.len() as i32)),
+                _ => Err(sql_err!("22023", "cannot get array length of a scalar")),
+            }
+        }
         "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible"
         | "has_table_privilege" | "has_column_privilege" | "has_schema_privilege"
         | "pg_relation_is_publishable" => {

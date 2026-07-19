@@ -2799,9 +2799,8 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                 if numeric && !float { of(ColType::Numeric) } else { of(ColType::Float8) }
             }
             "div" | "trim_scale" | "to_number" => of(ColType::Numeric),
-            "scale" | "min_scale" | "width_bucket" | "regexp_count" | "regexp_instr" => {
-                of(ColType::Int4)
-            }
+            "scale" | "min_scale" | "width_bucket" | "regexp_count" | "regexp_instr"
+            | "array_position" | "jsonb_array_length" | "json_array_length" => of(ColType::Int4),
             "regexp_substr" => of(ColType::Text),
             "string_to_array" => of(ColType::Array(super::types::ArrElem::Text)),
             "format" | "overlay" | "regexp_replace" => of(ColType::Text),

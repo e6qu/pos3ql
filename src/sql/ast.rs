@@ -433,7 +433,7 @@ impl Expr<'_> {
         matches!(
             self,
             Expr::Call { name, .. }
-                if matches!(*name, "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "string_agg")
+                if matches!(*name, "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "string_agg" | "percentile_cont" | "percentile_disc" | "mode")
         )
     }
 

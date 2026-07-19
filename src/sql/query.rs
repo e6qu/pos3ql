@@ -2877,6 +2877,12 @@ enum AggKind {
     BoolAnd,
     BoolOr,
     StringAgg,
+    /// Ordered-set aggregates: the aggregated values come from `WITHIN GROUP
+    /// (ORDER BY ...)` and are buffered (in `vals`), sorted, then reduced in
+    /// `finish`. `sum_float` holds the percentile fraction.
+    PercentileCont,
+    PercentileDisc,
+    Mode,
 }
 
 impl Default for AggState<'_> {
@@ -2922,6 +2928,9 @@ impl<'a> AggState<'a> {
             "bool_and" | "every" => AggKind::BoolAnd,
             "bool_or" => AggKind::BoolOr,
             "string_agg" => AggKind::StringAgg,
+            "percentile_cont" => AggKind::PercentileCont,
+            "percentile_disc" => AggKind::PercentileDisc,
+            "mode" => AggKind::Mode,
             other => {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
@@ -2976,6 +2985,35 @@ impl<'a> AggState<'a> {
         }
         if self.kind == AggKind::StringAgg {
             return self.update_string_agg(args, arena, params, row, hooks);
+        }
+        // Ordered-set aggregates buffer their `WITHIN GROUP (ORDER BY expr)`
+        // values (reduced in `finish`); `args[0]` is the percentile fraction.
+        if matches!(
+            self.kind,
+            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode
+        ) {
+            let Expr::Call { order_by, .. } = node else {
+                unreachable!("validated in init");
+            };
+            let Some(item) = order_by.first() else {
+                return Err(sql_err!("42809", "an ordered-set aggregate requires WITHIN GROUP"));
+            };
+            if matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc)
+                && let Some(fraction) = args.first()
+            {
+                self.sum_float = match eval_full(fraction, arena, params, row, hooks)? {
+                    Datum::Float8(f) => f,
+                    Datum::Numeric(n) => n.to_f64(),
+                    Datum::Int4(v) => f64::from(v),
+                    Datum::Int8(v) => v as f64,
+                    _ => return Err(sql_err!("2202E", "percentile value must be numeric")),
+                };
+            }
+            let value = eval_full(item.expression, arena, params, row, hooks)?;
+            if value.is_null() {
+                return Ok(());
+            }
+            return self.push_distinct(value, arena);
         }
         let Some(arg) = args.first() else {
             return Err(sql_err!("42803", "aggregate requires an argument"));
@@ -3060,6 +3098,9 @@ impl<'a> AggState<'a> {
                 let sep = self.sep.unwrap_or("");
                 self.append_str_elem(sep, s, arena)?;
             }
+            // Ordered-set aggregates buffer their values and reduce in `finish`;
+            // they never fold through `accumulate`.
+            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => {}
         }
         Ok(())
     }
@@ -3185,6 +3226,78 @@ impl<'a> AggState<'a> {
 
     /// Append a non-null value to the DISTINCT buffer, growing it (doubling)
     /// in the arena when full. The prior region becomes dead bump-arena space.
+    /// Reduces the buffered `WITHIN GROUP` values for an ordered-set aggregate.
+    fn finish_ordered_set(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+        let n = self.vals_len;
+        if n == 0 {
+            return Ok(Datum::Null);
+        }
+        let values: &mut [Datum<'a>] = unsafe { core::slice::from_raw_parts_mut(self.vals, n) };
+        // Stable insertion sort (compare_datums is fallible, so no library sort).
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 && compare_datums(&values[j - 1], &values[j])?.is_gt() {
+                values.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        match self.kind {
+            AggKind::Mode => {
+                // Most frequent value; ties resolve to the smallest (first).
+                let (mut best_index, mut best_run) = (0usize, 0usize);
+                let mut i = 0;
+                while i < n {
+                    let mut end = i;
+                    while end + 1 < n && compare_datums(&values[end], &values[end + 1])?.is_eq() {
+                        end += 1;
+                    }
+                    if end - i + 1 > best_run {
+                        best_run = end - i + 1;
+                        best_index = i;
+                    }
+                    i = end + 1;
+                }
+                Ok(values[best_index])
+            }
+            AggKind::PercentileDisc => {
+                let fraction = self.sum_float.clamp(0.0, 1.0);
+                let index = if fraction <= 0.0 {
+                    0
+                } else {
+                    ((fraction * n as f64).ceil() as usize).saturating_sub(1).min(n - 1)
+                };
+                Ok(values[index])
+            }
+            _ => {
+                // PercentileCont: linear interpolation between the two nearest
+                // ranks. Numeric input yields numeric; int/float yield double
+                // precision (PostgreSQL's signatures).
+                let fraction = self.sum_float.clamp(0.0, 1.0);
+                let position = fraction * (n as f64 - 1.0);
+                let low = position.floor() as usize;
+                let high = position.ceil() as usize;
+                let weight = position - low as f64;
+                let to_f64 = |d: &Datum<'a>| -> f64 {
+                    match d {
+                        Datum::Int4(v) => f64::from(*v),
+                        Datum::Int8(v) => *v as f64,
+                        Datum::Float8(v) => *v,
+                        Datum::Numeric(v) => v.to_f64(),
+                        _ => 0.0,
+                    }
+                };
+                let interpolated = to_f64(&values[low]) + (to_f64(&values[high]) - to_f64(&values[low])) * weight;
+                match values[low] {
+                    Datum::Numeric(_) => {
+                        let text = crate::stack_format!(48, "{}", interpolated);
+                        Ok(Datum::Numeric(super::numeric::Numeric::parse(text.as_str(), arena)?))
+                    }
+                    _ => Ok(Datum::Float8(interpolated)),
+                }
+            }
+        }
+    }
+
     fn push_distinct(&mut self, v: Datum<'a>, arena: &'a Arena) -> Result<(), SqlError> {
         if self.vals_len == self.vals_cap {
             let new_cap = if self.vals_cap == 0 { 8 } else { self.vals_cap * 2 };
@@ -3296,6 +3409,13 @@ impl<'a> AggState<'a> {
 
     fn finish(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
         use super::numeric::{self as num, Numeric};
+        // Ordered-set aggregates reduce their buffered values directly.
+        if matches!(
+            self.kind,
+            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode
+        ) {
+            return self.finish_ordered_set(arena);
+        }
         self.fold_distinct(arena)?;
         self.fold_ordered(arena)?;
         Ok(match self.kind {
@@ -3339,6 +3459,8 @@ impl<'a> AggState<'a> {
                 let bytes = unsafe { core::slice::from_raw_parts(self.str_buf, self.str_len) };
                 Datum::Text(unsafe { core::str::from_utf8_unchecked(bytes) })
             }
+            // Handled by `finish_ordered_set` before this match.
+            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => Datum::Null,
         })
     }
 }

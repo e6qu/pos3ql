@@ -2130,6 +2130,21 @@ impl<'a> Parser<'a> {
             &[]
         };
         self.expect_op(")")?;
+        // Ordered-set aggregate: `agg(direct_args) WITHIN GROUP (ORDER BY ...)`.
+        // The WITHIN GROUP ordering is the aggregated input; it is carried in the
+        // same `order_by` slot.
+        let order_by = if self.peeked == Tok::Ident("within") {
+            self.advance()?;
+            self.expect_ident("group")?;
+            self.expect_op("(")?;
+            self.expect_ident("order")?;
+            self.expect_ident("by")?;
+            let items = self.order_by_items()?;
+            self.expect_op(")")?;
+            items
+        } else {
+            order_by
+        };
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = self.arena_slice(&args[..n])?;

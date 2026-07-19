@@ -36,3 +36,7 @@ SELECT x, ntile(3) OVER (ORDER BY x) FROM generate_series(1, 10) AS g(x) ORDER B
 SELECT x, first_value(x) OVER (ORDER BY x), last_value(x) OVER () FROM generate_series(1, 4) AS g(x) ORDER BY x;
 SELECT x, nth_value(x, 2) OVER (ORDER BY x) FROM generate_series(1, 4) AS g(x) ORDER BY x;
 SELECT x, first_value(x * 10) OVER (PARTITION BY x % 2 ORDER BY x) FROM generate_series(1, 6) AS g(x) ORDER BY x;
+-- ordered-set aggregates
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x), percentile_cont(0.25) WITHIN GROUP (ORDER BY x) FROM generate_series(1, 5) AS g(x);
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x), percentile_disc(0.9) WITHIN GROUP (ORDER BY x) FROM generate_series(1, 10) AS g(x);
+SELECT mode() WITHIN GROUP (ORDER BY x) FROM (VALUES (3),(1),(1),(3),(3)) AS v(x);

@@ -2726,7 +2726,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
         }
         // A `_pg_expandarray` composite's `.x`/`.n` fields are integers.
         Expr::Field { .. } => of(ColType::Int4),
-        Expr::Call { name, args, .. } => match *name {
+        Expr::Call { name, args, order_by, .. } => match *name {
             // Catalog-introspection helpers (for psql \d).
             "pg_get_userbyid" | "format_type" | "pg_get_expr" | "pg_get_indexdef"
             | "pg_get_constraintdef" | "pg_get_viewdef" | "pg_get_functiondef"
@@ -2868,6 +2868,24 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
             "string_agg" => of(ColType::Text),
+            // Ordered-set aggregates: percentile_cont yields double precision
+            // (numeric for a numeric input); percentile_disc/mode yield the
+            // WITHIN GROUP input type.
+            "percentile_cont" | "percentile_disc" | "mode" => {
+                let input = order_by
+                    .first()
+                    .map(|o| infer_type_res(o.expression, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                match *name {
+                    "percentile_cont" if input == Some(oid::NUMERIC) => of(ColType::Numeric),
+                    "percentile_cont" => of(ColType::Float8),
+                    _ => match input.and_then(coltype_of_oid) {
+                        Some(t) => of(t),
+                        None => (oid::UNKNOWN, -2),
+                    },
+                }
+            }
             "extract" => of(ColType::Numeric),
             "date_part" => of(ColType::Float8),
             // Paren-less temporal functions carry a proper type so date/time

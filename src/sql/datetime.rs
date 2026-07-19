@@ -188,18 +188,18 @@ fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32
     }
     let table: &[&str] = if abbr { &MONTH_ABBR } else { &MONTH_FULL };
     for (i, name) in table.iter().enumerate() {
-        let nb = name.as_bytes();
-        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
-            *input_position += nb.len();
+        let name_bytes = name.as_bytes();
+        if *input_position + name_bytes.len() <= bytes.len() && bytes[*input_position..*input_position + name_bytes.len()].eq_ignore_ascii_case(name_bytes) {
+            *input_position += name_bytes.len();
             return Some(i as u32 + 1);
         }
     }
     // `MON` also accepts the full name; `MONTH` also accepts the abbreviation.
     let other: &[&str] = if abbr { &MONTH_FULL } else { &MONTH_ABBR };
     for (i, name) in other.iter().enumerate() {
-        let nb = name.as_bytes();
-        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
-            *input_position += nb.len();
+        let name_bytes = name.as_bytes();
+        if *input_position + name_bytes.len() <= bytes.len() && bytes[*input_position..*input_position + name_bytes.len()].eq_ignore_ascii_case(name_bytes) {
+            *input_position += name_bytes.len();
             return Some(i as u32 + 1);
         }
     }

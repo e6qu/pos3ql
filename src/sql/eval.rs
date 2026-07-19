@@ -3605,8 +3605,8 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         (Datum::Json { text: a, .. }, Datum::Json { text: b, .. }) => a.cmp(b),
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             // Element-wise, then by length (PostgreSQL array ordering).
-            let (na, nb) = (super::array::len(ra), super::array::len(rb));
-            for i in 0..na.min(nb) {
+            let (length_a, length_b) = (super::array::len(ra), super::array::len(rb));
+            for i in 0..length_a.min(length_b) {
                 let x = super::array::get(ra, *element, i).unwrap_or(Datum::Null);
                 let y = super::array::get(rb, *element, i).unwrap_or(Datum::Null);
                 let c = compare_datums(&x, &y)?;
@@ -3614,7 +3614,7 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
                     return Ok(c);
                 }
             }
-            na.cmp(&nb)
+            length_a.cmp(&length_b)
         }
         (Datum::Date(a), Datum::Timestamp(b) | Datum::Timestamptz(b)) => {
             (i64::from(*a) * 86_400_000_000).cmp(b)

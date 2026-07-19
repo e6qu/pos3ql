@@ -115,8 +115,8 @@ impl<'a> Lexer<'a> {
         let rest = self.rest();
         // Longer operators first: the POSIX regex match family before `~`.
         for operator in [
-            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "||", "<<", ">>", "@>", "<@", "&<", "&>",
-            "&&", "<", ">", "=", "~", "|", "&", "#", "^",
+            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "=>", "||", "<<", ">>", "@>", "<@", "&<",
+            "&>", "&&", "<", ">", "=", "~", "|", "&", "#", "^",
         ] {
             if rest.starts_with(operator) {
                 self.at += operator.len();

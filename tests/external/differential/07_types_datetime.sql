@@ -33,3 +33,12 @@ SELECT timestamp '2024-07-01 12:00' AT TIME ZONE 'America/New_York';
 SELECT timestamp '2024-06-01 12:00' AT TIME ZONE '+05';
 SELECT timestamptz '2024-06-01 12:00+00' AT TIME ZONE 'Etc/GMT-3';
 SELECT timezone('UTC', timestamptz '2024-01-01 00:00+00');
+-- make_interval: positional and named-argument field composition
+SELECT make_interval(1, 2, 3, 4, 5, 6, 7.5);
+SELECT make_interval(years => 2, months => 6);
+SELECT make_interval(days => 10, hours => 3, mins => 30, secs => 15.25);
+SELECT make_interval(weeks => 2);
+SELECT make_interval(secs => 90.5);
+SELECT make_interval();
+SELECT make_interval(mins => -90);
+SELECT make_interval(1, 2) + make_interval(hours => 5);

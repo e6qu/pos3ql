@@ -2084,6 +2084,53 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return self.plain_call("overlay", &cargs[..cn]);
         }
+        if name.eq_ignore_ascii_case("make_interval") {
+            // `make_interval([years =>] i, [months =>] i, [weeks =>] i,
+            //  [days =>] i, [hours =>] i, [mins =>] i, [secs =>] d)` — the seven
+            // named fields, any subset, positional or `field => value`. Desugar
+            // to a fixed seven-argument positional call (missing fields = 0) so
+            // the AST and evaluator stay unaware of argument names.
+            const FIELDS: [&str; 7] =
+                ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+            let zero = self.arena_expr(Expr::Int(0))?;
+            let mut slots: [&'a Expr<'a>; 7] = [zero; 7];
+            let mut pos = 0usize;
+            let mut seen_named = false;
+            if self.peeked != Tok::Op(")") {
+                loop {
+                    let first = self.expression(0)?;
+                    if self.eat_op("=>")? {
+                        // Named argument: the parsed expression must be a bare
+                        // field name; map it to its fixed slot.
+                        let field = match first {
+                            Expr::Column { qualifier: None, name } => *name,
+                            _ => return Err(self.err_here("make_interval argument name must be a field")),
+                        };
+                        let idx = FIELDS.iter().position(|f| f.eq_ignore_ascii_case(field));
+                        let idx = match idx {
+                            Some(i) => i,
+                            None => return Err(self.err_here("unknown make_interval field")),
+                        };
+                        slots[idx] = self.expression(0)?;
+                        seen_named = true;
+                    } else {
+                        if seen_named {
+                            return Err(self.err_here("positional argument after named argument"));
+                        }
+                        if pos >= FIELDS.len() {
+                            return Err(self.err_here("too many arguments to make_interval"));
+                        }
+                        slots[pos] = first;
+                        pos += 1;
+                    }
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+            }
+            self.expect_op(")")?;
+            return self.plain_call("make_interval", &slots);
+        }
         if self.peeked == Tok::Op("*") {
             self.advance()?;
             self.expect_op(")")?;

@@ -2909,7 +2909,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),
-            "age" | "justify_hours" | "justify_days" | "justify_interval" => {
+            "age" | "justify_hours" | "justify_days" | "justify_interval" | "make_interval" => {
                 of(ColType::Interval)
             }
             // timezone(zone, ts) == ts AT TIME ZONE zone: timestamptz <-> timestamp.

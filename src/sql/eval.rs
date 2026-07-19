@@ -2534,6 +2534,45 @@ fn call<'a>(
                 )?)),
             }
         }
+        "make_interval" => {
+            // Seven positional fields (the parser desugars named arguments):
+            // years, months, weeks, days, hours, mins (integers) and secs
+            // (double precision). Years fold into months and weeks into days,
+            // matching PostgreSQL's interval field composition.
+            arity(7)?;
+            let mut ints = [0i64; 6];
+            for (i, slot) in ints.iter_mut().enumerate() {
+                match int_arg(name, args, i, arena, params, row, hooks)? {
+                    Some(v) => *slot = v,
+                    None => return Ok(Datum::Null),
+                }
+            }
+            let secs = match num_f64(name, args, 6, arena, params, row, hooks)? {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let months = ints[0]
+                .checked_mul(12)
+                .and_then(|y| y.checked_add(ints[1]))
+                .and_then(|m| i32::try_from(m).ok());
+            let days = ints[2]
+                .checked_mul(7)
+                .and_then(|w| w.checked_add(ints[3]))
+                .and_then(|d| i32::try_from(d).ok());
+            let (Some(months), Some(days)) = (months, days) else {
+                return Err(sql_err!("22008", "interval field value out of range"));
+            };
+            let sec_micros = (secs * 1_000_000.0).round();
+            let micros = ints[4]
+                .checked_mul(3_600_000_000)
+                .and_then(|h| ints[5].checked_mul(60_000_000).and_then(|m| h.checked_add(m)))
+                .filter(|_| sec_micros.is_finite() && sec_micros.abs() < 9.2e18)
+                .and_then(|hm| hm.checked_add(sec_micros as i64));
+            let Some(micros) = micros else {
+                return Err(sql_err!("22008", "interval field value out of range"));
+            };
+            Ok(Datum::Interval(super::types::Interval { months, days, micros }))
+        }
         "similar_to" => {
             // `x SIMILAR TO p`: the SQL regular-expression pattern is translated
             // to a POSIX regex anchored to the whole string, then matched by the

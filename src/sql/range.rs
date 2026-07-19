@@ -32,7 +32,7 @@ fn bad(kind: RangeKind, s: &str) -> SqlError {
     sql_err!("22P02", "malformed range literal for {}: \"{}\"", kind.name(), s)
 }
 
-/// Parses a range literal `[lo,hi)` / `(,hi]` / `empty` into its components.
+/// Parses a range literal (`[1,5)` / `(,5]` / `empty`) into its components.
 pub fn parse<'a>(input: &'a str, kind: RangeKind) -> Result<Parsed<'a>, SqlError> {
     let t = input.trim();
     if t.eq_ignore_ascii_case("empty") {
@@ -53,12 +53,12 @@ pub fn parse<'a>(input: &'a str, kind: RangeKind) -> Result<Parsed<'a>, SqlError
         _ => return Err(bad(kind, input)),
     };
     let inner = &t[1..t.len() - 1];
-    let (lo, hi) = inner.split_once(',').ok_or_else(|| bad(kind, input))?;
-    let (lo, hi) = (lo.trim(), hi.trim());
+    let (lower_text, upper_text) = inner.split_once(',').ok_or_else(|| bad(kind, input))?;
+    let (lower_text, upper_text) = (lower_text.trim(), upper_text.trim());
     Ok(Parsed {
         empty: false,
-        lower: if lo.is_empty() { None } else { Some(lo) },
-        upper: if hi.is_empty() { None } else { Some(hi) },
+        lower: if lower_text.is_empty() { None } else { Some(lower_text) },
+        upper: if upper_text.is_empty() { None } else { Some(upper_text) },
         lower_inc,
         upper_inc,
     })
@@ -71,8 +71,8 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
     if p.empty {
         return alloc(arena, "empty");
     }
-    if let (Some(lo), Some(hi)) = (p.lower, p.upper)
-        && cmp_elem(lo, hi, kind)? == Ordering::Greater
+    if let (Some(lower_text), Some(upper_text)) = (p.lower, p.upper)
+        && cmp_elem(lower_text, upper_text, kind)? == Ordering::Greater
     {
         return Err(sql_err!(
             "22000",
@@ -84,7 +84,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
         // incremented bound text).
         let mut lo_buf = StackStr::<48>::new();
         let mut hi_buf = StackStr::<48>::new();
-        let lo: Option<&str> = match (p.lower, p.lower_inc) {
+        let lower_text: Option<&str> = match (p.lower, p.lower_inc) {
             (None, _) => None,
             (Some(v), true) => Some(v),
             (Some(v), false) => {
@@ -92,7 +92,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
                 Some(lo_buf.as_str())
             }
         };
-        let hi: Option<&str> = match (p.upper, p.upper_inc) {
+        let upper_text: Option<&str> = match (p.upper, p.upper_inc) {
             (None, _) => None,
             (Some(v), false) => Some(v),
             (Some(v), true) => {
@@ -100,19 +100,19 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
                 Some(hi_buf.as_str())
             }
         };
-        if let (Some(l), Some(h)) = (lo, hi)
+        if let (Some(l), Some(h)) = (lower_text, upper_text)
             && cmp_elem(l, h, kind)? != Ordering::Less
         {
             return alloc(arena, "empty");
         }
         // An unbounded lower bound uses `(`; a bounded one is inclusive `[`.
-        let lb = if lo.is_some() { '[' } else { '(' };
-        let text = stack_format!(128, "{}{},{})", lb, lo.unwrap_or(""), hi.unwrap_or(""));
+        let lb = if lower_text.is_some() { '[' } else { '(' };
+        let text = stack_format!(128, "{}{},{})", lb, lower_text.unwrap_or(""), upper_text.unwrap_or(""));
         return alloc(arena, text.as_str());
     }
     // Continuous: empty when bounds are equal and not both inclusive.
-    if let (Some(lo), Some(hi)) = (p.lower, p.upper)
-        && cmp_elem(lo, hi, kind)? == Ordering::Equal
+    if let (Some(lower_text), Some(upper_text)) = (p.lower, p.upper)
+        && cmp_elem(lower_text, upper_text, kind)? == Ordering::Equal
         && !(p.lower_inc && p.upper_inc)
     {
         return alloc(arena, "empty");
@@ -124,7 +124,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
     alloc(arena, text.as_str())
 }
 
-/// Builds a range from a constructor `int4range(lo, hi [, flags])`.
+/// Builds a range from a constructor `int4range(lower_text, upper_text [, flags])`.
 pub fn construct<'a>(
     lower: Datum,
     upper: Datum,
@@ -140,9 +140,9 @@ pub fn construct<'a>(
     let lower_inc = fb[0] == b'[';
     let upper_inc = fb[1] == b']';
     // Bound datums render to canonical text in the arena (validated).
-    let lo = elem_text(lower, kind, arena)?;
-    let hi = elem_text(upper, kind, arena)?;
-    let p = Parsed { empty: false, lower: lo, upper: hi, lower_inc, upper_inc };
+    let lower_text = elem_text(lower, kind, arena)?;
+    let upper_text = elem_text(upper, kind, arena)?;
+    let p = Parsed { empty: false, lower: lower_text, upper: upper_text, lower_inc, upper_inc };
     canonical(&p, kind, arena)
 }
 
@@ -161,20 +161,20 @@ fn alloc<'a>(arena: &'a Arena, s: &str) -> Result<&'a str, SqlError> {
     arena.alloc_str(s).map_err(|_| sql_err!("53200", "out of memory"))
 }
 
-/// Increments a discrete bound value by one (int/date) into `buf`.
-fn incr_into(v: &str, kind: RangeKind, buf: &mut StackStr<48>) -> Result<(), SqlError> {
-    buf.clear();
+/// Increments a discrete bound value by one (int/date) into `buffer`.
+fn incr_into(v: &str, kind: RangeKind, buffer: &mut StackStr<48>) -> Result<(), SqlError> {
+    buffer.clear();
     match kind {
         RangeKind::Int4 | RangeKind::Int8 => {
             let n: i64 = v.trim().parse().map_err(|_| bad(kind, v))?;
-            let _ = write!(buf, "{}", n + 1);
+            let _ = write!(buffer, "{}", n + 1);
         }
         RangeKind::Date => {
             let d = super::datetime::parse_date(v.trim())?;
-            let _ = write!(buf, "{}", super::datetime::format_date(d + 1).as_str());
+            let _ = write!(buffer, "{}", super::datetime::format_date(d + 1).as_str());
         }
         _ => {
-            let _ = write!(buf, "{}", v);
+            let _ = write!(buffer, "{}", v);
         }
     }
     Ok(())
@@ -251,15 +251,15 @@ pub fn contains_elem(text: &str, kind: RangeKind, elem: &str) -> Result<bool, Sq
     if p.empty {
         return Ok(false);
     }
-    if let Some(lo) = p.lower {
-        match cmp_elem(elem, lo, kind)? {
+    if let Some(lower_text) = p.lower {
+        match cmp_elem(elem, lower_text, kind)? {
             Ordering::Less => return Ok(false),
             Ordering::Equal if !p.lower_inc => return Ok(false),
             _ => {}
         }
     }
-    if let Some(hi) = p.upper {
-        match cmp_elem(elem, hi, kind)? {
+    if let Some(upper_text) = p.upper {
+        match cmp_elem(elem, upper_text, kind)? {
             Ordering::Greater => return Ok(false),
             Ordering::Equal if !p.upper_inc => return Ok(false),
             _ => {}
@@ -270,30 +270,30 @@ pub fn contains_elem(text: &str, kind: RangeKind, elem: &str) -> Result<bool, Sq
 
 /// `outer @> inner` (range contains range).
 pub fn contains_range(outer: &str, inner: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (po, pi) = (parse(outer, kind)?, parse(inner, kind)?);
-    if pi.empty {
+    let (parsed_outer, parsed_inner) = (parse(outer, kind)?, parse(inner, kind)?);
+    if parsed_inner.empty {
         return Ok(true);
     }
-    if po.empty {
+    if parsed_outer.empty {
         return Ok(false);
     }
-    Ok(lower_le(&po, &pi, kind)? && upper_ge(&po, &pi, kind)?)
+    Ok(lower_le(&parsed_outer, &parsed_inner, kind)? && upper_ge(&parsed_outer, &parsed_inner, kind)?)
 }
 
 /// `a && b` (ranges overlap).
 pub fn overlaps(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty || pb.empty {
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    Ok(!(strictly_left(&pa, &pb, kind)? || strictly_left(&pb, &pa, kind)?))
+    Ok(!(strictly_left(&parsed_a, &parsed_b, kind)? || strictly_left(&parsed_b, &parsed_a, kind)?))
 }
 
 fn strictly_left(a: &Parsed, b: &Parsed, kind: RangeKind) -> Result<bool, SqlError> {
-    let (Some(au), Some(bl)) = (a.upper, b.lower) else {
+    let (Some(au), Some(b_lower)) = (a.upper, b.lower) else {
         return Ok(false);
     };
-    Ok(match cmp_elem(au, bl, kind)? {
+    Ok(match cmp_elem(au, b_lower, kind)? {
         Ordering::Less => true,
         Ordering::Equal => !(a.upper_inc && b.lower_inc),
         Ordering::Greater => false,
@@ -326,37 +326,37 @@ fn upper_ge(outer: &Parsed, inner: &Parsed, kind: RangeKind) -> Result<bool, Sql
 /// Comparison is on bound *values* (not canonical text), so `numrange(1.0,5.0)`
 /// and `numrange(1.00,5.0)` compare equal.
 pub fn cmp_ranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    match (pa.empty, pb.empty) {
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    match (parsed_a.empty, parsed_b.empty) {
         (true, true) => return Ok(Ordering::Equal),
         (true, false) => return Ok(Ordering::Less),
         (false, true) => return Ok(Ordering::Greater),
         (false, false) => {}
     }
-    let lo = cmp_bound(pa.lower, pa.lower_inc, pb.lower, pb.lower_inc, true, kind)?;
-    if lo != Ordering::Equal {
-        return Ok(lo);
+    let lower_text = cmp_bound(parsed_a.lower, parsed_a.lower_inc, parsed_b.lower, parsed_b.lower_inc, true, kind)?;
+    if lower_text != Ordering::Equal {
+        return Ok(lower_text);
     }
-    cmp_bound(pa.upper, pa.upper_inc, pb.upper, pb.upper_inc, false, kind)
+    cmp_bound(parsed_a.upper, parsed_a.upper_inc, parsed_b.upper, parsed_b.upper_inc, false, kind)
 }
 
 /// Compares one bound of two ranges. `None` value denotes an infinite bound;
 /// `lower` selects the direction so infinities and inclusivity ties resolve the
 /// way PostgreSQL's `range_cmp_bounds` does.
 fn cmp_bound(
-    av: Option<&str>,
-    ainc: bool,
-    bv: Option<&str>,
-    binc: bool,
+    a_value: Option<&str>,
+    a_inclusive: bool,
+    b_value: Option<&str>,
+    b_inclusive: bool,
     lower: bool,
     kind: RangeKind,
 ) -> Result<Ordering, SqlError> {
-    match (av, bv) {
+    match (a_value, b_value) {
         (None, None) => Ok(Ordering::Equal),
         (None, Some(_)) => Ok(if lower { Ordering::Less } else { Ordering::Greater }),
         (Some(_), None) => Ok(if lower { Ordering::Greater } else { Ordering::Less }),
         (Some(x), Some(y)) => Ok(match cmp_elem(x, y, kind)? {
-            Ordering::Equal => match (ainc, binc) {
+            Ordering::Equal => match (a_inclusive, b_inclusive) {
                 (true, false) => {
                     if lower {
                         Ordering::Less
@@ -393,11 +393,11 @@ pub fn upper_inf(text: &str, kind: RangeKind) -> Result<bool, SqlError> {
 /// `a << b`: `a` lies strictly to the left of `b` (no overlap, `a` entirely
 /// below `b`). Empty ranges are never strictly left of anything.
 pub fn strictly_before(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty || pb.empty {
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    strictly_left(&pa, &pb, kind)
+    strictly_left(&parsed_a, &parsed_b, kind)
 }
 
 /// `a >> b`: `a` lies strictly to the right of `b`.
@@ -407,30 +407,30 @@ pub fn strictly_after(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlErro
 
 /// `a &< b`: `a` does not extend to the right of `b` (`upper(a) <= upper(b)`).
 pub fn not_right_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty || pb.empty {
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    Ok(cmp_bound(pa.upper, pa.upper_inc, pb.upper, pb.upper_inc, false, kind)? != Ordering::Greater)
+    Ok(cmp_bound(parsed_a.upper, parsed_a.upper_inc, parsed_b.upper, parsed_b.upper_inc, false, kind)? != Ordering::Greater)
 }
 
 /// `a &> b`: `a` does not extend to the left of `b` (`lower(a) >= lower(b)`).
 pub fn not_left_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty || pb.empty {
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    Ok(cmp_bound(pa.lower, pa.lower_inc, pb.lower, pb.lower_inc, true, kind)? != Ordering::Less)
+    Ok(cmp_bound(parsed_a.lower, parsed_a.lower_inc, parsed_b.lower, parsed_b.lower_inc, true, kind)? != Ordering::Less)
 }
 
 /// `a -|- b`: the ranges are adjacent (disjoint with no gap between them).
 pub fn adjacent(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty || pb.empty {
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    Ok(bound_adjacent(pa.upper, pa.upper_inc, pb.lower, pb.lower_inc, kind)?
-        || bound_adjacent(pb.upper, pb.upper_inc, pa.lower, pa.lower_inc, kind)?)
+    Ok(bound_adjacent(parsed_a.upper, parsed_a.upper_inc, parsed_b.lower, parsed_b.lower_inc, kind)?
+        || bound_adjacent(parsed_b.upper, parsed_b.upper_inc, parsed_a.lower, parsed_a.lower_inc, kind)?)
 }
 
 /// An upper bound and a lower bound touch (same value, exactly one inclusive),
@@ -450,65 +450,65 @@ fn bound_adjacent(
 
 /// `a * b`: the intersection of two ranges (empty when they do not overlap).
 pub fn intersect<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty || pb.empty || !overlaps(a, b, kind)? {
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty || parsed_b.empty || !overlaps(a, b, kind)? {
         return alloc(arena, "empty");
     }
     // The more restrictive bounds: the greater lower and the lesser upper.
-    let (lo, lo_inc) = pick_lower(&pa, &pb, kind, true)?;
-    let (hi, hi_inc) = pick_upper(&pa, &pb, kind, true)?;
-    canonical(&mk(lo, lo_inc, hi, hi_inc), kind, arena)
+    let (lower_text, lo_inc) = pick_lower(&parsed_a, &parsed_b, kind, true)?;
+    let (upper_text, hi_inc) = pick_upper(&parsed_a, &parsed_b, kind, true)?;
+    canonical(&mk(lower_text, lo_inc, upper_text, hi_inc), kind, arena)
 }
 
 /// `a + b`: the union of two ranges. PostgreSQL requires the result to be
 /// contiguous (the inputs overlap or are adjacent), else it errors.
 pub fn union<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty {
-        return canonical(&pb, kind, arena);
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty {
+        return canonical(&parsed_b, kind, arena);
     }
-    if pb.empty {
-        return canonical(&pa, kind, arena);
+    if parsed_b.empty {
+        return canonical(&parsed_a, kind, arena);
     }
     if !overlaps(a, b, kind)? && !adjacent(a, b, kind)? {
         return Err(sql_err!("22000", "result of range union would not be contiguous"));
     }
-    let (lo, lo_inc) = pick_lower(&pa, &pb, kind, false)?;
-    let (hi, hi_inc) = pick_upper(&pa, &pb, kind, false)?;
-    canonical(&mk(lo, lo_inc, hi, hi_inc), kind, arena)
+    let (lower_text, lo_inc) = pick_lower(&parsed_a, &parsed_b, kind, false)?;
+    let (upper_text, hi_inc) = pick_upper(&parsed_a, &parsed_b, kind, false)?;
+    canonical(&mk(lower_text, lo_inc, upper_text, hi_inc), kind, arena)
 }
 
 /// `range_merge(a, b)`: the smallest range containing both, with no contiguity
 /// requirement (unlike `+`).
 pub fn merge<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty {
-        return canonical(&pb, kind, arena);
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty {
+        return canonical(&parsed_b, kind, arena);
     }
-    if pb.empty {
-        return canonical(&pa, kind, arena);
+    if parsed_b.empty {
+        return canonical(&parsed_a, kind, arena);
     }
-    let (lo, lo_inc) = pick_lower(&pa, &pb, kind, false)?;
-    let (hi, hi_inc) = pick_upper(&pa, &pb, kind, false)?;
-    canonical(&mk(lo, lo_inc, hi, hi_inc), kind, arena)
+    let (lower_text, lo_inc) = pick_lower(&parsed_a, &parsed_b, kind, false)?;
+    let (upper_text, hi_inc) = pick_upper(&parsed_a, &parsed_b, kind, false)?;
+    canonical(&mk(lower_text, lo_inc, upper_text, hi_inc), kind, arena)
 }
 
 /// `a - b`: `a` with the portion overlapping `b` removed. Errors when the
 /// result would not be contiguous (`b` strictly inside `a`).
 pub fn difference<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (pa, pb) = (parse(a, kind)?, parse(b, kind)?);
-    if pa.empty || pb.empty || !overlaps(a, b, kind)? {
-        return canonical(&pa, kind, arena);
+    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    if parsed_a.empty || parsed_b.empty || !overlaps(a, b, kind)? {
+        return canonical(&parsed_a, kind, arena);
     }
     // Does `b` cover `a`'s left end / right end?
-    let left = cmp_bound(pb.lower, pb.lower_inc, pa.lower, pa.lower_inc, true, kind)? != Ordering::Greater;
-    let right = cmp_bound(pb.upper, pb.upper_inc, pa.upper, pa.upper_inc, false, kind)? != Ordering::Less;
+    let left = cmp_bound(parsed_b.lower, parsed_b.lower_inc, parsed_a.lower, parsed_a.lower_inc, true, kind)? != Ordering::Greater;
+    let right = cmp_bound(parsed_b.upper, parsed_b.upper_inc, parsed_a.upper, parsed_a.upper_inc, false, kind)? != Ordering::Less;
     match (left, right) {
         (true, true) => alloc(arena, "empty"),
         // `b` trims the left: keep `[b.upper, a.upper)` (inclusivity flipped).
-        (true, false) => canonical(&mk(pb.upper, !pb.upper_inc, pa.upper, pa.upper_inc), kind, arena),
+        (true, false) => canonical(&mk(parsed_b.upper, !parsed_b.upper_inc, parsed_a.upper, parsed_a.upper_inc), kind, arena),
         // `b` trims the right: keep `[a.lower, b.lower)` (inclusivity flipped).
-        (false, true) => canonical(&mk(pa.lower, pa.lower_inc, pb.lower, !pb.lower_inc), kind, arena),
+        (false, true) => canonical(&mk(parsed_a.lower, parsed_a.lower_inc, parsed_b.lower, !parsed_b.lower_inc), kind, arena),
         (false, false) => {
             Err(sql_err!("22000", "result of range difference would not be contiguous"))
         }
@@ -516,8 +516,8 @@ pub fn difference<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Re
 }
 
 /// Builds a non-empty `Parsed` from chosen bounds.
-fn mk<'a>(lo: Option<&'a str>, lo_inc: bool, hi: Option<&'a str>, hi_inc: bool) -> Parsed<'a> {
-    Parsed { empty: false, lower: lo, upper: hi, lower_inc: lo_inc, upper_inc: hi_inc }
+fn mk<'a>(lower_text: Option<&'a str>, lo_inc: bool, upper_text: Option<&'a str>, hi_inc: bool) -> Parsed<'a> {
+    Parsed { empty: false, lower: lower_text, upper: upper_text, lower_inc: lo_inc, upper_inc: hi_inc }
 }
 
 /// Chooses one range's lower bound: the greater (more restrictive) when

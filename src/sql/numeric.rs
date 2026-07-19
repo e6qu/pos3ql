@@ -304,7 +304,7 @@ impl<'a> Numeric<'a> {
         if n_base > MAX_NDIGITS {
             return Err(overflow());
         }
-        let mut buf: [i16; MAX_NDIGITS] = [0; MAX_NDIGITS];
+        let mut buffer: [i16; MAX_NDIGITS] = [0; MAX_NDIGITS];
         // Fill a scratch of decimal digits: lead_pad zeros, sig, trailing pad
         // to a multiple of 4.
         let mut scratch: [u8; MAX_NDIGITS * DEC_DIGITS + 8] = [0; MAX_NDIGITS * DEC_DIGITS + 8];
@@ -321,22 +321,22 @@ impl<'a> Numeric<'a> {
             for &d in chunk {
                 v = v * 10 + d as i16;
             }
-            buf[bi] = v;
+            buffer[bi] = v;
         }
-        // weight of buf[0] in base-10000: msd decimal weight of buf[0] is
-        // (first_dw + lead_pad) ... buf[0] covers decimals [first_dw+lead_pad
+        // weight of buffer[0] in base-10000: msd decimal weight of buffer[0] is
+        // (first_dw + lead_pad) ... buffer[0] covers decimals [first_dw+lead_pad
         // down]. Its base-10000 weight = (first_dw + lead_pad) / 4.
         let base_weight = (first_dw + lead_pad).div_euclid(4);
 
         // Trim trailing zero base-digits (they don't affect value; dscale
         // keeps display width).
         let mut nb = n_base;
-        while nb > 0 && buf[nb - 1] == 0 {
+        while nb > 0 && buffer[nb - 1] == 0 {
             nb -= 1;
         }
         // Trim leading zero base-digits.
         let mut lead = 0;
-        while lead < nb && buf[lead] == 0 {
+        while lead < nb && buffer[lead] == 0 {
             lead += 1;
         }
         let ndigits = nb - lead;
@@ -353,7 +353,7 @@ impl<'a> Numeric<'a> {
             sign: if neg { Sign::Neg } else { Sign::Pos },
             weight,
             dscale,
-            digits: pack(&buf[lead..nb], arena)?,
+            digits: pack(&buffer[lead..nb], arena)?,
         })
     }
 
@@ -378,21 +378,21 @@ impl<'a> Numeric<'a> {
             n += 1;
         }
         // rev is least-significant first; reverse into canonical MSD-first.
-        let mut buf: [i16; MAX_NDIGITS] = [0; MAX_NDIGITS];
+        let mut buffer: [i16; MAX_NDIGITS] = [0; MAX_NDIGITS];
         for k in 0..n {
-            buf[k] = rev[n - 1 - k];
+            buffer[k] = rev[n - 1 - k];
         }
         let weight = (n - 1) as i16;
         // Trim trailing zero digits.
         let mut nb = n;
-        while nb > 0 && buf[nb - 1] == 0 {
+        while nb > 0 && buffer[nb - 1] == 0 {
             nb -= 1;
         }
         Ok(Numeric {
             sign: if neg { Sign::Neg } else { Sign::Pos },
             weight,
             dscale: 0,
-            digits: pack(&buf[..nb], arena)?,
+            digits: pack(&buffer[..nb], arena)?,
         })
     }
 
@@ -403,7 +403,7 @@ impl<'a> Numeric<'a> {
     /// Builds a Numeric for `v` borrowing digit bytes from a caller stack
     /// buffer (>= 20 bytes), for allocation-free comparison. i64 needs at
     /// most 5 base-10000 digits (10 bytes).
-    pub fn from_i64_stack(v: i64, buf: &'a mut [u8; 20]) -> Numeric<'a> {
+    pub fn from_i64_stack(v: i64, buffer: &'a mut [u8; 20]) -> Numeric<'a> {
         if v == 0 {
             return Numeric { sign: Sign::Pos, weight: 0, dscale: 0, digits: &[] };
         }
@@ -416,7 +416,7 @@ impl<'a> Numeric<'a> {
             mag /= NBASE as u128;
             n += 1;
         }
-        // MSD-first into buf; trim trailing zero digits.
+        // MSD-first into buffer; trim trailing zero digits.
         let mut nb = n;
         while nb > 0 && rev[0] == 0 {
             // trailing (least-significant) zero: drop from the low end
@@ -427,13 +427,13 @@ impl<'a> Numeric<'a> {
         }
         for k in 0..nb {
             let d = rev[n - 1 - k];
-            buf[k * 2..k * 2 + 2].copy_from_slice(&d.to_le_bytes());
+            buffer[k * 2..k * 2 + 2].copy_from_slice(&d.to_le_bytes());
         }
         Numeric {
             sign: if neg { Sign::Neg } else { Sign::Pos },
             weight: (n - 1) as i16,
             dscale: 0,
-            digits: &buf[..nb * 2],
+            digits: &buffer[..nb * 2],
         }
     }
 
@@ -582,11 +582,11 @@ impl Numeric<'_> {
         // Which base-10000 digit and which of its 4 decimal positions?
         let base_w = dw.div_euclid(DEC_DIGITS as i32);
         let within = dw.rem_euclid(DEC_DIGITS as i32); // 0..3, 0 = least sig
-        let idx = self.weight as i32 - base_w;
-        if idx < 0 || idx as usize >= self.ndigits() {
+        let index = self.weight as i32 - base_w;
+        if index < 0 || index as usize >= self.ndigits() {
             return 0;
         }
-        let mut v = self.digit(idx as usize) as i32;
+        let mut v = self.digit(index as usize) as i32;
         for _ in 0..within {
             v /= 10;
         }
@@ -785,17 +785,17 @@ fn add_magnitudes<'a>(
     if n + 2 > MAX_NDIGITS * 2 {
         return Err(overflow());
     }
-    let mut buf: DigitBuf = [0; MAX_NDIGITS * 2 + 4];
-    // buf[i] corresponds to base-weight lo + i.
-    accumulate(&mut buf, a, lo, 1);
-    accumulate(&mut buf, b, lo, 1);
+    let mut buffer: DigitBuf = [0; MAX_NDIGITS * 2 + 4];
+    // buffer[i] corresponds to base-weight lo + i.
+    accumulate(&mut buffer, a, lo, 1);
+    accumulate(&mut buffer, b, lo, 1);
     let mut carry = 0;
-    for slot in buf.iter_mut().take(n + 2) {
+    for slot in buffer.iter_mut().take(n + 2) {
         *slot += carry;
         carry = *slot / NBASE;
         *slot %= NBASE;
     }
-    finish_from_lsf(sign, lo, &buf[..n + 2], dscale, arena)
+    finish_from_lsf(sign, lo, &buffer[..n + 2], dscale, arena)
 }
 
 fn sub_magnitudes<'a>(
@@ -810,12 +810,12 @@ fn sub_magnitudes<'a>(
     let lo_b = b.weight as i32 - b.ndigits() as i32;
     let lo = lo_a.min(lo_b);
     let n = (hi as i32 - lo) as usize;
-    let mut buf: DigitBuf = [0; MAX_NDIGITS * 2 + 4];
-    accumulate(&mut buf, a, lo, 1);
-    accumulate(&mut buf, b, lo, -1);
+    let mut buffer: DigitBuf = [0; MAX_NDIGITS * 2 + 4];
+    accumulate(&mut buffer, a, lo, 1);
+    accumulate(&mut buffer, b, lo, -1);
     // Borrow.
     let mut borrow = 0;
-    for slot in buf.iter_mut().take(n + 1) {
+    for slot in buffer.iter_mut().take(n + 1) {
         *slot += borrow;
         if *slot < 0 {
             *slot += NBASE;
@@ -824,16 +824,16 @@ fn sub_magnitudes<'a>(
             borrow = 0;
         }
     }
-    finish_from_lsf(sign, lo, &buf[..n + 1], dscale, arena)
+    finish_from_lsf(sign, lo, &buffer[..n + 1], dscale, arena)
 }
 
-/// Adds `sign * digits` of `x` into `buf`, where buf position i has base
+/// Adds `sign * digits` of `x` into `buffer`, where buffer position i has base
 /// weight `lo + i`.
-fn accumulate(buf: &mut DigitBuf, x: &Numeric, lo: i32, mul: i32) {
+fn accumulate(buffer: &mut DigitBuf, x: &Numeric, lo: i32, mul: i32) {
     for k in 0..x.ndigits() {
         let w = x.weight as i32 - k as i32;
-        let idx = (w - lo) as usize;
-        buf[idx] += mul * x.digit(k) as i32;
+        let index = (w - lo) as usize;
+        buffer[index] += mul * x.digit(k) as i32;
     }
 }
 
@@ -855,7 +855,7 @@ pub fn mul<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
         return Err(overflow());
     }
     // Schoolbook multiply into an LSF accumulator.
-    let mut buf: DigitBuf = [0; MAX_NDIGITS * 2 + 4];
+    let mut buffer: DigitBuf = [0; MAX_NDIGITS * 2 + 4];
     // a.digits[i] has base-weight a.weight-i; product term weight = sum.
     // Use LSF indexing with lo = (a.weight - (na-1)) + (b.weight - (nb-1)).
     let lo = (a.weight as i32 - (na as i32 - 1)) + (b.weight as i32 - (nb as i32 - 1));
@@ -864,20 +864,20 @@ pub fn mul<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
         for j in 0..nb {
             // weight of this term = (a.weight-i)+(b.weight-j)
             let w = (a.weight as i32 - i as i32) + (b.weight as i32 - j as i32);
-            let idx = (w - lo) as usize;
-            buf[idx] += da * b.digit(j) as i32;
+            let index = (w - lo) as usize;
+            buffer[index] += da * b.digit(j) as i32;
         }
     }
     let n = na + nb;
     let mut carry = 0;
-    for slot in buf.iter_mut().take(n + 1) {
+    for slot in buffer.iter_mut().take(n + 1) {
         *slot += carry;
         carry = *slot / NBASE;
         *slot %= NBASE;
     }
     let sign = if a.sign == b.sign { Sign::Pos } else { Sign::Neg };
     let dscale = a.dscale + b.dscale;
-    finish_from_lsf(sign, lo, &buf[..n + 1], dscale, arena)
+    finish_from_lsf(sign, lo, &buffer[..n + 1], dscale, arena)
 }
 
 /// PostgreSQL's div result display scale (select_div_scale, simplified):
@@ -1049,14 +1049,14 @@ fn sig_decimal(x: &Numeric, out: &mut [i8]) -> (usize, i32) {
     while last <= first && x.decimal_digit_at(last) == 0 {
         last += 1;
     }
-    let mut idx = 0;
+    let mut index = 0;
     let mut dw = first;
     while dw >= last {
-        out[idx] = x.decimal_digit_at(dw) as i8;
-        idx += 1;
+        out[index] = x.decimal_digit_at(dw) as i8;
+        index += 1;
         dw -= 1;
     }
-    (idx, last)
+    (index, last)
 }
 
 /// Schoolbook integer long division of decimal-digit arrays (MSD-first, no
@@ -1157,22 +1157,22 @@ fn finish<'a>(
     Ok(Numeric { sign, weight, dscale, digits: &*d })
 }
 
-/// Builds a canonical Numeric from an LSF base-10000 buffer where `buf[i]`
+/// Builds a canonical Numeric from an LSF base-10000 buffer where `buffer[i]`
 /// has base-weight `lo + i`.
 fn finish_from_lsf<'a>(
     sign: Sign,
     lo: i32,
-    buf: &[i32],
+    buffer: &[i32],
     dscale: u16,
     arena: &'a Arena,
 ) -> Result<Numeric<'a>, SqlError> {
     // Find most significant nonzero.
-    let mut hi = buf.len();
-    while hi > 0 && buf[hi - 1] == 0 {
+    let mut hi = buffer.len();
+    while hi > 0 && buffer[hi - 1] == 0 {
         hi -= 1;
     }
     let mut lead = 0;
-    while lead < hi && buf[lead] == 0 {
+    while lead < hi && buffer[lead] == 0 {
         lead += 1;
     }
     if lead >= hi {
@@ -1190,7 +1190,7 @@ fn finish_from_lsf<'a>(
     // MSD-first output.
     let mut out: [i16; MAX_NDIGITS] = [0; MAX_NDIGITS];
     for k in 0..ndigits {
-        out[k] = buf[hi - 1 - k] as i16;
+        out[k] = buffer[hi - 1 - k] as i16;
     }
     let weight = (lo + hi as i32 - 1) as i16;
     Ok(Numeric { sign, weight, dscale, digits: pack(&out[..ndigits], arena)? })

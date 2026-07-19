@@ -151,12 +151,12 @@ pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     windows: None, catalog: None, srf_index: None };
 
 pub fn eval<'a>(
-    expr: &Expr<'a>,
+    expression: &Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    eval_full(expr, arena, params, row, &NO_HOOKS)
+    eval_full(expression, arena, params, row, &NO_HOOKS)
 }
 
 /// Surfaces errors from every maximal constant subexpression, as
@@ -164,8 +164,8 @@ pub fn eval<'a>(
 /// `... OR 0.0/0.0 > 1` error even when no row would reach them. Constant
 /// subtrees are evaluated once here; per-row evaluation (with short-circuit)
 /// handles the rest.
-pub fn check_constant_errors<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
-    fold_check(expr, arena).map(|_| ())
+pub fn check_constant_errors<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+    fold_check(expression, arena).map(|_| ())
 }
 
 /// The simplification-aware core of [`check_constant_errors`], mirroring
@@ -176,16 +176,16 @@ pub fn check_constant_errors<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<()
 /// `... WHERE FALSE AND (id > (-1 % 0))` to no rows, never folding `-1 % 0`).
 /// Returns the folded boolean value when the expression provably reduces to
 /// one, else `None`.
-fn fold_check<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, SqlError> {
+fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, SqlError> {
     use super::ast::BinaryOp;
-    if expr.is_constant() {
+    if expression.is_constant() {
         // A fully-constant subtree folds eagerly; its error surfaces here.
-        return Ok(match eval(expr, arena, NO_PARAMS, &NoColumns)? {
+        return Ok(match eval(expression, arena, NO_PARAMS, &NoColumns)? {
             Datum::Bool(b) => Some(b),
             _ => None,
         });
     }
-    match expr {
+    match expression {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
         | Expr::NumericLit(_) | Expr::Str(_) | Expr::Column { .. }
         | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
@@ -303,7 +303,7 @@ fn fold_check<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, Sql
 }
 
 pub fn eval_full<'a>(
-    expr: &Expr<'a>,
+    expression: &Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -313,12 +313,12 @@ pub fn eval_full<'a>(
     // evaluates to the group's value.
     if let Some((exprs, values)) = hooks.group {
         for (g, v) in exprs.iter().zip(values) {
-            if **g == *expr {
+            if **g == *expression {
                 return Ok(*v);
             }
         }
     }
-    match *expr {
+    match *expression {
         Expr::Null => Ok(Datum::Null),
         Expr::Bool(b) => Ok(Datum::Bool(b)),
         Expr::Int(v) => Ok(if let Ok(small) = i32::try_from(v) {
@@ -424,14 +424,14 @@ pub fn eval_full<'a>(
                 && let Some((nodes, values)) = hooks.windows
             {
                 for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
             }
             if let Some((nodes, values)) = hooks.aggs {
                 for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
@@ -565,7 +565,7 @@ pub fn eval_full<'a>(
         Expr::Subquery(_) | Expr::ArraySubquery(_) => {
             if let Some(subs) = hooks.subs {
                 for (node, v) in subs.scalars {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
@@ -584,7 +584,7 @@ pub fn eval_full<'a>(
             };
             let mut found: Option<(&[Datum], bool, Datum)> = None;
             for (node, list, saw_null, witness) in subs.lists {
-                if core::ptr::eq(*node, expr as *const _) {
+                if core::ptr::eq(*node, expression as *const _) {
                     found = Some((list, *saw_null, *witness));
                     break;
                 }
@@ -628,7 +628,7 @@ pub fn eval_full<'a>(
             // node identity, alongside scalar subqueries.
             if let Some(subs) = hooks.subs {
                 for (node, v) in subs.scalars {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
@@ -665,7 +665,7 @@ pub fn eval_full<'a>(
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
-            let idx = match i {
+            let index = match i {
                 Datum::Int4(x) => x as i64,
                 Datum::Int8(x) => x,
                 Datum::Null => return Ok(Datum::Null),
@@ -674,10 +674,10 @@ pub fn eval_full<'a>(
             match b {
                 Datum::Array { elem, raw } => {
                     // PostgreSQL array subscripts are 1-based.
-                    if idx < 1 {
+                    if index < 1 {
                         return Ok(Datum::Null);
                     }
-                    Ok(super::array::get(raw, elem, (idx - 1) as usize).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, elem, (index - 1) as usize).unwrap_or(Datum::Null))
                 }
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
@@ -691,7 +691,7 @@ pub fn eval_full<'a>(
             match b {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Array { elem, raw } => {
-                    let idx = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
+                    let index = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
                     {
                         0
                     } else if field.eq_ignore_ascii_case("n") || field.eq_ignore_ascii_case("f2") {
@@ -703,18 +703,18 @@ pub fn eval_full<'a>(
                             field
                         ));
                     };
-                    Ok(super::array::get(raw, elem, idx).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, elem, index).unwrap_or(Datum::Null))
                 }
                 _ => Err(type_mismatch("field access on a non-composite value", &b)),
             }
         }
         Expr::AnyAll { operand, op, array, all } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
-            let arr = eval_full(array, arena, params, row, hooks)?;
-            let (elem, raw) = match arr {
+            let array = eval_full(array, arena, params, row, hooks)?;
+            let (elem, raw) = match array {
                 Datum::Array { elem, raw } => (elem, raw),
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("ANY/ALL requires an array", &arr)),
+                _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
             };
             let n = super::array::len(raw);
             let mut saw_null = false;
@@ -1021,8 +1021,8 @@ fn call<'a>(
                 Ok(Datum::Int8(v))
             }
         }
-        // Set-returning `_pg_expandarray(arr)` yields, for the current expansion
-        // index k, the composite `(x, n)` = (arr[k], k), encoded as `[x, n]`.
+        // Set-returning `_pg_expandarray(array)` yields, for the current expansion
+        // index k, the composite `(x, n)` = (array[k], k), encoded as `[x, n]`.
         "_pg_expandarray" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
@@ -1804,22 +1804,22 @@ fn call<'a>(
             // Padding is `fill` repeated, cut to `pad_count` characters.
             let pad_len: usize = fill.chars().cycle().take(pad_count).map(char::len_utf8).sum();
             let total = pad_len + s.len();
-            let buf = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
+            let buffer = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
             let mut at = 0;
-            let write_pad = |buf: &mut [u8], at: &mut usize| {
+            let write_pad = |buffer: &mut [u8], at: &mut usize| {
                 for c in fill.chars().cycle().take(pad_count) {
-                    *at += c.encode_utf8(&mut buf[*at..]).len();
+                    *at += c.encode_utf8(&mut buffer[*at..]).len();
                 }
             };
             if name == "lpad" {
-                write_pad(buf, &mut at);
-                buf[at..at + s.len()].copy_from_slice(s.as_bytes());
+                write_pad(buffer, &mut at);
+                buffer[at..at + s.len()].copy_from_slice(s.as_bytes());
             } else {
-                buf[at..at + s.len()].copy_from_slice(s.as_bytes());
+                buffer[at..at + s.len()].copy_from_slice(s.as_bytes());
                 at += s.len();
-                write_pad(buf, &mut at);
+                write_pad(buffer, &mut at);
             }
-            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buf) }))
+            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buffer) }))
         }
         "split_part" => {
             arity(3)?;
@@ -1842,11 +1842,11 @@ fn call<'a>(
                 s.split(delim).nth((n - 1) as usize).unwrap_or("")
             } else {
                 let total = s.split(delim).count() as i64;
-                let idx = total + n; // n is negative
-                if idx < 0 {
+                let index = total + n; // n is negative
+                if index < 0 {
                     ""
                 } else {
-                    s.split(delim).nth(idx as usize).unwrap_or("")
+                    s.split(delim).nth(index as usize).unwrap_or("")
                 }
             };
             Ok(Datum::Text(part))
@@ -1863,22 +1863,22 @@ fn call<'a>(
             // Each character of `s` that appears in `from` is replaced by the
             // char at the same index in `to`, or removed if `to` is shorter.
             let out_cap: usize = s.chars().map(|c| c.len_utf8()).sum();
-            let buf = arena.alloc_slice_with(out_cap.max(1), |_| 0u8).map_err(|_| arena_full())?;
+            let buffer = arena.alloc_slice_with(out_cap.max(1), |_| 0u8).map_err(|_| arena_full())?;
             let mut at = 0;
             for c in s.chars() {
                 match from.chars().position(|f| f == c) {
                     Some(i) => {
                         if let Some(r) = to.chars().nth(i) {
-                            at += r.encode_utf8(&mut buf[at..]).len();
+                            at += r.encode_utf8(&mut buffer[at..]).len();
                         }
                         // else: removed.
                     }
                     None => {
-                        at += c.encode_utf8(&mut buf[at..]).len();
+                        at += c.encode_utf8(&mut buffer[at..]).len();
                     }
                 }
             }
-            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(&buf[..at]) }))
+            Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(&buffer[..at]) }))
         }
         "greatest" | "least" => {
             if star || args.is_empty() {
@@ -2505,10 +2505,10 @@ fn call<'a>(
             arity(1)?;
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
-                Datum::Interval(iv) => Ok(Datum::Interval(match name {
-                    "justify_hours" => super::datetime::justify_hours(iv),
-                    "justify_days" => super::datetime::justify_days(iv),
-                    _ => super::datetime::justify_interval(iv),
+                Datum::Interval(interval) => Ok(Datum::Interval(match name {
+                    "justify_hours" => super::datetime::justify_hours(interval),
+                    "justify_days" => super::datetime::justify_days(interval),
+                    _ => super::datetime::justify_interval(interval),
                 })),
                 other => Err(type_mismatch(name, &other)),
             }
@@ -2663,11 +2663,11 @@ fn call<'a>(
             } else {
                 None
             };
-            if let Some(iv) = int_val {
+            if let Some(interval) = int_val {
                 return Ok(if name == "extract" {
-                    Datum::Numeric(Numeric::from_i64(iv, arena)?)
+                    Datum::Numeric(Numeric::from_i64(interval, arena)?)
                 } else {
-                    Datum::Float8(iv as f64)
+                    Datum::Float8(interval as f64)
                 });
             }
             // Fractional fields, scaled to microseconds.
@@ -3182,8 +3182,8 @@ fn unary<'a>(op: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
 /// A string literal or a parameter is PostgreSQL's "unknown" type, which
 /// coerces to whatever it is compared/combined with. A real typed value
 /// (column, function result, cast) does not.
-fn is_unknown_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Str(_) | Expr::Param(_))
+fn is_unknown_literal(expression: &Expr) -> bool {
+    matches!(expression, Expr::Str(_) | Expr::Param(_))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3298,17 +3298,21 @@ fn range_mismatch() -> SqlError {
 /// Whether `container` (a range) contains `contained` (a range of the same kind
 /// or a bare element).
 fn range_contains<'a>(container: Datum<'a>, contained: Datum<'a>) -> Result<Datum<'a>, SqlError> {
-    let (ct, ck) = as_range(&container)?;
+    let (container_text, container_kind) = as_range(&container)?;
     match contained {
         Datum::Range { text, kind } => {
-            if kind != ck {
+            if kind != container_kind {
                 return Err(range_mismatch());
             }
-            Ok(Datum::Bool(super::range::contains_range(ct, text, ck)?))
+            Ok(Datum::Bool(super::range::contains_range(container_text, text, container_kind)?))
         }
-        elem => {
-            let es = stack_format!(64, "{}", elem);
-            Ok(Datum::Bool(super::range::contains_elem(ct, ck, es.as_str())?))
+        element => {
+            let element_text = stack_format!(64, "{}", element);
+            Ok(Datum::Bool(super::range::contains_elem(
+                container_text,
+                container_kind,
+                element_text.as_str(),
+            )?))
         }
     }
 }
@@ -3382,13 +3386,13 @@ fn json_get<'a>(
         if let super::json::Json::Str(s) = child {
             return Ok(Datum::Text(s));
         }
-        let mut buf = crate::util::StackStr::<8192>::new();
-        let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&child)));
-        return Ok(Datum::Text(arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?));
+        let mut buffer = crate::util::StackStr::<8192>::new();
+        let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
+        return Ok(Datum::Text(arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?));
     }
-    let mut buf = crate::util::StackStr::<8192>::new();
-    let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&child)));
-    Ok(Datum::Json { text: arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?, jsonb })
+    let mut buffer = crate::util::StackStr::<8192>::new();
+    let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
+    Ok(Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb })
 }
 
 /// Evaluates `left AND right` / `left OR right` with PostgreSQL's short-circuit
@@ -3466,14 +3470,14 @@ fn array_null_concat<'a>(
     row: &impl ColumnLookup<'a>,
     arena: &'a Arena,
 ) -> Result<Option<Datum<'a>>, SqlError> {
-    let (arr, elem, null_expr) = match (l, r) {
+    let (array, elem, null_expr) = match (l, r) {
         (Datum::Array { elem, .. }, Datum::Null) => (l, elem, right),
         (Datum::Null, Datum::Array { elem, .. }) => (r, elem, left),
         _ => return Ok(None),
     };
     match static_type(null_expr, row) {
         // Untyped NULL or a NULL of the array type: identity.
-        None | Some(ColType::Array(_)) => Ok(Some(arr)),
+        None | Some(ColType::Array(_)) => Ok(Some(array)),
         // NULL of the element type: append/prepend a NULL element.
         Some(t) if super::types::ArrElem::from_coltype(t) == Some(elem) => {
             Ok(Some(array_concat(l, r, arena)?))
@@ -3571,16 +3575,16 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
 /// between the two, so NULL never reaches here.
 /// Exact comparison between a Numeric and an integer, allocation-free.
 fn compare_numeric_int(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlError> {
-    let mut buf = [0u8; 20];
+    let mut buffer = [0u8; 20];
     match (l, r) {
         (Datum::Numeric(n), other) => {
-            let iv = as_i64(other).expect("integer side");
-            let t = Numeric::from_i64_stack(iv, &mut buf);
+            let interval = as_i64(other).expect("integer side");
+            let t = Numeric::from_i64_stack(interval, &mut buffer);
             Ok(numeric::compare(n, &t))
         }
         (other, Datum::Numeric(n)) => {
-            let iv = as_i64(other).expect("integer side");
-            let t = Numeric::from_i64_stack(iv, &mut buf);
+            let interval = as_i64(other).expect("integer side");
+            let t = Numeric::from_i64_stack(interval, &mut buffer);
             Ok(numeric::compare(&t, n))
         }
         _ => unreachable!("compare_numeric_int only for numeric/int pairs"),
@@ -3800,26 +3804,26 @@ fn arithmetic<'a>(
             }));
         }
         // `interval * number` / `number * interval` / `interval / number`.
-        (BinaryOp::Mul, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), false)));
+        (BinaryOp::Mul, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(interval, num_factor(&r).expect("checked"), false)));
         }
-        (BinaryOp::Mul, _, Datum::Interval(iv)) if num_factor(&l).is_some() => {
-            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&l).expect("checked"), false)));
+        (BinaryOp::Mul, _, Datum::Interval(interval)) if num_factor(&l).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(interval, num_factor(&l).expect("checked"), false)));
         }
-        (BinaryOp::Div, Datum::Interval(iv), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(super::datetime::interval_scale(iv, num_factor(&r).expect("checked"), true)));
+        (BinaryOp::Div, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
+            return Ok(Datum::Interval(super::datetime::interval_scale(interval, num_factor(&r).expect("checked"), true)));
         }
-        (BinaryOp::Add | BinaryOp::Sub, dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)), Datum::Interval(iv))
-        | (BinaryOp::Add, Datum::Interval(iv), dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_))) => {
+        (BinaryOp::Add | BinaryOp::Sub, dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)), Datum::Interval(interval))
+        | (BinaryOp::Add, Datum::Interval(interval), dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_))) => {
             let base = match dt {
                 Datum::Timestamp(t) | Datum::Timestamptz(t) => t,
                 Datum::Date(d) => d as i64 * 86_400_000_000,
                 _ => unreachable!(),
             };
             let signed = if op == BinaryOp::Sub {
-                super::types::Interval { months: -iv.months, days: -iv.days, micros: -iv.micros }
+                super::types::Interval { months: -interval.months, days: -interval.days, micros: -interval.micros }
             } else {
-                iv
+                interval
             };
             let out = super::datetime::add_interval(base, signed);
             // date ± interval yields timestamp in PostgreSQL; timestamptz stays tz.
@@ -4073,12 +4077,12 @@ pub fn cast_to<'a>(
             Datum::Json { jsonb: true, .. } => v,
             Datum::Json { text, jsonb: false } | Datum::Text(text) => {
                 let tree = super::json::parse(text, arena)?;
-                let mut buf = crate::util::StackStr::<8192>::new();
-                let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", super::json::JsonWrite(&tree)));
-                if buf.is_truncated() {
+                let mut buffer = crate::util::StackStr::<8192>::new();
+                let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&tree)));
+                if buffer.is_truncated() {
                     return Err(sql_err!("54000", "jsonb value exceeds the supported size"));
                 }
-                Datum::Json { text: arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?, jsonb: true }
+                Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb: true }
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
         },
@@ -4245,7 +4249,7 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
     if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
         return None;
     }
-    let mut buf = [0u8; 80];
+    let mut buffer = [0u8; 80];
     let mut n = 0;
     let mut prev_underscore = false;
     for &c in db {
@@ -4257,13 +4261,13 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
             continue;
         }
         prev_underscore = false;
-        if n >= buf.len() {
+        if n >= buffer.len() {
             return None;
         }
-        buf[n] = c;
+        buffer[n] = c;
         n += 1;
     }
-    let cleaned = core::str::from_utf8(&buf[..n]).ok()?;
+    let cleaned = core::str::from_utf8(&buffer[..n]).ok()?;
     let v = i64::from_str_radix(cleaned, radix).ok()?;
     Some(if neg { -v } else { v })
 }
@@ -4420,8 +4424,8 @@ mod tests {
         let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
             panic!()
         };
-        let SelectItem::Expr { expr, .. } = s.items[0] else { panic!() };
-        eval(expr, arena, NO_PARAMS, &NoColumns)
+        let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
+        eval(expression, arena, NO_PARAMS, &NoColumns)
     }
 
     fn with_arena(f: impl FnOnce(&Arena)) {

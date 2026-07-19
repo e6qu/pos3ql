@@ -211,7 +211,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
+        let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         // Materialize the subquery rows, self-describing-encoded, into a
         // doubling arena vector.
         const EMPTY: &[u8] = &[];
@@ -242,7 +242,7 @@ impl<'d> QueryScope<'d> {
             unsafe { core::slice::from_raw_parts(store, len) }
         };
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -294,9 +294,9 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
+        let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
@@ -328,7 +328,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_ref: &'a TableDef = arena.alloc(synth.def).map_err(|_| arena_full())?;
+        let def_reference: &'a TableDef = arena.alloc(synth.def).map_err(|_| arena_full())?;
         let rows: &'a [&'a [u8]] = if materialize {
             const EMPTY: &[u8] = &[];
             let encoded = arena
@@ -342,7 +342,7 @@ impl<'d> QueryScope<'d> {
             &[]
         };
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -361,7 +361,7 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
-        let def_ref = table_func_def(tref, arena, params)?;
+        let def_reference = table_func_def(tref, arena, params)?;
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
@@ -373,7 +373,7 @@ impl<'d> QueryScope<'d> {
         let rows: &'a [&'a [u8]] =
             if materialize { table_func_rows(tref, arena, params)? } else { &[] };
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(def_ref);
+        self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -558,21 +558,21 @@ fn scan_source<'a>(
         // fills each table's own `values` slot.
         let mut rest: &mut [[Datum<'v>; MAX_COLUMNS]] = buffers;
         for &t in order.iter().take(count) {
-            let (buf, tail) = rest.split_first_mut().expect("enough buffers");
+            let (buffer, tail) = rest.split_first_mut().expect("enough buffers");
             rest = tail;
             let def = scope.defs[t].expect("resolved");
             match bound[t] {
                 Some(bytes) => {
                     if scope.derived[t].is_some() {
-                        for (c, slot) in buf.iter_mut().enumerate().take(def.n_columns) {
+                        for (c, slot) in buffer.iter_mut().enumerate().take(def.n_columns) {
                             *slot = super::exec::decode_projected_pub(bytes, c);
                         }
                     } else {
                         let mut schema = [ColType::Bool; MAX_COLUMNS];
                         def.schema(&mut schema);
-                        rowenc::decode(bytes, &schema[..def.n_columns], buf)?;
+                        rowenc::decode(bytes, &schema[..def.n_columns], buffer)?;
                     }
-                    values[t] = Some(&buf[..def.n_columns]);
+                    values[t] = Some(&buffer[..def.n_columns]);
                 }
                 None => values[t] = Some(&[]), // outer-join null row
             }
@@ -608,8 +608,8 @@ fn scan_source<'a>(
             let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
             let row = assemble(scope, bound, order, depth, &mut buffers)?;
             if let Some(w) = where_clause {
-                let cr = Chained { inner: &row, outer };
-                if !where_passes(w, arena, params, &cr, hooks)? {
+                let chained_row = Chained { inner: &row, outer };
+                if !where_passes(w, arena, params, &chained_row, hooks)? {
                     return Ok(true);
                 }
             }
@@ -626,8 +626,8 @@ fn scan_source<'a>(
                 && let Some(on) = join.on {
                     let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
                     let row = assemble(scope, bound, order, depth + 1, &mut buffers)?;
-                    let cr = Chained { inner: &row, outer };
-                    return match eval_full(on, arena, params, &cr, hooks)? {
+                    let chained_row = Chained { inner: &row, outer };
+                    return match eval_full(on, arena, params, &chained_row, hooks)? {
                         Datum::Bool(true) => Ok(true),
                         Datum::Bool(false) | Datum::Null => Ok(false),
                         _ => Err(sql_err!(
@@ -658,7 +658,7 @@ fn scan_source<'a>(
         // Derived tables scan their materialized rows; physical tables scan the
         // visibility-filtered heap.
         if let Some(rows) = scope.derived[order[depth]] {
-            for (idx, bytes) in rows.iter().enumerate() {
+            for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
                 bound[order[depth]] = Some(bytes);
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
@@ -666,7 +666,7 @@ fn scan_source<'a>(
                 }
                 matched_any = true;
                 if let Some(m) = matched.filter(|_| depth + 1 == scope.n) {
-                    m[idx].set(true);
+                    m[index].set(true);
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
@@ -719,15 +719,15 @@ fn scan_source<'a>(
             }
         } else {
             let table = storage.table(scope.slots[order[depth]]);
-            let mut idx = 0usize;
+            let mut index = 0usize;
             for (_, state) in table.rows.iter() {
                 check_timeout()?;
                 let Some(loc) = state.visible_to(txid) else {
                     continue;
                 };
                 bound[order[depth]] = Some(storage.heap.get(loc));
-                let this = idx;
-                idx += 1;
+                let this = index;
+                index += 1;
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
                 }
@@ -819,14 +819,14 @@ fn scan_source<'a>(
     for (pos, &t) in order.iter().enumerate() {
         inv_order[t] = pos;
     }
-    let mut pd_bufs: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
+    let mut pushdown_buffers: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
         [[&Expr::Null; MAX_CONJUNCTS]; MAX_JOIN_TABLES];
     let mut pd_n = [0usize; MAX_JOIN_TABLES];
     if all_inner && scope.n >= 2 && let Some(w) = where_clause {
-        let mut conj: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
+        let mut conjunct: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
         let mut n = 0;
         let conjuncts: &[&Expr] =
-            if flatten_and(w, &mut conj, &mut n) { &conj[..n] } else { core::slice::from_ref(&w) };
+            if flatten_and(w, &mut conjunct, &mut n) { &conjunct[..n] } else { core::slice::from_ref(&w) };
         for &c in conjuncts {
             // The execution depth at which a conjunct is fully bound is the
             // latest execution position of any table it references (under
@@ -840,13 +840,13 @@ fn scan_source<'a>(
                     .max()
                     .unwrap_or(0);
                 if d < scope.n && pd_n[d] < MAX_CONJUNCTS {
-                    pd_bufs[d][pd_n[d]] = c;
+                    pushdown_buffers[d][pd_n[d]] = c;
                     pd_n[d] += 1;
                 }
             }
         }
     }
-    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] = core::array::from_fn(|d| &pd_bufs[d][..pd_n[d]]);
+    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] = core::array::from_fn(|d| &pushdown_buffers[d][..pd_n[d]]);
 
     let mut bound = [None; MAX_JOIN_TABLES];
     level(
@@ -878,28 +878,28 @@ fn scan_source<'a>(
             let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
             let row = assemble(scope, &b, &order, scope.n, &mut buffers)?;
             if let Some(w) = where_clause {
-                let cr = Chained { inner: &row, outer };
-                if !where_passes(w, arena, params, &cr, hooks)? {
+                let chained_row = Chained { inner: &row, outer };
+                if !where_passes(w, arena, params, &chained_row, hooks)? {
                     return Ok(true);
                 }
             }
             f(&row)
         };
         if let Some(rows) = scope.derived[deep] {
-            for (idx, bytes) in rows.iter().enumerate() {
-                if !m[idx].get() && !emit_unmatched(bytes, f)? {
+            for (index, bytes) in rows.iter().enumerate() {
+                if !m[index].get() && !emit_unmatched(bytes, f)? {
                     return Ok(());
                 }
             }
         } else {
             let table = storage.table(scope.slots[deep]);
-            let mut idx = 0usize;
+            let mut index = 0usize;
             for (_, state) in table.rows.iter() {
                 let Some(loc) = state.visible_to(txid) else {
                     continue;
                 };
-                let this = idx;
-                idx += 1;
+                let this = index;
+                index += 1;
                 if !m[this].get() && !emit_unmatched(storage.heap.get(loc), f)? {
                     return Ok(());
                 }
@@ -980,7 +980,7 @@ pub fn resolve_view_for_dml<'a>(
             }
             // Only a plain, un-aliased base column keeps view and base names in
             // sync (so the view's/DML's WHERE resolve directly against the base).
-            SelectItem::Expr { expr: Expr::Column { name: cn, .. }, alias } => {
+            SelectItem::Expr { expression: Expr::Column { name: cn, .. }, alias } => {
                 if alias.is_some_and(|a| a != *cn) {
                     return Err(not_updatable());
                 }
@@ -1056,15 +1056,15 @@ pub fn expand_ctes<'a>(
         if resolved[..n].iter().any(|(name, _)| *name == cte.name) {
             return Err(sql_err!("42712", "WITH query name \"{}\" specified more than once", cte.name));
         }
-        let ctx = Subst { ctes: &resolved[..n], storage, depth: 0 };
-        let q = subst_select(cte.query, ctx, arena)?;
+        let context = Subst { ctes: &resolved[..n], storage, depth: 0 };
+        let q = subst_select(cte.query, context, arena)?;
         resolved[n] = (cte.name, q);
         n += 1;
     }
     // Substitute the body against all CTEs (the WITH list is dropped by
     // subst_select, which never copies it) and expand any view references.
-    let ctx = Subst { ctes: &resolved[..n], storage, depth: 0 };
-    subst_select(sel, ctx, arena)
+    let context = Subst { ctes: &resolved[..n], storage, depth: 0 };
+    subst_select(sel, context, arena)
 }
 
 type CteBindings<'a> = [(&'a str, &'a Select<'a>)];
@@ -1083,11 +1083,11 @@ const MAX_VIEW_DEPTH: u32 = 12;
 
 fn subst_select<'a>(
     s: &'a Select<'a>,
-    ctx: Subst<'_, 'a>,
+    context: Subst<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     let from = match &s.from {
-        Some(f) => Some(subst_from(f, ctx, arena)?),
+        Some(f) => Some(subst_from(f, context, arena)?),
         None => None,
     };
     let mut items = [SelectItem::Wildcard; MAX_PROJ];
@@ -1097,37 +1097,37 @@ fn subst_select<'a>(
     for (i, it) in s.items.iter().enumerate() {
         items[i] = match it {
             SelectItem::Wildcard => SelectItem::Wildcard,
-            SelectItem::Expr { expr, alias } => SelectItem::Expr {
-                expr: subst_expr(expr, ctx, arena)?,
+            SelectItem::Expr { expression, alias } => SelectItem::Expr {
+                expression: subst_expr(expression, context, arena)?,
                 alias: *alias,
             },
         };
     }
     let items = arena.alloc_slice_copy(&items[..s.items.len()]).map_err(|_| arena_full())?;
-    let group_by = subst_expr_slice(s.group_by, ctx, arena)?;
-    let mut order = [OrderBy { expr: &Expr::Null, descending: false, nulls_first: false };
+    let group_by = subst_expr_slice(s.group_by, context, arena)?;
+    let mut order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
         super::parser::MAX_LIST];
     if s.order_by.len() > super::parser::MAX_LIST {
         return Err(sql_err!("54023", "ORDER BY list too long"));
     }
     for (i, ob) in s.order_by.iter().enumerate() {
-        order[i] = OrderBy { expr: subst_expr(ob.expr, ctx, arena)?, ..*ob };
+        order[i] = OrderBy { expression: subst_expr(ob.expression, context, arena)?, ..*ob };
     }
     let order_by = arena.alloc_slice_copy(&order[..s.order_by.len()]).map_err(|_| arena_full())?;
     let set_body = match s.set_body {
-        Some(tree) => Some(subst_set_tree(tree, ctx, arena)?),
+        Some(tree) => Some(subst_set_tree(tree, context, arena)?),
         None => None,
     };
     let new = Select {
         items,
         distinct: s.distinct,
         from,
-        where_clause: opt_subst(s.where_clause, ctx, arena)?,
+        where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,
-        having: opt_subst(s.having, ctx, arena)?,
+        having: opt_subst(s.having, context, arena)?,
         order_by,
-        limit: opt_subst(s.limit, ctx, arena)?,
-        offset: opt_subst(s.offset, ctx, arena)?,
+        limit: opt_subst(s.limit, context, arena)?,
+        offset: opt_subst(s.offset, context, arena)?,
         with: &[],
         set_body,
     };
@@ -1138,16 +1138,16 @@ fn subst_select<'a>(
 /// mirroring [`subst_select`] for a set-op subquery body.
 fn subst_set_tree<'a>(
     tree: &'a SetTree<'a>,
-    ctx: Subst<'_, 'a>,
+    context: Subst<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
     let out = match tree {
-        SetTree::Select(s) => SetTree::Select(subst_select(s, ctx, arena)?),
+        SetTree::Select(s) => SetTree::Select(subst_select(s, context, arena)?),
         SetTree::Op { op, all, left, right } => SetTree::Op {
             op: *op,
             all: *all,
-            left: subst_set_tree(left, ctx, arena)?,
-            right: subst_set_tree(right, ctx, arena)?,
+            left: subst_set_tree(left, context, arena)?,
+            right: subst_set_tree(right, context, arena)?,
         },
     };
     Ok(&*arena.alloc(out).map_err(|_| arena_full())?)
@@ -1155,10 +1155,10 @@ fn subst_set_tree<'a>(
 
 fn subst_from<'a>(
     f: &'a FromClause<'a>,
-    ctx: Subst<'_, 'a>,
+    context: Subst<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<FromClause<'a>, SqlError> {
-    let base = subst_tableref(&f.base, ctx, arena)?;
+    let base = subst_tableref(&f.base, context, arena)?;
     let dummy = Join { table: f.base, kind: JoinKind::Inner, on: None };
     let mut joins = [dummy; MAX_JOIN_TABLES - 1];
     if f.joins.len() > joins.len() {
@@ -1166,9 +1166,9 @@ fn subst_from<'a>(
     }
     for (i, j) in f.joins.iter().enumerate() {
         joins[i] = Join {
-            table: subst_tableref(&j.table, ctx, arena)?,
+            table: subst_tableref(&j.table, context, arena)?,
             kind: j.kind,
-            on: opt_subst(j.on, ctx, arena)?,
+            on: opt_subst(j.on, context, arena)?,
         };
     }
     let joins = arena.alloc_slice_copy(&joins[..f.joins.len()]).map_err(|_| arena_full())?;
@@ -1177,19 +1177,19 @@ fn subst_from<'a>(
 
 fn subst_tableref<'a>(
     t: &TableRef<'a>,
-    ctx: Subst<'_, 'a>,
+    context: Subst<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<TableRef<'a>, SqlError> {
     if let Some(sub) = t.subquery {
         return Ok(TableRef {
-            subquery: Some(subst_select(sub, ctx, arena)?),
+            subquery: Some(subst_select(sub, context, arena)?),
             ..*t
         });
     }
     // An unqualified name matching a CTE becomes a derived table over the
     // (already-substituted) CTE query, exposed under its alias or CTE name.
     if t.schema.is_none()
-        && let Some((_, q)) = ctx.ctes.iter().find(|(name, _)| *name == t.table)
+        && let Some((_, q)) = context.ctes.iter().find(|(name, _)| *name == t.table)
     {
         return Ok(TableRef {
             schema: None,
@@ -1203,10 +1203,10 @@ fn subst_tableref<'a>(
     // A name matching a view (and not shadowed by a CTE or table) expands to a
     // derived table over the view's stored SELECT, recursively expanded.
     if t.schema.is_none()
-        && ctx.storage.find_table(t.table).is_none()
-        && let Some(view_sql) = ctx.storage.find_view(t.table)
+        && context.storage.find_table(t.table).is_none()
+        && let Some(view_sql) = context.storage.find_view(t.table)
     {
-        if ctx.depth >= MAX_VIEW_DEPTH {
+        if context.depth >= MAX_VIEW_DEPTH {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "view \"{}\" nests too deeply (or references itself)",
@@ -1217,8 +1217,8 @@ fn subst_tableref<'a>(
         // The view body has its own scope: no outer CTEs, deeper view depth.
         let inner = Subst {
             ctes: &[],
-            storage: ctx.storage,
-            depth: ctx.depth + 1,
+            storage: context.storage,
+            depth: context.depth + 1,
         };
         let expanded = subst_select(vsel, inner, arena)?;
         return Ok(TableRef {
@@ -1235,18 +1235,18 @@ fn subst_tableref<'a>(
 
 fn opt_subst<'a>(
     e: Option<&'a Expr<'a>>,
-    ctx: Subst<'_, 'a>,
+    context: Subst<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<Option<&'a Expr<'a>>, SqlError> {
     match e {
-        Some(x) => Ok(Some(subst_expr(x, ctx, arena)?)),
+        Some(x) => Ok(Some(subst_expr(x, context, arena)?)),
         None => Ok(None),
     }
 }
 
 fn subst_expr_slice<'a>(
     xs: &'a [&'a Expr<'a>],
-    ctx: Subst<'_, 'a>,
+    context: Subst<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<&'a [&'a Expr<'a>], SqlError> {
     if !xs.iter().any(|x| expr_has_subquery(x)) {
@@ -1257,7 +1257,7 @@ fn subst_expr_slice<'a>(
         return Err(sql_err!("54023", "expression list too long"));
     }
     for (i, x) in xs.iter().enumerate() {
-        tmp[i] = subst_expr(x, ctx, arena)?;
+        tmp[i] = subst_expr(x, context, arena)?;
     }
     Ok(&*arena.alloc_slice_copy(&tmp[..xs.len()]).map_err(|_| arena_full())?)
 }
@@ -1274,7 +1274,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
         Expr::Call { args, order_by, .. } => {
             args.iter().any(|a| expr_has_subquery(a))
-                || order_by.iter().any(|o| expr_has_subquery(o.expr))
+                || order_by.iter().any(|o| expr_has_subquery(o.expression))
         }
         Expr::InList { operand, list, .. } => {
             expr_has_subquery(operand) || list.iter().any(|a| expr_has_subquery(a))
@@ -1296,47 +1296,47 @@ fn expr_has_subquery(e: &Expr) -> bool {
 
 fn subst_expr<'a>(
     e: &'a Expr<'a>,
-    ctx: Subst<'_, 'a>,
+    context: Subst<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
     if !expr_has_subquery(e) {
         return Ok(e);
     }
     let rebuilt = match e {
-        Expr::Subquery(s) => Expr::Subquery(subst_select(s, ctx, arena)?),
-        Expr::ArraySubquery(s) => Expr::ArraySubquery(subst_select(s, ctx, arena)?),
-        Expr::Exists(s) => Expr::Exists(subst_select(s, ctx, arena)?),
+        Expr::Subquery(s) => Expr::Subquery(subst_select(s, context, arena)?),
+        Expr::ArraySubquery(s) => Expr::ArraySubquery(subst_select(s, context, arena)?),
+        Expr::Exists(s) => Expr::Exists(subst_select(s, context, arena)?),
         Expr::InSubquery { operand, select, negated } => Expr::InSubquery {
-            operand: subst_expr(operand, ctx, arena)?,
-            select: subst_select(select, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
+            select: subst_select(select, context, arena)?,
             negated: *negated,
         },
         Expr::Unary { op, operand } => Expr::Unary {
             op: *op,
-            operand: subst_expr(operand, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
         },
         Expr::Binary { op, left, right } => Expr::Binary {
             op: *op,
-            left: subst_expr(left, ctx, arena)?,
-            right: subst_expr(right, ctx, arena)?,
+            left: subst_expr(left, context, arena)?,
+            right: subst_expr(right, context, arena)?,
         },
         Expr::Cast { operand, type_name, type_mod } => Expr::Cast {
-            operand: subst_expr(operand, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
             type_name,
             type_mod: *type_mod,
         },
         Expr::IsNull { operand, negated } => Expr::IsNull {
-            operand: subst_expr(operand, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
             negated: *negated,
         },
         Expr::Call { name, args, star, distinct, order_by, over, filter } => {
-            let mut ob = [OrderBy { expr: &Expr::Null, descending: false, nulls_first: false };
+            let mut ob = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
                 super::parser::MAX_LIST];
             if order_by.len() > ob.len() {
                 return Err(sql_err!("54023", "aggregate ORDER BY list too long"));
             }
             for (i, o) in order_by.iter().enumerate() {
-                ob[i] = OrderBy { expr: subst_expr(o.expr, ctx, arena)?, ..*o };
+                ob[i] = OrderBy { expression: subst_expr(o.expression, context, arena)?, ..*o };
             }
             let order_by = arena
                 .alloc_slice_copy(&ob[..order_by.len()])
@@ -1344,13 +1344,13 @@ fn subst_expr<'a>(
             let over = match over {
                 None => None,
                 Some(w) => {
-                    let mut ob2 = [OrderBy { expr: &Expr::Null, descending: false, nulls_first: false };
+                    let mut ob2 = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
                         super::parser::MAX_LIST];
                     for (i, o) in w.order_by.iter().enumerate() {
-                        ob2[i] = OrderBy { expr: subst_expr(o.expr, ctx, arena)?, ..*o };
+                        ob2[i] = OrderBy { expression: subst_expr(o.expression, context, arena)?, ..*o };
                     }
                     let spec = super::ast::WindowSpec {
-                        partition_by: subst_expr_slice(w.partition_by, ctx, arena)?,
+                        partition_by: subst_expr_slice(w.partition_by, context, arena)?,
                         order_by: arena.alloc_slice_copy(&ob2[..w.order_by.len()]).map_err(|_| arena_full())?,
                     };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
@@ -1358,11 +1358,11 @@ fn subst_expr<'a>(
             };
             let filter = match filter {
                 None => None,
-                Some(f) => Some(subst_expr(f, ctx, arena)?),
+                Some(f) => Some(subst_expr(f, context, arena)?),
             };
             Expr::Call {
                 name,
-                args: subst_expr_slice(args, ctx, arena)?,
+                args: subst_expr_slice(args, context, arena)?,
                 star: *star,
                 distinct: *distinct,
                 order_by,
@@ -1371,42 +1371,42 @@ fn subst_expr<'a>(
             }
         }
         Expr::InList { operand, list, negated } => Expr::InList {
-            operand: subst_expr(operand, ctx, arena)?,
-            list: subst_expr_slice(list, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
+            list: subst_expr_slice(list, context, arena)?,
             negated: *negated,
         },
         Expr::Between { operand, low, high, negated } => Expr::Between {
-            operand: subst_expr(operand, ctx, arena)?,
-            low: subst_expr(low, ctx, arena)?,
-            high: subst_expr(high, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
+            low: subst_expr(low, context, arena)?,
+            high: subst_expr(high, context, arena)?,
             negated: *negated,
         },
         Expr::Like { operand, pattern, negated, case_insensitive } => Expr::Like {
-            operand: subst_expr(operand, ctx, arena)?,
-            pattern: subst_expr(pattern, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
+            pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
             case_insensitive: *case_insensitive,
         },
         Expr::Match { operand, pattern, negated, case_insensitive } => Expr::Match {
-            operand: subst_expr(operand, ctx, arena)?,
-            pattern: subst_expr(pattern, ctx, arena)?,
+            operand: subst_expr(operand, context, arena)?,
+            pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
             case_insensitive: *case_insensitive,
         },
         Expr::Case { operand, whens, otherwise } => {
-            let operand = opt_subst(*operand, ctx, arena)?;
+            let operand = opt_subst(*operand, context, arena)?;
             let mut ws = [(&Expr::Null, &Expr::Null); super::parser::MAX_LIST];
             if whens.len() > ws.len() {
                 return Err(sql_err!("54023", "CASE has too many WHEN branches"));
             }
             for (i, (c, r)) in whens.iter().enumerate() {
-                ws[i] = (subst_expr(c, ctx, arena)?, subst_expr(r, ctx, arena)?);
+                ws[i] = (subst_expr(c, context, arena)?, subst_expr(r, context, arena)?);
             }
             let whens = arena.alloc_slice_copy(&ws[..whens.len()]).map_err(|_| arena_full())?;
             Expr::Case {
                 operand,
                 whens,
-                otherwise: opt_subst(*otherwise, ctx, arena)?,
+                otherwise: opt_subst(*otherwise, context, arena)?,
             }
         }
         // Leaves never reach here (guarded by expr_has_subquery above).
@@ -1417,45 +1417,45 @@ fn subst_expr<'a>(
 
 /// Walks an expression tree collecting aggregate call nodes.
 fn collect_aggs<'a>(
-    expr: &'a Expr<'a>,
+    expression: &'a Expr<'a>,
     out: &mut [(*const Expr<'a>, &'a Expr<'a>); MAX_AGGS],
     n: &mut usize,
 ) -> Result<(), SqlError> {
-    if expr.is_aggregate() {
-        if out[..*n].iter().any(|(p, _)| core::ptr::eq(*p, expr)) {
+    if expression.is_aggregate() {
+        if out[..*n].iter().any(|(p, _)| core::ptr::eq(*p, expression)) {
             return Ok(());
         }
         if *n == MAX_AGGS {
             return Err(sql_err!("54000", "too many aggregates in one query"));
         }
-        out[*n] = (expr as *const _, expr);
+        out[*n] = (expression as *const _, expression);
         *n += 1;
         return Ok(()); // aggregate arguments evaluate per input row
     }
-    walk_children(expr, &mut |child| collect_aggs(child, out, n))
+    walk_children(expression, &mut |child| collect_aggs(child, out, n))
 }
 
 /// Collects window-function call nodes (a `Call` with an `OVER` clause).
 fn collect_windows<'a>(
-    expr: &'a Expr<'a>,
+    expression: &'a Expr<'a>,
     out: &mut [&'a Expr<'a>; MAX_WINDOWS],
     n: &mut usize,
 ) -> Result<(), SqlError> {
-    if let Expr::Call { over: Some(_), .. } = expr {
-        if out[..*n].iter().any(|e| core::ptr::eq(*e, expr)) {
+    if let Expr::Call { over: Some(_), .. } = expression {
+        if out[..*n].iter().any(|e| core::ptr::eq(*e, expression)) {
             return Ok(());
         }
         if *n == MAX_WINDOWS {
             return Err(sql_err!("54023", "too many window functions in one query"));
         }
-        out[*n] = expr;
+        out[*n] = expression;
         *n += 1;
         // The arguments and PARTITION/ORDER expressions evaluate per input row;
         // a window function nested inside another is not supported and would be
         // found by the analysis pass, not here.
         return Ok(());
     }
-    walk_children(expr, &mut |child| collect_windows(child, out, n))
+    walk_children(expression, &mut |child| collect_windows(child, out, n))
 }
 
 /// Builds a `JoinRow` view over one flat materialized row (all scope columns
@@ -1584,9 +1584,9 @@ fn compute_window<'a>(
                     && spec.order_by.iter().try_fold(true, |acc, o| {
                         Ok::<bool, SqlError>(acc && {
                             let ra = window_row(scope, rows[p[j - 1]], offs);
-                            let va = eval_full(o.expr, arena, params, &ra, hooks)?;
+                            let va = eval_full(o.expression, arena, params, &ra, hooks)?;
                             let rb = window_row(scope, rows[p[j]], offs);
-                            let vb = eval_full(o.expr, arena, params, &rb, hooks)?;
+                            let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
                             match (va.is_null(), vb.is_null()) {
                                 (true, true) => true,
                                 (true, false) | (false, true) => false,
@@ -1655,9 +1655,9 @@ fn compute_window<'a>(
                         let same = spec.order_by.iter().try_fold(true, |acc, o| {
                             Ok::<bool, SqlError>(acc && {
                                 let ra = window_row(scope, rows[p[e]], offs);
-                                let va = eval_full(o.expr, arena, params, &ra, hooks)?;
+                                let va = eval_full(o.expression, arena, params, &ra, hooks)?;
                                 let rb = window_row(scope, rows[p[e + 1]], offs);
-                                let vb = eval_full(o.expr, arena, params, &rb, hooks)?;
+                                let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
                                 match (va.is_null(), vb.is_null()) {
                                     (true, true) => true,
                                     (true, false) | (false, true) => false,
@@ -1706,9 +1706,9 @@ fn cmp_order<'a>(
     use core::cmp::Ordering;
     for o in ord {
         let ra = window_row(scope, rows[a], offs);
-        let va = eval_full(o.expr, arena, params, &ra, hooks)?;
+        let va = eval_full(o.expression, arena, params, &ra, hooks)?;
         let rb = window_row(scope, rows[b], offs);
-        let vb = eval_full(o.expr, arena, params, &rb, hooks)?;
+        let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
         let base = match (va.is_null(), vb.is_null()) {
             (true, true) => Ordering::Equal,
             (true, false) => {
@@ -1739,7 +1739,7 @@ fn cmp_order<'a>(
 fn project_window_rows<'a>(
     storage: &'a Storage,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
     scope: &QueryScope<'a>,
     win_nodes: &[&'a Expr<'a>],
@@ -1758,7 +1758,7 @@ fn project_window_rows<'a>(
     // Pass 1: count source rows.
     let mut count = 0usize;
     scan_source(
-        storage, scope, from, txid, stmt.where_clause, arena, params, hooks, None,
+        storage, scope, from, txid, statement.where_clause, arena, params, hooks, None,
         &mut |_| {
             count += 1;
             Ok(true)
@@ -1769,7 +1769,7 @@ fn project_window_rows<'a>(
     let rows: &mut [&[Datum]] = arena.alloc_slice_with(count, |_| empty).map_err(|_| arena_full())?;
     let mut at = 0usize;
     scan_source(
-        storage, scope, from, txid, stmt.where_clause, arena, params, hooks, None,
+        storage, scope, from, txid, statement.where_clause, arena, params, hooks, None,
         &mut |row| {
             let flat = arena
                 .alloc_slice_with(total.max(1), |_| Datum::Null)
@@ -1798,13 +1798,13 @@ fn project_window_rows<'a>(
         .map_err(|_| arena_full())?;
 
     // Resolve ORDER BY (ordinals → select items).
-    let n_order = stmt.order_by.len();
+    let n_order = statement.order_by.len();
     let mut order_exprs: [Option<&Expr>; MAX_WIN_KEYS] = [None; MAX_WIN_KEYS];
     if n_order > MAX_WIN_KEYS {
         return Err(sql_err!("54023", "ORDER BY list too long"));
     }
-    for (k, ob) in stmt.order_by.iter().enumerate() {
-        order_exprs[k] = Some(super::exec::resolve_order_expr_pub(ob.expr, stmt.items)?);
+    for (k, ob) in statement.order_by.iter().enumerate() {
+        order_exprs[k] = Some(super::exec::resolve_order_expr_pub(ob.expression, statement.items)?);
     }
 
     // Project each row (with the window hook) and compute its sort keys.
@@ -1826,7 +1826,7 @@ fn project_window_rows<'a>(
         };
         let jr = window_row(scope, rows[i], &offs);
         let mut projected = [Datum::Null; MAX_PROJ];
-        let np = project_row(stmt.items, scope, &jr, arena, params, &win_hooks, &mut projected)?;
+        let np = project_row(statement.items, scope, &jr, arena, params, &win_hooks, &mut projected)?;
         proj_rows[i] = &*arena.alloc_slice_copy(&projected[..np]).map_err(|_| arena_full())?;
         let mut keys = [Datum::Null; MAX_WIN_KEYS];
         for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
@@ -1841,7 +1841,7 @@ fn project_window_rows<'a>(
 fn window_select<'a>(
     storage: &'a Storage,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     from: &'a FromClause<'a>,
     scope: &QueryScope<'a>,
     win_nodes: &[&'a Expr<'a>],
@@ -1852,14 +1852,14 @@ fn window_select<'a>(
     offset: u64,
     resp: &mut Responder,
 ) -> Outcome {
-    if !stmt.group_by.is_empty() || stmt.having.is_some() || stmt.distinct {
+    if !statement.group_by.is_empty() || statement.having.is_some() || statement.distinct {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "window functions combined with GROUP BY/HAVING/DISTINCT are not supported yet"
         ));
     }
     let (proj_rows, sort_keys) = match project_window_rows(
-        storage, txid, stmt, from, scope, win_nodes, hooks, arena, params,
+        storage, txid, statement, from, scope, win_nodes, hooks, arena, params,
     ) {
         Ok(v) => v,
         Err(e) => return sql_fail(e),
@@ -1871,11 +1871,11 @@ fn window_select<'a>(
         Ok(o) => o,
         Err(_) => return sql_fail(arena_full()),
     };
-    if !stmt.order_by.is_empty() {
+    if !statement.order_by.is_empty() {
         for x in 1..count {
             let mut y = x;
             while y > 0 {
-                let c = cmp_key_rows(sort_keys[order[y - 1]], sort_keys[order[y]], stmt.order_by);
+                let c = cmp_key_rows(sort_keys[order[y - 1]], sort_keys[order[y]], statement.order_by);
                 if c == core::cmp::Ordering::Greater {
                     order.swap(y - 1, y);
                     y -= 1;
@@ -1926,36 +1926,36 @@ fn cmp_key_rows(a: &[Datum], b: &[Datum], ord: &[OrderBy]) -> core::cmp::Orderin
 
 /// Walks an expression tree collecting subquery nodes.
 fn collect_subqueries<'a>(
-    expr: &'a Expr<'a>,
+    expression: &'a Expr<'a>,
     out: &mut [Option<&'a Expr<'a>>; MAX_SUBQUERIES],
     n: &mut usize,
 ) -> Result<(), SqlError> {
     if matches!(
-        expr,
+        expression,
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_)
     ) {
-        if out[..*n].iter().any(|e| core::ptr::eq(e.expect("set"), expr)) {
+        if out[..*n].iter().any(|e| core::ptr::eq(e.expect("set"), expression)) {
             return Ok(());
         }
         if *n == MAX_SUBQUERIES {
             return Err(sql_err!("54000", "too many subqueries in one query"));
         }
-        out[*n] = Some(expr);
+        out[*n] = Some(expression);
         *n += 1;
         // The operand of IN (SELECT ..) may itself contain subqueries.
-        if let Expr::InSubquery { operand, .. } = expr {
+        if let Expr::InSubquery { operand, .. } = expression {
             collect_subqueries(operand, out, n)?;
         }
         return Ok(());
     }
-    walk_children(expr, &mut |child| collect_subqueries(child, out, n))
+    walk_children(expression, &mut |child| collect_subqueries(child, out, n))
 }
 
 fn walk_children<'a>(
-    expr: &'a Expr<'a>,
+    expression: &'a Expr<'a>,
     f: &mut dyn FnMut(&'a Expr<'a>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    match expr {
+    match expression {
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::IsNull { operand, .. } => f(operand),
@@ -2017,8 +2017,8 @@ pub fn prepare_subqueries<'a>(
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
     let mut n = 0;
-    for expr in exprs.iter().flatten() {
-        collect_subqueries(expr, &mut nodes, &mut n)?;
+    for expression in exprs.iter().flatten() {
+        collect_subqueries(expression, &mut nodes, &mut n)?;
     }
     eval_subquery_nodes(&nodes[..n], storage, txid, arena, params, depth, outer)
 }
@@ -2116,8 +2116,8 @@ fn subquery_exists<'a>(
     let mut item_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut n_items = 0;
     for item in select.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            item_exprs[n_items] = Some(expr);
+        if let SelectItem::Expr { expression, .. } = item {
+            item_exprs[n_items] = Some(expression);
             n_items += 1;
         }
     }
@@ -2215,21 +2215,21 @@ fn select_has_outer_ref<'a>(
         return true;
     }
     select.items.iter().any(|it| match it {
-        SelectItem::Expr { expr, .. } => expr_has_outer_ref(expr, chain, storage, arena),
+        SelectItem::Expr { expression, .. } => expr_has_outer_ref(expression, chain, storage, arena),
         _ => false,
     })
 }
 
-/// Whether any column reference in `expr` resolves only in an enclosing scope
+/// Whether any column reference in `expression` resolves only in an enclosing scope
 /// beyond `chain`. Nested subqueries push their own scope onto the chain, so a
 /// column they provide themselves does not count as an outer reference.
 fn expr_has_outer_ref<'a>(
-    expr: &'a Expr<'a>,
+    expression: &'a Expr<'a>,
     chain: &ScopeChain,
     storage: &'a Storage,
     arena: &'a Arena,
 ) -> bool {
-    match expr {
+    match expression {
         Expr::Column { qualifier, name } => !chain.resolves(*qualifier, name),
         Expr::Subquery(s) | Expr::Exists(s) => {
             let sscope = s
@@ -2250,7 +2250,7 @@ fn expr_has_outer_ref<'a>(
         }
         _ => {
             let mut found = false;
-            let _ = walk_children(expr, &mut |c| {
+            let _ = walk_children(expression, &mut |c| {
                 if expr_has_outer_ref(c, chain, storage, arena) {
                     found = true;
                 }
@@ -2279,8 +2279,8 @@ fn prepare_outer_subqueries<'a>(
 ) -> Result<OuterSubs<'a>, SqlError> {
     let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
     let mut n = 0;
-    for expr in exprs.iter().flatten() {
-        collect_subqueries(expr, &mut nodes, &mut n)?;
+    for expression in exprs.iter().flatten() {
+        collect_subqueries(expression, &mut nodes, &mut n)?;
     }
     let mut uncorr: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
     let mut n_un = 0;
@@ -2437,7 +2437,7 @@ fn run_subquery<'a>(
     // subqueries or aggregates of its own).
     let wildcard = matches!(&select.items[0], SelectItem::Wildcard);
     let item: &Expr = match &select.items[0] {
-        SelectItem::Expr { expr, .. } => expr,
+        SelectItem::Expr { expression, .. } => expression,
         SelectItem::Wildcard => &Expr::Null,
     };
     if !select.group_by.is_empty() || select.having.is_some() || select.distinct {
@@ -2555,13 +2555,13 @@ fn run_subquery<'a>(
         &hooks,
         outer,
         &mut |row| {
-            let cr = Chained { inner: row, outer };
-            vals[at] = eval_full(item, arena, params, &cr, &hooks)?;
+            let chained_row = Chained { inner: row, outer };
+            vals[at] = eval_full(item, arena, params, &chained_row, &hooks)?;
             for (k, o) in select.order_by.iter().enumerate() {
                 // A positional `ORDER BY 1` sorts by the single output column.
-                let key = match o.expr {
+                let key = match o.expression {
                     Expr::Int(_) => vals[at],
-                    e => eval_full(e, arena, params, &cr, &hooks)?,
+                    e => eval_full(e, arena, params, &chained_row, &hooks)?,
                 };
                 keys[at * n_keys + k] = key;
             }
@@ -2654,15 +2654,15 @@ fn build_array_scalar<'a>(
         .or_else(|| values.iter().find_map(super::types::ArrElem::from_datum))
         .unwrap_or(super::types::ArrElem::Text);
     let ct = elem.to_coltype();
-    let buf = arena
+    let buffer = arena
         .alloc_slice_with(values.len(), |i| values[i])
         .map_err(|_| arena_full())?;
-    for v in buf.iter_mut() {
+    for v in buffer.iter_mut() {
         if !v.is_null() {
             *v = super::eval::cast_to(*v, ct, arena)?;
         }
     }
-    Ok(Datum::Array { elem, raw: super::array::build(buf, arena)? })
+    Ok(Datum::Array { elem, raw: super::array::build(buffer, arena)? })
 }
 
 /// Streams the source once, folding every aggregate node's state.
@@ -2695,9 +2695,9 @@ fn fold_aggregates<'a>(
         hooks,
         outer_arg,
         &mut |row| {
-            let cr = Chained { inner: row, outer: outer_arg };
+            let chained_row = Chained { inner: row, outer: outer_arg };
             for (i, (_, node)) in agg_nodes.iter().enumerate() {
-                states[i].update(node, arena, params, &cr, hooks)?;
+                states[i].update(node, arena, params, &chained_row, hooks)?;
             }
             Ok(true)
         },
@@ -3001,7 +3001,7 @@ impl<'a> AggState<'a> {
             let mut tuple = [Datum::Null; 1 + MAX_PROJ];
             tuple[0] = Datum::Text(val_str);
             for (i, o) in self.ord_spec.iter().enumerate() {
-                tuple[1 + i] = eval_full(o.expr, arena, params, row, hooks)?;
+                tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
             }
             let enc =
                 super::exec::encode_projected_pub(&tuple[..1 + self.ord_spec.len()], arena)?;
@@ -3238,23 +3238,23 @@ impl<'a> AggState<'a> {
 /// engine).
 /// Surfaces plan-time constant errors (e.g. `1/0`) across every expression
 /// of a SELECT, matching PostgreSQL's constant folding.
-pub fn check_select_constants<'a>(stmt: &Select<'a>, arena: &'a Arena) -> Result<(), SqlError> {
-    for item in stmt.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            super::eval::check_constant_errors(expr, arena)?;
+pub fn check_select_constants<'a>(statement: &Select<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            super::eval::check_constant_errors(expression, arena)?;
         }
     }
-    if let Some(w) = stmt.where_clause {
+    if let Some(w) = statement.where_clause {
         super::eval::check_constant_errors(w, arena)?;
     }
-    for g in stmt.group_by {
+    for g in statement.group_by {
         super::eval::check_constant_errors(g, arena)?;
     }
-    if let Some(h) = stmt.having {
+    if let Some(h) = statement.having {
         super::eval::check_constant_errors(h, arena)?;
     }
-    for ob in stmt.order_by {
-        super::eval::check_constant_errors(ob.expr, arena)?;
+    for ob in statement.order_by {
+        super::eval::check_constant_errors(ob.expression, arena)?;
     }
     Ok(())
 }
@@ -3262,12 +3262,12 @@ pub fn check_select_constants<'a>(stmt: &Select<'a>, arena: &'a Arena) -> Result
 pub fn select_query<'a>(
     storage: &'a Storage,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     resp: &mut Responder,
 ) -> Outcome {
-    let from = stmt.from.as_ref().expect("FROM-less handled by caller");
+    let from = statement.from.as_ref().expect("FROM-less handled by caller");
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
     // general executor — joins, subqueries, aggregates, and ORDER BY included.
@@ -3279,11 +3279,11 @@ pub fn select_query<'a>(
     // Subqueries first (uncorrelated, evaluated once).
     let mut sub_exprs: [Option<&Expr>; 4 + super::parser::MAX_LIST] =
         [None; 4 + super::parser::MAX_LIST];
-    sub_exprs[0] = stmt.where_clause;
-    sub_exprs[1] = stmt.having;
-    for (i, item) in stmt.items.iter().enumerate() {
-        if let SelectItem::Expr { expr, .. } = item {
-            sub_exprs[4 + i] = Some(expr);
+    sub_exprs[0] = statement.where_clause;
+    sub_exprs[1] = statement.having;
+    for (i, item) in statement.items.iter().enumerate() {
+        if let SelectItem::Expr { expression, .. } = item {
+            sub_exprs[4 + i] = Some(expression);
         }
     }
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
@@ -3315,22 +3315,22 @@ pub fn select_query<'a>(
             // SELECT-list items first: PostgreSQL analyzes types before it folds
             // constants, so an invalid aggregate/operator (e.g. `min(boolean)`)
             // errors ahead of a constant division elsewhere in the query.
-            for item in stmt.items {
-                if let SelectItem::Expr { expr, .. } = item {
-                    check(expr)?;
+            for item in statement.items {
+                if let SelectItem::Expr { expression, .. } = item {
+                    check(expression)?;
                 }
             }
-            if let Some(w) = stmt.where_clause {
+            if let Some(w) = statement.where_clause {
                 check(w)?;
             }
-            for g in stmt.group_by {
+            for g in statement.group_by {
                 check(g)?;
             }
-            if let Some(h) = stmt.having {
+            if let Some(h) = statement.having {
                 check(h)?;
             }
-            for ob in stmt.order_by {
-                check(super::exec::resolve_order_expr_pub(ob.expr, stmt.items)?)?;
+            for ob in statement.order_by {
+                check(super::exec::resolve_order_expr_pub(ob.expression, statement.items)?)?;
             }
             Ok(())
         };
@@ -3341,23 +3341,23 @@ pub fn select_query<'a>(
 
     // Constant folding runs after type analysis, matching PostgreSQL's
     // analyze-then-plan order: `min(boolean)` errors before `1/0` folds.
-    if let Err(e) = check_select_constants(stmt, arena) {
+    if let Err(e) = check_select_constants(statement, arena) {
         return sql_fail(e);
     }
 
     // Result description.
     let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = match describe_scope_items(stmt.items, &scope, &mut cols) {
+    let n_cols = match describe_scope_items(statement.items, &scope, &mut cols) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
     resp.row_description(&cols[..n_cols])?;
 
-    let limit = match super::exec::eval_limit_pub(stmt.limit, arena, params) {
+    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
         Ok(l) => l,
         Err(e) => return sql_fail(e),
     };
-    let offset = match super::exec::eval_offset_pub(stmt.offset, arena, params) {
+    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params) {
         Ok(o) => o,
         Err(e) => return sql_fail(e),
     };
@@ -3373,9 +3373,9 @@ pub fn select_query<'a>(
     // Window functions? They run over materialized rows before ORDER BY/LIMIT.
     let mut win_nodes: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
     let mut n_win = 0;
-    for item in stmt.items {
-        if let SelectItem::Expr { expr, .. } = item
-            && let Err(e) = collect_windows(expr, &mut win_nodes, &mut n_win)
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && let Err(e) = collect_windows(expression, &mut win_nodes, &mut n_win)
         {
             return sql_fail(e);
         }
@@ -3388,7 +3388,7 @@ pub fn select_query<'a>(
             ));
         }
         return window_select(
-            storage, txid, stmt, from, &scope, &win_nodes[..n_win], &hooks, arena, params,
+            storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, arena, params,
             limit, offset, resp,
         );
     }
@@ -3397,17 +3397,17 @@ pub fn select_query<'a>(
     let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
-    for item in stmt.items {
-        if let SelectItem::Expr { expr, .. } = item
-            && let Err(e) = collect_aggs(expr, &mut agg_nodes, &mut n_aggs) {
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs) {
                 return sql_fail(e);
             }
     }
-    if let Some(h) = stmt.having
+    if let Some(h) = statement.having
         && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs) {
             return sql_fail(e);
         }
-    if n_aggs > 0 || !stmt.group_by.is_empty() {
+    if n_aggs > 0 || !statement.group_by.is_empty() {
         if !correlated.is_empty() {
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3419,7 +3419,7 @@ pub fn select_query<'a>(
             &scope,
             from,
             txid,
-            stmt,
+            statement,
             &agg_nodes[..n_aggs],
             arena,
             params,
@@ -3430,7 +3430,7 @@ pub fn select_query<'a>(
         );
     }
 
-    let needs_materialize = stmt.distinct || !stmt.order_by.is_empty();
+    let needs_materialize = statement.distinct || !statement.order_by.is_empty();
     if !needs_materialize {
         // Stream.
         let mut emitted = 0u64;
@@ -3440,10 +3440,10 @@ pub fn select_query<'a>(
         // With correlated subqueries, WHERE is applied per row against merged
         // hooks (which include the correlated results); otherwise the scan
         // applies WHERE directly for the common, faster path.
-        let where_in_scan = if correlated.is_empty() { stmt.where_clause } else { None };
-        // A set-returning `_pg_expandarray(arr)` expands each row into one output
+        let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
+        // A set-returning `_pg_expandarray(array)` expands each row into one output
         // row per array element.
-        let srf_call = find_srf(stmt.items);
+        let srf_call = find_srf(statement.items);
         let scan = scan_source(
             storage,
             &scope,
@@ -3477,7 +3477,7 @@ pub fn select_query<'a>(
                     &row_hooks_owned
                 };
                 if !correlated.is_empty()
-                    && let Some(w) = stmt.where_clause {
+                    && let Some(w) = statement.where_clause {
                         match eval_full(w, arena, params, row, row_hooks)? {
                             Datum::Bool(true) => {}
                             Datum::Bool(false) | Datum::Null => return Ok(true),
@@ -3509,7 +3509,7 @@ pub fn select_query<'a>(
                         row_hooks
                     };
                     let mut projected = [Datum::Null; MAX_PROJ];
-                    let n = project_row(stmt.items, &scope, row, arena, params, use_hooks, &mut projected)?;
+                    let n = project_row(statement.items, &scope, row, arena, params, use_hooks, &mut projected)?;
                     if let Err(w) = resp.data_row(&projected[..n]) {
                         wire_full = true;
                         wire_result = Err(w);
@@ -3534,7 +3534,7 @@ pub fn select_query<'a>(
     // A set-returning function combined with a top-level DISTINCT/ORDER BY is
     // not supported directly; wrapping it in a subquery (as JDBC does) routes it
     // through the materializer, which does expand it.
-    if find_srf(stmt.items).is_some() {
+    if find_srf(statement.items).is_some() {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "a set-returning function with a top-level DISTINCT/ORDER BY is not supported; \
@@ -3543,7 +3543,7 @@ pub fn select_query<'a>(
     }
     // Materialize: visible columns + hidden ORDER BY keys.
     materialized_select(
-        storage, &scope, from, txid, stmt, arena, params, &hooks, correlated, &outer_subs.base,
+        storage, &scope, from, txid, statement, arena, params, &hooks, correlated, &outer_subs.base,
         limit, offset, resp,
     )
 }
@@ -3559,9 +3559,9 @@ const MAX_CONJUNCTS: usize = 32;
 /// not fully cover, in which case the conjunct is left for the final WHERE.
 /// The set of table indices (as a bitmask) an expression references. `None` if
 /// it contains a construct not analyzable for pushdown (subquery, aggregate, …).
-fn expr_tables(expr: &Expr, scope: &QueryScope) -> Option<u16> {
+fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u16> {
     use Expr::*;
-    match expr {
+    match expression {
         Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | Param(_) => Some(0),
         Column { qualifier, name } => scope.find_column(*qualifier, name).ok().map(|(t, _)| 1 << t),
         Unary { operand, .. } | IsNull { operand, .. } | Cast { operand, .. } => {
@@ -3581,7 +3581,7 @@ fn expr_tables(expr: &Expr, scope: &QueryScope) -> Option<u16> {
             }
             Some(m)
         }
-        Call { args, over: None, .. } if !expr.is_aggregate() => {
+        Call { args, over: None, .. } if !expression.is_aggregate() => {
             let mut m = 0;
             for a in *args {
                 m |= expr_tables(a, scope)?;
@@ -3613,10 +3613,10 @@ fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [usize; MAX_JO
     let mut masks = [0u16; MAX_CONJUNCTS];
     let mut n_masks = 0;
     if let Some(w) = where_clause {
-        let mut conj: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
+        let mut conjunct: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
         let mut nc = 0;
         let conjuncts: &[&Expr] =
-            if flatten_and(w, &mut conj, &mut nc) { &conj[..nc] } else { core::slice::from_ref(&w) };
+            if flatten_and(w, &mut conjunct, &mut nc) { &conjunct[..nc] } else { core::slice::from_ref(&w) };
         for &c in conjuncts {
             if let Some(m) = expr_tables(c, scope)
                 && n_masks < MAX_CONJUNCTS
@@ -3806,14 +3806,14 @@ fn reorder_qual<'a>(
     scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    let mut conj: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
+    let mut conjunct: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
     let mut n = 0;
-    if !flatten_and(pred, &mut conj, &mut n) || n <= 1 {
+    if !flatten_and(pred, &mut conjunct, &mut n) || n <= 1 {
         return Ok(pred);
     }
     let cols = ScopeCols(scope);
     let mut cost = [0u32; MAX_CONJUNCTS];
-    for (i, c) in conj[..n].iter().enumerate() {
+    for (i, c) in conjunct[..n].iter().enumerate() {
         cost[i] = qual_cost(c, &cols);
     }
     let mut order = [0usize; MAX_CONJUNCTS];
@@ -3828,10 +3828,10 @@ fn reorder_qual<'a>(
         }
     }
     // Rebuild a left-deep AND in cost order.
-    let mut acc = conj[order[0]];
+    let mut acc = conjunct[order[0]];
     for &i in &order[1..n] {
         acc = arena
-            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conj[i] })
+            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conjunct[i] })
             .map_err(|_| arena_full())?;
     }
     Ok(acc)
@@ -4233,16 +4233,16 @@ fn combine_sets<'a>(
                 while j < r.len() && r[j] < row {
                     j += 1;
                 }
-                let mut cr = 0;
+                let mut chained_row = 0;
                 while j < r.len() && r[j] == row {
-                    cr += 1;
+                    chained_row += 1;
                     j += 1;
                 }
                 let times = match (op, all) {
-                    (SetOp::Intersect, true) => cl.min(cr),
-                    (SetOp::Intersect, false) => usize::from(cr > 0),
-                    (SetOp::Except, true) => cl.saturating_sub(cr),
-                    (SetOp::Except, false) => usize::from(cr == 0),
+                    (SetOp::Intersect, true) => cl.min(chained_row),
+                    (SetOp::Intersect, false) => usize::from(chained_row > 0),
+                    (SetOp::Except, true) => cl.saturating_sub(chained_row),
+                    (SetOp::Except, false) => usize::from(chained_row == 0),
                     _ => unreachable!(),
                 };
                 push(row, times);
@@ -4267,7 +4267,7 @@ fn sort_set_rows(
     let mut keys: [(usize, bool, bool); MAX_PROJ] = [(0, false, false); MAX_PROJ];
     let mut nk = 0;
     for ob in order_by {
-        let idx = match ob.expr {
+        let index = match ob.expression {
             Expr::Int(n) if *n >= 1 && (*n as usize) <= cols.len() => (*n as usize) - 1,
             Expr::Column { name, qualifier: None } => {
                 match cols.iter().position(|c| c.name == *name) {
@@ -4288,7 +4288,7 @@ fn sort_set_rows(
                 ))
             }
         };
-        keys[nk] = (idx, ob.descending, ob.nulls_first);
+        keys[nk] = (index, ob.descending, ob.nulls_first);
         nk += 1;
     }
     let keys = &keys[..nk];
@@ -4297,9 +4297,9 @@ fn sort_set_rows(
         if err.is_some() {
             return core::cmp::Ordering::Equal;
         }
-        for &(idx, descending, nulls_first) in keys {
-            let va = super::exec::decode_projected_pub(a, idx);
-            let vb = super::exec::decode_projected_pub(b, idx);
+        for &(index, descending, nulls_first) in keys {
+            let va = super::exec::decode_projected_pub(a, index);
+            let vb = super::exec::decode_projected_pub(b, index);
             let ord = match (va.is_null(), vb.is_null()) {
                 (true, true) => core::cmp::Ordering::Equal,
                 (true, false) => if nulls_first { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater },
@@ -4331,25 +4331,25 @@ fn sort_set_rows(
 pub fn constant_select<'a>(
     storage: &'a Storage,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     resp: &mut Responder,
 ) -> Outcome {
-    if let Err(e) = check_select_constants(stmt, arena) {
+    if let Err(e) = check_select_constants(statement, arena) {
         return sql_fail(e);
     }
     let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = match describe_items(stmt.items, None, &mut cols) {
+    let n = match describe_items(statement.items, None, &mut cols) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
 
     let mut sub_exprs: [Option<&Expr>; 1 + MAX_PROJ] = [None; 1 + MAX_PROJ];
-    sub_exprs[0] = stmt.where_clause;
-    for (i, item) in stmt.items.iter().enumerate() {
-        if let SelectItem::Expr { expr, .. } = item {
-            sub_exprs[1 + i] = Some(expr);
+    sub_exprs[0] = statement.where_clause;
+    for (i, item) in statement.items.iter().enumerate() {
+        if let SelectItem::Expr { expression, .. } = item {
+            sub_exprs[1 + i] = Some(expression);
         }
     }
     let subs = match prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)
@@ -4361,7 +4361,7 @@ pub fn constant_select<'a>(
 
     // A set-returning function in the select list expands the single virtual
     // row into one output row per element/value.
-    let srf_call = find_srf(stmt.items);
+    let srf_call = find_srf(statement.items);
     let count = match srf_call {
         None => 1,
         Some(c) => match srf_count(c, arena, params, &super::eval::NoColumns, &hooks) {
@@ -4378,16 +4378,16 @@ pub fn constant_select<'a>(
             hooks
         };
         let mut values = [Datum::Null; MAX_PROJ];
-        for (i, item) in stmt.items.iter().enumerate() {
-            let SelectItem::Expr { expr, .. } = item else {
+        for (i, item) in statement.items.iter().enumerate() {
+            let SelectItem::Expr { expression, .. } = item else {
                 unreachable!("wildcard rejected by describe_items");
             };
-            match eval_full(expr, arena, params, &super::eval::NoColumns, &khooks) {
+            match eval_full(expression, arena, params, &super::eval::NoColumns, &khooks) {
                 Ok(v) => values[i] = v,
                 Err(e) => return sql_fail(e),
             }
         }
-        if let Some(w) = stmt.where_clause {
+        if let Some(w) = statement.where_clause {
             match where_passes(w, arena, params, &super::eval::NoColumns, &khooks) {
                 Ok(false) => continue,
                 Ok(true) => {}
@@ -4411,12 +4411,12 @@ pub fn constant_select<'a>(
 pub fn select_into_rows<'a>(
     storage: &'a Storage,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     emit: &mut dyn FnMut(&[Datum<'a>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    if let Some(tree) = stmt.set_body {
+    if let Some(tree) = statement.set_body {
         let (rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params)?;
         let mut vals = [Datum::Null; MAX_PROJ];
         for row in rows.iter() {
@@ -4427,28 +4427,28 @@ pub fn select_into_rows<'a>(
         }
         return Ok(());
     }
-    check_select_constants(stmt, arena)?;
+    check_select_constants(statement, arena)?;
     let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
-    for item in stmt.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            collect_aggs(expr, &mut agg_nodes, &mut n_aggs)?;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            collect_aggs(expression, &mut agg_nodes, &mut n_aggs)?;
         }
     }
-    if let Some(h) = stmt.having {
+    if let Some(h) = statement.having {
         collect_aggs(h, &mut agg_nodes, &mut n_aggs)?;
     }
     // GROUP BY or aggregates: run the grouped executor and emit each output
     // row. ORDER BY is dropped (the resulting set is unordered).
-    if !stmt.group_by.is_empty() || n_aggs > 0 {
-        if stmt.distinct {
+    if !statement.group_by.is_empty() || n_aggs > 0 {
+        if statement.distinct {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "SELECT DISTINCT with GROUP BY or aggregates is not supported in this context"
             ));
         }
-        let Some(from) = &stmt.from else {
+        let Some(from) = &statement.from else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "aggregates without a FROM clause are not supported in this context"
@@ -4456,11 +4456,11 @@ pub fn select_into_rows<'a>(
         };
         let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
         let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ] = [None; 2 + MAX_PROJ];
-        sub_exprs[0] = stmt.where_clause;
-        sub_exprs[1] = stmt.having;
-        for (i, item) in stmt.items.iter().enumerate() {
-            if let SelectItem::Expr { expr, .. } = item {
-                sub_exprs[2 + i] = Some(expr);
+        sub_exprs[0] = statement.where_clause;
+        sub_exprs[1] = statement.having;
+        for (i, item) in statement.items.iter().enumerate() {
+            if let SelectItem::Expr { expression, .. } = item {
+                sub_exprs[2 + i] = Some(expression);
             }
         }
         let outer = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
@@ -4472,7 +4472,7 @@ pub fn select_into_rows<'a>(
         }
         let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer.base) , windows: None, catalog: None, srf_index: None };
         let (rows, width) =
-            grouped_rows(storage, &scope, from, txid, stmt, &agg_nodes[..n_aggs], arena, params, &hooks)?;
+            grouped_rows(storage, &scope, from, txid, statement, &agg_nodes[..n_aggs], arena, params, &hooks)?;
         for row in rows {
             let mut out = [Datum::Null; MAX_PROJ];
             for (i, slot) in out.iter_mut().take(width).enumerate() {
@@ -4483,20 +4483,20 @@ pub fn select_into_rows<'a>(
         return Ok(());
     }
     let mut sub_exprs: [Option<&Expr>; 1 + MAX_PROJ] = [None; 1 + MAX_PROJ];
-    sub_exprs[0] = stmt.where_clause;
-    for (i, item) in stmt.items.iter().enumerate() {
-        if let SelectItem::Expr { expr, .. } = item {
-            sub_exprs[1 + i] = Some(expr);
+    sub_exprs[0] = statement.where_clause;
+    for (i, item) in statement.items.iter().enumerate() {
+        if let SelectItem::Expr { expression, .. } = item {
+            sub_exprs[1 + i] = Some(expression);
         }
     }
 
-    let Some(from) = &stmt.from else {
+    let Some(from) = &statement.from else {
         // FROM-less: one row (or zero, when WHERE is false), unless a
         // set-returning function in the list expands it to several.
         let subs =
             prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
         let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
-        let srf_call = find_srf(stmt.items);
+        let srf_call = find_srf(statement.items);
         let count = match srf_call {
             None => 1,
             Some(c) => srf_count(c, arena, params, &super::eval::NoColumns, &hooks)?,
@@ -4507,18 +4507,18 @@ pub fn select_into_rows<'a>(
             } else {
                 hooks
             };
-            if let Some(w) = stmt.where_clause
+            if let Some(w) = statement.where_clause
                 && !where_passes(w, arena, params, &super::eval::NoColumns, &khooks)?
             {
                 continue;
             }
             let mut vals = [Datum::Null; MAX_PROJ];
             let mut n = 0;
-            for item in stmt.items {
-                let SelectItem::Expr { expr, .. } = item else {
+            for item in statement.items {
+                let SelectItem::Expr { expression, .. } = item else {
                     return Err(sql_err!("42601", "SELECT * with no tables specified is not valid"));
                 };
-                vals[n] = eval_full(expr, arena, params, &super::eval::NoColumns, &khooks)?;
+                vals[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &khooks)?;
                 n += 1;
             }
             emit(&vals[..n])?;
@@ -4536,14 +4536,14 @@ pub fn select_into_rows<'a>(
     // the outer query, so the derived-table order is left unspecified.
     let mut win_nodes: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
     let mut n_win = 0;
-    for item in stmt.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            collect_windows(expr, &mut win_nodes, &mut n_win)?;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            collect_windows(expression, &mut win_nodes, &mut n_win)?;
         }
     }
     if n_win > 0 {
         let (proj_rows, _keys) = project_window_rows(
-            storage, txid, stmt, from, &scope, &win_nodes[..n_win], &hooks, arena, params,
+            storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, arena, params,
         )?;
         for row in proj_rows {
             emit(row)?;
@@ -4553,12 +4553,12 @@ pub fn select_into_rows<'a>(
 
     // DISTINCT / ORDER BY / LIMIT / OFFSET need the whole set materialized
     // (so top-N and dedup are correct), then paged.
-    if stmt.distinct || !stmt.order_by.is_empty() || stmt.limit.is_some() || stmt.offset.is_some() {
+    if statement.distinct || !statement.order_by.is_empty() || statement.limit.is_some() || statement.offset.is_some() {
         let (rows, width) = materialized_rows(
-            storage, &scope, from, txid, stmt, arena, params, &hooks, correlated, &outer_subs.base,
+            storage, &scope, from, txid, statement, arena, params, &hooks, correlated, &outer_subs.base,
         )?;
-        let limit = super::exec::eval_limit_pub(stmt.limit, arena, params)?;
-        let offset = super::exec::eval_offset_pub(stmt.offset, arena, params)?;
+        let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+        let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
         for row in rows
             .iter()
             .skip(offset as usize)
@@ -4572,11 +4572,11 @@ pub fn select_into_rows<'a>(
         }
         return Ok(());
     }
-    let where_in_scan = if correlated.is_empty() { stmt.where_clause } else { None };
+    let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
 
-    // A set-returning `_pg_expandarray(arr)` in the projection expands each
+    // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
-    let srf_call = find_srf(stmt.items);
+    let srf_call = find_srf(statement.items);
     scan_source(
         storage, &scope, from, txid, where_in_scan, arena, params, &hooks, None,
         &mut |row| {
@@ -4593,7 +4593,7 @@ pub fn select_into_rows<'a>(
                     correlated, &outer_subs.base, row, storage, txid, arena, params, &mut sc, &mut ls,
                 )?;
                 row_hooks_owned = EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None };
-                if let Some(w) = stmt.where_clause
+                if let Some(w) = statement.where_clause
                     && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                         return Ok(true);
                     }
@@ -4602,14 +4602,14 @@ pub fn select_into_rows<'a>(
             let mut projected = [Datum::Null; MAX_PROJ];
             match srf_call {
                 None => {
-                    let n = project_row(stmt.items, &scope, row, arena, params, row_hooks, &mut projected)?;
+                    let n = project_row(statement.items, &scope, row, arena, params, row_hooks, &mut projected)?;
                     emit(&projected[..n])?;
                 }
                 Some(c) => {
                     let count = srf_count(c, arena, params, row, row_hooks)?;
                     for k in 1..=count {
                         let srf_hooks = EvalHooks { srf_index: Some(k), ..*row_hooks };
-                        let n = project_row(stmt.items, &scope, row, arena, params, &srf_hooks, &mut projected)?;
+                        let n = project_row(statement.items, &scope, row, arena, params, &srf_hooks, &mut projected)?;
                         emit(&projected[..n])?;
                     }
                 }
@@ -4641,7 +4641,7 @@ fn find_srf<'a>(items: &[SelectItem<'a>]) -> Option<&'a Expr<'a>> {
         }
     }
     items.iter().find_map(|it| match it {
-        SelectItem::Expr { expr, .. } => walk(expr),
+        SelectItem::Expr { expression, .. } => walk(expression),
         SelectItem::Wildcard => None,
     })
 }
@@ -4735,7 +4735,7 @@ fn project_row<'a>(
                     }
                 }
             }
-            SelectItem::Expr { expr, .. } => {
+            SelectItem::Expr { expression, .. } => {
                 if n == MAX_PROJ {
                     return Err(sql_err!(
                         "54000",
@@ -4743,7 +4743,7 @@ fn project_row<'a>(
                         MAX_PROJ
                     ));
                 }
-                out[n] = eval_full(expr, arena, params, row, hooks)?;
+                out[n] = eval_full(expression, arena, params, row, hooks)?;
                 n += 1;
             }
         }
@@ -4779,13 +4779,13 @@ pub fn describe_scope_items<'q>(
                     }
                 }
             }
-            SelectItem::Expr { expr, alias } => {
+            SelectItem::Expr { expression, alias } => {
                 if n == out.len() {
                     return Err(sql_err!("54000", "select list too wide"));
                 }
                 // Multi-table type inference: columns resolve via scope.
-                let (oid, typlen) = infer_scope_type(expr, scope)?;
-                let name = alias.unwrap_or(super::exec::derived_name(expr));
+                let (oid, typlen) = infer_scope_type(expression, scope)?;
+                let name = alias.unwrap_or(super::exec::derived_name(expression));
                 out[n] = ColDesc::new(name, oid, typlen);
                 n += 1;
             }
@@ -4803,8 +4803,8 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 }
 
-fn infer_scope_type(expr: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {
-    let (oid, typlen) = super::exec::infer_type_res(expr, &ScopeCols(scope))?;
+fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {
+    let (oid, typlen) = super::exec::infer_type_res(expression, &ScopeCols(scope))?;
     if oid == super::types::oid::UNKNOWN {
         Ok((super::types::oid::TEXT, -1))
     } else {
@@ -4827,21 +4827,21 @@ fn grouped_rows<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(&'a [&'a [u8]], usize), SqlError> {
     // Validate: non-aggregate select items must be GROUP BY expressions.
-    for item in stmt.items {
-        let SelectItem::Expr { expr, .. } = item else {
+    for item in statement.items {
+        let SelectItem::Expr { expression, .. } = item else {
             return Err(sql_err!(
                 "42803",
                 "SELECT * must appear in the GROUP BY clause or be used in an aggregate function"
             ));
         };
-        if !expr_is_grouped(expr, stmt.group_by) {
+        if !expr_is_grouped(expression, statement.group_by) {
             return Err(sql_err!(
                 "42803",
                 "column must appear in the GROUP BY clause or be used in an aggregate function"
@@ -4852,7 +4852,7 @@ fn grouped_rows<'a>(
     // Pass 1: count rows, so group storage can be arena-allocated.
     let mut row_count = 0usize;
     scan_source(
-        storage, scope, from, txid, stmt.where_clause, arena, params, hooks,
+        storage, scope, from, txid, statement.where_clause, arena, params, hooks,
         None,
         &mut |_| {
             row_count += 1;
@@ -4861,7 +4861,7 @@ fn grouped_rows<'a>(
     )?;
 
     // No rows and no GROUP BY: aggregates still yield one row.
-    let n_keys = stmt.group_by.len();
+    let n_keys = statement.group_by.len();
 
     // Pass 2: encode group keys per row.
     let empty: &[u8] = &[];
@@ -4871,11 +4871,11 @@ fn grouped_rows<'a>(
     {
         let mut at = 0usize;
         scan_source(
-            storage, scope, from, txid, stmt.where_clause, arena, params, hooks,
+            storage, scope, from, txid, statement.where_clause, arena, params, hooks,
             None,
             &mut |row| {
                 let mut key_vals = [Datum::Null; MAX_PROJ];
-                for (k, g) in stmt.group_by.iter().enumerate() {
+                for (k, g) in statement.group_by.iter().enumerate() {
                     key_vals[k] = eval_full(g, arena, params, row, hooks)?;
                 }
                 keys[at].0 = super::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
@@ -4897,7 +4897,7 @@ fn grouped_rows<'a>(
                 g += 1;
             }
         }
-        if keys.is_empty() && stmt.group_by.is_empty() {
+        if keys.is_empty() && statement.group_by.is_empty() {
             1 // plain aggregates over zero rows: one output row
         } else {
             g
@@ -4935,7 +4935,7 @@ fn grouped_rows<'a>(
     if n_aggs > 0 {
         let mut at = 0usize;
         scan_source(
-            storage, scope, from, txid, stmt.where_clause, arena, params, hooks,
+            storage, scope, from, txid, statement.where_clause, arena, params, hooks,
             None,
             &mut |row| {
                 let g = group_of.get(at).copied().unwrap_or(0) as usize;
@@ -4955,11 +4955,11 @@ fn grouped_rows<'a>(
         .map_err(|_| arena_full())?;
     // ORDER BY over groups: ordinals resolve to select items; every key
     // expression evaluates under the group hooks (so aggregates work).
-    let n_order = stmt.order_by.len();
-    let width = stmt.items.len();
+    let n_order = statement.order_by.len();
+    let width = statement.items.len();
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
-    for (k, ob) in stmt.order_by.iter().enumerate() {
-        order_exprs[k] = Some(super::exec::resolve_order_expr_pub(ob.expr, stmt.items)?);
+    for (k, ob) in statement.order_by.iter().enumerate() {
+        order_exprs[k] = Some(super::exec::resolve_order_expr_pub(ob.expression, statement.items)?);
     }
 
     // Materialize surviving groups (visible + hidden key columns).
@@ -4973,7 +4973,7 @@ fn grouped_rows<'a>(
         if !keys.is_empty() {
             let rep = keys
                 .iter()
-                .find(|(_, idx)| group_of[*idx as usize] as usize == g)
+                .find(|(_, index)| group_of[*index as usize] as usize == g)
                 .expect("group non-empty");
             for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
                 *slot = super::exec::decode_projected_pub(rep.0, k);
@@ -4984,11 +4984,11 @@ fn grouped_rows<'a>(
             agg_vals[i] = states[g * n_aggs.max(1) + i].finish(arena)?;
         }
         let group_hooks = EvalHooks {
-            group: Some((stmt.group_by, &key_vals[..n_keys])),
+            group: Some((statement.group_by, &key_vals[..n_keys])),
             aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
             subs: hooks.subs,
         windows: None, catalog: None, srf_index: None };
-        if let Some(h) = stmt.having {
+        if let Some(h) = statement.having {
             match eval_full(h, arena, params, &super::eval::NoColumns, &group_hooks)? {
                 Datum::Bool(true) => {}
                 Datum::Bool(false) | Datum::Null => continue,
@@ -5001,9 +5001,9 @@ fn grouped_rows<'a>(
             }
         }
         let mut full = [Datum::Null; MAX_PROJ];
-        for (n, item) in stmt.items.iter().enumerate() {
-            let SelectItem::Expr { expr, .. } = item else { unreachable!() };
-            full[n] = eval_full(expr, arena, params, &super::eval::NoColumns, &group_hooks)?;
+        for (n, item) in statement.items.iter().enumerate() {
+            let SelectItem::Expr { expression, .. } = item else { unreachable!() };
+            full[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &group_hooks)?;
         }
         for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
             full[width + k] = eval_full(
@@ -5022,7 +5022,7 @@ fn grouped_rows<'a>(
 
     if n_order > 0 {
         out_rows.sort_unstable_by(|a, b| {
-            for (k, ob) in stmt.order_by.iter().enumerate() {
+            for (k, ob) in statement.order_by.iter().enumerate() {
                 let ka = super::exec::decode_projected_pub(a, width + k);
                 let kb = super::exec::decode_projected_pub(b, width + k);
                 // NULL placement follows NULLS FIRST/LAST (absolute, not
@@ -5060,7 +5060,7 @@ fn grouped_select<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -5070,7 +5070,7 @@ fn grouped_select<'a>(
     resp: &mut Responder,
 ) -> Outcome {
     let (out_rows, width) =
-        match grouped_rows(storage, scope, from, txid, stmt, agg_nodes, arena, params, hooks) {
+        match grouped_rows(storage, scope, from, txid, statement, agg_nodes, arena, params, hooks) {
             Ok(x) => x,
             Err(e) => return sql_fail(e),
         };
@@ -5093,11 +5093,11 @@ fn grouped_select<'a>(
 
 /// Does this item expression consist only of grouped expressions,
 /// aggregates, and constants?
-fn expr_is_grouped(expr: &Expr, group_by: &[&Expr]) -> bool {
-    if group_by.iter().any(|g| **g == *expr) || expr.is_aggregate() {
+fn expr_is_grouped(expression: &Expr, group_by: &[&Expr]) -> bool {
+    if group_by.iter().any(|g| **g == *expression) || expression.is_aggregate() {
         return true;
     }
-    match expr {
+    match expression {
         Expr::Column { .. } => false,
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_) | Expr::Str(_)
         | Expr::Param(_) | Expr::DefaultMarker | Expr::Subquery(_) | Expr::Exists(_)
@@ -5153,29 +5153,29 @@ fn materialized_rows<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
 ) -> Result<(&'a [&'a [u8]], usize), SqlError> {
-    let n_order = stmt.order_by.len();
+    let n_order = statement.order_by.len();
     // With correlated subqueries WHERE is applied per row (against merged
     // hooks); otherwise the scan applies it directly.
-    let where_in_scan = if correlated.is_empty() { stmt.where_clause } else { None };
+    let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
 
     // Resolve ORDER BY ordinals to item expressions.
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
-    for (k, ob) in stmt.order_by.iter().enumerate() {
-        order_exprs[k] = Some(super::exec::resolve_order_expr_pub(ob.expr, stmt.items)?);
+    for (k, ob) in statement.order_by.iter().enumerate() {
+        order_exprs[k] = Some(super::exec::resolve_order_expr_pub(ob.expression, statement.items)?);
     }
     // DISTINCT restriction: keys must be select-list members.
-    if stmt.distinct {
+    if statement.distinct {
         for oe in order_exprs.iter().take(n_order) {
             let target = oe.expect("resolved");
-            let in_list = stmt.items.iter().any(|item| {
-                matches!(item, SelectItem::Expr { expr, .. } if **expr == *target)
+            let in_list = statement.items.iter().any(|item| {
+                matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
             });
             if !in_list {
                 return Err(sql_err!(
@@ -5189,7 +5189,7 @@ fn materialized_rows<'a>(
     // Visible width.
     let width = {
         let mut w = 0usize;
-        for item in stmt.items {
+        for item in statement.items {
             w += match item {
                 SelectItem::Wildcard => scope.total_columns(),
                 SelectItem::Expr { .. } => 1,
@@ -5223,14 +5223,14 @@ fn materialized_rows<'a>(
                 )?;
                 row_hooks_owned =
                     EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None };
-                if let Some(w) = stmt.where_clause
+                if let Some(w) = statement.where_clause
                     && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                         return Ok(true);
                     }
                 &row_hooks_owned
             };
             let mut projected = [Datum::Null; MAX_PROJ];
-            project_row(stmt.items, scope, row, arena, params, row_hooks, &mut projected)?;
+            project_row(statement.items, scope, row, arena, params, row_hooks, &mut projected)?;
             for oe in order_exprs.iter().take(n_order) {
                 eval_full(oe.expect("resolved"), arena, params, row, row_hooks)?;
             }
@@ -5263,14 +5263,14 @@ fn materialized_rows<'a>(
                     )?;
                     row_hooks_owned =
                         EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None };
-                    if let Some(w) = stmt.where_clause
+                    if let Some(w) = statement.where_clause
                         && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                             return Ok(true);
                         }
                     &row_hooks_owned
                 };
                 let mut projected = [Datum::Null; MAX_PROJ];
-                let n = project_row(stmt.items, scope, row, arena, params, row_hooks, &mut projected)?;
+                let n = project_row(statement.items, scope, row, arena, params, row_hooks, &mut projected)?;
                 debug_assert_eq!(n, width);
                 let mut full = projected;
                 for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
@@ -5285,7 +5285,7 @@ fn materialized_rows<'a>(
     }
 
     let mut live = rows.len();
-    if stmt.distinct {
+    if statement.distinct {
         // Dedupe on the visible prefix: sort whole rows (visible prefix
         // dominates the encoding), then drop adjacent equal prefixes.
         rows.sort_unstable();
@@ -5304,7 +5304,7 @@ fn materialized_rows<'a>(
 
     if n_order > 0 {
         rows.sort_unstable_by(|a, b| {
-            for (k, ob) in stmt.order_by.iter().enumerate() {
+            for (k, ob) in statement.order_by.iter().enumerate() {
                 let ka = super::exec::decode_projected_pub(a, width + k);
                 let kb = super::exec::decode_projected_pub(b, width + k);
                 // NULL placement follows NULLS FIRST/LAST (absolute, not
@@ -5342,7 +5342,7 @@ fn materialized_select<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     txid: u32,
-    stmt: &'a Select<'a>,
+    statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
@@ -5353,7 +5353,7 @@ fn materialized_select<'a>(
     resp: &mut Responder,
 ) -> Outcome {
     let (rows, width) = match materialized_rows(
-        storage, scope, from, txid, stmt, arena, params, hooks, correlated, base,
+        storage, scope, from, txid, statement, arena, params, hooks, correlated, base,
     ) {
         Ok(x) => x,
         Err(e) => return sql_fail(e),
@@ -5439,8 +5439,8 @@ pub fn first_from_match<'a>(
         &hooks,
         Some(target),
         &mut |jr| {
-            let cr = Chained { inner: jr, outer: Some(target) };
-            on_match(&cr)?;
+            let chained_row = Chained { inner: jr, outer: Some(target) };
+            on_match(&chained_row)?;
             found = true;
             Ok(false) // stop at the first match (PostgreSQL uses one arbitrary row)
         },
@@ -5471,15 +5471,15 @@ fn synth_derived_def<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a TableDef, SqlError> {
-    let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => describe_set_body(storage, tree, txid, &mut descs, arena)?,
+        Some(tree) => describe_set_body(storage, tree, txid, &mut descriptors, arena)?,
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
-                describe_scope_items(sub.items, &ss, &mut descs)?
+                describe_scope_items(sub.items, &ss, &mut descriptors)?
             }
-            None => describe_items(sub.items, None, &mut descs)?,
+            None => describe_items(sub.items, None, &mut descriptors)?,
         },
     };
     if n_cols > MAX_COLUMNS {
@@ -5502,7 +5502,7 @@ fn synth_derived_def<'a>(
             ));
         }
         for (i, alias) in aliases.iter().enumerate() {
-            descs[i].name = alias;
+            descriptors[i].name = alias;
         }
     }
     let blank = ColumnMeta {
@@ -5517,16 +5517,16 @@ fn synth_derived_def<'a>(
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {
-        let ct = super::exec::coltype_of_oid(descs[i].type_oid).ok_or_else(|| {
+        let ct = super::exec::coltype_of_oid(descriptors[i].type_oid).ok_or_else(|| {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "derived table column \"{}\" type (oid {}) is not supported",
-                descs[i].name,
-                descs[i].type_oid
+                descriptors[i].name,
+                descriptors[i].type_oid
             )
         })?;
         columns[i] = ColumnMeta {
-            name: SqlName::parse(descs[i].name)?,
+            name: SqlName::parse(descriptors[i].name)?,
             ctype: ct,
             ..blank
         };

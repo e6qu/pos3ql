@@ -1,6 +1,7 @@
 # pos3ql roadmap
 
-Architecture summary lives in [README.md](README.md). Decisions fixed with the
+Architecture summary lives in [README.md](README.md); the glossary and naming
+rules live in [docs/terminology.md](docs/terminology.md). Decisions fixed with the
 project owner: hand-rolled everything (no tokio / pgwire / sqlparser-rs / AWS
 SDK; `std` + `libc` only), strict no-alloc-after-init, row-oriented storage on
 object storage, own Viewstamped Replication for 1..N replicas (future phase),

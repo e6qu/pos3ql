@@ -233,17 +233,17 @@ fn render<'a>(
     let dp = point_index(toks);
     let mut zero_start = int_digits;
     {
-        let mut idx = 0usize;
+        let mut index = 0usize;
         for (tp, &t) in toks.iter().enumerate() {
             if tp == dp {
                 break;
             }
             match t {
                 Tok::Zero => {
-                    zero_start = idx;
+                    zero_start = index;
                     break;
                 }
-                Tok::Nine => idx += 1,
+                Tok::Nine => index += 1,
                 _ => {}
             }
         }
@@ -411,26 +411,26 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
     }
 
     // Extract sign, digits, and a single decimal point from the input.
-    let mut buf = [0u8; 512];
+    let mut buffer = [0u8; 512];
     let mut k = 0usize;
     let mut neg = false;
     let mut dot = false;
     let mut digits = false;
-    buf[k] = b' '; // placeholder for a sign slot
+    buffer[k] = b' '; // placeholder for a sign slot
     k += 1;
     for &c in input.as_bytes() {
         match c {
             b'0'..=b'9' => {
-                if k >= buf.len() {
+                if k >= buffer.len() {
                     return Err(sql_err!("22P02", "value too long for to_number"));
                 }
-                buf[k] = c;
+                buffer[k] = c;
                 k += 1;
                 digits = true;
             }
             b'.' if !dot => {
                 dot = true;
-                buf[k] = b'.';
+                buffer[k] = b'.';
                 k += 1;
             }
             b'-' => neg = true,
@@ -441,10 +441,10 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
         return Err(sql_err!("22P02", "invalid input syntax for type numeric: \"{}\"", input));
     }
     if neg {
-        buf[0] = b'-';
+        buffer[0] = b'-';
     }
     let start = if neg { 0 } else { 1 };
-    let cleaned = core::str::from_utf8(&buf[start..k]).expect("ascii");
+    let cleaned = core::str::from_utf8(&buffer[start..k]).expect("ascii");
     Numeric::parse(cleaned, arena)?.round_scale(frac, RoundMode::HalfAwayZero, arena)
 }
 
@@ -492,29 +492,29 @@ fn name_case(code: &[u8]) -> Case {
 pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
     use crate::sql::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};
     let days = micros.div_euclid(86_400_000_000);
-    let tod = micros.rem_euclid(86_400_000_000);
+    let time_of_day = micros.rem_euclid(86_400_000_000);
     let adays = days + PG_EPOCH_DAYS;
     let (y, mo, d) = civil_from_days(adays);
-    let hh24 = (tod / 3_600_000_000) as u32;
-    let mi = ((tod / 60_000_000) % 60) as u32;
-    let ss = ((tod / 1_000_000) % 60) as u32;
-    let us = (tod % 1_000_000) as u32;
+    let hh24 = (time_of_day / 3_600_000_000) as u32;
+    let mi = ((time_of_day / 60_000_000) % 60) as u32;
+    let ss = ((time_of_day / 1_000_000) % 60) as u32;
+    let us = (time_of_day % 1_000_000) as u32;
     let dow = day_of_week(days); // 0=Sun..6=Sat (PG-epoch day count)
     let doy = (adays - days_from_civil(y, 1, 1) + 1) as u32;
     let hh12 = if hh24.is_multiple_of(12) { 12 } else { hh24 % 12 };
 
     let mut out = StackStr::<512>::new();
     let name = |out: &mut StackStr<512>, s: &str, case: Case, pad: usize, fm: bool| {
-        let mut buf = [0u8; 16];
-        let n = s.len().min(buf.len());
+        let mut buffer = [0u8; 16];
+        let n = s.len().min(buffer.len());
         for (i, b) in s.bytes().take(n).enumerate() {
-            buf[i] = match case {
+            buffer[i] = match case {
                 Case::Upper => b.to_ascii_uppercase(),
                 Case::Lower => b.to_ascii_lowercase(),
                 Case::Title => b,
             };
         }
-        let _ = out.write_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+        let _ = out.write_str(core::str::from_utf8(&buffer[..n]).unwrap_or(""));
         if !fm {
             for _ in n..pad {
                 let _ = out.write_char(' ');

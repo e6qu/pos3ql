@@ -9,7 +9,7 @@ use std::os::fd::AsRawFd;
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::pg::auth::{AuthMode, ScramFlow, ScramServer, ScramStep};
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::sqlstate;
 use crate::sql::parser::Parser;
@@ -698,7 +698,7 @@ impl Conn {
         let parse = || -> Result<BindParts<'_>, BindProblem> {
             let mut m = MsgIn::new(payload);
             let portal = m.cstr().map_err(|_| BindProblem::Malformed)?;
-            let stmt = m.cstr().map_err(|_| BindProblem::Malformed)?;
+            let statement = m.cstr().map_err(|_| BindProblem::Malformed)?;
             let n_fmt = m.i16().map_err(|_| BindProblem::Malformed)?.max(0) as usize;
             let mut formats = [false; MAX_BIND_PARAMS];
             let mut uniform: Option<bool> = None;
@@ -743,7 +743,7 @@ impl Conn {
                 }
             }
             let result_formats = ResultFmt::new(rcodes, n_rfmt.min(MAX_RESULT_COLS) as u16);
-            Ok((portal, stmt, n_params, spans, formats, values, result_formats))
+            Ok((portal, statement, n_params, spans, formats, values, result_formats))
         };
         let (portal_name, stmt_name, n_params, spans, formats, values, result_formats) =
             match parse() {
@@ -1158,7 +1158,7 @@ enum Step {
 
 fn resp_portal_suspended(resp: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {
     use crate::pg::wire::{MsgOut, MSG_PORTAL_SUSPENDED};
-    MsgOut::begin(resp.buf, MSG_PORTAL_SUSPENDED).finish()
+    MsgOut::begin(resp.buffer, MSG_PORTAL_SUSPENDED).finish()
 }
 
 /// Decodes a binary-format parameter using its declared type OID
@@ -1242,9 +1242,9 @@ fn decode_binary_param<'a>(
                 .map_err(|_| "invalid UTF-8 in binary jsonb parameter")
         }
         oids::NUMERIC => {
-            let mut buf = crate::util::StackStr::<96>::new();
-            binary_numeric_to_str(bytes, &mut buf)?;
-            crate::sql::numeric::Numeric::parse(buf.as_str(), arena)
+            let mut buffer = crate::util::StackStr::<96>::new();
+            binary_numeric_to_str(bytes, &mut buffer)?;
+            crate::sql::numeric::Numeric::parse(buffer.as_str(), arena)
                 .map(Datum::Numeric)
                 .map_err(|_| "binary numeric out of range")
         }

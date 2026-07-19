@@ -7,7 +7,7 @@ use core::fmt;
 /// on paths that must not allocate.
 #[derive(Clone, Copy)]
 pub struct StackStr<const N: usize> {
-    buf: [u8; N],
+    buffer: [u8; N],
     len: usize,
     truncated: bool,
 }
@@ -21,7 +21,7 @@ impl<const N: usize> fmt::Debug for StackStr<N> {
 impl<const N: usize> StackStr<N> {
     pub const fn new() -> Self {
         Self {
-            buf: [0; N],
+            buffer: [0; N],
             len: 0,
             truncated: false,
         }
@@ -29,7 +29,7 @@ impl<const N: usize> StackStr<N> {
 
     pub fn as_str(&self) -> &str {
         // Only whole UTF-8 sequences are ever appended.
-        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+        unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.len]) }
     }
 
     pub fn is_truncated(&self) -> bool {
@@ -52,7 +52,7 @@ impl<const N: usize> fmt::Write for StackStr<N> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let space = N - self.len;
         if s.len() <= space {
-            self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.buffer[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
             self.len += s.len();
         } else {
             // Take the longest prefix that is still valid UTF-8.
@@ -60,7 +60,7 @@ impl<const N: usize> fmt::Write for StackStr<N> {
             while cut > 0 && !s.is_char_boundary(cut) {
                 cut -= 1;
             }
-            self.buf[self.len..self.len + cut].copy_from_slice(&s.as_bytes()[..cut]);
+            self.buffer[self.len..self.len + cut].copy_from_slice(&s.as_bytes()[..cut]);
             self.len += cut;
             self.truncated = true;
         }

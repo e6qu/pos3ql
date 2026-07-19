@@ -223,16 +223,16 @@ impl Server {
     /// Builds the canned ErrorResponse sent when all slots are taken.
     fn render_refusal(budget: &mut Budget) -> Result<([u8; 128], usize), ServerSetupError> {
         use crate::pg::respond::Responder;
-        let mut buf = crate::mem::buf::FixedBuf::new(budget, "refusal_scratch", 128)?;
-        let mut resp = Responder::new(&mut buf);
+        let mut buffer = crate::mem::buffer::FixedBuf::new(budget, "refusal_scratch", 128)?;
+        let mut resp = Responder::new(&mut buffer);
         resp.error(
             crate::sql::eval::sqlstate::TOO_MANY_CONNECTIONS,
             "sorry, too many clients already",
         )
         .expect("refusal fits in 128 bytes");
         let mut bytes = [0u8; 128];
-        let n = buf.readable().len();
-        bytes[..n].copy_from_slice(buf.readable());
+        let n = buffer.readable().len();
+        bytes[..n].copy_from_slice(buffer.readable());
         Ok((bytes, n))
     }
 
@@ -257,9 +257,9 @@ impl Server {
                 let event = self.reactor.event(i);
                 if event.token == SHUTDOWN_TOKEN {
                     // Drain the pipe; the flag is already set.
-                    let mut buf = [0u8; 64];
+                    let mut buffer = [0u8; 64];
                     while unsafe {
-                        libc::read(self.shutdown_read, buf.as_mut_ptr().cast(), buf.len())
+                        libc::read(self.shutdown_read, buffer.as_mut_ptr().cast(), buffer.len())
                     } > 0
                     {}
                 } else if event.token == LISTENER_TOKEN {

@@ -5,7 +5,7 @@
 use super::budget::{Budget, BudgetError};
 
 pub struct FixedBuf {
-    buf: Box<[u8]>,
+    buffer: Box<[u8]>,
     start: usize,
     end: usize,
 }
@@ -18,7 +18,7 @@ impl FixedBuf {
     ) -> Result<Self, BudgetError> {
         budget.draw(capacity, what)?;
         Ok(Self {
-            buf: vec![0; capacity].into_boxed_slice(),
+            buffer: vec![0; capacity].into_boxed_slice(),
             start: 0,
             end: 0,
         })
@@ -26,7 +26,7 @@ impl FixedBuf {
 
     /// Unread bytes.
     pub fn readable(&self) -> &[u8] {
-        &self.buf[self.start..self.end]
+        &self.buffer[self.start..self.end]
     }
 
     /// Marks `n` readable bytes as consumed.
@@ -42,16 +42,16 @@ impl FixedBuf {
     /// Space to append into, after moving any unread bytes to the front.
     pub fn writable(&mut self) -> &mut [u8] {
         if self.start > 0 {
-            self.buf.copy_within(self.start..self.end, 0);
+            self.buffer.copy_within(self.start..self.end, 0);
             self.end -= self.start;
             self.start = 0;
         }
-        &mut self.buf[self.end..]
+        &mut self.buffer[self.end..]
     }
 
     /// Marks `n` bytes of the writable slice as filled.
     pub fn advance(&mut self, n: usize) {
-        assert!(self.end + n <= self.buf.len(), "advancing past capacity");
+        assert!(self.end + n <= self.buffer.len(), "advancing past capacity");
         self.end += n;
     }
 
@@ -74,7 +74,7 @@ impl FixedBuf {
     }
 
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.buffer.len()
     }
 
     pub fn clear(&mut self) {
@@ -84,7 +84,7 @@ impl FixedBuf {
 
     /// Raw filled region, for length back-patching by message writers.
     pub fn filled_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.end]
+        &mut self.buffer[..self.end]
     }
 
     /// Absolute offset where the next appended byte will land, stable until

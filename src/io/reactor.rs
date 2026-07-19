@@ -248,9 +248,9 @@ mod tests {
         // Level-triggered: still ready until drained.
         let events = reactor.wait(Some(Duration::from_millis(1000))).unwrap();
         assert_eq!(events.len(), 1);
-        let mut buf = [0u8; 8];
+        let mut buffer = [0u8; 8];
         let mut b_reader = &b;
-        assert_eq!(b_reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(b_reader.read(&mut buffer).unwrap(), 2);
 
         drop(a);
         let events = reactor.wait(Some(Duration::from_millis(1000))).unwrap();

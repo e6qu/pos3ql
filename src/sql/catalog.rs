@@ -400,9 +400,9 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
             push(mk(uk.cols(), uk.is_primary, true, stack_str_64(uk.name.as_str())), &mut n);
         }
         // Explicit CREATE INDEX on this table.
-        for idx in storage.live_indexes().filter(|i| i.table.as_str() == tname) {
+        for index in storage.live_indexes().filter(|i| i.table.as_str() == tname) {
             push(
-                mk(&idx.cols[..idx.n_cols], false, idx.unique, stack_str_64(idx.name.as_str())),
+                mk(&index.cols[..index.n_cols], false, index.unique, stack_str_64(index.name.as_str())),
                 &mut n,
             );
         }

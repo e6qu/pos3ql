@@ -15,7 +15,7 @@ use std::io::Write as IoWrite;
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::s3::sha256::{HexDigest, Sha256};
 use crate::s3::{Precondition, S3Client, S3Error};
@@ -340,17 +340,17 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("chk name missing"))?;
                     let hexpr = words
                         .next()
-                        .ok_or(CheckpointSetupError::Corrupt("chk expr missing"))?;
-                    let mut ck = crate::storage::CheckConstraint::EMPTY;
-                    ck.name = sql_name(&decode_hex_name(hname)?)?;
-                    let expr = decode_hex_name(hexpr)?;
+                        .ok_or(CheckpointSetupError::Corrupt("chk expression missing"))?;
+                    let mut check = crate::storage::CheckConstraint::EMPTY;
+                    check.name = sql_name(&decode_hex_name(hname)?)?;
+                    let expression = decode_hex_name(hexpr)?;
                     use core::fmt::Write;
-                    let _ = write!(ck.expr, "{expr}");
-                    if ck.expr.is_truncated() {
+                    let _ = write!(check.expression, "{expression}");
+                    if check.expression.is_truncated() {
                         return Err(CheckpointSetupError::Corrupt("chk predicate too long"));
                     }
                     let i = def.n_checks;
-                    def.checks[i] = ck;
+                    def.checks[i] = check;
                     def.n_checks += 1;
                 }
                 Some("fkey") => {
@@ -425,11 +425,11 @@ impl Checkpointer {
                     let sql = String::from_utf8(bytes)
                         .map_err(|_| CheckpointSetupError::Corrupt("view sql not UTF-8"))?;
                     let name = rest_of(line, 2)?;
-                    let mut buf = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+                    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
                     use core::fmt::Write;
-                    let _ = write!(buf, "{sql}");
+                    let _ = write!(buffer, "{sql}");
                     storage
-                        .create_view(sql_name(name)?, buf, true)
+                        .create_view(sql_name(name)?, buffer, true)
                         .map_err(|e| {
                             CheckpointSetupError::S3(format!(
                                 "manifest view rejected: {}",
@@ -678,14 +678,14 @@ impl Checkpointer {
                 )?;
             }
             // `chk <hex-name> <hex-predicate>`
-            for ck in table.def.checks() {
+            for check in table.def.checks() {
                 use core::fmt::Write;
                 let mut hname = StackStr::<130>::new();
-                for b in ck.name.as_str().as_bytes() {
+                for b in check.name.as_str().as_bytes() {
                     let _ = write!(hname, "{b:02x}");
                 }
                 let mut hexpr = StackStr::<{ 2 * crate::storage::CHECK_SQL_MAX }>::new();
-                for b in ck.expr.as_str().as_bytes() {
+                for b in check.expression.as_str().as_bytes() {
                     let _ = write!(hexpr, "{b:02x}");
                 }
                 write_manifest(
@@ -837,27 +837,27 @@ impl Checkpointer {
                 format_args!("view {} {name}", hex.as_str()),
             )?;
         }
-        // Indexes: `idx <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
-        for idx in storage.live_indexes() {
+        // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
+        for index in storage.live_indexes() {
             use core::fmt::Write;
             let mut cols = StackStr::<128>::new();
-            for c in &idx.cols[..idx.n_cols] {
+            for c in &index.cols[..index.n_cols] {
                 let _ = write!(cols, "{c} ");
             }
             let mut hname = StackStr::<130>::new();
-            for b in idx.name.as_str().as_bytes() {
+            for b in index.name.as_str().as_bytes() {
                 let _ = write!(hname, "{b:02x}");
             }
             let mut htable = StackStr::<130>::new();
-            for b in idx.table.as_str().as_bytes() {
+            for b in index.table.as_str().as_bytes() {
                 let _ = write!(htable, "{b:02x}");
             }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
                     "idx {} {} {}{} {}",
-                    u8::from(idx.unique),
-                    idx.n_cols,
+                    u8::from(index.unique),
+                    index.n_cols,
                     cols.as_str(),
                     hname.as_str(),
                     htable.as_str()
@@ -927,7 +927,7 @@ impl Checkpointer {
 /// syscall per row.
 struct ChunkedWriter<'a> {
     stream: &'a mut std::net::TcpStream,
-    buf: [u8; 16384],
+    buffer: [u8; 16384],
     len: usize,
 }
 
@@ -935,18 +935,18 @@ impl<'a> ChunkedWriter<'a> {
     fn new(stream: &'a mut std::net::TcpStream) -> Self {
         Self {
             stream,
-            buf: [0; 16384],
+            buffer: [0; 16384],
             len: 0,
         }
     }
 
     fn write_all(&mut self, mut data: &[u8]) -> std::io::Result<()> {
         while !data.is_empty() {
-            if self.len == self.buf.len() {
+            if self.len == self.buffer.len() {
                 self.flush_buf()?;
             }
-            let take = data.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + take].copy_from_slice(&data[..take]);
+            let take = data.len().min(self.buffer.len() - self.len);
+            self.buffer[self.len..self.len + take].copy_from_slice(&data[..take]);
             self.len += take;
             data = &data[take..];
         }
@@ -954,7 +954,7 @@ impl<'a> ChunkedWriter<'a> {
     }
 
     fn flush_buf(&mut self) -> std::io::Result<()> {
-        self.stream.write_all(&self.buf[..self.len])?;
+        self.stream.write_all(&self.buffer[..self.len])?;
         self.len = 0;
         Ok(())
     }
@@ -964,9 +964,9 @@ impl<'a> ChunkedWriter<'a> {
     }
 }
 
-fn write_manifest(buf: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {
+fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {
     use core::fmt::Write;
-    writeln!(buf, "{line}").map_err(|_| {
+    writeln!(buffer, "{line}").map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "manifest exceeds its fixed buffer"

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::mem::buf::FixedBuf;
+use crate::mem::buffer::FixedBuf;
 use crate::stack_format;
 use crate::util::StackStr;
 

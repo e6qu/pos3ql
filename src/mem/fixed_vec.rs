@@ -9,7 +9,7 @@ use super::budget::{Budget, BudgetError};
 
 pub struct FixedVec<T> {
     what: &'static str,
-    buf: Box<[MaybeUninit<T>]>,
+    buffer: Box<[MaybeUninit<T>]>,
     len: usize,
 }
 
@@ -36,19 +36,19 @@ impl<T> FixedVec<T> {
         budget.draw_array(capacity, size_of::<T>(), what)?;
         Ok(Self {
             what,
-            buf: Box::new_uninit_slice(capacity),
+            buffer: Box::new_uninit_slice(capacity),
             len: 0,
         })
     }
 
     pub fn push(&mut self, value: T) -> Result<(), CapacityError> {
-        if self.len == self.buf.len() {
+        if self.len == self.buffer.len() {
             return Err(CapacityError {
                 what: self.what,
-                capacity: self.buf.len(),
+                capacity: self.buffer.len(),
             });
         }
-        self.buf[self.len].write(value);
+        self.buffer[self.len].write(value);
         self.len += 1;
         Ok(())
     }
@@ -58,7 +58,7 @@ impl<T> FixedVec<T> {
             return None;
         }
         self.len -= 1;
-        Some(unsafe { self.buf[self.len].assume_init_read() })
+        Some(unsafe { self.buffer[self.len].assume_init_read() })
     }
 
     /// Removes the element at `index` by swapping the last element into its
@@ -81,15 +81,15 @@ impl<T> FixedVec<T> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.buffer.len()
     }
 
     pub fn as_slice(&self) -> &[T] {
-        unsafe { core::slice::from_raw_parts(self.buf.as_ptr().cast::<T>(), self.len) }
+        unsafe { core::slice::from_raw_parts(self.buffer.as_ptr().cast::<T>(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<T>(), self.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.buffer.as_mut_ptr().cast::<T>(), self.len) }
     }
 }
 

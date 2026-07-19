@@ -87,10 +87,10 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[..4].copy_from_slice(&x.to_le_bytes());
                 take = 4;
             }
-            Datum::Interval(iv) => {
-                rest[..4].copy_from_slice(&iv.months.to_le_bytes());
-                rest[4..8].copy_from_slice(&iv.days.to_le_bytes());
-                rest[8..16].copy_from_slice(&iv.micros.to_le_bytes());
+            Datum::Interval(interval) => {
+                rest[..4].copy_from_slice(&interval.months.to_le_bytes());
+                rest[4..8].copy_from_slice(&interval.days.to_le_bytes());
+                rest[8..16].copy_from_slice(&interval.micros.to_le_bytes());
                 take = 16;
             }
             Datum::Timestamp(x) | Datum::Timestamptz(x) | Datum::Time(x) => {
@@ -298,10 +298,10 @@ mod tests {
             Datum::Text("hello, 世界"),
             Datum::Null,
         ];
-        let mut buf = vec![0u8; encoded_len(&values)];
-        encode(&values, &mut buf);
+        let mut buffer = vec![0u8; encoded_len(&values)];
+        encode(&values, &mut buffer);
         let mut out = [Datum::Null; MAX_COLUMNS];
-        decode(&buf, &schema, &mut out).unwrap();
+        decode(&buffer, &schema, &mut out).unwrap();
         assert_eq!(&out[..6], &values);
     }
 
@@ -309,20 +309,20 @@ mod tests {
     fn truncated_bytes_are_an_error_not_a_panic() {
         let schema = [ColType::Int8];
         let values = [Datum::Int8(1)];
-        let mut buf = vec![0u8; encoded_len(&values)];
-        encode(&values, &mut buf);
-        for cut in 0..buf.len() {
+        let mut buffer = vec![0u8; encoded_len(&values)];
+        encode(&values, &mut buffer);
+        for cut in 0..buffer.len() {
             let mut out = [Datum::Null; 1];
-            assert!(decode(&buf[..cut], &schema, &mut out).is_err(), "cut={cut}");
+            assert!(decode(&buffer[..cut], &schema, &mut out).is_err(), "cut={cut}");
         }
     }
 
     #[test]
     fn schema_mismatch_is_an_error() {
         let values = [Datum::Int4(1)];
-        let mut buf = vec![0u8; encoded_len(&values)];
-        encode(&values, &mut buf);
+        let mut buffer = vec![0u8; encoded_len(&values)];
+        encode(&values, &mut buffer);
         let mut out = [Datum::Null; 2];
-        assert!(decode(&buf, &[ColType::Int4, ColType::Int4], &mut out).is_err());
+        assert!(decode(&buffer, &[ColType::Int4, ColType::Int4], &mut out).is_err());
     }
 }

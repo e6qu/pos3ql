@@ -502,7 +502,7 @@ impl fmt::Display for Datum<'_> {
                 f.write_str(super::datetime::format_timestamp(*t, true).as_str())
             }
             Datum::Time(t) => f.write_str(super::datetime::format_time(*t).as_str()),
-            Datum::Interval(iv) => f.write_str(super::datetime::format_interval(*iv).as_str()),
+            Datum::Interval(interval) => f.write_str(super::datetime::format_interval(*interval).as_str()),
             Datum::Json { text, .. } => f.write_str(text),
             Datum::Range { text, .. } => f.write_str(text),
             Datum::Array { elem, raw } => super::array::write(f, *elem, raw),

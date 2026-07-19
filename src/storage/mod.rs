@@ -270,13 +270,13 @@ impl UniqueKey {
 #[derive(Debug, Clone, Copy)]
 pub struct CheckConstraint {
     pub name: SqlName,
-    pub expr: StackStr<CHECK_SQL_MAX>,
+    pub expression: StackStr<CHECK_SQL_MAX>,
 }
 
 impl CheckConstraint {
     pub const EMPTY: Self = CheckConstraint {
         name: SqlName::EMPTY,
-        expr: StackStr::new(),
+        expression: StackStr::new(),
     };
 }
 
@@ -426,7 +426,7 @@ impl RowState {
 
 /// Fixed byte heap for encoded rows.
 pub struct RowHeap {
-    buf: Box<[u8]>,
+    buffer: Box<[u8]>,
     used: usize,
 }
 
@@ -434,30 +434,30 @@ impl RowHeap {
     fn new(budget: &mut Budget, bytes: usize) -> Result<Self, BudgetError> {
         budget.draw(bytes, "memtable")?;
         Ok(Self {
-            buf: vec![0; bytes].into_boxed_slice(),
+            buffer: vec![0; bytes].into_boxed_slice(),
             used: 0,
         })
     }
 
     pub fn append(&mut self, len: usize) -> Result<(RowLoc, &mut [u8]), SqlError> {
-        if self.buf.len() - self.used < len {
+        if self.buffer.len() - self.used < len {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "memtable is full ({} bytes); flush to object storage is not implemented yet",
-                self.buf.len()
+                self.buffer.len()
             ));
         }
         let loc = RowLoc {
             offset: self.used as u32,
             len: len as u32,
         };
-        let slice = &mut self.buf[self.used..self.used + len];
+        let slice = &mut self.buffer[self.used..self.used + len];
         self.used += len;
         Ok((loc, slice))
     }
 
     pub fn get(&self, loc: RowLoc) -> &[u8] {
-        &self.buf[loc.offset as usize..(loc.offset + loc.len) as usize]
+        &self.buffer[loc.offset as usize..(loc.offset + loc.len) as usize]
     }
 
     pub fn used(&self) -> usize {
@@ -465,7 +465,7 @@ impl RowHeap {
     }
 
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.buffer.len()
     }
 }
 
@@ -692,7 +692,7 @@ impl Storage {
             let src = loc.offset as usize;
             debug_assert!(write_at <= src, "targets never overtake sources");
             if src != write_at {
-                self.heap.buf.copy_within(src..src + len, write_at);
+                self.heap.buffer.copy_within(src..src + len, write_at);
             }
             let new_loc = RowLoc {
                 offset: write_at as u32,
@@ -1210,13 +1210,13 @@ mod tests {
         let mut budget = Budget::new(1 << 22);
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let def = make_def("t1", &[("id", ColType::Int4, true)]);
-        let idx = s.create_table(def).unwrap();
-        assert_eq!(s.find_table("t1"), Some(idx));
+        let index = s.create_table(def).unwrap();
+        assert_eq!(s.find_table("t1"), Some(index));
         assert_eq!(
             s.create_table(def).unwrap_err().sqlstate,
             sqlstate::DUPLICATE_TABLE
         );
-        s.drop_table(idx);
+        s.drop_table(index);
         assert_eq!(s.find_table("t1"), None);
         // Slot is reusable; capacity is enforced.
         for i in 0..4u32 {

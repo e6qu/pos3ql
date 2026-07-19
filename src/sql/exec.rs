@@ -79,15 +79,15 @@ pub fn create_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    stmt: &CreateTable,
+    statement: &CreateTable,
     arena: &Arena,
     resp: &mut Responder,
 ) -> Outcome {
-    let mut def = match build_def(stmt.name, stmt.columns, arena) {
+    let mut def = match build_def(statement.name, statement.columns, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    if let Err(e) = attach_constraints(storage, &mut def, stmt.constraints, txn.txid, arena) {
+    if let Err(e) = attach_constraints(storage, &mut def, statement.constraints, txn.txid, arena) {
         return sql_fail(e);
     }
     match storage.create_table_in(def, txn.txid) {
@@ -103,10 +103,10 @@ pub fn create_table(
                 return sql_fail(e);
             }
         }
-        Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && stmt.if_not_exists => {
+        Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
             resp.notice(
                 "42P07",
-                stack_format!(128, "relation \"{}\" already exists, skipping", stmt.name).as_str(),
+                stack_format!(128, "relation \"{}\" already exists, skipping", statement.name).as_str(),
             )?;
         }
         Err(e) => return sql_fail(e),
@@ -167,8 +167,8 @@ fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, SqlError> {
     };
     let default_value = match c.default {
         None => None,
-        Some(expr) => {
-            let v = eval(expr, arena, super::eval::NO_PARAMS, &NoColumns).map_err(|_| {
+        Some(expression) => {
+            let v = eval(expression, arena, super::eval::NO_PARAMS, &NoColumns).map_err(|_| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "DEFAULT must be a constant expression"
@@ -219,14 +219,14 @@ fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_INDEX_COLS]
     }
     let mut out = [0u16; MAX_INDEX_COLS];
     for (i, name) in names.iter().enumerate() {
-        let Some(idx) = def.column_index(name) else {
+        let Some(index) = def.column_index(name) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" named in key does not exist",
                 name
             ));
         };
-        out[i] = idx as u16;
+        out[i] = index as u16;
     }
     Ok((out, names.len()))
 }
@@ -234,8 +234,8 @@ fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_INDEX_COLS]
 /// Validates that every column reference in a CHECK predicate names a real
 /// column of the table being defined, and that the predicate uses no subquery
 /// (which PostgreSQL forbids in CHECK).
-fn validate_check_refs(expr: &Expr, def: &TableDef) -> Result<(), SqlError> {
-    match expr {
+fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError> {
+    match expression {
         Expr::Column { name, .. } => {
             if def.column_index(name).is_none() {
                 return Err(sql_err!(
@@ -358,8 +358,8 @@ fn attach_constraints(
                     add_unique_key(def, *name, "key", &idxs, n, false)?;
                 }
             }
-            TableConstraint::Check { name, expr, text } => {
-                validate_check_refs(expr, def)?;
+            TableConstraint::Check { name, expression, text } => {
+                validate_check_refs(expression, def)?;
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -380,9 +380,9 @@ fn attach_constraints(
                         stack_format!(64, "{}_check", def.name.as_str()).as_str(),
                     )?,
                 };
-                let mut c = CheckConstraint { name: cname, expr: crate::util::StackStr::new() };
-                let _ = core::fmt::Write::write_str(&mut c.expr, text);
-                if c.expr.is_truncated() {
+                let mut c = CheckConstraint { name: cname, expression: crate::util::StackStr::new() };
+                let _ = core::fmt::Write::write_str(&mut c.expression, text);
+                if c.expression.is_truncated() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "CHECK predicate is too long"
@@ -690,8 +690,8 @@ fn find_conflict(
                 return Some(rowid);
             }
         }
-        for idx in storage.unique_indexes_for(table_name) {
-            let icols = &idx.cols[..idx.n_cols];
+        for index in storage.unique_indexes_for(table_name) {
+            let icols = &index.cols[..index.n_cols];
             if !icols.iter().any(|&c| values[c as usize].is_null())
                 && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
             {
@@ -773,15 +773,15 @@ fn handle_conflict(
             .and_then(|s| s.visible_to(txn.txid))
             .ok_or_else(|| sql_err!("XX000", "conflict row vanished"))?;
         rowenc::decode(storage.heap.get(loc), schema, &mut existing)?;
-        let ctx = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
+        let context = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
         if let Some(cond) = oc.update_where
-            && !matches!(eval(cond, arena, params, &ctx)?, Datum::Bool(true))
+            && !matches!(eval(cond, arena, params, &context)?, Datum::Bool(true))
         {
             return Ok(ConflictOutcome::Skip); // WHERE excluded this row
         }
         let mut new_values = [Datum::Null; MAX_COLUMNS];
         new_values[..def.n_columns].copy_from_slice(&existing[..def.n_columns]);
-        for (name, expr) in assigns {
+        for (name, expression) in assigns {
             let Some(target) = def.column_index(name) else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
@@ -790,7 +790,7 @@ fn handle_conflict(
                     def.name.as_str()
                 ));
             };
-            let v = eval(expr, arena, params, &ctx)?;
+            let v = eval(expression, arena, params, &context)?;
             new_values[target] = coerce(v, &def.columns()[target], arena)?;
         }
         check_not_null(def, &new_values)?;
@@ -931,10 +931,10 @@ pub fn check_unique_indexes(
     txid: u32,
 ) -> Result<(), SqlError> {
     let table_name = def.name.as_str();
-    for idx in storage.unique_indexes_for(table_name) {
-        let icols = &idx.cols[..idx.n_cols];
+    for index in storage.unique_indexes_for(table_name) {
+        let icols = &index.cols[..index.n_cols];
         tuple_uniqueness(
-            storage, table_index, schema, icols, values, self_rowid, txid, idx.name.as_str(),
+            storage, table_index, schema, icols, values, self_rowid, txid, index.name.as_str(),
         )?;
     }
     Ok(())
@@ -1024,7 +1024,7 @@ type ParsedChecks<'a> = [Option<&'a Expr<'a>>; crate::storage::MAX_CHECKS];
 fn parse_checks<'a>(def: &'a TableDef, arena: &'a Arena) -> Result<ParsedChecks<'a>, SqlError> {
     let mut out: ParsedChecks<'a> = [None; crate::storage::MAX_CHECKS];
     for (i, c) in def.checks().iter().enumerate() {
-        out[i] = Some(super::parser::parse_expr(c.expr.as_str(), arena)?);
+        out[i] = Some(super::parser::parse_expr(c.expression.as_str(), arena)?);
     }
     Ok(out)
 }
@@ -1059,10 +1059,10 @@ fn check_row_checks(
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
-    let ctx = RowCtx { def, values };
+    let context = RowCtx { def, values };
     for (i, c) in def.checks().iter().enumerate() {
-        let Some(expr) = checks[i] else { continue };
-        if matches!(eval(expr, arena, params, &ctx)?, Datum::Bool(false)) {
+        let Some(expression) = checks[i] else { continue };
+        if matches!(eval(expression, arena, params, &context)?, Datum::Bool(false)) {
             return Err(sql_err!(
                 "23514",
                 "new row for relation \"{}\" violates check constraint \"{}\"",
@@ -1255,21 +1255,21 @@ pub fn drop_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    stmt: &DropTable,
+    statement: &DropTable,
     resp: &mut Responder,
 ) -> Outcome {
-    match storage.find_visible(stmt.name, txn.txid) {
+    match storage.find_visible(statement.name, txn.txid) {
         Some(index) => {
             if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
                 let _ = other;
                 return sql_fail(sql_err!(
                     "40001",
                     "could not serialize access due to concurrent DDL on \"{}\"",
-                    stmt.name
+                    statement.name
                 ));
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::DropTable(stmt.name)) {
+            if let Err(e) = wal.append(lsn, &WalOp::DropTable(statement.name)) {
                 return sql_fail(e);
             }
             if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(index as u32)) {
@@ -1278,15 +1278,15 @@ pub fn drop_table(
             storage.drop_table_in(index, txn.txid);
             // A table's indexes are dropped with it (no separate journal record;
             // DropTable replay re-applies this).
-            storage.drop_indexes_for(stmt.name);
+            storage.drop_indexes_for(statement.name);
         }
-        None if stmt.if_exists => {
+        None if statement.if_exists => {
             resp.notice(
                 sqlstate::UNDEFINED_TABLE,
-                stack_format!(128, "table \"{}\" does not exist, skipping", stmt.name).as_str(),
+                stack_format!(128, "table \"{}\" does not exist, skipping", statement.name).as_str(),
             )?;
         }
-        None => return sql_fail(undefined_table(stmt.name)),
+        None => return sql_fail(undefined_table(statement.name)),
     }
     resp.command_complete("DROP TABLE")?;
     sql_ok()
@@ -1307,9 +1307,9 @@ pub fn create_view(
     resp: &mut Responder,
 ) -> Outcome {
     use core::fmt::Write;
-    let mut buf = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
-    let _ = write!(buf, "{sql}");
-    if buf.is_truncated() {
+    let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+    let _ = write!(buffer, "{sql}");
+    if buffer.is_truncated() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "view definition exceeds {} bytes",
@@ -1318,14 +1318,14 @@ pub fn create_view(
     }
     // Validate the definition now (tables/views exist, columns resolve), as
     // PostgreSQL does at CREATE VIEW time.
-    if let Err(e) = super::query::validate_view(buf.as_str(), storage, arena) {
+    if let Err(e) = super::query::validate_view(buffer.as_str(), storage, arena) {
         return sql_fail(e);
     }
     let sqlname = match SqlName::parse(name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    match storage.create_view(sqlname, buf, or_replace) {
+    match storage.create_view(sqlname, buffer, or_replace) {
         Ok((new_slot, old_slot)) => {
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(lsn, &WalOp::CreateView { name, sql }) {
@@ -1517,13 +1517,13 @@ pub fn drop_index(
 pub fn insert(
     storage: &mut Storage,
     txn: &mut TxnState,
-    stmt: &Insert,
+    statement: &Insert,
     arena: &Arena,
     params: &[Datum],
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(stmt.table, txn.txid) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
     let checks = match parse_checks(&def, arena) {
@@ -1533,30 +1533,30 @@ pub fn insert(
 
     // Column list → target indices.
     let mut targets = [0usize; MAX_COLUMNS];
-    let n_targets = if stmt.columns.is_empty() {
+    let n_targets = if statement.columns.is_empty() {
         for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
             *t = i;
         }
         def.n_columns
     } else {
-        for (i, name) in stmt.columns.iter().enumerate() {
+        for (i, name) in statement.columns.iter().enumerate() {
             let Some(col) = def.column_index(name) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" of relation \"{}\" does not exist",
                     name,
-                    stmt.table
+                    statement.table
                 ));
             };
             targets[i] = col;
         }
-        stmt.columns.len()
+        statement.columns.len()
     };
 
     // RETURNING sends its RowDescription before any rows.
-    if !stmt.returning.is_empty() {
+    if !statement.returning.is_empty() {
         let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(stmt.returning, Some(&def), &mut cols) {
+        match describe_items(statement.returning, Some(&def), &mut cols) {
             Ok(n) => resp.row_description(&cols[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -1565,7 +1565,7 @@ pub fn insert(
     // INSERT ... SELECT: materialize the source rows into the arena first
     // (reading storage immutably), then insert them (mutably) — the source may
     // read the very table being written, so the two phases must not overlap.
-    if let Some(sel) = stmt.select {
+    if let Some(sel) = statement.select {
         // Pass 1: count.
         let mut count = 0usize;
         if let Err(e) = super::query::select_into_rows(
@@ -1627,7 +1627,7 @@ pub fn insert(
             {
                 let mut sch = [ColType::Bool; MAX_COLUMNS];
                 def.schema(&mut sch);
-                match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &stmt.on_conflict, &checks, arena, params) {
+                match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &checks, arena, params) {
                     Ok(ConflictOutcome::Store) => {}
                     Ok(ConflictOutcome::Skip) => continue,
                     Ok(ConflictOutcome::Updated) => { inserted += 1; continue; }
@@ -1653,8 +1653,8 @@ pub fn insert(
             if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
                 return sql_fail(e);
             }
-            if !stmt.returning.is_empty()
-                && let Err(e) = emit_projected(&def, &values[..def.n_columns], stmt.returning, arena, params, resp)? {
+            if !statement.returning.is_empty()
+                && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, resp)? {
                     return sql_fail(e);
                 }
             inserted += 1;
@@ -1665,7 +1665,7 @@ pub fn insert(
     }
 
     let mut inserted = 0u64;
-    for row_exprs in stmt.rows {
+    for row_exprs in statement.rows {
         if row_exprs.len() > n_targets {
             return sql_fail(sql_err!(
                 sqlstate::SYNTAX_ERROR,
@@ -1680,11 +1680,11 @@ pub fn insert(
                 values[i] = d.as_datum();
             }
         }
-        for (i, expr) in row_exprs.iter().enumerate() {
-            if matches!(expr, Expr::DefaultMarker) {
+        for (i, expression) in row_exprs.iter().enumerate() {
+            if matches!(expression, Expr::DefaultMarker) {
                 continue; // keep the default already in place
             }
-            let v = match eval(expr, arena, params, &NoColumns) {
+            let v = match eval(expression, arena, params, &NoColumns) {
                 Ok(v) => v,
                 Err(e) => return sql_fail(e),
             };
@@ -1701,7 +1701,7 @@ pub fn insert(
         {
             let mut sch = [ColType::Bool; MAX_COLUMNS];
             def.schema(&mut sch);
-            match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &stmt.on_conflict, &checks, arena, params) {
+            match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &checks, arena, params) {
                 Ok(ConflictOutcome::Store) => {}
                 Ok(ConflictOutcome::Skip) => continue,
                 Ok(ConflictOutcome::Updated) => { inserted += 1; continue; }
@@ -1727,8 +1727,8 @@ pub fn insert(
         if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
             return sql_fail(e);
         }
-        if !stmt.returning.is_empty()
-            && let Err(e) = emit_projected(&def, &values[..def.n_columns], stmt.returning, arena, params, resp)? {
+        if !statement.returning.is_empty()
+            && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, resp)? {
                 return sql_fail(e);
             }
         inserted += 1;
@@ -1747,18 +1747,18 @@ fn emit_projected(
     params: &[Datum],
     resp: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
-    let ctx = RowCtx { def, values };
+    let context = RowCtx { def, values };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0;
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                for v in ctx.values {
+                for v in context.values {
                     projected[n] = *v;
                     n += 1;
                 }
             }
-            SelectItem::Expr { expr, .. } => match eval(expr, arena, params, &ctx) {
+            SelectItem::Expr { expression, .. } => match eval(expression, arena, params, &context) {
                 Ok(v) => {
                     projected[n] = v;
                     n += 1;
@@ -1775,13 +1775,13 @@ pub fn update(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowLoc)>,
-    stmt: &Update,
+    statement: &Update,
     arena: &Arena,
     params: &[Datum],
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(stmt.table, txn.txid) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
     let checks = match parse_checks(&def, arena) {
@@ -1794,20 +1794,20 @@ pub fn update(
 
     // Resolve assignment targets once.
     let mut targets = [0usize; MAX_COLUMNS];
-    for (i, (name, _)) in stmt.assignments.iter().enumerate() {
+    for (i, (name, _)) in statement.assignments.iter().enumerate() {
         let Some(col) = def.column_index(name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" of relation \"{}\" does not exist",
                 name,
-                stmt.table
+                statement.table
             ));
         };
         targets[i] = col;
     }
 
     let subs = match super::query::subquery_hooks(
-        &[stmt.where_clause],
+        &[statement.where_clause],
         storage,
         txn.txid,
         arena,
@@ -1817,18 +1817,18 @@ pub fn update(
         Err(e) => return sql_fail(e),
     };
     let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
-    let collect = if let Some(from) = stmt.from {
-        collect_join_matches(storage, table_index, &def, schema, from, stmt.where_clause, arena, params, txn.txid, scratch)
+    let collect = if let Some(from) = statement.from {
+        collect_join_matches(storage, table_index, &def, schema, from, statement.where_clause, arena, params, txn.txid, scratch)
     } else {
-        collect_matches(storage, table_index, txn.txid, schema, stmt.where_clause, arena, params, &hooks, scratch)
+        collect_matches(storage, table_index, txn.txid, schema, statement.where_clause, arena, params, &hooks, scratch)
     };
     if let Err(e) = collect {
         return sql_fail(e);
     }
 
-    if !stmt.returning.is_empty() {
+    if !statement.returning.is_empty() {
         let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(stmt.returning, Some(&def), &mut cols) {
+        match describe_items(statement.returning, Some(&def), &mut cols) {
             Ok(n) => resp.row_description(&cols[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -1846,16 +1846,16 @@ pub fn update(
             }
             let mut new_values = [Datum::Null; MAX_COLUMNS];
             new_values[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
-            let ctx = RowCtx { def: &def, values: &values[..def.n_columns] };
-            if let Some(from) = stmt.from {
+            let context = RowCtx { def: &def, values: &values[..def.n_columns] };
+            if let Some(from) = statement.from {
                 // UPDATE ... FROM: evaluate the assignments against the target
                 // row joined with the first matching FROM row.
                 let mut set_err: Option<SqlError> = None;
                 let r = super::query::first_from_match(
-                    storage, from, txn.txid, stmt.where_clause, arena, params, &ctx,
+                    storage, from, txn.txid, statement.where_clause, arena, params, &context,
                     &mut |combined| {
-                        for (a, (_, expr)) in stmt.assignments.iter().enumerate() {
-                            let v = eval(expr, arena, params, &combined)?;
+                        for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                            let v = eval(expression, arena, params, &combined)?;
                             new_values[targets[a]] = coerce(v, &def.columns()[targets[a]], arena)?;
                         }
                         Ok(())
@@ -1869,8 +1869,8 @@ pub fn update(
                     return sql_fail(e);
                 }
             } else {
-                for (a, (_, expr)) in stmt.assignments.iter().enumerate() {
-                    let v = match eval(expr, arena, params, &ctx) {
+                for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                    let v = match eval(expression, arena, params, &context) {
                         Ok(v) => v,
                         Err(e) => return sql_fail(e),
                     };
@@ -1903,13 +1903,13 @@ pub fn update(
             // it (NO ACTION / RESTRICT).
             if referenced_key_changed(
                 storage,
-                stmt.table,
+                statement.table,
                 &values[..def.n_columns],
                 &new_values[..def.n_columns],
                 txn.txid,
             ) && let Err(e) = check_fk_parent_referenced(
                 storage,
-                stmt.table,
+                statement.table,
                 &values[..def.n_columns],
                 txn.txid,
             ) {
@@ -1942,7 +1942,7 @@ pub fn update(
             }
             Err(e) => return sql_fail(e),
         }
-        if !stmt.returning.is_empty() {
+        if !statement.returning.is_empty() {
             let mut new_values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(storage.heap.get(new_loc), schema, &mut new_values) {
                 return sql_fail(e);
@@ -1950,7 +1950,7 @@ pub fn update(
             if let Err(e) = emit_projected(
                 &def,
                 &new_values[..def.n_columns],
-                stmt.returning,
+                statement.returning,
                 arena,
                 params,
                 resp,
@@ -1969,13 +1969,13 @@ pub fn delete(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowLoc)>,
-    stmt: &Delete,
+    statement: &Delete,
     arena: &Arena,
     params: &[Datum],
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(stmt.table, txn.txid) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -1983,7 +1983,7 @@ pub fn delete(
     let schema = &schema[..def.n_columns];
 
     let subs = match super::query::subquery_hooks(
-        &[stmt.where_clause],
+        &[statement.where_clause],
         storage,
         txn.txid,
         arena,
@@ -1993,25 +1993,25 @@ pub fn delete(
         Err(e) => return sql_fail(e),
     };
     let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
-    let collect = if let Some(using) = stmt.using {
-        collect_join_matches(storage, table_index, &def, schema, using, stmt.where_clause, arena, params, txn.txid, scratch)
+    let collect = if let Some(using) = statement.using {
+        collect_join_matches(storage, table_index, &def, schema, using, statement.where_clause, arena, params, txn.txid, scratch)
     } else {
-        collect_matches(storage, table_index, txn.txid, schema, stmt.where_clause, arena, params, &hooks, scratch)
+        collect_matches(storage, table_index, txn.txid, schema, statement.where_clause, arena, params, &hooks, scratch)
     };
     if let Err(e) = collect {
         return sql_fail(e);
     }
-    if !stmt.returning.is_empty() {
+    if !statement.returning.is_empty() {
         let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(stmt.returning, Some(&def), &mut cols) {
+        match describe_items(statement.returning, Some(&def), &mut cols) {
             Ok(n) => resp.row_description(&cols[..n])?,
             Err(e) => return sql_fail(e),
         }
     }
-    let referenced = table_is_referenced(storage, stmt.table, txn.txid);
+    let referenced = table_is_referenced(storage, statement.table, txn.txid);
     for i in 0..scratch.len() {
         let (rowid, old_loc) = scratch[i];
-        if !stmt.returning.is_empty() || referenced {
+        if !statement.returning.is_empty() || referenced {
             let mut old_values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(storage.heap.get(old_loc), schema, &mut old_values) {
                 return sql_fail(e);
@@ -2021,18 +2021,18 @@ pub fn delete(
             if referenced
                 && let Err(e) = check_fk_parent_referenced(
                     storage,
-                    stmt.table,
+                    statement.table,
                     &old_values[..def.n_columns],
                     txn.txid,
                 )
             {
                 return sql_fail(e);
             }
-            if !stmt.returning.is_empty()
+            if !statement.returning.is_empty()
                 && let Err(e) = emit_projected(
                     &def,
                     &old_values[..def.n_columns],
-                    stmt.returning,
+                    statement.returning,
                     arena,
                     params,
                     resp,
@@ -2065,12 +2065,12 @@ pub fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
     scratch: &mut FixedVec<(u64, RowLoc)>,
-    stmt: &AlterTable,
+    statement: &AlterTable,
     arena: &Arena,
     resp: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_table(stmt.table) else {
-        return sql_fail(undefined_table(stmt.table));
+    let Some(table_index) = storage.find_table(statement.table) else {
+        return sql_fail(undefined_table(statement.table));
     };
     let def = storage.table(table_index).def;
 
@@ -2084,7 +2084,7 @@ pub fn alter_table(
         return sql_fail(sql_err!(
             "55P03",
             "table \"{}\" has uncommitted changes; retry when idle",
-            stmt.table
+            statement.table
         ));
     }
 
@@ -2092,7 +2092,7 @@ pub fn alter_table(
     let mut new_def = def;
     let mut added: Option<(usize, Datum)> = None; // (index, fill value)
     let mut dropped: Option<usize> = None;
-    match &stmt.action {
+    match &statement.action {
         AlterAction::RenameTable(new_name) => {
             if storage.find_table(new_name).is_some() {
                 return sql_fail(sql_err!(
@@ -2137,23 +2137,23 @@ pub fn alter_table(
             let _ = fill;
             new_def.columns[def.n_columns] = meta;
             new_def.n_columns += 1;
-            let idx = def.n_columns;
+            let index = def.n_columns;
             // NOT NULL without a default over a non-empty table is a
             // constraint violation, as in PostgreSQL.
             let has_rows = !storage.table(table_index).rows.is_empty();
-            let fill_value = match &new_def.columns[idx].default_value {
+            let fill_value = match &new_def.columns[index].default_value {
                 Some(d) => d.as_datum(),
                 None if meta.not_null && has_rows => {
                     return sql_fail(sql_err!(
                         sqlstate::NOT_NULL_VIOLATION,
                         "column \"{}\" of relation \"{}\" contains null values",
                         c.name,
-                        stmt.table
+                        statement.table
                     ))
                 }
                 None => Datum::Null,
             };
-            added = Some((idx, fill_value));
+            added = Some((index, fill_value));
         }
         AlterAction::DropColumn(name) => {
             let Some(i) = def.column_index(name) else {
@@ -2219,9 +2219,9 @@ pub fn alter_table(
                 }
                 let mut out = [Datum::Null; MAX_COLUMNS];
                 let n_out = new_def.n_columns;
-                if let Some((idx, ref fill)) = added {
+                if let Some((index, ref fill)) = added {
                     out[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
-                    out[idx] = *fill;
+                    out[index] = *fill;
                 } else if let Some(d) = dropped {
                     let mut w = 0;
                     for (j, v) in values[..def.n_columns].iter().enumerate() {
@@ -2232,7 +2232,7 @@ pub fn alter_table(
                     }
                 }
                 let len = rowenc::encoded_len(&out[..n_out]);
-                let buf = match arena.alloc_slice_with(len, |_| 0u8) {
+                let buffer = match arena.alloc_slice_with(len, |_| 0u8) {
                     Ok(b) => b,
                     Err(_) => {
                         return sql_fail(sql_err!(
@@ -2241,8 +2241,8 @@ pub fn alter_table(
                         ))
                     }
                 };
-                rowenc::encode(&out[..n_out], buf);
-                &*buf
+                rowenc::encode(&out[..n_out], buffer);
+                &*buffer
             };
             let (loc, slice) = match storage.heap.append(new_bytes.len()) {
                 Ok(x) => x,
@@ -2326,15 +2326,15 @@ pub fn describe_items<'q>(
                     push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
                 }
             }
-            SelectItem::Expr { expr, alias } => {
-                let (mut type_oid, mut typlen) = infer_type_pub(expr, def)?;
+            SelectItem::Expr { expression, alias } => {
+                let (mut type_oid, mut typlen) = infer_type_pub(expression, def)?;
                 // A bare unknown (string literal / param) resolves to text
                 // for output, as PostgreSQL does.
                 if type_oid == oid::UNKNOWN {
                     type_oid = oid::TEXT;
                     typlen = -1;
                 }
-                let name = alias.unwrap_or(derived_name(expr));
+                let name = alias.unwrap_or(derived_name(expression));
                 push(ColDesc::new(name, type_oid, typlen))?;
             }
         }
@@ -2414,8 +2414,8 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// A specific output name for an expression, if it has one (parse_target.c
 /// FigureColnameInternal): a column ref, a function call, a cast (the type
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
-fn name_of<'a>(expr: &Expr<'a>) -> Option<&'a str> {
-    match expr {
+fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
+    match expression {
         Expr::Column { name, .. } => Some(name),
         Expr::Call { name, .. } => Some(name),
         Expr::Cast { type_name, .. } => {
@@ -2428,11 +2428,11 @@ fn name_of<'a>(expr: &Expr<'a>) -> Option<&'a str> {
 
 /// PostgreSQL's output-column name for a SELECT-list expression: `name_of`
 /// with the per-node fallback ("case" for a CASE, else "?column?").
-pub fn derived_name<'a>(expr: &Expr<'a>) -> &'a str {
-    if let Some(n) = name_of(expr) {
+pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
+    if let Some(n) = name_of(expression) {
         return n;
     }
-    match expr {
+    match expression {
         Expr::Case { .. } => "case",
         _ => "?column?",
     }
@@ -2494,10 +2494,10 @@ fn operator_undefined(l: ColType, op: &str, r: ColType) -> SqlError {
     )
 }
 
-pub fn infer_type_pub(expr: &Expr, def: Option<&TableDef>) -> Result<(i32, i16), SqlError> {
+pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32, i16), SqlError> {
     match def {
-        Some(d) => infer_type_res(expr, &DefCols(d)),
-        None => infer_type_res(expr, &NoCols),
+        Some(d) => infer_type_res(expression, &DefCols(d)),
+        None => infer_type_res(expression, &NoCols),
     }
 }
 
@@ -2505,9 +2505,9 @@ pub fn infer_type_pub(expr: &Expr, def: Option<&TableDef>) -> Result<(i32, i16),
 /// PostgreSQL's plan-time analysis: comparisons and arithmetic over
 /// incompatible types raise 42883 here, before any row is scanned. String
 /// literals and parameters are UNKNOWN and coerce to the other operand.
-pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i16), SqlError> {
+pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
-    Ok(match expr {
+    Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {
@@ -2935,10 +2935,10 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
 }
 
 pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -> Result<u64, SqlError> {
-    let Some(expr) = offset else {
+    let Some(expression) = offset else {
         return Ok(0);
     };
-    match eval(expr, arena, params, &NoColumns)? {
+    match eval(expression, arena, params, &NoColumns)? {
         Datum::Null => Ok(0),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
@@ -2954,7 +2954,7 @@ pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -
 
 /// ORDER BY <n> refers to the n-th select item, as in PostgreSQL.
 pub fn resolve_order_expr_pub<'a>(
-    expr: &'a Expr<'a>,
+    expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
 ) -> Result<&'a Expr<'a>, SqlError> {
     // An unqualified name that matches a SELECT-list output column binds to
@@ -2963,10 +2963,10 @@ pub fn resolve_order_expr_pub<'a>(
     // is ambiguous (42702), matching PostgreSQL's findTargetlistEntrySQL92 —
     // e.g. `SELECT (CASE .. ELSE b END), b ... ORDER BY b`, where the CASE
     // inherits the name `b` from its ELSE column.
-    if let Expr::Column { qualifier: None, name } = expr {
+    if let Expr::Column { qualifier: None, name } = expression {
         let mut found: Option<&'a Expr<'a>> = None;
         for item in items {
-            if let SelectItem::Expr { expr: item_expr, alias } = item {
+            if let SelectItem::Expr { expression: item_expr, alias } = item {
                 let out_name = alias.unwrap_or(derived_name(item_expr));
                 if out_name == *name {
                     match found {
@@ -2990,19 +2990,19 @@ pub fn resolve_order_expr_pub<'a>(
             return Ok(item_expr);
         }
     }
-    let Expr::Int(n) = expr else {
-        return Ok(expr);
+    let Expr::Int(n) = expression else {
+        return Ok(expression);
     };
-    let idx = *n;
-    if idx < 1 || idx as usize > items.len() {
+    let index = *n;
+    if index < 1 || index as usize > items.len() {
         return Err(sql_err!(
             "42P10",
             "ORDER BY position {} is not in select list",
-            idx
+            index
         ));
     }
-    match &items[idx as usize - 1] {
-        SelectItem::Expr { expr, .. } => Ok(expr),
+    match &items[index as usize - 1] {
+        SelectItem::Expr { expression, .. } => Ok(expression),
         SelectItem::Wildcard => Err(sql_err!(
             "42P10",
             "ORDER BY position cannot reference *"
@@ -3096,11 +3096,11 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
                 out[at + 1..at + 9].copy_from_slice(&x.to_le_bytes());
                 at += 9;
             }
-            Datum::Interval(iv) => {
+            Datum::Interval(interval) => {
                 out[at] = 13;
-                out[at + 1..at + 5].copy_from_slice(&iv.months.to_le_bytes());
-                out[at + 5..at + 9].copy_from_slice(&iv.days.to_le_bytes());
-                out[at + 9..at + 17].copy_from_slice(&iv.micros.to_le_bytes());
+                out[at + 1..at + 5].copy_from_slice(&interval.months.to_le_bytes());
+                out[at + 5..at + 9].copy_from_slice(&interval.days.to_le_bytes());
+                out[at + 9..at + 17].copy_from_slice(&interval.micros.to_le_bytes());
                 at += 17;
             }
             Datum::Json { text, jsonb } => {
@@ -3266,10 +3266,10 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
 }
 
 pub fn eval_limit_pub(limit: Option<&Expr>, arena: &Arena, params: &[Datum]) -> Result<u64, SqlError> {
-    let Some(expr) = limit else {
+    let Some(expression) = limit else {
         return Ok(u64::MAX);
     };
-    match eval(expr, arena, params, &NoColumns)? {
+    match eval(expression, arena, params, &NoColumns)? {
         Datum::Null => Ok(u64::MAX),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
@@ -3300,8 +3300,8 @@ fn row_matches<'a>(
     };
     let mut values = [Datum::Null; MAX_COLUMNS];
     rowenc::decode(storage.heap.get(loc), schema, &mut values)?;
-    let ctx = RowCtx { def, values: &values[..def.n_columns] };
-    match super::eval::eval_full(w, arena, params, &ctx, hooks)? {
+    let context = RowCtx { def, values: &values[..def.n_columns] };
+    match super::eval::eval_full(w, arena, params, &context, hooks)? {
         Datum::Bool(true) => Ok(true),
         Datum::Bool(false) | Datum::Null => Ok(false),
         _ => Err(sql_err!(
@@ -3366,9 +3366,9 @@ fn collect_join_matches<'a>(
         };
         let mut tv = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(storage.heap.get(loc), schema, &mut tv)?;
-        let ctx = RowCtx { def, values: &tv[..def.n_columns] };
+        let context = RowCtx { def, values: &tv[..def.n_columns] };
         let found = super::query::first_from_match(
-            storage, from, txid, where_clause, arena, params, &ctx, &mut |_| Ok(()),
+            storage, from, txid, where_clause, arena, params, &context, &mut |_| Ok(()),
         )?;
         if found {
             scratch.push((rowid, loc)).map_err(|_| {
@@ -3480,11 +3480,11 @@ fn bpchar_fit<'a>(
     }
     // Blank-pad to n characters (a space is one byte).
     let total = s.len() + (n - clen);
-    let buf = arena
+    let buffer = arena
         .alloc_slice_with(total, |_| b' ')
         .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "padded value too large"))?;
-    buf[..s.len()].copy_from_slice(s.as_bytes());
-    Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buf) }))
+    buffer[..s.len()].copy_from_slice(s.as_bytes());
+    Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buffer) }))
 }
 
 pub fn apply_typmod<'a>(

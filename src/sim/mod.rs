@@ -366,10 +366,10 @@ impl Sim {
             .map(|l| l.len())
             .max()
             .unwrap_or(0);
-        for idx in 0..max_len {
+        for index in 0..max_len {
             let mut chosen: Option<Committed> = None;
             for log in &self.committed_log {
-                if let Some(c) = log.get(idx) {
+                if let Some(c) = log.get(index) {
                     match chosen {
                         None => chosen = Some(*c),
                         Some(prev) => {
@@ -379,7 +379,7 @@ impl Sim {
                                 || prev.op != c.op
                             {
                                 return Some(format!(
-                                    "AGREEMENT VIOLATED at commit index {idx}: {prev:?} vs {c:?}"
+                                    "AGREEMENT VIOLATED at commit index {index}: {prev:?} vs {c:?}"
                                 ));
                             }
                         }

@@ -32,6 +32,13 @@ pub mod oid {
     pub const VARBIT: i32 = 1562;
     pub const BIT_ARRAY: i32 = 1561;
     pub const VARBIT_ARRAY: i32 = 1563;
+    // Multirange type OIDs (PostgreSQL 14+).
+    pub const INT4MULTIRANGE: i32 = 4451;
+    pub const NUMMULTIRANGE: i32 = 4532;
+    pub const TSMULTIRANGE: i32 = 4533;
+    pub const TSTZMULTIRANGE: i32 = 4534;
+    pub const DATEMULTIRANGE: i32 = 4535;
+    pub const INT8MULTIRANGE: i32 = 4536;
     /// PostgreSQL's pseudo-type for a string literal / parameter before its
     /// type is resolved from context.
     pub const UNKNOWN: i32 = 705;
@@ -80,6 +87,8 @@ pub enum ColType {
     /// `bit varying` / `varbit` (OID 1562). Length is enforced at cast time,
     /// not tracked here.
     Bit { varying: bool },
+    /// A multirange type (int4multirange/…), stored as canonical text.
+    Multirange(RangeKind),
 }
 
 impl ColType {
@@ -91,6 +100,9 @@ impl ColType {
         }
         if let Some(k) = RangeKind::from_name(name) {
             return Some(Self::Range(k));
+        }
+        if let Some(k) = RangeKind::from_multirange_name(name) {
+            return Some(Self::Multirange(k));
         }
         Some(match name {
             "bool" | "boolean" => Self::Bool,
@@ -149,6 +161,7 @@ impl ColType {
             Self::Range(k) => k.oid(),
             Self::Bit { varying: false } => oid::BIT,
             Self::Bit { varying: true } => oid::VARBIT,
+            Self::Multirange(k) => k.multirange_oid(),
         }
     }
 
@@ -160,7 +173,7 @@ impl ColType {
             Self::Interval => 16,
             Self::Uuid => 16,
             Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
-            Self::Array(_) | Self::Range(_) | Self::Bit { .. } => -1,
+            Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
         }
     }
 
@@ -201,6 +214,7 @@ impl ColType {
             Self::Range(k) => k.name(),
             Self::Bit { varying: false } => "bit",
             Self::Bit { varying: true } => "varbit",
+            Self::Multirange(k) => k.multirange_name(),
         }
     }
 
@@ -229,6 +243,7 @@ impl ColType {
             Self::Range(k) => k.name(),
             Self::Bit { varying: false } => "bit",
             Self::Bit { varying: true } => "bit varying",
+            Self::Multirange(k) => k.multirange_name(),
         }
     }
 }
@@ -429,6 +444,41 @@ impl RangeKind {
             _ => Self::Int4,
         }
     }
+    /// The multirange type name for this range subtype (`int4range` →
+    /// `int4multirange`).
+    pub fn multirange_name(self) -> &'static str {
+        match self {
+            Self::Int4 => "int4multirange",
+            Self::Int8 => "int8multirange",
+            Self::Num => "nummultirange",
+            Self::Date => "datemultirange",
+            Self::Ts => "tsmultirange",
+            Self::Tstz => "tstzmultirange",
+        }
+    }
+    /// The multirange type OID for this range subtype.
+    pub fn multirange_oid(self) -> i32 {
+        match self {
+            Self::Int4 => oid::INT4MULTIRANGE,
+            Self::Int8 => oid::INT8MULTIRANGE,
+            Self::Num => oid::NUMMULTIRANGE,
+            Self::Date => oid::DATEMULTIRANGE,
+            Self::Ts => oid::TSMULTIRANGE,
+            Self::Tstz => oid::TSTZMULTIRANGE,
+        }
+    }
+    /// Resolves a multirange type name to its range subtype.
+    pub fn from_multirange_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "int4multirange" => Self::Int4,
+            "int8multirange" => Self::Int8,
+            "nummultirange" => Self::Num,
+            "datemultirange" => Self::Date,
+            "tsmultirange" => Self::Ts,
+            "tstzmultirange" => Self::Tstz,
+            _ => return None,
+        })
+    }
 }
 
 /// A runtime value. Text borrows from the statement arena or storage.
@@ -465,6 +515,8 @@ pub enum Datum<'a> {
     /// the reported type: `false` = `bit(n)` (OID 1560), `true` = `varbit`
     /// (OID 1562).
     Bit { bits: &'a str, varying: bool },
+    /// A multirange value in canonical text form (e.g. `{[1,3),[5,7)}`, `{}`).
+    Multirange { text: &'a str, kind: RangeKind },
 }
 
 impl<'a> Datum<'a> {
@@ -494,6 +546,7 @@ impl<'a> Datum<'a> {
             Datum::Range { kind, .. } => kind.oid(),
             Datum::Bit { varying: false, .. } => oid::BIT,
             Datum::Bit { varying: true, .. } => oid::VARBIT,
+            Datum::Multirange { kind, .. } => kind.multirange_oid(),
         }
     }
 }
@@ -530,6 +583,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Json { text, .. } => f.write_str(text),
             Datum::Range { text, .. } => f.write_str(text),
             Datum::Bit { bits, .. } => f.write_str(bits),
+            Datum::Multirange { text, .. } => f.write_str(text),
             Datum::Array { element, raw } => super::array::write(f, *element, raw),
             Datum::Uuid(b) => {
                 for (i, byte) in b.iter().enumerate() {

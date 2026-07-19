@@ -25,7 +25,7 @@ pub fn encoded_len(values: &[Datum]) -> usize {
             Datum::Interval(_) => 16,
             Datum::Uuid(_) => 16,
             Datum::Text(s) => 4 + s.len(),
-            Datum::Json { text, .. } | Datum::Range { text, .. } => 4 + text.len(),
+            Datum::Json { text, .. } | Datum::Range { text, .. } | Datum::Multirange { text, .. } => 4 + text.len(),
             // 4-byte payload length, 1 flag byte (varying), then the bit chars.
             Datum::Bit { bits, .. } => 5 + bits.len(),
             Datum::Array { raw, .. } => 5 + raw.len(),
@@ -73,7 +73,7 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[4..4 + s.len()].copy_from_slice(s.as_bytes());
                 take = 4 + s.len();
             }
-            Datum::Json { text, .. } | Datum::Range { text, .. } => {
+            Datum::Json { text, .. } | Datum::Range { text, .. } | Datum::Multirange { text, .. } => {
                 rest[..4].copy_from_slice(&(text.len() as u32).to_le_bytes());
                 rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
                 take = 4 + text.len();
@@ -237,6 +237,15 @@ pub fn decode<'a>(
                 at += len;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Range { text: s, kind };
+            }
+            ColType::Multirange(kind) => {
+                let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                at += 4;
+                let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
+                at += len;
+                let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
+                out[i] = Datum::Multirange { text: s, kind };
             }
             ColType::Bit { varying } => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;

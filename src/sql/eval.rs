@@ -1304,6 +1304,10 @@ fn call<'a>(
                         super::range::lower_datum(text, kind, arena)
                     }
                 }
+                // On a multirange, the overall lower/upper bound.
+                Datum::Multirange { text, kind } => {
+                    super::range::multirange_bound(text, kind, name == "upper", arena)
+                }
                 Datum::Text(s) => {
                     let upper = name == "upper";
                     // Two passes: measure, then fill the arena slice.
@@ -1393,6 +1397,7 @@ fn call<'a>(
                 Datum::Range { kind, .. } => kind.name(),
                 Datum::Bit { varying: false, .. } => "bit",
                 Datum::Bit { varying: true, .. } => "bit varying",
+                Datum::Multirange { kind, .. } => kind.multirange_name(),
             }))
         }
         "trim" | "btrim" | "ltrim" | "rtrim" => {
@@ -2447,11 +2452,40 @@ fn call<'a>(
             };
             Ok(Datum::Range { text: super::range::construct(lo, hi, flags, kind, arena)?, kind })
         }
+        "int4multirange" | "int8multirange" | "nummultirange" | "datemultirange"
+        | "tsmultirange" | "tstzmultirange" => {
+            let kind = super::types::RangeKind::from_multirange_name(name).expect("matched a multirange name");
+            // Each argument is a range of the matching subtype; non-empty
+            // component texts are collected then canonicalized. A NULL argument
+            // makes the whole result NULL, matching PostgreSQL's strict
+            // multirange constructors.
+            let mut comps: [&str; super::range::MAX_MULTIRANGE] =
+                [""; super::range::MAX_MULTIRANGE];
+            let mut n = 0usize;
+            for arg in args.iter() {
+                match eval_full(arg, arena, params, row, hooks)? {
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Range { text, kind: k } if k == kind => {
+                        if !super::range::is_empty(text) {
+                            if n == super::range::MAX_MULTIRANGE {
+                                return Err(sql_err!("54000", "multirange has too many component ranges"));
+                            }
+                            comps[n] = text;
+                            n += 1;
+                        }
+                    }
+                    other => return Err(type_mismatch(name, &other)),
+                }
+            }
+            let text = super::range::canonicalize_multirange(&mut comps[..n], kind, arena)?;
+            Ok(Datum::Multirange { text, kind })
+        }
         "isempty" => {
             arity(1)?;
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Range { text, .. } => Ok(Datum::Bool(super::range::is_empty(text))),
+                Datum::Multirange { text, .. } => Ok(Datum::Bool(text.trim() == "{}")),
                 other => Err(type_mismatch(name, &other)),
             }
         }
@@ -3415,6 +3449,9 @@ fn binary<'a>(
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub | Mul | Div | Mod => match (l, r) {
+            (Datum::Multirange { .. }, _) | (_, Datum::Multirange { .. }) => {
+                multirange_setop(operator, l, r, arena)
+            }
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(operator, l, r, arena),
             _ => arithmetic(operator, l, r, l_unknown, r_unknown, arena),
         },
@@ -3428,6 +3465,11 @@ fn binary<'a>(
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_bitwise(operator, l, r, arena),
             _ => bitwise(operator, l, r),
         },
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent
+            if matches!(l, Datum::Multirange { .. }) || matches!(r, Datum::Multirange { .. }) =>
+        {
+            multirange_op(operator, l, r, arena)
+        }
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(operator, l, r),
         // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
         Like | ILike => {
@@ -3546,6 +3588,115 @@ fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), Sql
         Datum::Range { text, kind } => Ok((text, *kind)),
         other => Err(type_mismatch("range operator", other)),
     }
+}
+
+fn as_multirange<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), SqlError> {
+    match d {
+        Datum::Multirange { text, kind } => Ok((text, *kind)),
+        other => Err(type_mismatch("multirange operator", other)),
+    }
+}
+
+/// Views a range or multirange as multirange text (a range is wrapped as a
+/// one-element multirange), for operators that accept either.
+fn as_multirange_coerce<'a>(
+    d: &Datum<'a>,
+    arena: &'a Arena,
+) -> Result<(&'a str, super::types::RangeKind), SqlError> {
+    match d {
+        Datum::Multirange { text, kind } => Ok((text, *kind)),
+        Datum::Range { text, kind } => {
+            Ok((super::range::multirange_from_range(text, *kind, arena)?, *kind))
+        }
+        other => Err(type_mismatch("multirange operator", other)),
+    }
+}
+
+/// Multirange set operators returning a multirange: `+` (union), `-`
+/// (difference), `*` (intersection). Both operands must be multiranges of the
+/// same subtype.
+fn multirange_setop<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::range;
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let (lt, lk) = as_multirange(&l)?;
+    let (rt, rk) = as_multirange(&r)?;
+    if lk != rk {
+        return Err(range_mismatch());
+    }
+    let text = match operator {
+        BinaryOp::Add => range::multirange_union(lt, rt, lk, arena)?,
+        BinaryOp::Sub => range::multirange_difference(lt, rt, lk, arena)?,
+        BinaryOp::Mul => range::multirange_intersect(lt, rt, lk, arena)?,
+        _ => return Err(type_mismatch("multirange operator", &l)),
+    };
+    Ok(Datum::Multirange { text, kind: lk })
+}
+
+/// Multirange predicate operators: `@>` (contains), `<@` (contained by), `&&`
+/// (overlaps). `@>`/`<@` accept a multirange, a range, or a bare element on the
+/// contained side; `&&` accepts a multirange or a range on either side.
+fn multirange_op<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::range;
+    use BinaryOp::{ContainedBy, Contains, Overlaps};
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    match operator {
+        Contains => multirange_contains(l, r, arena),
+        ContainedBy => multirange_contains(r, l, arena),
+        Overlaps => {
+            let (lt, lk) = as_multirange_coerce(&l, arena)?;
+            let (rt, rk) = as_multirange_coerce(&r, arena)?;
+            if lk != rk {
+                return Err(range_mismatch());
+            }
+            Ok(Datum::Bool(range::multirange_overlaps(lt, rt, lk)?))
+        }
+        _ => Err(type_mismatch("multirange operator", &l)),
+    }
+}
+
+/// Whether `container` (a multirange) holds `contained` — a multirange, a range,
+/// or a bare element.
+fn multirange_contains<'a>(
+    container: Datum<'a>,
+    contained: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::range;
+    let (ct, ck) = as_multirange(&container)?;
+    let held = match contained {
+        Datum::Multirange { text, kind } => {
+            if kind != ck {
+                return Err(range_mismatch());
+            }
+            range::multirange_contains_multirange(ct, text, ck, arena)?
+        }
+        Datum::Range { text, kind } => {
+            if kind != ck {
+                return Err(range_mismatch());
+            }
+            let mr = range::multirange_from_range(text, ck, arena)?;
+            range::multirange_contains_multirange(ct, mr, ck, arena)?
+        }
+        element => {
+            let element_text = stack_format!(64, "{}", element);
+            range::multirange_contains_elem(ct, ck, element_text.as_str())?
+        }
+    };
+    Ok(Datum::Bool(held))
 }
 
 /// Integer bitwise operators (`& | # << >>`). Both operands must be integers.
@@ -3973,6 +4124,17 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
                 ));
             }
             super::range::cmp_ranges(a, b, *ka)?
+        }
+        (Datum::Multirange { text: a, kind: ka }, Datum::Multirange { text: b, kind: kb }) => {
+            if ka != kb {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} = {}",
+                    ka.multirange_name(),
+                    kb.multirange_name()
+                ));
+            }
+            super::range::cmp_multiranges(a, b, *ka)?
         }
         // Numeric vs integer: compare exactly via numeric.
         (Datum::Numeric(_), Datum::Int4(_) | Datum::Int8(_))
@@ -4480,6 +4642,17 @@ pub fn cast_to<'a>(
             Datum::Int8(x) => Datum::Bit { bits: int_to_bits(x as u64, 64, arena)?, varying },
             _ => return Err(cast_unsupported(&v, "bit")),
         },
+        ColType::Multirange(kind) => match v {
+            Datum::Multirange { kind: k, .. } if k == kind => v,
+            // A range promotes to a one-element multirange (empty range → {}).
+            Datum::Range { text, kind: k } if k == kind => {
+                Datum::Multirange { text: super::range::multirange_from_range(text, kind, arena)?, kind }
+            }
+            Datum::Text(s) => {
+                Datum::Multirange { text: super::range::parse_multirange(s, kind, arena)?, kind }
+            }
+            _ => return Err(cast_unsupported(&v, kind.multirange_name())),
+        },
     };
     Ok(out)
 }
@@ -4773,6 +4946,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Range { kind, .. } => kind.name(),
         Datum::Bit { varying: false, .. } => "bit",
         Datum::Bit { varying: true, .. } => "bit varying",
+        Datum::Multirange { kind, .. } => kind.multirange_name(),
     }
 }
 

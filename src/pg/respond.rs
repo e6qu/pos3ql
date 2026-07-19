@@ -397,9 +397,9 @@ impl<'b> Responder<'b> {
                     }
                     m.bytes(text.as_bytes());
                 }
-                Datum::Range { text, .. } => {
-                    // The binary range wire format is elaborate; send the
-                    // canonical text (correct for the common text-format path).
+                Datum::Range { text, .. } | Datum::Multirange { text, .. } => {
+                    // The binary range/multirange wire format is elaborate; send
+                    // the canonical text (correct for the common text path).
                     m.i32(text.len() as i32);
                     m.bytes(text.as_bytes());
                 }

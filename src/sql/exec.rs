@@ -2365,6 +2365,12 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::JSONB => ColType::Jsonb,
         oid::UUID => ColType::Uuid,
         oid::BYTEA => ColType::Bytea,
+        oid::INT4MULTIRANGE => ColType::Multirange(super::types::RangeKind::Int4),
+        oid::INT8MULTIRANGE => ColType::Multirange(super::types::RangeKind::Int8),
+        oid::NUMMULTIRANGE => ColType::Multirange(super::types::RangeKind::Num),
+        oid::DATEMULTIRANGE => ColType::Multirange(super::types::RangeKind::Date),
+        oid::TSMULTIRANGE => ColType::Multirange(super::types::RangeKind::Ts),
+        oid::TSTZMULTIRANGE => ColType::Multirange(super::types::RangeKind::Tstz),
         oid::BIT => ColType::Bit { varying: false },
         oid::VARBIT => ColType::Bit { varying: true },
         // `"char"` (internal single-byte) and `name` appear in catalog columns;
@@ -2424,9 +2430,13 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // though we desugar it to a `similar_to(...)` call internally.
         Expr::Call { name: "similar_to", .. } => None,
         Expr::Call { name, .. } => Some(name),
-        Expr::Cast { type_name, .. } => {
-            ColType::from_sql_name(type_name).map(ColType::internal_name)
-        }
+        // A cast keeps its operand's name when the operand is a column or
+        // function call (`count(*)::int` → `count`); otherwise it takes the
+        // target type's name (`'x'::int` → `int4`), matching PostgreSQL.
+        Expr::Cast { operand, type_name, .. } => match operand {
+            Expr::Column { .. } | Expr::Call { .. } => name_of(operand),
+            _ => ColType::from_sql_name(type_name).map(ColType::internal_name),
+        },
         Expr::Case { otherwise: Some(e), .. } => name_of(e),
         _ => None,
     }
@@ -2478,6 +2488,10 @@ impl ColTypeResolver for DefCols<'_> {
 /// Whether an OID names a range type (so range operators apply).
 fn is_range_oid(oid: i32) -> bool {
     matches!(coltype_of_oid(oid), Some(ColType::Range(_)))
+}
+
+fn is_multirange_oid(oid: i32) -> bool {
+    matches!(coltype_of_oid(oid), Some(ColType::Multirange(_)))
 }
 
 fn comparable(a: ColType, b: ColType) -> bool {
@@ -2550,6 +2564,11 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 And | Or | Like | ILike => of(ColType::Bool),
                 Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
                     of(ColType::Bool)
+                }
+                // Multirange set operators (`+`/`-`/`*`) return a multirange of
+                // the same subtype.
+                Add | Sub | Mul if is_multirange_oid(lo) || is_multirange_oid(ro) => {
+                    (if is_multirange_oid(lo) { lo } else { ro }, -1)
                 }
                 // Range set operators (`+`/`-`/`*` on ranges) return a range of
                 // the same type; shifts on ranges (`<<`/`>>`) return boolean.
@@ -2940,6 +2959,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
                 of(ColType::Range(super::types::RangeKind::from_name(name).expect("range name")))
             }
+            "int4multirange" | "int8multirange" | "nummultirange" | "datemultirange"
+            | "tsmultirange" | "tstzmultirange" => of(ColType::Multirange(
+                super::types::RangeKind::from_multirange_name(name).expect("multirange name"),
+            )),
             "similar_to" | "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => of(ColType::Bool),
             "range_merge" => {
                 // Same range type as its arguments.
@@ -2952,7 +2975,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 // A range argument yields its element type; otherwise text.
                 match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {
                     Some(o) => match coltype_of_oid(o) {
-                        Some(ColType::Range(kind)) => of(kind.elem_type()),
+                        Some(ColType::Range(kind)) | Some(ColType::Multirange(kind)) => {
+                            of(kind.elem_type())
+                        }
                         _ => (oid::TEXT, -1),
                     },
                     None => (oid::TEXT, -1),
@@ -3082,6 +3107,8 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
             Datum::Range { text, .. } => 5 + text.len(),
             // varying(1) + len(4) + bits
             Datum::Bit { bits, .. } => 5 + bits.len(),
+            // kind(1) + len(4) + text
+            Datum::Multirange { text, .. } => 5 + text.len(),
         };
     }
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
@@ -3203,6 +3230,13 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
                 out[at + 6..at + 6 + bits.len()].copy_from_slice(bits.as_bytes());
                 at += 6 + bits.len();
             }
+            Datum::Multirange { text, kind } => {
+                out[at] = 18;
+                out[at + 1] = kind.code();
+                out[at + 2..at + 6].copy_from_slice(&(text.len() as u32).to_le_bytes());
+                out[at + 6..at + 6 + text.len()].copy_from_slice(text.as_bytes());
+                at += 6 + text.len();
+            }
         }
     }
     Ok(&*out)
@@ -3289,6 +3323,12 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
                 let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
                 let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
                 (Datum::Bit { bits: s, varying }, 5 + len)
+            }
+            18 => {
+                let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
+                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+                let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+                (Datum::Multirange { text: s, kind }, 5 + len)
             }
             9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
             10 => {

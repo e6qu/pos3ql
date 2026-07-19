@@ -427,7 +427,7 @@ fn encoded_payload_len(op: &WalOp) -> usize {
             // checks
             n += 1;
             for check in def.checks() {
-                n += 1 + check.name.as_str().len() + 2 + check.expr.as_str().len();
+                n += 1 + check.name.as_str().len() + 2 + check.expression.as_str().len();
             }
             // foreign keys
             n += 1;
@@ -483,7 +483,7 @@ fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
             ok &= buffer.append(&[def.n_checks as u8]);
             for check in def.checks() {
                 ok &= name_bytes(buffer, check.name.as_str());
-                let e = check.expr.as_str();
+                let e = check.expression.as_str();
                 ok &= buffer.append(&(e.len() as u16).to_le_bytes());
                 ok &= buffer.append(e.as_bytes());
             }
@@ -637,8 +637,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let text = core::str::from_utf8(raw).ok()?;
                 let mut check = CheckConstraint::EMPTY;
                 check.name = SqlName::parse(cname).ok()?;
-                core::fmt::Write::write_str(&mut check.expr, text).ok()?;
-                if check.expr.is_truncated() {
+                core::fmt::Write::write_str(&mut check.expression, text).ok()?;
+                if check.expression.is_truncated() {
                     return None;
                 }
                 def.checks[k] = check;
@@ -1000,7 +1000,7 @@ mod tests {
         def.n_uniques = 1;
         let mut check = CheckConstraint::EMPTY;
         check.name = SqlName::parse("t_check").unwrap();
-        core::fmt::Write::write_str(&mut check.expr, "id > 0").unwrap();
+        core::fmt::Write::write_str(&mut check.expression, "id > 0").unwrap();
         def.checks[0] = check;
         def.n_checks = 1;
         let mut fk = ForeignKey::EMPTY;

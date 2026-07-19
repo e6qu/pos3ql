@@ -167,8 +167,8 @@ fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, SqlError> {
     };
     let default_value = match c.default {
         None => None,
-        Some(expr) => {
-            let v = eval(expr, arena, super::eval::NO_PARAMS, &NoColumns).map_err(|_| {
+        Some(expression) => {
+            let v = eval(expression, arena, super::eval::NO_PARAMS, &NoColumns).map_err(|_| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "DEFAULT must be a constant expression"
@@ -234,8 +234,8 @@ fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_INDEX_COLS]
 /// Validates that every column reference in a CHECK predicate names a real
 /// column of the table being defined, and that the predicate uses no subquery
 /// (which PostgreSQL forbids in CHECK).
-fn validate_check_refs(expr: &Expr, def: &TableDef) -> Result<(), SqlError> {
-    match expr {
+fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError> {
+    match expression {
         Expr::Column { name, .. } => {
             if def.column_index(name).is_none() {
                 return Err(sql_err!(
@@ -358,8 +358,8 @@ fn attach_constraints(
                     add_unique_key(def, *name, "key", &idxs, n, false)?;
                 }
             }
-            TableConstraint::Check { name, expr, text } => {
-                validate_check_refs(expr, def)?;
+            TableConstraint::Check { name, expression, text } => {
+                validate_check_refs(expression, def)?;
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -380,9 +380,9 @@ fn attach_constraints(
                         stack_format!(64, "{}_check", def.name.as_str()).as_str(),
                     )?,
                 };
-                let mut c = CheckConstraint { name: cname, expr: crate::util::StackStr::new() };
-                let _ = core::fmt::Write::write_str(&mut c.expr, text);
-                if c.expr.is_truncated() {
+                let mut c = CheckConstraint { name: cname, expression: crate::util::StackStr::new() };
+                let _ = core::fmt::Write::write_str(&mut c.expression, text);
+                if c.expression.is_truncated() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "CHECK predicate is too long"
@@ -781,7 +781,7 @@ fn handle_conflict(
         }
         let mut new_values = [Datum::Null; MAX_COLUMNS];
         new_values[..def.n_columns].copy_from_slice(&existing[..def.n_columns]);
-        for (name, expr) in assigns {
+        for (name, expression) in assigns {
             let Some(target) = def.column_index(name) else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
@@ -790,7 +790,7 @@ fn handle_conflict(
                     def.name.as_str()
                 ));
             };
-            let v = eval(expr, arena, params, &context)?;
+            let v = eval(expression, arena, params, &context)?;
             new_values[target] = coerce(v, &def.columns()[target], arena)?;
         }
         check_not_null(def, &new_values)?;
@@ -1024,7 +1024,7 @@ type ParsedChecks<'a> = [Option<&'a Expr<'a>>; crate::storage::MAX_CHECKS];
 fn parse_checks<'a>(def: &'a TableDef, arena: &'a Arena) -> Result<ParsedChecks<'a>, SqlError> {
     let mut out: ParsedChecks<'a> = [None; crate::storage::MAX_CHECKS];
     for (i, c) in def.checks().iter().enumerate() {
-        out[i] = Some(super::parser::parse_expr(c.expr.as_str(), arena)?);
+        out[i] = Some(super::parser::parse_expr(c.expression.as_str(), arena)?);
     }
     Ok(out)
 }
@@ -1061,8 +1061,8 @@ fn check_row_checks(
 ) -> Result<(), SqlError> {
     let context = RowCtx { def, values };
     for (i, c) in def.checks().iter().enumerate() {
-        let Some(expr) = checks[i] else { continue };
-        if matches!(eval(expr, arena, params, &context)?, Datum::Bool(false)) {
+        let Some(expression) = checks[i] else { continue };
+        if matches!(eval(expression, arena, params, &context)?, Datum::Bool(false)) {
             return Err(sql_err!(
                 "23514",
                 "new row for relation \"{}\" violates check constraint \"{}\"",
@@ -1680,11 +1680,11 @@ pub fn insert(
                 values[i] = d.as_datum();
             }
         }
-        for (i, expr) in row_exprs.iter().enumerate() {
-            if matches!(expr, Expr::DefaultMarker) {
+        for (i, expression) in row_exprs.iter().enumerate() {
+            if matches!(expression, Expr::DefaultMarker) {
                 continue; // keep the default already in place
             }
-            let v = match eval(expr, arena, params, &NoColumns) {
+            let v = match eval(expression, arena, params, &NoColumns) {
                 Ok(v) => v,
                 Err(e) => return sql_fail(e),
             };
@@ -1758,7 +1758,7 @@ fn emit_projected(
                     n += 1;
                 }
             }
-            SelectItem::Expr { expr, .. } => match eval(expr, arena, params, &context) {
+            SelectItem::Expr { expression, .. } => match eval(expression, arena, params, &context) {
                 Ok(v) => {
                     projected[n] = v;
                     n += 1;
@@ -1854,8 +1854,8 @@ pub fn update(
                 let r = super::query::first_from_match(
                     storage, from, txn.txid, statement.where_clause, arena, params, &context,
                     &mut |combined| {
-                        for (a, (_, expr)) in statement.assignments.iter().enumerate() {
-                            let v = eval(expr, arena, params, &combined)?;
+                        for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                            let v = eval(expression, arena, params, &combined)?;
                             new_values[targets[a]] = coerce(v, &def.columns()[targets[a]], arena)?;
                         }
                         Ok(())
@@ -1869,8 +1869,8 @@ pub fn update(
                     return sql_fail(e);
                 }
             } else {
-                for (a, (_, expr)) in statement.assignments.iter().enumerate() {
-                    let v = match eval(expr, arena, params, &context) {
+                for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                    let v = match eval(expression, arena, params, &context) {
                         Ok(v) => v,
                         Err(e) => return sql_fail(e),
                     };
@@ -2326,15 +2326,15 @@ pub fn describe_items<'q>(
                     push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
                 }
             }
-            SelectItem::Expr { expr, alias } => {
-                let (mut type_oid, mut typlen) = infer_type_pub(expr, def)?;
+            SelectItem::Expr { expression, alias } => {
+                let (mut type_oid, mut typlen) = infer_type_pub(expression, def)?;
                 // A bare unknown (string literal / param) resolves to text
                 // for output, as PostgreSQL does.
                 if type_oid == oid::UNKNOWN {
                     type_oid = oid::TEXT;
                     typlen = -1;
                 }
-                let name = alias.unwrap_or(derived_name(expr));
+                let name = alias.unwrap_or(derived_name(expression));
                 push(ColDesc::new(name, type_oid, typlen))?;
             }
         }
@@ -2414,8 +2414,8 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// A specific output name for an expression, if it has one (parse_target.c
 /// FigureColnameInternal): a column ref, a function call, a cast (the type
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
-fn name_of<'a>(expr: &Expr<'a>) -> Option<&'a str> {
-    match expr {
+fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
+    match expression {
         Expr::Column { name, .. } => Some(name),
         Expr::Call { name, .. } => Some(name),
         Expr::Cast { type_name, .. } => {
@@ -2428,11 +2428,11 @@ fn name_of<'a>(expr: &Expr<'a>) -> Option<&'a str> {
 
 /// PostgreSQL's output-column name for a SELECT-list expression: `name_of`
 /// with the per-node fallback ("case" for a CASE, else "?column?").
-pub fn derived_name<'a>(expr: &Expr<'a>) -> &'a str {
-    if let Some(n) = name_of(expr) {
+pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
+    if let Some(n) = name_of(expression) {
         return n;
     }
-    match expr {
+    match expression {
         Expr::Case { .. } => "case",
         _ => "?column?",
     }
@@ -2494,10 +2494,10 @@ fn operator_undefined(l: ColType, op: &str, r: ColType) -> SqlError {
     )
 }
 
-pub fn infer_type_pub(expr: &Expr, def: Option<&TableDef>) -> Result<(i32, i16), SqlError> {
+pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32, i16), SqlError> {
     match def {
-        Some(d) => infer_type_res(expr, &DefCols(d)),
-        None => infer_type_res(expr, &NoCols),
+        Some(d) => infer_type_res(expression, &DefCols(d)),
+        None => infer_type_res(expression, &NoCols),
     }
 }
 
@@ -2505,9 +2505,9 @@ pub fn infer_type_pub(expr: &Expr, def: Option<&TableDef>) -> Result<(i32, i16),
 /// PostgreSQL's plan-time analysis: comparisons and arithmetic over
 /// incompatible types raise 42883 here, before any row is scanned. String
 /// literals and parameters are UNKNOWN and coerce to the other operand.
-pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i16), SqlError> {
+pub fn infer_type_res(expression: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
-    Ok(match expr {
+    Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {
@@ -2935,10 +2935,10 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
 }
 
 pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -> Result<u64, SqlError> {
-    let Some(expr) = offset else {
+    let Some(expression) = offset else {
         return Ok(0);
     };
-    match eval(expr, arena, params, &NoColumns)? {
+    match eval(expression, arena, params, &NoColumns)? {
         Datum::Null => Ok(0),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
@@ -2954,7 +2954,7 @@ pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -
 
 /// ORDER BY <n> refers to the n-th select item, as in PostgreSQL.
 pub fn resolve_order_expr_pub<'a>(
-    expr: &'a Expr<'a>,
+    expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
 ) -> Result<&'a Expr<'a>, SqlError> {
     // An unqualified name that matches a SELECT-list output column binds to
@@ -2963,10 +2963,10 @@ pub fn resolve_order_expr_pub<'a>(
     // is ambiguous (42702), matching PostgreSQL's findTargetlistEntrySQL92 —
     // e.g. `SELECT (CASE .. ELSE b END), b ... ORDER BY b`, where the CASE
     // inherits the name `b` from its ELSE column.
-    if let Expr::Column { qualifier: None, name } = expr {
+    if let Expr::Column { qualifier: None, name } = expression {
         let mut found: Option<&'a Expr<'a>> = None;
         for item in items {
-            if let SelectItem::Expr { expr: item_expr, alias } = item {
+            if let SelectItem::Expr { expression: item_expr, alias } = item {
                 let out_name = alias.unwrap_or(derived_name(item_expr));
                 if out_name == *name {
                     match found {
@@ -2990,8 +2990,8 @@ pub fn resolve_order_expr_pub<'a>(
             return Ok(item_expr);
         }
     }
-    let Expr::Int(n) = expr else {
-        return Ok(expr);
+    let Expr::Int(n) = expression else {
+        return Ok(expression);
     };
     let idx = *n;
     if idx < 1 || idx as usize > items.len() {
@@ -3002,7 +3002,7 @@ pub fn resolve_order_expr_pub<'a>(
         ));
     }
     match &items[idx as usize - 1] {
-        SelectItem::Expr { expr, .. } => Ok(expr),
+        SelectItem::Expr { expression, .. } => Ok(expression),
         SelectItem::Wildcard => Err(sql_err!(
             "42P10",
             "ORDER BY position cannot reference *"
@@ -3266,10 +3266,10 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
 }
 
 pub fn eval_limit_pub(limit: Option<&Expr>, arena: &Arena, params: &[Datum]) -> Result<u64, SqlError> {
-    let Some(expr) = limit else {
+    let Some(expression) = limit else {
         return Ok(u64::MAX);
     };
-    match eval(expr, arena, params, &NoColumns)? {
+    match eval(expression, arena, params, &NoColumns)? {
         Datum::Null => Ok(u64::MAX),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),

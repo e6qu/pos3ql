@@ -662,12 +662,12 @@ impl Engine {
     fn infer_where_params(
         &self,
         table: &str,
-        expr: &Expr,
+        expression: &Expr,
         txid: u32,
         oids: &mut [i32; MAX_BIND_PARAMS],
     ) {
         use ast::BinaryOp::*;
-        if let Expr::Binary { op, left, right } = expr {
+        if let Expr::Binary { op, left, right } = expression {
             match op {
                 And | Or => {
                     self.infer_where_params(table, left, txid, oids);
@@ -2225,7 +2225,7 @@ mod tests {
 
     #[test]
     fn expandarray_and_composite_field_access() {
-        // `_pg_expandarray` (set-returning) + `(expr).n/.x` composite access,
+        // `_pg_expandarray` (set-returning) + `(expression).n/.x` composite access,
         // driving JDBC getPrimaryKeys. A single-column PK expands to one row.
         let (mut e, mut b) = test_engine();
         let mut t = TxnState::new(&mut b, 256).unwrap();

@@ -151,12 +151,12 @@ pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     windows: None, catalog: None, srf_index: None };
 
 pub fn eval<'a>(
-    expr: &Expr<'a>,
+    expression: &Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    eval_full(expr, arena, params, row, &NO_HOOKS)
+    eval_full(expression, arena, params, row, &NO_HOOKS)
 }
 
 /// Surfaces errors from every maximal constant subexpression, as
@@ -164,8 +164,8 @@ pub fn eval<'a>(
 /// `... OR 0.0/0.0 > 1` error even when no row would reach them. Constant
 /// subtrees are evaluated once here; per-row evaluation (with short-circuit)
 /// handles the rest.
-pub fn check_constant_errors<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
-    fold_check(expr, arena).map(|_| ())
+pub fn check_constant_errors<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+    fold_check(expression, arena).map(|_| ())
 }
 
 /// The simplification-aware core of [`check_constant_errors`], mirroring
@@ -176,16 +176,16 @@ pub fn check_constant_errors<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<()
 /// `... WHERE FALSE AND (id > (-1 % 0))` to no rows, never folding `-1 % 0`).
 /// Returns the folded boolean value when the expression provably reduces to
 /// one, else `None`.
-fn fold_check<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, SqlError> {
+fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, SqlError> {
     use super::ast::BinaryOp;
-    if expr.is_constant() {
+    if expression.is_constant() {
         // A fully-constant subtree folds eagerly; its error surfaces here.
-        return Ok(match eval(expr, arena, NO_PARAMS, &NoColumns)? {
+        return Ok(match eval(expression, arena, NO_PARAMS, &NoColumns)? {
             Datum::Bool(b) => Some(b),
             _ => None,
         });
     }
-    match expr {
+    match expression {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
         | Expr::NumericLit(_) | Expr::Str(_) | Expr::Column { .. }
         | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
@@ -303,7 +303,7 @@ fn fold_check<'a>(expr: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, Sql
 }
 
 pub fn eval_full<'a>(
-    expr: &Expr<'a>,
+    expression: &Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -313,12 +313,12 @@ pub fn eval_full<'a>(
     // evaluates to the group's value.
     if let Some((exprs, values)) = hooks.group {
         for (g, v) in exprs.iter().zip(values) {
-            if **g == *expr {
+            if **g == *expression {
                 return Ok(*v);
             }
         }
     }
-    match *expr {
+    match *expression {
         Expr::Null => Ok(Datum::Null),
         Expr::Bool(b) => Ok(Datum::Bool(b)),
         Expr::Int(v) => Ok(if let Ok(small) = i32::try_from(v) {
@@ -424,14 +424,14 @@ pub fn eval_full<'a>(
                 && let Some((nodes, values)) = hooks.windows
             {
                 for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
             }
             if let Some((nodes, values)) = hooks.aggs {
                 for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
@@ -565,7 +565,7 @@ pub fn eval_full<'a>(
         Expr::Subquery(_) | Expr::ArraySubquery(_) => {
             if let Some(subs) = hooks.subs {
                 for (node, v) in subs.scalars {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
@@ -584,7 +584,7 @@ pub fn eval_full<'a>(
             };
             let mut found: Option<(&[Datum], bool, Datum)> = None;
             for (node, list, saw_null, witness) in subs.lists {
-                if core::ptr::eq(*node, expr as *const _) {
+                if core::ptr::eq(*node, expression as *const _) {
                     found = Some((list, *saw_null, *witness));
                     break;
                 }
@@ -628,7 +628,7 @@ pub fn eval_full<'a>(
             // node identity, alongside scalar subqueries.
             if let Some(subs) = hooks.subs {
                 for (node, v) in subs.scalars {
-                    if core::ptr::eq(*node, expr as *const _) {
+                    if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
                 }
@@ -3182,8 +3182,8 @@ fn unary<'a>(op: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
 /// A string literal or a parameter is PostgreSQL's "unknown" type, which
 /// coerces to whatever it is compared/combined with. A real typed value
 /// (column, function result, cast) does not.
-fn is_unknown_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Str(_) | Expr::Param(_))
+fn is_unknown_literal(expression: &Expr) -> bool {
+    matches!(expression, Expr::Str(_) | Expr::Param(_))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4424,8 +4424,8 @@ mod tests {
         let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
             panic!()
         };
-        let SelectItem::Expr { expr, .. } = s.items[0] else { panic!() };
-        eval(expr, arena, NO_PARAMS, &NoColumns)
+        let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
+        eval(expression, arena, NO_PARAMS, &NoColumns)
     }
 
     fn with_arena(f: impl FnOnce(&Arena)) {

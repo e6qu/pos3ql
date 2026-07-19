@@ -340,13 +340,13 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("chk name missing"))?;
                     let hexpr = words
                         .next()
-                        .ok_or(CheckpointSetupError::Corrupt("chk expr missing"))?;
+                        .ok_or(CheckpointSetupError::Corrupt("chk expression missing"))?;
                     let mut check = crate::storage::CheckConstraint::EMPTY;
                     check.name = sql_name(&decode_hex_name(hname)?)?;
-                    let expr = decode_hex_name(hexpr)?;
+                    let expression = decode_hex_name(hexpr)?;
                     use core::fmt::Write;
-                    let _ = write!(check.expr, "{expr}");
-                    if check.expr.is_truncated() {
+                    let _ = write!(check.expression, "{expression}");
+                    if check.expression.is_truncated() {
                         return Err(CheckpointSetupError::Corrupt("chk predicate too long"));
                     }
                     let i = def.n_checks;
@@ -685,7 +685,7 @@ impl Checkpointer {
                     let _ = write!(hname, "{b:02x}");
                 }
                 let mut hexpr = StackStr::<{ 2 * crate::storage::CHECK_SQL_MAX }>::new();
-                for b in check.expr.as_str().as_bytes() {
+                for b in check.expression.as_str().as_bytes() {
                     let _ = write!(hexpr, "{b:02x}");
                 }
                 write_manifest(

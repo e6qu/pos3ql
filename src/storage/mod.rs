@@ -270,13 +270,13 @@ impl UniqueKey {
 #[derive(Debug, Clone, Copy)]
 pub struct CheckConstraint {
     pub name: SqlName,
-    pub expr: StackStr<CHECK_SQL_MAX>,
+    pub expression: StackStr<CHECK_SQL_MAX>,
 }
 
 impl CheckConstraint {
     pub const EMPTY: Self = CheckConstraint {
         name: SqlName::EMPTY,
-        expr: StackStr::new(),
+        expression: StackStr::new(),
     };
 }
 

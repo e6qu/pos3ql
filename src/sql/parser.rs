@@ -105,11 +105,11 @@ pub fn parse_expr<'a>(
         message: crate::stack_format!(192, "invalid expression: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
-    let expr = parser.expr(0).map_err(|e| to_sql(e.message.as_str()))?;
+    let expression = parser.expression(0).map_err(|e| to_sql(e.message.as_str()))?;
     if parser.peeked != Tok::Eof {
         return Err(to_sql("trailing tokens after expression"));
     }
-    Ok(expr)
+    Ok(expression)
 }
 
 impl<'a> Parser<'a> {
@@ -279,9 +279,9 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 SelectItem::Wildcard
             } else {
-                let expr = self.expr(0)?;
+                let expression = self.expression(0)?;
                 let alias = self.alias()?;
-                SelectItem::Expr { expr, alias }
+                SelectItem::Expr { expression, alias }
             };
             n += 1;
             if !self.eat_op(",")? {
@@ -328,7 +328,7 @@ impl<'a> Parser<'a> {
                 if n_group == MAX_LIST {
                     return Err(self.limit("GROUP BY list", MAX_LIST));
                 }
-                group_exprs[n_group] = self.expr(0)?;
+                group_exprs[n_group] = self.expression(0)?;
                 n_group += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -337,7 +337,7 @@ impl<'a> Parser<'a> {
         }
         let group_by = self.arena_slice(&group_exprs[..n_group])?;
         let having = if self.eat_ident("having")? {
-            Some(self.expr(0)?)
+            Some(self.expression(0)?)
         } else {
             None
         };
@@ -361,7 +361,7 @@ impl<'a> Parser<'a> {
     fn order_limit(
         &mut self,
     ) -> Result<(&'a [OrderBy<'a>], Option<&'a Expr<'a>>, Option<&'a Expr<'a>>), ParseError> {
-        let mut order = [OrderBy { expr: &Expr::Null, descending: false, nulls_first: false }; MAX_LIST];
+        let mut order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false }; MAX_LIST];
         let mut n_order = 0;
         if self.eat_ident("order")? {
             self.expect_ident("by")?;
@@ -369,7 +369,7 @@ impl<'a> Parser<'a> {
                 if n_order == MAX_LIST {
                     return Err(self.limit("order by list", MAX_LIST));
                 }
-                let expr = self.expr(0)?;
+                let expression = self.expression(0)?;
                 let descending = if self.eat_ident("desc")? {
                     true
                 } else {
@@ -388,7 +388,7 @@ impl<'a> Parser<'a> {
                 } else {
                     descending
                 };
-                order[n_order] = OrderBy { expr, descending, nulls_first };
+                order[n_order] = OrderBy { expression, descending, nulls_first };
                 n_order += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -401,9 +401,9 @@ impl<'a> Parser<'a> {
         let mut offset = None;
         loop {
             if limit.is_none() && self.eat_ident("limit")? {
-                limit = Some(self.expr(0)?);
+                limit = Some(self.expression(0)?);
             } else if offset.is_none() && self.eat_ident("offset")? {
-                offset = Some(self.expr(0)?);
+                offset = Some(self.expression(0)?);
                 // Accept the noise words ROW/ROWS.
                 let _ = self.eat_ident("rows")? || self.eat_ident("row")?;
             } else {
@@ -565,7 +565,7 @@ impl<'a> Parser<'a> {
                     if n == MAX_LIST {
                         return Err(self.limit("VALUES columns", MAX_LIST));
                     }
-                    items[n] = SelectItem::Expr { expr: self.expr(0)?, alias: None };
+                    items[n] = SelectItem::Expr { expression: self.expression(0)?, alias: None };
                     n += 1;
                     if !self.eat_op(",")? {
                         break;
@@ -676,7 +676,7 @@ impl<'a> Parser<'a> {
                     if n == MAX_LIST {
                         return Err(self.limit("function arguments", MAX_LIST));
                     }
-                    args[n] = self.expr(0)?;
+                    args[n] = self.expression(0)?;
                     n += 1;
                     if !self.eat_op(",")? {
                         break;
@@ -812,7 +812,7 @@ impl<'a> Parser<'a> {
                 acc
             } else {
                 self.expect_ident("on")?;
-                Some(self.expr(0)?)
+                Some(self.expression(0)?)
             };
             joins[n] = Join { table, kind, on };
             n += 1;
@@ -851,7 +851,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("null")? {
                     not_null = false;
                 } else if self.eat_ident("default")? {
-                    default = Some(self.expr(0)?);
+                    default = Some(self.expression(0)?);
                 } else if self.eat_ident("unique")? {
                     unique = true;
                 } else {
@@ -918,7 +918,7 @@ impl<'a> Parser<'a> {
                     if n == MAX_LIST {
                         return Err(self.limit("EXECUTE arguments", MAX_LIST));
                     }
-                    args[n] = self.expr(0)?;
+                    args[n] = self.expression(0)?;
                     n += 1;
                     if !self.eat_op(",")? {
                         break;
@@ -1082,7 +1082,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("null")? {
                     not_null = false;
                 } else if self.eat_ident("default")? {
-                    default = Some(self.expr(0)?);
+                    default = Some(self.expression(0)?);
                 } else if self.eat_ident("unique")? {
                     unique = true;
                 } else if self.eat_ident("primary")? {
@@ -1171,11 +1171,11 @@ impl<'a> Parser<'a> {
     fn check_constraint(&mut self, name: Option<&'a str>) -> Result<TableConstraint<'a>, ParseError> {
         self.expect_op("(")?;
         let start = self.peek_at;
-        let expr = self.expr(0)?;
+        let expression = self.expression(0)?;
         let text = self.text[start..self.peek_at].trim_end();
         let text = self.arena_str(text)?;
         self.expect_op(")")?;
-        Ok(TableConstraint::Check { name, expr, text })
+        Ok(TableConstraint::Check { name, expression, text })
     }
 
     /// The part of a FOREIGN KEY after `REFERENCES`: parent table, optional
@@ -1295,7 +1295,7 @@ impl<'a> Parser<'a> {
                     if n == MAX_LIST {
                         return Err(self.limit("VALUES row", MAX_LIST));
                     }
-                    row[n] = self.expr(0)?;
+                    row[n] = self.expression(0)?;
                     n += 1;
                     if !self.eat_op(",")? {
                         break;
@@ -1357,7 +1357,7 @@ impl<'a> Parser<'a> {
                 }
                 let col = self.any_ident("column name")?;
                 self.expect_op("=")?;
-                let val = self.expr(0)?;
+                let val = self.expression(0)?;
                 assigns[na] = (col, val);
                 na += 1;
                 if !self.eat_op(",")? {
@@ -1365,7 +1365,7 @@ impl<'a> Parser<'a> {
                 }
             }
             let where_clause = if self.eat_ident("where")? {
-                Some(self.expr(0)?)
+                Some(self.expression(0)?)
             } else {
                 None
             };
@@ -1391,7 +1391,7 @@ impl<'a> Parser<'a> {
             }
             let col = self.any_ident("column name")?;
             self.expect_op("=")?;
-            let value = self.expr(0)?;
+            let value = self.expression(0)?;
             assignments[n] = (col, value);
             n += 1;
             if !self.eat_op(",")? {
@@ -1432,14 +1432,14 @@ impl<'a> Parser<'a> {
 
     fn where_clause(&mut self) -> Result<Option<&'a Expr<'a>>, ParseError> {
         if self.eat_ident("where")? {
-            Ok(Some(self.expr(0)?))
+            Ok(Some(self.expression(0)?))
         } else {
             Ok(None)
         }
     }
 
     /// Pratt expression parser.
-    fn expr(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
+    fn expression(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
         let mut left = self.prefix()?;
         loop {
             // Postfix `::type` binds tightest.
@@ -1478,7 +1478,7 @@ impl<'a> Parser<'a> {
                 }
                 if self.eat_ident("distinct")? {
                     self.expect_ident("from")?;
-                    let right = self.expr(5)?;
+                    let right = self.expression(5)?;
                     left = self.build_distinct_from(left, right, negated)?;
                     continue;
                 }
@@ -1487,12 +1487,12 @@ impl<'a> Parser<'a> {
             // Array subscript `base[index]` (1-based).
             if self.peeked == Tok::Op("[") {
                 self.advance()?;
-                let index = self.expr(0)?;
+                let index = self.expression(0)?;
                 self.expect_op("]")?;
                 left = self.arena_expr(Expr::Subscript { base: left, index })?;
                 continue;
             }
-            // `expr COLLATE collation`: we implement a single (default)
+            // `expression COLLATE collation`: we implement a single (default)
             // collation, so the clause is accepted and has no effect.
             if self.peeked == Tok::Ident("collate") {
                 self.advance()?;
@@ -1514,7 +1514,7 @@ impl<'a> Parser<'a> {
                     op = self.any_op_token()?;
                 }
                 self.expect_op(")")?;
-                let right = self.expr(5)?;
+                let right = self.expression(5)?;
                 left = self.build_operator(op, left, right)?;
                 continue;
             }
@@ -1558,7 +1558,7 @@ impl<'a> Parser<'a> {
                         if n == MAX_LIST {
                             return Err(self.limit("IN list", MAX_LIST));
                         }
-                        list[n] = self.expr(0)?;
+                        list[n] = self.expression(0)?;
                         n += 1;
                         if !self.eat_op(",")? {
                             break;
@@ -1574,16 +1574,16 @@ impl<'a> Parser<'a> {
                 }
                 if self.eat_ident("between")? {
                     // Operands bind tighter than AND here.
-                    let low = self.expr(5)?;
+                    let low = self.expression(5)?;
                     self.expect_ident("and")?;
-                    let high = self.expr(5)?;
+                    let high = self.expression(5)?;
                     left = self.arena_expr(Expr::Between { operand: left, low, high, negated })?;
                     continue;
                 }
                 let ilike = self.peeked == Tok::Ident("ilike");
                 if ilike || self.peeked == Tok::Ident("like") {
                     self.advance()?;
-                    let pattern = self.expr(5)?;
+                    let pattern = self.expression(5)?;
                     left = self.arena_expr(Expr::Like {
                         operand: left,
                         pattern,
@@ -1601,7 +1601,7 @@ impl<'a> Parser<'a> {
                 && let Tok::Op(o @ ("~" | "!~" | "~*" | "!~*")) = self.peeked
             {
                 self.advance()?;
-                let pattern = self.expr(5)?;
+                let pattern = self.expression(5)?;
                 left = self.arena_expr(Expr::Match {
                     operand: left,
                     pattern,
@@ -1622,12 +1622,12 @@ impl<'a> Parser<'a> {
                 let all = self.peeked == Tok::Ident("all");
                 self.advance()?;
                 self.expect_op("(")?;
-                let array = self.expr(0)?;
+                let array = self.expression(0)?;
                 self.expect_op(")")?;
                 left = self.arena_expr(Expr::AnyAll { operand: left, op, array, all })?;
                 continue;
             }
-            let right = self.expr(op.precedence() + 1)?;
+            let right = self.expression(op.precedence() + 1)?;
             left = self.arena_expr(Expr::Binary { op, left, right })?;
         }
     }
@@ -1669,9 +1669,9 @@ impl<'a> Parser<'a> {
                         .map_err(|_| self.err_here("statement too large for SQL arena"))?;
                     return self.arena_expr(Expr::Subquery(boxed));
                 }
-                let inner = self.expr(0)?;
+                let inner = self.expression(0)?;
                 self.expect_op(")")?;
-                // `(expr).field` composite field access (chained).
+                // `(expression).field` composite field access (chained).
                 let mut base = inner;
                 while self.peeked == Tok::Op(".") {
                     self.advance()?;
@@ -1682,7 +1682,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Op("~") => {
                 self.advance()?;
-                let operand = self.expr(8)?;
+                let operand = self.expression(8)?;
                 self.arena_expr(Expr::Unary { op: UnaryOp::BitNot, operand })
             }
             Tok::Op("-") => {
@@ -1699,16 +1699,16 @@ impl<'a> Parser<'a> {
                             return self.arena_expr(Expr::Int(-v));
                         }
                 }
-                let operand = self.expr(8)?;
+                let operand = self.expression(8)?;
                 self.arena_expr(Expr::Unary { op: UnaryOp::Neg, operand })
             }
             Tok::Op("+") => {
                 self.advance()?;
-                self.expr(8)
+                self.expression(8)
             }
             Tok::Ident("not") => {
                 self.advance()?;
-                let operand = self.expr(3)?;
+                let operand = self.expression(3)?;
                 self.arena_expr(Expr::Unary { op: UnaryOp::Not, operand })
             }
             Tok::Ident("null") => {
@@ -1722,7 +1722,7 @@ impl<'a> Parser<'a> {
                 self.expect_op("(")?;
                 let field = self.any_ident("extract field")?;
                 self.expect_ident("from")?;
-                let source = self.expr(0)?;
+                let source = self.expression(0)?;
                 self.expect_op(")")?;
                 let field_lit = self.arena_expr(Expr::Str(field))?;
                 self.arena_expr(Expr::Call {
@@ -1755,7 +1755,7 @@ impl<'a> Parser<'a> {
                 let operand = if self.peeked == Tok::Ident("when") {
                     None
                 } else {
-                    Some(self.expr(0)?)
+                    Some(self.expression(0)?)
                 };
                 let dummy: (&'a Expr<'a>, &'a Expr<'a>) =
                     (self.arena_expr(Expr::Null)?, self.arena_expr(Expr::Null)?);
@@ -1765,9 +1765,9 @@ impl<'a> Parser<'a> {
                     if n == MAX_LIST {
                         return Err(self.limit("CASE branches", MAX_LIST));
                     }
-                    let cond = self.expr(0)?;
+                    let cond = self.expression(0)?;
                     self.expect_ident("then")?;
-                    let result = self.expr(0)?;
+                    let result = self.expression(0)?;
                     whens[n] = (cond, result);
                     n += 1;
                 }
@@ -1775,7 +1775,7 @@ impl<'a> Parser<'a> {
                     return Err(self.unexpected("CASE requires at least one WHEN"));
                 }
                 let otherwise = if self.eat_ident("else")? {
-                    Some(self.expr(0)?)
+                    Some(self.expression(0)?)
                 } else {
                     None
                 };
@@ -1804,11 +1804,11 @@ impl<'a> Parser<'a> {
                     Err(self.unexpected("expected an expression"))
                 }
             }
-            // SQL-standard `CAST(expr AS type[(mod)])`, equivalent to `expr::type`.
+            // SQL-standard `CAST(expression AS type[(mod)])`, equivalent to `expression::type`.
             Tok::Ident("cast") => {
                 self.advance()?;
                 self.expect_op("(")?;
-                let operand = self.expr(0)?;
+                let operand = self.expression(0)?;
                 self.expect_ident("as")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
                 self.expect_op(")")?;
@@ -1840,7 +1840,7 @@ impl<'a> Parser<'a> {
                             if n == MAX_LIST {
                                 return Err(self.limit("array elements", MAX_LIST));
                             }
-                            items[n] = self.expr(0)?;
+                            items[n] = self.expression(0)?;
                             n += 1;
                             if !self.eat_op(",")? {
                                 break;
@@ -1932,13 +1932,13 @@ impl<'a> Parser<'a> {
         // `trim([both|leading|trailing] [chars] FROM str)` desugar to the plain
         // function forms.
         if name.eq_ignore_ascii_case("substring") {
-            let target = self.expr(0)?;
+            let target = self.expression(0)?;
             if self.eat_ident("from")? {
-                let start = self.expr(0)?;
+                let start = self.expression(0)?;
                 let mut cargs = [target, start, target];
                 let mut cn = 2;
                 if self.eat_ident("for")? {
-                    cargs[2] = self.expr(0)?;
+                    cargs[2] = self.expression(0)?;
                     cn = 3;
                 }
                 self.expect_op(")")?;
@@ -1948,7 +1948,7 @@ impl<'a> Parser<'a> {
             let mut cargs = [target, target, target];
             let mut cn = 1;
             while self.eat_op(",")? {
-                cargs[cn] = self.expr(0)?;
+                cargs[cn] = self.expression(0)?;
                 cn += 1;
             }
             self.expect_op(")")?;
@@ -1965,9 +1965,9 @@ impl<'a> Parser<'a> {
                 "btrim"
             };
             // Optional characters expression, then `FROM str` — or just `str`.
-            let first = self.expr(0)?;
+            let first = self.expression(0)?;
             if self.eat_ident("from")? {
-                let target = self.expr(0)?;
+                let target = self.expression(0)?;
                 self.expect_op(")")?;
                 return self.plain_call(dir, &[target, first]);
             }
@@ -1979,9 +1979,9 @@ impl<'a> Parser<'a> {
             // (strpos takes the haystack first, the needle second). Parse the
             // needle above IN's precedence (4) so the IN keyword is not consumed
             // as an `x IN (...)` operator.
-            let needle = self.expr(5)?;
+            let needle = self.expression(5)?;
             if self.eat_ident("in")? {
-                let haystack = self.expr(0)?;
+                let haystack = self.expression(0)?;
                 self.expect_op(")")?;
                 return self.plain_call("strpos", &[haystack, needle]);
             }
@@ -1989,7 +1989,7 @@ impl<'a> Parser<'a> {
             let mut cn = 1;
             while self.eat_op(",")? {
                 if cn < cargs.len() {
-                    cargs[cn] = self.expr(0)?;
+                    cargs[cn] = self.expression(0)?;
                 }
                 cn += 1;
             }
@@ -1998,15 +1998,15 @@ impl<'a> Parser<'a> {
         }
         if name.eq_ignore_ascii_case("overlay") {
             // SQL-standard `overlay(str PLACING sub FROM start [FOR len])`.
-            let target = self.expr(0)?;
+            let target = self.expression(0)?;
             self.expect_ident("placing")?;
-            let sub = self.expr(0)?;
+            let sub = self.expression(0)?;
             self.expect_ident("from")?;
-            let start = self.expr(0)?;
+            let start = self.expression(0)?;
             let mut cargs = [target, sub, start, start];
             let mut cn = 3;
             if self.eat_ident("for")? {
-                cargs[3] = self.expr(0)?;
+                cargs[3] = self.expression(0)?;
                 cn = 4;
             }
             self.expect_op(")")?;
@@ -2027,7 +2027,7 @@ impl<'a> Parser<'a> {
                 filter,
             });
         }
-        // `agg(DISTINCT expr)` — deduplicate argument values before aggregating.
+        // `agg(DISTINCT expression)` — deduplicate argument values before aggregating.
         let distinct = if self.peeked == Tok::Ident("distinct") {
             self.advance()?;
             true
@@ -2042,7 +2042,7 @@ impl<'a> Parser<'a> {
                 if n == MAX_LIST {
                     return Err(self.limit("function arguments", MAX_LIST));
                 }
-                args[n] = self.expr(0)?;
+                args[n] = self.expression(0)?;
                 n += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -2072,7 +2072,7 @@ impl<'a> Parser<'a> {
         self.advance()?;
         self.expect_op("(")?;
         self.expect_ident("where")?;
-        let cond = self.expr(0)?;
+        let cond = self.expression(0)?;
         self.expect_op(")")?;
         Ok(Some(cond))
     }
@@ -2081,13 +2081,13 @@ impl<'a> Parser<'a> {
     /// already consumed).
     fn order_by_items(&mut self) -> Result<&'a [OrderBy<'a>], ParseError> {
         let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-        let mut ord = [OrderBy { expr: null_expr, descending: false, nulls_first: false }; MAX_LIST];
+        let mut ord = [OrderBy { expression: null_expr, descending: false, nulls_first: false }; MAX_LIST];
         let mut m = 0;
         loop {
             if m == MAX_LIST {
                 return Err(self.limit("ORDER BY", MAX_LIST));
             }
-            let expr = self.expr(0)?;
+            let expression = self.expression(0)?;
             let descending = if self.eat_ident("desc")? {
                 true
             } else {
@@ -2104,7 +2104,7 @@ impl<'a> Parser<'a> {
             } else {
                 descending
             };
-            ord[m] = OrderBy { expr, descending, nulls_first };
+            ord[m] = OrderBy { expression, descending, nulls_first };
             m += 1;
             if !self.eat_op(",")? {
                 break;
@@ -2129,7 +2129,7 @@ impl<'a> Parser<'a> {
                 if n == MAX_LIST {
                     return Err(self.limit("PARTITION BY", MAX_LIST));
                 }
-                parts[n] = self.expr(0)?;
+                parts[n] = self.expression(0)?;
                 n += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -2524,8 +2524,8 @@ mod tests {
                 panic!()
             };
             assert_eq!(s.items.len(), 3);
-            let SelectItem::Expr { expr, alias } = s.items[1] else { panic!() };
-            assert_eq!(*expr, Expr::Str("x"));
+            let SelectItem::Expr { expression, alias } = s.items[1] else { panic!() };
+            assert_eq!(*expression, Expr::Str("x"));
             assert_eq!(alias, Some("name"));
             let SelectItem::Expr { alias, .. } = s.items[2] else { panic!() };
             assert_eq!(alias, Some("half"));
@@ -2559,13 +2559,13 @@ mod tests {
     fn precedence_and_parens() {
         with_parser("SELECT 1 + 2 * 3, (1 + 2) * 3", |p| {
             let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
-            let SelectItem::Expr { expr, .. } = s.items[0] else { panic!() };
+            let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
             // 1 + (2 * 3)
-            let Expr::Binary { op: BinaryOp::Add, left, right } = expr else { panic!() };
+            let Expr::Binary { op: BinaryOp::Add, left, right } = expression else { panic!() };
             assert_eq!(**left, Expr::Int(1));
             assert!(matches!(right, Expr::Binary { op: BinaryOp::Mul, .. }));
-            let SelectItem::Expr { expr, .. } = s.items[1] else { panic!() };
-            assert!(matches!(expr, Expr::Binary { op: BinaryOp::Mul, .. }));
+            let SelectItem::Expr { expression, .. } = s.items[1] else { panic!() };
+            assert!(matches!(expression, Expr::Binary { op: BinaryOp::Mul, .. }));
         });
     }
 
@@ -2620,10 +2620,10 @@ mod tests {
     fn casts_is_null_and_txn() {
         with_parser("SELECT 1::bigint, NULL IS NULL, 2 IS NOT NULL; BEGIN; COMMIT; ROLLBACK", |p| {
             let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
-            let SelectItem::Expr { expr, .. } = s.items[0] else { panic!() };
-            assert!(matches!(expr, Expr::Cast { type_name: "bigint", .. }));
-            let SelectItem::Expr { expr, .. } = s.items[2] else { panic!() };
-            assert!(matches!(expr, Expr::IsNull { negated: true, .. }));
+            let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
+            assert!(matches!(expression, Expr::Cast { type_name: "bigint", .. }));
+            let SelectItem::Expr { expression, .. } = s.items[2] else { panic!() };
+            assert!(matches!(expression, Expr::IsNull { negated: true, .. }));
             assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Begin));
             assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
             assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));

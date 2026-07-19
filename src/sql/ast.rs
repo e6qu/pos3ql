@@ -157,7 +157,7 @@ pub enum JoinKind {
 pub enum SelectItem<'a> {
     /// `*`
     Wildcard,
-    Expr { expr: &'a Expr<'a>, alias: Option<&'a str> },
+    Expr { expression: &'a Expr<'a>, alias: Option<&'a str> },
 }
 
 /// A window function's `OVER (PARTITION BY ... ORDER BY ...)` clause. Only the
@@ -170,7 +170,7 @@ pub struct WindowSpec<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OrderBy<'a> {
-    pub expr: &'a Expr<'a>,
+    pub expression: &'a Expr<'a>,
     pub descending: bool,
     /// NULLs sort first. PostgreSQL's default is NULLS LAST for ASC and
     /// NULLS FIRST for DESC.
@@ -201,7 +201,7 @@ pub enum TableConstraint<'a> {
     },
     Check {
         name: Option<&'a str>,
-        expr: &'a Expr<'a>,
+        expression: &'a Expr<'a>,
         /// Source text of the predicate, stored durably and re-parsed at
         /// enforcement time.
         text: &'a str,
@@ -361,20 +361,20 @@ pub enum Expr<'a> {
         /// are excluded from that aggregate.
         filter: Option<&'a Expr<'a>>,
     },
-    /// `expr [NOT] IN (list)`.
+    /// `expression [NOT] IN (list)`.
     InList {
         operand: &'a Expr<'a>,
         list: &'a [&'a Expr<'a>],
         negated: bool,
     },
-    /// `expr [NOT] BETWEEN low AND high`.
+    /// `expression [NOT] BETWEEN low AND high`.
     Between {
         operand: &'a Expr<'a>,
         low: &'a Expr<'a>,
         high: &'a Expr<'a>,
         negated: bool,
     },
-    /// `expr [NOT] LIKE/ILIKE pattern`.
+    /// `expression [NOT] LIKE/ILIKE pattern`.
     Like {
         operand: &'a Expr<'a>,
         pattern: &'a Expr<'a>,
@@ -398,7 +398,7 @@ pub enum Expr<'a> {
     DefaultMarker,
     /// Scalar subquery: must yield one column, at most one row.
     Subquery(&'a Select<'a>),
-    /// `expr [NOT] IN (SELECT ...)`.
+    /// `expression [NOT] IN (SELECT ...)`.
     InSubquery {
         operand: &'a Expr<'a>,
         select: &'a Select<'a>,

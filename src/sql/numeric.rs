@@ -442,19 +442,17 @@ impl<'a> Numeric<'a> {
         if self.is_nan() {
             return f64::NAN;
         }
-        let mut value = 0.0f64;
-        for k in 0..self.ndigits() {
-            value = value * NBASE as f64 + self.digit(k) as f64;
-        }
-        // digits[0] has weight `weight`; we multiplied as if weight 0 for the
-        // last, so scale by NBASE^(weight - (ndigits-1)).
-        let exp = self.weight as i32 - (self.ndigits() as i32 - 1);
-        value *= (NBASE as f64).powi(exp);
-        if self.sign == Sign::Neg {
-            -value
-        } else {
-            value
-        }
+        // PostgreSQL's numeric→float8 goes through the decimal text (strtod),
+        // which rounds correctly to the nearest f64; digit-by-digit float
+        // accumulation drifts by ULPs and diverges from PostgreSQL's results.
+        // Rust's `str::parse::<f64>` is correctly rounded like strtod. A value
+        // whose text exceeds the buffer is ≥ 10^1000 in magnitude, far past
+        // f64 range, and its truncated digit prefix parses to the same
+        // infinity the full text would.
+        let text = crate::stack_format!(1024, "{}", self);
+        text.as_str()
+            .parse::<f64>()
+            .expect("a numeric's decimal text is a parseable float")
     }
 
     /// Rounds to an i64, erroring on overflow (for int casts).

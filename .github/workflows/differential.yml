@@ -116,5 +116,5 @@ jobs:
           # B-039). A ceiling, not an exact target — the residual divergences are
           # PostgreSQL-implementation-specific (unspecified within-row operand
           # order, plan-dependent projection placement). Ratchet toward zero.
-          FUZZ_BUDGET: "31"
+          FUZZ_BUDGET: "0"
         run: bash tests/external/ci_diff.sh

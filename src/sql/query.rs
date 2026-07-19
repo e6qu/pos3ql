@@ -603,11 +603,15 @@ fn scan_source<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
-    // Fold `col IS [NOT] NULL` on NOT-NULL columns, then order the WHERE
-    // conjuncts by PostgreSQL's clause cost once, up front, so the per-row leaf
-    // evaluates them cheapest-first without re-sorting.
+    // Simplify plan-time-decided boolean arms, fold `col IS [NOT] NULL` on
+    // NOT-NULL columns, then order the WHERE conjuncts by PostgreSQL's clause
+    // cost once, up front, so the per-row leaf evaluates them cheapest-first
+    // without re-sorting.
     let where_clause = match where_clause {
-        Some(w) => Some(reorder_qual(fold_null(w, scope, arena)?, scope, arena)?),
+        Some(w) => {
+            let simplified = simplify_qual(w, arena)?;
+            Some(reorder_qual(fold_null(simplified, scope, arena)?, scope, arena)?)
+        }
         None => None,
     };
     // Assemble a JoinRow from the currently bound row bytes. Physical rows
@@ -4548,17 +4552,67 @@ fn reorder_qual<'a>(
 ) -> Result<&'a Expr<'a>, SqlError> {
     let mut conjunct: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
     let mut n = 0;
-    if !flatten_and(pred, &mut conjunct, &mut n) || n <= 1 {
+    if !flatten_and(pred, &mut conjunct, &mut n) || n == 0 {
         return Ok(pred);
     }
-    let columns = ScopeCols(scope);
+    // PostgreSQL rewrites `x BETWEEN a AND b` at parse time into `x >= a AND
+    // x <= b` — two *independent* top-level conjuncts that order separately
+    // (each is one comparison, cheaper than a compound clause).
+    let mut expanded: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
+    let mut m = 0usize;
+    for &c in &conjunct[..n] {
+        if let Expr::Between { operand, low, high, negated: false } = c {
+            if m + 2 > MAX_CONJUNCTS {
+                return Ok(pred);
+            }
+            expanded[m] = arena
+                .alloc(Expr::Binary { operator: super::ast::BinaryOp::GtEq, left: operand, right: low })
+                .map_err(|_| arena_full())?;
+            expanded[m + 1] = arena
+                .alloc(Expr::Binary { operator: super::ast::BinaryOp::LtEq, left: operand, right: high })
+                .map_err(|_| arena_full())?;
+            m += 2;
+        } else {
+            if m + 1 > MAX_CONJUNCTS {
+                return Ok(pred);
+            }
+            expanded[m] = c;
+            m += 1;
+        }
+    }
+    let conjunct = expanded;
+    let n = m;
+    if n <= 1 {
+        return Ok(conjunct[0]);
+    }
+    // PostgreSQL routes top-level *equality* conjuncts through its
+    // equivalence-class machinery, which re-appends them to the qual list
+    // AFTER every other conjunct; only then does `order_qual_clauses` run its
+    // stable per-tuple-cost insertion sort (verified against the PostgreSQL 18
+    // source and pinned empirically — `(a%a)=a AND (…OR…)` evaluates the OR
+    // first on an exact cost tie, while `0 <> (…) AND (…OR…)` keeps written
+    // order). The same calibrated cost model drives projection postponement.
+    let is_equality = |c: &Expr| -> bool {
+        matches!(c, Expr::Binary { operator: super::ast::BinaryOp::Eq, .. })
+            || matches!(c, Expr::InList { list, negated: false, .. } if list.len() == 1)
+    };
+    let mut order = [0usize; MAX_CONJUNCTS];
+    let mut at = 0usize;
+    for (i, c) in conjunct[..n].iter().enumerate() {
+        if !is_equality(c) {
+            order[at] = i;
+            at += 1;
+        }
+    }
+    for (i, c) in conjunct[..n].iter().enumerate() {
+        if is_equality(c) {
+            order[at] = i;
+            at += 1;
+        }
+    }
     let mut cost = [0u32; MAX_CONJUNCTS];
     for (i, c) in conjunct[..n].iter().enumerate() {
-        cost[i] = qual_cost(c, &columns);
-    }
-    let mut order = [0usize; MAX_CONJUNCTS];
-    for (i, slot) in order[..n].iter_mut().enumerate() {
-        *slot = i;
+        cost[i] = postpone_cost(c, scope, arena);
     }
     for i in 1..n {
         let mut j = i;
@@ -4577,89 +4631,7 @@ fn reorder_qual<'a>(
     Ok(acc)
 }
 
-/// Per-tuple evaluation cost of a qual expression, approximating PostgreSQL's
-/// `cost_qual_eval` closely enough to reproduce its clause ordering: each
-/// operator, comparison, function, and cast counts one unit; the boolean
-/// connectives AND/OR/NOT are control flow and cost nothing; subqueries
-/// dominate. Only relative order matters.
-fn qual_cost(e: &Expr, columns: &dyn super::exec::ColTypeResolver) -> u32 {
-    use super::ast::{BinaryOp, UnaryOp};
-    // PostgreSQL folds a constant subexpression to a single Const at plan time,
-    // so it costs nothing at scan time and is evaluated first.
-    if e.is_constant() {
-        return 0;
-    }
-    match e {
-        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-        | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
-        Expr::Binary { operator: BinaryOp::And | BinaryOp::Or, left, right } => {
-            qual_cost(left, columns) + qual_cost(right, columns)
-        }
-        Expr::Binary { operator, left, right } => {
-            // A comparison that mixes a *runtime* integer side with a
-            // float/numeric side widens the integer with a cast, which
-            // PostgreSQL counts (`(b % 0)::numeric < 0.21` costs more than the
-            // int-only `100 = a % id`); a constant int operand is folded and
-            // cast for free.
-            let cast = if matches!(operator, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
-                | BinaryOp::GtEq | BinaryOp::Eq | BinaryOp::NotEq)
-                && widening_cast(left, right, columns)
-            {
-                1
-            } else {
-                0
-            };
-            1 + cast + qual_cost(left, columns) + qual_cost(right, columns)
-        }
-        Expr::Unary { operator: UnaryOp::Not, operand } => qual_cost(operand, columns),
-        Expr::Unary { operand, .. } => 1 + qual_cost(operand, columns),
-        Expr::IsNull { operand, .. } => 1 + qual_cost(operand, columns),
-        Expr::Cast { operand, .. } => 1 + qual_cost(operand, columns),
-        Expr::Field { base, .. } => qual_cost(base, columns),
-        Expr::Subscript { base, index } => 1 + qual_cost(base, columns) + qual_cost(index, columns),
-        Expr::InList { operand, list, .. } => {
-            // PostgreSQL expands `x IN (a, b, ...)` to `x=a OR x=b OR ...`, one
-            // comparison per element, so the cost grows with the list length.
-            list.len() as u32
-                + qual_cost(operand, columns)
-                + list.iter().map(|e| qual_cost(e, columns)).sum::<u32>()
-        }
-        Expr::Between { operand, low, high, .. } => {
-            2 + qual_cost(operand, columns) + qual_cost(low, columns) + qual_cost(high, columns)
-        }
-        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            1 + qual_cost(operand, columns) + qual_cost(pattern, columns)
-        }
-        Expr::AnyAll { operand, array, .. } => {
-            1 + qual_cost(operand, columns) + qual_cost(array, columns)
-        }
-        Expr::Call { args, .. } => 1 + args.iter().map(|e| qual_cost(e, columns)).sum::<u32>(),
-        Expr::Array(elems) => elems.iter().map(|e| qual_cost(e, columns)).sum::<u32>(),
-        Expr::Case { operand, whens, otherwise } => {
-            let mut c = operand.map_or(0, |o| qual_cost(o, columns));
-            for (w, t) in *whens {
-                c += 1 + qual_cost(w, columns) + qual_cost(t, columns);
-            }
-            c + otherwise.map_or(0, |o| qual_cost(o, columns))
-        }
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => 1000,
-    }
-}
 
-/// Whether a comparison of `l` and `r` widens a runtime integer operand to
-/// float/numeric (a cast PostgreSQL charges). True when one side is an integer
-/// expression that is not a compile-time constant and the other side resolves
-/// to float/numeric.
-fn widening_cast(l: &Expr, r: &Expr, columns: &dyn super::exec::ColTypeResolver) -> bool {
-    use super::exec::infer_type_res;
-    use super::types::oid;
-    let ty = |e: &Expr| infer_type_res(e, columns).map(|(o, _)| o).unwrap_or(oid::UNKNOWN);
-    let wide = |o: i32| matches!(o, oid::FLOAT8 | oid::FLOAT4 | oid::NUMERIC);
-    let narrow = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8);
-    let (lt, rt) = (ty(l), ty(r));
-    (narrow(lt) && !l.is_constant() && wide(rt)) || (narrow(rt) && !r.is_constant() && wide(lt))
-}
 
 const MAX_SET_LEAVES: usize = 32;
 
@@ -5294,21 +5266,23 @@ pub fn select_into_rows<'a>(
     // DISTINCT / ORDER BY / LIMIT / OFFSET need the whole set materialized
     // (so top-N and dedup are correct), then paged.
     if statement.distinct || !statement.order_by.is_empty() || statement.limit.is_some() || statement.offset.is_some() {
-        let (rows, width) = materialized_rows(
+        let (rows, width, deferred) = materialized_rows(
             storage, &scope, from, txid, statement, arena, params, &hooks, correlated, &outer_subs.base,
         )?;
         let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
         let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
-        for row in rows
-            .iter()
-            .skip(offset as usize)
-            .take(limit.min(usize::MAX as u64) as usize)
-        {
+        // OFFSET rows flow through PostgreSQL's projection before Limit
+        // discards them, so deferred items are evaluated for them too (their
+        // errors surface); only rows past the offset are emitted.
+        let window = offset.saturating_add(limit).min(usize::MAX as u64) as usize;
+        for (index, row) in rows.iter().take(window).enumerate() {
             let mut out = [Datum::Null; MAX_PROJ];
-            for (i, slot) in out.iter_mut().take(width).enumerate() {
-                *slot = super::exec::decode_projected_pub(row, i);
+            finalize_projected_row(
+                row, width, deferred.as_ref(), statement, &scope, arena, params, &hooks, &mut out,
+            )?;
+            if (index as u64) >= offset {
+                emit(&out[..width])?;
             }
-            emit(&out[..width])?;
         }
         return Ok(());
     }
@@ -5492,8 +5466,37 @@ fn project_row<'a>(
     hooks: &EvalHooks<'_, 'a>,
     out: &mut [Datum<'a>; MAX_PROJ],
 ) -> Result<usize, SqlError> {
+    project_row_skipping(items, None, scope, row, arena, params, hooks, out)
+}
+
+/// [`project_row`], with `skip` marking items whose evaluation is deferred
+/// until after the sort (their slots stay NULL placeholders).
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn project_row_skipping<'a>(
+    items: &[SelectItem<'a>],
+    skip: Option<&[bool; MAX_PROJ]>,
+    scope: &QueryScope,
+    row: &JoinRow<'_, 'a, '_>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    out: &mut [Datum<'a>; MAX_PROJ],
+) -> Result<usize, SqlError> {
     let mut n = 0;
-    for item in items {
+    for (item_index, item) in items.iter().enumerate() {
+        if skip.is_some_and(|s| s[item_index]) {
+            // A postponed item occupies one slot (wildcards are never skipped).
+            if n == MAX_PROJ {
+                return Err(sql_err!(
+                    "54000",
+                    "select list expands past {} columns",
+                    MAX_PROJ
+                ));
+            }
+            out[n] = Datum::Null;
+            n += 1;
+            continue;
+        }
         match item {
             SelectItem::Wildcard => {
                 for t in 0..scope.n {
@@ -5527,6 +5530,7 @@ fn project_row<'a>(
     }
     Ok(n)
 }
+
 
 /// Column descriptions across the whole scope (wildcards expand every
 /// table).
@@ -5984,6 +5988,441 @@ fn expr_is_grouped(expression: &Expr, group_by: &[&Expr]) -> bool {
 /// prefix for DISTINCT, and sort by the hidden keys. Returns `(rows, width)`;
 /// the caller pages with LIMIT/OFFSET and emits. Shared by the wire path
 /// (`materialized_select`) and the row-source path (`select_into_rows`).
+/// Evaluation cost of a select-list expression in half-operator units,
+/// approximating PostgreSQL's `cost_qual_eval`: each operator or function
+/// application costs 2, an implicit numeric-family coercion costs 2, an IN
+/// list costs 1 per element (PostgreSQL charges half an operator per element),
+/// and AND/OR/IS NULL cost nothing. Used for the sort/limit projection
+/// postponement decision (threshold empirically pinned against PostgreSQL 18.4:
+/// items costing more than 10 operators are projected above the Sort + Limit).
+/// PostgreSQL's `find_duplicate_ors` canonicalization: AND terms common to
+/// every arm of an OR are factored out in front — `(A AND B) OR (A AND C)`
+/// becomes `A AND (B OR C)`, and when an arm consists *only* of common terms
+/// the whole OR collapses to them (`(A AND B) OR A` ≡ `A`), so the dropped
+/// arms' other conjuncts are never evaluated.
+fn factor_common_or_terms<'a>(
+    e: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    use super::ast::BinaryOp;
+    const MAX_PARTS: usize = 16;
+    fn flatten_or<'a>(x: &'a Expr<'a>, out: &mut [&'a Expr<'a>; MAX_PARTS], n: &mut usize) -> bool {
+        if let Expr::Binary { operator: BinaryOp::Or, left, right } = x {
+            return flatten_or(left, out, n) && flatten_or(right, out, n);
+        }
+        if *n == MAX_PARTS {
+            return false;
+        }
+        out[*n] = x;
+        *n += 1;
+        true
+    }
+    fn and_terms<'a>(x: &'a Expr<'a>, out: &mut [&'a Expr<'a>; MAX_PARTS], n: &mut usize) -> bool {
+        if let Expr::Binary { operator: BinaryOp::And, left, right } = x {
+            return and_terms(left, out, n) && and_terms(right, out, n);
+        }
+        if *n == MAX_PARTS {
+            return false;
+        }
+        out[*n] = x;
+        *n += 1;
+        true
+    }
+    let dummy = e;
+    let mut arms: [&Expr; MAX_PARTS] = [dummy; MAX_PARTS];
+    let mut n_arms = 0;
+    if !flatten_or(e, &mut arms, &mut n_arms) || n_arms < 2 {
+        return Ok(e);
+    }
+    // Terms of the first arm that appear in every other arm.
+    let mut common: [&Expr; MAX_PARTS] = [dummy; MAX_PARTS];
+    let mut n_common = 0;
+    if !and_terms(arms[0], &mut common, &mut n_common) {
+        return Ok(e);
+    }
+    let mut kept = 0usize;
+    'term: for i in 0..n_common {
+        for arm in &arms[1..n_arms] {
+            let mut terms: [&Expr; MAX_PARTS] = [dummy; MAX_PARTS];
+            let mut nt = 0;
+            if !and_terms(arm, &mut terms, &mut nt) {
+                return Ok(e);
+            }
+            if !terms[..nt].iter().any(|t| **t == *common[i]) {
+                continue 'term;
+            }
+        }
+        common[kept] = common[i];
+        kept += 1;
+    }
+    if kept == 0 {
+        return Ok(e);
+    }
+    // Residue of each arm (its terms minus the common ones). An empty residue
+    // means that arm is implied by the common terms: the OR collapses.
+    let mut residues: [&Expr; MAX_PARTS] = [dummy; MAX_PARTS];
+    let mut n_res = 0;
+    for arm in &arms[..n_arms] {
+        let mut terms: [&Expr; MAX_PARTS] = [dummy; MAX_PARTS];
+        let mut nt = 0;
+        let _ = and_terms(arm, &mut terms, &mut nt);
+        let mut residue: Option<&Expr> = None;
+        for &t in &terms[..nt] {
+            if common[..kept].iter().any(|c| **c == *t) {
+                continue;
+            }
+            residue = Some(match residue {
+                None => t,
+                Some(acc) => arena
+                    .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: t })
+                    .map_err(|_| arena_full())?,
+            });
+        }
+        match residue {
+            None => {
+                // This arm is exactly the common terms: OR collapses to them.
+                let mut acc = common[0];
+                for &c in &common[1..kept] {
+                    acc = arena
+                        .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: c })
+                        .map_err(|_| arena_full())?;
+                }
+                return Ok(acc);
+            }
+            Some(x) => {
+                residues[n_res] = x;
+                n_res += 1;
+            }
+        }
+    }
+    // AND(common..., OR(residues...)).
+    let mut or_acc = residues[0];
+    for &x in &residues[1..n_res] {
+        or_acc = arena
+            .alloc(Expr::Binary { operator: BinaryOp::Or, left: or_acc, right: x })
+            .map_err(|_| arena_full())?;
+    }
+    let mut acc = common[0];
+    for &c in &common[1..kept] {
+        acc = arena
+            .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: c })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(&*arena
+        .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: or_acc })
+        .map_err(|_| arena_full())?)
+}
+
+/// The plan-time boolean value of a condition, when PostgreSQL's
+/// `eval_const_expressions` can decide it: a constant subtree, or an AND/OR
+/// settled by one constant side. `None` = not decidable at plan time.
+fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
+    use super::ast::BinaryOp;
+    if e.is_constant() {
+        return match super::eval::eval(e, arena, super::eval::NO_PARAMS, &super::eval::NoColumns) {
+            Ok(Datum::Bool(b)) => Some(b),
+            _ => None,
+        };
+    }
+    match e {
+        Expr::Binary { operator: BinaryOp::And, left, right } => {
+            if plan_time_bool(left, arena) == Some(false)
+                || plan_time_bool(right, arena) == Some(false)
+            {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Expr::Binary { operator: BinaryOp::Or, left, right } => {
+            if plan_time_bool(left, arena) == Some(true)
+                || plan_time_bool(right, arena) == Some(true)
+            {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        Expr::Unary { operator: super::ast::UnaryOp::Not, operand } => {
+            plan_time_bool(operand, arena).map(|b| !b)
+        }
+        _ => None,
+    }
+}
+
+/// PostgreSQL's plan-time boolean simplification applied to a qual: an AND arm
+/// folding TRUE (or an OR arm folding FALSE) is dropped, and a decided
+/// connective collapses to its constant. This exposes a nested AND to the
+/// top-level conjunct ordering — `(a AND b) OR const-false` orders `a`/`b` by
+/// cost just as PostgreSQL does after simplifying the OR away.
+fn simplify_qual<'a>(e: &'a Expr<'a>, arena: &'a Arena) -> Result<&'a Expr<'a>, SqlError> {
+    use super::ast::BinaryOp;
+    if let Some(b) = plan_time_bool(e, arena) {
+        return Ok(if b { &Expr::Bool(true) } else { &Expr::Bool(false) });
+    }
+    match e {
+        Expr::Binary { operator: operator @ (BinaryOp::And | BinaryOp::Or), left, right } => {
+            let keep_true = matches!(operator, BinaryOp::And);
+            let l = simplify_qual(left, arena)?;
+            let r = simplify_qual(right, arena)?;
+            // The decided-connective cases returned above, so at most one side
+            // is the droppable constant here.
+            if *l == Expr::Bool(keep_true) {
+                return Ok(r);
+            }
+            if *r == Expr::Bool(keep_true) {
+                return Ok(l);
+            }
+            let rebuilt: &Expr = if core::ptr::eq(l, *left) && core::ptr::eq(r, *right) {
+                e
+            } else {
+                arena
+                    .alloc(Expr::Binary { operator: *operator, left: l, right: r })
+                    .map_err(|_| arena_full())?
+            };
+            if matches!(operator, BinaryOp::Or) {
+                return factor_common_or_terms(rebuilt, arena);
+            }
+            Ok(rebuilt)
+        }
+        // NOT pushes through the connectives (De Morgan), exposing the pieces
+        // to top-level conjunct ordering exactly as PostgreSQL's
+        // `canonicalize_qual` does: `NOT (x OR y IS NOT NULL)` becomes
+        // `NOT x AND y IS NULL`, so the cheap null test can filter first.
+        Expr::Unary { operator: super::ast::UnaryOp::Not, operand } => {
+            let negated: &Expr = match *operand {
+                Expr::Binary { operator: BinaryOp::Or, left, right } => {
+                    let nl = arena
+                        .alloc(Expr::Unary { operator: super::ast::UnaryOp::Not, operand: left })
+                        .map_err(|_| arena_full())?;
+                    let nr = arena
+                        .alloc(Expr::Unary { operator: super::ast::UnaryOp::Not, operand: right })
+                        .map_err(|_| arena_full())?;
+                    arena
+                        .alloc(Expr::Binary { operator: BinaryOp::And, left: nl, right: nr })
+                        .map_err(|_| arena_full())?
+                }
+                Expr::Binary { operator: BinaryOp::And, left, right } => {
+                    let nl = arena
+                        .alloc(Expr::Unary { operator: super::ast::UnaryOp::Not, operand: left })
+                        .map_err(|_| arena_full())?;
+                    let nr = arena
+                        .alloc(Expr::Unary { operator: super::ast::UnaryOp::Not, operand: right })
+                        .map_err(|_| arena_full())?;
+                    arena
+                        .alloc(Expr::Binary { operator: BinaryOp::Or, left: nl, right: nr })
+                        .map_err(|_| arena_full())?
+                }
+                Expr::Unary { operator: super::ast::UnaryOp::Not, operand: inner } => inner,
+                Expr::IsNull { operand: inner, negated } => arena
+                    .alloc(Expr::IsNull { operand: inner, negated: !negated })
+                    .map_err(|_| arena_full())?,
+                _ => return Ok(e),
+            };
+            simplify_qual(negated, arena)
+        }
+        _ => Ok(e),
+    }
+}
+
+fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 {
+    use Expr::*;
+    // PostgreSQL costs the *plan-time-folded* expression: a fully-constant
+    // subtree has become a Const by then and costs nothing.
+    if e.is_constant() {
+        return 0;
+    }
+    let oid_of = |x: &Expr| -> Option<i32> {
+        super::exec::infer_type_res(x, &ScopeCols(scope)).ok().map(|t| t.0)
+    };
+    // Numeric-family promotion rank: the lower-ranked operand is the one
+    // PostgreSQL casts (int → numeric → float8).
+    let rank = |o: i32| -> Option<u32> {
+        use super::types::oid;
+        Some(match o {
+            oid::INT2 => 0,
+            oid::INT4 => 1,
+            oid::INT8 => 2,
+            oid::NUMERIC => 3,
+            oid::FLOAT4 => 4,
+            oid::FLOAT8 => 5,
+            _ => return None,
+        })
+    };
+    // One implicit cast (2 half-ops) when a numeric-family pair mixes types —
+    // free when the coerced side is a constant, which PostgreSQL folds into a
+    // pre-cast Const at plan time.
+    let coercion = |l: &Expr, r: &Expr| -> u32 {
+        match (oid_of(l).and_then(rank), oid_of(r).and_then(rank)) {
+            (Some(a), Some(b)) if a != b => {
+                let coerced = if a < b { l } else { r };
+                if coerced.is_constant() { 0 } else { 2 }
+            }
+            _ => 0,
+        }
+    };
+    match e {
+        Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | BitLit(_) | Param(_)
+        | DefaultMarker | Column { .. } => 0,
+        Unary { operator: super::ast::UnaryOp::Not, operand } => postpone_cost(operand, scope, arena),
+        Unary { operand, .. } => postpone_cost(operand, scope, arena) + 2,
+        IsNull { operand, .. } => postpone_cost(operand, scope, arena),
+        Cast { operand, .. } => postpone_cost(operand, scope, arena) + 2,
+        Binary { operator: super::ast::BinaryOp::And | super::ast::BinaryOp::Or, left, right } => {
+            postpone_cost(left, scope, arena) + postpone_cost(right, scope, arena)
+        }
+        Binary { left, right, .. } => {
+            postpone_cost(left, scope, arena) + postpone_cost(right, scope, arena) + 2 + coercion(left, right)
+        }
+        Between { operand, low, high, .. } => {
+            postpone_cost(operand, scope, arena)
+                + postpone_cost(low, scope, arena)
+                + postpone_cost(high, scope, arena)
+                + 4
+                + coercion(operand, low)
+                + coercion(operand, high)
+        }
+        InList { operand, list, .. } => {
+            // PostgreSQL rewrites a one-element IN to plain `=` (one operator);
+            // longer lists cost half an operator per element (= ANY(array)).
+            let applications = if list.len() <= 1 { 2 } else { list.len() as u32 };
+            postpone_cost(operand, scope, arena)
+                + list.iter().map(|x| postpone_cost(x, scope, arena)).sum::<u32>()
+                + applications
+        }
+        Like { operand, pattern, .. } | Match { operand, pattern, .. } => {
+            postpone_cost(operand, scope, arena) + postpone_cost(pattern, scope, arena) + 2
+        }
+        Call { args, .. } => args.iter().map(|a| postpone_cost(a, scope, arena)).sum::<u32>() + 2,
+        Case { operand, whens, otherwise } => {
+            let mut c = operand.map_or(0, |o| postpone_cost(o, scope, arena));
+            // Non-constant branch results whose type differs from the CASE's
+            // unified result type carry an implicit cast, which PostgreSQL
+            // counts (a constant result is pre-cast at plan time).
+            let case_rank = oid_of(e).and_then(rank);
+            let result_cast = |result: &Expr| -> u32 {
+                if result.is_constant() {
+                    return 0;
+                }
+                match (oid_of(result).and_then(rank), case_rank) {
+                    (Some(a), Some(b)) if a != b => 2,
+                    _ => 0,
+                }
+            };
+            for (cond, result) in whens.iter() {
+                // PostgreSQL's plan-time simplification drops a WHEN whose
+                // condition folds to constant FALSE, and truncates the CASE at
+                // one folding to constant TRUE.
+                match plan_time_bool(cond, arena) {
+                    Some(false) => continue,
+                    Some(true) => {
+                        c += postpone_cost(result, scope, arena) + result_cast(result);
+                        return c;
+                    }
+                    None => {}
+                }
+                c += postpone_cost(cond, scope, arena) + postpone_cost(result, scope, arena);
+                c += result_cast(result);
+                // The simple form compares the operand per WHEN.
+                if operand.is_some() {
+                    c += 2;
+                }
+            }
+            if let Some(o) = otherwise {
+                c += postpone_cost(o, scope, arena) + result_cast(o);
+            }
+            c
+        }
+        Array(items) => items.iter().map(|x| postpone_cost(x, scope, arena)).sum(),
+        Subscript { base, index } => postpone_cost(base, scope, arena) + postpone_cost(index, scope, arena),
+        Field { base, .. } => postpone_cost(base, scope, arena),
+        AnyAll { operand, array, .. } => {
+            let elements = if let Array(items) = array { items.len() as u32 } else { 20 };
+            postpone_cost(operand, scope, arena) + postpone_cost(array, scope, arena) + elements
+        }
+        // Subqueries carry a subplan's cost in PostgreSQL and are postponed.
+        Subquery(_) | Exists(_) | ArraySubquery(_) | InSubquery { .. } => 1000,
+    }
+}
+
+/// A flat decoded source row (every column of every scope table, in scope
+/// order) resolvable by name, for evaluating postponed projection items after
+/// the sort.
+struct RawRow<'s, 'd, 'a> {
+    scope: &'s QueryScope<'d>,
+    values: &'s [Datum<'a>],
+}
+
+impl<'a> ColumnLookup<'a> for RawRow<'_, '_, 'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        let (t, c) = self.scope.find_column(qualifier, name)?;
+        let flat: usize = (0..t)
+            .map(|i| self.scope.defs[i].expect("resolved").n_columns)
+            .sum::<usize>()
+            + c;
+        Ok(self.values[flat])
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        let (t, c) = self.scope.find_column(qualifier, name).ok()?;
+        Some(self.scope.defs[t].expect("resolved").columns[c].ctype)
+    }
+}
+
+/// Which projection items an ORDER BY + LIMIT query defers until after the
+/// sort: `postponed` flags the deferred items, and the raw source columns are
+/// appended to each encoded row starting at `raw_at`.
+struct PostponedProjection {
+    postponed: [bool; MAX_PROJ],
+    raw_at: usize,
+    n_raw: usize,
+}
+
+/// Fills `out` with an encoded row's visible columns, evaluating any postponed
+/// projection items from the row's appended raw source columns. Only rows that
+/// survive LIMIT/OFFSET reach this, in sorted order — the whole point of the
+/// postponement.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn finalize_projected_row<'a>(
+    bytes: &'a [u8],
+    width: usize,
+    deferred: Option<&PostponedProjection>,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    out: &mut [Datum<'a>; MAX_PROJ],
+) -> Result<(), SqlError> {
+    for (i, slot) in out.iter_mut().take(width).enumerate() {
+        *slot = super::exec::decode_projected_pub(bytes, i);
+    }
+    let Some(d) = deferred else { return Ok(()) };
+    let mut raw = [Datum::Null; MAX_COLUMNS * MAX_JOIN_TABLES];
+    for (k, slot) in raw.iter_mut().enumerate().take(d.n_raw) {
+        *slot = super::exec::decode_projected_pub(bytes, d.raw_at + k);
+    }
+    let raw_row = RawRow { scope, values: &raw[..d.n_raw] };
+    // `postponed` is indexed by item; wildcards (never postponed) advance the
+    // output slot by their column count.
+    let mut slot = 0usize;
+    for (i, item) in statement.items.iter().enumerate() {
+        match item {
+            SelectItem::Wildcard => slot += scope.total_columns(),
+            SelectItem::Expr { expression, .. } => {
+                if d.postponed[i] {
+                    out[slot] = eval_full(expression, arena, params, &raw_row, hooks)?;
+                }
+                slot += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Materialized rows, their visible width, and any postponed-projection plan.
+type MaterializedSelect<'a> = (&'a [&'a [u8]], usize, Option<PostponedProjection>);
+
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn materialized_rows<'a>(
     storage: &'a Storage,
@@ -5996,7 +6435,7 @@ fn materialized_rows<'a>(
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
-) -> Result<(&'a [&'a [u8]], usize), SqlError> {
+) -> Result<MaterializedSelect<'a>, SqlError> {
     let n_order = statement.order_by.len();
     // With correlated subqueries WHERE is applied per row (against merged
     // hooks); otherwise the scan applies it directly.
@@ -6035,12 +6474,42 @@ fn materialized_rows<'a>(
         w
     };
 
+    // Projection postponement (PostgreSQL `make_sort_input_target`, behavior
+    // pinned empirically against 18.4): with ORDER BY *and* LIMIT (OFFSET alone
+    // does not trigger it), a select-list item costing more than 10 operators
+    // is evaluated above the Sort + Limit — only on surviving rows, in sorted
+    // order — unless the ORDER BY references it. Wildcards are plain columns
+    // and never postponed. Each row then also carries its raw source columns
+    // so the deferred items can be evaluated later.
+    let defer_allowed = n_order > 0
+        && statement.limit.is_some()
+        && !statement.distinct
+        && correlated.is_empty()
+        && statement.items.len() <= MAX_PROJ;
+    let mut postponed = [false; MAX_PROJ];
+    let mut any_postponed = false;
+    if defer_allowed {
+        for (i, item) in statement.items.iter().enumerate() {
+            let SelectItem::Expr { expression, .. } = item else { continue };
+            let ordered_by = order_exprs[..n_order]
+                .iter()
+                .any(|oe| oe.is_some_and(|o| *o == **expression));
+            if !ordered_by && postpone_cost(expression, scope, arena) > 20 {
+                postponed[i] = true;
+                any_postponed = true;
+            }
+        }
+    }
+    let n_raw = if any_postponed { scope.total_columns() } else { 0 };
+
     // Pass 1: count — and evaluate the projection and ORDER BY keys per row
     // (discarding the values). PostgreSQL scans, filters, and projects in a
     // single per-row pass below the Sort, so an early row's projection error
     // surfaces before a later row's WHERE error. We materialize in two passes
     // for a fixed-size allocation, so the count pass must reproduce that error
-    // timing rather than evaluate every WHERE before any projection.
+    // timing rather than evaluate every WHERE before any projection. Postponed
+    // items are exactly the ones PostgreSQL does not evaluate below the Sort,
+    // so they are skipped here too.
     let mut count = 0usize;
     scan_source(
         storage, scope, from, txid, where_in_scan, arena, params, hooks,
@@ -6067,7 +6536,10 @@ fn materialized_rows<'a>(
                 &row_hooks_owned
             };
             let mut projected = [Datum::Null; MAX_PROJ];
-            project_row(statement.items, scope, row, arena, params, row_hooks, &mut projected)?;
+            project_row_skipping(
+                statement.items, if any_postponed { Some(&postponed) } else { None },
+                scope, row, arena, params, row_hooks, &mut projected,
+            )?;
             for oe in order_exprs.iter().take(n_order) {
                 eval_full(oe.expect("resolved"), arena, params, row, row_hooks)?;
             }
@@ -6107,14 +6579,31 @@ fn materialized_rows<'a>(
                     &row_hooks_owned
                 };
                 let mut projected = [Datum::Null; MAX_PROJ];
-                let n = project_row(statement.items, scope, row, arena, params, row_hooks, &mut projected)?;
+                let n = project_row_skipping(
+                    statement.items, if any_postponed { Some(&postponed) } else { None },
+                    scope, row, arena, params, row_hooks, &mut projected,
+                )?;
                 debug_assert_eq!(n, width);
-                let mut full = projected;
+                let mut full = [Datum::Null; MAX_PROJ + MAX_PROJ + MAX_COLUMNS * MAX_JOIN_TABLES];
+                full[..width].copy_from_slice(&projected[..width]);
                 for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
                     full[width + k] =
                         eval_full(oe.expect("resolved"), arena, params, row, row_hooks)?;
                 }
-                rows[at] = super::exec::encode_projected_pub(&full[..width + n_order], arena)?;
+                // Raw source columns for deferred projection after the sort.
+                if any_postponed {
+                    let mut flat = width + n_order;
+                    for t in 0..scope.n {
+                        let def = scope.defs[t].expect("resolved");
+                        let vals = row.values[t].expect("bound");
+                        for c in 0..def.n_columns {
+                            full[flat] = if vals.is_empty() { Datum::Null } else { vals[c] };
+                            flat += 1;
+                        }
+                    }
+                }
+                rows[at] =
+                    super::exec::encode_projected_pub(&full[..width + n_order + n_raw], arena)?;
                 at += 1;
                 Ok(true)
             },
@@ -6168,7 +6657,12 @@ fn materialized_rows<'a>(
         });
     }
 
-    Ok((rows, width))
+    let deferred = any_postponed.then_some(PostponedProjection {
+        postponed,
+        raw_at: width + n_order,
+        n_raw,
+    });
+    Ok((rows, width, deferred))
 }
 
 /// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
@@ -6189,23 +6683,28 @@ fn materialized_select<'a>(
     offset: u64,
     responder: &mut Responder,
 ) -> Outcome {
-    let (rows, width) = match materialized_rows(
+    let (rows, width, deferred) = match materialized_rows(
         storage, scope, from, txid, statement, arena, params, hooks, correlated, base,
     ) {
         Ok(x) => x,
         Err(e) => return sql_fail(e),
     };
     let mut emitted = 0u64;
-    for row in rows.iter().skip(offset as usize) {
-        if emitted >= limit {
-            break;
-        }
+    // OFFSET rows flow through PostgreSQL's projection before Limit discards
+    // them, so deferred items are evaluated for them too (their errors
+    // surface); only rows past the offset are emitted.
+    let window = offset.saturating_add(limit).min(usize::MAX as u64) as usize;
+    for (index, row) in rows.iter().take(window).enumerate() {
         let mut out = [Datum::Null; MAX_PROJ];
-        for (i, slot) in out.iter_mut().take(width).enumerate() {
-            *slot = super::exec::decode_projected_pub(row, i);
+        if let Err(e) = finalize_projected_row(
+            row, width, deferred.as_ref(), statement, scope, arena, params, hooks, &mut out,
+        ) {
+            return sql_fail(e);
         }
-        responder.data_row(&out[..width])?;
-        emitted += 1;
+        if (index as u64) >= offset {
+            responder.data_row(&out[..width])?;
+            emitted += 1;
+        }
     }
     let tag = stack_format!(48, "SELECT {}", emitted);
     responder.command_complete(tag.as_str())?;

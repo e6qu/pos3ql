@@ -11,10 +11,10 @@ pub const MAX_LOG: usize = 64;
 /// One replicated operation: a client request identified for dedup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogEntry {
-    /// The view in which this op was first prepared (used to pick the most
+    /// The view in which this operation was first prepared (used to pick the most
     /// up-to-date log during view change).
     pub view: u64,
-    pub op: u64,
+    pub operation: u64,
     pub client: u32,
     pub request: u32,
     /// Opaque application payload.
@@ -24,7 +24,7 @@ pub struct LogEntry {
 impl LogEntry {
     pub const EMPTY: LogEntry = LogEntry {
         view: 0,
-        op: 0,
+        operation: 0,
         client: 0,
         request: 0,
         value: 0,
@@ -40,16 +40,16 @@ pub struct Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageBody {
-    /// Primary → backups: replicate one op.
+    /// Primary → backups: replicate one operation.
     Prepare {
         view: u64,
-        op: u64,
+        operation: u64,
         commit: u64,
         entry: LogEntry,
     },
-    /// Backup → primary: op accepted.
-    PrepareOk { view: u64, op: u64 },
-    /// Primary → backups: heartbeat / commit advance (no new op).
+    /// Backup → primary: operation accepted.
+    PrepareOk { view: u64, operation: u64 },
+    /// Primary → backups: heartbeat / commit advance (no new operation).
     Commit { view: u64, commit: u64 },
     /// Backup → all: begin a view change.
     StartViewChange { view: u64 },
@@ -58,7 +58,7 @@ pub enum MessageBody {
         view: u64,
         /// The view in which the log was last normal (log-view `v'`).
         log_view: u64,
-        op: u64,
+        operation: u64,
         commit: u64,
         log_len: u16,
         log: [LogEntry; MAX_LOG],
@@ -66,7 +66,7 @@ pub enum MessageBody {
     /// New primary → all: install the chosen log for the new view.
     StartView {
         view: u64,
-        op: u64,
+        operation: u64,
         commit: u64,
         log_len: u16,
         log: [LogEntry; MAX_LOG],

@@ -15,7 +15,7 @@ const TAG_SVC: u8 = 4;
 const TAG_DVC: u8 = 5;
 const TAG_START_VIEW: u8 = 6;
 
-const ENTRY_LEN: usize = 8 + 8 + 4 + 4 + 8; // view, op, client, request, value
+const ENTRY_LEN: usize = 8 + 8 + 4 + 4 + 8; // view, operation, client, request, value
 
 /// Largest possible encoded message (a DoViewChange/StartView with a full
 /// log), used to size transport buffers.
@@ -48,7 +48,7 @@ impl<'a> Writer<'a> {
     }
     fn entry(&mut self, e: &LogEntry) {
         self.u64(e.view);
-        self.u64(e.op);
+        self.u64(e.operation);
         self.u32(e.client);
         self.u32(e.request);
         self.u64(e.value);
@@ -69,17 +69,17 @@ pub fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
     w.u8(msg.from);
     w.u8(msg.to);
     match &msg.body {
-        MessageBody::Prepare { view, op, commit, entry } => {
+        MessageBody::Prepare { view, operation, commit, entry } => {
             w.u8(TAG_PREPARE);
             w.u64(*view);
-            w.u64(*op);
+            w.u64(*operation);
             w.u64(*commit);
             w.entry(entry);
         }
-        MessageBody::PrepareOk { view, op } => {
+        MessageBody::PrepareOk { view, operation } => {
             w.u8(TAG_PREPARE_OK);
             w.u64(*view);
-            w.u64(*op);
+            w.u64(*operation);
         }
         MessageBody::Commit { view, commit } => {
             w.u8(TAG_COMMIT);
@@ -93,7 +93,7 @@ pub fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
         MessageBody::DoViewChange {
             view,
             log_view,
-            op,
+            operation,
             commit,
             log_len,
             log,
@@ -101,7 +101,7 @@ pub fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
             w.u8(TAG_DVC);
             w.u64(*view);
             w.u64(*log_view);
-            w.u64(*op);
+            w.u64(*operation);
             w.u64(*commit);
             let n = (*log_len as usize).min(MAX_LOG);
             w.u16(n as u16);
@@ -111,14 +111,14 @@ pub fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
         }
         MessageBody::StartView {
             view,
-            op,
+            operation,
             commit,
             log_len,
             log,
         } => {
             w.u8(TAG_START_VIEW);
             w.u64(*view);
-            w.u64(*op);
+            w.u64(*operation);
             w.u64(*commit);
             let n = (*log_len as usize).min(MAX_LOG);
             w.u16(n as u16);
@@ -164,7 +164,7 @@ impl<'a> Reader<'a> {
     fn entry(&mut self) -> Option<LogEntry> {
         Some(LogEntry {
             view: self.u64()?,
-            op: self.u64()?,
+            operation: self.u64()?,
             client: self.u32()?,
             request: self.u32()?,
             value: self.u64()?,
@@ -199,13 +199,13 @@ pub fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
         let body = match tag {
             TAG_PREPARE => MessageBody::Prepare {
                 view: r.u64()?,
-                op: r.u64()?,
+                operation: r.u64()?,
                 commit: r.u64()?,
                 entry: r.entry()?,
             },
             TAG_PREPARE_OK => MessageBody::PrepareOk {
                 view: r.u64()?,
-                op: r.u64()?,
+                operation: r.u64()?,
             },
             TAG_COMMIT => MessageBody::Commit {
                 view: r.u64()?,
@@ -215,7 +215,7 @@ pub fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
             TAG_DVC => {
                 let view = r.u64()?;
                 let log_view = r.u64()?;
-                let op = r.u64()?;
+                let operation = r.u64()?;
                 let commit = r.u64()?;
                 let n = r.u16()? as usize;
                 if n > MAX_LOG {
@@ -228,7 +228,7 @@ pub fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
                 MessageBody::DoViewChange {
                     view,
                     log_view,
-                    op,
+                    operation,
                     commit,
                     log_len: n as u16,
                     log,
@@ -236,7 +236,7 @@ pub fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
             }
             TAG_START_VIEW => {
                 let view = r.u64()?;
-                let op = r.u64()?;
+                let operation = r.u64()?;
                 let commit = r.u64()?;
                 let n = r.u16()? as usize;
                 if n > MAX_LOG {
@@ -248,7 +248,7 @@ pub fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
                 }
                 MessageBody::StartView {
                     view,
-                    op,
+                    operation,
                     commit,
                     log_len: n as u16,
                     log,
@@ -280,7 +280,7 @@ mod tests {
     fn every_message_kind_round_trips() {
         let entry = LogEntry {
             view: 3,
-            op: 9,
+            operation: 9,
             client: 42,
             request: 7,
             value: 0xDEAD_BEEF,
@@ -288,12 +288,12 @@ mod tests {
         roundtrip(Message {
             from: 1,
             to: 2,
-            body: MessageBody::Prepare { view: 3, op: 9, commit: 8, entry },
+            body: MessageBody::Prepare { view: 3, operation: 9, commit: 8, entry },
         });
         roundtrip(Message {
             from: 2,
             to: 0,
-            body: MessageBody::PrepareOk { view: 3, op: 9 },
+            body: MessageBody::PrepareOk { view: 3, operation: 9 },
         });
         roundtrip(Message {
             from: 0,
@@ -309,7 +309,7 @@ mod tests {
         for (i, e) in log.iter_mut().enumerate().take(5) {
             *e = LogEntry {
                 view: 1,
-                op: i as u64 + 1,
+                operation: i as u64 + 1,
                 client: 1,
                 request: i as u32,
                 value: i as u64 * 100,
@@ -321,7 +321,7 @@ mod tests {
             body: MessageBody::DoViewChange {
                 view: 4,
                 log_view: 3,
-                op: 5,
+                operation: 5,
                 commit: 4,
                 log_len: 5,
                 log,
@@ -332,7 +332,7 @@ mod tests {
             to: 0,
             body: MessageBody::StartView {
                 view: 4,
-                op: 5,
+                operation: 5,
                 commit: 5,
                 log_len: 5,
                 log,
@@ -364,7 +364,7 @@ mod tests {
         let b = Message {
             from: 0,
             to: 2,
-            body: MessageBody::PrepareOk { view: 1, op: 3 },
+            body: MessageBody::PrepareOk { view: 1, operation: 3 },
         };
         let mut buffer = [0u8; MAX_ENCODED * 2];
         let n1 = encode(&a, &mut buffer).unwrap();

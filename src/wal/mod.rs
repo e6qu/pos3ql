@@ -232,12 +232,12 @@ impl Wal {
                     break 'outer;
                 }
                 let payload = &data[HEADER_LEN..total];
-                let op = match decode_op(kind, payload) {
-                    Some(op) => op,
+                let operation = match decode_op(kind, payload) {
+                    Some(operation) => operation,
                     None => break 'outer,
                 };
                 if lsn > floor {
-                    apply(lsn, op).map_err(WalSetupError::Replay)?;
+                    apply(lsn, operation).map_err(WalSetupError::Replay)?;
                 }
                 self.last_lsn = lsn;
                 self.write_offset += total as u64;
@@ -263,8 +263,8 @@ impl Wal {
     /// Appends one record to the in-memory batch. Never writes to the file:
     /// a batch either fits `wal_buffer_bytes` entirely or the transaction
     /// fails — so the journal only ever contains whole transactions.
-    pub fn append(&mut self, lsn: u64, op: &WalOp) -> Result<(), SqlError> {
-        let payload_len = encoded_payload_len(op);
+    pub fn append(&mut self, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
+        let payload_len = encoded_payload_len(operation);
         let total = HEADER_LEN + payload_len;
         if self.buffer.capacity() - self.buffer.len() < total {
             return Err(sql_err!(
@@ -293,8 +293,8 @@ impl Wal {
         let mut ok = self.buffer.append(&[0u8; 4]); // crc, patched below
         ok &= self.buffer.append(&(payload_len as u32).to_le_bytes());
         ok &= self.buffer.append(&lsn.to_le_bytes());
-        ok &= self.buffer.append(&[op_kind(op), 0, 0, 0, 0, 0, 0, 0]);
-        ok &= append_payload(&mut self.buffer, op);
+        ok &= self.buffer.append(&[op_kind(operation), 0, 0, 0, 0, 0, 0, 0]);
+        ok &= append_payload(&mut self.buffer, operation);
         assert!(ok, "record size was checked against buffer capacity");
 
         let filled = self.buffer.filled_mut();
@@ -399,8 +399,8 @@ fn die(msg: &str) -> ! {
     std::process::abort();
 }
 
-fn op_kind(op: &WalOp) -> u8 {
-    match op {
+fn op_kind(operation: &WalOp) -> u8 {
+    match operation {
         WalOp::CreateTable(_) => KIND_CREATE,
         WalOp::DropTable(_) => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
@@ -412,8 +412,8 @@ fn op_kind(op: &WalOp) -> u8 {
     }
 }
 
-fn encoded_payload_len(op: &WalOp) -> usize {
-    match op {
+fn encoded_payload_len(operation: &WalOp) -> usize {
+    match operation {
         WalOp::CreateTable(def) => {
             let mut n = 1 + def.name.as_str().len() + 2;
             for c in def.columns() {
@@ -452,11 +452,11 @@ fn encoded_payload_len(op: &WalOp) -> usize {
     }
 }
 
-fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
+fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
     let name_bytes = |buffer: &mut FixedBuf, s: &str| -> bool {
         buffer.append(&[s.len() as u8]) && buffer.append(s.as_bytes())
     };
-    match op {
+    match operation {
         WalOp::CreateTable(def) => {
             let mut ok = name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
@@ -1022,8 +1022,8 @@ mod tests {
 
     fn collect_replay_from(wal: &mut Wal, floor: u64) -> Vec<String> {
         let mut seen = Vec::new();
-        wal.replay(floor, |lsn, op| {
-            seen.push(format!("{lsn}:{op:?}"));
+        wal.replay(floor, |lsn, operation| {
+            seen.push(format!("{lsn}:{operation:?}"));
             Ok(())
         })
         .unwrap();

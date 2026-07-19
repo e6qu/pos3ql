@@ -1570,9 +1570,22 @@ fn call<'a>(
             if star || args.is_empty() {
                 return Err(arity_err(name, args.len()));
             }
+            // PostgreSQL types the result as the common type of all arguments,
+            // so `least(1, 2.5)` is numeric even when the int wins. Track the
+            // widest numeric rank across every argument and promote the winner
+            // to it (float8 > numeric > int8 > int4).
+            let rank = |d: &Datum| match d {
+                Datum::Int4(_) => 1,
+                Datum::Int8(_) => 2,
+                Datum::Numeric(_) => 3,
+                Datum::Float8(_) => 4,
+                _ => 0,
+            };
             let mut best: Option<Datum> = None;
+            let mut widest = 0u8;
             for a in args {
                 let v = eval_full(a, arena, params, row, hooks)?;
+                widest = widest.max(rank(&v));
                 if v.is_null() {
                     continue;
                 }
@@ -1580,16 +1593,28 @@ fn call<'a>(
                     None => v,
                     Some(cur) => {
                         let ord = compare_datums(&cur, &v)?;
-                        let take_v = if name == "greatest" {
-                            ord.is_lt()
-                        } else {
-                            ord.is_gt()
-                        };
+                        let take_v = if name == "greatest" { ord.is_lt() } else { ord.is_gt() };
                         if take_v { v } else { cur }
                     }
                 });
             }
-            Ok(best.unwrap_or(Datum::Null))
+            let best = best.unwrap_or(Datum::Null);
+            Ok(match (widest, best) {
+                (4, d) => Datum::Float8(match d {
+                    Datum::Int4(x) => x as f64,
+                    Datum::Int8(x) => x as f64,
+                    Datum::Numeric(n) => n.to_f64(),
+                    Datum::Float8(f) => f,
+                    other => return Ok(other),
+                }),
+                (3, d) => match d {
+                    Datum::Int4(x) => Datum::Numeric(Numeric::from_i64(x as i64, arena)?),
+                    Datum::Int8(x) => Datum::Numeric(Numeric::from_i64(x, arena)?),
+                    other => other,
+                },
+                (2, Datum::Int4(x)) => Datum::Int8(x as i64),
+                (_, d) => d,
+            })
         }
         "nullif" => {
             arity(2)?;
@@ -1698,6 +1723,17 @@ fn call<'a>(
             ) else {
                 return Ok(Datum::Null);
             };
+            // PostgreSQL rejects the cases whose real result is undefined,
+            // rather than returning NaN/Inf as libm's powf would.
+            if a < 0.0 && bb.fract() != 0.0 {
+                return Err(sql_err!(
+                    "2201F",
+                    "a negative number raised to a non-integer power yields a complex result"
+                ));
+            }
+            if a == 0.0 && bb < 0.0 {
+                return Err(sql_err!("2201F", "zero raised to a negative power is undefined"));
+            }
             Ok(Datum::Float8(a.powf(bb)))
         }
         "mod" => {

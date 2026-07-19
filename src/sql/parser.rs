@@ -718,20 +718,20 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.advance()?;
-        let mut cols: [&'a str; MAX_LIST] = [""; MAX_LIST];
+        let mut columns: [&'a str; MAX_LIST] = [""; MAX_LIST];
         let mut n = 0;
         loop {
             if n == MAX_LIST {
                 return Err(self.limit("column aliases", MAX_LIST));
             }
-            cols[n] = self.any_ident("column alias")?;
+            columns[n] = self.any_ident("column alias")?;
             n += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        Ok(Some(self.arena_slice(&cols[..n])?))
+        Ok(Some(self.arena_slice(&columns[..n])?))
     }
 
     #[expect(clippy::wrong_self_convention, reason = "parses the FROM clause; not a conversion")]
@@ -963,20 +963,20 @@ impl<'a> Parser<'a> {
         self.expect_ident("on")?;
         let table = self.any_ident("table name")?;
         self.expect_op("(")?;
-        let mut cols = [""; MAX_LIST];
+        let mut columns = [""; MAX_LIST];
         let mut n = 0;
         loop {
             if n == MAX_LIST {
                 return Err(self.limit("index columns", MAX_LIST));
             }
-            cols[n] = self.any_ident("column name")?;
+            columns[n] = self.any_ident("column name")?;
             n += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        let columns = self.arena_slice(&cols[..n])?;
+        let columns = self.arena_slice(&columns[..n])?;
         Ok(Stmt::CreateIndex { name, table, columns, unique })
     }
 
@@ -1031,7 +1031,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None }; MAX_LIST];
         let mut n = 0;
-        let mut cons = [TableConstraint::Unique { name: None, cols: &[] }; MAX_LIST];
+        let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
         let mut n_cons = 0;
         loop {
             if n == MAX_LIST {
@@ -1130,39 +1130,39 @@ impl<'a> Parser<'a> {
     /// Parses a parenthesized, comma-separated column-name list.
     fn column_name_list(&mut self) -> Result<&'a [&'a str], ParseError> {
         self.expect_op("(")?;
-        let mut cols: [&'a str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
+        let mut columns: [&'a str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
         let mut k = 0;
         loop {
             if k == MAX_INDEX_COLS {
                 return Err(self.limit("constraint column list", MAX_INDEX_COLS));
             }
-            cols[k] = self.any_ident("column name")?;
+            columns[k] = self.any_ident("column name")?;
             k += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        self.arena_slice(&cols[..k])
+        self.arena_slice(&columns[..k])
     }
 
     /// A table-level PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY constraint.
     fn table_constraint(&mut self, name: Option<&'a str>) -> Result<TableConstraint<'a>, ParseError> {
         if self.eat_ident("primary")? {
             self.expect_ident("key")?;
-            let cols = self.column_name_list()?;
-            Ok(TableConstraint::PrimaryKey { name, cols })
+            let columns = self.column_name_list()?;
+            Ok(TableConstraint::PrimaryKey { name, columns })
         } else if self.eat_ident("unique")? {
-            let cols = self.column_name_list()?;
-            Ok(TableConstraint::Unique { name, cols })
+            let columns = self.column_name_list()?;
+            Ok(TableConstraint::Unique { name, columns })
         } else if self.eat_ident("check")? {
             self.check_constraint(name)
         } else {
             self.expect_ident("foreign")?;
             self.expect_ident("key")?;
-            let cols = self.column_name_list()?;
+            let columns = self.column_name_list()?;
             self.expect_ident("references")?;
-            self.references_tail(name, cols)
+            self.references_tail(name, columns)
         }
     }
 
@@ -1183,7 +1183,7 @@ impl<'a> Parser<'a> {
     fn references_tail(
         &mut self,
         name: Option<&'a str>,
-        cols: &'a [&'a str],
+        columns: &'a [&'a str],
     ) -> Result<TableConstraint<'a>, ParseError> {
         let parent = self.any_ident("referenced table")?;
         let parent_cols = if self.peeked == Tok::Op("(") {
@@ -1209,7 +1209,7 @@ impl<'a> Parser<'a> {
         }
         Ok(TableConstraint::ForeignKey {
             name,
-            cols,
+            columns,
             parent,
             parent_cols,
             on_delete,
@@ -1321,7 +1321,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// `ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET a = e, ... [WHERE cond]}`.
+    /// `ON CONFLICT [(columns)] DO {NOTHING | UPDATE SET a = e, ... [WHERE cond]}`.
     fn on_conflict(&mut self) -> Result<Option<OnConflict<'a>>, ParseError> {
         if !self.eat_ident("on")? {
             return Ok(None);
@@ -1357,8 +1357,8 @@ impl<'a> Parser<'a> {
                 }
                 let col = self.any_ident("column name")?;
                 self.expect_op("=")?;
-                let val = self.expression(0)?;
-                assigns[na] = (col, val);
+                let value = self.expression(0)?;
+                assigns[na] = (col, value);
                 na += 1;
                 if !self.eat_op(",")? {
                     break;

@@ -317,7 +317,7 @@ impl Checkpointer {
                     let mut uk = crate::storage::UniqueKey::EMPTY;
                     uk.is_primary = is_primary != 0;
                     uk.n_cols = n_cols;
-                    for c in uk.cols.iter_mut().take(n_cols) {
+                    for c in uk.columns.iter_mut().take(n_cols) {
                         *c = parse_field(words.next(), "ukey col")?;
                     }
                     let hname = words
@@ -366,7 +366,7 @@ impl Checkpointer {
                     }
                     let mut fk = crate::storage::ForeignKey::EMPTY;
                     fk.n_cols = n_cols;
-                    for c in fk.cols.iter_mut().take(n_cols) {
+                    for c in fk.columns.iter_mut().take(n_cols) {
                         *c = parse_field(words.next(), "fkey col")?;
                     }
                     let n_parent: usize = parse_field(words.next(), "fkey nparent")?;
@@ -444,8 +444,8 @@ impl Checkpointer {
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
                         return Err(CheckpointSetupError::Corrupt("bad index ncols"));
                     }
-                    let mut cols = [0u16; crate::storage::MAX_INDEX_COLS];
-                    for c in cols.iter_mut().take(n_cols) {
+                    let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+                    for c in columns.iter_mut().take(n_cols) {
                         *c = parse_field(words.next(), "idx col")?;
                     }
                     let hname = words
@@ -460,7 +460,7 @@ impl Checkpointer {
                         .create_index(crate::storage::IndexDef {
                             name: sql_name(&name)?,
                             table: sql_name(&table)?,
-                            cols,
+                            columns,
                             n_cols,
                             unique: unique != 0,
                             live: true,
@@ -658,9 +658,9 @@ impl Checkpointer {
             // `ukey <is_primary> <ncols> <c0..cN> <hex-name>`
             for uk in table.def.uniques() {
                 use core::fmt::Write;
-                let mut cols = StackStr::<64>::new();
-                for c in uk.cols() {
-                    let _ = write!(cols, "{c} ");
+                let mut columns = StackStr::<64>::new();
+                for c in uk.columns() {
+                    let _ = write!(columns, "{c} ");
                 }
                 let mut hname = StackStr::<130>::new();
                 for b in uk.name.as_str().as_bytes() {
@@ -672,7 +672,7 @@ impl Checkpointer {
                         "ukey {} {} {}{}",
                         u8::from(uk.is_primary),
                         uk.n_cols,
-                        cols.as_str(),
+                        columns.as_str(),
                         hname.as_str()
                     ),
                 )?;
@@ -696,9 +696,9 @@ impl Checkpointer {
             // `fkey <ncols> <c..> <nparent> <p..> <on_delete> <on_update> <hex-name> <hex-parent>`
             for fk in table.def.fkeys() {
                 use core::fmt::Write;
-                let mut cols = StackStr::<64>::new();
-                for c in fk.cols() {
-                    let _ = write!(cols, "{c} ");
+                let mut columns = StackStr::<64>::new();
+                for c in fk.columns() {
+                    let _ = write!(columns, "{c} ");
                 }
                 let mut pcols = StackStr::<64>::new();
                 for c in fk.parent_cols() {
@@ -717,7 +717,7 @@ impl Checkpointer {
                     format_args!(
                         "fkey {} {}{} {}{} {} {} {}",
                         fk.n_cols,
-                        cols.as_str(),
+                        columns.as_str(),
                         fk.n_parent_cols,
                         pcols.as_str(),
                         fk.on_delete.code(),
@@ -840,9 +840,9 @@ impl Checkpointer {
         // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
         for index in storage.live_indexes() {
             use core::fmt::Write;
-            let mut cols = StackStr::<128>::new();
-            for c in &index.cols[..index.n_cols] {
-                let _ = write!(cols, "{c} ");
+            let mut columns = StackStr::<128>::new();
+            for c in &index.columns[..index.n_cols] {
+                let _ = write!(columns, "{c} ");
             }
             let mut hname = StackStr::<130>::new();
             for b in index.name.as_str().as_bytes() {
@@ -858,7 +858,7 @@ impl Checkpointer {
                     "idx {} {} {}{} {}",
                     u8::from(index.unique),
                     index.n_cols,
-                    cols.as_str(),
+                    columns.as_str(),
                     hname.as_str(),
                     htable.as_str()
                 ),

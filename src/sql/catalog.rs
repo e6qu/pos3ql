@@ -343,7 +343,7 @@ struct IdxInfo {
     table_oid: i32,
     table_slot: usize,
     name: StackStr<64>,
-    cols: [u16; crate::storage::MAX_INDEX_COLS],
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
     is_primary: bool,
     is_unique: bool,
@@ -368,16 +368,16 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
         let tname = def.name.as_str();
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
-        let mut mk = |cols: &[u16], is_primary: bool, is_unique: bool, name: StackStr<64>| {
+        let mut mk = |columns: &[u16], is_primary: bool, is_unique: bool, name: StackStr<64>| {
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
-            c[..cols.len()].copy_from_slice(cols);
+            c[..columns.len()].copy_from_slice(columns);
             let info = IdxInfo {
                 oid: index_oid(slot, pos),
                 table_oid: toid,
                 table_slot: slot,
                 name,
-                cols: c,
-                n_cols: cols.len(),
+                columns: c,
+                n_cols: columns.len(),
                 is_primary,
                 is_unique,
             };
@@ -397,12 +397,12 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
         }
         // Multi-column PK / UNIQUE constraints.
         for uk in def.uniques() {
-            push(mk(uk.cols(), uk.is_primary, true, stack_str_64(uk.name.as_str())), &mut n);
+            push(mk(uk.columns(), uk.is_primary, true, stack_str_64(uk.name.as_str())), &mut n);
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.live_indexes().filter(|i| i.table.as_str() == tname) {
             push(
-                mk(&index.cols[..index.n_cols], false, index.unique, stack_str_64(index.name.as_str())),
+                mk(&index.columns[..index.n_cols], false, index.unique, stack_str_64(index.name.as_str())),
                 &mut n,
             );
         }
@@ -522,7 +522,7 @@ pub fn constraint_def_text<'a>(
         let mut s = StackStr::<256>::new();
         use core::fmt::Write as _;
         let _ = s.write_str("FOREIGN KEY (");
-        for (k, &c) in fk.cols[..fk.n_cols].iter().enumerate() {
+        for (k, &c) in fk.columns[..fk.n_cols].iter().enumerate() {
             if k > 0 {
                 let _ = s.write_str(", ");
             }
@@ -575,7 +575,7 @@ pub fn index_def_text<'a>(
             continue;
         }
         let def = &storage.table(info.table_slot).def;
-        let col_name = |ci: usize| def.columns()[info.cols[ci] as usize].name.as_str();
+        let col_name = |ci: usize| def.columns()[info.columns[ci] as usize].name.as_str();
         // `col > 0`: just the name of that 1-based indexed column.
         if col > 0 {
             let name = if col <= info.n_cols { col_name(col - 1) } else { return Ok(None) };
@@ -598,7 +598,7 @@ pub fn index_def_text<'a>(
     Ok(None)
 }
 
-fn def_of(name: &str, cols: &[(&str, ColType)]) -> TableDef {
+fn def_of(name: &str, columns: &[(&str, ColType)]) -> TableDef {
     let mut def = TableDef {
         name: SqlName::parse(name).expect("catalog name fits"),
         columns: [ColumnMeta {
@@ -611,10 +611,10 @@ fn def_of(name: &str, cols: &[(&str, ColType)]) -> TableDef {
             auto_increment: false,
             default_value: None,
         }; MAX_COLUMNS],
-        n_columns: cols.len(),
+        n_columns: columns.len(),
         ..TableDef::empty()
     };
-    for (i, (n, t)) in cols.iter().enumerate() {
+    for (i, (n, t)) in columns.iter().enumerate() {
         def.columns[i].name = SqlName::parse(n).expect("catalog column fits");
         def.columns[i].ctype = *t;
     }
@@ -794,7 +794,7 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
                 Datum::Bool(false), // conperiod
                 text(" ", arena)?, // confupdtype (n/a for non-FK)
                 text(" ", arena)?, // confdeltype
-                attnum_array(&info.cols[..info.n_cols], arena)?,
+                attnum_array(&info.columns[..info.n_cols], arena)?,
                 empty_int_array(arena)?,
             ],
             arena,
@@ -819,7 +819,7 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
             .find(|ix| {
                 ix.table_oid == info.confrelid
                     && ix.n_cols == fk.n_parent_cols
-                    && ix.cols[..ix.n_cols] == fk.parent_cols[..fk.n_parent_cols]
+                    && ix.columns[..ix.n_cols] == fk.parent_cols[..fk.n_parent_cols]
             })
             .map_or(0, |ix| ix.oid);
         out[n] = row(
@@ -837,7 +837,7 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
                 Datum::Bool(false),
                 text(fk_action_char(fk.on_update), arena)?,
                 text(fk_action_char(fk.on_delete), arena)?,
-                attnum_array(&fk.cols[..fk.n_cols], arena)?,
+                attnum_array(&fk.columns[..fk.n_cols], arena)?,
                 attnum_array(&fk.parent_cols[..fk.n_parent_cols], arena)?,
             ],
             arena,
@@ -861,20 +861,20 @@ fn fk_action_char(a: crate::storage::FkAction) -> &'static str {
 
 /// A `Datum::Array` of 1-based attribute numbers (column index + 1), the form
 /// `conkey`/`confkey`/`indkey`-as-array take in `pg_constraint`.
-fn attnum_array<'a>(cols: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn attnum_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let mut vals = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    for (i, &c) in cols.iter().enumerate() {
+    for (i, &c) in columns.iter().enumerate() {
         vals[i] = Datum::Int4(i32::from(c) + 1);
     }
     Ok(Datum::Array {
-        elem: super::types::ArrElem::Int4,
-        raw: super::array::build(&vals[..cols.len()], arena)?,
+        element: super::types::ArrElem::Int4,
+        raw: super::array::build(&vals[..columns.len()], arena)?,
     })
 }
 
 fn empty_int_array<'a>(arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     Ok(Datum::Array {
-        elem: super::types::ArrElem::Int4,
+        element: super::types::ArrElem::Int4,
         raw: super::array::build(&[], arena)?,
     })
 }
@@ -913,7 +913,7 @@ fn pg_index<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 Datum::Bool(true),  // indisvalid
                 Datum::Bool(false), // indisreplident
                 Datum::Int4(info.n_cols as i32),
-                attnum_array(&info.cols[..info.n_cols], arena)?,
+                attnum_array(&info.columns[..info.n_cols], arena)?,
                 option_array(&zeros[..info.n_cols], arena)?,
             ],
             arena,
@@ -924,14 +924,14 @@ fn pg_index<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
 }
 
 /// An index-option array (one 0-flag per column) for `pg_index.indoption`.
-fn option_array<'a>(cols: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn option_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let mut vals = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    for (i, _) in cols.iter().enumerate() {
+    for (i, _) in columns.iter().enumerate() {
         vals[i] = Datum::Int4(0);
     }
     Ok(Datum::Array {
-        elem: super::types::ArrElem::Int4,
-        raw: super::array::build(&vals[..cols.len()], arena)?,
+        element: super::types::ArrElem::Int4,
+        raw: super::array::build(&vals[..columns.len()], arena)?,
     })
 }
 

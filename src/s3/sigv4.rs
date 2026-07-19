@@ -132,16 +132,16 @@ pub fn uri_encode<W: core::fmt::Write>(out: &mut W, s: &str, is_path: bool) -> c
 /// the civil-from-days algorithm — exact for the whole u32 epoch range).
 pub fn format_amz_timestamp(unix_secs: i64) -> StackStr<16> {
     let days = unix_secs.div_euclid(86400);
-    let secs = unix_secs.rem_euclid(86400);
+    let seconds = unix_secs.rem_euclid(86400);
     let (year, month, day) = civil_from_days(days);
     let mut out = StackStr::<16>::new();
     let _ = core::fmt::Write::write_fmt(
         &mut out,
         format_args!(
             "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-            secs / 3600,
-            (secs / 60) % 60,
-            secs % 60
+            seconds / 3600,
+            (seconds / 60) % 60,
+            seconds % 60
         ),
     );
     out

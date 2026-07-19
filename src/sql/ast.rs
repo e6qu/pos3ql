@@ -193,11 +193,11 @@ pub struct CreateTable<'a> {
 pub enum TableConstraint<'a> {
     PrimaryKey {
         name: Option<&'a str>,
-        cols: &'a [&'a str],
+        columns: &'a [&'a str],
     },
     Unique {
         name: Option<&'a str>,
-        cols: &'a [&'a str],
+        columns: &'a [&'a str],
     },
     Check {
         name: Option<&'a str>,
@@ -208,7 +208,7 @@ pub enum TableConstraint<'a> {
     },
     ForeignKey {
         name: Option<&'a str>,
-        cols: &'a [&'a str],
+        columns: &'a [&'a str],
         parent: &'a str,
         /// Referenced columns; empty means "the parent's primary key".
         parent_cols: &'a [&'a str],

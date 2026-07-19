@@ -442,18 +442,18 @@ impl<'a> Numeric<'a> {
         if self.is_nan() {
             return f64::NAN;
         }
-        let mut val = 0.0f64;
+        let mut value = 0.0f64;
         for k in 0..self.ndigits() {
-            val = val * NBASE as f64 + self.digit(k) as f64;
+            value = value * NBASE as f64 + self.digit(k) as f64;
         }
         // digits[0] has weight `weight`; we multiplied as if weight 0 for the
         // last, so scale by NBASE^(weight - (ndigits-1)).
         let exp = self.weight as i32 - (self.ndigits() as i32 - 1);
-        val *= (NBASE as f64).powi(exp);
+        value *= (NBASE as f64).powi(exp);
         if self.sign == Sign::Neg {
-            -val
+            -value
         } else {
-            val
+            value
         }
     }
 
@@ -1358,9 +1358,9 @@ pub fn exp<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError>
     if arg.is_nan() {
         return Ok(Numeric::NAN);
     }
-    let val = arg.to_f64();
-    // rscale = MIN_SIG_DIGITS - trunc(val/ln10) (result decimal weight).
-    let rscale = (MIN_SIG_DIGITS - (val / LN10) as i32)
+    let value = arg.to_f64();
+    // rscale = MIN_SIG_DIGITS - trunc(value/ln10) (result decimal weight).
+    let rscale = (MIN_SIG_DIGITS - (value / LN10) as i32)
         .max(arg.dscale as i32)
         .clamp(0, MAX_DISPLAY_SCALE) as u16;
     exp_var(arg, rscale, arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
@@ -1370,9 +1370,9 @@ pub fn exp<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError>
 fn exp_var<'a>(arg: &Numeric, rscale: u16, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
     // Count halvings needed to bring |arg| under 0.01 (bounds the series length
     // and the error before squaring back).
-    let val = arg.to_f64().abs();
+    let value = arg.to_f64().abs();
     let mut ndiv2 = 0u32;
-    let mut v = val;
+    let mut v = value;
     while v > 0.01 {
         v /= 2.0;
         ndiv2 += 1;

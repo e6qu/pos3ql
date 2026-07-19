@@ -45,12 +45,12 @@ pub fn len(raw: &[u8]) -> usize {
 }
 
 /// Decodes the `index`-th element (0-based) of the blob.
-pub fn get<'a>(raw: &'a [u8], elem: ArrElem, index: usize) -> Option<Datum<'a>> {
+pub fn get<'a>(raw: &'a [u8], element: ArrElem, index: usize) -> Option<Datum<'a>> {
     let n = len(raw);
     if index >= n {
         return None;
     }
-    let schema = [elem.to_coltype()];
+    let schema = [element.to_coltype()];
     let mut at = 2;
     for i in 0..n {
         let l = u32::from_le_bytes(raw.get(at..at + 4)?.try_into().ok()?) as usize;
@@ -65,10 +65,10 @@ pub fn get<'a>(raw: &'a [u8], elem: ArrElem, index: usize) -> Option<Datum<'a>> 
     None
 }
 
-/// Parses a `{a,b,c}` array literal, coercing each element to `elem`.
+/// Parses a `{a,b,c}` array literal, coercing each element to `element`.
 pub fn parse_literal<'a>(
     text: &'a str,
-    elem: ArrElem,
+    element: ArrElem,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
     let bad = || sql_err!("22P02", "malformed array literal: \"{}\"", text);
@@ -79,7 +79,7 @@ pub fn parse_literal<'a>(
         .ok_or_else(bad)?;
     let mut items = [Datum::Null; 1024];
     let mut n = 0;
-    let ct = elem.to_coltype();
+    let ct = element.to_coltype();
     if !inner.trim().is_empty() {
         let b = inner.as_bytes();
         let mut i = 0;
@@ -157,13 +157,13 @@ fn read_field<'a>(
 }
 
 /// Renders the array in PostgreSQL's `{a,b,c}` text form.
-pub fn write(f: &mut core::fmt::Formatter<'_>, elem: ArrElem, raw: &[u8]) -> core::fmt::Result {
+pub fn write(f: &mut core::fmt::Formatter<'_>, element: ArrElem, raw: &[u8]) -> core::fmt::Result {
     f.write_str("{")?;
     for i in 0..len(raw) {
         if i > 0 {
             f.write_str(",")?;
         }
-        match get(raw, elem, i) {
+        match get(raw, element, i) {
             Some(d) => super::types::write_array_elem(f, &d)?,
             None => f.write_str("NULL")?,
         }

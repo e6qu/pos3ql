@@ -69,7 +69,7 @@ pub enum WalOp<'a> {
     CreateIndex {
         name: &'a str,
         table: &'a str,
-        cols: [u16; MAX_INDEX_COLS],
+        columns: [u16; MAX_INDEX_COLS],
         n_cols: usize,
         unique: bool,
     },
@@ -475,7 +475,7 @@ fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
             for uk in def.uniques() {
                 ok &= name_bytes(buffer, uk.name.as_str());
                 ok &= buffer.append(&[u8::from(uk.is_primary), uk.n_cols as u8]);
-                for &c in uk.cols() {
+                for &c in uk.columns() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
             }
@@ -492,7 +492,7 @@ fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
             for fk in def.fkeys() {
                 ok &= name_bytes(buffer, fk.name.as_str());
                 ok &= buffer.append(&[fk.n_cols as u8]);
-                for &c in fk.cols() {
+                for &c in fk.columns() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
                 ok &= name_bytes(buffer, fk.parent.as_str());
@@ -520,11 +520,11 @@ fn append_payload(buffer: &mut FixedBuf, op: &WalOp) -> bool {
                 && buffer.append(sql.as_bytes())
         }
         WalOp::DropView(name) => name_bytes(buffer, name),
-        WalOp::CreateIndex { name, table, cols, n_cols, unique } => {
+        WalOp::CreateIndex { name, table, columns, n_cols, unique } => {
             let mut ok = name_bytes(buffer, name)
                 && name_bytes(buffer, table)
                 && buffer.append(&[u8::from(*unique), *n_cols as u8]);
-            for c in &cols[..*n_cols] {
+            for c in &columns[..*n_cols] {
                 ok &= buffer.append(&c.to_le_bytes());
             }
             ok
@@ -614,7 +614,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 uk.name = SqlName::parse(uname).ok()?;
                 uk.is_primary = meta[0] != 0;
                 uk.n_cols = n;
-                for c in uk.cols.iter_mut().take(n) {
+                for c in uk.columns.iter_mut().take(n) {
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
@@ -660,7 +660,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let mut fk = ForeignKey::EMPTY;
                 fk.name = SqlName::parse(fname).ok()?;
                 fk.n_cols = nc;
-                for c in fk.cols.iter_mut().take(nc) {
+                for c in fk.columns.iter_mut().take(nc) {
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
@@ -729,15 +729,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if n_cols > MAX_INDEX_COLS {
                 return None;
             }
-            let mut cols = [0u16; MAX_INDEX_COLS];
-            for c in cols.iter_mut().take(n_cols) {
+            let mut columns = [0u16; MAX_INDEX_COLS];
+            for c in columns.iter_mut().take(n_cols) {
                 *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                 at += 2;
             }
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 name,
                 table,
-                cols,
+                columns,
                 n_cols,
                 unique,
             })
@@ -993,8 +993,8 @@ mod tests {
         // round-trip covers every constraint kind.
         let mut uk = UniqueKey::EMPTY;
         uk.name = SqlName::parse("t_id_v_key").unwrap();
-        uk.cols[0] = 0;
-        uk.cols[1] = 1;
+        uk.columns[0] = 0;
+        uk.columns[1] = 1;
         uk.n_cols = 2;
         def.uniques[0] = uk;
         def.n_uniques = 1;
@@ -1005,7 +1005,7 @@ mod tests {
         def.n_checks = 1;
         let mut fk = ForeignKey::EMPTY;
         fk.name = SqlName::parse("t_id_fkey").unwrap();
-        fk.cols[0] = 0;
+        fk.columns[0] = 0;
         fk.n_cols = 1;
         fk.parent = SqlName::parse("parent").unwrap();
         fk.parent_cols[0] = 3;

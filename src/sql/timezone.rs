@@ -15,14 +15,14 @@ use crate::util::StackStr;
 
 const DAY_US: i64 = 86_400_000_000;
 
-/// One DST transition: the `week`-th `dow` (0 = Sunday) of `month`, at `secs`
+/// One DST transition: the `week`-th `dow` (0 = Sunday) of `month`, at `seconds`
 /// after local midnight. `week` 5 means "last".
 #[derive(Debug, Clone, Copy)]
 pub struct Trans {
     month: u32,
     week: u32,
     dow: usize,
-    secs: i64,
+    seconds: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,7 +89,7 @@ fn trans_instant(year: i64, t: Trans, off_secs: i32) -> i64 {
         dom -= 7; // "last" (week 5) or an overshoot clamps to the final occurrence
     }
     let day = days_from_civil(year, t.month, dom as u32) - PG_EPOCH_DAYS;
-    (day * DAY_US + t.secs * 1_000_000) - off_secs as i64 * 1_000_000
+    (day * DAY_US + t.seconds * 1_000_000) - off_secs as i64 * 1_000_000
 }
 
 fn days_in_month(y: i64, m: u32) -> u32 {
@@ -120,8 +120,8 @@ fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst
 /// November 02:00 dst.
 fn us() -> Dst {
     Dst {
-        start: Trans { month: 3, week: 2, dow: 0, secs: 2 * 3600 },
-        end: Trans { month: 11, week: 1, dow: 0, secs: 2 * 3600 },
+        start: Trans { month: 3, week: 2, dow: 0, seconds: 2 * 3600 },
+        end: Trans { month: 11, week: 1, dow: 0, seconds: 2 * 3600 },
     }
 }
 
@@ -131,8 +131,8 @@ fn eu(std_off_hours: i32) -> Dst {
     let start_local = (1 + std_off_hours) * 3600; // 01:00 UTC in std local time
     let end_local = (1 + std_off_hours + 1) * 3600; // 01:00 UTC in dst local time
     Dst {
-        start: Trans { month: 3, week: 5, dow: 0, secs: start_local as i64 },
-        end: Trans { month: 10, week: 5, dow: 0, secs: end_local as i64 },
+        start: Trans { month: 3, week: 5, dow: 0, seconds: start_local as i64 },
+        end: Trans { month: 10, week: 5, dow: 0, seconds: end_local as i64 },
     }
 }
 
@@ -140,16 +140,16 @@ fn eu(std_off_hours: i32) -> Dst {
 /// April 03:00 dst (southern hemisphere — DST spans the new year).
 fn au() -> Dst {
     Dst {
-        start: Trans { month: 10, week: 1, dow: 0, secs: 2 * 3600 },
-        end: Trans { month: 4, week: 1, dow: 0, secs: 3 * 3600 },
+        start: Trans { month: 10, week: 1, dow: 0, seconds: 2 * 3600 },
+        end: Trans { month: 4, week: 1, dow: 0, seconds: 3 * 3600 },
     }
 }
 
 /// New Zealand rule: last Sunday September 02:00 std, 1st Sunday April 03:00 dst.
 fn nz() -> Dst {
     Dst {
-        start: Trans { month: 9, week: 5, dow: 0, secs: 2 * 3600 },
-        end: Trans { month: 4, week: 1, dow: 0, secs: 3 * 3600 },
+        start: Trans { month: 9, week: 5, dow: 0, seconds: 2 * 3600 },
+        end: Trans { month: 4, week: 1, dow: 0, seconds: 3 * 3600 },
     }
 }
 
@@ -255,8 +255,8 @@ mod tests {
     use super::*;
     use crate::sql::datetime::days_from_civil;
 
-    fn ts(y: i64, mo: u32, d: u32, h: i64) -> i64 {
-        (days_from_civil(y, mo, d) - PG_EPOCH_DAYS) * DAY_US + h * 3_600_000_000
+    fn ts(y: i64, month: u32, d: u32, h: i64) -> i64 {
+        (days_from_civil(y, month, d) - PG_EPOCH_DAYS) * DAY_US + h * 3_600_000_000
     }
 
     #[test]

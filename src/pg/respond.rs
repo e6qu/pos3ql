@@ -50,7 +50,7 @@ pub struct Responder<'b> {
     /// the duration.
     flush_fd: Option<i32>,
     /// Session value-rendering settings (DateStyle, time zone).
-    render: crate::sql::guc::RenderCtx,
+    render: crate::sql::guc::RenderContext,
 }
 
 impl<'b> Responder<'b> {
@@ -60,7 +60,7 @@ impl<'b> Responder<'b> {
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             flush_fd: None,
-            render: crate::sql::guc::RenderCtx::default(),
+            render: crate::sql::guc::RenderContext::default(),
         }
     }
 
@@ -70,7 +70,7 @@ impl<'b> Responder<'b> {
             suppress_row_description: true,
             formats,
             flush_fd: None,
-            render: crate::sql::guc::RenderCtx::default(),
+            render: crate::sql::guc::RenderContext::default(),
         }
     }
 
@@ -82,7 +82,7 @@ impl<'b> Responder<'b> {
             suppress_row_description: false,
             formats,
             flush_fd: None,
-            render: crate::sql::guc::RenderCtx::default(),
+            render: crate::sql::guc::RenderContext::default(),
         }
     }
 
@@ -94,14 +94,14 @@ impl<'b> Responder<'b> {
     }
 
     /// Sets the session value-rendering context (DateStyle / time zone).
-    pub fn with_render(mut self, render: crate::sql::guc::RenderCtx) -> Self {
+    pub fn with_render(mut self, render: crate::sql::guc::RenderContext) -> Self {
         self.render = render;
         self
     }
 
     /// Updates the value-rendering context in place (e.g. after a SET changed
     /// DateStyle mid-batch).
-    pub fn set_render(&mut self, render: crate::sql::guc::RenderCtx) {
+    pub fn set_render(&mut self, render: crate::sql::guc::RenderContext) {
         self.render = render;
     }
 
@@ -249,15 +249,15 @@ impl<'b> Responder<'b> {
         m.finish()
     }
 
-    pub fn row_description(&mut self, cols: &[ColDesc]) -> Result<(), WireFull> {
+    pub fn row_description(&mut self, columns: &[ColDesc]) -> Result<(), WireFull> {
         if self.suppress_row_description {
             return Ok(());
         }
         let formats = self.formats;
         self.with_retry(|buffer| {
             let mut m = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
-            m.i16(cols.len() as i16);
-            for (i, c) in cols.iter().enumerate() {
+            m.i16(columns.len() as i16);
+            for (i, c) in columns.iter().enumerate() {
                 m.cstr(c.name);
                 m.i32(0);
                 m.i16(0);
@@ -281,7 +281,7 @@ impl<'b> Responder<'b> {
         buffer: &mut FixedBuf,
         values: &[Datum],
         formats: ResultFmt,
-        render: crate::sql::guc::RenderCtx,
+        render: crate::sql::guc::RenderContext,
     ) -> Result<(), WireFull> {
         let mut m = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
         m.i16(values.len() as i16);
@@ -300,7 +300,7 @@ impl<'b> Responder<'b> {
     fn encode_value_text(
         m: &mut MsgOut,
         v: &Datum,
-        render: crate::sql::guc::RenderCtx,
+        render: crate::sql::guc::RenderContext,
     ) {
         {
             match v {
@@ -419,12 +419,12 @@ impl<'b> Responder<'b> {
                     m.i32(16);
                     m.bytes(b);
                 }
-                Datum::Array { elem, raw } => {
+                Datum::Array { element, raw } => {
                     // The full binary array wire format (ndim/dims/per-element
                     // binary) is not emitted; a binary-requesting client gets
                     // the canonical text form instead (arrays are near-always
                     // consumed in text format). Documented as a known gap.
-                    let text = stack_format!(256, "{}", Datum::Array { elem: *elem, raw });
+                    let text = stack_format!(256, "{}", Datum::Array { element: *element, raw });
                     m.i32(text.as_str().len() as i32);
                     m.bytes(text.as_str().as_bytes());
                 }
@@ -464,7 +464,7 @@ impl<'b> Responder<'b> {
     /// is above NOTICE (e.g. `warning`), matching PostgreSQL.
     pub fn notice(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
         self.diagnostic(
-            crate::sql::guc::MsgLevel::Notice,
+            crate::sql::guc::MessageLevel::Notice,
             "NOTICE",
             sqlstate,
             message,
@@ -475,7 +475,7 @@ impl<'b> Responder<'b> {
     /// `client_min_messages` is above WARNING (i.e. `error`).
     pub fn warning(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
         self.diagnostic(
-            crate::sql::guc::MsgLevel::Warning,
+            crate::sql::guc::MessageLevel::Warning,
             "WARNING",
             sqlstate,
             message,
@@ -487,7 +487,7 @@ impl<'b> Responder<'b> {
     /// errors.
     fn diagnostic(
         &mut self,
-        level: crate::sql::guc::MsgLevel,
+        level: crate::sql::guc::MessageLevel,
         severity: &str,
         sqlstate: &str,
         message: &str,

@@ -246,20 +246,20 @@ pub fn bound_inc(text: &str, kind: RangeKind, lower: bool) -> Result<bool, SqlEr
 }
 
 /// `range @> element`.
-pub fn contains_elem(text: &str, kind: RangeKind, elem: &str) -> Result<bool, SqlError> {
+pub fn contains_elem(text: &str, kind: RangeKind, element: &str) -> Result<bool, SqlError> {
     let p = parse(text, kind)?;
     if p.empty {
         return Ok(false);
     }
     if let Some(lower_text) = p.lower {
-        match cmp_elem(elem, lower_text, kind)? {
+        match cmp_elem(element, lower_text, kind)? {
             Ordering::Less => return Ok(false),
             Ordering::Equal if !p.lower_inc => return Ok(false),
             _ => {}
         }
     }
     if let Some(upper_text) = p.upper {
-        match cmp_elem(elem, upper_text, kind)? {
+        match cmp_elem(element, upper_text, kind)? {
             Ordering::Greater => return Ok(false),
             Ordering::Equal if !p.upper_inc => return Ok(false),
             _ => {}

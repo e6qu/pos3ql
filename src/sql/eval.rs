@@ -644,23 +644,23 @@ pub fn eval_full<'a>(
             if items.len() > vals.len() {
                 return Err(sql_err!("54000", "array constructor too large"));
             }
-            let mut elem: Option<super::types::ArrElem> = None;
+            let mut element: Option<super::types::ArrElem> = None;
             for (i, e) in items.iter().enumerate() {
                 let v = eval_full(e, arena, params, row, hooks)?;
                 if let Some(el) = super::types::ArrElem::from_datum(&v) {
-                    elem = Some(elem.map_or(el, |acc| unify_arr_elem(acc, el)));
+                    element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
                 }
                 vals[i] = v;
             }
-            let elem = elem.unwrap_or(super::types::ArrElem::Int4);
+            let element = element.unwrap_or(super::types::ArrElem::Int4);
             // Coerce each element to the unified type.
-            let ct = elem.to_coltype();
+            let ct = element.to_coltype();
             for v in vals.iter_mut().take(items.len()) {
                 if !v.is_null() {
                     *v = cast_to(*v, ct, arena)?;
                 }
             }
-            Ok(Datum::Array { elem, raw: super::array::build(&vals[..items.len()], arena)? })
+            Ok(Datum::Array { element, raw: super::array::build(&vals[..items.len()], arena)? })
         }
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
@@ -672,12 +672,12 @@ pub fn eval_full<'a>(
                 _ => return Err(type_mismatch("array subscript must be integer", &i)),
             };
             match b {
-                Datum::Array { elem, raw } => {
+                Datum::Array { element, raw } => {
                     // PostgreSQL array subscripts are 1-based.
                     if index < 1 {
                         return Ok(Datum::Null);
                     }
-                    Ok(super::array::get(raw, elem, (index - 1) as usize).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, element, (index - 1) as usize).unwrap_or(Datum::Null))
                 }
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
@@ -690,7 +690,7 @@ pub fn eval_full<'a>(
             let b = eval_full(base, arena, params, row, hooks)?;
             match b {
                 Datum::Null => Ok(Datum::Null),
-                Datum::Array { elem, raw } => {
+                Datum::Array { element, raw } => {
                     let index = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
                     {
                         0
@@ -703,7 +703,7 @@ pub fn eval_full<'a>(
                             field
                         ));
                     };
-                    Ok(super::array::get(raw, elem, index).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, element, index).unwrap_or(Datum::Null))
                 }
                 _ => Err(type_mismatch("field access on a non-composite value", &b)),
             }
@@ -711,15 +711,15 @@ pub fn eval_full<'a>(
         Expr::AnyAll { operand, op, array, all } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let array = eval_full(array, arena, params, row, hooks)?;
-            let (elem, raw) = match array {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match array {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
             };
             let n = super::array::len(raw);
             let mut saw_null = false;
             for i in 0..n {
-                let el = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+                let el = super::array::get(raw, element, i).unwrap_or(Datum::Null);
                 match binary(op, lhs, el, false, false, arena)? {
                     Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
                     Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
@@ -888,7 +888,7 @@ fn call<'a>(
                 &[Datum::Text("public")]
             };
             Ok(Datum::Array {
-                elem: super::types::ArrElem::Text,
+                element: super::types::ArrElem::Text,
                 raw: super::array::build(elems, arena)?,
             })
         }
@@ -939,13 +939,13 @@ fn call<'a>(
             arity(2)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
             let target = eval_full(args[1], arena, params, row, hooks)?;
-            let (elem, raw) = match a {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match a {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("array_position requires an array", &a)),
             };
             for i in 0..super::array::len(raw) {
-                let el = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+                let el = super::array::get(raw, element, i).unwrap_or(Datum::Null);
                 let hit = if target.is_null() {
                     el.is_null()
                 } else if el.is_null() {
@@ -982,15 +982,15 @@ fn call<'a>(
         "unnest" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
-            let (elem, raw) = match a {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match a {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("unnest requires an array", &a)),
             };
             let k = hooks
                 .srf_index
                 .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
-            Ok(super::array::get(raw, elem, k - 1).unwrap_or(Datum::Null))
+            Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
         }
         "generate_series" => {
             if !(2..=3).contains(&args.len()) {
@@ -1026,22 +1026,22 @@ fn call<'a>(
         "_pg_expandarray" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
-            let (elem, raw) = match a {
-                Datum::Array { elem, raw } => (elem, raw),
+            let (element, raw) = match a {
+                Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("_pg_expandarray requires an array", &a)),
             };
             let k = hooks.srf_index.unwrap_or(1);
-            let x = super::array::get(raw, elem, k - 1).unwrap_or(Datum::Null);
+            let x = super::array::get(raw, element, k - 1).unwrap_or(Datum::Null);
             let comp = [x, Datum::Int4(k as i32)];
             Ok(Datum::Array {
-                elem: super::types::ArrElem::Int4,
+                element: super::types::ArrElem::Int4,
                 raw: super::array::build(&comp, arena)?,
             })
         }
         "pg_get_indexdef" => {
             // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole
-            // `btree (cols)` definition; `(oid, n, _)` with n>0 returns the name
+            // `btree (columns)` definition; `(oid, n, _)` with n>0 returns the name
             // of the n-th (1-based) indexed column (used by JDBC getIndexInfo).
             let Some(cat) = hooks.catalog else {
                 return Ok(Datum::Null);
@@ -1121,9 +1121,9 @@ fn call<'a>(
             } else {
                 None
             };
-            let (elem, raw) = match a {
+            let (element, raw) = match a {
                 Datum::Null => return Ok(Datum::Null),
-                Datum::Array { elem, raw } => (elem, raw),
+                Datum::Array { element, raw } => (element, raw),
                 other => return Err(type_mismatch("array_to_string", &other)),
             };
             let delim = match delim {
@@ -1135,7 +1135,7 @@ fn call<'a>(
             // Renders the i-th element as text, or `None` to omit it (a NULL
             // element with no null-string replacement).
             let elem_text = |i: usize| -> Result<Option<&'a str>, SqlError> {
-                match super::array::get(raw, elem, i) {
+                match super::array::get(raw, element, i) {
                     Some(Datum::Null) | None => Ok(nullrep),
                     Some(v) => match cast_to(v, ColType::Text, arena)? {
                         Datum::Text(s) => Ok(Some(s)),
@@ -1479,7 +1479,7 @@ fn call<'a>(
                 };
             }
             Ok(Datum::Array {
-                elem: super::types::ArrElem::Text,
+                element: super::types::ArrElem::Text,
                 raw: super::array::build(&items[..n], arena)?,
             })
         }
@@ -2416,10 +2416,10 @@ fn call<'a>(
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
                 d => {
-                    let Some(secs) = num_factor(&d) else {
+                    let Some(seconds) = num_factor(&d) else {
                         return Err(type_mismatch(name, &d));
                     };
-                    let micros = (secs * 1_000_000.0).round() as i64
+                    let micros = (seconds * 1_000_000.0).round() as i64
                         - super::datetime::PG_EPOCH_DAYS * 86_400_000_000;
                     Ok(Datum::Timestamptz(micros))
                 }
@@ -2623,8 +2623,8 @@ fn call<'a>(
             };
             use super::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS, PG_EPOCH_SECS};
             let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
-            let (secs, frac) = (in_day / 1_000_000, in_day % 1_000_000);
-            let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+            let (seconds, frac) = (in_day / 1_000_000, in_day % 1_000_000);
+            let (h, mi, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
             let eq = |k: &str| field.eq_ignore_ascii_case(k);
             let dow0 = day_of_week(days) as i64;
             // Integer-valued fields.
@@ -2713,8 +2713,8 @@ fn call<'a>(
             use super::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};
             let (days, in_day) = (t.div_euclid(86_400_000_000), t.rem_euclid(86_400_000_000));
             let (y, m, _d) = civil_from_days(days + PG_EPOCH_DAYS);
-            let (secs, _frac) = (in_day / 1_000_000, in_day % 1_000_000);
-            let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+            let (seconds, _frac) = (in_day / 1_000_000, in_day % 1_000_000);
+            let (h, mi, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
             let eq = |k: &str| field.eq_ignore_ascii_case(k);
             // (new day count since epoch, seconds within the day).
             let (new_days, sod): (i64, i64) = if eq("year") || eq("years") {
@@ -3470,22 +3470,22 @@ fn array_null_concat<'a>(
     row: &impl ColumnLookup<'a>,
     arena: &'a Arena,
 ) -> Result<Option<Datum<'a>>, SqlError> {
-    let (array, elem, null_expr) = match (l, r) {
-        (Datum::Array { elem, .. }, Datum::Null) => (l, elem, right),
-        (Datum::Null, Datum::Array { elem, .. }) => (r, elem, left),
+    let (array, element, null_expr) = match (l, r) {
+        (Datum::Array { element, .. }, Datum::Null) => (l, element, right),
+        (Datum::Null, Datum::Array { element, .. }) => (r, element, left),
         _ => return Ok(None),
     };
     match static_type(null_expr, row) {
         // Untyped NULL or a NULL of the array type: identity.
         None | Some(ColType::Array(_)) => Ok(Some(array)),
         // NULL of the element type: append/prepend a NULL element.
-        Some(t) if super::types::ArrElem::from_coltype(t) == Some(elem) => {
+        Some(t) if super::types::ArrElem::from_coltype(t) == Some(element) => {
             Ok(Some(array_concat(l, r, arena)?))
         }
         Some(t) => Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
             "operator does not exist: {}[] || {}",
-            elem.to_coltype().name(),
+            element.to_coltype().name(),
             t.name()
         )),
     }
@@ -3507,14 +3507,14 @@ fn concat<'a>(
     // type), so it is parsed as an array literal and errors if malformed —
     // matching `ARRAY['a','b'] || 'c'` (error) vs `|| 'c'::text` (append).
     let arr_elem = match (&l, &r) {
-        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => Some(*elem),
+        (Datum::Array { element, .. }, _) | (_, Datum::Array { element, .. }) => Some(*element),
         _ => None,
     };
-    if let Some(elem) = arr_elem {
+    if let Some(element) = arr_elem {
         let coerce = |d: Datum<'a>, unknown: bool| -> Result<Datum<'a>, SqlError> {
             match d {
                 Datum::Text(s) if unknown => {
-                    Ok(Datum::Array { elem, raw: super::array::parse_literal(s, elem, arena)? })
+                    Ok(Datum::Array { element, raw: super::array::parse_literal(s, element, arena)? })
                 }
                 other => Ok(other),
             }
@@ -3540,15 +3540,15 @@ fn concat<'a>(
 /// Concatenates two operands where at least one is an array, following
 /// PostgreSQL's `array || array`, `array || element`, and `element || array`.
 fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let elem = match (&l, &r) {
-        (Datum::Array { elem, .. }, _) | (_, Datum::Array { elem, .. }) => *elem,
+    let element = match (&l, &r) {
+        (Datum::Array { element, .. }, _) | (_, Datum::Array { element, .. }) => *element,
         _ => unreachable!("caller ensures one side is an array"),
     };
     let mut items = [Datum::Null; 4096];
     let mut n = 0usize;
     for side in [l, r] {
         match side {
-            Datum::Array { raw, elem: e } => {
+            Datum::Array { raw, element: e } => {
                 for i in 0..super::array::len(raw) {
                     if n >= items.len() {
                         return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
@@ -3568,7 +3568,7 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             }
         }
     }
-    Ok(Datum::Array { elem, raw: super::array::build(&items[..n], arena)? })
+    Ok(Datum::Array { element, raw: super::array::build(&items[..n], arena)? })
 }
 
 /// Total order used by comparisons and ORDER BY. NULL handling differs
@@ -3603,12 +3603,12 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         | (Datum::Timestamptz(a), Datum::Timestamp(b)) => a.cmp(b),
         (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
         (Datum::Json { text: a, .. }, Datum::Json { text: b, .. }) => a.cmp(b),
-        (Datum::Array { elem, raw: ra }, Datum::Array { raw: rb, .. }) => {
+        (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             // Element-wise, then by length (PostgreSQL array ordering).
             let (na, nb) = (super::array::len(ra), super::array::len(rb));
             for i in 0..na.min(nb) {
-                let x = super::array::get(ra, *elem, i).unwrap_or(Datum::Null);
-                let y = super::array::get(rb, *elem, i).unwrap_or(Datum::Null);
+                let x = super::array::get(ra, *element, i).unwrap_or(Datum::Null);
+                let y = super::array::get(rb, *element, i).unwrap_or(Datum::Null);
                 let c = compare_datums(&x, &y)?;
                 if !c.is_eq() {
                     return Ok(c);
@@ -4086,9 +4086,9 @@ pub fn cast_to<'a>(
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
         },
-        ColType::Array(elem) => match v {
-            Datum::Array { elem: e, .. } if e == elem => v,
-            Datum::Text(s) => Datum::Array { elem, raw: super::array::parse_literal(s, elem, arena)? },
+        ColType::Array(element) => match v {
+            Datum::Array { element: e, .. } if e == element => v,
+            Datum::Text(s) => Datum::Array { element, raw: super::array::parse_literal(s, element, arena)? },
             _ => return Err(cast_unsupported(&v, "array")),
         },
         ColType::Uuid => match v {

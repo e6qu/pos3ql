@@ -615,7 +615,7 @@ impl Engine {
                 let slot = self.storage.find_visible(ins.table, txid);
                 let def = slot.map(|s| &self.storage.table(s).def);
                 for row in ins.rows {
-                    for (i, val) in row.iter().enumerate() {
+                    for (i, value) in row.iter().enumerate() {
                         let ty = def.and_then(|d| {
                             let ci = if ins.columns.is_empty() {
                                 (i < d.n_columns).then_some(i)
@@ -625,15 +625,15 @@ impl Engine {
                             ci.map(|ci| d.columns()[ci].ctype.oid())
                         });
                         if let Some(ty) = ty {
-                            set(oids, val, ty);
+                            set(oids, value, ty);
                         }
                     }
                 }
             }
             Stmt::Update(u) => {
-                for (col, val) in u.assignments {
+                for (col, value) in u.assignments {
                     if let Some(ty) = self.column_oid(u.table, col, txid) {
-                        set(oids, val, ty);
+                        set(oids, value, ty);
                     }
                 }
                 if let Some(w) = u.where_clause {
@@ -728,22 +728,22 @@ impl Engine {
                         return Ok(false);
                     }
                 };
-                let mut cols = [ColDesc::new("", 0, 0); MAX_PROJ];
+                let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
                 let described = match &s.from {
                     Some(from) => {
                         match query::QueryScope::resolve_schema(&self.storage, from, txn.txid, arena) {
-                            Ok(scope) => query::describe_scope_items(s.items, &scope, &mut cols),
+                            Ok(scope) => query::describe_scope_items(s.items, &scope, &mut columns),
                             Err(e) => {
                                 resp.error(e.sqlstate, e.message.as_str())?;
                                 return Ok(false);
                             }
                         }
                     }
-                    None => exec::describe_items(s.items, None, &mut cols),
+                    None => exec::describe_items(s.items, None, &mut columns),
                 };
                 match described {
                     Ok(n) => {
-                        resp.row_description(&cols[..n])?;
+                        resp.row_description(&columns[..n])?;
                         Ok(true)
                     }
                     Err(e) => {
@@ -1354,11 +1354,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, op: WalOp) -> Result<(), SqlErr
         WalOp::DropView(name) => {
             storage.drop_view(name);
         }
-        WalOp::CreateIndex { name, table, cols, n_cols, unique } => {
+        WalOp::CreateIndex { name, table, columns, n_cols, unique } => {
             storage.create_index(crate::storage::IndexDef {
                 name: crate::storage::SqlName::parse(name)?,
                 table: crate::storage::SqlName::parse(table)?,
-                cols,
+                columns,
                 n_cols,
                 unique,
                 live: true,

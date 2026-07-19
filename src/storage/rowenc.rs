@@ -76,10 +76,10 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
                 take = 4 + text.len();
             }
-            Datum::Array { elem, raw } => {
+            Datum::Array { element, raw } => {
                 let payload = 1 + raw.len();
                 rest[..4].copy_from_slice(&(payload as u32).to_le_bytes());
-                rest[4] = elem.code();
+                rest[4] = element.code();
                 rest[5..5 + raw.len()].copy_from_slice(raw);
                 take = 4 + payload;
             }
@@ -202,14 +202,14 @@ pub fn decode<'a>(
                 out[i] = Datum::Time(i64::from_le_bytes(b.try_into().unwrap()));
                 at += 8;
             }
-            ColType::Array(elem) => {
+            ColType::Array(element) => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let payload = u32::from_le_bytes(b.try_into().unwrap()) as usize;
                 at += 4;
                 // Skip the element-type code byte; the schema is authoritative.
                 let raw = bytes.get(at + 1..at + payload).ok_or_else(corrupt)?;
                 at += payload;
-                out[i] = Datum::Array { elem, raw };
+                out[i] = Datum::Array { element, raw };
             }
             ColType::Json | ColType::Jsonb => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
@@ -230,11 +230,11 @@ pub fn decode<'a>(
                 out[i] = Datum::Range { text: s, kind };
             }
             ColType::Interval => {
-                let mo = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let month = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let dy = bytes.get(at + 4..at + 8).ok_or_else(corrupt)?;
                 let us = bytes.get(at + 8..at + 16).ok_or_else(corrupt)?;
                 out[i] = Datum::Interval(crate::sql::types::Interval {
-                    months: i32::from_le_bytes(mo.try_into().unwrap()),
+                    months: i32::from_le_bytes(month.try_into().unwrap()),
                     days: i32::from_le_bytes(dy.try_into().unwrap()),
                     micros: i64::from_le_bytes(us.try_into().unwrap()),
                 });

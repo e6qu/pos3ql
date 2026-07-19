@@ -18,7 +18,7 @@ use super::eval::SqlError;
 /// it: a message is delivered to the client only when its own severity is at or
 /// above this level. Declaration order is the rank (low to high).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MsgLevel {
+pub enum MessageLevel {
     Debug5,
     Debug4,
     Debug3,
@@ -30,45 +30,45 @@ pub enum MsgLevel {
     Error,
 }
 
-impl MsgLevel {
+impl MessageLevel {
     /// Whether a message of severity `msg` is shown at this threshold.
-    pub fn allows(self, msg: MsgLevel) -> bool {
+    pub fn allows(self, msg: MessageLevel) -> bool {
         msg >= self
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            MsgLevel::Debug5 => "debug5",
-            MsgLevel::Debug4 => "debug4",
-            MsgLevel::Debug3 => "debug3",
-            MsgLevel::Debug2 => "debug2",
-            MsgLevel::Debug1 => "debug1",
-            MsgLevel::Log => "log",
-            MsgLevel::Notice => "notice",
-            MsgLevel::Warning => "warning",
-            MsgLevel::Error => "error",
+            MessageLevel::Debug5 => "debug5",
+            MessageLevel::Debug4 => "debug4",
+            MessageLevel::Debug3 => "debug3",
+            MessageLevel::Debug2 => "debug2",
+            MessageLevel::Debug1 => "debug1",
+            MessageLevel::Log => "log",
+            MessageLevel::Notice => "notice",
+            MessageLevel::Warning => "warning",
+            MessageLevel::Error => "error",
         }
     }
 
-    fn parse(s: &str) -> Option<MsgLevel> {
+    fn parse(s: &str) -> Option<MessageLevel> {
         // `debug` with no digit is an accepted alias for debug2 in PostgreSQL.
         for lvl in [
-            MsgLevel::Debug5,
-            MsgLevel::Debug4,
-            MsgLevel::Debug3,
-            MsgLevel::Debug2,
-            MsgLevel::Debug1,
-            MsgLevel::Log,
-            MsgLevel::Notice,
-            MsgLevel::Warning,
-            MsgLevel::Error,
+            MessageLevel::Debug5,
+            MessageLevel::Debug4,
+            MessageLevel::Debug3,
+            MessageLevel::Debug2,
+            MessageLevel::Debug1,
+            MessageLevel::Log,
+            MessageLevel::Notice,
+            MessageLevel::Warning,
+            MessageLevel::Error,
         ] {
             if s.eq_ignore_ascii_case(lvl.as_str()) {
                 return Some(lvl);
             }
         }
         if s.eq_ignore_ascii_case("debug") {
-            return Some(MsgLevel::Debug2);
+            return Some(MessageLevel::Debug2);
         }
         None
     }
@@ -78,21 +78,21 @@ impl MsgLevel {
 /// GUCs, handed to the wire layer so DateStyle, TimeZone, and
 /// client_min_messages affect output.
 #[derive(Debug, Clone, Copy)]
-pub struct RenderCtx {
+pub struct RenderContext {
     pub datestyle: DateStyle,
     /// The session time zone; resolves offset + abbreviation per timestamp so
     /// DST is honored.
     pub parsed_timezone: super::timezone::Timezone,
     /// The client_min_messages threshold: NOTICE/WARNING below it are dropped.
-    pub min_message_level: MsgLevel,
+    pub min_message_level: MessageLevel,
 }
 
-impl Default for RenderCtx {
+impl Default for RenderContext {
     fn default() -> Self {
-        RenderCtx {
+        RenderContext {
             datestyle: DateStyle::default(),
             parsed_timezone: super::timezone::Timezone::utc(),
-            min_message_level: MsgLevel::Notice,
+            min_message_level: MessageLevel::Notice,
         }
     }
 }
@@ -105,7 +105,7 @@ pub struct GucState {
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
     search_path: StackStr<128>,
-    client_min_messages: MsgLevel,
+    client_min_messages: MessageLevel,
     extra_float_digits: StackStr<8>,
     lock_timeout: StackStr<24>,
     /// statement_timeout in milliseconds (0 = disabled), enforced at scan
@@ -129,7 +129,7 @@ impl GucState {
             client_encoding: StackStr::new(),
             application_name: StackStr::new(),
             search_path: StackStr::new(),
-            client_min_messages: MsgLevel::Notice,
+            client_min_messages: MessageLevel::Notice,
             extra_float_digits: StackStr::new(),
             lock_timeout: StackStr::new(),
             statement_timeout: StackStr::new(),
@@ -211,9 +211,9 @@ impl GucState {
             // Filters which NOTICE/WARNING messages reach the client. The
             // default is `notice`; an unrecognized level errors like PostgreSQL.
             self.client_min_messages = if is_default {
-                MsgLevel::Notice
+                MessageLevel::Notice
             } else {
-                MsgLevel::parse(v).ok_or_else(|| {
+                MessageLevel::parse(v).ok_or_else(|| {
                     sql_err!(
                         "22023",
                         "invalid value for parameter \"client_min_messages\": \"{}\"",
@@ -363,10 +363,10 @@ impl GucState {
     }
 
     /// Value-rendering settings for the wire layer (DateStyle + zone).
-    pub fn render(&self) -> RenderCtx {
+    pub fn render(&self) -> RenderContext {
         let (format, ord) = parse_full(self.datestyle.as_str());
         let order = if ord == Order3::Dmy { FieldOrder::Dmy } else { FieldOrder::Mdy };
-        RenderCtx {
+        RenderContext {
             datestyle: DateStyle { format, order },
             parsed_timezone: self.parsed_timezone,
             min_message_level: self.client_min_messages,

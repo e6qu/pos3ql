@@ -1318,7 +1318,7 @@ fn call<'a>(
                 return Ok(Datum::Null);
             };
             let mut global = false;
-            let mut ci = false;
+            let mut case_insensitive = false;
             if args.len() == 4 {
                 let Some(flags) = text_arg(name, args, 3, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
@@ -1326,8 +1326,8 @@ fn call<'a>(
                 for f in flags.chars() {
                     match f {
                         'g' => global = true,
-                        'i' => ci = true,
-                        'c' => ci = false,
+                        'i' => case_insensitive = true,
+                        'c' => case_insensitive = false,
                         _ => {
                             return Err(sql_err!(
                                 "22023",
@@ -1340,7 +1340,7 @@ fn call<'a>(
             }
             let mut out = StackStr::<8192>::new();
             let mut pos = 0usize;
-            while let Some((s, e)) = super::regex::find(pat, src, pos, ci)? {
+            while let Some((s, e)) = super::regex::find(pat, src, pos, case_insensitive)? {
                 if out.write_str(&src[pos..s]).is_err() {
                     return Err(sql_err!("54000", "regexp_replace result too large"));
                 }
@@ -1390,18 +1390,18 @@ fn call<'a>(
             } else {
                 1
             };
-            let mut ci = false;
+            let mut case_insensitive = false;
             if args.len() == 4 {
                 let Some(flags) = text_arg(name, args, 3, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                ci = flags.contains('i');
+                case_insensitive = flags.contains('i');
             }
             let begin = char_index_to_byte(src, (start_char - 1) as usize);
             if name == "regexp_count" {
                 let mut count = 0i32;
                 let mut pos = begin;
-                while let Some((s, e)) = super::regex::find(pat, src, pos, ci)? {
+                while let Some((s, e)) = super::regex::find(pat, src, pos, case_insensitive)? {
                     count += 1;
                     pos = if e == s {
                         match src[e..].chars().next() {
@@ -1414,7 +1414,7 @@ fn call<'a>(
                 }
                 return Ok(Datum::Int4(count));
             }
-            match super::regex::find(pat, src, begin, ci)? {
+            match super::regex::find(pat, src, begin, case_insensitive)? {
                 None if name == "regexp_instr" => Ok(Datum::Int4(0)),
                 None => Ok(Datum::Null),
                 Some((s, _)) if name == "regexp_instr" => {

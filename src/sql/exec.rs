@@ -1411,12 +1411,12 @@ pub fn create_index(
         ));
     }
     let mut columns = [0u16; MAX_INDEX_COLS];
-    for (i, cn) in column_names.iter().enumerate() {
-        let Some(ci) = tdef.column_index(cn) else {
+    for (i, column_name) in column_names.iter().enumerate() {
+        let Some(ci) = tdef.column_index(column_name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
-                cn
+                column_name
             ));
         };
         columns[i] = ci as u16;

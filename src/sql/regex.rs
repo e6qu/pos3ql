@@ -16,7 +16,7 @@ use super::eval::{sqlstate, SqlError};
 use crate::sql_err;
 
 /// Whether `pattern` matches anywhere in `text` (POSIX `~` semantics).
-pub fn regex_search(pattern: &str, text: &str, ci: bool) -> Result<bool, SqlError> {
+pub fn regex_search(pattern: &str, text: &str, case_insensitive: bool) -> Result<bool, SqlError> {
     validate(pattern)?;
     let anchored = pattern.starts_with('^');
     let pat = if anchored { &pattern[1..] } else { pattern };
@@ -25,11 +25,11 @@ pub fn regex_search(pattern: &str, text: &str, ci: bool) -> Result<bool, SqlErro
     // matches a substring; a trailing `$` in the pattern enforces the end.
     let accept = |_rest: &str| Ok(true);
     if anchored {
-        return m(pat, text, ci, &budget, &accept);
+        return m(pat, text, case_insensitive, &budget, &accept);
     }
     let mut rest = text;
     loop {
-        if m(pat, rest, ci, &budget, &accept)? {
+        if m(pat, rest, case_insensitive, &budget, &accept)? {
             return Ok(true);
         }
         match rest.chars().next() {
@@ -46,7 +46,7 @@ pub fn find(
     pattern: &str,
     text: &str,
     from: usize,
-    ci: bool,
+    case_insensitive: bool,
 ) -> Result<Option<(usize, usize)>, SqlError> {
     validate(pattern)?;
     let anchored = pattern.starts_with('^');
@@ -65,7 +65,7 @@ pub fn find(
             }
             Ok(false)
         };
-        m(pat, sub, ci, &budget, &accept)?;
+        m(pat, sub, case_insensitive, &budget, &accept)?;
         Ok(best.get())
     };
     if anchored {
@@ -147,17 +147,17 @@ fn step(budget: &Cell<u32>) -> Result<(), SqlError> {
 fn m(
     pat: &str,
     text: &str,
-    ci: bool,
+    case_insensitive: bool,
     budget: &Cell<u32>,
     k: &dyn Fn(&str) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     step(budget)?;
     // Top-level alternation: try each branch.
     if let Some(bar) = top_level_bar(pat) {
-        if m(&pat[..bar], text, ci, budget, k)? {
+        if m(&pat[..bar], text, case_insensitive, budget, k)? {
             return Ok(true);
         }
-        return m(&pat[bar + 1..], text, ci, budget, k);
+        return m(&pat[bar + 1..], text, case_insensitive, budget, k);
     }
     if pat.is_empty() {
         return k(text);
@@ -172,11 +172,11 @@ fn m(
         let body = &pat[1..close];
         let after = &pat[close + 1..];
         let (quant, rest) = split_quant(after);
-        let cont = move |t: &str| m(rest, t, ci, budget, k);
+        let cont = move |t: &str| m(rest, t, case_insensitive, budget, k);
         return match quant {
-            None => m(body, text, ci, budget, &cont),
+            None => m(body, text, case_insensitive, budget, &cont),
             Some(b'?') => {
-                if m(body, text, ci, budget, &cont)? {
+                if m(body, text, case_insensitive, budget, &cont)? {
                     Ok(true)
                 } else {
                     cont(text)
@@ -184,22 +184,22 @@ fn m(
             }
             _ => {
                 let min = if quant == Some(b'+') { 1 } else { 0 };
-                rep_group(body, text, ci, budget, min, &cont)
+                rep_group(body, text, case_insensitive, budget, min, &cont)
             }
         };
     }
     // A single atom (literal / '.' / escaped / class) plus optional quantifier.
     let (atom, after) = take_atom(pat);
     let (quant, rest) = split_quant(after);
-    let cont = move |t: &str| m(rest, t, ci, budget, k);
+    let cont = move |t: &str| m(rest, t, case_insensitive, budget, k);
     match quant {
         Some(b'*') | Some(b'+') => {
             let min = if quant == Some(b'+') { 1 } else { 0 };
-            rep_atom(atom, text, ci, budget, min, &cont)
+            rep_atom(atom, text, case_insensitive, budget, min, &cont)
         }
         Some(b'?') => {
             if let Some(c) = text.chars().next()
-                && atom_matches(atom, c, ci)
+                && atom_matches(atom, c, case_insensitive)
                 && cont(&text[c.len_utf8()..])?
             {
                 return Ok(true);
@@ -208,7 +208,7 @@ fn m(
         }
         _ => {
             if let Some(c) = text.chars().next()
-                && atom_matches(atom, c, ci)
+                && atom_matches(atom, c, case_insensitive)
             {
                 cont(&text[c.len_utf8()..])
             } else {
@@ -222,15 +222,15 @@ fn m(
 fn rep_atom(
     atom: &str,
     text: &str,
-    ci: bool,
+    case_insensitive: bool,
     budget: &Cell<u32>,
     min: u32,
     cont: &dyn Fn(&str) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     step(budget)?;
     if let Some(c) = text.chars().next()
-        && atom_matches(atom, c, ci)
-        && rep_atom(atom, &text[c.len_utf8()..], ci, budget, min.saturating_sub(1), cont)?
+        && atom_matches(atom, c, case_insensitive)
+        && rep_atom(atom, &text[c.len_utf8()..], case_insensitive, budget, min.saturating_sub(1), cont)?
     {
         return Ok(true);
     }
@@ -245,7 +245,7 @@ fn rep_atom(
 fn rep_group(
     body: &str,
     text: &str,
-    ci: bool,
+    case_insensitive: bool,
     budget: &Cell<u32>,
     min: u32,
     cont: &dyn Fn(&str) -> Result<bool, SqlError>,
@@ -257,9 +257,9 @@ fn rep_group(
         if t.len() == start_len {
             return Ok(false);
         }
-        rep_group(body, t, ci, budget, min.saturating_sub(1), cont)
+        rep_group(body, t, case_insensitive, budget, min.saturating_sub(1), cont)
     };
-    if m(body, text, ci, budget, &more)? {
+    if m(body, text, case_insensitive, budget, &more)? {
         return Ok(true);
     }
     if min == 0 {
@@ -360,26 +360,26 @@ fn take_atom(pat: &str) -> (&str, &str) {
     }
 }
 
-fn eq_ci(a: char, b: char, ci: bool) -> bool {
-    if ci {
+fn eq_ci(a: char, b: char, case_insensitive: bool) -> bool {
+    if case_insensitive {
         a.eq_ignore_ascii_case(&b)
     } else {
         a == b
     }
 }
 
-fn atom_matches(atom: &str, ch: char, ci: bool) -> bool {
+fn atom_matches(atom: &str, ch: char, case_insensitive: bool) -> bool {
     let b = atom.as_bytes();
     match b.first() {
         Some(b'.') if atom.len() == 1 => true,
-        Some(b'\\') => atom[1..].chars().next().map(|c| eq_ci(c, ch, ci)).unwrap_or(false),
-        Some(b'[') => class_matches(atom, ch, ci),
-        Some(_) => atom.chars().next().map(|c| eq_ci(c, ch, ci)).unwrap_or(false),
+        Some(b'\\') => atom[1..].chars().next().map(|c| eq_ci(c, ch, case_insensitive)).unwrap_or(false),
+        Some(b'[') => class_matches(atom, ch, case_insensitive),
+        Some(_) => atom.chars().next().map(|c| eq_ci(c, ch, case_insensitive)).unwrap_or(false),
         None => false,
     }
 }
 
-fn class_matches(class: &str, ch: char, ci: bool) -> bool {
+fn class_matches(class: &str, ch: char, case_insensitive: bool) -> bool {
     let inner = &class[1..class.len().saturating_sub(1)];
     let mut it = inner.chars().peekable();
     let negated = matches!(it.peek(), Some('^'));
@@ -396,7 +396,7 @@ fn class_matches(class: &str, ch: char, ci: bool) -> bool {
         }
         if pending_dash {
             if let Some(lo) = prev
-                && in_range(lo, c, ch, ci)
+                && in_range(lo, c, ch, case_insensitive)
             {
                 found = true;
             }
@@ -404,22 +404,22 @@ fn class_matches(class: &str, ch: char, ci: bool) -> bool {
             prev = None;
             continue;
         }
-        if eq_ci(c, ch, ci) {
+        if eq_ci(c, ch, case_insensitive) {
             found = true;
         }
         prev = Some(c);
     }
-    if pending_dash && eq_ci('-', ch, ci) {
+    if pending_dash && eq_ci('-', ch, case_insensitive) {
         found = true;
     }
     found != negated
 }
 
-fn in_range(lo: char, hi: char, ch: char, ci: bool) -> bool {
+fn in_range(lo: char, hi: char, ch: char, case_insensitive: bool) -> bool {
     if (lo..=hi).contains(&ch) {
         return true;
     }
-    if ci {
+    if case_insensitive {
         (lo..=hi).contains(&ch.to_ascii_lowercase())
             || (lo..=hi).contains(&ch.to_ascii_uppercase())
     } else {

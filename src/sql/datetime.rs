@@ -102,75 +102,75 @@ const MONTH_FULL: [&str; 12] = [
 pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i64, i64), SqlError> {
     let bad = || sql_err!("22007", "invalid value for input string");
     let (mut y, mut month, mut d, mut h, mut mi, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
-    let ib = input.as_bytes();
-    let fb = fmt.as_bytes();
-    let mut ip = 0usize;
-    let mut fi = 0usize;
+    let input_bytes = input.as_bytes();
+    let format_bytes = fmt.as_bytes();
+    let mut input_position = 0usize;
+    let mut format_index = 0usize;
     // Reads up to `width` decimal digits (skipping leading spaces) into an int.
-    let read_num = |ip: &mut usize, width: usize| -> Option<i64> {
-        while *ip < ib.len() && ib[*ip] == b' ' {
-            *ip += 1;
+    let read_num = |input_position: &mut usize, width: usize| -> Option<i64> {
+        while *input_position < input_bytes.len() && input_bytes[*input_position] == b' ' {
+            *input_position += 1;
         }
-        let start = *ip;
+        let start = *input_position;
         let mut v: i64 = 0;
-        while *ip < ib.len() && *ip - start < width && ib[*ip].is_ascii_digit() {
-            v = v * 10 + (ib[*ip] - b'0') as i64;
-            *ip += 1;
+        while *input_position < input_bytes.len() && *input_position - start < width && input_bytes[*input_position].is_ascii_digit() {
+            v = v * 10 + (input_bytes[*input_position] - b'0') as i64;
+            *input_position += 1;
         }
-        if *ip == start { None } else { Some(v) }
+        if *input_position == start { None } else { Some(v) }
     };
     let starts_with_ci = |bytes: &[u8], at: usize, word: &[u8]| -> bool {
         at + word.len() <= bytes.len()
             && bytes[at..at + word.len()].eq_ignore_ascii_case(word)
     };
-    while fi < fb.len() {
-        let up = fb[fi].to_ascii_uppercase();
+    while format_index < format_bytes.len() {
+        let up = format_bytes[format_index].to_ascii_uppercase();
         // Longest field codes first.
-        if starts_with_ci(fb, fi, b"HH24") || starts_with_ci(fb, fi, b"HH12") {
-            h = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 4;
-        } else if starts_with_ci(fb, fi, b"YYYY") {
-            y = read_num(&mut ip, 4).ok_or_else(bad)?;
-            fi += 4;
-        } else if starts_with_ci(fb, fi, b"MONTH") {
-            month = read_month(input, &mut ip, false).ok_or_else(bad)?;
-            fi += 5;
-        } else if starts_with_ci(fb, fi, b"MON") {
-            month = read_month(input, &mut ip, true).ok_or_else(bad)?;
-            fi += 3;
-        } else if starts_with_ci(fb, fi, b"YYY") {
-            y = read_num(&mut ip, 3).ok_or_else(bad)?;
-            fi += 3;
-        } else if up == b'H' && starts_with_ci(fb, fi, b"HH") {
-            h = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"YY") {
-            let v = read_num(&mut ip, 2).ok_or_else(bad)?;
+        if starts_with_ci(format_bytes, format_index, b"HH24") || starts_with_ci(format_bytes, format_index, b"HH12") {
+            h = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"YYYY") {
+            y = read_num(&mut input_position, 4).ok_or_else(bad)?;
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"MONTH") {
+            month = read_month(input, &mut input_position, false).ok_or_else(bad)?;
+            format_index += 5;
+        } else if starts_with_ci(format_bytes, format_index, b"MON") {
+            month = read_month(input, &mut input_position, true).ok_or_else(bad)?;
+            format_index += 3;
+        } else if starts_with_ci(format_bytes, format_index, b"YYY") {
+            y = read_num(&mut input_position, 3).ok_or_else(bad)?;
+            format_index += 3;
+        } else if up == b'H' && starts_with_ci(format_bytes, format_index, b"HH") {
+            h = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"YY") {
+            let v = read_num(&mut input_position, 2).ok_or_else(bad)?;
             y = if v < 70 { 2000 + v } else { 1900 + v };
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"MM") {
-            month = read_num(&mut ip, 2).ok_or_else(bad)? as u32;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"DD") {
-            d = read_num(&mut ip, 2).ok_or_else(bad)? as u32;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"MI") {
-            mi = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 2;
-        } else if starts_with_ci(fb, fi, b"SS") {
-            s = read_num(&mut ip, 2).ok_or_else(bad)?;
-            fi += 2;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"MM") {
+            month = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"DD") {
+            d = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"MI") {
+            mi = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"SS") {
+            s = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 2;
         } else if up == b'Y' {
-            y = read_num(&mut ip, 1).ok_or_else(bad)?;
-            fi += 1;
+            y = read_num(&mut input_position, 1).ok_or_else(bad)?;
+            format_index += 1;
         } else if up.is_ascii_alphabetic() {
             return Err(sql_err!("22007", "unsupported to_date/to_timestamp code"));
         } else {
             // Separator: skip one non-alphanumeric input character if present.
-            if ip < ib.len() && !ib[ip].is_ascii_alphanumeric() {
-                ip += 1;
+            if input_position < input_bytes.len() && !input_bytes[input_position].is_ascii_alphanumeric() {
+                input_position += 1;
             }
-            fi += 1;
+            format_index += 1;
         }
     }
     if !(1..=12).contains(&month) || d < 1 || d > days_in_month(y, month) {
@@ -179,18 +179,18 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
     Ok((y, month, d, h, mi, s))
 }
 
-/// Reads a month name (abbreviated when `abbr`, else full) at `*ip`, returning
+/// Reads a month name (abbreviated when `abbr`, else full) at `*input_position`, returning
 /// the 1-based month.
-fn read_month(input: &str, ip: &mut usize, abbr: bool) -> Option<u32> {
+fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32> {
     let bytes = input.as_bytes();
-    while *ip < bytes.len() && bytes[*ip] == b' ' {
-        *ip += 1;
+    while *input_position < bytes.len() && bytes[*input_position] == b' ' {
+        *input_position += 1;
     }
     let table: &[&str] = if abbr { &MONTH_ABBR } else { &MONTH_FULL };
     for (i, name) in table.iter().enumerate() {
         let nb = name.as_bytes();
-        if *ip + nb.len() <= bytes.len() && bytes[*ip..*ip + nb.len()].eq_ignore_ascii_case(nb) {
-            *ip += nb.len();
+        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
+            *input_position += nb.len();
             return Some(i as u32 + 1);
         }
     }
@@ -198,8 +198,8 @@ fn read_month(input: &str, ip: &mut usize, abbr: bool) -> Option<u32> {
     let other: &[&str] = if abbr { &MONTH_FULL } else { &MONTH_ABBR };
     for (i, name) in other.iter().enumerate() {
         let nb = name.as_bytes();
-        if *ip + nb.len() <= bytes.len() && bytes[*ip..*ip + nb.len()].eq_ignore_ascii_case(nb) {
-            *ip += nb.len();
+        if *input_position + nb.len() <= bytes.len() && bytes[*input_position..*input_position + nb.len()].eq_ignore_ascii_case(nb) {
+            *input_position += nb.len();
             return Some(i as u32 + 1);
         }
     }

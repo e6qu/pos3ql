@@ -140,7 +140,7 @@ impl Engine {
             None => 0,
         };
         let mut wal = Wal::open(config, budget)?;
-        wal.replay(floor, |lsn, op| apply_wal_op(&mut storage, lsn, op))?;
+        wal.replay(floor, |lsn, operator| apply_wal_op(&mut storage, lsn, operator))?;
         // RPO=0: replay any WAL segments in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
         if let Some(c) = ckpt.as_mut() {
@@ -148,7 +148,7 @@ impl Engine {
             let applied_to = c
                 .replay_wal_segments(seg_floor, |lsn, record| {
                     match crate::wal::decode_record(record) {
-                        Some(op) => apply_wal_op(&mut storage, lsn, op),
+                        Some(operator) => apply_wal_op(&mut storage, lsn, operator),
                         None => Err(SqlError {
                             sqlstate: "XX000",
                             message: stack_format!(192, "corrupt uploaded WAL record"),
@@ -667,8 +667,8 @@ impl Engine {
         oids: &mut [i32; MAX_BIND_PARAMS],
     ) {
         use ast::BinaryOp::*;
-        if let Expr::Binary { op, left, right } = expression {
-            match op {
+        if let Expr::Binary { operator, left, right } = expression {
+            match operator {
                 And | Or => {
                     self.infer_where_params(table, left, txid, oids);
                     self.infer_where_params(table, right, txid, oids);
@@ -1302,8 +1302,8 @@ fn report_parse_error(resp: &mut Responder, e: &ParseError) -> Result<(), WireFu
 }
 
 /// Reapplies one journal record to storage during recovery.
-fn apply_wal_op(storage: &mut Storage, lsn: u64, op: WalOp) -> Result<(), SqlError> {
-    match op {
+fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
+    match operator {
         WalOp::CreateTable(def) => {
             storage.create_table(def)?;
         }
@@ -3301,7 +3301,7 @@ mod tests {
 
     #[test]
     fn grouped_row_sources() {
-        // GROUP BY / aggregates as a row source: derived tables, CTEs, set-op
+        // GROUP BY / aggregates as a row source: derived tables, CTEs, set-operator
         // branches, and INSERT ... SELECT. Values validated against PG 18.4.
         let (mut e, mut b) = test_engine();
         run_with(&mut e, &mut b, "CREATE TABLE t (g int, v int)");

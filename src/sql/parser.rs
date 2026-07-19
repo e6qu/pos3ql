@@ -519,7 +519,7 @@ impl<'a> Parser<'a> {
     fn set_union(&mut self) -> Result<&'a SetTree<'a>, ParseError> {
         let mut left = self.set_intersect()?;
         loop {
-            let op = if self.eat_ident("union")? {
+            let operator = if self.eat_ident("union")? {
                 SetOp::Union
             } else if self.eat_ident("except")? {
                 SetOp::Except
@@ -528,7 +528,7 @@ impl<'a> Parser<'a> {
             };
             let all = self.set_all()?;
             let right = self.set_intersect()?;
-            left = self.alloc_set(SetTree::Op { op, all, left, right })?;
+            left = self.alloc_set(SetTree::Op { operator, all, left, right })?;
         }
         Ok(left)
     }
@@ -539,7 +539,7 @@ impl<'a> Parser<'a> {
         while self.eat_ident("intersect")? {
             let all = self.set_all()?;
             let right = self.set_leaf()?;
-            left = self.alloc_set(SetTree::Op { op: SetOp::Intersect, all, left, right })?;
+            left = self.alloc_set(SetTree::Op { operator: SetOp::Intersect, all, left, right })?;
         }
         Ok(left)
     }
@@ -552,7 +552,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return Ok(inner);
         }
-        // `VALUES (row), (row), ...` is a set-op branch: desugar to
+        // `VALUES (row), (row), ...` is a set-operator branch: desugar to
         // `SELECT row UNION ALL SELECT row ...` (each row a FROM-less SELECT).
         if self.peeked == Tok::Ident("values") {
             self.advance()?;
@@ -591,7 +591,7 @@ impl<'a> Parser<'a> {
                 tree = Some(match tree {
                     None => leaf,
                     Some(l) => self.alloc_set(SetTree::Op {
-                        op: SetOp::Union,
+                        operator: SetOp::Union,
                         all: true,
                         left: l,
                         right: leaf,
@@ -797,11 +797,11 @@ impl<'a> Parser<'a> {
                     let col = self.any_ident("column name")?;
                     let l = self.arena_expr(Expr::Column { qualifier: Some(left_q), name: col })?;
                     let r = self.arena_expr(Expr::Column { qualifier: Some(right_q), name: col })?;
-                    let eq = self.arena_expr(Expr::Binary { op: BinaryOp::Eq, left: l, right: r })?;
+                    let eq = self.arena_expr(Expr::Binary { operator: BinaryOp::Eq, left: l, right: r })?;
                     acc = Some(match acc {
                         None => eq,
                         Some(prev) => {
-                            self.arena_expr(Expr::Binary { op: BinaryOp::And, left: prev, right: eq })?
+                            self.arena_expr(Expr::Binary { operator: BinaryOp::And, left: prev, right: eq })?
                         }
                     });
                     if !self.eat_op(",")? {
@@ -1468,7 +1468,7 @@ impl<'a> Parser<'a> {
                     let cond = if is_true {
                         left
                     } else {
-                        self.arena_expr(Expr::Unary { op: UnaryOp::Not, operand: left })?
+                        self.arena_expr(Expr::Unary { operator: UnaryOp::Not, operand: left })?
                     };
                     let then_v = self.arena_expr(Expr::Bool(!negated))?;
                     let else_v = self.arena_expr(Expr::Bool(negated))?;
@@ -1503,19 +1503,19 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            // `left OPERATOR([schema.]op) right`: the explicit-operator syntax
+            // `left OPERATOR([schema.]operator) right`: the explicit-operator syntax
             // psql uses (e.g. `OPERATOR(pg_catalog.~)`), at comparison
             // precedence.
             if min_prec <= 4 && self.peeked == Tok::Ident("operator") {
                 self.advance()?;
                 self.expect_op("(")?;
-                let mut op = self.any_op_token()?;
+                let mut operator = self.any_op_token()?;
                 if self.eat_op(".")? {
-                    op = self.any_op_token()?;
+                    operator = self.any_op_token()?;
                 }
                 self.expect_op(")")?;
                 let right = self.expression(5)?;
-                left = self.build_operator(op, left, right)?;
+                left = self.build_operator(operator, left, right)?;
                 continue;
             }
             // IN / BETWEEN / LIKE / ILIKE, optionally NOT-prefixed. They
@@ -1610,25 +1610,25 @@ impl<'a> Parser<'a> {
                 })?;
                 continue;
             }
-            let Some(op) = self.peek_binary_op() else {
+            let Some(operator) = self.peek_binary_op() else {
                 return Ok(left);
             };
-            if op.precedence() < min_prec {
+            if operator.precedence() < min_prec {
                 return Ok(left);
             }
             self.advance()?;
-            // Quantified comparison: `operand op ANY/ALL (array)`.
+            // Quantified comparison: `operand operator ANY/ALL (array)`.
             if matches!(self.peeked, Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")) {
                 let all = self.peeked == Tok::Ident("all");
                 self.advance()?;
                 self.expect_op("(")?;
                 let array = self.expression(0)?;
                 self.expect_op(")")?;
-                left = self.arena_expr(Expr::AnyAll { operand: left, op, array, all })?;
+                left = self.arena_expr(Expr::AnyAll { operand: left, operator, array, all })?;
                 continue;
             }
-            let right = self.expression(op.precedence() + 1)?;
-            left = self.arena_expr(Expr::Binary { op, left, right })?;
+            let right = self.expression(operator.precedence() + 1)?;
+            left = self.arena_expr(Expr::Binary { operator, left, right })?;
         }
     }
 
@@ -1683,7 +1683,7 @@ impl<'a> Parser<'a> {
             Tok::Op("~") => {
                 self.advance()?;
                 let operand = self.expression(8)?;
-                self.arena_expr(Expr::Unary { op: UnaryOp::BitNot, operand })
+                self.arena_expr(Expr::Unary { operator: UnaryOp::BitNot, operand })
             }
             Tok::Op("-") => {
                 self.advance()?;
@@ -1700,7 +1700,7 @@ impl<'a> Parser<'a> {
                         }
                 }
                 let operand = self.expression(8)?;
-                self.arena_expr(Expr::Unary { op: UnaryOp::Neg, operand })
+                self.arena_expr(Expr::Unary { operator: UnaryOp::Neg, operand })
             }
             Tok::Op("+") => {
                 self.advance()?;
@@ -1709,7 +1709,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("not") => {
                 self.advance()?;
                 let operand = self.expression(3)?;
-                self.arena_expr(Expr::Unary { op: UnaryOp::Not, operand })
+                self.arena_expr(Expr::Unary { operator: UnaryOp::Not, operand })
             }
             Tok::Ident("null") => {
                 self.advance()?;
@@ -2172,22 +2172,22 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Builds an expression for an explicit `OPERATOR(op)` symbol.
+    /// Builds an expression for an explicit `OPERATOR(operator)` symbol.
     fn build_operator(
         &self,
-        op: &str,
+        operator: &str,
         left: &'a Expr<'a>,
         right: &'a Expr<'a>,
     ) -> Result<&'a Expr<'a>, ParseError> {
-        if matches!(op, "~" | "!~" | "~*" | "!~*") {
+        if matches!(operator, "~" | "!~" | "~*" | "!~*") {
             return self.arena_expr(Expr::Match {
                 operand: left,
                 pattern: right,
-                negated: op.starts_with('!'),
-                case_insensitive: op.ends_with('*'),
+                negated: operator.starts_with('!'),
+                case_insensitive: operator.ends_with('*'),
             });
         }
-        let bop = match op {
+        let bop = match operator {
             "=" => BinaryOp::Eq,
             "<>" | "!=" => BinaryOp::NotEq,
             "<" => BinaryOp::Lt,
@@ -2202,7 +2202,7 @@ impl<'a> Parser<'a> {
             "||" => BinaryOp::Concat,
             _ => return Err(self.err_here("unsupported operator in OPERATOR()")),
         };
-        self.arena_expr(Expr::Binary { op: bop, left, right })
+        self.arena_expr(Expr::Binary { operator: bop, left, right })
     }
 
     /// Desugars `left IS [NOT] DISTINCT FROM right` into a null-safe `CASE`:
@@ -2215,10 +2215,10 @@ impl<'a> Parser<'a> {
     ) -> Result<&'a Expr<'a>, ParseError> {
         let l_null = self.arena_expr(Expr::IsNull { operand: left, negated: false })?;
         let r_null = self.arena_expr(Expr::IsNull { operand: right, negated: false })?;
-        let both = self.arena_expr(Expr::Binary { op: BinaryOp::And, left: l_null, right: r_null })?;
-        let either = self.arena_expr(Expr::Binary { op: BinaryOp::Or, left: l_null, right: r_null })?;
+        let both = self.arena_expr(Expr::Binary { operator: BinaryOp::And, left: l_null, right: r_null })?;
+        let either = self.arena_expr(Expr::Binary { operator: BinaryOp::Or, left: l_null, right: r_null })?;
         let cmp_op = if negated { BinaryOp::Eq } else { BinaryOp::NotEq };
-        let cmp = self.arena_expr(Expr::Binary { op: cmp_op, left, right })?;
+        let cmp = self.arena_expr(Expr::Binary { operator: cmp_op, left, right })?;
         let both_val = self.arena_expr(Expr::Bool(negated))?;
         let either_val = self.arena_expr(Expr::Bool(!negated))?;
         let whens = self.arena_slice(&[(both, both_val), (either, either_val)])?;
@@ -2416,19 +2416,19 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn eat_op(&mut self, op: &str) -> Result<bool, ParseError> {
-        if self.peeked == Tok::Op(op) {
+    fn eat_op(&mut self, operator: &str) -> Result<bool, ParseError> {
+        if self.peeked == Tok::Op(operator) {
             self.advance()?;
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn expect_op(&mut self, op: &str) -> Result<(), ParseError> {
-        if !self.eat_op(op)? {
+    fn expect_op(&mut self, operator: &str) -> Result<(), ParseError> {
+        if !self.eat_op(operator)? {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "expected '{}'", op),
+                message: stack_format!(96, "expected '{}'", operator),
             });
         }
         Ok(())
@@ -2561,11 +2561,11 @@ mod tests {
             let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
             let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
             // 1 + (2 * 3)
-            let Expr::Binary { op: BinaryOp::Add, left, right } = expression else { panic!() };
+            let Expr::Binary { operator: BinaryOp::Add, left, right } = expression else { panic!() };
             assert_eq!(**left, Expr::Int(1));
-            assert!(matches!(right, Expr::Binary { op: BinaryOp::Mul, .. }));
+            assert!(matches!(right, Expr::Binary { operator: BinaryOp::Mul, .. }));
             let SelectItem::Expr { expression, .. } = s.items[1] else { panic!() };
-            assert!(matches!(expression, Expr::Binary { op: BinaryOp::Mul, .. }));
+            assert!(matches!(expression, Expr::Binary { operator: BinaryOp::Mul, .. }));
         });
     }
 
@@ -2578,7 +2578,7 @@ mod tests {
                 assert_eq!(s.from.unwrap().base.table, "t");
                 assert!(matches!(
                     s.where_clause.unwrap(),
-                    Expr::Binary { op: BinaryOp::And, .. }
+                    Expr::Binary { operator: BinaryOp::And, .. }
                 ));
                 assert_eq!(s.order_by.len(), 2);
                 assert!(s.order_by[0].descending);

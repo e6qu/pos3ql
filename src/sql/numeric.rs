@@ -720,7 +720,7 @@ fn compare_magnitude(a: &Numeric, b: &Numeric) -> Ordering {
 
 // ---- arithmetic ----
 
-/// Digit buffer used for intermediates; large enough for any bounded op.
+/// Digit buffer used for intermediates; large enough for any bounded operator.
 type DigitBuf = [i32; MAX_NDIGITS * 2 + 4];
 
 pub fn add<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {

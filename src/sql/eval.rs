@@ -192,7 +192,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
         // so the sibling's constant errors are never surfaced.
-        Expr::Binary { op: BinaryOp::And, left, right } => {
+        Expr::Binary { operator: BinaryOp::And, left, right } => {
             if fold_check(left, arena)? == Some(false) {
                 return Ok(Some(false));
             }
@@ -201,7 +201,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
-        Expr::Binary { op: BinaryOp::Or, left, right } => {
+        Expr::Binary { operator: BinaryOp::Or, left, right } => {
             if fold_check(left, arena)? == Some(true) {
                 return Ok(Some(true));
             }
@@ -338,11 +338,11 @@ pub fn eval_full<'a>(
                 "there is no parameter ${}",
                 n
             )),
-        Expr::Unary { op, operand } => {
+        Expr::Unary { operator, operand } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
-            unary(op, v)
+            unary(operator, v)
         }
-        Expr::Binary { op: BinaryOp::And, left, right } => {
+        Expr::Binary { operator: BinaryOp::And, left, right } => {
             // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
             // scan qual in a cost order that is not fixed, so a FALSE operand
             // determines the result even when the *other* operand would error at
@@ -352,18 +352,18 @@ pub fn eval_full<'a>(
             // we get here, so anything that reaches this point is per-row.
             eval_logic_short_circuit(BinaryOp::And, left, right, arena, params, row, hooks)
         }
-        Expr::Binary { op: BinaryOp::Or, left, right } => {
+        Expr::Binary { operator: BinaryOp::Or, left, right } => {
             // Dual of AND: a definite TRUE on either side yields TRUE and
             // absorbs the sibling's runtime error (PostgreSQL's `x OR TRUE`).
             eval_logic_short_circuit(BinaryOp::Or, left, right, arena, params, row, hooks)
         }
-        Expr::Binary { op, left, right } => {
+        Expr::Binary { operator, left, right } => {
             let l = eval_full(left, arena, params, row, hooks)?;
             let r = eval_full(right, arena, params, row, hooks)?;
             // `array || NULL` resolution depends on the NULL operand's static
             // type, which the datum has lost — resolve it here where the
             // expression is still available.
-            if op == BinaryOp::Concat
+            if operator == BinaryOp::Concat
                 && let Some(d) = array_null_concat(l, r, left, right, row, arena)?
             {
                 return Ok(d);
@@ -371,7 +371,7 @@ pub fn eval_full<'a>(
             // Track which side is an "unknown" literal (a string literal or a
             // parameter): only those coerce to the other operand's type, as
             // PostgreSQL does. A real text value never coerces to a number.
-            binary(op, l, r, is_unknown_literal(left), is_unknown_literal(right), arena)
+            binary(operator, l, r, is_unknown_literal(left), is_unknown_literal(right), arena)
         }
         Expr::Cast { operand, type_name, type_mod } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
@@ -519,7 +519,7 @@ pub fn eval_full<'a>(
         }
         Expr::Case { operand, whens, otherwise } => {
             let scrutinee = match operand {
-                Some(op) => Some(eval_full(op, arena, params, row, hooks)?),
+                Some(operator) => Some(eval_full(operator, arena, params, row, hooks)?),
                 None => None,
             };
             // PostgreSQL unifies all branch result types to one common type;
@@ -708,7 +708,7 @@ pub fn eval_full<'a>(
                 _ => Err(type_mismatch("field access on a non-composite value", &b)),
             }
         }
-        Expr::AnyAll { operand, op, array, all } => {
+        Expr::AnyAll { operand, operator, array, all } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let array = eval_full(array, arena, params, row, hooks)?;
             let (element, raw) = match array {
@@ -720,7 +720,7 @@ pub fn eval_full<'a>(
             let mut saw_null = false;
             for i in 0..n {
                 let el = super::array::get(raw, element, i).unwrap_or(Datum::Null);
-                match binary(op, lhs, el, false, false, arena)? {
+                match binary(operator, lhs, el, false, false, arena)? {
                     Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
                     Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
                     Datum::Null => saw_null = true,
@@ -2198,23 +2198,23 @@ fn call<'a>(
             // the operand falls in (0 below, count+1 at/above). Numeric args use
             // exact numeric arithmetic; a float argument uses double precision.
             arity(4)?;
-            let op = eval_full(args[0], arena, params, row, hooks)?;
+            let operator = eval_full(args[0], arena, params, row, hooks)?;
             let lo = eval_full(args[1], arena, params, row, hooks)?;
             let hi = eval_full(args[2], arena, params, row, hooks)?;
             let Some(cnt) = int_arg(name, args, 3, arena, params, row, hooks)? else {
                 return Ok(Datum::Null);
             };
-            if op.is_null() || lo.is_null() || hi.is_null() {
+            if operator.is_null() || lo.is_null() || hi.is_null() {
                 return Ok(Datum::Null);
             }
             if cnt <= 0 {
                 return Err(sql_err!("2201G", "count must be greater than zero"));
             }
-            let any_float = matches!(op, Datum::Float8(_))
+            let any_float = matches!(operator, Datum::Float8(_))
                 || matches!(lo, Datum::Float8(_))
                 || matches!(hi, Datum::Float8(_));
             if any_float {
-                let (o, l, h) = (datum_f64(name, op)?, datum_f64(name, lo)?, datum_f64(name, hi)?);
+                let (o, l, h) = (datum_f64(name, operator)?, datum_f64(name, lo)?, datum_f64(name, hi)?);
                 if l == h {
                     return Err(sql_err!("22004", "lower and upper bounds cannot be equal"));
                 }
@@ -2222,7 +2222,7 @@ fn call<'a>(
                 return Ok(Datum::Int4(b));
             }
             let (o, l, h) = (
-                datum_numeric(name, op, arena)?,
+                datum_numeric(name, operator, arena)?,
                 datum_numeric(name, lo, arena)?,
                 datum_numeric(name, hi, arena)?,
             );
@@ -2837,22 +2837,22 @@ fn datum_f64(name: &str, d: Datum<'_>) -> Result<f64, SqlError> {
 
 /// `width_bucket` for double-precision bounds; `count` buckets over [low,high]
 /// (or reversed when high < low), 0 below and count+1 at/above the range.
-fn width_bucket_f64(op: f64, lo: f64, hi: f64, count: i64) -> i32 {
+fn width_bucket_f64(operator: f64, lo: f64, hi: f64, count: i64) -> i32 {
     let c = count as f64;
     let bucket = if lo < hi {
-        if op < lo {
+        if operator < lo {
             0
-        } else if op >= hi {
+        } else if operator >= hi {
             count + 1
         } else {
-            ((op - lo) / (hi - lo) * c).floor() as i64 + 1
+            ((operator - lo) / (hi - lo) * c).floor() as i64 + 1
         }
-    } else if op > lo {
+    } else if operator > lo {
         0
-    } else if op <= hi {
+    } else if operator <= hi {
         count + 1
     } else {
-        ((lo - op) / (lo - hi) * c).floor() as i64 + 1
+        ((lo - operator) / (lo - hi) * c).floor() as i64 + 1
     };
     bucket as i32
 }
@@ -2860,7 +2860,7 @@ fn width_bucket_f64(op: f64, lo: f64, hi: f64, count: i64) -> i32 {
 /// `width_bucket` with exact numeric arithmetic (matching PostgreSQL's numeric
 /// form), using an integer quotient so bucket boundaries land exactly.
 fn width_bucket_numeric(
-    op: &Numeric,
+    operator: &Numeric,
     lo: &Numeric,
     hi: &Numeric,
     count: i64,
@@ -2874,9 +2874,9 @@ fn width_bucket_numeric(
     let cnt = Numeric::from_i64(count, arena)?;
     let ascending = compare(lo, hi) == Ordering::Less;
     let (below, at_or_above) = if ascending {
-        (compare(op, lo) == Ordering::Less, compare(op, hi) != Ordering::Less)
+        (compare(operator, lo) == Ordering::Less, compare(operator, hi) != Ordering::Less)
     } else {
-        (compare(op, lo) == Ordering::Greater, compare(op, hi) != Ordering::Greater)
+        (compare(operator, lo) == Ordering::Greater, compare(operator, hi) != Ordering::Greater)
     };
     if below {
         return Ok(0);
@@ -2884,11 +2884,11 @@ fn width_bucket_numeric(
     if at_or_above {
         return Ok((count + 1) as i32);
     }
-    // floor((|op-lo| * count) / |hi-lo|) + 1
+    // floor((|operator-lo| * count) / |hi-lo|) + 1
     let (num_a, den) = if ascending {
-        (sub(op, lo, arena)?, sub(hi, lo, arena)?)
+        (sub(operator, lo, arena)?, sub(hi, lo, arena)?)
     } else {
-        (sub(lo, op, arena)?, sub(lo, hi, arena)?)
+        (sub(lo, operator, arena)?, sub(lo, hi, arena)?)
     };
     let q = trunc_div(&mul(&num_a, &cnt, arena)?, &den, arena)?;
     Ok((q.to_i64()? + 1) as i32)
@@ -3127,10 +3127,10 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Str(_) => Some(ColType::Text),
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
-        Expr::Unary { op: UnaryOp::Neg, operand } => static_type(operand, row),
-        Expr::Unary { op: UnaryOp::Not, .. } | Expr::IsNull { .. }
+        Expr::Unary { operator: UnaryOp::Neg, operand } => static_type(operand, row),
+        Expr::Unary { operator: UnaryOp::Not, .. } | Expr::IsNull { .. }
         | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } | Expr::Match { .. } => Some(ColType::Bool),
-        Expr::Binary { op, left, right } => match op {
+        Expr::Binary { operator, left, right } => match operator {
             BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
             | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or => Some(ColType::Bool),
             BinaryOp::Concat => Some(ColType::Text),
@@ -3145,8 +3145,8 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
     }
 }
 
-fn unary<'a>(op: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
-    match (op, v) {
+fn unary<'a>(operator: UnaryOp, v: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    match (operator, v) {
         (_, Datum::Null) => Ok(Datum::Null),
         (UnaryOp::Neg, Datum::Int4(x)) => x
             .checked_neg()
@@ -3188,7 +3188,7 @@ fn is_unknown_literal(expression: &Expr) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn binary<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     l_unknown: bool,
@@ -3196,24 +3196,24 @@ fn binary<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
-    match op {
-        And | Or => logic(op, l, r),
+    match operator {
+        And | Or => logic(operator, l, r),
         Concat => concat(l, r, l_unknown, r_unknown, arena),
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(op, l, r),
-            _ => compare(op, l, r, l_unknown, r_unknown),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
+            _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub | Mul | Div | Mod => match (l, r) {
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(op, l, r, arena),
-            _ => arithmetic(op, l, r, l_unknown, r_unknown, arena),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(operator, l, r, arena),
+            _ => arithmetic(operator, l, r, l_unknown, r_unknown, arena),
         },
-        JsonGet | JsonGetText => json_get(l, r, op == JsonGetText, arena),
+        JsonGet | JsonGetText => json_get(l, r, operator == JsonGetText, arena),
         Shl | Shr => match (l, r) {
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(op, l, r),
-            _ => bitwise(op, l, r),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r),
+            _ => bitwise(operator, l, r),
         },
-        BitAnd | BitOr | BitXor => bitwise(op, l, r),
-        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(op, l, r),
+        BitAnd | BitOr | BitXor => bitwise(operator, l, r),
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(operator, l, r),
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
             // is float8); otherwise it is double-precision exponentiation.
@@ -3237,13 +3237,13 @@ fn binary<'a>(
 /// (overlaps), `<<`/`>>` (strictly left/right), `&<`/`&>` (does not extend
 /// right/left), `-|-` (adjacent). `@>`/`<@` accept a range-vs-range or
 /// range-vs-element pair; the rest require two ranges of the same kind.
-fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn range_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     use super::range;
     use BinaryOp::{Adjacent, ContainedBy, Contains, NotLeftOf, NotRightOf, Overlaps, Shl, Shr};
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
-    match op {
+    match operator {
         Contains => range_contains(l, r),
         ContainedBy => range_contains(r, l),
         _ => {
@@ -3252,7 +3252,7 @@ fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, S
             if lk != rk {
                 return Err(range_mismatch());
             }
-            Ok(Datum::Bool(match op {
+            Ok(Datum::Bool(match operator {
                 Overlaps => range::overlaps(lt, rt, lk)?,
                 Shl => range::strictly_before(lt, rt, lk)?,
                 Shr => range::strictly_after(lt, rt, lk)?,
@@ -3268,7 +3268,7 @@ fn range_op<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, S
 /// Range set operators returning a range: `+` (union), `-` (difference), `*`
 /// (intersection). Both operands must be ranges of the same kind.
 fn range_setop<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     arena: &'a Arena,
@@ -3282,7 +3282,7 @@ fn range_setop<'a>(
     if lk != rk {
         return Err(range_mismatch());
     }
-    let text = match op {
+    let text = match operator {
         BinaryOp::Add => range::union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::intersect(lt, rt, lk, arena)?,
@@ -3325,7 +3325,7 @@ fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), Sql
 }
 
 /// Integer bitwise operators (`& | # << >>`). Both operands must be integers.
-fn bitwise<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
     let int = |d: &Datum| -> Result<i64, SqlError> {
         match d {
@@ -3338,7 +3338,7 @@ fn bitwise<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, Sq
         return Ok(Datum::Null);
     }
     let (a, b) = (int(&l)?, int(&r)?);
-    let v = match op {
+    let v = match operator {
         BitAnd => a & b,
         BitOr => a | b,
         BitXor => a ^ b,
@@ -3404,7 +3404,7 @@ fn json_get<'a>(
 /// statically FALSE. `fold_check` decides statically (surfacing a constant
 /// operand's own error left-first, exactly as plan-time folding does).
 fn eval_logic_short_circuit<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     left: &Expr<'a>,
     right: &Expr<'a>,
     arena: &'a Arena,
@@ -3412,7 +3412,7 @@ fn eval_logic_short_circuit<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let absorbing = matches!(op, BinaryOp::Or);
+    let absorbing = matches!(operator, BinaryOp::Or);
     // Left first: a statically-determined left settles the result (absorbing) or
     // hands off to the right (non-absorbing), matching plan-time folding order.
     match fold_check(left, arena)? {
@@ -3432,11 +3432,11 @@ fn eval_logic_short_circuit<'a>(
         return Ok(Datum::Bool(absorbing));
     }
     let r = eval_full(right, arena, params, row, hooks)?;
-    logic(op, l, r)
+    logic(operator, l, r)
 }
 
 /// SQL three-valued AND/OR.
-fn logic<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn logic<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     let as_bool = |d: &Datum| -> Result<Option<bool>, SqlError> {
         match d {
             Datum::Null => Ok(None),
@@ -3445,7 +3445,7 @@ fn logic<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlE
         }
     };
     let (a, b) = (as_bool(&l)?, as_bool(&r)?);
-    let out = match (op, a, b) {
+    let out = match (operator, a, b) {
         (BinaryOp::And, Some(false), _) | (BinaryOp::And, _, Some(false)) => Some(false),
         (BinaryOp::And, Some(true), Some(true)) => Some(true),
         (BinaryOp::And, _, _) => None,
@@ -3706,11 +3706,11 @@ fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a>, SqlError
 
 /// Range comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`). Both operands
 /// must be ranges of the same kind; ordering follows PostgreSQL `range_cmp`.
-fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn compare_ranges<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
-    let sym = match op {
+    let sym = match operator {
         BinaryOp::Eq => "=",
         BinaryOp::NotEq => "<>",
         BinaryOp::Lt => "<",
@@ -3738,7 +3738,7 @@ fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<
         ));
     }
     let ord = super::range::cmp_ranges(lt, rt, lk)?;
-    let out = match op {
+    let out = match operator {
         BinaryOp::Eq => ord.is_eq(),
         BinaryOp::NotEq => ord.is_ne(),
         BinaryOp::Lt => ord.is_lt(),
@@ -3751,7 +3751,7 @@ fn compare_ranges<'a>(op: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<
 }
 
 fn compare<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     l_unknown: bool,
@@ -3763,7 +3763,7 @@ fn compare<'a>(
     let l = if l_unknown { coerce_unknown(l, &r)? } else { l };
     let r = if r_unknown { coerce_unknown(r, &l)? } else { r };
     let ord = compare_datums(&l, &r)?;
-    let out = match op {
+    let out = match operator {
         BinaryOp::Eq => ord.is_eq(),
         BinaryOp::NotEq => ord.is_ne(),
         BinaryOp::Lt => ord.is_lt(),
@@ -3777,7 +3777,7 @@ fn compare<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn arithmetic<'a>(
-    op: BinaryOp,
+    operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     l_unknown: bool,
@@ -3794,9 +3794,9 @@ fn arithmetic<'a>(
     // which would otherwise coerce a date to a bare day count.
     // Interval arithmetic: date/timestamp ± interval -> timestamp; interval
     // ± interval -> interval. Months add calendar months (day clamped).
-    match (op, l, r) {
+    match (operator, l, r) {
         (BinaryOp::Add | BinaryOp::Sub, Datum::Interval(a), Datum::Interval(b)) => {
-            let s: i32 = if op == BinaryOp::Sub { -1 } else { 1 };
+            let s: i32 = if operator == BinaryOp::Sub { -1 } else { 1 };
             return Ok(Datum::Interval(super::types::Interval {
                 months: a.months + s * b.months,
                 days: a.days + s * b.days,
@@ -3820,7 +3820,7 @@ fn arithmetic<'a>(
                 Datum::Date(d) => d as i64 * 86_400_000_000,
                 _ => unreachable!(),
             };
-            let signed = if op == BinaryOp::Sub {
+            let signed = if operator == BinaryOp::Sub {
                 super::types::Interval { months: -interval.months, days: -interval.days, micros: -interval.micros }
             } else {
                 interval
@@ -3834,7 +3834,7 @@ fn arithmetic<'a>(
         }
         _ => {}
     }
-    match (op, l, r) {
+    match (operator, l, r) {
         (BinaryOp::Sub, Datum::Date(a), Datum::Date(b)) => {
             return Ok(Datum::Int4(a - b));
         }
@@ -3850,7 +3850,7 @@ fn arithmetic<'a>(
         }
         (BinaryOp::Add | BinaryOp::Sub, Datum::Date(a), _) if as_i64(&r).is_some() => {
             let days = as_i64(&r).expect("checked");
-            return date_shift(a, days, op == BinaryOp::Sub);
+            return date_shift(a, days, operator == BinaryOp::Sub);
         }
         // `int + date` is commutative with `date + int`; `int - date` is not
         // defined in PostgreSQL, so only Add is accepted here.
@@ -3860,14 +3860,14 @@ fn arithmetic<'a>(
         }
         _ => {}
     }
-    // PostgreSQL numeric-promotion: int op int -> int; if either side is
+    // PostgreSQL numeric-promotion: int operator int -> int; if either side is
     // numeric (and neither is float8) -> numeric; if either is float8 ->
     // float8.
     let either_numeric = matches!(l, Datum::Numeric(_)) || matches!(r, Datum::Numeric(_));
     let either_float = matches!(l, Datum::Float8(_)) || matches!(r, Datum::Float8(_));
-    // Integer op integer stays integral.
+    // Integer operator integer stays integral.
     if let (Some(a), Some(b)) = (as_i64(&l), as_i64(&r)) {
-        let out = match op {
+        let out = match operator {
             BinaryOp::Add => a.checked_add(b),
             BinaryOp::Sub => a.checked_sub(b),
             BinaryOp::Mul => a.checked_mul(b),
@@ -3891,7 +3891,7 @@ fn arithmetic<'a>(
     if either_numeric && !either_float {
         let a = to_numeric(&l, arena)?;
         let b = to_numeric(&r, arena)?;
-        let out = match op {
+        let out = match operator {
             BinaryOp::Add => numeric::add(&a, &b, arena)?,
             BinaryOp::Sub => numeric::sub(&a, &b, arena)?,
             BinaryOp::Mul => numeric::mul(&a, &b, arena)?,
@@ -3903,7 +3903,7 @@ fn arithmetic<'a>(
     }
     // PostgreSQL defines no modulo operator for double precision, so `%` with
     // a float8 operand is undefined even though `+`/`-`/`*`/`/` are not.
-    if op == BinaryOp::Mod && either_float {
+    if operator == BinaryOp::Mod && either_float {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
             "operator does not exist: {} % {}",
@@ -3912,7 +3912,7 @@ fn arithmetic<'a>(
         ));
     }
     if let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) {
-        let out = match op {
+        let out = match operator {
             BinaryOp::Add => a + b,
             BinaryOp::Sub => a - b,
             BinaryOp::Mul => a * b,
@@ -3934,7 +3934,7 @@ fn arithmetic<'a>(
     }
     // No arithmetic operator is defined for this operand pair (e.g. int - date,
     // text + int). PostgreSQL reports this as "operator does not exist" (42883).
-    let sym = match op {
+    let sym = match operator {
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
@@ -3964,7 +3964,7 @@ fn date_shift<'a>(date: i32, days: i64, sub: bool) -> Result<Datum<'a>, SqlError
     }
 }
 
-/// int4 op int4 yields int4 (with range check), as in PostgreSQL.
+/// int4 operator int4 yields int4 (with range check), as in PostgreSQL.
 fn narrow_int<'a>(v: i64, l: &Datum, r: &Datum) -> Result<Datum<'a>, SqlError> {
     let both_int4 = matches!(l, Datum::Int4(_)) && matches!(r, Datum::Int4(_));
     if both_int4 {
@@ -4378,11 +4378,11 @@ fn division_by_zero() -> SqlError {
     sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero")
 }
 
-fn type_mismatch(op: &str, d: &Datum) -> SqlError {
+fn type_mismatch(operator: &str, d: &Datum) -> SqlError {
     sql_err!(
         sqlstate::DATATYPE_MISMATCH,
         "operator {} does not accept {}",
-        op,
+        operator,
         type_name_of(d)
     )
 }

@@ -430,9 +430,9 @@ pub fn relname_text<'a>(
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
-    let mut idxs = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, &mut idxs);
-    for info in idxs[..n].iter().flatten() {
+    let mut indices = [None; MAX_SYNTH_INDEXES];
+    let n = collect_indexes(storage, &mut indices);
+    for info in indices[..n].iter().flatten() {
         if info.oid == oid {
             let bytes =
                 arena.alloc_slice_copy(info.name.as_str().as_bytes()).map_err(|_| arena_full())?;
@@ -450,9 +450,9 @@ pub fn reloid_of_name(storage: &Storage, name: &str) -> Option<i32> {
             return Some(table_oid(storage, slot));
         }
     }
-    let mut idxs = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, &mut idxs);
-    idxs[..n]
+    let mut indices = [None; MAX_SYNTH_INDEXES];
+    let n = collect_indexes(storage, &mut indices);
+    indices[..n]
         .iter()
         .flatten()
         .find(|info| info.name.as_str() == name)
@@ -568,9 +568,9 @@ pub fn index_def_text<'a>(
     col: usize,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let mut idxs = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, &mut idxs);
-    for info in idxs[..n].iter().flatten() {
+    let mut indices = [None; MAX_SYNTH_INDEXES];
+    let n = collect_indexes(storage, &mut indices);
+    for info in indices[..n].iter().flatten() {
         if info.oid != oid {
             continue;
         }

@@ -912,7 +912,7 @@ fn scan_source<'a>(
 /// Expands a query's non-recursive `WITH` CTEs into derived tables: every
 /// FROM reference to a CTE name (in the body and in nested subqueries) is
 /// rewritten to `(cte_query) alias`, so the ordinary derived-table executor
-/// runs the whole thing. Returns the CTE-free select. A no-op when there are
+/// runs the whole thing. Returns the CTE-free select. A no-operator when there are
 /// no CTEs. Each CTE is substituted against the CTEs declared before it.
 /// A view that PostgreSQL treats as auto-updatable: a single base table, no
 /// aggregation/DISTINCT/GROUP BY/HAVING/LIMIT/joins, and every output column a
@@ -1006,7 +1006,7 @@ pub fn and_where<'a>(
     match (view_where, dml_where) {
         (None, w) | (w, None) => Ok(w),
         (Some(a), Some(b)) => {
-            let e = Expr::Binary { op: super::ast::BinaryOp::And, left: a, right: b };
+            let e = Expr::Binary { operator: super::ast::BinaryOp::And, left: a, right: b };
             Ok(Some(&*arena.alloc(e).map_err(|_| arena_full())?))
         }
     }
@@ -1135,7 +1135,7 @@ fn subst_select<'a>(
 }
 
 /// Substitutes parameters through every leaf SELECT of a set-operation tree,
-/// mirroring [`subst_select`] for a set-op subquery body.
+/// mirroring [`subst_select`] for a set-operator subquery body.
 fn subst_set_tree<'a>(
     tree: &'a SetTree<'a>,
     context: Subst<'_, 'a>,
@@ -1143,8 +1143,8 @@ fn subst_set_tree<'a>(
 ) -> Result<&'a SetTree<'a>, SqlError> {
     let out = match tree {
         SetTree::Select(s) => SetTree::Select(subst_select(s, context, arena)?),
-        SetTree::Op { op, all, left, right } => SetTree::Op {
-            op: *op,
+        SetTree::Op { operator, all, left, right } => SetTree::Op {
+            operator: *operator,
             all: *all,
             left: subst_set_tree(left, context, arena)?,
             right: subst_set_tree(right, context, arena)?,
@@ -1311,12 +1311,12 @@ fn subst_expr<'a>(
             select: subst_select(select, context, arena)?,
             negated: *negated,
         },
-        Expr::Unary { op, operand } => Expr::Unary {
-            op: *op,
+        Expr::Unary { operator, operand } => Expr::Unary {
+            operator: *operator,
             operand: subst_expr(operand, context, arena)?,
         },
-        Expr::Binary { op, left, right } => Expr::Binary {
-            op: *op,
+        Expr::Binary { operator, left, right } => Expr::Binary {
+            operator: *operator,
             left: subst_expr(left, context, arena)?,
             right: subst_expr(right, context, arena)?,
         },
@@ -3095,7 +3095,7 @@ impl<'a> AggState<'a> {
     }
 
     /// Sort the DISTINCT buffer, drop adjacent duplicates, and fold the unique
-    /// values through `accumulate` (bumping `count` per unique value). A no-op
+    /// values through `accumulate` (bumping `count` per unique value). A no-operator
     /// for non-distinct aggregates.
     fn fold_distinct(&mut self, arena: &'a Arena) -> Result<(), SqlError> {
         if !self.distinct || self.vals_len == 0 {
@@ -3680,7 +3680,7 @@ fn conjunct_passes<'a>(
 /// Flattens a top-level `AND` chain into `out`, returning the count, or `None`
 /// if it would overflow (caller then evaluates the predicate whole).
 fn flatten_and<'e, 'a>(e: &'e Expr<'a>, out: &mut [&'e Expr<'a>], n: &mut usize) -> bool {
-    if let Expr::Binary { op: super::ast::BinaryOp::And, left, right } = e {
+    if let Expr::Binary { operator: super::ast::BinaryOp::And, left, right } = e {
         return flatten_and(left, out, n) && flatten_and(right, out, n);
     }
     if *n == out.len() {
@@ -3708,11 +3708,11 @@ fn is_error_safe(e: &Expr) -> bool {
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => true,
-        Expr::Binary { op, left, right } => match op {
+        Expr::Binary { operator, left, right } => match operator {
             Add | Sub | Mul | Div | Mod => false,
             _ => is_error_safe(left) && is_error_safe(right),
         },
-        Expr::Unary { op, operand } => matches!(op, UnaryOp::Not) && is_error_safe(operand),
+        Expr::Unary { operator, operand } => matches!(operator, UnaryOp::Not) && is_error_safe(operand),
         Expr::IsNull { operand, .. } => is_error_safe(operand),
         Expr::InList { operand, list, .. } => {
             is_error_safe(operand) && list.iter().all(|e| is_error_safe(e))
@@ -3772,23 +3772,23 @@ fn fold_null<'a>(
         {
             Ok(&*arena.alloc(Expr::Bool(*negated)).map_err(|_| arena_full())?)
         }
-        Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } => {
+        Expr::Binary { operator: operator @ (BinaryOp::And | BinaryOp::Or), left, right } => {
             let (l, r) = (fold_null(left, scope, arena)?, fold_null(right, scope, arena)?);
             if core::ptr::eq(l, *left) && core::ptr::eq(r, *right) {
                 Ok(e)
             } else {
                 Ok(&*arena
-                    .alloc(Expr::Binary { op: *op, left: l, right: r })
+                    .alloc(Expr::Binary { operator: *operator, left: l, right: r })
                     .map_err(|_| arena_full())?)
             }
         }
-        Expr::Unary { op: UnaryOp::Not, operand } => {
+        Expr::Unary { operator: UnaryOp::Not, operand } => {
             let o = fold_null(operand, scope, arena)?;
             if core::ptr::eq(o, *operand) {
                 Ok(e)
             } else {
                 Ok(&*arena
-                    .alloc(Expr::Unary { op: UnaryOp::Not, operand: o })
+                    .alloc(Expr::Unary { operator: UnaryOp::Not, operand: o })
                     .map_err(|_| arena_full())?)
             }
         }
@@ -3831,7 +3831,7 @@ fn reorder_qual<'a>(
     let mut acc = conjunct[order[0]];
     for &i in &order[1..n] {
         acc = arena
-            .alloc(Expr::Binary { op: super::ast::BinaryOp::And, left: acc, right: conjunct[i] })
+            .alloc(Expr::Binary { operator: super::ast::BinaryOp::And, left: acc, right: conjunct[i] })
             .map_err(|_| arena_full())?;
     }
     Ok(acc)
@@ -3852,16 +3852,16 @@ fn qual_cost(e: &Expr, columns: &dyn super::exec::ColTypeResolver) -> u32 {
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
         | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => 0,
-        Expr::Binary { op: BinaryOp::And | BinaryOp::Or, left, right } => {
+        Expr::Binary { operator: BinaryOp::And | BinaryOp::Or, left, right } => {
             qual_cost(left, columns) + qual_cost(right, columns)
         }
-        Expr::Binary { op, left, right } => {
+        Expr::Binary { operator, left, right } => {
             // A comparison that mixes a *runtime* integer side with a
             // float/numeric side widens the integer with a cast, which
             // PostgreSQL counts (`(b % 0)::numeric < 0.21` costs more than the
             // int-only `100 = a % id`); a constant int operand is folded and
             // cast for free.
-            let cast = if matches!(op, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
+            let cast = if matches!(operator, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
                 | BinaryOp::GtEq | BinaryOp::Eq | BinaryOp::NotEq)
                 && widening_cast(left, right, columns)
             {
@@ -3871,7 +3871,7 @@ fn qual_cost(e: &Expr, columns: &dyn super::exec::ColTypeResolver) -> u32 {
             };
             1 + cast + qual_cost(left, columns) + qual_cost(right, columns)
         }
-        Expr::Unary { op: UnaryOp::Not, operand } => qual_cost(operand, columns),
+        Expr::Unary { operator: UnaryOp::Not, operand } => qual_cost(operand, columns),
         Expr::Unary { operand, .. } => 1 + qual_cost(operand, columns),
         Expr::IsNull { operand, .. } => 1 + qual_cost(operand, columns),
         Expr::Cast { operand, .. } => 1 + qual_cost(operand, columns),
@@ -4054,10 +4054,10 @@ fn eval_set_tree<'a>(
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
         SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, target),
-        SetTree::Op { op, all, left, right } => {
+        SetTree::Op { operator, all, left, right } => {
             let l = eval_set_tree(left, storage, txid, arena, params, target)?;
             let r = eval_set_tree(right, storage, txid, arena, params, target)?;
-            combine_sets(*op, *all, l, r, arena)
+            combine_sets(*operator, *all, l, r, arena)
         }
     }
 }
@@ -4175,7 +4175,7 @@ fn eval_set_leaf<'a>(
 /// Combines two encoded-row multisets. Both inputs are sorted here (set ops are
 /// unordered until the final ORDER BY), then merged by equal runs.
 fn combine_sets<'a>(
-    op: SetOp,
+    operator: SetOp,
     all: bool,
     l: &'a mut [&'a [u8]],
     r: &'a mut [&'a [u8]],
@@ -4194,7 +4194,7 @@ fn combine_sets<'a>(
             n += 1;
         }
     };
-    match op {
+    match operator {
         SetOp::Union if all => {
             for &row in l.iter().chain(r.iter()) {
                 push(row, 1);
@@ -4238,7 +4238,7 @@ fn combine_sets<'a>(
                     chained_row += 1;
                     j += 1;
                 }
-                let times = match (op, all) {
+                let times = match (operator, all) {
                     (SetOp::Intersect, true) => cl.min(chained_row),
                     (SetOp::Intersect, false) => usize::from(chained_row > 0),
                     (SetOp::Except, true) => cl.saturating_sub(chained_row),

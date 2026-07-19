@@ -339,23 +339,23 @@ fn attach_constraints(
                     ));
                 }
                 has_primary = true;
-                let (idxs, n) = resolve_cols(def, columns)?;
-                for &ci in &idxs[..n] {
+                let (indices, n) = resolve_cols(def, columns)?;
+                for &ci in &indices[..n] {
                     def.columns[ci as usize].not_null = true;
                 }
                 if n == 1 {
-                    def.columns[idxs[0] as usize].primary = true;
-                    def.columns[idxs[0] as usize].unique = true;
+                    def.columns[indices[0] as usize].primary = true;
+                    def.columns[indices[0] as usize].unique = true;
                 } else {
-                    add_unique_key(def, *name, "pkey", &idxs, n, true)?;
+                    add_unique_key(def, *name, "pkey", &indices, n, true)?;
                 }
             }
             TableConstraint::Unique { name, columns } => {
-                let (idxs, n) = resolve_cols(def, columns)?;
+                let (indices, n) = resolve_cols(def, columns)?;
                 if n == 1 {
-                    def.columns[idxs[0] as usize].unique = true;
+                    def.columns[indices[0] as usize].unique = true;
                 } else {
-                    add_unique_key(def, *name, "key", &idxs, n, false)?;
+                    add_unique_key(def, *name, "key", &indices, n, false)?;
                 }
             }
             TableConstraint::Check { name, expression, text } => {
@@ -439,7 +439,7 @@ fn add_unique_key(
     def: &mut TableDef,
     name: Option<&str>,
     suffix: &str,
-    idxs: &[u16; MAX_INDEX_COLS],
+    indices: &[u16; MAX_INDEX_COLS],
     n: usize,
     is_primary: bool,
 ) -> Result<(), SqlError> {
@@ -453,11 +453,11 @@ fn add_unique_key(
     let kname = match name {
         Some(nm) => SqlName::parse(nm)?,
         // A primary key is `<table>_pkey`; a unique key lists every column.
-        None => auto_key_name(def, &idxs[..n], suffix, !is_primary)?,
+        None => auto_key_name(def, &indices[..n], suffix, !is_primary)?,
     };
     let mut k = UniqueKey::EMPTY;
     k.name = kname;
-    k.columns[..n].copy_from_slice(&idxs[..n]);
+    k.columns[..n].copy_from_slice(&indices[..n]);
     k.n_cols = n;
     k.is_primary = is_primary;
     def.uniques[def.n_uniques] = k;
@@ -2484,12 +2484,12 @@ fn comparable(a: ColType, b: ColType) -> bool {
     (numeric(a) && numeric(b)) || (datetime(a) && datetime(b))
 }
 
-fn operator_undefined(l: ColType, op: &str, r: ColType) -> SqlError {
+fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "operator does not exist: {} {} {}",
         l.name(),
-        op,
+        operator,
         r.name()
     )
 }
@@ -2516,21 +2516,21 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
         Expr::Float(_) => of(ColType::Float8),
         Expr::NumericLit(_) => of(ColType::Numeric),
         Expr::Column { qualifier, name } => of(columns.resolve(*qualifier, name)?),
-        Expr::Unary { op, operand } => match op {
+        Expr::Unary { operator, operand } => match operator {
             super::ast::UnaryOp::Not => of(ColType::Bool),
             super::ast::UnaryOp::Neg | super::ast::UnaryOp::BitNot => infer_type_res(operand, columns)?,
         },
-        Expr::Binary { op, left, right } => {
+        Expr::Binary { operator, left, right } => {
             use super::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
-            match op {
+            match operator {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
                     // Unknown coerces; two concrete types must be comparable.
                     if lo != oid::UNKNOWN && ro != oid::UNKNOWN
                         && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
                             && !comparable(a, b) {
-                                let sym = match op {
+                                let sym = match operator {
                                     Eq => "=", NotEq => "<>", Lt => "<",
                                     LtEq => "<=", Gt => ">", _ => ">=",
                                 };
@@ -2589,40 +2589,40 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     let int_like = |o: i32| matches!(o, oid::INT4 | oid::INT8 | oid::UNKNOWN);
                     // Date arithmetic: date - date -> int4; date +/- int -> date;
                     // int + date -> date.
-                    if lo == oid::DATE && ro == oid::DATE && matches!(op, Sub) {
+                    if lo == oid::DATE && ro == oid::DATE && matches!(operator, Sub) {
                         return Ok(of(ColType::Int4));
                     }
                     // timestamp - timestamp -> interval.
-                    if matches!(op, Sub)
+                    if matches!(operator, Sub)
                         && (lo == oid::TIMESTAMP && ro == oid::TIMESTAMP
                             || lo == oid::TIMESTAMPTZ && ro == oid::TIMESTAMPTZ)
                     {
                         return Ok(of(ColType::Interval));
                     }
-                    if lo == oid::DATE && matches!(op, Add | Sub) && int_like(ro) {
+                    if lo == oid::DATE && matches!(operator, Add | Sub) && int_like(ro) {
                         return Ok(of(ColType::Date));
                     }
-                    if ro == oid::DATE && matches!(op, Add) && int_like(lo) {
+                    if ro == oid::DATE && matches!(operator, Add) && int_like(lo) {
                         return Ok(of(ColType::Date));
                     }
                     // Interval arithmetic: date/timestamp ± interval -> the
                     // timestamp type; interval ± interval -> interval.
                     let is_dt = |o: i32| matches!(o, oid::DATE | oid::TIMESTAMP | oid::TIMESTAMPTZ);
-                    if matches!(op, Add | Sub) {
+                    if matches!(operator, Add | Sub) {
                         if lo == oid::INTERVAL && ro == oid::INTERVAL {
                             return Ok(of(ColType::Interval));
                         }
                         if is_dt(lo) && ro == oid::INTERVAL {
                             return Ok(of(if lo == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
                         }
-                        if matches!(op, Add) && lo == oid::INTERVAL && is_dt(ro) {
+                        if matches!(operator, Add) && lo == oid::INTERVAL && is_dt(ro) {
                             return Ok(of(if ro == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
                         }
                     }
                     // interval * number / number * interval / interval / number.
-                    if (matches!(op, Mul) && lo == oid::INTERVAL && numeric(ro))
-                        || (matches!(op, Mul) && numeric(lo) && ro == oid::INTERVAL)
-                        || (matches!(op, Div) && lo == oid::INTERVAL && numeric(ro))
+                    if (matches!(operator, Mul) && lo == oid::INTERVAL && numeric(ro))
+                        || (matches!(operator, Mul) && numeric(lo) && ro == oid::INTERVAL)
+                        || (matches!(operator, Div) && lo == oid::INTERVAL && numeric(ro))
                     {
                         return Ok(of(ColType::Interval));
                     }
@@ -2630,7 +2630,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     let r_ok = ro == oid::UNKNOWN || numeric(ro);
                     if (!l_ok || !r_ok)
                         && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro)) {
-                            let sym = match op {
+                            let sym = match operator {
                                 Add => "+", Sub => "-", Mul => "*", Div => "/", _ => "%",
                             };
                             return Err(operator_undefined(a, sym, b));

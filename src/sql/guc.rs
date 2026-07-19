@@ -285,7 +285,7 @@ impl GucState {
         }
         if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
             // No idle-in-transaction reaper yet, so only the disabled value is
-            // honored; a non-zero value would be a silent no-op.
+            // honored; a non-zero value would be a silent no-operator.
             if is_default || v == "0" {
                 return Ok(());
             }

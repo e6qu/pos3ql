@@ -42,5 +42,11 @@ These reinforce, and are subordinate to, the Boyscout Rule.
   exhausting any pool is a loud error, never growth. Only runtime dependency is `libc`.
 - **Docs:** update `PLAN.md` and `BUGS.md` in the same PR as the work. No phase numbers or
   BUGS IDs in source or code comments — the "why" belongs in commit messages.
+- **Names are spelled out.** No non-obvious abbreviations: `interval` not `iv`, `buffer`
+  not `buf`, `expression` not `expr`, `statement` not `stmt`, `index` not `idx`. Well-known
+  acronyms (`AWS`, `ECS`, `S3`, `SQL`, `JSON`, `UUID`, `HTTP`, …) are fine. Limit coined
+  project terminology; when a term is unavoidable, define it in
+  [`docs/terminology.md`](docs/terminology.md) — the canonical glossary and naming rules,
+  cross-linked from every doc.
 - **Commits:** PRs are squash-merged, so one commit per PR is fine; don't make fine-grained
   commits inside a PR.

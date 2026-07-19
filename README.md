@@ -58,7 +58,8 @@ Working single-node database:
 
 Not yet: multi-replica VSR and TLS. See [PLAN.md](PLAN.md) for the roadmap and
 [BUGS.md](BUGS.md) for known divergences; the headline ones are summarized
-under **Limitations** below.
+under **Limitations** below. [docs/terminology.md](docs/terminology.md) is the
+glossary and naming rules.
 
 ## Durability and write safety
 

@@ -2844,6 +2844,20 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             // arithmetic (e.g. `current_date - 1`) type-checks correctly.
             "to_date" => of(ColType::Date),
             "to_timestamp" => of(ColType::Timestamptz),
+            "generate_series" => {
+                let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
+                if a == Some(oid::INT8) { of(ColType::Int8) } else { of(ColType::Int4) }
+            }
+            "unnest" => {
+                // The element type of the array argument.
+                match args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0) {
+                    Some(o) => match coltype_of_oid(o) {
+                        Some(ColType::Array(elem)) => of(elem.to_coltype()),
+                        _ => of(ColType::Text),
+                    },
+                    None => of(ColType::Text),
+                }
+            }
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),

@@ -438,6 +438,13 @@ impl Expr<'_> {
     /// aggregate reference. PostgreSQL evaluates these at plan time, so
     /// their errors (division by zero, overflow) surface eagerly.
     pub fn is_constant(&self) -> bool {
+        /// Set-returning functions expand to multiple rows and are never a
+        /// foldable constant.
+        fn is_set_returning(name: &str) -> bool {
+            name.eq_ignore_ascii_case("unnest")
+                || name.eq_ignore_ascii_case("generate_series")
+                || name.eq_ignore_ascii_case("_pg_expandarray")
+        }
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
             | Expr::NumericLit(_) | Expr::Str(_) => true,
@@ -462,10 +469,13 @@ impl Expr<'_> {
                     && whens.iter().all(|(c, r)| c.is_constant() && r.is_constant())
                     && otherwise.map(|e| e.is_constant()).unwrap_or(true)
             }
-            // Aggregates and window functions are never constant; other calls
-            // are constant when their arguments are (pure scalar functions).
-            Expr::Call { args, over, .. } => {
-                over.is_none() && !self.is_aggregate() && args.iter().all(|a| a.is_constant())
+            // Aggregates, window functions, and set-returning functions are
+            // never constant; other calls are constant when their arguments are.
+            Expr::Call { name, args, over, .. } => {
+                over.is_none()
+                    && !self.is_aggregate()
+                    && !is_set_returning(name)
+                    && args.iter().all(|a| a.is_constant())
             }
             Expr::Array(items) => items.iter().all(|e| e.is_constant()),
             Expr::Subscript { base, index } => base.is_constant() && index.is_constant(),

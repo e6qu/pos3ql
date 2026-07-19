@@ -969,6 +969,50 @@ fn call<'a>(
         | "pg_relation_is_publishable" => {
             Ok(Datum::Bool(true))
         }
+        // Set-returning functions: during expansion `hooks.srf_index` (1-based)
+        // selects which element/value this output row carries.
+        "unnest" => {
+            arity(1)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let (elem, raw) = match a {
+                Datum::Array { elem, raw } => (elem, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("unnest requires an array", &a)),
+            };
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            Ok(super::array::get(raw, elem, k - 1).unwrap_or(Datum::Null))
+        }
+        "generate_series" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?
+                as i64;
+            let start = eval_full(args[0], arena, params, row, hooks)?;
+            let step = if args.len() == 3 {
+                eval_full(args[2], arena, params, row, hooks)?
+            } else {
+                Datum::Int4(1)
+            };
+            let (Some(s), Some(st)) = (as_i64(&start), as_i64(&step)) else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "generate_series is supported for integer arguments"
+                ));
+            };
+            let v = s + (k - 1) * st;
+            // int4 unless an argument is int8 or the value overflows int4.
+            let wide = matches!(start, Datum::Int8(_)) || matches!(step, Datum::Int8(_));
+            if !wide && i32::try_from(v).is_ok() {
+                Ok(Datum::Int4(v as i32))
+            } else {
+                Ok(Datum::Int8(v))
+            }
+        }
         // Set-returning `_pg_expandarray(arr)` yields, for the current expansion
         // index k, the composite `(x, n)` = (arr[k], k), encoded as `[x, n]`.
         "_pg_expandarray" => {

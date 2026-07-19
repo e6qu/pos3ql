@@ -8,7 +8,9 @@
 use super::eval::SqlError;
 use super::numeric::{Numeric, RoundMode, Sign};
 use crate::mem::arena::Arena;
+use crate::util::StackStr;
 use crate::{sql_err, stack_format};
+use core::fmt::Write as _;
 
 const MAX_TOKS: usize = 256;
 const MAX_OUT: usize = 512;
@@ -446,6 +448,176 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
     Numeric::parse(cleaned, arena)?.round_scale(frac, RoundMode::HalfAwayZero, arena)
 }
 
+const MONTH_FULL: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June", "July", "August", "September",
+    "October", "November", "December",
+];
+const MONTH_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const DAY_FULL: [&str; 7] = [
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+];
+const DAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// The output casing a name-producing code selects: `MONTH`→upper, `month`→
+/// lower, `Month`→title (matching the code's own casing).
+#[derive(Clone, Copy)]
+enum Case {
+    Upper,
+    Lower,
+    Title,
+}
+
+fn name_case(code: &[u8]) -> Case {
+    let mut any_upper = false;
+    let mut any_lower = false;
+    for &c in code {
+        if c.is_ascii_uppercase() {
+            any_upper = true;
+        } else if c.is_ascii_lowercase() {
+            any_lower = true;
+        }
+    }
+    match (any_upper, any_lower) {
+        (true, false) => Case::Upper,
+        (false, true) => Case::Lower,
+        _ => Case::Title,
+    }
+}
+
+/// `to_char(timestamp/date, text)` — formats the temporal value `micros`
+/// (microseconds since 2000-01-01) per the format string. Supports the common
+/// field codes; unrecognized letter codes are rejected loudly.
+pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    use crate::sql::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};
+    let days = micros.div_euclid(86_400_000_000);
+    let tod = micros.rem_euclid(86_400_000_000);
+    let adays = days + PG_EPOCH_DAYS;
+    let (y, mo, d) = civil_from_days(adays);
+    let hh24 = (tod / 3_600_000_000) as u32;
+    let mi = ((tod / 60_000_000) % 60) as u32;
+    let ss = ((tod / 1_000_000) % 60) as u32;
+    let us = (tod % 1_000_000) as u32;
+    let dow = day_of_week(days); // 0=Sun..6=Sat (PG-epoch day count)
+    let doy = (adays - days_from_civil(y, 1, 1) + 1) as u32;
+    let hh12 = if hh24.is_multiple_of(12) { 12 } else { hh24 % 12 };
+
+    let mut out = StackStr::<512>::new();
+    let name = |out: &mut StackStr<512>, s: &str, case: Case, pad: usize, fm: bool| {
+        let mut buf = [0u8; 16];
+        let n = s.len().min(buf.len());
+        for (i, b) in s.bytes().take(n).enumerate() {
+            buf[i] = match case {
+                Case::Upper => b.to_ascii_uppercase(),
+                Case::Lower => b.to_ascii_lowercase(),
+                Case::Title => b,
+            };
+        }
+        let _ = out.write_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+        if !fm {
+            for _ in n..pad {
+                let _ = out.write_char(' ');
+            }
+        }
+    };
+    let num = |out: &mut StackStr<512>, v: i64, width: usize, fm: bool| {
+        let s = crate::stack_format!(24, "{}", v);
+        if !fm {
+            for _ in s.as_str().len()..width {
+                let _ = out.write_char('0');
+            }
+        }
+        let _ = out.write_str(s.as_str());
+    };
+
+    let fb = fmt.as_bytes();
+    let mut i = 0usize;
+    while i < fb.len() {
+        let mut fm = false;
+        if i + 1 < fb.len() && fb[i].eq_ignore_ascii_case(&b'F') && fb[i + 1].eq_ignore_ascii_case(&b'M') {
+            fm = true;
+            i += 2;
+        }
+        let rest = &fb[i..];
+        let m = |w: &[u8]| rest.len() >= w.len() && rest[..w.len()].eq_ignore_ascii_case(w);
+        if m(b"HH24") {
+            num(&mut out, hh24 as i64, 2, fm);
+            i += 4;
+        } else if m(b"HH12") {
+            num(&mut out, hh12 as i64, 2, fm);
+            i += 4;
+        } else if m(b"YYYY") {
+            num(&mut out, y, 4, fm);
+            i += 4;
+        } else if m(b"MONTH") {
+            name(&mut out, MONTH_FULL[(mo - 1) as usize], name_case(&rest[..5]), 9, fm);
+            i += 5;
+        } else if m(b"MON") {
+            name(&mut out, MONTH_ABBR[(mo - 1) as usize], name_case(&rest[..3]), 3, fm);
+            i += 3;
+        } else if m(b"DAY") {
+            name(&mut out, DAY_FULL[dow], name_case(&rest[..3]), 9, fm);
+            i += 3;
+        } else if m(b"DDD") {
+            num(&mut out, doy as i64, 3, fm);
+            i += 3;
+        } else if m(b"DY") {
+            name(&mut out, DAY_ABBR[dow], name_case(&rest[..2]), 3, fm);
+            i += 2;
+        } else if m(b"YYY") {
+            num(&mut out, y % 1000, 3, fm);
+            i += 3;
+        } else if m(b"HH") {
+            num(&mut out, hh12 as i64, 2, fm);
+            i += 2;
+        } else if m(b"YY") {
+            num(&mut out, y % 100, 2, fm);
+            i += 2;
+        } else if m(b"MI") {
+            num(&mut out, mi as i64, 2, fm);
+            i += 2;
+        } else if m(b"MM") {
+            num(&mut out, mo as i64, 2, fm);
+            i += 2;
+        } else if m(b"MS") {
+            num(&mut out, (us / 1000) as i64, 3, fm);
+            i += 2;
+        } else if m(b"US") {
+            num(&mut out, us as i64, 6, fm);
+            i += 2;
+        } else if m(b"SS") {
+            num(&mut out, ss as i64, 2, fm);
+            i += 2;
+        } else if m(b"DD") {
+            num(&mut out, d as i64, 2, fm);
+            i += 2;
+        } else if m(b"WW") {
+            num(&mut out, ((doy - 1) / 7 + 1) as i64, 2, fm);
+            i += 2;
+        } else if m(b"AM") || m(b"PM") {
+            let mer = if hh24 < 12 { "AM" } else { "PM" };
+            name(&mut out, mer, name_case(&rest[..2]), 0, true);
+            i += 2;
+        } else if m(b"Q") {
+            num(&mut out, ((mo - 1) / 3 + 1) as i64, 1, fm);
+            i += 1;
+        } else if m(b"D") {
+            num(&mut out, (dow + 1) as i64, 1, fm);
+            i += 1;
+        } else if m(b"Y") {
+            num(&mut out, y % 10, 1, fm);
+            i += 1;
+        } else if rest[0].is_ascii_alphabetic() {
+            return Err(sql_err!("0A000", "to_char timestamp code not supported: \"{}\"", rest[0] as char));
+        } else {
+            let _ = out.write_char(rest[0] as char);
+            i += 1;
+        }
+    }
+    arena.alloc_str(out.as_str()).map_err(|_| sql_err!("53200", "out of memory"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +667,24 @@ mod tests {
         assert_eq!(tn("42", "99"), "42");
         assert_eq!(tn("12,345", "99G999"), "12345");
         assert!(to_number("abc", "999", &a).is_err());
+    }
+
+    #[test]
+    fn timestamp_formats_match_postgres() {
+        let a = arena();
+        // 2024-06-15 14:07:09.123456 (a Saturday) in micros since 2000-01-01.
+        let micros = crate::sql::datetime::parse_timestamp("2024-06-15 14:07:09.123456", false)
+            .unwrap();
+        let tc = |f: &str| timestamp(micros, f, &a).unwrap().to_string();
+        assert_eq!(tc("YYYY-MM-DD HH24:MI:SS"), "2024-06-15 14:07:09");
+        assert_eq!(tc("HH12:MI:SS AM"), "02:07:09 PM");
+        assert_eq!(tc("Mon DD, YYYY"), "Jun 15, 2024");
+        assert_eq!(tc("Month"), "June     ");
+        assert_eq!(tc("FMMonth FMDD"), "June 15");
+        assert_eq!(tc("Day DY D"), "Saturday  SAT 7");
+        assert_eq!(tc("Q WW DDD"), "2 24 167");
+        assert_eq!(tc("US"), "123456");
+        assert!(timestamp(micros, "ZZZ", &a).is_err());
     }
 
     #[test]

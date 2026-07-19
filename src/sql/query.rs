@@ -2441,7 +2441,10 @@ fn run_subquery<'a>(
         return Ok((&*out, v.is_null(), subquery_witness(item, Some(&scope))));
     }
 
-    // Plain scan: collect item values. Two passes (count then fill).
+    // Plain scan: collect item values (and ORDER BY keys). Two passes (count
+    // then fill), then sort and apply OFFSET/LIMIT so a subquery's own ORDER BY
+    // / LIMIT is honored (element order matters for ARRAY(...) and scalar).
+    let n_keys = select.order_by.len();
     let mut count = 0usize;
     scan_source(
         storage,
@@ -2458,11 +2461,9 @@ fn run_subquery<'a>(
             Ok(true)
         },
     )?;
-    let out = arena
-        .alloc_slice_with(count, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
+    let vals = arena.alloc_slice_with(count, |_| Datum::Null).map_err(|_| arena_full())?;
+    let keys = arena.alloc_slice_with(count * n_keys, |_| Datum::Null).map_err(|_| arena_full())?;
     let mut at = 0usize;
-    let mut saw_null = false;
     scan_source(
         storage,
         &scope,
@@ -2475,15 +2476,53 @@ fn run_subquery<'a>(
         outer,
         &mut |row| {
             let cr = Chained { inner: row, outer };
-            let v = eval_full(item, arena, params, &cr, &hooks)?;
-            if v.is_null() {
-                saw_null = true;
+            vals[at] = eval_full(item, arena, params, &cr, &hooks)?;
+            for (k, o) in select.order_by.iter().enumerate() {
+                // A positional `ORDER BY 1` sorts by the single output column.
+                let key = match o.expr {
+                    Expr::Int(_) => vals[at],
+                    e => eval_full(e, arena, params, &cr, &hooks)?,
+                };
+                keys[at * n_keys + k] = key;
             }
-            out[at] = v;
             at += 1;
             Ok(true)
         },
     )?;
+
+    // Stable insertion sort of row indices by the ORDER BY keys.
+    let order = arena.alloc_slice_with(count, |i| i).map_err(|_| arena_full())?;
+    if n_keys > 0 {
+        for x in 1..count {
+            let mut y = x;
+            while y > 0 {
+                let a = &keys[order[y - 1] * n_keys..order[y - 1] * n_keys + n_keys];
+                let b = &keys[order[y] * n_keys..order[y] * n_keys + n_keys];
+                if cmp_key_rows(a, b, select.order_by) == core::cmp::Ordering::Greater {
+                    order.swap(y - 1, y);
+                    y -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Apply OFFSET/LIMIT over the ordered rows.
+    let offset = super::exec::eval_offset_pub(select.offset, arena, params)? as usize;
+    let limit = super::exec::eval_limit_pub(select.limit, arena, params)?;
+    let start = offset.min(count);
+    let n = ((count - start) as u64).min(limit) as usize;
+    let mut saw_null = false;
+    let out = arena
+        .alloc_slice_with(n, |i| {
+            let v = vals[order[start + i]];
+            if v.is_null() {
+                saw_null = true;
+            }
+            v
+        })
+        .map_err(|_| arena_full())?;
     Ok((&*out, saw_null, subquery_witness(item, Some(&scope))))
 }
 

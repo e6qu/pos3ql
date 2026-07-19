@@ -2266,6 +2266,17 @@ fn call<'a>(
             let Datum::Text(fmt) = f else {
                 return Err(type_mismatch(name, &f));
             };
+            // Temporal values format via the date/time codes; numeric values via
+            // the number codes.
+            let micros = match v {
+                Datum::Timestamp(t) | Datum::Timestamptz(t) => Some(t),
+                Datum::Date(d) => Some(d as i64 * 86_400_000_000),
+                Datum::Time(t) => Some(t),
+                _ => None,
+            };
+            if let Some(m) = micros {
+                return Ok(Datum::Text(super::to_char::timestamp(m, fmt, arena)?));
+            }
             let n = datum_numeric(name, v, arena)?;
             Ok(Datum::Text(super::to_char::number(&n, fmt, arena)?))
         }

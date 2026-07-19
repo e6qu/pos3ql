@@ -2828,6 +2828,8 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "date_part" => of(ColType::Float8),
             // Paren-less temporal functions carry a proper type so date/time
             // arithmetic (e.g. `current_date - 1`) type-checks correctly.
+            "to_date" => of(ColType::Date),
+            "to_timestamp" => of(ColType::Timestamptz),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),

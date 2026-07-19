@@ -2240,6 +2240,20 @@ fn call<'a>(
             };
             Ok(Datum::Numeric(super::to_char::to_number(s, fmt, arena)?))
         }
+        "to_date" | "to_timestamp" => {
+            arity(2)?;
+            let (Some(s), Some(fmt)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            if name == "to_date" {
+                Ok(Datum::Date(super::datetime::to_date(s, fmt)?))
+            } else {
+                Ok(Datum::Timestamptz(super::datetime::to_timestamp(s, fmt)?))
+            }
+        }
         "make_date" | "make_time" | "make_timestamp" => {
             let want = if name == "make_timestamp" { 6 } else { 3 };
             arity(want)?;

@@ -101,7 +101,7 @@ const MONTH_FULL: [&str; 12] = [
 /// unrecognized letter codes are rejected loudly.
 pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i64, i64), SqlError> {
     let bad = || sql_err!("22007", "invalid value for input string");
-    let (mut y, mut month, mut d, mut h, mut mi, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
+    let (mut y, mut month, mut d, mut h, mut minute, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
     let input_bytes = input.as_bytes();
     let format_bytes = fmt.as_bytes();
     let mut input_position = 0usize;
@@ -155,7 +155,7 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
             d = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"MI") {
-            mi = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            minute = read_num(&mut input_position, 2).ok_or_else(bad)?;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"SS") {
             s = read_num(&mut input_position, 2).ok_or_else(bad)?;
@@ -176,7 +176,7 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
     if !(1..=12).contains(&month) || d < 1 || d > days_in_month(y, month) {
         return Err(sql_err!("22008", "date/time field value out of range"));
     }
-    Ok((y, month, d, h, mi, s))
+    Ok((y, month, d, h, minute, s))
 }
 
 /// Reads a month name (abbreviated when `abbr`, else full) at `*input_position`, returning
@@ -215,8 +215,8 @@ pub fn to_date(input: &str, fmt: &str) -> Result<i32, SqlError> {
 /// `to_timestamp`: parses a formatted timestamp into microseconds since
 /// 2000-01-01.
 pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
-    let (y, month, d, h, mi, s) = parse_formatted(input, fmt)?;
-    make_timestamp(y, month as i64, d as i64, h, mi, s as f64)
+    let (y, month, d, h, minute, s) = parse_formatted(input, fmt)?;
+    make_timestamp(y, month as i64, d as i64, h, minute, s as f64)
 }
 
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
@@ -236,18 +236,18 @@ pub fn make_date(y: i64, m: i64, d: i64) -> Result<i32, SqlError> {
 
 /// Constructs a time-of-day (microseconds since midnight) from hour/minute and
 /// a fractional second, validating fields as PostgreSQL `make_time` does.
-pub fn make_time(h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+pub fn make_time(h: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
     let range = || sql_err!("22008", "time field value out of range");
-    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0.0..60.0).contains(&sec) {
+    if !(0..=23).contains(&h) || !(0..=59).contains(&minute) || !(0.0..60.0).contains(&sec) {
         return Err(range());
     }
-    Ok(((h * 60 + mi) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
+    Ok(((h * 60 + minute) * 60) * 1_000_000 + (sec * 1_000_000.0).round() as i64)
 }
 
 /// Constructs a timestamp (microseconds since 2000-01-01) from its fields.
-pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, mi: i64, sec: f64) -> Result<i64, SqlError> {
+pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
     let days = make_date(y, m, d)? as i64;
-    let time_of_day = make_time(h, mi, sec)?;
+    let time_of_day = make_time(h, minute, sec)?;
     Ok(days * 86_400_000_000 + time_of_day)
 }
 
@@ -752,14 +752,14 @@ pub fn format_timestamp_styled(
     let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
     let seconds = in_day / 1_000_000;
     let frac = in_day % 1_000_000;
-    let (h, mi, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
+    let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
     let dmy = style.order == FieldOrder::Dmy;
     let mut out = StackStr::<48>::new();
     use core::fmt::Write;
 
     match style.format {
         DateFormat::Iso => {
-            let _ = write!(out, "{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+            let _ = write!(out, "{y:04}-{m:02}-{d:02} {h:02}:{minute:02}:{s:02}");
             write_frac(&mut out, frac);
             if with_timezone {
                 write_iso_offset(&mut out, timezone_offset_seconds);
@@ -769,9 +769,9 @@ pub fn format_timestamp_styled(
             let dow = DOW[day_of_week(days)];
             let month = MON[(m - 1) as usize];
             if dmy {
-                let _ = write!(out, "{dow} {d:02} {month} {h:02}:{mi:02}:{s:02}");
+                let _ = write!(out, "{dow} {d:02} {month} {h:02}:{minute:02}:{s:02}");
             } else {
-                let _ = write!(out, "{dow} {month} {d:02} {h:02}:{mi:02}:{s:02}");
+                let _ = write!(out, "{dow} {month} {d:02} {h:02}:{minute:02}:{s:02}");
             }
             write_frac(&mut out, frac);
             let _ = write!(out, " {y:04}");
@@ -787,7 +787,7 @@ pub fn format_timestamp_styled(
             } else {
                 write!(out, "{m:02}/{d:02}/{y:04}")
             };
-            let _ = write!(out, " {h:02}:{mi:02}:{s:02}");
+            let _ = write!(out, " {h:02}:{minute:02}:{s:02}");
             write_frac(&mut out, frac);
             if with_timezone {
                 let _ = write!(out, " {timezone_abbreviation}");

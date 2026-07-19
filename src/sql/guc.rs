@@ -306,7 +306,7 @@ impl GucState {
             ));
         }
         if name.eq_ignore_ascii_case("row_security") {
-            // No row-level-security policies exist, so `on` and `off` select
+            // No row-level-security policies exist, so `on` and `offset` select
             // the same rows; the value is validated and retained for SHOW.
             let on = if is_default {
                 true
@@ -374,7 +374,7 @@ impl GucState {
     }
 }
 
-/// Parses a PostgreSQL boolean GUC value (on/off/true/false/1/0), allocation-free.
+/// Parses a PostgreSQL boolean GUC value (on/offset/true/false/1/0), allocation-free.
 fn parse_on_off(v: &str) -> Option<bool> {
     if ["on", "true", "yes", "1"].iter().any(|s| v.eq_ignore_ascii_case(s)) {
         Some(true)
@@ -535,8 +535,8 @@ fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
         if rest.is_empty() {
             return Some(Timezone::utc());
         }
-        let off = -parse_hms(rest)?;
-        return Some(Timezone::fixed(off, super::datetime::iso_offset_string(off).as_str()));
+        let offset = -parse_hms(rest)?;
+        return Some(Timezone::fixed(offset, super::datetime::iso_offset_string(offset).as_str()));
     }
     // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
     if t.starts_with('+') || t.starts_with('-') {

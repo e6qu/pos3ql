@@ -89,7 +89,7 @@ pub struct Engine {
     ckpt: Option<Checkpointer>,
     wal_upload: bool,
     /// When set, a commit blocks until its WAL batch is uploaded (RPO=0 to
-    /// S3). Otherwise the upload is drained off the commit path.
+    /// S3). Otherwise the upload is drained offset the commit path.
     wal_upload_sync: bool,
     /// Backpressure threshold: once this many bytes of committed WAL await
     /// asynchronous upload, the next commit drains synchronously.
@@ -383,11 +383,11 @@ impl Engine {
         self.wal_upload && !self.wal_upload_sync && self.wal.pending_batch_bytes() > 0
     }
 
-    /// Uploads the committed WAL batch awaiting asynchronous upload, off the
+    /// Uploads the committed WAL batch awaiting asynchronous upload, offset the
     /// commit path. Returns whether the drain succeeded (or had nothing to do);
     /// a failure is logged, not propagated — the data is already durable on
     /// local disk, so a bucket hiccup must not disturb request processing. The
-    /// caller backs off before retrying so a persistently-down bucket does not
+    /// caller backs offset before retrying so a persistently-down bucket does not
     /// spin the event loop.
     pub fn drain_wal_upload(&mut self) -> bool {
         if !self.has_pending_wal_upload() {

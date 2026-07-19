@@ -1466,9 +1466,9 @@ fn window_row<'r, 'a>(
     offs: &[usize],
 ) -> JoinRow<'r, 'a, 'a> {
     let mut values: [Option<&[Datum]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
-    for (t, off) in offs.iter().enumerate().take(scope.n) {
+    for (t, offset) in offs.iter().enumerate().take(scope.n) {
         let nc = scope.defs[t].expect("resolved").n_columns;
-        values[t] = Some(&flat[*off..*off + nc]);
+        values[t] = Some(&flat[*offset..*offset + nc]);
     }
     JoinRow { scope, values }
 }
@@ -1606,7 +1606,7 @@ fn compute_window<'a>(
             }
         } else if is_offset {
             let sign: isize = if *name == "lag" { -1 } else { 1 };
-            let off: isize = if args.len() >= 2 {
+            let offset: isize = if args.len() >= 2 {
                 let r = window_row(scope, rows[p[0]], offs);
                 match eval_full(args[1], arena, params, &r, hooks)? {
                     Datum::Int4(v) => v as isize,
@@ -1617,7 +1617,7 @@ fn compute_window<'a>(
                 1
             };
             for j in 0..m {
-                let src = j as isize + sign * off;
+                let src = j as isize + sign * offset;
                 out[p[j]] = if src >= 0 && (src as usize) < m {
                     let r = window_row(scope, rows[p[src as usize]], offs);
                     eval_full(args[0], arena, params, &r, hooks)?
@@ -1774,11 +1774,11 @@ fn project_window_rows<'a>(
             let flat = arena
                 .alloc_slice_with(total.max(1), |_| Datum::Null)
                 .map_err(|_| arena_full())?;
-            for (t, off) in offs.iter().enumerate().take(scope.n) {
+            for (t, offset) in offs.iter().enumerate().take(scope.n) {
                 let def = scope.defs[t].expect("resolved");
                 let vals = row.values[t].expect("bound");
                 for c in 0..def.n_columns {
-                    flat[off + c] = if vals.is_empty() { Datum::Null } else { vals[c] };
+                    flat[offset + c] = if vals.is_empty() { Datum::Null } else { vals[c] };
                 }
             }
             rows[at] = &flat[..total];

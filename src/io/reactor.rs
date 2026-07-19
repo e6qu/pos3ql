@@ -69,7 +69,7 @@ impl Reactor {
         self.change(fd, libc::EVFILT_READ, libc::EV_ADD, token)
     }
 
-    /// Turns write-readiness reporting for `fd` on or off. Disabling when
+    /// Turns write-readiness reporting for `fd` on or offset. Disabling when
     /// not enabled is a no-op so callers can treat this as setting the
     /// desired state rather than tracking transitions.
     pub fn set_write_interest(

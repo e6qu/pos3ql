@@ -788,10 +788,10 @@ impl Conn {
             );
         }
         // Text-format parameters must be valid UTF-8, checked at bind time.
-        for (i, &(off, len)) in spans.iter().take(n_params).enumerate() {
+        for (i, &(offset, len)) in spans.iter().take(n_params).enumerate() {
             if !formats[i]
                 && len != u32::MAX
-                && core::str::from_utf8(&values[off as usize..(off + len) as usize]).is_err()
+                && core::str::from_utf8(&values[offset as usize..(offset + len) as usize]).is_err()
             {
                 return ext_err(&mut self.send, &mut self.phase, "22021", "invalid UTF-8 in parameter value");
             }
@@ -931,12 +931,12 @@ impl Conn {
                 core::str::from_utf8(prepared.text.readable()).expect("stored from valid UTF-8");
             let mut params = [Datum::Null; MAX_BIND_PARAMS];
             let raw = portal.params.readable();
-            for (i, &(off, len)) in portal.spans.iter().take(portal.n_params as usize).enumerate() {
+            for (i, &(offset, len)) in portal.spans.iter().take(portal.n_params as usize).enumerate() {
                 if len == u32::MAX {
                     params[i] = Datum::Null;
                     continue;
                 }
-                let bytes = &raw[off as usize..(off + len) as usize];
+                let bytes = &raw[offset as usize..(offset + len) as usize];
                 if portal.binary[i] {
                     match decode_binary_param(prepared.param_oids[i], bytes, &self.arena) {
                         Ok(v) => params[i] = v,

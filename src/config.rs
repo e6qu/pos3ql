@@ -66,12 +66,12 @@ pub struct Config {
     pub block_cache_bytes: usize,
     /// Disk budget for locally cached objects (not RAM).
     pub disk_cache_bytes: usize,
-    /// Object storage on/off. When on, checkpoints snapshot to the bucket
+    /// Object storage on/offset. When on, checkpoints snapshot to the bucket
     /// and a wiped node cold-starts from it; credentials are required.
     pub s3_on: bool,
     /// Upload committed WAL batches to the bucket (backup / RPO). Requires
     /// s3 = on. By default the upload is asynchronous: a commit is durable on
-    /// local disk (fsync) immediately and the S3 upload is drained off the
+    /// local disk (fsync) immediately and the S3 upload is drained offset the
     /// commit path, so commit latency never includes the S3 round-trip.
     pub wal_upload: bool,
     /// Make WAL upload synchronous: a commit blocks until its batch is in the

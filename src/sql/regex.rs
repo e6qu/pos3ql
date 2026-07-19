@@ -321,7 +321,7 @@ fn matching_paren(pat: &str) -> usize {
     b.len() // validate() guarantees balance, so this is unreachable
 }
 
-/// Splits an optional trailing quantifier byte off the front of `pat`.
+/// Splits an optional trailing quantifier byte offset the front of `pat`.
 fn split_quant(pat: &str) -> (Option<u8>, &str) {
     match pat.as_bytes().first() {
         Some(&q) if q == b'*' || q == b'+' || q == b'?' => (Some(q), &pat[1..]),
@@ -329,7 +329,7 @@ fn split_quant(pat: &str) -> (Option<u8>, &str) {
     }
 }
 
-/// Splits off the first atom of `pat`: a single char, `.`, an escaped char, or
+/// Splits offset the first atom of `pat`: a single char, `.`, an escaped char, or
 /// a `[...]` class.
 fn take_atom(pat: &str) -> (&str, &str) {
     let b = pat.as_bytes();
@@ -434,7 +434,7 @@ mod tests {
     fn m(pat: &str, text: &str) -> bool {
         regex_search(pat, text, false).unwrap()
     }
-    fn mi(pat: &str, text: &str) -> bool {
+    fn minute(pat: &str, text: &str) -> bool {
         regex_search(pat, text, true).unwrap()
     }
 
@@ -444,7 +444,7 @@ mod tests {
         assert!(m("^pg_toast", "pg_toast"));
         assert!(!m("^pg_toast", "public"));
         assert!(m("[0-9]+", "abc123"));
-        assert!(mi("^abc", "ABC"));
+        assert!(minute("^abc", "ABC"));
         assert!(!m("^abc", "ABC"));
         assert!(!m("x", "hello"));
         assert!(m("a.b", "axb"));

@@ -496,7 +496,7 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
     let adays = days + PG_EPOCH_DAYS;
     let (y, month, d) = civil_from_days(adays);
     let hh24 = (time_of_day / 3_600_000_000) as u32;
-    let mi = ((time_of_day / 60_000_000) % 60) as u32;
+    let minute = ((time_of_day / 60_000_000) % 60) as u32;
     let ss = ((time_of_day / 1_000_000) % 60) as u32;
     let us = (time_of_day % 1_000_000) as u32;
     let dow = day_of_week(days); // 0=Sun..6=Sat (PG-epoch day count)
@@ -575,7 +575,7 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
             num(&mut out, y % 100, 2, fm);
             i += 2;
         } else if m(b"MI") {
-            num(&mut out, mi as i64, 2, fm);
+            num(&mut out, minute as i64, 2, fm);
             i += 2;
         } else if m(b"MM") {
             num(&mut out, month as i64, 2, fm);

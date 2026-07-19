@@ -2624,7 +2624,7 @@ fn call<'a>(
             use super::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS, PG_EPOCH_SECS};
             let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
             let (seconds, frac) = (in_day / 1_000_000, in_day % 1_000_000);
-            let (h, mi, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
+            let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
             let eq = |k: &str| field.eq_ignore_ascii_case(k);
             let dow0 = day_of_week(days) as i64;
             // Integer-valued fields.
@@ -2637,7 +2637,7 @@ fn call<'a>(
             } else if eq("hour") || eq("hours") {
                 Some(h)
             } else if eq("minute") || eq("minutes") {
-                Some(mi)
+                Some(minute)
             } else if eq("dow") {
                 Some(dow0)
             } else if eq("isodow") {
@@ -2714,7 +2714,7 @@ fn call<'a>(
             let (days, in_day) = (t.div_euclid(86_400_000_000), t.rem_euclid(86_400_000_000));
             let (y, m, _d) = civil_from_days(days + PG_EPOCH_DAYS);
             let (seconds, _frac) = (in_day / 1_000_000, in_day % 1_000_000);
-            let (h, mi, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
+            let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
             let eq = |k: &str| field.eq_ignore_ascii_case(k);
             // (new day count since epoch, seconds within the day).
             let (new_days, sod): (i64, i64) = if eq("year") || eq("years") {
@@ -2732,9 +2732,9 @@ fn call<'a>(
             } else if eq("hour") || eq("hours") {
                 (days, h * 3600)
             } else if eq("minute") || eq("minutes") {
-                (days, h * 3600 + mi * 60)
+                (days, h * 3600 + minute * 60)
             } else if eq("second") || eq("seconds") {
-                (days, h * 3600 + mi * 60 + s)
+                (days, h * 3600 + minute * 60 + s)
             } else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3414,7 +3414,7 @@ fn eval_logic_short_circuit<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let absorbing = matches!(operator, BinaryOp::Or);
     // Left first: a statically-determined left settles the result (absorbing) or
-    // hands off to the right (non-absorbing), matching plan-time folding order.
+    // hands offset to the right (non-absorbing), matching plan-time folding order.
     match fold_check(left, arena)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
         Some(_) => return eval_full(right, arena, params, row, hooks),

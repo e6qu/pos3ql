@@ -254,7 +254,7 @@ pub fn make_timestamp(y: i64, m: i64, d: i64, h: i64, mi: i64, sec: f64) -> Resu
 /// Parses `YYYY-MM-DD[ |T]HH:MM[:SS[.ffffff]][Z|±HH[:MM]]` into
 /// microseconds since 2000-01-01 UTC. `require_tz_shift` applies the zone
 /// offset (timestamptz); plain timestamp ignores any suffix.
-pub fn parse_timestamp(s: &str, apply_tz: bool) -> Result<i64, SqlError> {
+pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     let bad = || {
         sql_err!(
             "22007",
@@ -275,7 +275,7 @@ pub fn parse_timestamp(s: &str, apply_tz: bool) -> Result<i64, SqlError> {
     }
 
     // Trailing zone: Z, +HH, +HH:MM, -HH, -HH:MM.
-    let (time_part, tz_secs) = if let Some(stripped) = rest.strip_suffix('Z') {
+    let (time_part, timezone_seconds) = if let Some(stripped) = rest.strip_suffix('Z') {
         (stripped, 0i64)
     } else if let Some(pos) = rest.rfind(['+', '-']) {
         if pos > 0 {
@@ -326,8 +326,8 @@ pub fn parse_timestamp(s: &str, apply_tz: bool) -> Result<i64, SqlError> {
     }
     let mut total =
         date_days * 86_400_000_000 + (h * 3600 + m * 60 + sec) * 1_000_000 + micros;
-    if apply_tz {
-        total -= tz_secs * 1_000_000;
+    if apply_timezone {
+        total -= timezone_seconds * 1_000_000;
     }
     Ok(total)
 }
@@ -695,9 +695,9 @@ pub fn format_date(days: i32) -> StackStr<16> {
     format_date_styled(days, DateStyle::default())
 }
 
-/// `with_tz` renders a timestamptz (UTC) as PostgreSQL does.
-pub fn format_timestamp(micros: i64, with_tz: bool) -> StackStr<48> {
-    format_timestamp_styled(micros, with_tz, DateStyle::default(), crate::sql::tz::Tz::utc())
+/// `with_timezone` renders a timestamptz (UTC) as PostgreSQL does.
+pub fn format_timestamp(micros: i64, with_timezone: bool) -> StackStr<48> {
+    format_timestamp_styled(micros, with_timezone, DateStyle::default(), crate::sql::timezone::Timezone::utc())
 }
 
 /// Date output honoring DateStyle. Matches PostgreSQL: ISO `YYYY-MM-DD`,
@@ -733,20 +733,20 @@ fn write_frac(out: &mut impl core::fmt::Write, frac: i64) {
     let _ = write!(out, ".{f:0width$}", width = digits);
 }
 
-/// Timestamp output honoring DateStyle. `tz_off_secs` shifts the wall clock for
+/// Timestamp output honoring DateStyle. `timezone_offset_seconds` shifts the wall clock for
 /// timestamptz (0 = UTC); the zone suffix is the ISO offset in ISO style and a
 /// zone abbreviation otherwise, matching PostgreSQL.
 pub fn format_timestamp_styled(
     micros: i64,
-    with_tz: bool,
+    with_timezone: bool,
     style: DateStyle,
-    tz: super::tz::Tz,
+    timezone: super::timezone::Timezone,
 ) -> StackStr<48> {
     // The offset and abbreviation are resolved for this specific instant, so
-    // DST is honored; a plain timestamp (no tz) always renders at wall clock.
-    let (tz_off_secs, abbrev) = if with_tz { tz.resolve(micros) } else { (0, StackStr::<8>::new()) };
-    let tz_abbrev = abbrev.as_str();
-    let local = micros + tz_off_secs as i64 * 1_000_000;
+    // DST is honored; a plain timestamp (no timezone) always renders at wall clock.
+    let (timezone_offset_seconds, abbrev) = if with_timezone { timezone.resolve(micros) } else { (0, StackStr::<8>::new()) };
+    let timezone_abbreviation = abbrev.as_str();
+    let local = micros + timezone_offset_seconds as i64 * 1_000_000;
     let days = local.div_euclid(DAY_US);
     let in_day = local.rem_euclid(DAY_US);
     let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
@@ -761,8 +761,8 @@ pub fn format_timestamp_styled(
         DateFormat::Iso => {
             let _ = write!(out, "{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}");
             write_frac(&mut out, frac);
-            if with_tz {
-                write_iso_offset(&mut out, tz_off_secs);
+            if with_timezone {
+                write_iso_offset(&mut out, timezone_offset_seconds);
             }
         }
         DateFormat::Postgres => {
@@ -775,8 +775,8 @@ pub fn format_timestamp_styled(
             }
             write_frac(&mut out, frac);
             let _ = write!(out, " {y:04}");
-            if with_tz {
-                let _ = write!(out, " {tz_abbrev}");
+            if with_timezone {
+                let _ = write!(out, " {timezone_abbreviation}");
             }
         }
         DateFormat::Sql | DateFormat::German => {
@@ -789,8 +789,8 @@ pub fn format_timestamp_styled(
             };
             let _ = write!(out, " {h:02}:{mi:02}:{s:02}");
             write_frac(&mut out, frac);
-            if with_tz {
-                let _ = write!(out, " {tz_abbrev}");
+            if with_timezone {
+                let _ = write!(out, " {timezone_abbreviation}");
             }
         }
     }
@@ -903,9 +903,9 @@ mod tests {
         ];
         for (style, d_exp, ts_exp, tsf_exp, tstz_exp) in cases {
             assert_eq!(format_date_styled(days, style).as_str(), d_exp, "{style:?} date");
-            assert_eq!(format_timestamp_styled(timestamp, false, style, crate::sql::tz::Tz::utc()).as_str(), ts_exp, "{style:?} timestamp");
-            assert_eq!(format_timestamp_styled(tsf, false, style, crate::sql::tz::Tz::utc()).as_str(), tsf_exp, "{style:?} tsf");
-            assert_eq!(format_timestamp_styled(timestamp, true, style, crate::sql::tz::Tz::utc()).as_str(), tstz_exp, "{style:?} tstz");
+            assert_eq!(format_timestamp_styled(timestamp, false, style, crate::sql::timezone::Timezone::utc()).as_str(), ts_exp, "{style:?} timestamp");
+            assert_eq!(format_timestamp_styled(tsf, false, style, crate::sql::timezone::Timezone::utc()).as_str(), tsf_exp, "{style:?} tsf");
+            assert_eq!(format_timestamp_styled(timestamp, true, style, crate::sql::timezone::Timezone::utc()).as_str(), tstz_exp, "{style:?} tstz");
         }
     }
 

@@ -20,7 +20,7 @@ pub mod txn;
 pub mod types;
 pub mod range;
 pub mod to_char;
-pub mod tz;
+pub mod timezone;
 
 use crate::checkpoint::{Checkpointer, CheckpointSetupError};
 use crate::config::Config;

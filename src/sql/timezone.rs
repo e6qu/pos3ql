@@ -1,11 +1,11 @@
-//! Time zones with DST. A [`Tz`] resolves the UTC offset and abbreviation for
+//! Time zones with DST. A [`Timezone`] resolves the UTC offset and abbreviation for
 //! a specific instant, so `timestamptz` output is correct across daylight-time
 //! transitions. Fixed-offset zones (UTC, `+05:30`) are the degenerate case
 //! with no transitions.
 //!
 //! DST rules follow the POSIX form (the `Mm.w.d` transition: month, week,
 //! day-of-week, local seconds-after-midnight). This is exact for current rules;
-//! it does not model historical rule changes (PostgreSQL's full tz database
+//! it does not model historical rule changes (PostgreSQL's full timezone database
 //! does), which only affects timestamps from before a zone's present rule.
 
 use core::fmt::Write;
@@ -35,7 +35,7 @@ pub struct Dst {
 
 /// A resolved time zone.
 #[derive(Debug, Clone, Copy)]
-pub struct Tz {
+pub struct Timezone {
     std_off: i32,
     dst_off: i32,
     std_abbrev: StackStr<8>,
@@ -43,16 +43,16 @@ pub struct Tz {
     dst: Option<Dst>,
 }
 
-impl Tz {
+impl Timezone {
     /// A fixed-offset zone (no DST): UTC, `Etc/GMT±N`, bare numeric offsets.
-    pub fn fixed(off_secs: i32, abbrev: &str) -> Tz {
+    pub fn fixed(off_secs: i32, abbrev: &str) -> Timezone {
         let mut a = StackStr::new();
         let _ = write!(a, "{abbrev}");
-        Tz { std_off: off_secs, dst_off: off_secs, std_abbrev: a, dst_abbrev: a, dst: None }
+        Timezone { std_off: off_secs, dst_off: off_secs, std_abbrev: a, dst_abbrev: a, dst: None }
     }
 
-    pub fn utc() -> Tz {
-        Tz::fixed(0, "UTC")
+    pub fn utc() -> Timezone {
+        Timezone::fixed(0, "UTC")
     }
 
     /// The offset (seconds east of UTC) and abbreviation in effect at `utc`
@@ -108,12 +108,12 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 
 const H: i32 = 3600;
 
-fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst>) -> Tz {
+fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst>) -> Timezone {
     let mut s = StackStr::new();
     let _ = write!(s, "{std_ab}");
     let mut d = StackStr::new();
     let _ = write!(d, "{dst_ab}");
-    Tz { std_off, dst_off, std_abbrev: s, dst_abbrev: d, dst }
+    Timezone { std_off, dst_off, std_abbrev: s, dst_abbrev: d, dst }
 }
 
 /// US rule (2007+): spring 2nd Sunday March 02:00 std, fall 1st Sunday
@@ -155,7 +155,7 @@ fn nz() -> Dst {
 
 /// Looks up an IANA zone name (case-insensitive). Returns the resolved zone, or
 /// `None` if it is not in the embedded set.
-pub fn lookup(name: &str) -> Option<Tz> {
+pub fn lookup(name: &str) -> Option<Timezone> {
     let n = name;
     let eq = |a: &str| n.eq_ignore_ascii_case(a);
     // North America
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn fixed_zones() {
-        assert_eq!(Tz::utc().resolve(ts(2021, 7, 1, 0)).0, 0);
+        assert_eq!(Timezone::utc().resolve(ts(2021, 7, 1, 0)).0, 0);
         let kolkata = lookup("Asia/Kolkata").unwrap();
         assert_eq!(kolkata.resolve(ts(2021, 7, 1, 0)).0, 5 * H + 1800);
     }

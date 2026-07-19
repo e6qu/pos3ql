@@ -82,7 +82,7 @@ pub struct RenderCtx {
     pub datestyle: DateStyle,
     /// The session time zone; resolves offset + abbreviation per timestamp so
     /// DST is honored.
-    pub tz: super::tz::Tz,
+    pub parsed_timezone: super::timezone::Timezone,
     /// The client_min_messages threshold: NOTICE/WARNING below it are dropped.
     pub min_message_level: MsgLevel,
 }
@@ -91,7 +91,7 @@ impl Default for RenderCtx {
     fn default() -> Self {
         RenderCtx {
             datestyle: DateStyle::default(),
-            tz: super::tz::Tz::utc(),
+            parsed_timezone: super::timezone::Timezone::utc(),
             min_message_level: MsgLevel::Notice,
         }
     }
@@ -101,7 +101,7 @@ pub struct GucState {
     datestyle: StackStr<48>,
     timezone: StackStr<64>,
     /// Parsed current time zone, so rendering does not re-parse it.
-    tz: super::tz::Tz,
+    parsed_timezone: super::timezone::Timezone,
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
     search_path: StackStr<128>,
@@ -125,7 +125,7 @@ impl GucState {
         let mut g = Self {
             datestyle: StackStr::new(),
             timezone: StackStr::new(),
-            tz: super::tz::Tz::utc(),
+            parsed_timezone: super::timezone::Timezone::utc(),
             client_encoding: StackStr::new(),
             application_name: StackStr::new(),
             search_path: StackStr::new(),
@@ -173,13 +173,13 @@ impl GucState {
         if name.eq_ignore_ascii_case("timezone") {
             // UTC, fixed numeric offsets, Etc/GMT±N, and named IANA zones (with
             // DST) are honored; an unknown zone is rejected loudly.
-            let tz = if is_default {
-                super::tz::Tz::utc()
+            let timezone = if is_default {
+                super::timezone::Timezone::utc()
             } else {
                 parse_timezone(v).ok_or_else(|| unsupported_value("TimeZone", v))?
             };
             store(&mut self.timezone, if is_default { "UTC" } else { v })?;
-            self.tz = tz;
+            self.parsed_timezone = timezone;
             return Ok(());
         }
         if name.eq_ignore_ascii_case("client_encoding") {
@@ -368,7 +368,7 @@ impl GucState {
         let order = if ord == Order3::Dmy { FieldOrder::Dmy } else { FieldOrder::Mdy };
         RenderCtx {
             datestyle: DateStyle { format, order },
-            tz: self.tz,
+            parsed_timezone: self.parsed_timezone,
             min_message_level: self.client_min_messages,
         }
     }
@@ -512,15 +512,15 @@ fn is_utc(v: &str) -> bool {
 /// abbreviation), or None for a named/DST zone we do not model. Matches
 /// PostgreSQL's inverted sign conventions: `Etc/GMT+5` is UTC-5 and a bare
 /// `+05:30` is UTC-5:30.
-fn parse_timezone(v: &str) -> Option<super::tz::Tz> {
-    use super::tz::Tz;
+fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
+    use super::timezone::Timezone;
     let t = v.trim();
     if is_utc(t) || t.eq_ignore_ascii_case("z") || t.eq_ignore_ascii_case("zulu") {
-        return Some(Tz::utc());
+        return Some(Timezone::utc());
     }
     // A named IANA zone (with DST) from the embedded set.
-    if let Some(tz) = super::tz::lookup(t) {
-        return Some(tz);
+    if let Some(timezone) = super::timezone::lookup(t) {
+        return Some(timezone);
     }
     // Etc/GMT±N and GMT±N: the sign is inverted; the abbreviation PostgreSQL
     // shows is the resulting ISO offset (e.g. Etc/GMT+5 -> "-05").
@@ -533,14 +533,14 @@ fn parse_timezone(v: &str) -> Option<super::tz::Tz> {
     };
     if let Some(rest) = etc {
         if rest.is_empty() {
-            return Some(Tz::utc());
+            return Some(Timezone::utc());
         }
         let off = -parse_hms(rest)?;
-        return Some(Tz::fixed(off, super::datetime::iso_offset_string(off).as_str()));
+        return Some(Timezone::fixed(off, super::datetime::iso_offset_string(off).as_str()));
     }
     // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
     if t.starts_with('+') || t.starts_with('-') {
-        return Some(Tz::fixed(-parse_hms(t)?, ""));
+        return Some(Timezone::fixed(-parse_hms(t)?, ""));
     }
     None
 }

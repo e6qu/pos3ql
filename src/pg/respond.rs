@@ -335,12 +335,12 @@ impl<'b> Responder<'b> {
                     m.bytes(text.as_str().as_bytes());
                 }
                 Datum::Timestamp(t) | Datum::Timestamptz(t) => {
-                    let with_tz = matches!(v, Datum::Timestamptz(_));
+                    let with_timezone = matches!(v, Datum::Timestamptz(_));
                     let text = crate::sql::datetime::format_timestamp_styled(
                         *t,
-                        with_tz,
+                        with_timezone,
                         render.datestyle,
-                        render.tz,
+                        render.parsed_timezone,
                     );
                     m.i32(text.as_str().len() as i32);
                     m.bytes(text.as_str().as_bytes());

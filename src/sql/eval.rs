@@ -3826,7 +3826,7 @@ fn arithmetic<'a>(
                 interval
             };
             let out = super::datetime::add_interval(base, signed);
-            // date ± interval yields timestamp in PostgreSQL; timestamptz stays tz.
+            // date ± interval yields timestamp in PostgreSQL; timestamptz stays timezone.
             return Ok(match dt {
                 Datum::Timestamptz(_) => Datum::Timestamptz(out),
                 _ => Datum::Timestamp(out),

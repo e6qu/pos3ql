@@ -1421,15 +1421,40 @@ impl<'a> Parser<'a> {
                 left = self.arena_expr(Expr::Cast { operand: left, type_name, type_mod })?;
                 continue;
             }
-            // `IS [NOT] NULL` binds looser than arithmetic and comparison (like
-            // PostgreSQL), so it applies only at the comparison precedence level
-            // and below — `1 - 2 IS NOT NULL` is `(1 - 2) IS NOT NULL`.
+            // `IS [NOT] NULL/TRUE/FALSE/UNKNOWN/DISTINCT FROM` binds looser than
+            // arithmetic and comparison (like PostgreSQL), so it applies only at
+            // the comparison precedence level and below — `1 - 2 IS NOT NULL` is
+            // `(1 - 2) IS NOT NULL`. The boolean tests and DISTINCT FROM desugar
+            // to `CASE`/`IS NULL` so they need no dedicated AST node.
             if min_prec <= 4 && self.peeked == Tok::Ident("is") {
                 self.advance()?;
                 let negated = self.eat_ident("not")?;
-                self.expect_ident("null")?;
-                left = self.arena_expr(Expr::IsNull { operand: left, negated })?;
-                continue;
+                if self.eat_ident("null")? || self.eat_ident("unknown")? {
+                    left = self.arena_expr(Expr::IsNull { operand: left, negated })?;
+                    continue;
+                }
+                let is_true = self.eat_ident("true")?;
+                if is_true || self.eat_ident("false")? {
+                    // `x IS TRUE` -> CASE WHEN x THEN true ELSE false; IS FALSE
+                    // tests `NOT x`; the NOT/negated flags flip the arms.
+                    let cond = if is_true {
+                        left
+                    } else {
+                        self.arena_expr(Expr::Unary { op: UnaryOp::Not, operand: left })?
+                    };
+                    let then_v = self.arena_expr(Expr::Bool(!negated))?;
+                    let else_v = self.arena_expr(Expr::Bool(negated))?;
+                    let whens = self.arena_slice(&[(cond, then_v)])?;
+                    left = self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(else_v) })?;
+                    continue;
+                }
+                if self.eat_ident("distinct")? {
+                    self.expect_ident("from")?;
+                    let right = self.expr(5)?;
+                    left = self.build_distinct_from(left, right, negated)?;
+                    continue;
+                }
+                return Err(self.err_here("expected NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS"));
             }
             // Array subscript `base[index]` (1-based).
             if self.peeked == Tok::Op("[") {
@@ -2129,6 +2154,26 @@ impl<'a> Parser<'a> {
             _ => return Err(self.err_here("unsupported operator in OPERATOR()")),
         };
         self.arena_expr(Expr::Binary { op: bop, left, right })
+    }
+
+    /// Desugars `left IS [NOT] DISTINCT FROM right` into a null-safe `CASE`:
+    /// both null → equal, one null → distinct, else the plain comparison.
+    fn build_distinct_from(
+        &self,
+        left: &'a Expr<'a>,
+        right: &'a Expr<'a>,
+        negated: bool,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let l_null = self.arena_expr(Expr::IsNull { operand: left, negated: false })?;
+        let r_null = self.arena_expr(Expr::IsNull { operand: right, negated: false })?;
+        let both = self.arena_expr(Expr::Binary { op: BinaryOp::And, left: l_null, right: r_null })?;
+        let either = self.arena_expr(Expr::Binary { op: BinaryOp::Or, left: l_null, right: r_null })?;
+        let cmp_op = if negated { BinaryOp::Eq } else { BinaryOp::NotEq };
+        let cmp = self.arena_expr(Expr::Binary { op: cmp_op, left, right })?;
+        let both_val = self.arena_expr(Expr::Bool(negated))?;
+        let either_val = self.arena_expr(Expr::Bool(!negated))?;
+        let whens = self.arena_slice(&[(both, both_val), (either, either_val)])?;
+        self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(cmp) })
     }
 
     fn peek_binary_op(&self) -> Option<BinaryOp> {

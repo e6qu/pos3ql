@@ -83,15 +83,25 @@ class Gen:
             return self.choice([self.choice(NUM_COLS), self.int_lit(),
                                 self.choice(["1.5", "0.0", "-2.25", "3.14"])])
         op = self.choice(["+", "-", "*", "/", "%"])
-        # % only makes sense on ints; keep both sides int for it
+        # float8 has no `%` operator, so keep modulo on integer/numeric operands
+        # (both of which PostgreSQL and pos3ql define).
         if op == "%":
-            return f"({self.int_operand(depth)} % {self.int_operand(depth)})"
+            return f"({self.mod_operand(depth)} % {self.mod_operand(depth)})"
         return f"({self.num_expr(depth+1)} {op} {self.num_expr(depth+1)})"
 
     def int_operand(self, depth):
         if self.maybe(0.5):
             return self.choice(INT_COLS)
         return self.int_lit()
+
+    def dec_lit(self):
+        return self.choice(["1.5", "0.0", "-2.25", "3.14", "2.0", "0.5",
+                            "10.0", "-7.5", "100.0", "0.04", "223.1273"])
+
+    def mod_operand(self, depth):
+        if self.maybe(0.4):
+            return self.choice(INT_COLS)
+        return self.choice([self.int_lit(), self.dec_lit()])
 
     def text_expr(self):
         if self.maybe(0.5):
@@ -149,20 +159,26 @@ class Gen:
             f"concat({s}, {self.text_expr()}, {self.int_lit()})",
             f"lpad({s}, {self.small_int()}, '*')", f"rpad({s}, {self.small_int()}, '*')",
             f"split_part({s}, 'a', {self.rng.randint(1, 3)})",
-            f"to_char({self.num_expr()}, '999.99')",
+            f"to_char({self.num_expr()}, "
+            f"'{self.choice(['999.99', 'FM999.99', '9,999.99', 'S999.99', '990.00', '0000.00'])}')",
             f"ascii({s})", f"chr(65 + {self.rng.randint(0, 25)})",
         ])
 
     def math_func(self):
-        """A numeric function. sqrt/power/exp/ln take float8 (`r`) or integer
-        arguments only: PostgreSQL computes those in NUMERIC for a numeric
-        argument and returns numeric, which pos3ql does not yet do (tracked as
-        a subset gap), so the fuzzer stays on the float/int forms it supports."""
+        """A numeric function. sqrt/power/exp/ln compute in NUMERIC for a
+        numeric argument (arbitrary precision) and in double precision for a
+        float8 (`r`) or integer argument; both forms are exercised here."""
         return self.choice([
             f"abs({self.num_expr()})",
             f"mod({self.int_operand(0)}, {self.int_operand(0)})",
+            f"mod({self.dec_lit()}, {self.choice(['3.2', '2.5', '7.0', '1.5'])})",
             f"power(r, {self.small_int()})", f"power({self.small_int()}, r)",
+            f"power({self.dec_lit()}, {self.small_int()})",
+            f"power({self.choice(['2.0', '0.5', '10.0', '3.0'])}, "
+            f"{self.choice(['0.5', '2', '3', '-1', '-2'])})",
             f"sqrt(abs(r))", f"exp(r)", f"ln(abs(r) + 1)",
+            f"sqrt(abs({self.dec_lit()}))", f"ln(abs({self.dec_lit()}) + 1.0)",
+            f"exp({self.choice(['0.5', '1.0', '-1.0', '2.0', '-0.5'])})",
             f"floor({self.num_expr()})", f"ceil({self.num_expr()})",
             f"round({self.num_expr()})", f"round({self.choice(['1.555','2.5','-2.5'])}, 1)",
             f"trunc({self.num_expr()})", f"sign({self.num_expr()})",

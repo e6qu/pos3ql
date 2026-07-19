@@ -18,6 +18,7 @@ pub mod prep;
 pub mod query;
 pub mod txn;
 pub mod types;
+pub mod to_char;
 pub mod tz;
 
 use crate::checkpoint::{Checkpointer, CheckpointSetupError};

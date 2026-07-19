@@ -76,5 +76,5 @@ jobs:
           # before-fold, WHERE/projection interleaving); the residual is
           # PostgreSQL-implementation-specific (unspecified within-row operand
           # order, plan-dependent projection placement). Ratchet toward it.
-          FUZZ_BUDGET: "38"
+          FUZZ_BUDGET: "25"
         run: bash tests/external/ci_diff.sh

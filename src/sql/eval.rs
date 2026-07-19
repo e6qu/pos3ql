@@ -1571,9 +1571,10 @@ fn call<'a>(
                 return Err(arity_err(name, args.len()));
             }
             // PostgreSQL types the result as the common type of all arguments,
-            // so `least(1, 2.5)` is numeric even when the int wins. Track the
-            // widest numeric rank across every argument and promote the winner
-            // to it (float8 > numeric > int8 > int4).
+            // so `least(1, 2.5)` is numeric even when the int wins. The rank
+            // comes from each argument's *static* type (so a NULL float8 still
+            // makes the result float8, as PostgreSQL does), falling back to the
+            // runtime value for expressions whose static type is unknown.
             let rank = |d: &Datum| match d {
                 Datum::Int4(_) => 1,
                 Datum::Int8(_) => 2,
@@ -1581,9 +1582,19 @@ fn call<'a>(
                 Datum::Float8(_) => 4,
                 _ => 0,
             };
+            let static_rank = |t: ColType| match t {
+                ColType::Int4 => 1,
+                ColType::Int8 => 2,
+                ColType::Numeric => 3,
+                ColType::Float8 => 4,
+                _ => 0,
+            };
             let mut best: Option<Datum> = None;
             let mut widest = 0u8;
             for a in args {
+                if let Some(t) = static_type(a, row) {
+                    widest = widest.max(static_rank(t));
+                }
                 let v = eval_full(a, arena, params, row, hooks)?;
                 widest = widest.max(rank(&v));
                 if v.is_null() {
@@ -1700,9 +1711,26 @@ fn call<'a>(
         }
         "sqrt" | "exp" | "ln" => {
             arity(1)?;
-            let Some(x) = num_f64(name, args, 0, arena, params, row, hooks)? else {
+            // A numeric argument keeps the numeric domain (arbitrary precision);
+            // int/float arguments follow PostgreSQL and return double precision.
+            let d = eval_full(args[0], arena, params, row, hooks)?;
+            if d.is_null() {
                 return Ok(Datum::Null);
-            };
+            }
+            if let Datum::Numeric(n) = d {
+                if name == "sqrt" && n.sign == super::numeric::Sign::Neg && !n.is_zero() {
+                    return Err(sql_err!("2201F", "cannot take square root of a negative number"));
+                }
+                if name == "ln" && (n.sign == super::numeric::Sign::Neg || n.is_zero()) {
+                    return Err(sql_err!("2201E", "cannot take logarithm of a non-positive number"));
+                }
+                return Ok(Datum::Numeric(match name {
+                    "sqrt" => numeric::sqrt(&n, arena)?,
+                    "exp" => numeric::exp(&n, arena)?,
+                    _ => numeric::ln(&n, arena)?,
+                }));
+            }
+            let x = datum_f64(name, d)?;
             if name == "sqrt" && x < 0.0 {
                 return Err(sql_err!("2201F", "cannot take square root of a negative number"));
             }
@@ -1717,12 +1745,21 @@ fn call<'a>(
         }
         "power" | "pow" => {
             arity(2)?;
-            let (Some(a), Some(bb)) = (
-                num_f64(name, args, 0, arena, params, row, hooks)?,
-                num_f64(name, args, 1, arena, params, row, hooks)?,
-            ) else {
+            let da = eval_full(args[0], arena, params, row, hooks)?;
+            let db = eval_full(args[1], arena, params, row, hooks)?;
+            if da.is_null() || db.is_null() {
                 return Ok(Datum::Null);
-            };
+            }
+            // A numeric argument keeps the numeric domain, but a float argument
+            // wins (double precision is preferred), so both go to the f64 path.
+            let any_numeric = matches!(da, Datum::Numeric(_)) || matches!(db, Datum::Numeric(_));
+            let any_float = matches!(da, Datum::Float8(_)) || matches!(db, Datum::Float8(_));
+            if any_numeric && !any_float {
+                let a = datum_numeric(name, da, arena)?;
+                let b = datum_numeric(name, db, arena)?;
+                return Ok(Datum::Numeric(numeric::pow(&a, &b, arena)?));
+            }
+            let (a, bb) = (datum_f64(name, da)?, datum_f64(name, db)?);
             // PostgreSQL rejects the cases whose real result is undefined,
             // rather than returning NaN/Inf as libm's powf would.
             if a < 0.0 && bb.fract() != 0.0 {
@@ -1742,6 +1779,13 @@ fn call<'a>(
             let b = eval_full(args[1], arena, params, row, hooks)?;
             if a.is_null() || b.is_null() {
                 return Ok(Datum::Null);
+            }
+            // A numeric operand keeps the numeric domain (matching the `%`
+            // operator); mixed integer widths pick the wider integer type.
+            if matches!(a, Datum::Numeric(_)) || matches!(b, Datum::Numeric(_)) {
+                let x = datum_numeric(name, a, arena)?;
+                let y = datum_numeric(name, b, arena)?;
+                return Ok(Datum::Numeric(numeric::rem(&x, &y, arena)?));
             }
             let (x, y, wide) = match (a, b) {
                 (Datum::Int4(x), Datum::Int4(y)) => (x as i64, y as i64, false),
@@ -1796,6 +1840,19 @@ fn call<'a>(
             } else {
                 Datum::Int4(i32::try_from(out).map_err(|_| range())?)
             })
+        }
+        "to_char" => {
+            arity(2)?;
+            let v = eval_full(args[0], arena, params, row, hooks)?;
+            let f = eval_full(args[1], arena, params, row, hooks)?;
+            if v.is_null() || f.is_null() {
+                return Ok(Datum::Null);
+            }
+            let Datum::Text(fmt) = f else {
+                return Err(type_mismatch(name, &f));
+            };
+            let n = datum_numeric(name, v, arena)?;
+            Ok(Datum::Text(super::to_char::number(&n, fmt, arena)?))
         }
         "to_hex" => {
             arity(1)?;
@@ -2104,6 +2161,28 @@ fn num_f64<'a>(
         Datum::Int8(v) => Ok(Some(v as f64)),
         Datum::Float8(v) => Ok(Some(v)),
         Datum::Numeric(n) => Ok(Some(n.to_f64())),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
+/// f64 view of an already-evaluated numeric-category datum.
+fn datum_f64(name: &str, d: Datum<'_>) -> Result<f64, SqlError> {
+    match d {
+        Datum::Int4(v) => Ok(v as f64),
+        Datum::Int8(v) => Ok(v as f64),
+        Datum::Float8(v) => Ok(v),
+        Datum::Numeric(n) => Ok(n.to_f64()),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
+/// Numeric view of an already-evaluated integer/numeric datum.
+fn datum_numeric<'a>(name: &str, d: Datum<'a>, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    match d {
+        Datum::Numeric(n) => Ok(n),
+        Datum::Int4(v) => Numeric::from_i64(v as i64, arena),
+        Datum::Int8(v) => Numeric::from_i64(v, arena),
+        Datum::Float8(v) => Numeric::parse(stack_format!(64, "{}", v).as_str(), arena),
         other => Err(type_mismatch(name, &other)),
     }
 }

@@ -2709,8 +2709,42 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                     }
                 t.unwrap_or_else(|| of(ColType::Int8))
             }
+            // Functions returning the common type of their arguments (numeric
+            // tower: float8 > numeric > int8 > int4), so a NULL of a wider type
+            // still widens the result — matching PostgreSQL and the runtime
+            // promotion in `greatest`/`least`.
+            "greatest" | "least" => {
+                let rank = |o: i32| {
+                    if o == oid::FLOAT8 || o == oid::FLOAT4 {
+                        4
+                    } else if o == oid::NUMERIC {
+                        3
+                    } else if o == oid::INT8 {
+                        2
+                    } else if o == oid::INT4 {
+                        1
+                    } else {
+                        0
+                    }
+                };
+                let mut best: Option<(i32, i16)> = None;
+                for a in args.iter() {
+                    let t = infer_type_res(a, cols)?;
+                    best = Some(match best {
+                        None => t,
+                        Some(p) => {
+                            if rank(t.0) > rank(p.0) {
+                                t
+                            } else {
+                                p
+                            }
+                        }
+                    });
+                }
+                best.unwrap_or(of(ColType::Int8))
+            }
             // Functions that return the type of their first argument.
-            "coalesce" | "abs" | "greatest" | "least" | "nullif" => {
+            "coalesce" | "abs" | "nullif" => {
                 if let Some(first) = args.first() {
                     infer_type_res(first, cols)?
                 } else {
@@ -2719,10 +2753,22 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             }
             "length" | "char_length" | "character_length" | "octet_length" | "strpos"
             | "ascii" => of(ColType::Int4),
-            // Math: sqrt/exp/ln/power return double; floor/ceil/trunc/round/sign
-            // return numeric for a numeric argument and double otherwise; mod
-            // returns the integer type of its arguments.
-            "sqrt" | "exp" | "ln" | "power" | "pow" => of(ColType::Float8),
+            // Math: sqrt/exp/ln/power stay numeric for a numeric argument (and
+            // no float argument outranking it), else double; floor/ceil/trunc/
+            // round/sign are numeric for a numeric argument and double
+            // otherwise; mod returns the integer type of its arguments.
+            "sqrt" | "exp" | "ln" | "power" | "pow" => {
+                let mut numeric = false;
+                let mut float = false;
+                for a in args.iter() {
+                    match infer_type_res(a, cols)?.0 {
+                        oid::NUMERIC => numeric = true,
+                        oid::FLOAT8 | oid::FLOAT4 => float = true,
+                        _ => {}
+                    }
+                }
+                if numeric && !float { of(ColType::Numeric) } else { of(ColType::Float8) }
+            }
             "floor" | "ceil" | "ceiling" | "sign" => {
                 let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
                 if a == Some(oid::NUMERIC) { of(ColType::Numeric) } else { of(ColType::Float8) }
@@ -2738,13 +2784,16 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             "mod" | "gcd" | "lcm" => {
                 let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
                 let b = args.get(1).map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
-                if a == Some(oid::INT8) || b == Some(oid::INT8) {
+                // `mod` keeps a numeric operand's type; gcd/lcm are integer-only.
+                if *name == "mod" && (a == Some(oid::NUMERIC) || b == Some(oid::NUMERIC)) {
+                    of(ColType::Numeric)
+                } else if a == Some(oid::INT8) || b == Some(oid::INT8) {
                     of(ColType::Int8)
                 } else {
                     of(ColType::Int4)
                 }
             }
-            "to_hex" | "md5" => of(ColType::Text),
+            "to_hex" | "md5" | "to_char" => of(ColType::Text),
             "factorial" => of(ColType::Numeric),
             "bit_length" => of(ColType::Int4),
             "starts_with" => of(ColType::Bool),

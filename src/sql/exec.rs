@@ -340,8 +340,8 @@ fn attach_constraints(
                 }
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
-                for &ci in &indices[..n] {
-                    def.columns[ci as usize].not_null = true;
+                for &column_index in &indices[..n] {
+                    def.columns[column_index as usize].not_null = true;
                 }
                 if n == 1 {
                     def.columns[indices[0] as usize].primary = true;
@@ -530,8 +530,8 @@ fn attach_fkey(
             ));
         }
         n_parent = pk_n;
-        for (i, &ci) in pk[..pk_n].iter().enumerate() {
-            pcol_names[i] = parent_def.columns()[ci as usize].name.as_str();
+        for (i, &column_index) in pk[..pk_n].iter().enumerate() {
+            pcol_names[i] = parent_def.columns()[column_index as usize].name.as_str();
         }
     } else {
         n_parent = parent_cols.len();
@@ -555,14 +555,14 @@ fn attach_fkey(
     }
     // Types must match between each child and parent column.
     for i in 0..n_child {
-        let ct = def.columns()[child_idxs[i] as usize].ctype;
-        let pt = parent_def.columns()[parent_idxs[i] as usize].ctype;
-        if ct.storage() != pt.storage() {
+        let column_type = def.columns()[child_idxs[i] as usize].ctype;
+        let parent_type = parent_def.columns()[parent_idxs[i] as usize].ctype;
+        if column_type.storage() != parent_type.storage() {
             return Err(sql_err!(
                 "42804",
                 "foreign key constraint cannot be implemented: column types {} and {} are incompatible",
-                ct.name(),
-                pt.name()
+                column_type.name(),
+                parent_type.name()
             ));
         }
     }
@@ -991,9 +991,9 @@ fn tuple_uniqueness(
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(storage.heap.get(loc), schema, &mut other)?;
             let all_eq = columns.iter().all(|&c| {
-                let ci = c as usize;
-                !other[ci].is_null()
-                    && compare_datums(&values[ci], &other[ci])
+                let column_index = c as usize;
+                !other[column_index].is_null()
+                    && compare_datums(&values[column_index], &other[column_index])
                         .map(|o| o.is_eq())
                         .unwrap_or(false)
             });
@@ -1157,9 +1157,9 @@ fn check_fk_parent_referenced(
     old_values: &[Datum],
     txid: u32,
 ) -> Result<(), SqlError> {
-    for ci in 0..storage.table_count() {
-        let cdef = storage.table(ci).def;
-        if !storage.table(ci).visible_to(txid) {
+    for column_index in 0..storage.table_count() {
+        let cdef = storage.table(column_index).def;
+        if !storage.table(column_index).visible_to(txid) {
             continue;
         }
         let mut cschema = [ColType::Bool; MAX_COLUMNS];
@@ -1169,7 +1169,7 @@ fn check_fk_parent_referenced(
                 continue;
             }
             // Does any child row reference the parent's current key tuple?
-            let table = storage.table(ci);
+            let table = storage.table(column_index);
             for (_, state) in table.rows.iter() {
                 let Some(loc) = state.visible_to(txid) else { continue };
                 let mut crow = [Datum::Null; MAX_COLUMNS];
@@ -1199,12 +1199,12 @@ fn check_fk_parent_referenced(
 
 /// Whether any visible table has a foreign key referencing `name`.
 fn table_is_referenced(storage: &Storage, name: &str, txid: u32) -> bool {
-    for ci in 0..storage.table_count() {
-        if !storage.table(ci).visible_to(txid) {
+    for column_index in 0..storage.table_count() {
+        if !storage.table(column_index).visible_to(txid) {
             continue;
         }
         if storage
-            .table(ci)
+            .table(column_index)
             .def
             .fkeys()
             .iter()
@@ -1225,11 +1225,11 @@ fn referenced_key_changed(
     new: &[Datum],
     txid: u32,
 ) -> bool {
-    for ci in 0..storage.table_count() {
-        if !storage.table(ci).visible_to(txid) {
+    for column_index in 0..storage.table_count() {
+        if !storage.table(column_index).visible_to(txid) {
             continue;
         }
-        let cdef = storage.table(ci).def;
+        let cdef = storage.table(column_index).def;
         for fk in cdef.fkeys() {
             if fk.parent.as_str() != parent_name {
                 continue;
@@ -1399,10 +1399,10 @@ pub fn create_index(
     resp: &mut Responder,
 ) -> Outcome {
     use crate::storage::{IndexDef, MAX_INDEX_COLS};
-    let Some(ti) = storage.find_visible(table, txn.txid) else {
+    let Some(table_index) = storage.find_visible(table, txn.txid) else {
         return sql_fail(undefined_table(table));
     };
-    let tdef = storage.table(ti).def;
+    let tdef = storage.table(table_index).def;
     if column_names.is_empty() || column_names.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1412,14 +1412,14 @@ pub fn create_index(
     }
     let mut columns = [0u16; MAX_INDEX_COLS];
     for (i, column_name) in column_names.iter().enumerate() {
-        let Some(ci) = tdef.column_index(column_name) else {
+        let Some(column_index) = tdef.column_index(column_name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
                 column_name
             ));
         };
-        columns[i] = ci as u16;
+        columns[i] = column_index as u16;
     }
     let n_cols = columns.len();
     let sqlname = match SqlName::parse(name) {
@@ -1444,7 +1444,7 @@ pub fn create_index(
         // registered index (all borrows shared); a conflict is deferred so the
         // rollback drop_index (a mutable borrow) runs after the scan.
         let mut conflict: Option<SqlError> = None;
-        for (&rowid, state) in storage.table(ti).rows.iter() {
+        for (&rowid, state) in storage.table(table_index).rows.iter() {
             let Some(loc) = state.committed else { continue };
             let mut values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) =
@@ -1455,7 +1455,7 @@ pub fn create_index(
             }
             if let Err(e) = check_unique_indexes(
                 storage,
-                ti,
+                table_index,
                 &tdef,
                 &schema[..tdef.n_columns],
                 &values[..tdef.n_columns],

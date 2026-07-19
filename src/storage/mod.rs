@@ -99,6 +99,7 @@ impl OwnedDatum {
             | Datum::Interval(_)
             | Datum::Json { .. }
             | Datum::Array { .. }
+            | Datum::Range { .. }
             | Datum::Uuid(_)
             | Datum::Bytea(_) => {
                 return Err(sql_err!(

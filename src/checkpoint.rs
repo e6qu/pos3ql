@@ -1152,6 +1152,7 @@ fn col_type_code(t: ColType) -> u8 {
         ColType::Uuid => 9,
         ColType::Bytea => 10,
         ColType::Numeric => 11,
+        ColType::Range(k) => 20 + k.code(),
     }
 }
 
@@ -1173,6 +1174,7 @@ fn col_type_from_code(code: u8) -> Result<ColType, CheckpointSetupError> {
         17 => ColType::Interval,
         18 => ColType::Json,
         19 => ColType::Jsonb,
+        c if (20..26).contains(&c) => ColType::Range(crate::sql::types::RangeKind::from_code(c - 20)),
         c if c >= 32 => crate::sql::types::ArrElem::from_code(c - 32).map(ColType::Array).ok_or(CheckpointSetupError::Corrupt("bad array element code"))?,
         9 => ColType::Uuid,
         10 => ColType::Bytea,

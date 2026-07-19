@@ -1176,6 +1176,14 @@ fn call<'a>(
             arity(1)?;
             match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
+                // On a range, lower/upper return the corresponding bound.
+                Datum::Range { text, kind } => {
+                    if name == "upper" {
+                        super::range::upper_datum(text, kind, arena)
+                    } else {
+                        super::range::lower_datum(text, kind, arena)
+                    }
+                }
                 Datum::Text(s) => {
                     let upper = name == "upper";
                     // Two passes: measure, then fill the arena slice.
@@ -1262,6 +1270,7 @@ fn call<'a>(
                 Datum::Uuid(_) => "uuid",
                 Datum::Bytea(_) => "bytea",
                 Datum::Numeric(_) => "numeric",
+                Datum::Range { kind, .. } => kind.name(),
             }))
         }
         "trim" | "btrim" | "ltrim" | "rtrim" => {
@@ -2297,6 +2306,38 @@ fn call<'a>(
                     arena,
                 )?)),
                 d @ (Datum::Int4(_) | Datum::Int8(_)) => Ok(d),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
+            let kind = super::types::RangeKind::from_name(name).expect("matched a range name");
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let lo = eval_full(args[0], arena, params, row, hooks)?;
+            let hi = eval_full(args[1], arena, params, row, hooks)?;
+            let flags = if args.len() == 3 {
+                text_arg(name, args, 2, arena, params, row, hooks)?
+            } else {
+                None
+            };
+            Ok(Datum::Range { text: super::range::construct(lo, hi, flags, kind, arena)?, kind })
+        }
+        "isempty" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Range { text, .. } => Ok(Datum::Bool(super::range::is_empty(text))),
+                other => Err(type_mismatch(name, &other)),
+            }
+        }
+        "lower_inc" | "upper_inc" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Range { text, kind } => {
+                    Ok(Datum::Bool(super::range::bound_inc(text, kind, name == "lower_inc")?))
+                }
                 other => Err(type_mismatch(name, &other)),
             }
         }
@@ -3759,6 +3800,14 @@ pub fn cast_to<'a>(
             Datum::Text(s) => Datum::Numeric(Numeric::parse(s, arena)?),
             _ => return Err(cast_unsupported(&v, "numeric")),
         },
+        ColType::Range(kind) => match v {
+            Datum::Range { kind: k, .. } if k == kind => v,
+            Datum::Text(s) => {
+                let p = super::range::parse(s, kind)?;
+                Datum::Range { text: super::range::canonical(&p, kind, arena)?, kind }
+            }
+            _ => return Err(cast_unsupported(&v, kind.name())),
+        },
     };
     Ok(out)
 }
@@ -3962,6 +4011,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Array { .. } => "array",
         Datum::Uuid(_) => "uuid",
         Datum::Bytea(_) => "bytea",
+        Datum::Range { kind, .. } => kind.name(),
     }
 }
 

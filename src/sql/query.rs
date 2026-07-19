@@ -2358,6 +2358,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Bytea | ColType::Numeric => {
             Datum::Text("")
         }
+        ColType::Range(kind) => Datum::Range { text: "empty", kind },
     }
 }
 

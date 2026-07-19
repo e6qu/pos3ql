@@ -157,22 +157,22 @@ impl TxnState {
             .rposition(|s| s.name.as_str() == name)
     }
 
-    pub fn savepoint_at(&self, idx: usize) -> Savepoint {
-        self.savepoints.as_slice()[idx].clone()
+    pub fn savepoint_at(&self, index: usize) -> Savepoint {
+        self.savepoints.as_slice()[index].clone()
     }
 
-    /// Drops the savepoint at `idx` and every one nested inside it (for
+    /// Drops the savepoint at `index` and every one nested inside it (for
     /// `RELEASE SAVEPOINT`; the changes themselves are kept).
-    pub fn release_savepoints_from(&mut self, idx: usize) {
-        while self.savepoints.len() > idx {
+    pub fn release_savepoints_from(&mut self, index: usize) {
+        while self.savepoints.len() > index {
             self.savepoints.pop();
         }
     }
 
-    /// Drops savepoints nested strictly inside `idx`, keeping `idx` itself (for
+    /// Drops savepoints nested strictly inside `index`, keeping `index` itself (for
     /// `ROLLBACK TO SAVEPOINT`, which leaves the target reusable).
-    pub fn rollback_savepoints_after(&mut self, idx: usize) {
-        while self.savepoints.len() > idx + 1 {
+    pub fn rollback_savepoints_after(&mut self, index: usize) {
+        while self.savepoints.len() > index + 1 {
             self.savepoints.pop();
         }
     }

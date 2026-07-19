@@ -837,27 +837,27 @@ impl Checkpointer {
                 format_args!("view {} {name}", hex.as_str()),
             )?;
         }
-        // Indexes: `idx <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
-        for idx in storage.live_indexes() {
+        // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
+        for index in storage.live_indexes() {
             use core::fmt::Write;
             let mut cols = StackStr::<128>::new();
-            for c in &idx.cols[..idx.n_cols] {
+            for c in &index.cols[..index.n_cols] {
                 let _ = write!(cols, "{c} ");
             }
             let mut hname = StackStr::<130>::new();
-            for b in idx.name.as_str().as_bytes() {
+            for b in index.name.as_str().as_bytes() {
                 let _ = write!(hname, "{b:02x}");
             }
             let mut htable = StackStr::<130>::new();
-            for b in idx.table.as_str().as_bytes() {
+            for b in index.table.as_str().as_bytes() {
                 let _ = write!(htable, "{b:02x}");
             }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
                     "idx {} {} {}{} {}",
-                    u8::from(idx.unique),
-                    idx.n_cols,
+                    u8::from(index.unique),
+                    index.n_cols,
                     cols.as_str(),
                     hname.as_str(),
                     htable.as_str()

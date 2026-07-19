@@ -1210,13 +1210,13 @@ mod tests {
         let mut budget = Budget::new(1 << 22);
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let def = make_def("t1", &[("id", ColType::Int4, true)]);
-        let idx = s.create_table(def).unwrap();
-        assert_eq!(s.find_table("t1"), Some(idx));
+        let index = s.create_table(def).unwrap();
+        assert_eq!(s.find_table("t1"), Some(index));
         assert_eq!(
             s.create_table(def).unwrap_err().sqlstate,
             sqlstate::DUPLICATE_TABLE
         );
-        s.drop_table(idx);
+        s.drop_table(index);
         assert_eq!(s.find_table("t1"), None);
         // Slot is reusable; capacity is enforced.
         for i in 0..4u32 {

@@ -582,11 +582,11 @@ impl Numeric<'_> {
         // Which base-10000 digit and which of its 4 decimal positions?
         let base_w = dw.div_euclid(DEC_DIGITS as i32);
         let within = dw.rem_euclid(DEC_DIGITS as i32); // 0..3, 0 = least sig
-        let idx = self.weight as i32 - base_w;
-        if idx < 0 || idx as usize >= self.ndigits() {
+        let index = self.weight as i32 - base_w;
+        if index < 0 || index as usize >= self.ndigits() {
             return 0;
         }
-        let mut v = self.digit(idx as usize) as i32;
+        let mut v = self.digit(index as usize) as i32;
         for _ in 0..within {
             v /= 10;
         }
@@ -832,8 +832,8 @@ fn sub_magnitudes<'a>(
 fn accumulate(buffer: &mut DigitBuf, x: &Numeric, lo: i32, mul: i32) {
     for k in 0..x.ndigits() {
         let w = x.weight as i32 - k as i32;
-        let idx = (w - lo) as usize;
-        buffer[idx] += mul * x.digit(k) as i32;
+        let index = (w - lo) as usize;
+        buffer[index] += mul * x.digit(k) as i32;
     }
 }
 
@@ -864,8 +864,8 @@ pub fn mul<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
         for j in 0..nb {
             // weight of this term = (a.weight-i)+(b.weight-j)
             let w = (a.weight as i32 - i as i32) + (b.weight as i32 - j as i32);
-            let idx = (w - lo) as usize;
-            buffer[idx] += da * b.digit(j) as i32;
+            let index = (w - lo) as usize;
+            buffer[index] += da * b.digit(j) as i32;
         }
     }
     let n = na + nb;
@@ -1049,14 +1049,14 @@ fn sig_decimal(x: &Numeric, out: &mut [i8]) -> (usize, i32) {
     while last <= first && x.decimal_digit_at(last) == 0 {
         last += 1;
     }
-    let mut idx = 0;
+    let mut index = 0;
     let mut dw = first;
     while dw >= last {
-        out[idx] = x.decimal_digit_at(dw) as i8;
-        idx += 1;
+        out[index] = x.decimal_digit_at(dw) as i8;
+        index += 1;
         dw -= 1;
     }
-    (idx, last)
+    (index, last)
 }
 
 /// Schoolbook integer long division of decimal-digit arrays (MSD-first, no

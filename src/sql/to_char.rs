@@ -233,17 +233,17 @@ fn render<'a>(
     let dp = point_index(toks);
     let mut zero_start = int_digits;
     {
-        let mut idx = 0usize;
+        let mut index = 0usize;
         for (tp, &t) in toks.iter().enumerate() {
             if tp == dp {
                 break;
             }
             match t {
                 Tok::Zero => {
-                    zero_start = idx;
+                    zero_start = index;
                     break;
                 }
-                Tok::Nine => idx += 1,
+                Tok::Nine => index += 1,
                 _ => {}
             }
         }

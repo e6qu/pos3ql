@@ -219,14 +219,14 @@ fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_INDEX_COLS]
     }
     let mut out = [0u16; MAX_INDEX_COLS];
     for (i, name) in names.iter().enumerate() {
-        let Some(idx) = def.column_index(name) else {
+        let Some(index) = def.column_index(name) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" named in key does not exist",
                 name
             ));
         };
-        out[i] = idx as u16;
+        out[i] = index as u16;
     }
     Ok((out, names.len()))
 }
@@ -690,8 +690,8 @@ fn find_conflict(
                 return Some(rowid);
             }
         }
-        for idx in storage.unique_indexes_for(table_name) {
-            let icols = &idx.cols[..idx.n_cols];
+        for index in storage.unique_indexes_for(table_name) {
+            let icols = &index.cols[..index.n_cols];
             if !icols.iter().any(|&c| values[c as usize].is_null())
                 && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
             {
@@ -931,10 +931,10 @@ pub fn check_unique_indexes(
     txid: u32,
 ) -> Result<(), SqlError> {
     let table_name = def.name.as_str();
-    for idx in storage.unique_indexes_for(table_name) {
-        let icols = &idx.cols[..idx.n_cols];
+    for index in storage.unique_indexes_for(table_name) {
+        let icols = &index.cols[..index.n_cols];
         tuple_uniqueness(
-            storage, table_index, schema, icols, values, self_rowid, txid, idx.name.as_str(),
+            storage, table_index, schema, icols, values, self_rowid, txid, index.name.as_str(),
         )?;
     }
     Ok(())
@@ -2137,11 +2137,11 @@ pub fn alter_table(
             let _ = fill;
             new_def.columns[def.n_columns] = meta;
             new_def.n_columns += 1;
-            let idx = def.n_columns;
+            let index = def.n_columns;
             // NOT NULL without a default over a non-empty table is a
             // constraint violation, as in PostgreSQL.
             let has_rows = !storage.table(table_index).rows.is_empty();
-            let fill_value = match &new_def.columns[idx].default_value {
+            let fill_value = match &new_def.columns[index].default_value {
                 Some(d) => d.as_datum(),
                 None if meta.not_null && has_rows => {
                     return sql_fail(sql_err!(
@@ -2153,7 +2153,7 @@ pub fn alter_table(
                 }
                 None => Datum::Null,
             };
-            added = Some((idx, fill_value));
+            added = Some((index, fill_value));
         }
         AlterAction::DropColumn(name) => {
             let Some(i) = def.column_index(name) else {
@@ -2219,9 +2219,9 @@ pub fn alter_table(
                 }
                 let mut out = [Datum::Null; MAX_COLUMNS];
                 let n_out = new_def.n_columns;
-                if let Some((idx, ref fill)) = added {
+                if let Some((index, ref fill)) = added {
                     out[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
-                    out[idx] = *fill;
+                    out[index] = *fill;
                 } else if let Some(d) = dropped {
                     let mut w = 0;
                     for (j, v) in values[..def.n_columns].iter().enumerate() {
@@ -2993,15 +2993,15 @@ pub fn resolve_order_expr_pub<'a>(
     let Expr::Int(n) = expression else {
         return Ok(expression);
     };
-    let idx = *n;
-    if idx < 1 || idx as usize > items.len() {
+    let index = *n;
+    if index < 1 || index as usize > items.len() {
         return Err(sql_err!(
             "42P10",
             "ORDER BY position {} is not in select list",
-            idx
+            index
         ));
     }
-    match &items[idx as usize - 1] {
+    match &items[index as usize - 1] {
         SelectItem::Expr { expression, .. } => Ok(expression),
         SelectItem::Wildcard => Err(sql_err!(
             "42P10",

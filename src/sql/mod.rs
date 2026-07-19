@@ -303,12 +303,12 @@ impl Engine {
         txn.clear();
     }
 
-    /// Rolls back to the savepoint at `idx`: undoes every row write and DDL
+    /// Rolls back to the savepoint at `index`: undoes every row write and DDL
     /// performed after it (reverse-replayed), discards the journal tail, and
     /// restores the pre-savepoint failed state — leaving the transaction (and
     /// the savepoint) open for reuse.
-    fn rollback_to_savepoint(&mut self, txn: &mut TxnState, idx: usize) {
-        let sp = txn.savepoint_at(idx);
+    fn rollback_to_savepoint(&mut self, txn: &mut TxnState, index: usize) {
+        let sp = txn.savepoint_at(index);
         for i in (sp.touched_mark..txn.touched().len()).rev() {
             let (table, rowid, prior) = txn.touched()[i];
             self.storage.restore_pending(table as usize, rowid, txn.txid, prior);
@@ -329,7 +329,7 @@ impl Engine {
         }
         txn.rewind_touched(sp.touched_mark);
         txn.rewind_ddl(sp.ddl_mark);
-        txn.rollback_savepoints_after(idx);
+        txn.rollback_savepoints_after(index);
         self.wal.truncate_to_mark(sp.wal_mark);
         txn.failed = sp.failed;
     }
@@ -599,8 +599,8 @@ impl Engine {
     fn column_oid(&self, table: &str, col: &str, txid: u32) -> Option<i32> {
         let slot = self.storage.find_visible(table, txid)?;
         let def = &self.storage.table(slot).def;
-        let idx = def.column_index(col)?;
-        Some(def.columns()[idx].ctype.oid())
+        let index = def.column_index(col)?;
+        Some(def.columns()[index].ctype.oid())
     }
 
     fn infer_stmt_params(&self, statement: &Stmt, txid: u32, oids: &mut [i32; MAX_BIND_PARAMS]) {
@@ -992,8 +992,8 @@ impl Engine {
                     )));
                 }
                 match txn.savepoint_index(name) {
-                    Some(idx) => {
-                        txn.release_savepoints_from(idx);
+                    Some(index) => {
+                        txn.release_savepoints_from(index);
                         resp.command_complete("RELEASE")?;
                         Ok(Ok(()))
                     }
@@ -1011,14 +1011,14 @@ impl Engine {
                         "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"
                     )));
                 }
-                let Some(idx) = txn.savepoint_index(name) else {
+                let Some(index) = txn.savepoint_index(name) else {
                     return Ok(Err(sql_err!(
                         "3B001",
                         "savepoint \"{}\" does not exist",
                         name
                     )));
                 };
-                self.rollback_to_savepoint(txn, idx);
+                self.rollback_to_savepoint(txn, index);
                 resp.command_complete("ROLLBACK")?;
                 Ok(Ok(()))
             }
@@ -2186,9 +2186,9 @@ mod tests {
         run("CREATE TABLE child (id int PRIMARY KEY, pa int, pb int, email text UNIQUE, \
              FOREIGN KEY (pa,pb) REFERENCES parent(a,b))");
         // Index relations exist with PostgreSQL-style names.
-        let idx = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+        let index = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
             "SELECT relname FROM pg_class WHERE relkind = 'i' ORDER BY relname"));
-        assert_eq!(idx, ["child_email_key", "child_pkey", "parent_pkey"], "index rels: {idx:?}");
+        assert_eq!(index, ["child_email_key", "child_pkey", "parent_pkey"], "index rels: {index:?}");
         // pg_get_indexdef reconstructs the btree column list.
         let pk = run_txn(&mut e, &mut b, &mut t,
             "SELECT pg_get_indexdef(indexrelid, 0, true) FROM pg_index i \

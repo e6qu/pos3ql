@@ -658,7 +658,7 @@ fn scan_source<'a>(
         // Derived tables scan their materialized rows; physical tables scan the
         // visibility-filtered heap.
         if let Some(rows) = scope.derived[order[depth]] {
-            for (idx, bytes) in rows.iter().enumerate() {
+            for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
                 bound[order[depth]] = Some(bytes);
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
@@ -666,7 +666,7 @@ fn scan_source<'a>(
                 }
                 matched_any = true;
                 if let Some(m) = matched.filter(|_| depth + 1 == scope.n) {
-                    m[idx].set(true);
+                    m[index].set(true);
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
@@ -719,15 +719,15 @@ fn scan_source<'a>(
             }
         } else {
             let table = storage.table(scope.slots[order[depth]]);
-            let mut idx = 0usize;
+            let mut index = 0usize;
             for (_, state) in table.rows.iter() {
                 check_timeout()?;
                 let Some(loc) = state.visible_to(txid) else {
                     continue;
                 };
                 bound[order[depth]] = Some(storage.heap.get(loc));
-                let this = idx;
-                idx += 1;
+                let this = index;
+                index += 1;
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
                 }
@@ -886,20 +886,20 @@ fn scan_source<'a>(
             f(&row)
         };
         if let Some(rows) = scope.derived[deep] {
-            for (idx, bytes) in rows.iter().enumerate() {
-                if !m[idx].get() && !emit_unmatched(bytes, f)? {
+            for (index, bytes) in rows.iter().enumerate() {
+                if !m[index].get() && !emit_unmatched(bytes, f)? {
                     return Ok(());
                 }
             }
         } else {
             let table = storage.table(scope.slots[deep]);
-            let mut idx = 0usize;
+            let mut index = 0usize;
             for (_, state) in table.rows.iter() {
                 let Some(loc) = state.visible_to(txid) else {
                     continue;
                 };
-                let this = idx;
-                idx += 1;
+                let this = index;
+                index += 1;
                 if !m[this].get() && !emit_unmatched(storage.heap.get(loc), f)? {
                     return Ok(());
                 }
@@ -4267,7 +4267,7 @@ fn sort_set_rows(
     let mut keys: [(usize, bool, bool); MAX_PROJ] = [(0, false, false); MAX_PROJ];
     let mut nk = 0;
     for ob in order_by {
-        let idx = match ob.expression {
+        let index = match ob.expression {
             Expr::Int(n) if *n >= 1 && (*n as usize) <= cols.len() => (*n as usize) - 1,
             Expr::Column { name, qualifier: None } => {
                 match cols.iter().position(|c| c.name == *name) {
@@ -4288,7 +4288,7 @@ fn sort_set_rows(
                 ))
             }
         };
-        keys[nk] = (idx, ob.descending, ob.nulls_first);
+        keys[nk] = (index, ob.descending, ob.nulls_first);
         nk += 1;
     }
     let keys = &keys[..nk];
@@ -4297,9 +4297,9 @@ fn sort_set_rows(
         if err.is_some() {
             return core::cmp::Ordering::Equal;
         }
-        for &(idx, descending, nulls_first) in keys {
-            let va = super::exec::decode_projected_pub(a, idx);
-            let vb = super::exec::decode_projected_pub(b, idx);
+        for &(index, descending, nulls_first) in keys {
+            let va = super::exec::decode_projected_pub(a, index);
+            let vb = super::exec::decode_projected_pub(b, index);
             let ord = match (va.is_null(), vb.is_null()) {
                 (true, true) => core::cmp::Ordering::Equal,
                 (true, false) => if nulls_first { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater },
@@ -4973,7 +4973,7 @@ fn grouped_rows<'a>(
         if !keys.is_empty() {
             let rep = keys
                 .iter()
-                .find(|(_, idx)| group_of[*idx as usize] as usize == g)
+                .find(|(_, index)| group_of[*index as usize] as usize == g)
                 .expect("group non-empty");
             for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
                 *slot = super::exec::decode_projected_pub(rep.0, k);

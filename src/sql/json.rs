@@ -283,10 +283,10 @@ impl<'a> Json<'a> {
         }
     }
 
-    pub fn get_index(&self, idx: i64) -> Option<Json<'a>> {
+    pub fn get_index(&self, index: i64) -> Option<Json<'a>> {
         match self {
             Json::Array(items) => {
-                let i = if idx < 0 { items.len() as i64 + idx } else { idx };
+                let i = if index < 0 { items.len() as i64 + index } else { index };
                 if i >= 0 && (i as usize) < items.len() {
                     Some(items[i as usize])
                 } else {

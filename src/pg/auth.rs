@@ -67,7 +67,7 @@ pub fn b64_encode(input: &[u8], out: &mut StackStr<512>) {
             chunk.get(1).copied().unwrap_or(0),
             chunk.get(2).copied().unwrap_or(0),
         ];
-        let idx = [
+        let index = [
             b[0] >> 2,
             ((b[0] & 0x03) << 4) | (b[1] >> 4),
             ((b[1] & 0x0f) << 2) | (b[2] >> 6),
@@ -75,10 +75,10 @@ pub fn b64_encode(input: &[u8], out: &mut StackStr<512>) {
         ];
         let n = chunk.len();
         let quad = [
-            A[idx[0] as usize],
-            A[idx[1] as usize],
-            if n > 1 { A[idx[2] as usize] } else { b'=' },
-            if n > 2 { A[idx[3] as usize] } else { b'=' },
+            A[index[0] as usize],
+            A[index[1] as usize],
+            if n > 1 { A[index[2] as usize] } else { b'=' },
+            if n > 2 { A[index[3] as usize] } else { b'=' },
         ];
         let _ = out.write_str(core::str::from_utf8(&quad).expect("base64 is ASCII"));
     }

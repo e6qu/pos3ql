@@ -665,7 +665,7 @@ pub fn eval_full<'a>(
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
-            let idx = match i {
+            let index = match i {
                 Datum::Int4(x) => x as i64,
                 Datum::Int8(x) => x,
                 Datum::Null => return Ok(Datum::Null),
@@ -674,10 +674,10 @@ pub fn eval_full<'a>(
             match b {
                 Datum::Array { elem, raw } => {
                     // PostgreSQL array subscripts are 1-based.
-                    if idx < 1 {
+                    if index < 1 {
                         return Ok(Datum::Null);
                     }
-                    Ok(super::array::get(raw, elem, (idx - 1) as usize).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, elem, (index - 1) as usize).unwrap_or(Datum::Null))
                 }
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
@@ -691,7 +691,7 @@ pub fn eval_full<'a>(
             match b {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Array { elem, raw } => {
-                    let idx = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
+                    let index = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
                     {
                         0
                     } else if field.eq_ignore_ascii_case("n") || field.eq_ignore_ascii_case("f2") {
@@ -703,7 +703,7 @@ pub fn eval_full<'a>(
                             field
                         ));
                     };
-                    Ok(super::array::get(raw, elem, idx).unwrap_or(Datum::Null))
+                    Ok(super::array::get(raw, elem, index).unwrap_or(Datum::Null))
                 }
                 _ => Err(type_mismatch("field access on a non-composite value", &b)),
             }
@@ -1842,11 +1842,11 @@ fn call<'a>(
                 s.split(delim).nth((n - 1) as usize).unwrap_or("")
             } else {
                 let total = s.split(delim).count() as i64;
-                let idx = total + n; // n is negative
-                if idx < 0 {
+                let index = total + n; // n is negative
+                if index < 0 {
                     ""
                 } else {
-                    s.split(delim).nth(idx as usize).unwrap_or("")
+                    s.split(delim).nth(index as usize).unwrap_or("")
                 }
             };
             Ok(Datum::Text(part))

@@ -44,10 +44,10 @@ pub fn len(raw: &[u8]) -> usize {
     }
 }
 
-/// Decodes the `idx`-th element (0-based) of the blob.
-pub fn get<'a>(raw: &'a [u8], elem: ArrElem, idx: usize) -> Option<Datum<'a>> {
+/// Decodes the `index`-th element (0-based) of the blob.
+pub fn get<'a>(raw: &'a [u8], elem: ArrElem, index: usize) -> Option<Datum<'a>> {
     let n = len(raw);
-    if idx >= n {
+    if index >= n {
         return None;
     }
     let schema = [elem.to_coltype()];
@@ -55,7 +55,7 @@ pub fn get<'a>(raw: &'a [u8], elem: ArrElem, idx: usize) -> Option<Datum<'a>> {
     for i in 0..n {
         let l = u32::from_le_bytes(raw.get(at..at + 4)?.try_into().ok()?) as usize;
         at += 4;
-        if i == idx {
+        if i == index {
             let mut out = [Datum::Null; 1];
             rowenc::decode(raw.get(at..at + l)?, &schema, &mut out).ok()?;
             return Some(out[0]);

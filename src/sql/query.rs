@@ -4861,6 +4861,7 @@ fn is_srf_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("_pg_expandarray")
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
+        || name.eq_ignore_ascii_case("regexp_matches")
 }
 
 /// Finds a set-returning function call among the SELECT items (the whole call
@@ -4932,6 +4933,42 @@ fn srf_count<'a, R: ColumnLookup<'a>>(
             (s - e) / (-st) + 1
         };
         Ok(n as usize)
+    } else if name.eq_ignore_ascii_case("regexp_matches") {
+        // Number of matches: 0/1 without the `g` flag, else all non-overlapping.
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!("42883", "regexp_matches(...) argument count"));
+        }
+        let string = eval_full(args[0], arena, params, row, hooks)?;
+        let pattern = eval_full(args[1], arena, params, row, hooks)?;
+        let (Datum::Text(string), Datum::Text(pattern)) = (string, pattern) else {
+            return Ok(0);
+        };
+        let flags = if args.len() == 3 {
+            match eval_full(args[2], arena, params, row, hooks)? {
+                Datum::Text(f) => f,
+                Datum::Null => return Ok(0),
+                _ => "",
+            }
+        } else {
+            ""
+        };
+        let (global, ci) = super::eval::regexp_flags(flags)?;
+        let mut spans = [(-1i64, -1i64); super::regex::MAX_GROUPS];
+        let mut from = 0usize;
+        let mut n = 0usize;
+        while let Some(((mstart, mend), _)) =
+            super::regex::find_captures(pattern, string, from, ci, &mut spans)?
+        {
+            n += 1;
+            if !global {
+                break;
+            }
+            from = if mend > mstart { mend } else { mend + 1 };
+            if from > string.len() {
+                break;
+            }
+        }
+        Ok(n)
     } else {
         // unnest / _pg_expandarray over an array.
         match eval_full(args[0], arena, params, row, hooks)? {
@@ -5847,14 +5884,21 @@ fn table_func_def<'a>(
 ) -> Result<&'a TableDef, SqlError> {
     let is_gs = tref.table.eq_ignore_ascii_case("generate_series");
     let is_unnest = tref.table.eq_ignore_ascii_case("unnest");
-    if !is_gs && !is_unnest {
+    let is_re = tref.table.eq_ignore_ascii_case("regexp_matches");
+    if !is_gs && !is_unnest && !is_re {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
             tref.table
         ));
     }
-    let name = tref.alias.unwrap_or(if is_gs { "generate_series" } else { "unnest" });
+    let name = tref.alias.unwrap_or(if is_gs {
+        "generate_series"
+    } else if is_re {
+        "regexp_matches"
+    } else {
+        "unnest"
+    });
     // A table function has a single output column, so at most one alias.
     if let Some(aliases) = tref.col_alias
         && aliases.len() > 1
@@ -5878,9 +5922,12 @@ fn table_func_def<'a>(
         auto_increment: false,
         default_value: None,
     };
-    // generate_series yields int8; unnest yields the array's element type.
+    // generate_series yields int8; regexp_matches yields text[]; unnest yields
+    // the array's element type.
     let ctype = if is_gs {
         ColType::Int8
+    } else if is_re {
+        ColType::Array(super::types::ArrElem::Text)
     } else {
         let args = tref.func_args.unwrap_or(&[]);
         match args.first() {
@@ -5912,6 +5959,70 @@ fn table_func_rows<'a>(
     params: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
+    // regexp_matches(string, pattern [, flags]): one row per match, each a
+    // text[] of the capture groups (or the whole match when there are no groups).
+    if tref.table.eq_ignore_ascii_case("regexp_matches") {
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!("42883", "regexp_matches(...) argument count"));
+        }
+        let string = super::eval::eval(args[0], arena, params, &super::eval::NoColumns)?;
+        let pattern = super::eval::eval(args[1], arena, params, &super::eval::NoColumns)?;
+        let (Datum::Text(string), Datum::Text(pattern)) = (string, pattern) else {
+            return Ok(&[]);
+        };
+        let flags = if args.len() == 3 {
+            match super::eval::eval(args[2], arena, params, &super::eval::NoColumns)? {
+                Datum::Text(f) => f,
+                Datum::Null => return Ok(&[]),
+                _ => "",
+            }
+        } else {
+            ""
+        };
+        let (global, ci) = super::eval::regexp_flags(flags)?;
+        // Collect each match's encoded text[] row.
+        const EMPTY: &[u8] = &[];
+        let mut rows = [EMPTY; super::parser::MAX_LIST];
+        let mut n = 0usize;
+        let mut spans = [(-1i64, -1i64); super::regex::MAX_GROUPS];
+        let mut from = 0usize;
+        while let Some(((mstart, mend), ng)) =
+            super::regex::find_captures(pattern, string, from, ci, &mut spans)?
+        {
+            let mut elems = [Datum::Null; super::regex::MAX_GROUPS];
+            let count = if ng == 0 {
+                elems[0] = Datum::Text(&string[mstart..mend]);
+                1
+            } else {
+                for (i, span) in spans[..ng].iter().enumerate() {
+                    elems[i] = if span.0 < 0 {
+                        Datum::Null
+                    } else {
+                        Datum::Text(&string[span.0 as usize..span.1 as usize])
+                    };
+                }
+                ng
+            };
+            let arr = Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(&elems[..count], arena)?,
+            };
+            if n == super::parser::MAX_LIST {
+                return Err(sql_err!("54000", "too many regexp_matches rows"));
+            }
+            rows[n] = super::exec::encode_projected_pub(&[arr], arena)?;
+            n += 1;
+            if !global {
+                break;
+            }
+            from = if mend > mstart { mend } else { mend + 1 };
+            if from > string.len() {
+                break;
+            }
+        }
+        let out = arena.alloc_slice_with(n, |i| rows[i]).map_err(|_| arena_full())?;
+        return Ok(&*out);
+    }
     // unnest(array): one row per element.
     if tref.table.eq_ignore_ascii_case("unnest") {
         let (element, raw) = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {

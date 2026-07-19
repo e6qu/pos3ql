@@ -2438,6 +2438,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             _ => ColType::from_sql_name(type_name).map(ColType::internal_name),
         },
         Expr::Case { otherwise: Some(e), .. } => name_of(e),
+        // An array subscript keeps the base column's name (`m[1]` → `m`).
+        Expr::Subscript { base, .. } => name_of(base),
         _ => None,
     }
 }
@@ -2941,6 +2943,8 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     None => of(ColType::Text),
                 }
             }
+            // regexp_matches returns each match's capture groups as text[].
+            "regexp_matches" => of(ColType::Array(super::types::ArrElem::Text)),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),

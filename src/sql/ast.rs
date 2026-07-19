@@ -457,6 +457,7 @@ impl Expr<'_> {
             name.eq_ignore_ascii_case("unnest")
                 || name.eq_ignore_ascii_case("generate_series")
                 || name.eq_ignore_ascii_case("_pg_expandarray")
+                || name.eq_ignore_ascii_case("regexp_matches")
         }
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)

@@ -548,13 +548,16 @@ fn scan_source<'a>(
     fn assemble<'s, 'v, 'd>(
         scope: &'s QueryScope<'d>,
         bound: &[Option<&'v [u8]>; MAX_JOIN_TABLES],
-        depth: usize,
+        order: &[usize; MAX_JOIN_TABLES],
+        count: usize,
         buffers: &'s mut [[Datum<'v>; MAX_COLUMNS]; MAX_JOIN_TABLES],
     ) -> Result<JoinRow<'s, 'v, 'd>, SqlError> {
         let mut values: [Option<&[Datum]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
-        // Split buffers so each table borrows a distinct buffer.
+        // Split buffers so each table borrows a distinct buffer. `order` maps the
+        // execution position to the scope-table index, so a reordered join still
+        // fills each table's own `values` slot.
         let mut rest: &mut [[Datum<'v>; MAX_COLUMNS]] = buffers;
-        for t in 0..depth {
+        for &t in order.iter().take(count) {
             let (buf, tail) = rest.split_first_mut().expect("enough buffers");
             rest = tail;
             let def = scope.defs[t].expect("resolved");
@@ -596,11 +599,14 @@ fn scan_source<'a>(
         matched: Option<&[core::cell::Cell<bool>]>,
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
         pushdown: &[&[&'a Expr<'a>]],
+        // Execution order: `order[depth]` is the scope-table joined at this depth
+        // (identity unless a cross join was cost-reordered).
+        order: &[usize; MAX_JOIN_TABLES],
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
             let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-            let row = assemble(scope, bound, depth, &mut buffers)?;
+            let row = assemble(scope, bound, order, depth, &mut buffers)?;
             if let Some(w) = where_clause {
                 let cr = Chained { inner: &row, outer };
                 if !where_passes(w, arena, params, &cr, hooks)? {
@@ -619,7 +625,7 @@ fn scan_source<'a>(
             if let Some(join) = join
                 && let Some(on) = join.on {
                     let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-                    let row = assemble(scope, bound, depth + 1, &mut buffers)?;
+                    let row = assemble(scope, bound, order, depth + 1, &mut buffers)?;
                     let cr = Chained { inner: &row, outer };
                     return match eval_full(on, arena, params, &cr, hooks)? {
                         Datum::Bool(true) => Ok(true),
@@ -640,7 +646,7 @@ fn scan_source<'a>(
                 return Ok(true);
             }
             let mut pbuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-            let prow = assemble(scope, bound, depth + 1, &mut pbuf)?;
+            let prow = assemble(scope, bound, order, depth + 1, &mut pbuf)?;
             let pcr = Chained { inner: &prow, outer };
             for &c in pushdown[depth] {
                 if !conjunct_passes(c, arena, params, &pcr, hooks)? {
@@ -651,9 +657,10 @@ fn scan_source<'a>(
         };
         // Derived tables scan their materialized rows; physical tables scan the
         // visibility-filtered heap.
-        if let Some(rows) = scope.derived[depth] {
+        if let Some(rows) = scope.derived[order[depth]] {
             for (idx, bytes) in rows.iter().enumerate() {
-                bound[depth] = Some(bytes);
+                check_timeout()?;
+                bound[order[depth]] = Some(bytes);
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
                 }
@@ -663,7 +670,7 @@ fn scan_source<'a>(
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, pushdown, f,
+                    outer, depth + 1, bound, matched, pushdown, order, f,
                 )? {
                     return Ok(false);
                 }
@@ -676,7 +683,7 @@ fn scan_source<'a>(
             // locations into the per-statement arena and sort by offset. Only
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
-            let table = storage.table(scope.slots[depth]);
+            let table = storage.table(scope.slots[order[depth]]);
             let mut count = 0usize;
             for (_, state) in table.rows.iter() {
                 if state.visible_to(txid).is_some() {
@@ -695,7 +702,7 @@ fn scan_source<'a>(
             ordered.sort_unstable_by_key(|l| l.offset);
             for (this, &loc) in ordered.iter().enumerate() {
                 check_timeout()?;
-                bound[depth] = Some(storage.heap.get(loc));
+                bound[order[depth]] = Some(storage.heap.get(loc));
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
                 }
@@ -705,19 +712,20 @@ fn scan_source<'a>(
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, pushdown, f,
+                    outer, depth + 1, bound, matched, pushdown, order, f,
                 )? {
                     return Ok(false);
                 }
             }
         } else {
-            let table = storage.table(scope.slots[depth]);
+            let table = storage.table(scope.slots[order[depth]]);
             let mut idx = 0usize;
             for (_, state) in table.rows.iter() {
+                check_timeout()?;
                 let Some(loc) = state.visible_to(txid) else {
                     continue;
                 };
-                bound[depth] = Some(storage.heap.get(loc));
+                bound[order[depth]] = Some(storage.heap.get(loc));
                 let this = idx;
                 idx += 1;
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
@@ -729,7 +737,7 @@ fn scan_source<'a>(
                 }
                 if !level(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, pushdown, f,
+                    outer, depth + 1, bound, matched, pushdown, order, f,
                 )? {
                     return Ok(false);
                 }
@@ -740,15 +748,15 @@ fn scan_source<'a>(
         if !matched_any
             && join.is_some_and(|j| matches!(j.kind, JoinKind::Left | JoinKind::Full))
         {
-            bound[depth] = None;
+            bound[order[depth]] = None;
             if !level(
                 storage, scope, from, txid, where_clause, arena, params, hooks,
-                outer, depth + 1, bound, matched, pushdown, f,
+                outer, depth + 1, bound, matched, pushdown, order, f,
             )? {
                 return Ok(false);
             }
         }
-        bound[depth] = None;
+        bound[order[depth]] = None;
         Ok(true)
     }
 
@@ -801,6 +809,16 @@ fn scan_source<'a>(
         .joins
         .iter()
         .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross));
+    // Cost-based execution order: only cross joins (no ON clause, no nullable
+    // side) may be reordered freely — an explicit JOIN ... ON's condition is tied
+    // to its position. Everything else keeps FROM order (identity).
+    let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
+    let order: [usize; MAX_JOIN_TABLES] =
+        if all_cross { join_order(scope, where_clause) } else { core::array::from_fn(|i| i) };
+    let mut inv_order = [0usize; MAX_JOIN_TABLES];
+    for (pos, &t) in order.iter().enumerate() {
+        inv_order[t] = pos;
+    }
     let mut pd_bufs: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
         [[&Expr::Null; MAX_CONJUNCTS]; MAX_JOIN_TABLES];
     let mut pd_n = [0usize; MAX_JOIN_TABLES];
@@ -810,13 +828,21 @@ fn scan_source<'a>(
         let conjuncts: &[&Expr] =
             if flatten_and(w, &mut conj, &mut n) { &conj[..n] } else { core::slice::from_ref(&w) };
         for &c in conjuncts {
+            // The execution depth at which a conjunct is fully bound is the
+            // latest execution position of any table it references (under
+            // identity order this is just the max table index it references).
             if is_error_safe(c)
-                && let Some(d) = expr_max_table(c, scope)
-                && d < scope.n
-                && pd_n[d] < MAX_CONJUNCTS
+                && let Some(mask) = expr_tables(c, scope)
             {
-                pd_bufs[d][pd_n[d]] = c;
-                pd_n[d] += 1;
+                let d = (0..scope.n)
+                    .filter(|t| mask & (1 << t) != 0)
+                    .map(|t| inv_order[t])
+                    .max()
+                    .unwrap_or(0);
+                if d < scope.n && pd_n[d] < MAX_CONJUNCTS {
+                    pd_bufs[d][pd_n[d]] = c;
+                    pd_n[d] += 1;
+                }
             }
         }
     }
@@ -837,6 +863,7 @@ fn scan_source<'a>(
         &mut bound,
         matched,
         &pushdown,
+        &order,
         f,
     )?;
 
@@ -849,7 +876,7 @@ fn scan_source<'a>(
             let mut b = [None; MAX_JOIN_TABLES];
             b[deep] = Some(bytes);
             let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-            let row = assemble(scope, &b, scope.n, &mut buffers)?;
+            let row = assemble(scope, &b, &order, scope.n, &mut buffers)?;
             if let Some(w) = where_clause {
                 let cr = Chained { inner: &row, outer };
                 if !where_passes(w, arena, params, &cr, hooks)? {
@@ -3530,43 +3557,105 @@ const MAX_CONJUNCTS: usize = 32;
 /// bound. `None` if it references a column outside `scope` (a correlated/outer
 /// reference), a subquery, an aggregate, or any construct this analysis does
 /// not fully cover, in which case the conjunct is left for the final WHERE.
-fn expr_max_table(expr: &Expr, scope: &QueryScope) -> Option<usize> {
+/// The set of table indices (as a bitmask) an expression references. `None` if
+/// it contains a construct not analyzable for pushdown (subquery, aggregate, …).
+fn expr_tables(expr: &Expr, scope: &QueryScope) -> Option<u16> {
     use Expr::*;
     match expr {
         Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | Param(_) => Some(0),
-        Column { qualifier, name } => scope.find_column(*qualifier, name).ok().map(|(t, _)| t),
+        Column { qualifier, name } => scope.find_column(*qualifier, name).ok().map(|(t, _)| 1 << t),
         Unary { operand, .. } | IsNull { operand, .. } | Cast { operand, .. } => {
-            expr_max_table(operand, scope)
+            expr_tables(operand, scope)
         }
-        Binary { left, right, .. } => {
-            Some(expr_max_table(left, scope)?.max(expr_max_table(right, scope)?))
+        Binary { left, right, .. } => Some(expr_tables(left, scope)? | expr_tables(right, scope)?),
+        Between { operand, low, high, .. } => {
+            Some(expr_tables(operand, scope)? | expr_tables(low, scope)? | expr_tables(high, scope)?)
         }
-        Between { operand, low, high, .. } => Some(
-            expr_max_table(operand, scope)?
-                .max(expr_max_table(low, scope)?)
-                .max(expr_max_table(high, scope)?),
-        ),
         Like { operand, pattern, .. } | Match { operand, pattern, .. } => {
-            Some(expr_max_table(operand, scope)?.max(expr_max_table(pattern, scope)?))
+            Some(expr_tables(operand, scope)? | expr_tables(pattern, scope)?)
         }
-        InList { operand, list, negated: _ } => {
-            let mut mx = expr_max_table(operand, scope)?;
+        InList { operand, list, .. } => {
+            let mut m = expr_tables(operand, scope)?;
             for e in *list {
-                mx = mx.max(expr_max_table(e, scope)?);
+                m |= expr_tables(e, scope)?;
             }
-            Some(mx)
+            Some(m)
         }
-        // Pure scalar function calls (not aggregates/window functions).
         Call { args, over: None, .. } if !expr.is_aggregate() => {
-            let mut mx = 0;
+            let mut m = 0;
             for a in *args {
-                mx = mx.max(expr_max_table(a, scope)?);
+                m |= expr_tables(a, scope)?;
             }
-            Some(mx)
+            Some(m)
         }
-        // Subqueries, aggregates, window/CASE/array/field/subscript: not pushed.
         _ => None,
     }
+}
+
+/// A cost-based execution order for a cross-join's tables (an identity order is
+/// returned when reordering does not apply). PostgreSQL reorders joins by
+/// selectivity; pos3ql's nested loop otherwise follows FROM order, so a table
+/// with no predicate binding it to the already-joined tables (e.g. an
+/// unconstrained table in the middle of the FROM list) multiplies the
+/// intermediate product and turns a k-way join O(N^k). The greedy heuristic
+/// picks, at each step, the remaining table that "unlocks" the most WHERE
+/// conjuncts (its columns, together with the already-chosen tables, fully bind a
+/// conjunct so pushdown can prune there), breaking ties by FROM order. This
+/// keeps selective and equi-joined tables early and pushes unconstrained tables
+/// last, without changing results (join order is free for inner/cross joins).
+fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [usize; MAX_JOIN_TABLES] {
+    let mut order = core::array::from_fn(|i| i);
+    let n = scope.n;
+    if n < 3 {
+        return order;
+    }
+    // Collect the WHERE conjuncts' table masks (only analyzable ones).
+    let mut masks = [0u16; MAX_CONJUNCTS];
+    let mut n_masks = 0;
+    if let Some(w) = where_clause {
+        let mut conj: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
+        let mut nc = 0;
+        let conjuncts: &[&Expr] =
+            if flatten_and(w, &mut conj, &mut nc) { &conj[..nc] } else { core::slice::from_ref(&w) };
+        for &c in conjuncts {
+            if let Some(m) = expr_tables(c, scope)
+                && n_masks < MAX_CONJUNCTS
+            {
+                masks[n_masks] = m;
+                n_masks += 1;
+            }
+        }
+    }
+    let mut chosen_mask = 0u16;
+    for slot in order.iter_mut().take(n) {
+        // Among not-yet-chosen tables, pick the one unlocking the most conjuncts
+        // (a conjunct is unlocked when the table is its last unbound one).
+        let mut best = usize::MAX;
+        let mut best_score = -1i32;
+        for t in 0..n {
+            if chosen_mask & (1 << t) != 0 {
+                continue;
+            }
+            let after = chosen_mask | (1 << t);
+            let mut score = 0i32;
+            for &m in &masks[..n_masks] {
+                if m & !chosen_mask == (1 << t) {
+                    score += 1;
+                }
+                // Slight preference for being connected at all (bounds growth).
+                if m & !after == 0 && m & (1 << t) != 0 {
+                    score += 1;
+                }
+            }
+            if score > best_score {
+                best_score = score;
+                best = t;
+            }
+        }
+        *slot = best;
+        chosen_mask |= 1 << best;
+    }
+    order
 }
 
 /// Evaluates one WHERE conjunct to a filter decision (NULL and FALSE both

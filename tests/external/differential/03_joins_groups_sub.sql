@@ -52,3 +52,8 @@ SELECT a, b, c, sum(v) FROM (VALUES (1,1,1,5),(1,2,1,7),(2,1,2,9)) AS t(a,b,c,v)
 -- grouping by parenthesized scalar expressions (must not be read as group lists)
 SELECT (v + 1) * 2 AS g, count(*) FROM (VALUES (1),(1),(3)) AS t(v) GROUP BY (v + 1) * 2 ORDER BY g;
 SELECT (v), sum(v) FROM (VALUES (1),(2),(2)) AS t(v) GROUP BY (v) ORDER BY 1;
+-- string_agg with DISTINCT and ORDER BY on the aggregated expression
+SELECT string_agg(DISTINCT v, ',' ORDER BY v) FROM (VALUES ('b'),('a'),('b'),('c'),('a')) AS t(v);
+SELECT string_agg(DISTINCT v, ',' ORDER BY v DESC) FROM (VALUES ('b'),('a'),('c'),('a')) AS t(v);
+-- DISTINCT with a different sort key is an error
+SELECT string_agg(DISTINCT v, ',' ORDER BY k) FROM (VALUES ('a', 1)) AS t(v, k);

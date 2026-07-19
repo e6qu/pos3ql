@@ -1522,11 +1522,14 @@ fn call<'a>(
             }
             let mut out = StackStr::<8192>::new();
             let mut pos = 0usize;
-            while let Some((s, e)) = super::regex::find(pat, src, pos, case_insensitive)? {
+            let mut spans = [(-1i64, -1i64); super::regex::MAX_GROUPS];
+            while let Some(((s, e), ng)) =
+                super::regex::find_captures(pat, src, pos, case_insensitive, &mut spans)?
+            {
                 if out.write_str(&src[pos..s]).is_err() {
                     return Err(sql_err!("54000", "regexp_replace result too large"));
                 }
-                expand_replacement(&mut out, rep, &src[s..e])?;
+                expand_replacement(&mut out, rep, src, s, e, &spans[..ng])?;
                 if e == s {
                     // Empty match: emit one source char and advance past it so
                     // the scan makes progress (PostgreSQL inserts between chars).
@@ -3272,7 +3275,10 @@ fn byte_to_char_1based(s: &str, b: usize) -> i32 {
 fn expand_replacement(
     out: &mut StackStr<8192>,
     rep: &str,
-    whole: &str,
+    src: &str,
+    match_start: usize,
+    match_end: usize,
+    spans: &[(i64, i64)],
 ) -> Result<(), SqlError> {
     let bytes = rep.as_bytes();
     let mut i = 0usize;
@@ -3286,18 +3292,28 @@ fn expand_replacement(
         }
         match bytes.get(i + 1) {
             Some(b'&') => {
-                let _ = out.write_str(whole);
+                let _ = out.write_str(&src[match_start..match_end]);
                 i += 2;
             }
             Some(b'\\') => {
                 let _ = out.write_char('\\');
                 i += 2;
             }
+            // `\1`..`\9`: the n-th capturing group's text. A group that did not
+            // participate in the match — or a number beyond the pattern's group
+            // count — contributes nothing (verified against PostgreSQL 18.4).
             Some(d) if d.is_ascii_digit() => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "capture-group backreferences in regexp_replace are not supported"
-                ));
+                let n = (d - b'0') as usize;
+                if n == 0 {
+                    // `\0` is not a backreference: PostgreSQL keeps it literally.
+                    let _ = out.write_str("\\0");
+                } else if n <= spans.len() {
+                    let (gs, ge) = spans[n - 1];
+                    if gs >= 0 {
+                        let _ = out.write_str(&src[gs as usize..ge as usize]);
+                    }
+                }
+                i += 2;
             }
             Some(&c) => {
                 let _ = out.write_char(c as char);

@@ -813,8 +813,10 @@ impl Engine {
         }
         match statement {
             Stmt::Select(s) => {
-                // WITH CTEs expand into derived tables before execution.
-                let s = match query::expand_ctes(s, &self.storage, arena) {
+                // WITH CTEs expand into derived tables before execution; a
+                // recursive CTE is materialized to its fixpoint in the work
+                // arena (reset per statement, sized for row data).
+                let s = match query::expand_ctes_exec(s, &self.storage, txn.txid, &self.work, params) {
                     Ok(x) => x,
                     Err(e) => return Ok(Err(e)),
                 };
@@ -3373,13 +3375,33 @@ mod tests {
                  SELECT t.id, j.v FROM t JOIN j ON t.id = j.id ORDER BY t.id")),
             ["3|30", "4|40"]
         );
-        // WITH RECURSIVE is rejected loudly.
+        // WITH RECURSIVE: a non-self-referencing CTE behaves like a plain one.
+        assert_eq!(
+            data_rows(&run_with(&mut e, &mut b,
+                "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r")),
+            ["1"]
+        );
+        // A self-referencing CTE iterates to its fixpoint.
+        assert_eq!(
+            data_rows(&run_with(&mut e, &mut b,
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) \
+                 SELECT * FROM c ORDER BY n")),
+            ["1", "2", "3", "4"]
+        );
+        // UNION (deduplicating) terminates a cyclic recursion.
+        assert_eq!(
+            data_rows(&run_with(&mut e, &mut b,
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT (n % 3) + 1 FROM c) \
+                 SELECT * FROM c ORDER BY n")),
+            ["1", "2", "3"]
+        );
+        // The required shape is enforced loudly.
         assert!(String::from_utf8_lossy(&run_with(
             &mut e,
             &mut b,
-            "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r"
+            "WITH RECURSIVE r(n) AS (SELECT n + 1 FROM r) SELECT * FROM r"
         ))
-        .contains("42601"));
+        .contains("42P19"));
     }
 
     #[test]
@@ -3486,11 +3508,23 @@ mod tests {
             data_rows(&run_with(&mut e, &mut b, "SELECT string_agg(distinct v, ',') FROM s WHERE g = 1")),
             ["a,b"]
         );
-        // string_agg with both DISTINCT and ORDER BY is not supported yet.
+        // DISTINCT + ORDER BY on the aggregated expression (values validated
+        // against PostgreSQL 18.4), ascending and descending.
+        assert_eq!(
+            data_rows(&run_with(&mut e, &mut b,
+                "SELECT string_agg(distinct v, ',' ORDER BY v) FROM s")),
+            ["a,b,z"]
+        );
+        assert_eq!(
+            data_rows(&run_with(&mut e, &mut b,
+                "SELECT string_agg(distinct v, ',' ORDER BY v DESC) FROM s")),
+            ["z,b,a"]
+        );
+        // DISTINCT with a different sort key errors, as PostgreSQL does.
         assert!(String::from_utf8_lossy(
-            &run_with(&mut e, &mut b, "SELECT string_agg(distinct v, ',' ORDER BY v) FROM s")
+            &run_with(&mut e, &mut b, "SELECT string_agg(distinct v, ',' ORDER BY g) FROM s")
         )
-        .contains("0A000"));
+        .contains("42P10"));
     }
 
     #[test]

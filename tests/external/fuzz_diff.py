@@ -162,6 +162,13 @@ class Gen:
             f"to_char({self.num_expr()}, "
             f"'{self.choice(['999.99', 'FM999.99', '9,999.99', 'S999.99', '990.00', '0000.00'])}')",
             f"ascii({s})", f"chr(65 + {self.rng.randint(0, 25)})",
+            f"overlay({s} placing 'X' from {self.rng.randint(1, 4)}"
+            f"{'' if self.maybe() else f' for {self.rng.randint(0, 3)}'})",
+            f"regexp_replace({s}, 'a', 'X'{'' if self.maybe() else chr(44) + chr(39) + 'g' + chr(39)})",
+            f"regexp_count({s}, 'a')", f"regexp_instr({s}, 'a')",
+            f"format('%s=%s', {s}, {self.int_lit()})",
+            f"array_to_string(string_to_array({s}, 'a'), '-')",
+            f"to_char(to_number('123.45', '999.99'), 'FM999.99')",
         ])
 
     def math_func(self):
@@ -179,6 +186,12 @@ class Gen:
             f"sqrt(abs(r))", f"exp(r)", f"ln(abs(r) + 1)",
             f"sqrt(abs({self.dec_lit()}))", f"ln(abs({self.dec_lit()}) + 1.0)",
             f"exp({self.choice(['0.5', '1.0', '-1.0', '2.0', '-0.5'])})",
+            f"log({self.choice(['10.0', '100.0', '2.0', '1000.0'])})",
+            f"log({self.choice(['2.0', '10.0'])}, {self.choice(['8.0', '100.0', '64.0'])})",
+            f"div({self.dec_lit()}, {self.choice(['3.2', '2.5', '7.0'])})",
+            f"scale({self.dec_lit()})", f"trim_scale({self.dec_lit()})",
+            f"min_scale({self.dec_lit()})",
+            f"width_bucket({self.num_expr()}, 0, 100, {self.rng.randint(1, 5)})",
             f"floor({self.num_expr()})", f"ceil({self.num_expr()})",
             f"round({self.num_expr()})", f"round({self.choice(['1.555','2.5','-2.5'])}, 1)",
             f"trunc({self.num_expr()})", f"sign({self.num_expr()})",

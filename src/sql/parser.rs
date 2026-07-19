@@ -1930,6 +1930,22 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return self.plain_call(name, &cargs[..cn.min(cargs.len())]);
         }
+        if name.eq_ignore_ascii_case("overlay") {
+            // SQL-standard `overlay(str PLACING sub FROM start [FOR len])`.
+            let target = self.expr(0)?;
+            self.expect_ident("placing")?;
+            let sub = self.expr(0)?;
+            self.expect_ident("from")?;
+            let start = self.expr(0)?;
+            let mut cargs = [target, sub, start, start];
+            let mut cn = 3;
+            if self.eat_ident("for")? {
+                cargs[3] = self.expr(0)?;
+                cn = 4;
+            }
+            self.expect_op(")")?;
+            return self.plain_call("overlay", &cargs[..cn]);
+        }
         if self.peeked == Tok::Op("*") {
             self.advance()?;
             self.expect_op(")")?;

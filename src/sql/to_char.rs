@@ -373,6 +373,81 @@ fn point_index(toks: &[Tok]) -> usize {
     toks.iter().position(|t| *t == Tok::Point).unwrap_or(usize::MAX)
 }
 
+/// `to_number(text, fmt)`: parse a formatted number. The format determines the
+/// result scale (its fractional digit positions); the value's digits, sign, and
+/// decimal point are read from the input, ignoring group separators, currency,
+/// and spaces — matching PostgreSQL.
+pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    // Count fractional digit positions in the format; reject input-unsupported
+    // codes loudly.
+    let mut frac = 0usize;
+    let mut seen_point = false;
+    let fb = fmt.as_bytes();
+    let mut i = 0usize;
+    while i < fb.len() {
+        let up = fb[i].to_ascii_uppercase();
+        if i + 1 < fb.len() {
+            let two = [up, fb[i + 1].to_ascii_uppercase()];
+            if &two == b"EE" {
+                return Err(sql_err!("0A000", "\"EEEE\" not supported for input"));
+            }
+            if matches!(&two, b"FM" | b"MI" | b"PL" | b"SG" | b"PR" | b"TH") {
+                i += 2;
+                continue;
+            }
+        }
+        match up {
+            b'9' | b'0' => {
+                if seen_point {
+                    frac += 1;
+                }
+            }
+            b'.' | b'D' => seen_point = true,
+            b'V' => return Err(sql_err!("0A000", "\"V\" not supported for input")),
+            b'R' => return Err(sql_err!("0A000", "\"RN\" not supported for input")),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Extract sign, digits, and a single decimal point from the input.
+    let mut buf = [0u8; 512];
+    let mut k = 0usize;
+    let mut neg = false;
+    let mut dot = false;
+    let mut digits = false;
+    buf[k] = b' '; // placeholder for a sign slot
+    k += 1;
+    for &c in input.as_bytes() {
+        match c {
+            b'0'..=b'9' => {
+                if k >= buf.len() {
+                    return Err(sql_err!("22P02", "value too long for to_number"));
+                }
+                buf[k] = c;
+                k += 1;
+                digits = true;
+            }
+            b'.' if !dot => {
+                dot = true;
+                buf[k] = b'.';
+                k += 1;
+            }
+            b'-' => neg = true,
+            _ => {}
+        }
+    }
+    if !digits {
+        return Err(sql_err!("22P02", "invalid input syntax for type numeric: \"{}\"", input));
+    }
+    if neg {
+        buf[0] = b'-';
+    }
+    let start = if neg { 0 } else { 1 };
+    let cleaned = core::str::from_utf8(&buf[start..k]).expect("ascii");
+    Numeric::parse(cleaned, arena)?.round_scale(frac, RoundMode::HalfAwayZero, arena)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +484,19 @@ mod tests {
         // Overflow fills the number field with '#', keeping the point.
         assert_eq!(tc("12345", "999", &a), " ###");
         assert_eq!(tc("12345", "9,999.99", &a), " #,###.##");
+    }
+
+    #[test]
+    fn to_number_matches_postgres() {
+        let a = arena();
+        let tn = |v: &str, f: &str| to_number(v, f, &a).unwrap().to_string();
+        assert_eq!(tn("1234.5", "9999.9"), "1234.5");
+        assert_eq!(tn("1,234.56", "9,999.99"), "1234.56");
+        assert_eq!(tn("-12.5", "99.9"), "-12.5");
+        assert_eq!(tn("12.30", "99.99"), "12.30");
+        assert_eq!(tn("42", "99"), "42");
+        assert_eq!(tn("12,345", "99G999"), "12345");
+        assert!(to_number("abc", "999", &a).is_err());
     }
 
     #[test]

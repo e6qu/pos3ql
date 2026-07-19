@@ -2757,7 +2757,7 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
             // no float argument outranking it), else double; floor/ceil/trunc/
             // round/sign are numeric for a numeric argument and double
             // otherwise; mod returns the integer type of its arguments.
-            "sqrt" | "exp" | "ln" | "power" | "pow" => {
+            "sqrt" | "exp" | "ln" | "power" | "pow" | "log" | "log10" => {
                 let mut numeric = false;
                 let mut float = false;
                 for a in args.iter() {
@@ -2769,6 +2769,13 @@ pub fn infer_type_res(expr: &Expr, cols: &dyn ColTypeResolver) -> Result<(i32, i
                 }
                 if numeric && !float { of(ColType::Numeric) } else { of(ColType::Float8) }
             }
+            "div" | "trim_scale" | "to_number" => of(ColType::Numeric),
+            "scale" | "min_scale" | "width_bucket" | "regexp_count" | "regexp_instr" => {
+                of(ColType::Int4)
+            }
+            "regexp_substr" => of(ColType::Text),
+            "string_to_array" => of(ColType::Array(super::types::ArrElem::Text)),
+            "format" | "overlay" | "regexp_replace" => of(ColType::Text),
             "floor" | "ceil" | "ceiling" | "sign" => {
                 let a = args.first().map(|a| infer_type_res(a, cols)).transpose()?.map(|t| t.0);
                 if a == Some(oid::NUMERIC) { of(ColType::Numeric) } else { of(ColType::Float8) }

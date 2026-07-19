@@ -1338,6 +1338,62 @@ fn exp_var<'a>(arg: &Numeric, rscale: u16, arena: &'a Arena) -> Result<Numeric<'
     Ok(sum)
 }
 
+/// `log10(arg)` (base-10 logarithm) in the numeric domain (arg must be > 0;
+/// caller checks). Computed as `ln(arg)/ln(10)` at the same result scale as
+/// `ln`, matching PostgreSQL.
+pub fn log10<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if arg.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    let ten = Numeric::from_i64(10, arena)?;
+    logb(&ten, arg, arena)
+}
+
+/// `log(base, value)` = `ln(value)/ln(base)` in the numeric domain (both must
+/// be > 0; caller checks). The result scale follows `value`, as PostgreSQL.
+pub fn logb<'a>(base: &Numeric, value: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if base.is_nan() || value.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    let rscale = ln_rscale(value);
+    let wscale = rscale + 12;
+    let lnv = ln_var(value, wscale, arena)?;
+    let lnb = ln_var(base, wscale, arena)?;
+    if lnb.is_zero() {
+        return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
+    }
+    div_with_scale(&lnv, &lnb, rscale + 2, true, arena)?
+        .round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+}
+
+/// `trunc(a / b)` toward zero (the `div` function): an exact integer quotient
+/// as a scale-0 numeric.
+pub fn trunc_div<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+    if a.is_nan() || b.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    if b.is_zero() {
+        return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
+    }
+    div_with_scale(a, b, 0, false, arena)
+}
+
+impl Numeric<'_> {
+    /// The minimum display scale that preserves this value (its significant
+    /// fractional digit count) — PostgreSQL `min_scale`.
+    pub fn min_scale(&self) -> u16 {
+        if self.is_zero() || self.is_nan() {
+            return 0;
+        }
+        let text = crate::stack_format!(2100, "{}", self);
+        let s = text.as_str();
+        match s.split_once('.') {
+            Some((_, frac)) => frac.trim_end_matches('0').len() as u16,
+            None => 0,
+        }
+    }
+}
+
 /// `pow(base, exp)` in the numeric domain, with PostgreSQL's domain rules and
 /// result-scale selection. Integer exponents are evaluated exactly by repeated
 /// squaring; other exponents use `exp(exp * ln(base))`.
@@ -1540,6 +1596,21 @@ mod tests {
         assert_eq!(disp(&ln(&p("1000000.0", &a), &a).unwrap()), "13.815510557964274");
         assert_eq!(disp(&exp(&p("1.0", &a), &a).unwrap()), "2.7182818284590452");
         assert_eq!(disp(&exp(&p("-5.0", &a), &a).unwrap()), "0.006737946999085467");
+    }
+
+    #[test]
+    fn log_div_scale_match_postgres() {
+        let a = arena();
+        assert_eq!(disp(&log10(&p("100.0", &a), &a).unwrap()), "2.0000000000000000");
+        assert_eq!(disp(&log10(&p("1000000.0", &a), &a).unwrap()), "6.000000000000000");
+        assert_eq!(disp(&logb(&p("2.0", &a), &p("8.0", &a), &a).unwrap()), "3.0000000000000000");
+        // div truncates toward zero at scale 0.
+        assert_eq!(disp(&trunc_div(&p("7.0", &a), &p("2.0", &a), &a).unwrap()), "3");
+        assert_eq!(disp(&trunc_div(&p("-7", &a), &p("2", &a), &a).unwrap()), "-3");
+        // min_scale strips trailing zeros.
+        assert_eq!(p("2.500", &a).min_scale(), 1);
+        assert_eq!(p("120.0", &a).min_scale(), 0);
+        assert_eq!(p("0", &a).min_scale(), 0);
     }
 
     #[test]

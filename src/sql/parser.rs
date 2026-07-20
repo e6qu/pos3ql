@@ -50,7 +50,7 @@ fn is_reserved(word: &str) -> bool {
             | "offset" | "insert" | "update" | "delete" | "create" | "drop" | "table"
             | "values" | "into" | "set" | "as" | "on" | "join" | "and" | "or" | "not"
             | "is" | "asc" | "desc" | "case" | "when" | "then" | "else" | "end"
-            | "begin" | "commit" | "rollback" | "primary" | "key" | "references"
+            | "begin" | "commit" | "rollback" | "primary" | "references"
             | "default" | "unique" | "check" | "constraint" | "returning"
             | "distinct" | "between" | "like" | "ilike" | "in" | "left"
             | "right" | "full" | "inner" | "outer" | "cross" | "using" | "natural"

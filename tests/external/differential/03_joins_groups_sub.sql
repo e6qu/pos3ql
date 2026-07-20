@@ -471,3 +471,19 @@ SELECT json_array_elements('{"a":1}'::json);
 SELECT jsonb_array_elements('{"a":1}'::jsonb);
 SELECT json_object_keys('[1]'::json);
 SELECT jsonb_object_keys('[1]'::jsonb);
+-- json_each / jsonb_each[_text]: two-column (key, value) set-returning functions
+SELECT * FROM json_each('{"a":1,"b":"x"}'::json);
+SELECT * FROM jsonb_each('{"b":1,"aa":2}'::jsonb);
+SELECT * FROM json_each_text('{"a":1,"b":"x\ty"}'::json);
+SELECT * FROM jsonb_each_text('{"a":1,"b":"x\ty"}'::jsonb);
+SELECT key, value FROM json_each('{"a":{"n":1},"b":[1,2]}'::json);
+SELECT json_each('{"a":1}'::json);
+SELECT * FROM json_each('{"a":1,"a":2}'::json);
+SELECT * FROM jsonb_each('{"a":1,"a":2}'::jsonb);
+SELECT * FROM json_each('{}'::json);
+SELECT e.key FROM json_each('{"x":1,"y":2}'::json) e;
+SELECT k, v FROM jsonb_each_text('{"m":true,"n":null}'::jsonb) AS t(k, v);
+SELECT json_each('[1,2]'::json);
+SELECT jsonb_each('5'::jsonb);
+-- KEY is a non-reserved keyword: usable as a column name
+SELECT key FROM (SELECT 1 AS key, 2 AS value) t;

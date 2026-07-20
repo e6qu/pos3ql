@@ -526,3 +526,14 @@ SELECT pg_typeof(array_append(ARRAY[1,2], 3)), pg_typeof(array_append(ARRAY[1,2]
 -- array-to-array cast (element re-encode)
 SELECT ARRAY[1,2]::int8[], ARRAY[1,2]::numeric[];
 SELECT pg_typeof(ARRAY[1,2]::int8[]);
+-- regex string functions: substring(FROM pattern), regexp_like, regexp_split_to_array
+SELECT substring('foobar' from 'o+'), substring('foobar' from 'x+');
+SELECT substring('foobar' from '(o+)(b)');
+SELECT substring('XY1234Z' from '%#"[0-9]+#"%' for '#');
+SELECT substring('abcXYZdef' from '%#"[A-Z]+#"%' for '#');
+SELECT substring('foobar', 2, 3), substring('foobar' from 2 for 3), substring('foobar' from 2);
+SELECT regexp_like('ABC', 'abc'), regexp_like('ABC', 'abc', 'i'), regexp_like('foobar', 'x+');
+SELECT regexp_split_to_array('a,b,c', ','), regexp_split_to_array('the quick brown', '\s+');
+SELECT regexp_split_to_array('abc', ''), regexp_split_to_array('a1b22c', '[0-9]+');
+SELECT regexp_split_to_array('a,b,', ',');
+SELECT pg_typeof(regexp_split_to_array('a,b', ',')), pg_typeof(regexp_like('a','a'));

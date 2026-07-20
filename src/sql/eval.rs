@@ -2206,6 +2206,53 @@ fn call<'a>(
                 }
             }
         }
+        // `regexp_like(source, pattern [, flags])`: whether the pattern matches.
+        "regexp_like" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let (Some(src), Some(pat)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let case_insensitive = if args.len() == 3 {
+                let Some(flags) = text_arg(name, args, 2, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                regexp_flags(flags)?.1
+            } else {
+                false
+            };
+            Ok(Datum::Bool(super::regex::find(pat, src, 0, case_insensitive)?.is_some()))
+        }
+        // `regexp_split_to_array(source, pattern [, flags])`: split on matches.
+        "regexp_split_to_array" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let (Some(src), Some(pat)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let case_insensitive = if args.len() == 3 {
+                let Some(flags) = text_arg(name, args, 2, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                regexp_flags(flags)?.1
+            } else {
+                false
+            };
+            let mut pieces = [Datum::Null; 1024];
+            let n = regex_split(src, pat, case_insensitive, &mut pieces)?;
+            Ok(Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(&pieces[..n], arena)?,
+            })
+        }
         "string_to_array" => {
             // (string, delimiter [, null_string]) -> text[]. A NULL delimiter
             // splits into individual characters; elements equal to null_string
@@ -2303,8 +2350,26 @@ fn call<'a>(
             let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                 return Ok(Datum::Null);
             };
-            let Some(from) = int_arg(name, args, 1, arena, params, row, hooks)? else {
-                return Ok(Datum::Null);
+            // A text second argument selects the regular-expression forms:
+            // `substring(str FROM posix_pattern)` and, with a third text arg,
+            // `substring(str FROM sql_pattern FOR escape)`.
+            let from_val = eval_full(args[1], arena, params, row, hooks)?;
+            if let Datum::Text(pattern) = from_val {
+                if args.len() == 2 {
+                    return regex_substring(s, pattern);
+                }
+                let escape = match eval_full(args[2], arena, params, row, hooks)? {
+                    Datum::Text(e) => e,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch("substring escape must be text", &other)),
+                };
+                return sql_regex_substring(s, pattern, escape, arena);
+            }
+            let from = match from_val {
+                Datum::Int4(v) => v as i64,
+                Datum::Int8(v) => v,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch(name, &other)),
             };
             let count = if args.len() == 3 {
                 match int_arg(name, args, 2, arena, params, row, hooks)? {
@@ -4350,6 +4415,158 @@ fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, super::types::RangeKind), Sql
         Datum::Range { text, kind } => Ok((text, *kind)),
         other => Err(type_mismatch("range operator", other)),
     }
+}
+
+/// `substring(str FROM posix_pattern)`: the first match, or its first capture
+/// group when the pattern has one (PostgreSQL semantics). NULL if no match.
+fn regex_substring<'a>(s: &'a str, pattern: &str) -> Result<Datum<'a>, SqlError> {
+    let mut spans = [(-1i64, -1i64); super::regex::MAX_GROUPS];
+    match super::regex::find_captures(pattern, s, 0, false, &mut spans)? {
+        None => Ok(Datum::Null),
+        Some(((mstart, mend), ng)) => {
+            if ng >= 1 {
+                let (gs, ge) = spans[0];
+                if gs < 0 {
+                    Ok(Datum::Null)
+                } else {
+                    Ok(Datum::Text(&s[gs as usize..ge as usize]))
+                }
+            } else {
+                Ok(Datum::Text(&s[mstart..mend]))
+            }
+        }
+    }
+}
+
+/// `substring(str FROM sql_pattern FOR escape)`: the SQL-regular-expression
+/// form. The pattern uses `SIMILAR TO` syntax; an `<escape>"` pair delimits the
+/// portion to return (else the whole match is returned). NULL if no match.
+fn sql_regex_substring<'a>(
+    s: &'a str,
+    pattern: &str,
+    escape: &str,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let escape_char = escape.chars().next();
+    // Translate to a POSIX regex, turning the `<escape>"` markers into a single
+    // capture group and every SIMILAR TO metacharacter per `similar_to_posix`.
+    let mut posix = crate::util::StackStr::<512>::new();
+    use core::fmt::Write as _;
+    let _ = posix.write_char('^');
+    let mut chars = pattern.chars().peekable();
+    let mut captures = 0u8;
+    let mut in_bracket = false;
+    while let Some(c) = chars.next() {
+        if Some(c) == escape_char {
+            match chars.next() {
+                Some('"') => {
+                    // Group boundary: first opens the capture, second closes it.
+                    let _ = posix.write_char(if captures == 0 { '(' } else { ')' });
+                    captures += 1;
+                }
+                Some(other) => {
+                    // An escaped metacharacter is a literal.
+                    if "\\^$.[]|()*+?{}".contains(other) {
+                        let _ = posix.write_char('\\');
+                    }
+                    let _ = posix.write_char(other);
+                }
+                None => return Err(sql_err!("22025", "invalid escape string")),
+            }
+            continue;
+        }
+        if in_bracket {
+            let _ = posix.write_char(c);
+            if c == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
+        match c {
+            '%' => {
+                // Outside the `#"..."#` capture, `%` is lazy so the captured run
+                // is maximal; inside it, greedy so the capture itself is maximal
+                // — matching PostgreSQL's SQL-regex substring extraction.
+                let _ = posix.write_str(if captures == 1 { ".*" } else { ".*?" });
+            }
+            '_' => {
+                let _ = posix.write_char('.');
+            }
+            '[' => {
+                in_bracket = true;
+                let _ = posix.write_char('[');
+            }
+            '.' | '^' | '$' | '\\' => {
+                let _ = posix.write_char('\\');
+                let _ = posix.write_char(c);
+            }
+            _ => {
+                let _ = posix.write_char(c);
+            }
+        }
+    }
+    let _ = posix.write_char('$');
+    if posix.is_truncated() {
+        return Err(sql_err!("54000", "substring pattern too long"));
+    }
+    let mut spans = [(-1i64, -1i64); super::regex::MAX_GROUPS];
+    match super::regex::find_captures(posix.as_str(), s, 0, false, &mut spans)? {
+        None => Ok(Datum::Null),
+        Some(((mstart, mend), ng)) => {
+            let (from, to) = if ng >= 1 && spans[0].0 >= 0 {
+                (spans[0].0 as usize, spans[0].1 as usize)
+            } else {
+                (mstart, mend)
+            };
+            Ok(Datum::Text(arena.alloc_str(&s[from..to]).map_err(|_| arena_full())?))
+        }
+    }
+}
+
+/// Splits `src` on every match of `pattern`, writing the pieces into `out` and
+/// returning the count. An empty pattern splits into individual characters.
+fn regex_split<'a>(
+    src: &'a str,
+    pattern: &str,
+    case_insensitive: bool,
+    out: &mut [Datum<'a>],
+) -> Result<usize, SqlError> {
+    let mut n = 0usize;
+    let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
+        if *n == out.len() {
+            return Err(sql_err!("54000", "too many split pieces"));
+        }
+        out[*n] = Datum::Text(piece);
+        *n += 1;
+        Ok(())
+    };
+    if pattern.is_empty() {
+        for (i, ch) in src.char_indices() {
+            push(&src[i..i + ch.len_utf8()], &mut n)?;
+        }
+        return Ok(n);
+    }
+    let mut last = 0usize;
+    let mut pos = 0usize;
+    while pos <= src.len() {
+        let Some((start, end)) = super::regex::find(pattern, src, pos, case_insensitive)? else {
+            break;
+        };
+        if end == start {
+            // A zero-width match: advance one character so the scan progresses.
+            let step = src[pos..].chars().next().map_or(1, char::len_utf8);
+            if pos + step > src.len() {
+                break;
+            }
+            pos += step;
+            continue;
+        }
+        push(&src[last..start], &mut n)?;
+        last = end;
+        pos = end;
+    }
+    push(&src[last..], &mut n)?;
+    Ok(n)
 }
 
 /// Parses PostgreSQL regex flags into `(global, case_insensitive)`; an unknown

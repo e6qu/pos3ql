@@ -2185,7 +2185,7 @@ impl<'a> Parser<'a> {
                     cn = 3;
                 }
                 self.expect_op(")")?;
-                return self.plain_call("substr", &cargs[..cn]);
+                return self.plain_call("substring", &cargs[..cn]);
             }
             // Comma form `substring(str, start[, len])`.
             let mut cargs = [target, target, target];
@@ -2195,7 +2195,7 @@ impl<'a> Parser<'a> {
                 cn += 1;
             }
             self.expect_op(")")?;
-            return self.plain_call("substr", &cargs[..cn]);
+            return self.plain_call("substring", &cargs[..cn]);
         }
         if name.eq_ignore_ascii_case("trim") {
             let dir = if self.eat_ident("both")? {

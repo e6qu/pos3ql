@@ -3442,7 +3442,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "json_extract_path" => of(ColType::Json),
             "jsonb_extract_path" => of(ColType::Jsonb),
             "regexp_substr" => of(ColType::Text),
-            "string_to_array" => of(ColType::Array(super::types::ArrElem::Text)),
+            "regexp_like" => of(ColType::Bool),
+            "regexp_split_to_array" | "string_to_array" => {
+                of(ColType::Array(super::types::ArrElem::Text))
+            }
             "format" | "overlay" | "regexp_replace" => of(ColType::Text),
             "floor" | "ceil" | "ceiling" | "sign" => {
                 let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);

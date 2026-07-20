@@ -354,3 +354,23 @@ INSERT INTO ins VALUES (2,'y') RETURNING ins;
 UPDATE ins SET b = 'z' WHERE a = 1 RETURNING to_jsonb(ins.*), ins;
 DELETE FROM ins WHERE a = 2 RETURNING ins.*;
 DROP TABLE ins;
+-- correlated subqueries in the select list of a window-function query
+DROP TABLE IF EXISTS w1; DROP TABLE IF EXISTS w2;
+CREATE TABLE w1 (k int, v int);
+CREATE TABLE w2 (k int, w int);
+INSERT INTO w1 VALUES (1,10),(1,20),(2,30);
+INSERT INTO w2 VALUES (1,100),(2,5);
+SELECT k, v, row_number() OVER (ORDER BY v), (SELECT max(w) FROM w2 WHERE w2.k = w1.k) FROM w1 ORDER BY v;
+SELECT k, sum(v) OVER (PARTITION BY k), (SELECT count(*) FROM w2 WHERE w2.w > w1.v) FROM w1 ORDER BY k, v;
+SELECT k, rank() OVER (ORDER BY v DESC) FROM w1 WHERE EXISTS (SELECT 1 FROM w2 WHERE w2.k = w1.k) ORDER BY v;
+SELECT DISTINCT k, (SELECT max(w) FROM w2 WHERE w2.k = w1.k) AS m, count(*) OVER () FROM w1 ORDER BY k;
+DROP TABLE w1; DROP TABLE w2;
+-- correlated subqueries in ORDER BY and in derived-table select lists
+DROP TABLE IF EXISTS m1; DROP TABLE IF EXISTS m2;
+CREATE TABLE m1 (k int, v int); CREATE TABLE m2 (k int, w int);
+INSERT INTO m1 VALUES (1,10),(2,20),(1,30); INSERT INTO m2 VALUES (1,5),(2,6);
+SELECT k FROM m1 ORDER BY (SELECT max(w) FROM m2 WHERE m2.k = m1.k) DESC, k LIMIT 2;
+SELECT * FROM (SELECT k, (SELECT w FROM m2 WHERE m2.k = m1.k) AS s FROM m1) t WHERE s > 5 ORDER BY k;
+SELECT DISTINCT (SELECT max(w) FROM m2 WHERE m2.k = m1.k) FROM m1 ORDER BY 1;
+SELECT t.s + 1 FROM (SELECT (SELECT w FROM m2 WHERE m2.k = m1.k) AS s FROM m1) t ORDER BY 1;
+DROP TABLE m1; DROP TABLE m2;

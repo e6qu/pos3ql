@@ -3959,6 +3959,7 @@ fn project_window_rows<'a>(
     win_nodes: &[&'a Expr<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
@@ -4044,14 +4045,37 @@ fn project_window_rows<'a>(
         for (w, wval) in win_vals.iter().enumerate().take(win_nodes.len()) {
             wv[w] = wval[i];
         }
+        let jr = window_row(scope, rows[i], &offs);
+        // Correlated subqueries in the select list / ORDER BY re-evaluate per
+        // output row (their outer references resolve to this window row).
+        let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
+            [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+        let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
+            [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+        let row_subs;
+        let subs = if correlated.is_empty() {
+            hooks.subs
+        } else {
+            row_subs = merge_correlated(
+                correlated,
+                base,
+                &jr,
+                storage,
+                txid,
+                arena,
+                params,
+                &mut sc,
+                &mut ls,
+            )?;
+            Some(&row_subs)
+        };
         let win_hooks = EvalHooks {
             group: None,
             aggs: None,
-            subs: hooks.subs,
+            subs,
             windows: Some((win_ptrs, &wv[..win_nodes.len()])),
             catalog: hooks.catalog, srf_index: hooks.srf_index,
         };
-        let jr = window_row(scope, rows[i], &offs);
         let mut projected = [Datum::Null; MAX_PROJ];
         let np = project_row(statement.items, scope, &jr, arena, params, &win_hooks, &mut projected)?;
         proj_rows[i] = &*arena.alloc_slice_copy(&projected[..np]).map_err(|_| arena_full())?;
@@ -4074,6 +4098,7 @@ fn window_select<'a>(
     win_nodes: &[&'a Expr<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     limit: u64,
@@ -4104,7 +4129,7 @@ fn window_select<'a>(
         }
     }
     let (proj_rows, sort_keys) = match project_window_rows(
-        storage, txid, statement, from, scope, win_nodes, hooks, correlated, arena, params,
+        storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
     ) {
         Ok(v) => v,
         Err(e) => return sql_fail(e),
@@ -5837,13 +5862,20 @@ pub fn select_query<'a>(
     };
 
     // Subqueries first (uncorrelated, evaluated once).
-    let mut sub_exprs: [Option<&Expr>; 4 + super::parser::MAX_LIST] =
-        [None; 4 + super::parser::MAX_LIST];
+    let mut sub_exprs: [Option<&Expr>; 4 + 2 * super::parser::MAX_LIST] =
+        [None; 4 + 2 * super::parser::MAX_LIST];
     sub_exprs[0] = statement.where_clause;
     sub_exprs[1] = statement.having;
     for (i, item) in statement.items.iter().enumerate() {
         if let SelectItem::Expr { expression, .. } = item {
             sub_exprs[4 + i] = Some(expression);
+        }
+    }
+    // ORDER BY expressions may carry (correlated) subqueries too; a bare
+    // ordinal resolves to a select item already covered above.
+    for (i, ob) in statement.order_by.iter().enumerate() {
+        if !matches!(ob.expression, Expr::Int(_)) {
+            sub_exprs[4 + super::parser::MAX_LIST + i] = Some(ob.expression);
         }
     }
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
@@ -5942,15 +5974,9 @@ pub fn select_query<'a>(
         }
     }
     if n_win > 0 {
-        if correlated_outside_where(correlated, statement) {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "correlated subqueries in the select list of a window-function query are not supported yet"
-            ));
-        }
         return window_select(
             storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, correlated,
-            arena, params, limit, offset, responder,
+            &outer_subs.base, arena, params, limit, offset, responder,
         );
     }
 
@@ -7288,12 +7314,6 @@ pub fn select_into_rows<'a>(
         }
     }
     if n_win > 0 {
-        if correlated_outside_where(correlated, statement) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "correlated subqueries in the select list of a window-function query are not supported yet"
-            ));
-        }
         // Windows over a grouped query: rewrite to the two-level form.
         let mut grouped_aggs: [(*const Expr, &Expr); MAX_AGGS] =
             [(core::ptr::null(), &Expr::Null); MAX_AGGS];
@@ -7309,7 +7329,7 @@ pub fn select_into_rows<'a>(
         }
         let (proj_rows, sort_keys) = project_window_rows(
             storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, correlated,
-            arena, params,
+            &outer_subs.base, arena, params,
         )?;
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
@@ -7731,29 +7751,6 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
         Ok(())
     });
     found
-}
-
-/// True when any correlated subquery node appears outside the WHERE clause
-/// (select items, HAVING, GROUP BY keys): those would have to re-evaluate per
-/// group, which the grouped executor does not do yet. WHERE-level correlated
-/// subqueries re-evaluate per scanned row and are supported.
-fn correlated_outside_where<'a>(
-    correlated: &[&'a Expr<'a>],
-    statement: &'a Select<'a>,
-) -> bool {
-    let in_expr = |e: &'a Expr<'a>| {
-        correlated.iter().any(|c| expr_contains_node(e, *c as *const Expr))
-    };
-    if statement.having.is_some_and(in_expr) {
-        return true;
-    }
-    if statement.group_by.iter().any(|g| in_expr(g)) {
-        return true;
-    }
-    statement.items.iter().any(|item| match item {
-        SelectItem::Expr { expression, .. } => in_expr(expression),
-        _ => false,
-    })
 }
 
 /// With correlated subqueries in WHERE, the filter cannot run inside
@@ -9238,7 +9235,45 @@ fn synth_derived_def<'a>(
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
-                describe_scope_items(sub.items, &ss, &mut descriptors)?
+                let n = describe_scope_items(sub.items, &ss, &mut descriptors)?;
+                // A bare scalar/array subquery item (possibly correlated) has
+                // no static type from the scope and describes as text; infer
+                // its real type from the inner select's projection so the
+                // derived-table column is typed correctly.
+                let mut slot = 0usize;
+                for item in sub.items {
+                    match item {
+                        SelectItem::Wildcard => slot += ss.star_columns(),
+                        SelectItem::TableWildcard(q) => {
+                            slot += ss.defs[ss.table_index(q)?].expect("resolved").n_columns;
+                        }
+                        SelectItem::Expr { expression, .. } => {
+                            if slot < n
+                                && descriptors[slot].type_oid == super::types::oid::TEXT
+                                && let Expr::Subquery(inner_sub) = &**expression
+                                && let Some(SelectItem::Expr { expression: inner, .. }) =
+                                    inner_sub.items.first()
+                            {
+                                let inner_scope = inner_sub.from.as_ref().and_then(|inf| {
+                                    QueryScope::resolve_schema(storage, inf, txid, arena).ok()
+                                });
+                                let witness = subquery_witness(
+                                    inner,
+                                    inner_scope.as_ref().or(Some(&ss)),
+                                );
+                                if !witness.is_null() {
+                                    descriptors[slot] = ColDesc::new(
+                                        descriptors[slot].name,
+                                        witness.type_oid(),
+                                        -1,
+                                    );
+                                }
+                            }
+                            slot += 1;
+                        }
+                    }
+                }
+                n
             }
             None => describe_items(sub.items, None, &mut descriptors)?,
         },

@@ -7904,23 +7904,36 @@ fn srf_count<'a, R: ColumnLookup<'a>>(
         if start.is_null() || stop.is_null() || step.is_null() {
             return Ok(0);
         }
-        let (Some(s), Some(e), Some(st)) = (as_i64(&start), as_i64(&stop), as_i64(&step)) else {
+        if let (Some(s), Some(e), Some(st)) = (as_i64(&start), as_i64(&stop), as_i64(&step)) {
+            if st == 0 {
+                return Err(sql_err!("22023", "step size cannot equal zero"));
+            }
+            let n = if st > 0 {
+                if e < s { 0 } else { (e - s) / st + 1 }
+            } else if e > s {
+                0
+            } else {
+                (s - e) / (-st) + 1
+            };
+            return Ok(n as usize);
+        }
+        // Temporal series: date/timestamp[tz] bounds with an interval step.
+        // Coerce bare string literals for the stop and step, as PostgreSQL's
+        // function resolution does.
+        let Some((base, kind)) = super::eval::timestamp_series_start(&start) else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
-                "generate_series is supported for integer arguments"
+                "generate_series is supported for integer and timestamp arguments"
             ));
         };
-        if st == 0 {
-            return Err(sql_err!("22023", "step size cannot equal zero"));
-        }
-        let n = if st > 0 {
-            if e < s { 0 } else { (e - s) / st + 1 }
-        } else if e > s {
-            0
-        } else {
-            (s - e) / (-st) + 1
+        let stop = super::eval::cast_to(stop, kind.coltype(), arena)?;
+        let step = super::eval::cast_to(step, ColType::Interval, arena)?;
+        let (Some((stop_micros, _)), Datum::Interval(step_iv)) =
+            (super::eval::timestamp_series_start(&stop), step)
+        else {
+            return Ok(0);
         };
-        Ok(n as usize)
+        super::eval::timestamp_series_count(base, stop_micros, step_iv)
     } else if name.eq_ignore_ascii_case("regexp_matches") {
         // Number of matches: 0/1 without the `g` flag, else all non-overlapping.
         if !(2..=3).contains(&args.len()) {
@@ -10041,7 +10054,15 @@ fn table_func_def<'a>(
         2
     } else {
         let single_type = if is_gs {
-            ColType::Int8
+            // Integer series → int8; a date/timestamp start makes it temporal.
+            match tref.func_args.and_then(|a| a.first()) {
+                Some(e) => match super::eval::eval(e, arena, params, &super::eval::NoColumns)? {
+                    Datum::Timestamp(_) => ColType::Timestamp,
+                    Datum::Timestamptz(_) | Datum::Date(_) => ColType::Timestamptz,
+                    _ => ColType::Int8,
+                },
+                None => ColType::Int8,
+            }
         } else if is_gsub {
             ColType::Int4
         } else if is_re {
@@ -10380,6 +10401,41 @@ fn table_func_rows<'a>(
             sqlstate::UNDEFINED_FUNCTION,
             "generate_series expects 2 or 3 arguments"
         ));
+    }
+    // Temporal series: a date/timestamp start with an interval step.
+    let start_val = super::eval::eval(args[0], arena, params, &super::eval::NoColumns)?;
+    if let Some((base, kind)) = super::eval::timestamp_series_start(&start_val) {
+        if args.len() != 3 {
+            return Err(sql_err!("42883", "generate_series over timestamps requires a step"));
+        }
+        // Coerce bare string literals for the stop and step (function resolution).
+        let stop_val = super::eval::cast_to(
+            super::eval::eval(args[1], arena, params, &super::eval::NoColumns)?,
+            kind.coltype(),
+            arena,
+        )?;
+        let step_val = super::eval::cast_to(
+            super::eval::eval(args[2], arena, params, &super::eval::NoColumns)?,
+            ColType::Interval,
+            arena,
+        )?;
+        let (Some((stop_micros, _)), Datum::Interval(step_iv)) =
+            (super::eval::timestamp_series_start(&stop_val), step_val)
+        else {
+            return Ok(&[]);
+        };
+        let count = super::eval::timestamp_series_count(base, stop_micros, step_iv)?;
+        const EMPTY: &[u8] = &[];
+        let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
+        let mut v = base;
+        for slot in rows.iter_mut() {
+            *slot = super::exec::encode_projected_pub(&[kind.datum(v)], arena)?;
+            v = super::datetime::add_interval(v, step_iv);
+        }
+        return Ok(&*rows);
+    }
+    if start_val.is_null() {
+        return Ok(&[]);
     }
     let as_i64 = |e: &'a Expr<'a>| -> Result<i64, SqlError> {
         match super::eval::eval(e, arena, params, &super::eval::NoColumns)? {

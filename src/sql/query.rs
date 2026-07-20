@@ -10,6 +10,7 @@
 //! Subqueries are uncorrelated and pre-evaluated once per statement; their
 //! results are injected into evaluation by node identity (EvalHooks).
 
+use core::fmt::Write as _;
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
@@ -157,6 +158,11 @@ pub struct QueryScope<'d> {
     /// self-describing-encoded. `None` marks a physical table (scanned from
     /// storage by `slots`).
     pub derived: [Option<&'d [&'d [u8]]>; MAX_JOIN_TABLES],
+    /// Marks a set-returning-function scan (`FROM func(args)`), whose output row
+    /// type is its single scalar column — so a whole-row reference to the table
+    /// alias yields that scalar, not a one-field record (which is how a
+    /// subquery- or storage-derived table's whole-row reference behaves).
+    pub func_scalar: [bool; MAX_JOIN_TABLES],
     pub n: usize,
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
     pub merged: [MergedColumn<'d>; MAX_MERGED_COLUMNS],
@@ -181,6 +187,7 @@ impl<'d> QueryScope<'d> {
             defs: [None; MAX_JOIN_TABLES],
             slots: [0; MAX_JOIN_TABLES],
             derived: [None; MAX_JOIN_TABLES],
+            func_scalar: [false; MAX_JOIN_TABLES],
             n: 0,
             merged: [MergedColumn {
                 name: "",
@@ -476,6 +483,7 @@ impl<'d> QueryScope<'d> {
         self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
+        self.func_scalar[self.n] = true;
         self.n += 1;
         Ok(())
     }
@@ -781,6 +789,19 @@ impl<'d> QueryScope<'d> {
         self.names[..self.n].iter().position(|n| *n == name).ok_or_else(|| {
             sql_err!("42P01", "missing FROM-clause entry for table \"{}\"", name)
         })
+    }
+
+    /// If `name` refers to a set-returning-function scan, the type of its single
+    /// scalar output column — the type a whole-row reference to it carries. A
+    /// storage- or subquery-derived table returns None (its whole-row reference
+    /// is a record).
+    pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
+        let t = self.table_index(name).ok()?;
+        if !self.func_scalar[t] {
+            return None;
+        }
+        let def = self.defs[t]?;
+        (def.n_columns == 1).then(|| def.columns()[0].ctype)
     }
 
     pub fn find_column(
@@ -1134,6 +1155,10 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<super::types::ColType> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.scope.func_scalar_type(table).is_some()
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
@@ -5191,6 +5216,12 @@ enum AggKind {
     /// `array_agg(expr [ORDER BY ...])`: buffers every value (NULLs kept),
     /// optionally sorted / DISTINCT, then builds a one-dimensional array.
     ArrayAgg,
+    /// `json_agg`/`jsonb_agg(expr [ORDER BY ...])`: buffers values, then
+    /// serializes them to a JSON array. `star` distinguishes json vs jsonb.
+    JsonAgg { jsonb: bool },
+    /// `json_object_agg`/`jsonb_object_agg(key, value)`: buffers `[key, value]`
+    /// tuples into a JSON object.
+    JsonObjectAgg { jsonb: bool },
     /// Ordered-set aggregates: the aggregated values come from `WITHIN GROUP
     /// (ORDER BY ...)` and are buffered (in `vals`), sorted, then reduced in
     /// `finish`. `sum_float` holds the percentile fraction.
@@ -5243,6 +5274,10 @@ impl<'a> AggState<'a> {
             "bool_or" => AggKind::BoolOr,
             "string_agg" => AggKind::StringAgg,
             "array_agg" => AggKind::ArrayAgg,
+            "json_agg" => AggKind::JsonAgg { jsonb: false },
+            "jsonb_agg" => AggKind::JsonAgg { jsonb: true },
+            "json_object_agg" => AggKind::JsonObjectAgg { jsonb: false },
+            "jsonb_object_agg" => AggKind::JsonObjectAgg { jsonb: true },
             "percentile_cont" => AggKind::PercentileCont,
             "percentile_disc" => AggKind::PercentileDisc,
             "mode" => AggKind::Mode,
@@ -5265,7 +5300,10 @@ impl<'a> AggState<'a> {
         // ORDER BY only affects string_agg (other aggregates are commutative,
         // so their result is identical regardless of input order).
         if !order_by.is_empty()
-            && matches!(self.kind, AggKind::StringAgg | AggKind::ArrayAgg)
+            && matches!(
+                self.kind,
+                AggKind::StringAgg | AggKind::ArrayAgg | AggKind::JsonAgg { .. }
+            )
         {
             if *distinct {
                 // With DISTINCT, PostgreSQL permits ORDER BY only on the
@@ -5309,14 +5347,33 @@ impl<'a> AggState<'a> {
         if self.kind == AggKind::StringAgg {
             return self.update_string_agg(args, arena, params, row, hooks);
         }
-        if self.kind == AggKind::ArrayAgg {
+        if matches!(self.kind, AggKind::JsonObjectAgg { .. }) {
+            if args.len() != 2 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "json_object_agg requires exactly two arguments"
+                ));
+            }
+            let key = eval_full(args[0], arena, params, row, hooks)?;
+            if key.is_null() {
+                return Err(sql_err!("22004", "field name must not be null"));
+            }
+            let value = eval_full(args[1], arena, params, row, hooks)?;
+            let tuple = [key, value];
+            let enc = super::exec::encode_projected_pub(&tuple, arena)?;
+            // Reuse the ordered buffer to hold the [key, value] pair.
+            self.push_ordered(enc, arena)?;
+            self.count += 1;
+            return Ok(());
+        }
+        if matches!(self.kind, AggKind::ArrayAgg | AggKind::JsonAgg { .. }) {
             if args.len() != 1 {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
-                    "array_agg requires exactly one argument"
+                    "aggregate requires exactly one argument"
                 ));
             }
-            // array_agg keeps NULL elements, unlike string_agg.
+            // array_agg/json_agg keep NULL elements, unlike string_agg.
             let value = eval_full(args[0], arena, params, row, hooks)?;
             if self.ordered {
                 let mut tuple = [Datum::Null; 1 + MAX_PROJ];
@@ -5450,9 +5507,14 @@ impl<'a> AggState<'a> {
                 let sep = self.sep.unwrap_or("");
                 self.append_str_elem(sep, s, arena)?;
             }
-            // Ordered-set and array aggregates buffer their values and reduce
-            // in `finish`; they never fold through `accumulate`.
-            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode | AggKind::ArrayAgg => {}
+            // Ordered-set, array, and json aggregates buffer their values and
+            // reduce in `finish`; they never fold through `accumulate`.
+            AggKind::PercentileCont
+            | AggKind::PercentileDisc
+            | AggKind::Mode
+            | AggKind::ArrayAgg
+            | AggKind::JsonAgg { .. }
+            | AggKind::JsonObjectAgg { .. } => {}
         }
         Ok(())
     }
@@ -5779,6 +5841,12 @@ impl<'a> AggState<'a> {
         if self.kind == AggKind::ArrayAgg {
             return self.finish_array_agg(arena);
         }
+        if let AggKind::JsonAgg { jsonb } = self.kind {
+            return self.finish_json_agg(jsonb, arena);
+        }
+        if let AggKind::JsonObjectAgg { jsonb } = self.kind {
+            return self.finish_json_object_agg(jsonb, arena);
+        }
         self.fold_distinct(arena)?;
         self.fold_ordered(arena)?;
         Ok(match self.kind {
@@ -5824,8 +5892,11 @@ impl<'a> AggState<'a> {
             }
             // Handled by `finish_ordered_set` before this match.
             AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => Datum::Null,
-            // Handled by `finish_array_agg` before this match.
-            AggKind::ArrayAgg => Datum::Null,
+            // Handled by `finish_array_agg` / `finish_json_agg` before this
+            // match.
+            AggKind::ArrayAgg | AggKind::JsonAgg { .. } | AggKind::JsonObjectAgg { .. } => {
+                Datum::Null
+            }
         })
     }
 
@@ -5833,7 +5904,77 @@ impl<'a> AggState<'a> {
     /// (or scan order), DISTINCT-deduped if requested. Zero rows → NULL (as
     /// PostgreSQL). The element type comes from the first non-null value.
     fn finish_array_agg(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-        let values: &mut [Datum<'a>] = if self.ordered {
+        let values = self.collect_agg_values(arena)?;
+        if values.is_empty() {
+            return Ok(Datum::Null);
+        }
+        let element = values
+            .iter()
+            .find_map(super::types::ArrElem::from_datum)
+            .unwrap_or(super::types::ArrElem::Int4);
+        let raw = super::array::build(values, arena)?;
+        Ok(Datum::Array { element, raw })
+    }
+
+    /// `json_agg`/`jsonb_agg`: the buffered values (ORDER BY / DISTINCT / scan
+    /// order) as a JSON array. Zero rows → NULL. json uses `, ` element
+    /// spacing (and `" : "` for nested objects); jsonb the canonical form.
+    fn finish_json_agg(&mut self, jsonb: bool, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+        let values = self.collect_agg_values(arena)?;
+        if values.is_empty() {
+            return Ok(Datum::Null);
+        }
+        let colon = if jsonb { ": " } else { " : " };
+        let mut buf = crate::util::StackStr::<65536>::default();
+        let _ = buf.write_char('[');
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                let _ = buf.write_str(", ");
+            }
+            let _ = super::json::write_datum_json_styled(v, colon, ", ", &mut buf);
+        }
+        let _ = buf.write_char(']');
+        let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+        Ok(Datum::Json { text, jsonb })
+    }
+
+    /// `json_object_agg`/`jsonb_object_agg`: the buffered `[key, value]` tuples
+    /// as a JSON object. Zero rows → NULL. json output is wrapped `{ … }` with
+    /// `" : "` between key and value; jsonb is the canonical `{…}` / `": "`.
+    fn finish_json_object_agg(
+        &mut self,
+        jsonb: bool,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        if self.ord_len == 0 {
+            return Ok(Datum::Null);
+        }
+        let rows = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
+        let colon = if jsonb { ": " } else { " : " };
+        let (open, close) = if jsonb { ("{", "}") } else { ("{ ", " }") };
+        let mut buf = crate::util::StackStr::<65536>::default();
+        let _ = buf.write_str(open);
+        for (i, &enc) in rows.iter().enumerate() {
+            if i > 0 {
+                let _ = buf.write_str(", ");
+            }
+            let key = super::exec::decode_projected_pub(enc, 0);
+            let value = super::exec::decode_projected_pub(enc, 1);
+            let mut key_text = crate::util::StackStr::<4096>::default();
+            let _ = write!(key_text, "{key}");
+            let _ = super::json::write_json_raw_string(key_text.as_str(), &mut buf);
+            let _ = buf.write_str(colon);
+            let _ = super::json::write_datum_json_styled(&value, colon, ", ", &mut buf);
+        }
+        let _ = buf.write_str(close);
+        let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+        Ok(Datum::Json { text, jsonb })
+    }
+
+    /// The buffered aggregate values in ORDER BY / DISTINCT / scan order,
+    /// shared by `finish_array_agg` and `finish_json_agg`.
+    fn collect_agg_values(&mut self, arena: &'a Arena) -> Result<&'a [Datum<'a>], SqlError> {
+        if self.ordered {
             let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
             let spec = self.ord_spec;
             let mut cmp_err: Option<SqlError> = None;
@@ -5867,7 +6008,7 @@ impl<'a> AggState<'a> {
             for (i, &row) in rows.iter().enumerate() {
                 out[i] = super::exec::decode_projected_pub(row, 0);
             }
-            out
+            Ok(out)
         } else if self.distinct {
             let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
             let mut cmp_err: Option<SqlError> = None;
@@ -5889,19 +6030,10 @@ impl<'a> AggState<'a> {
                     unique += 1;
                 }
             }
-            &mut vals[..unique]
+            Ok(&vals[..unique])
         } else {
-            unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) }
-        };
-        if values.is_empty() {
-            return Ok(Datum::Null);
+            Ok(unsafe { core::slice::from_raw_parts(self.vals, self.vals_len) })
         }
-        let element = values
-            .iter()
-            .find_map(super::types::ArrElem::from_datum)
-            .unwrap_or(super::types::ArrElem::Int4);
-        let raw = super::array::build(values, arena)?;
-        Ok(Datum::Array { element, raw })
     }
 }
 
@@ -7621,6 +7753,12 @@ fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
         || name.eq_ignore_ascii_case("regexp_matches")
+        || name.eq_ignore_ascii_case("jsonb_object_keys")
+        || name.eq_ignore_ascii_case("json_object_keys")
+        || name.eq_ignore_ascii_case("jsonb_array_elements")
+        || name.eq_ignore_ascii_case("json_array_elements")
+        || name.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || name.eq_ignore_ascii_case("json_array_elements_text")
 }
 
 /// Finds a set-returning function call among the SELECT items (the whole call
@@ -7728,6 +7866,50 @@ fn srf_count<'a, R: ColumnLookup<'a>>(
             }
         }
         Ok(n)
+    } else if name.eq_ignore_ascii_case("jsonb_object_keys")
+        || name.eq_ignore_ascii_case("json_object_keys")
+    {
+        let text = match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(0),
+            _ => return Err(super::json::object_keys_error(name, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Object {
+            return Err(super::json::object_keys_error(name, kind));
+        }
+        if name.eq_ignore_ascii_case("jsonb_object_keys") {
+            return match super::json::parse(text, arena)? {
+                super::json::Json::Object(members) => Ok(members.len()),
+                _ => Err(super::json::object_keys_error(name, kind)),
+            };
+        }
+        Ok(super::json::object_members_source(text, arena)?.len())
+    } else if name.eq_ignore_ascii_case("jsonb_array_elements")
+        || name.eq_ignore_ascii_case("json_array_elements")
+        || name.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || name.eq_ignore_ascii_case("json_array_elements_text")
+    {
+        let jsonb = name.eq_ignore_ascii_case("jsonb_array_elements")
+            || name.eq_ignore_ascii_case("jsonb_array_elements_text");
+        let text = match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(0),
+            _ => return Err(super::json::array_elements_error(name, jsonb, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Array {
+            return Err(super::json::array_elements_error(name, jsonb, kind));
+        }
+        if jsonb {
+            return match super::json::parse(text, arena)? {
+                super::json::Json::Array(items) => Ok(items.len()),
+                _ => Err(super::json::array_elements_error(name, jsonb, kind)),
+            };
+        }
+        Ok(super::json::array_elements_source(text, arena)?.len())
     } else {
         // unnest / _pg_expandarray over an array.
         match eval_full(args[0], arena, params, row, hooks)? {
@@ -7902,6 +8084,10 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.0.table_index(name).is_ok()
+    }
+
+    fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.0.func_scalar_type(name)
     }
 }
 
@@ -9590,20 +9776,29 @@ fn table_func_def<'a>(
     let is_gs = tref.table.eq_ignore_ascii_case("generate_series");
     let is_unnest = tref.table.eq_ignore_ascii_case("unnest");
     let is_re = tref.table.eq_ignore_ascii_case("regexp_matches");
-    if !is_gs && !is_unnest && !is_re {
+    let is_keys = tref.table.eq_ignore_ascii_case("jsonb_object_keys")
+        || tref.table.eq_ignore_ascii_case("json_object_keys");
+    let is_elems = tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+        || tref.table.eq_ignore_ascii_case("json_array_elements")
+        || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || tref.table.eq_ignore_ascii_case("json_array_elements_text");
+    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
             tref.table
         ));
     }
-    let name = tref.alias.unwrap_or(if is_gs {
+    let base_name = if is_gs {
         "generate_series"
     } else if is_re {
         "regexp_matches"
+    } else if is_keys || is_elems {
+        tref.table
     } else {
         "unnest"
-    });
+    };
+    let name = tref.alias.unwrap_or(base_name);
     // A table function has a single output column, so at most one alias.
     if let Some(aliases) = tref.col_alias
         && aliases.len() > 1
@@ -9615,8 +9810,10 @@ fn table_func_def<'a>(
             aliases.len()
         ));
     }
-    // The column takes the explicit column-alias if given, else the table name.
-    let col_name = tref.col_alias.and_then(|a| a.first().copied()).unwrap_or(name);
+    // The column takes the explicit column-alias if given, else the function's
+    // default output name: `value` for array_elements, else the function name.
+    let default_col = if is_elems { "value" } else { name };
+    let col_name = tref.col_alias.and_then(|a| a.first().copied()).unwrap_or(default_col);
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
@@ -9633,6 +9830,16 @@ fn table_func_def<'a>(
         ColType::Int8
     } else if is_re {
         ColType::Array(super::types::ArrElem::Text)
+    } else if is_keys {
+        ColType::Text
+    } else if is_elems {
+        if tref.table.eq_ignore_ascii_case("json_array_elements") {
+            ColType::Json
+        } else if tref.table.eq_ignore_ascii_case("jsonb_array_elements") {
+            ColType::Jsonb
+        } else {
+            ColType::Text
+        }
     } else {
         let args = tref.func_args.unwrap_or(&[]);
         match args.first() {
@@ -9727,6 +9934,99 @@ fn table_func_rows<'a>(
         }
         let out = arena.alloc_slice_with(n, |i| rows[i]).map_err(|_| arena_full())?;
         return Ok(&*out);
+    }
+    // jsonb_object_keys(obj) / json_object_keys(obj): one text row per key.
+    if tref.table.eq_ignore_ascii_case("jsonb_object_keys")
+        || tref.table.eq_ignore_ascii_case("json_object_keys")
+    {
+        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
+        let text = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(super::json::object_keys_error(tref.table, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Object {
+            return Err(super::json::object_keys_error(tref.table, kind));
+        }
+        const EMPTY: &[u8] = &[];
+        // jsonb: normalized/sorted keys; json: source order with duplicates.
+        if jsonb {
+            let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
+                return Err(super::json::object_keys_error(tref.table, kind));
+            };
+            let rows = arena.alloc_slice_with(members.len(), |_| EMPTY).map_err(|_| arena_full())?;
+            for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
+                *slot = super::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
+            }
+            return Ok(&*rows);
+        }
+        let members = super::json::object_members_source(text, arena)?;
+        let rows = arena.alloc_slice_with(members.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
+            *slot = super::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
+        }
+        return Ok(&*rows);
+    }
+    // jsonb_array_elements / json_array_elements[_text]: one row per element.
+    if tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+        || tref.table.eq_ignore_ascii_case("json_array_elements")
+        || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || tref.table.eq_ignore_ascii_case("json_array_elements_text")
+    {
+        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+            || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
+        let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+            || tref.table.eq_ignore_ascii_case("json_array_elements_text");
+        let text = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(super::json::array_elements_error(tref.table, jsonb, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Array {
+            return Err(super::json::array_elements_error(tref.table, jsonb, kind));
+        }
+        const EMPTY: &[u8] = &[];
+        if jsonb {
+            let super::json::Json::Array(items) = super::json::parse(text, arena)? else {
+                return Err(super::json::array_elements_error(tref.table, jsonb, kind));
+            };
+            let rows = arena.alloc_slice_with(items.len(), |_| EMPTY).map_err(|_| arena_full())?;
+            for (slot, element) in rows.iter_mut().zip(items.iter()) {
+                let datum = if as_text {
+                    match *element {
+                        super::json::Json::Str(s) => {
+                            Datum::Text(super::json::decode_string(s, arena)?)
+                        }
+                        super::json::Json::Null => Datum::Null,
+                        _ => Datum::Text(super::eval::json_to_text_pub(element, arena)?),
+                    }
+                } else {
+                    Datum::Json { text: super::eval::json_to_text_pub(element, arena)?, jsonb }
+                };
+                *slot = super::exec::encode_projected_pub(&[datum], arena)?;
+            }
+            return Ok(&*rows);
+        }
+        // json: each element's verbatim source text.
+        let items = super::json::array_elements_source(text, arena)?;
+        let rows = arena.alloc_slice_with(items.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        for (slot, element) in rows.iter_mut().zip(items.iter()) {
+            let datum = if as_text {
+                match super::json::parse(element, arena)? {
+                    super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                    super::json::Json::Null => Datum::Null,
+                    _ => Datum::Text(element),
+                }
+            } else {
+                Datum::Json { text: element, jsonb }
+            };
+            *slot = super::exec::encode_projected_pub(&[datum], arena)?;
+        }
+        return Ok(&*rows);
     }
     // unnest(array): one row per element.
     if tref.table.eq_ignore_ascii_case("unnest") {

@@ -2745,6 +2745,13 @@ pub trait ColTypeResolver {
     fn is_whole_row(&self, _name: &str) -> bool {
         false
     }
+
+    /// If a whole-row reference to `name` is actually a scalar (a
+    /// set-returning-function scan's single output column), that column's type.
+    /// Defaults to None, meaning the whole-row reference is an anonymous record.
+    fn whole_row_scalar_type(&self, _name: &str) -> Option<ColType> {
+        None
+    }
 }
 
 /// No FROM clause: any column reference is an error.
@@ -2821,8 +2828,12 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
     let of = |t: ColType| (t.oid(), t.typlen());
     Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
-        // A whole-row reference is an anonymous record.
-        Expr::WholeRow(_) => (oid::RECORD, -1),
+        // A whole-row reference is an anonymous record — unless it is a function
+        // scan's whole row, which is its single scalar column.
+        Expr::WholeRow(t) => match columns.whole_row_scalar_type(t) {
+            Some(ty) => of(ty),
+            None => (oid::RECORD, -1),
+        },
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {
@@ -2833,10 +2844,14 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
         Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
             Ok(t) => of(t),
             // A bare name that is not a column but names a FROM item is a
-            // whole-row/record value.
+            // whole-row/record value — except a function scan's whole row,
+            // which is its single scalar column.
             Err(e) if qualifier.is_none() && columns.is_whole_row(name) => {
                 let _ = e;
-                (oid::RECORD, -1)
+                match columns.whole_row_scalar_type(name) {
+                    Some(t) => of(t),
+                    None => (oid::RECORD, -1),
+                }
             }
             Err(e) => return Err(e),
         },
@@ -2902,15 +2917,18 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
                 // Bit-string concatenation yields varbit; otherwise text.
                 Concat => {
-                    if is_bit(lo) || is_bit(ro) {
+                    if lo == oid::JSONB || ro == oid::JSONB {
+                        (oid::JSONB, -1)
+                    } else if is_bit(lo) || is_bit(ro) {
                         (oid::VARBIT, -1)
                     } else {
                         (oid::TEXT, -1)
                     }
                 }
                 // `json -> k` keeps the json/jsonb type; `->>` yields text.
-                JsonGet => (if lo == oid::JSONB { oid::JSONB } else { oid::JSON }, -1),
-                JsonGetText => (oid::TEXT, -1),
+                JsonGet | JsonPath => (if lo == oid::JSONB { oid::JSONB } else { oid::JSON }, -1),
+                JsonGetText | JsonPathText => (oid::TEXT, -1),
+                JsonExists | JsonExistsAny | JsonExistsAll => of(ColType::Bool),
                 // On bit strings the bitwise/shift operators return a bit
                 // string; on integers they keep the wider integer width.
                 BitAnd | BitOr | BitXor | Shl | Shr => {
@@ -3087,8 +3105,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 .transpose()?
                 .unwrap_or_else(|| of(ColType::Int8)),
             "count" => of(ColType::Int8),
-            "row_to_json" | "to_json" => of(ColType::Json),
-            "to_jsonb" => of(ColType::Jsonb),
+            "row_to_json" | "to_json" | "json_build_object" | "json_build_array" => {
+                of(ColType::Json)
+            }
+            "to_jsonb" | "jsonb_build_object" | "jsonb_build_array" => of(ColType::Jsonb),
             "row" => (oid::RECORD, -1),
             "sum" | "avg" => {
                 let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
@@ -3171,6 +3191,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "div" | "trim_scale" | "to_number" => of(ColType::Numeric),
             "scale" | "min_scale" | "width_bucket" | "regexp_count" | "regexp_instr"
             | "array_position" | "jsonb_array_length" | "json_array_length" => of(ColType::Int4),
+            "jsonb_typeof" | "json_typeof" | "json_extract_path_text"
+            | "jsonb_extract_path_text" => of(ColType::Text),
+            "json_extract_path" => of(ColType::Json),
+            "jsonb_extract_path" => of(ColType::Jsonb),
             "regexp_substr" => of(ColType::Text),
             "string_to_array" => of(ColType::Array(super::types::ArrElem::Text)),
             "format" | "overlay" | "regexp_replace" => of(ColType::Text),
@@ -3259,6 +3283,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             // regexp_matches returns each match's capture groups as text[].
             "regexp_matches" => of(ColType::Array(super::types::ArrElem::Text)),
+            "jsonb_object_keys" | "json_object_keys" | "jsonb_array_elements_text"
+            | "json_array_elements_text" => of(ColType::Text),
+            "jsonb_array_elements" => of(ColType::Jsonb),
+            "json_array_elements" => of(ColType::Json),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),

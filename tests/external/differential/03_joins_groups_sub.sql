@@ -409,3 +409,65 @@ SELECT * FROM (VALUES ('a', 1),(NULL, 2),('c', NULL)) t(a,b) ORDER BY b;
 SELECT 1 UNION SELECT NULL ORDER BY 1;
 SELECT NULL UNION SELECT NULL;
 SELECT a FROM (VALUES (NULL),(NULL)) t(a);
+-- json_build_object/array, json_agg/jsonb_agg, json_object_agg
+SELECT json_build_object('a', 1, 'b', 'x');
+SELECT jsonb_build_object('a', 1, 'b', true, 'c', null);
+SELECT json_build_array(1, 'x', true, null);
+SELECT jsonb_build_array(1, 2.5, 'y');
+SELECT json_agg(k) FROM (VALUES (1),(3),(2)) t(k);
+SELECT jsonb_agg(k ORDER BY k DESC) FROM (VALUES (1),(3),(2)) t(k);
+SELECT json_agg(row_to_json(t)) FROM (VALUES (1,'a'),(2,'b')) t(k,v);
+SELECT json_object_agg(k, v) FROM (VALUES ('a',1),('b',2)) t(k,v);
+SELECT jsonb_object_agg(k, v) FROM (VALUES ('a',1),('b',2)) t(k,v);
+SELECT json_agg(k) FROM (VALUES (1)) t(k) WHERE k > 5;
+SELECT g, json_agg(v ORDER BY v) FROM (VALUES ('x',2),('x',1),('y',3)) t(g,v) GROUP BY g ORDER BY g;
+SELECT json_build_object('nested', json_build_array(1,2), 'obj', json_build_object('x',1));
+SELECT jsonb_build_object('arr', ARRAY[1,2,3]);
+SELECT json_agg(DISTINCT k ORDER BY k) FROM (VALUES (3),(1),(1),(2)) t(k);
+-- DISTINCT ON in FROM-less, derived-table, set-op, and grouped contexts
+SELECT DISTINCT ON (1) 1, 2;
+SELECT DISTINCT ON (a%2) a FROM (VALUES (1),(3),(2),(4)) t(a) ORDER BY a%2, a;
+(SELECT DISTINCT ON (a) a, b FROM (VALUES (1,2),(1,3)) t(a,b)) UNION ALL SELECT 9, 9;
+SELECT count(*) FROM (SELECT DISTINCT ON (k) k FROM (VALUES (1),(1),(2)) t(k)) s;
+SELECT DISTINCT ON (k) k, sum(v) FROM (VALUES (1,10),(1,20),(2,5)) t(k,v) GROUP BY k ORDER BY k;
+-- jsonb object-key ordering (length then bytewise), duplicate handling
+SELECT '{"b":1,"aa":2,"c":3}'::jsonb;
+SELECT '{"a":1,"a":2}'::jsonb;
+SELECT '{"name":1,"id":2,"a":3,"created_at":4}'::jsonb;
+-- json preserves source order/whitespace/duplicates verbatim
+SELECT '{"b":1,  "aa":2,"c":3}'::json;
+SELECT '[1,  2,{"k":2}]'::json;
+-- jsonb || merge, path and existence operators, typeof, extract_path
+SELECT '{"a":1,"b":2}'::jsonb || '{"b":3,"c":4}'::jsonb;
+SELECT '[1,2]'::jsonb || '[3,4]'::jsonb;
+SELECT '{"a":{"b":{"c":5}}}'::jsonb #> '{a,b,c}';
+SELECT '{"a":{"b":{"c":5}}}'::jsonb #>> '{a,b,c}';
+SELECT '{"a":1,"b":2}'::jsonb ? 'a';
+SELECT '{"a":1}'::jsonb ?| ARRAY['x','a'];
+SELECT '{"a":1,"b":2}'::jsonb ?& ARRAY['a','b'];
+SELECT jsonb_typeof('[1,2]'::jsonb), json_typeof('"x"'::json), jsonb_typeof('null'::jsonb);
+SELECT jsonb_extract_path('{"a":{"b":5}}'::jsonb, 'a', 'b');
+SELECT jsonb_extract_path_text('{"a":{"b":5}}'::jsonb, 'a', 'b');
+-- ->> / #>> decode JSON string escapes to raw characters
+SELECT ('{"k":"x\ty"}'::jsonb)->>'k';
+SELECT ('{"k":"x\ty"}'::json)->>'k';
+SELECT '"abc"'::jsonb #>> '{}';
+-- object_keys / array_elements (json = source order, jsonb = normalized)
+SELECT jsonb_object_keys('{"z":1,"a":2,"mm":3}'::jsonb);
+SELECT json_object_keys('{"z":1,"a":2,"a":9}'::json);
+SELECT jsonb_array_elements('[1,"x",{"k":2},null]'::jsonb);
+SELECT json_array_elements('[ {"k":  2} , 3 ]'::json);
+SELECT jsonb_array_elements_text('[ {"k":  2} ,"x\ty", 3 ]'::jsonb);
+SELECT json_array_elements_text('["a b",true,null]'::json);
+-- SRFs in FROM position, alias-as-scalar, headers, lateral cross product
+SELECT * FROM json_array_elements('[1,2]'::json);
+SELECT x FROM json_array_elements_text('["p","q"]') AS x;
+SELECT elem->>'n' FROM json_array_elements('[{"n":1},{"n":2}]'::json) elem;
+SELECT k FROM jsonb_object_keys('{"z":1,"a":2}'::jsonb) AS k;
+SELECT g, e FROM generate_series(1,2) g, jsonb_array_elements('[9,8]'::jsonb) e ORDER BY g, e::text;
+-- error messages for the wrong JSON shape
+SELECT json_array_elements('5'::json);
+SELECT json_array_elements('{"a":1}'::json);
+SELECT jsonb_array_elements('{"a":1}'::jsonb);
+SELECT json_object_keys('[1]'::json);
+SELECT jsonb_object_keys('[1]'::jsonb);

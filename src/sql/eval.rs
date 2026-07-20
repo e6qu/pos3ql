@@ -236,22 +236,37 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
         // so the sibling's constant errors are never surfaced.
         Expr::Binary { operator: BinaryOp::And, left, right } => {
-            if fold_check(left, arena)? == Some(false) {
+            // FALSE settles AND; otherwise the result is known only when both
+            // sides fold to TRUE (`TRUE AND TRUE` = TRUE).
+            let l = fold_check(left, arena)?;
+            if l == Some(false) {
                 return Ok(Some(false));
             }
-            if fold_check(right, arena)? == Some(false) {
+            let r = fold_check(right, arena)?;
+            if r == Some(false) {
                 return Ok(Some(false));
             }
-            Ok(None)
+            Ok(match (l, r) {
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            })
         }
         Expr::Binary { operator: BinaryOp::Or, left, right } => {
-            if fold_check(left, arena)? == Some(true) {
+            // TRUE settles OR; otherwise the result is known only when both
+            // sides fold to FALSE (`FALSE OR FALSE` = FALSE) — so a constant
+            // OR of dead predicates lets a CASE arm drop.
+            let l = fold_check(left, arena)?;
+            if l == Some(true) {
                 return Ok(Some(true));
             }
-            if fold_check(right, arena)? == Some(true) {
+            let r = fold_check(right, arena)?;
+            if r == Some(true) {
                 return Ok(Some(true));
             }
-            Ok(None)
+            Ok(match (l, r) {
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            })
         }
         // NOT propagates a folded boolean, so `NOT (x AND FALSE)` simplifies to
         // TRUE — which lets a CASE truncate exactly as PostgreSQL's plan-time

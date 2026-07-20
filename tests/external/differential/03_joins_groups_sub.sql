@@ -578,3 +578,23 @@ SELECT generate_series('2024-01-01'::timestamp, '2024-01-03', '1 day'), generate
 SELECT generate_series(1,3), unnest(ARRAY['x','y','z','w']);
 SELECT generate_series(5,1,-1), generate_series(1,2);
 SELECT g, generate_series(1,2) FROM generate_series(1,2) g;
+-- encode/decode, cryptographic hashes, bytea manipulation, quoting, OVERLAPS
+SELECT encode('abc'::bytea, 'base64'), encode('abc'::bytea, 'hex');
+SELECT encode('\x00ff41'::bytea, 'escape'), encode('\x00ff41'::bytea, 'base64');
+SELECT decode('YWJj', 'base64'), decode('616263', 'hex'), decode('a\000b', 'escape');
+SELECT 'abc'::bytea, '\x616263'::bytea, length('abcde'::bytea);
+SELECT encode(sha224('abc'::bytea), 'hex');
+SELECT encode(sha256('abc'::bytea), 'hex');
+SELECT encode(sha384('abc'::bytea), 'hex');
+SELECT encode(sha512('abc'::bytea), 'hex');
+SELECT encode(convert_to('héllo', 'UTF8'), 'hex'), convert_from(convert_to('a€b','UTF8'), 'UTF8');
+SELECT get_byte('abc'::bytea, 1), set_byte('abc'::bytea, 1, 90);
+SELECT get_bit('\x02'::bytea, 1), set_bit('\x00'::bytea, 3, 1);
+SELECT bit_count('abc'::bytea), bit_count('\xff0f'::bytea);
+SELECT quote_ident('foo bar'), quote_ident('simple'), quote_ident('select'), quote_ident('UpperCase');
+SELECT quote_literal('a''b'), quote_literal(42), quote_nullable(NULL::int), quote_nullable('x');
+SELECT parse_ident('a.b.c'), parse_ident('public."My Table"');
+SELECT (DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-01-15', DATE '2024-03-01');
+SELECT (DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-02-01', DATE '2024-03-01');
+SELECT (DATE '2024-01-01', INTERVAL '1 month') OVERLAPS (DATE '2024-01-15', DATE '2024-03-01');
+SELECT (TIMESTAMP '2024-01-01 10:00', TIMESTAMP '2024-01-01 12:00') OVERLAPS (TIMESTAMP '2024-01-01 11:00', TIMESTAMP '2024-01-01 13:00');

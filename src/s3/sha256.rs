@@ -136,6 +136,22 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     h.finish()
 }
 
+/// SHA-224 (FIPS 180-4): the SHA-256 compression function with the SHA-224
+/// initial hash, truncated to the leading 28 bytes. Used by the `sha224` SQL
+/// function.
+pub fn sha224(data: &[u8]) -> [u8; 28] {
+    const H0_224: [u32; 8] = [
+        0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7,
+        0xbefa4fa4,
+    ];
+    let mut h = Sha256 { state: H0_224, buffer: [0; 64], buf_len: 0, total: 0 };
+    h.update(data);
+    let full = h.finish();
+    let mut out = [0u8; 28];
+    out.copy_from_slice(&full[..28]);
+    out
+}
+
 /// Lowercase hex into a caller-provided buffer (2× input size).
 pub fn hex_into(bytes: &[u8], out: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";

@@ -42,7 +42,7 @@ fn is_base_prefixed(text: &str) -> bool {
     b.len() > 2 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
 }
 
-fn is_reserved(word: &str) -> bool {
+pub(crate) fn is_reserved(word: &str) -> bool {
     matches!(
         word,
         "select" | "from" | "where" | "order" | "group" | "having" | "union" | "limit"
@@ -1914,6 +1914,21 @@ impl<'a> Parser<'a> {
                     return self.arena_expr(Expr::Subquery(boxed));
                 }
                 let inner = self.expression(0)?;
+                // `(start, end) OVERLAPS (start, end)`: a time-period pair. The
+                // only place a bare parenthesized comma pair is valid; desugars
+                // to the internal `overlaps(s1, e1, s2, e2)` call.
+                if self.peeked == Tok::Op(",") {
+                    self.advance()?;
+                    let inner_end = self.expression(0)?;
+                    self.expect_op(")")?;
+                    self.expect_ident("overlaps")?;
+                    self.expect_op("(")?;
+                    let other_start = self.expression(0)?;
+                    self.expect_op(",")?;
+                    let other_end = self.expression(0)?;
+                    self.expect_op(")")?;
+                    return self.plain_call("overlaps", &[inner, inner_end, other_start, other_end]);
+                }
                 self.expect_op(")")?;
                 // `(expression).field` composite field access (chained), or
                 // `(expression).*` record expansion. The star is carried as a

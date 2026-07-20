@@ -1967,6 +1967,8 @@ fn call<'a>(
                 Datum::Text(s) => Ok(Datum::Int4(s.chars().count() as i32)),
                 // length of a bit string is its number of bits.
                 Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len() as i32)),
+                // length of a bytea is its number of bytes.
+                Datum::Bytea(b) => Ok(Datum::Int4(b.len() as i32)),
                 other => Err(type_mismatch("length", &other)),
             }
         }
@@ -3655,6 +3657,257 @@ fn call<'a>(
             };
             Ok(Datum::Bool(s.starts_with(p)))
         }
+        // Cryptographic hashes of a bytea, each returning bytea.
+        "sha224" | "sha256" | "sha384" | "sha512" => {
+            arity(1)?;
+            let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let digest: &[u8] = match name {
+                "sha224" => {
+                    arena.alloc_slice_copy(&crate::s3::sha256::sha224(bytes)).map_err(|_| arena_full())?
+                }
+                "sha256" => {
+                    arena.alloc_slice_copy(&crate::s3::sha256::sha256(bytes)).map_err(|_| arena_full())?
+                }
+                "sha384" => {
+                    arena.alloc_slice_copy(&super::sha512::sha384(bytes)).map_err(|_| arena_full())?
+                }
+                _ => arena.alloc_slice_copy(&super::sha512::sha512(bytes)).map_err(|_| arena_full())?,
+            };
+            Ok(Datum::Bytea(digest))
+        }
+        // `encode(bytea, format)` → text; `decode(text, format)` → bytea.
+        "encode" | "decode" => {
+            arity(2)?;
+            let Some(format) = text_arg(name, args, 1, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            if name == "encode" {
+                let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let text = match format {
+                    "base64" => super::encoding::base64_encode(bytes, arena)?,
+                    "hex" => super::encoding::hex_encode(bytes, arena)?,
+                    "escape" => super::encoding::escape_encode(bytes, arena)?,
+                    _ => return Err(sql_err!("22023", "unrecognized encoding: \"{}\"", format)),
+                };
+                Ok(Datum::Text(text))
+            } else {
+                let Some(text) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let bytes = match format {
+                    "base64" => super::encoding::base64_decode(text, arena)?,
+                    "hex" => super::encoding::hex_decode(text, arena)?,
+                    "escape" => super::encoding::escape_decode(text, arena)?,
+                    _ => return Err(sql_err!("22023", "unrecognized encoding: \"{}\"", format)),
+                };
+                Ok(Datum::Bytea(bytes))
+            }
+        }
+        // `convert_to(text, enc)` → bytea; `convert_from(bytea, enc)` → text.
+        // Only UTF8/UTF-8 (an identity mapping over our text storage) is
+        // supported; other encodings error loudly.
+        "convert_to" | "convert_from" => {
+            arity(2)?;
+            let Some(encoding) = text_arg(name, args, 1, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "encoding \"{}\" is not supported (only UTF8)",
+                    encoding
+                ));
+            }
+            if name == "convert_to" {
+                let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                Ok(Datum::Bytea(s.as_bytes()))
+            } else {
+                let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let s = core::str::from_utf8(bytes)
+                    .map_err(|_| sql_err!("22021", "invalid byte sequence for encoding UTF8"))?;
+                Ok(Datum::Text(s))
+            }
+        }
+        // `get_byte(bytea, n)` / `set_byte(bytea, n, v)`: 0-based byte access.
+        "get_byte" | "set_byte" => {
+            arity(if name == "get_byte" { 2 } else { 3 })?;
+            let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let Some(index) = int_arg(name, args, 1, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            if index < 0 || index as usize >= bytes.len() {
+                return Err(sql_err!("2202E", "index {} out of valid range, 0..{}", index, bytes.len()));
+            }
+            if name == "get_byte" {
+                return Ok(Datum::Int4(bytes[index as usize] as i32));
+            }
+            let Some(value) = int_arg(name, args, 2, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let out = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+            out[index as usize] = value as u8;
+            Ok(Datum::Bytea(out))
+        }
+        // `get_bit(bytea, n)` / `set_bit(bytea, n, v)`: 0-based bit access, with
+        // PostgreSQL's per-byte bit numbering (bit 0 is the LSB of byte 0).
+        "get_bit" | "set_bit" => {
+            arity(if name == "get_bit" { 2 } else { 3 })?;
+            let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let Some(bit) = int_arg(name, args, 1, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            if bit < 0 || (bit as usize) >= bytes.len() * 8 {
+                return Err(sql_err!("2202E", "index {} out of valid range, 0..{}", bit, bytes.len() * 8 - 1));
+            }
+            let byte_index = bit as usize / 8;
+            let bit_index = bit as usize % 8;
+            if name == "get_bit" {
+                return Ok(Datum::Int4(((bytes[byte_index] >> bit_index) & 1) as i32));
+            }
+            let Some(value) = int_arg(name, args, 2, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let out = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+            if value & 1 == 1 {
+                out[byte_index] |= 1 << bit_index;
+            } else {
+                out[byte_index] &= !(1 << bit_index);
+            }
+            Ok(Datum::Bytea(out))
+        }
+        // `bit_count`: the number of set bits in a bytea or bit string.
+        "bit_count" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Bytea(b) => {
+                    Ok(Datum::Int8(b.iter().map(|byte| byte.count_ones() as i64).sum()))
+                }
+                Datum::Bit { bits, .. } => {
+                    Ok(Datum::Int8(bits.bytes().filter(|c| *c == b'1').count() as i64))
+                }
+                other => Err(type_mismatch("bit_count requires bytea or bit", &other)),
+            }
+        }
+        // `(s1, e1) OVERLAPS (s2, e2)`: whether two half-open time periods
+        // overlap, comparing in microseconds. The end of each pair may be an
+        // interval (the period's length); pairs are normalized so start <= end.
+        // Any NULL endpoint → NULL.
+        "overlaps" => {
+            arity(4)?;
+            let s1 = eval_full(args[0], arena, params, row, hooks)?;
+            let e1 = eval_full(args[1], arena, params, row, hooks)?;
+            let s2 = eval_full(args[2], arena, params, row, hooks)?;
+            let e2 = eval_full(args[3], arena, params, row, hooks)?;
+            let (Some(mut a_start), Some(mut a_end)) =
+                (overlaps_micros(&s1), overlaps_end_micros(&s1, &e1))
+            else {
+                return Ok(Datum::Null);
+            };
+            let (Some(mut b_start), Some(mut b_end)) =
+                (overlaps_micros(&s2), overlaps_end_micros(&s2, &e2))
+            else {
+                return Ok(Datum::Null);
+            };
+            if a_start > a_end {
+                core::mem::swap(&mut a_start, &mut a_end);
+            }
+            if b_start > b_end {
+                core::mem::swap(&mut b_start, &mut b_end);
+            }
+            // Put the earlier start first; equal starts always overlap, else the
+            // later start must fall before the earlier period's end.
+            if a_start > b_start {
+                core::mem::swap(&mut a_start, &mut b_start);
+                core::mem::swap(&mut a_end, &mut b_end);
+            }
+            let result = a_start == b_start || b_start < a_end;
+            Ok(Datum::Bool(result))
+        }
+        // `quote_ident`: double-quote an identifier when it is not a bare
+        // lowercase identifier (or is a keyword), doubling embedded quotes.
+        "quote_ident" => {
+            arity(1)?;
+            let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            if ident_needs_quotes(s) {
+                let mut out = crate::util::StackStr::<8192>::new();
+                let _ = core::fmt::Write::write_char(&mut out, '"');
+                for c in s.chars() {
+                    if c == '"' {
+                        let _ = core::fmt::Write::write_str(&mut out, "\"\"");
+                    } else {
+                        let _ = core::fmt::Write::write_char(&mut out, c);
+                    }
+                }
+                let _ = core::fmt::Write::write_char(&mut out, '"');
+                Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+            } else {
+                Ok(Datum::Text(s))
+            }
+        }
+        // `quote_literal` / `quote_nullable`: the value as a SQL literal string.
+        // NULL → SQL NULL for quote_literal, the text `NULL` for quote_nullable.
+        "quote_literal" | "quote_nullable" => {
+            arity(1)?;
+            let v = eval_full(args[0], arena, params, row, hooks)?;
+            if v.is_null() {
+                return Ok(if name == "quote_nullable" {
+                    Datum::Text("NULL")
+                } else {
+                    Datum::Null
+                });
+            }
+            let text = datum_to_text(v, arena)?;
+            let has_backslash = text.contains('\\');
+            let mut out = crate::util::StackStr::<16384>::new();
+            use core::fmt::Write as _;
+            if has_backslash {
+                let _ = out.write_char('E');
+            }
+            let _ = out.write_char('\'');
+            for c in text.chars() {
+                match c {
+                    '\'' => {
+                        let _ = out.write_str("''");
+                    }
+                    '\\' => {
+                        let _ = out.write_str("\\\\");
+                    }
+                    _ => {
+                        let _ = out.write_char(c);
+                    }
+                }
+            }
+            let _ = out.write_char('\'');
+            Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+        }
+        // `parse_ident(text)`: split a qualified name into its parts as text[].
+        "parse_ident" => {
+            arity(1)?;
+            let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let mut parts = [Datum::Null; 64];
+            let n = parse_qualified_ident(s, &mut parts, arena)?;
+            Ok(Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(&parts[..n], arena)?,
+            })
+        }
         "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "sinh" | "cosh"
         | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians" => {
             arity(1)?;
@@ -3884,6 +4137,26 @@ fn text_arg<'a>(
     match eval_full(args[i], arena, params, row, hooks)? {
         Datum::Null => Ok(None),
         Datum::Text(s) => Ok(Some(s)),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
+/// Evaluates `args[i]` and requires a bytea (None = SQL NULL). An unknown text
+/// literal is parsed as a bytea, as PostgreSQL's coercion does.
+#[allow(clippy::too_many_arguments)]
+fn bytea_arg<'a>(
+    name: &str,
+    args: &[&Expr<'a>],
+    i: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<&'a [u8]>, SqlError> {
+    match eval_full(args[i], arena, params, row, hooks)? {
+        Datum::Null => Ok(None),
+        Datum::Bytea(b) => Ok(Some(b)),
+        Datum::Text(s) => Ok(Some(parse_bytea(s, arena)?)),
         other => Err(type_mismatch(name, &other)),
     }
 }
@@ -4155,6 +4428,113 @@ fn datum_numeric<'a>(name: &str, d: Datum<'a>, arena: &'a Arena) -> Result<Numer
 }
 
 /// Text form of a datum for concat-family functions.
+/// A date/time value as microseconds for OVERLAPS comparison, or None for NULL
+/// or a non-temporal value.
+fn overlaps_micros(d: &Datum) -> Option<i64> {
+    match d {
+        Datum::Date(days) => Some(*days as i64 * 86_400_000_000),
+        Datum::Timestamp(v) | Datum::Timestamptz(v) | Datum::Time(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// The end microseconds of an OVERLAPS pair whose start is `start`: either the
+/// end value directly, or `start` advanced by an interval end.
+fn overlaps_end_micros(start: &Datum, end: &Datum) -> Option<i64> {
+    if let Datum::Interval(iv) = end {
+        return overlaps_micros(start).map(|s| super::datetime::add_interval(s, *iv));
+    }
+    overlaps_micros(end)
+}
+
+/// Whether an identifier must be double-quoted to round-trip: it is not a bare
+/// `[a-z_][a-z0-9_]*` token, or it is a reserved keyword (which would otherwise
+/// be reinterpreted).
+fn ident_needs_quotes(s: &str) -> bool {
+    let mut chars = s.chars();
+    let valid = match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_lowercase() => {
+            chars.all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit())
+        }
+        _ => false,
+    };
+    !valid || super::parser::is_reserved(s)
+}
+
+/// Splits a possibly-qualified identifier (`schema.table`, `"Weird Name".col`)
+/// into its parts, folding unquoted parts to lowercase and unescaping quoted
+/// ones. Returns the part count.
+fn parse_qualified_ident<'a>(
+    input: &str,
+    out: &mut [Datum<'a>],
+    arena: &'a Arena,
+) -> Result<usize, SqlError> {
+    let bad = || sql_err!("42601", "string is not a valid identifier: \"{}\"", input);
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let mut n = 0usize;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err(bad());
+        }
+        if n == out.len() {
+            return Err(sql_err!("54000", "identifier has too many parts"));
+        }
+        let part = if bytes[i] == b'"' {
+            // Quoted part: read to the closing quote, collapsing `""` to `"`.
+            i += 1;
+            let mut buffer = crate::util::StackStr::<1024>::new();
+            use core::fmt::Write as _;
+            loop {
+                match bytes.get(i) {
+                    None => return Err(bad()),
+                    Some(b'"') if bytes.get(i + 1) == Some(&b'"') => {
+                        let _ = buffer.write_char('"');
+                        i += 2;
+                    }
+                    Some(b'"') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(&c) => {
+                        let _ = buffer.write_char(c as char);
+                        i += 1;
+                    }
+                }
+            }
+            arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?
+        } else {
+            // Unquoted part: letters/digits/underscore, folded to lowercase.
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric() || bytes[i] >= 0x80)
+            {
+                i += 1;
+            }
+            if i == start {
+                return Err(bad());
+            }
+            let raw = &input[start..i];
+            let lower = arena.alloc_slice_with(raw.len(), |k| raw.as_bytes()[k].to_ascii_lowercase())
+                .map_err(|_| arena_full())?;
+            unsafe { core::str::from_utf8_unchecked(lower) }
+        };
+        out[n] = Datum::Text(part);
+        n += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match bytes.get(i) {
+            Some(b'.') => i += 1,
+            None => return Ok(n),
+            _ => return Err(bad()),
+        }
+    }
+}
+
 fn datum_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
         Datum::Text(s) => Ok(s),
@@ -6292,24 +6672,44 @@ fn parse_uuid(s: &str) -> Result<[u8; 16], SqlError> {
 
 /// `\x` hex form (PostgreSQL's default bytea output).
 fn parse_bytea<'a>(s: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
-    let bad = || {
-        sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "invalid input syntax for type bytea (use \\x hex)"
-        )
-    };
-    let t = s.trim();
-    let hex = t.strip_prefix("\\x").ok_or_else(bad)?;
-    if hex.len() % 2 != 0 {
-        return Err(bad());
+    // The hex form `\xNN…`; otherwise PostgreSQL's escape form (printable bytes
+    // verbatim, `\\` for backslash, `\ooo` octal for the rest).
+    if let Some(hex) = s.strip_prefix("\\x") {
+        let bad = || {
+            sql_err!(
+                sqlstate::INVALID_TEXT_REPRESENTATION,
+                "invalid input syntax for type bytea"
+            )
+        };
+        // Whitespace between hex digits is permitted.
+        let out = arena.alloc_slice_with(hex.len() / 2 + 1, |_| 0u8).map_err(|_| arena_full())?;
+        let mut n = 0usize;
+        let mut high: Option<u8> = None;
+        for &c in hex.as_bytes() {
+            if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+                continue;
+            }
+            let v = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => return Err(bad()),
+            };
+            match high {
+                None => high = Some(v),
+                Some(h) => {
+                    out[n] = (h << 4) | v;
+                    n += 1;
+                    high = None;
+                }
+            }
+        }
+        if high.is_some() {
+            return Err(bad());
+        }
+        return Ok(&out[..n]);
     }
-    let out = arena
-        .alloc_slice_with(hex.len() / 2, |_| 0u8)
-        .map_err(|_| arena_full())?;
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| bad())?;
-    }
-    Ok(&*out)
+    super::encoding::escape_decode(s, arena)
 }
 
 /// Cast-to-text semantics (`true`/`false`), unlike wire output (`t`/`f`).
@@ -6545,7 +6945,7 @@ fn bad_text(s: &str, target: &'static str) -> SqlError {
     )
 }
 
-fn arena_full() -> SqlError {
+pub(crate) fn arena_full() -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "statement too large for SQL arena"

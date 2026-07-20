@@ -47,7 +47,23 @@ pub struct Lexer<'a> {
     token_start: usize,
 }
 
+/// An opaque lexer position, for bounded lookahead (`mark` / `reset`).
+#[derive(Clone, Copy)]
+pub struct LexerMark {
+    at: usize,
+    token_start: usize,
+}
+
 impl<'a> Lexer<'a> {
+    pub fn mark(&self) -> LexerMark {
+        LexerMark { at: self.at, token_start: self.token_start }
+    }
+
+    pub fn reset(&mut self, mark: LexerMark) {
+        self.at = mark.at;
+        self.token_start = mark.token_start;
+    }
+
     pub fn new(text: &'a str, arena: &'a Arena) -> Self {
         Self {
             text,

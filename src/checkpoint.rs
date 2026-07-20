@@ -428,14 +428,19 @@ impl Checkpointer {
                     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
                     use core::fmt::Write;
                     let _ = write!(buffer, "{sql}");
-                    storage
-                        .create_view(sql_name(name)?, buffer, true)
+                    // Checkpoint load reconstructs committed state.
+                    let (new_slot, old_slot) = storage
+                        .create_view(sql_name(name)?, buffer, true, 0)
                         .map_err(|e| {
                             CheckpointSetupError::S3(format!(
                                 "manifest view rejected: {}",
                                 e.message.as_str()
                             ))
                         })?;
+                    storage.commit_view_create(new_slot);
+                    if let Some(old) = old_slot {
+                        storage.commit_view_drop(old);
+                    }
                 }
                 Some("idx") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -456,21 +461,27 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("idx table missing"))?;
                     let name = decode_hex_name(hex_name)?;
                     let table = decode_hex_name(htable)?;
-                    storage
-                        .create_index(crate::storage::IndexDef {
-                            name: sql_name(&name)?,
-                            table: sql_name(&table)?,
-                            columns,
-                            n_cols,
-                            unique: unique != 0,
-                            live: true,
-                        })
+                    let slot = storage
+                        .create_index(
+                            crate::storage::IndexDef {
+                                name: sql_name(&name)?,
+                                table: sql_name(&table)?,
+                                columns,
+                                n_cols,
+                                unique: unique != 0,
+                                live: true,
+                                pending: None,
+                            },
+                            0,
+                        )
                         .map_err(|e| {
                             CheckpointSetupError::S3(format!(
                                 "manifest index rejected: {}",
                                 e.message.as_str()
                             ))
                         })?;
+                    // Checkpoint load reconstructs committed state.
+                    storage.commit_index_create(slot);
                 }
                 Some("end") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;

@@ -260,16 +260,19 @@ impl Engine {
         }
         for undo in txn.ddl() {
             match undo {
-                // Promote a transaction's uncommitted table DDL into the
-                // committed catalog now that the journal is durable.
+                // Promote the transaction's uncommitted DDL into the committed
+                // catalog now that the journal is durable.
                 DdlUndo::Created(slot) => self.storage.commit_create(*slot as usize),
-                DdlUndo::Dropped(slot) => self.storage.commit_drop(*slot as usize),
-                // Views and indexes are applied to the committed catalog at
-                // execution time; nothing to promote here.
-                DdlUndo::ViewCreated(_)
-                | DdlUndo::ViewDropped(_)
-                | DdlUndo::IndexCreated(_)
-                | DdlUndo::IndexDropped(_) => {}
+                DdlUndo::Dropped(slot) => {
+                    let name = self.storage.table(*slot as usize).def.name;
+                    self.storage.commit_drop(*slot as usize);
+                    // The table's indexes were pending-dropped with it.
+                    self.storage.commit_indexes_for(name.as_str(), txn.txid);
+                }
+                DdlUndo::ViewCreated(slot) => self.storage.commit_view_create(*slot as usize),
+                DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
+                DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
+                DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
             }
         }
         txn.clear();
@@ -289,14 +292,18 @@ impl Engine {
                 DdlUndo::Created(slot) => self.storage.rollback_create(slot as usize),
                 DdlUndo::Dropped(slot) => {
                     self.storage.rollback_drop(slot as usize);
-                    // The table's indexes were dropped with it; revive them too.
+                    // The table's indexes were pending-dropped with it; revert.
                     let name = self.storage.table(slot as usize).def.name;
-                    self.storage.revive_indexes_for(name.as_str());
+                    self.storage.rollback_indexes_for(name.as_str(), txn.txid);
                 }
-                DdlUndo::ViewCreated(slot) => self.storage.drop_view_slot(slot as usize),
-                DdlUndo::ViewDropped(slot) => self.storage.revive_view(slot as usize),
-                DdlUndo::IndexCreated(slot) => self.storage.drop_index_slot(slot as usize),
-                DdlUndo::IndexDropped(slot) => self.storage.revive_index(slot as usize),
+                DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
+                DdlUndo::ViewDropped(slot) => {
+                    self.storage.rollback_view_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
+                DdlUndo::IndexDropped(slot) => {
+                    self.storage.rollback_index_drop(slot as usize, txn.txid)
+                }
             }
         }
         self.wal.truncate_to_mark(txn.wal_mark);
@@ -319,12 +326,16 @@ impl Engine {
                 DdlUndo::Dropped(slot) => {
                     self.storage.rollback_drop(slot as usize);
                     let name = self.storage.table(slot as usize).def.name;
-                    self.storage.revive_indexes_for(name.as_str());
+                    self.storage.rollback_indexes_for(name.as_str(), txn.txid);
                 }
-                DdlUndo::ViewCreated(slot) => self.storage.drop_view_slot(slot as usize),
-                DdlUndo::ViewDropped(slot) => self.storage.revive_view(slot as usize),
-                DdlUndo::IndexCreated(slot) => self.storage.drop_index_slot(slot as usize),
-                DdlUndo::IndexDropped(slot) => self.storage.revive_index(slot as usize),
+                DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
+                DdlUndo::ViewDropped(slot) => {
+                    self.storage.rollback_view_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
+                DdlUndo::IndexDropped(slot) => {
+                    self.storage.rollback_index_drop(slot as usize, txn.txid)
+                }
             }
         }
         txn.rewind_touched(sp.touched_mark);
@@ -721,7 +732,7 @@ impl Engine {
         match &statement {
             Stmt::Select(s) => {
                 // Describe the CTE-expanded query so derived columns resolve.
-                let s = match query::expand_ctes(s, &self.storage, arena) {
+                let s = match query::expand_ctes(s, &self.storage, txn.txid, arena) {
                     Ok(x) => x,
                     Err(e) => {
                         responder.error(e.sqlstate, e.message.as_str())?;
@@ -742,6 +753,19 @@ impl Engine {
                     None => exec::describe_items(s.items, None, &mut columns),
                 };
                 match described {
+                    Ok(n) => {
+                        responder.row_description(&columns[..n])?;
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        responder.error(e.sqlstate, e.message.as_str())?;
+                        Ok(false)
+                    }
+                }
+            }
+            Stmt::SetQuery(q) => {
+                let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                match query::describe_set_query(&self.storage, txn.txid, q, &mut columns, arena) {
                     Ok(n) => {
                         responder.row_description(&columns[..n])?;
                         Ok(true)
@@ -867,7 +891,7 @@ impl Engine {
             }
             Stmt::Insert(i) => {
                 // DML on an auto-updatable view rewrites to its base table.
-                let i = match query::resolve_view_for_dml(&self.storage, i.table, arena) {
+                let i = match query::resolve_view_for_dml(&self.storage, i.table, txn.txid, arena) {
                     Ok(Some(uv)) => {
                         // Empty target columns default to the view's exposed
                         // columns, so a base column the view hides is untouched.
@@ -890,7 +914,7 @@ impl Engine {
                 exec::insert(&mut self.storage, txn, i, arena, params, responder)
             }
             Stmt::Update(u) => {
-                let u = match query::resolve_view_for_dml(&self.storage, u.table, arena) {
+                let u = match query::resolve_view_for_dml(&self.storage, u.table, txn.txid, arena) {
                     Ok(Some(uv)) => {
                         let where_clause =
                             match query::and_where(uv.where_clause, u.where_clause, arena) {
@@ -914,7 +938,7 @@ impl Engine {
                 exec::update(&mut self.storage, txn, &mut self.scratch, u, arena, params, responder)
             }
             Stmt::Delete(d) => {
-                let d = match query::resolve_view_for_dml(&self.storage, d.table, arena) {
+                let d = match query::resolve_view_for_dml(&self.storage, d.table, txn.txid, arena) {
                     Ok(Some(uv)) => {
                         let where_clause =
                             match query::and_where(uv.where_clause, d.where_clause, arena) {
@@ -1300,7 +1324,7 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
 }
 
 fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), WireFull> {
-    responder.error(sqlstate::SYNTAX_ERROR, e.message.as_str())
+    responder.error(e.sqlstate, e.message.as_str())
 }
 
 /// Reapplies one journal record to storage during recovery.
@@ -1317,7 +1341,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 });
             };
             storage.drop_table(index);
-            storage.drop_indexes_for(name);
+            storage.drop_indexes_for(name, 0);
+            storage.commit_indexes_for(name, 0);
         }
         WalOp::Upsert { table, rowid, row } => {
             let Some(index) = storage.find_table(table) else {
@@ -1348,26 +1373,41 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.table_mut(index).rows.remove(&rowid);
         }
         WalOp::CreateView { name, sql } => {
+            // Replay reconstructs committed state: create then promote.
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             use core::fmt::Write;
             let _ = write!(buffer, "{sql}");
-            storage.create_view(crate::storage::SqlName::parse(name)?, buffer, true)?;
+            let (new_slot, old_slot) =
+                storage.create_view(crate::storage::SqlName::parse(name)?, buffer, true, 0)?;
+            storage.commit_view_create(new_slot);
+            if let Some(old) = old_slot {
+                storage.commit_view_drop(old);
+            }
         }
         WalOp::DropView(name) => {
-            storage.drop_view(name);
+            if let Some(slot) = storage.drop_view(name, 0)? {
+                storage.commit_view_drop(slot);
+            }
         }
         WalOp::CreateIndex { name, table, columns, n_cols, unique } => {
-            storage.create_index(crate::storage::IndexDef {
-                name: crate::storage::SqlName::parse(name)?,
-                table: crate::storage::SqlName::parse(table)?,
-                columns,
-                n_cols,
-                unique,
-                live: true,
-            })?;
+            let slot = storage.create_index(
+                crate::storage::IndexDef {
+                    name: crate::storage::SqlName::parse(name)?,
+                    table: crate::storage::SqlName::parse(table)?,
+                    columns,
+                    n_cols,
+                    unique,
+                    live: true,
+                    pending: None,
+                },
+                0,
+            )?;
+            storage.commit_index_create(slot);
         }
         WalOp::DropIndex(name) => {
-            storage.drop_index(name);
+            if let Some(slot) = storage.drop_index(name, 0)? {
+                storage.commit_index_drop(slot);
+            }
         }
     }
     storage.set_lsn(lsn);
@@ -1707,6 +1747,96 @@ mod tests {
     }
 
     #[test]
+    fn uncommitted_create_view_is_invisible_to_other_sessions() {
+        let (mut e, mut b) = test_engine();
+        let mut a = TxnState::new(&mut b, 256).unwrap();
+        let mut s = TxnState::new(&mut b, 256).unwrap();
+        run_txn(&mut e, &mut b, &mut a, "CREATE TABLE t (id int)");
+        run_txn(&mut e, &mut b, &mut a, "INSERT INTO t VALUES (3)");
+        run_txn(&mut e, &mut b, &mut a, "BEGIN");
+        run_txn(&mut e, &mut b, &mut a, "CREATE VIEW v AS SELECT id FROM t");
+        // The creator sees its own uncommitted view.
+        let own = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM v");
+        assert!(own.contains("SELECT 1") && own.contains('3'), "creator sees its own view: {own}");
+        // Another session does not.
+        let other = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
+        assert!(other.contains("does not exist"), "other must not see it: {other}");
+        // Nor can it create the same name concurrently.
+        let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE VIEW v AS SELECT id FROM t");
+        assert!(conflict.contains("40001"), "concurrent create conflicts: {conflict}");
+        // After commit it becomes visible to everyone.
+        run_txn(&mut e, &mut b, &mut a, "COMMIT");
+        let now = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
+        assert!(now.contains("SELECT 1") && now.contains('3'), "visible after commit: {now}");
+    }
+
+    #[test]
+    fn rolled_back_create_view_never_appears() {
+        let (mut e, mut b) = test_engine();
+        let mut a = TxnState::new(&mut b, 256).unwrap();
+        let mut s = TxnState::new(&mut b, 256).unwrap();
+        run_txn(&mut e, &mut b, &mut a, "CREATE TABLE t (id int)");
+        run_txn(&mut e, &mut b, &mut a, "BEGIN");
+        run_txn(&mut e, &mut b, &mut a, "CREATE VIEW v AS SELECT id FROM t");
+        run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
+        let gone = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
+        assert!(gone.contains("does not exist"), "rolled-back view never appears: {gone}");
+        // The name (and slot) is free again for anyone.
+        let reuse = run_txn(&mut e, &mut b, &mut s, "CREATE VIEW v AS SELECT id FROM t");
+        assert!(reuse.contains("CREATE VIEW"), "slot freed after rollback: {reuse}");
+    }
+
+    #[test]
+    fn uncommitted_drop_view_stays_visible_to_other_sessions() {
+        let (mut e, mut b) = test_engine();
+        let mut a = TxnState::new(&mut b, 256).unwrap();
+        let mut s = TxnState::new(&mut b, 256).unwrap();
+        run_txn(&mut e, &mut b, &mut a, "CREATE TABLE t (id int)");
+        run_txn(&mut e, &mut b, &mut a, "INSERT INTO t VALUES (9)");
+        run_txn(&mut e, &mut b, &mut a, "CREATE VIEW v AS SELECT id FROM t");
+        run_txn(&mut e, &mut b, &mut a, "BEGIN");
+        let dropped = run_txn(&mut e, &mut b, &mut a, "DROP VIEW v");
+        assert!(dropped.contains("DROP VIEW"), "drop succeeds: {dropped}");
+        // The dropper no longer sees it; others still do until commit.
+        let own = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM v");
+        assert!(own.contains("does not exist"), "dropper does not see it: {own}");
+        run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
+        let other = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
+        assert!(other.contains("SELECT 1") && other.contains('9'), "still visible after rollback: {other}");
+        // Now commit an actual drop and it disappears for everyone.
+        run_txn(&mut e, &mut b, &mut a, "DROP VIEW v");
+        let after = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
+        assert!(after.contains("does not exist"), "gone after committed drop: {after}");
+    }
+
+    #[test]
+    fn uncommitted_create_index_is_invisible_to_other_sessions() {
+        let (mut e, mut b) = test_engine();
+        let mut a = TxnState::new(&mut b, 256).unwrap();
+        let mut s = TxnState::new(&mut b, 256).unwrap();
+        run_txn(&mut e, &mut b, &mut a, "CREATE TABLE t (id int)");
+        run_txn(&mut e, &mut b, &mut a, "INSERT INTO t VALUES (1)");
+        run_txn(&mut e, &mut b, &mut a, "BEGIN");
+        run_txn(&mut e, &mut b, &mut a, "CREATE UNIQUE INDEX t_id ON t (id)");
+        // The pending unique index binds its creator...
+        let own = run_txn(&mut e, &mut b, &mut a, "INSERT INTO t VALUES (1)");
+        assert!(own.contains("23505"), "creator is bound by its own pending index: {own}");
+        run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
+        // ...but another session must not be bound by an uncommitted index.
+        run_txn(&mut e, &mut b, &mut a, "BEGIN");
+        run_txn(&mut e, &mut b, &mut a, "CREATE UNIQUE INDEX t_id ON t (id)");
+        let other = run_txn(&mut e, &mut b, &mut s, "INSERT INTO t VALUES (1)");
+        assert!(other.contains("INSERT 0 1"), "other unbound by pending index: {other}");
+        // Concurrent creation of the same index name conflicts.
+        let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
+        assert!(conflict.contains("40001"), "concurrent create conflicts: {conflict}");
+        run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
+        // After rollback the name is free.
+        let reuse = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
+        assert!(reuse.contains("CREATE INDEX"), "name freed after rollback: {reuse}");
+    }
+
+    #[test]
     fn rolled_back_create_never_appears_and_frees_the_slot() {
         let (mut e, mut b) = test_engine();
         let mut a = TxnState::new(&mut b, 256).unwrap();
@@ -1967,9 +2097,15 @@ mod tests {
         assert!(run("CREATE TABLE nc (a int REFERENCES nu(a))").contains("42830"), "non-unique");
         // Referencing a missing table is 42P01.
         assert!(run("CREATE TABLE nt (a int REFERENCES nope(a))").contains("42P01"), "missing tbl");
-        // A cascade/set-null action is rejected loudly for now (0A000).
+        // Referential actions rewrite the referencing rows (verified against
+        // PostgreSQL 18.4): CASCADE removes them with the parent.
         assert!(run("CREATE TABLE cc (pid int REFERENCES p(id) ON DELETE CASCADE)")
-            .contains("0A000"), "cascade rejected");
+            .contains("CREATE TABLE"), "cascade accepted");
+        run("INSERT INTO p VALUES (5, 'x')");
+        run("INSERT INTO cc VALUES (5)");
+        assert!(run("DELETE FROM p WHERE id = 5").contains("DELETE 1"), "cascade delete");
+        let left = run("SELECT pid FROM cc");
+        assert!(left.contains("SELECT 0"), "child cascaded: {left}");
     }
 
     #[test]

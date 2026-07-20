@@ -1,9 +1,13 @@
 //! `to_char(numeric, text)` number formatting, following PostgreSQL's
-//! `NUM_processor`. Supports the common format codes — digit positions (`9`,
-//! `0`), decimal point (`.`, `D`), group separators (`,`, `G`), the floating
-//! sign (`S` and the implicit sign slot), a currency marker (`L`, `$`), fill
-//! mode (`FM`), and the overflow `#` fill. Exotic codes (`MI`, `PL`, `SG`,
-//! `PR`, `V`, `EEEE`, `RN`, `TH`) are rejected loudly rather than misformatted.
+//! `NUM_processor`. Supports digit positions (`9`, `0`), decimal point
+//! (`.`, `D`), group separators (`,`, `G`), the floating sign (`S` and the
+//! implicit sign slot), positional signs (`MI`, `PL`, `SG`), angle brackets
+//! (`PR`), ordinal suffixes (`TH`/`th`), Roman numerals (`RN`/`rn`),
+//! scientific notation (`EEEE`), the implied-decimal multiplier (`V`), a
+//! currency marker (`L`, `$`), fill mode (`FM`), and the overflow `#` fill.
+//! Format-combination validation mirrors `NUMDesc_prepare` (PostgreSQL 18,
+//! `src/backend/utils/adt/formatting.c`), and every rendering rule here was
+//! pinned empirically against PostgreSQL 18.4.
 
 use super::eval::SqlError;
 use super::numeric::{Numeric, RoundMode};
@@ -27,6 +31,21 @@ enum Tok {
     Group,
     /// `L` / `$`: currency marker (`$` in the C locale).
     Currency,
+    /// `MI`: `-` for negatives, a space otherwise (nothing under FM).
+    SignMinus,
+    /// `PL`: `+` for non-negatives, a space otherwise (nothing under FM).
+    SignPlus,
+    /// `SG`: `-` or `+`, always.
+    SignSg,
+    /// `PR`: the closing `>` position (`<value>` for negatives; the opening
+    /// bracket floats like a sign).
+    BracketClose,
+    /// `TH` / `th`: English ordinal suffix (skipped for negatives and for
+    /// formats with a decimal point).
+    Ordinal { upper: bool },
+    /// `V`: renders nothing itself; the digits after it extend the integer
+    /// field and each `9` multiplies the value by ten.
+    VMark,
     /// Any literal character emitted verbatim.
     Literal(u8),
 }
@@ -38,6 +57,12 @@ enum SignKind {
     Default,
     /// `S`: `-`/`+` glued to the number.
     S,
+    /// `MI`/`SG` present: the positional token carries the sign; the implicit
+    /// slot disappears entirely.
+    None,
+    /// `PR`: `<` floats like a sign for negatives (space otherwise); the
+    /// matching `>` sits at the `PR` position.
+    Bracket,
 }
 
 /// Formats `value` per `fmt`, returning an arena-allocated string.
@@ -56,12 +81,20 @@ pub fn number<'a>(
     let mut ntok = 0usize;
     let mut fm = false;
     let mut sign_kind = SignKind::Default;
-    let mut sign_seen = false;
+    let mut sign_seen = false; // `S`
     let mut sign_trailing = false;
     let mut has_point = false;
     let mut int_digits = 0usize;
     let mut frac_digits = 0usize;
     let mut seen_digit = false;
+    let mut plus = false; // PL
+    let mut minus = false; // MI
+    let mut bracket = false; // PR
+    let mut roman = false; // RN
+    let mut roman_upper = true;
+    let mut multi = 0usize; // `9` positions after V: multiply by 10^multi
+    let mut in_multi = false;
+    let mut eeee = false;
 
     let bytes = fmt.as_bytes();
     let mut i = 0usize;
@@ -82,29 +115,105 @@ pub fn number<'a>(
         } else {
             [up, 0]
         };
+        // Anything but a plain literal after EEEE is an error, as in
+        // PostgreSQL (literal characters may still follow).
+        let is_action = matches!(up, b'9' | b'0' | b'.' | b'D' | b',' | b'G' | b'L' | b'$' | b'S' | b'V')
+            || matches!(&two, b"MI" | b"PL" | b"SG" | b"PR" | b"TH" | b"RN" | b"FM" | b"EE");
+        if eeee && is_action {
+            return Err(sql_err!("42601", "\"EEEE\" must be the last pattern used"));
+        }
         match &two {
             b"FM" => {
                 fm = true;
                 i += 2;
                 continue;
             }
-            b"MI" | b"PL" | b"SG" | b"PR" | b"TH" | b"RN" => {
-                return Err(sql_err!(
-                    "0A000",
-                    "to_char format code not supported: \"{}{}\"",
-                    two[0] as char,
-                    (two[1] as char).to_ascii_lowercase()
-                ));
+            b"MI" => {
+                if sign_seen {
+                    return Err(sql_err!("42601", "cannot use \"S\" and \"MI\" together"));
+                }
+                minus = true;
+                push(&mut toks, &mut ntok, Tok::SignMinus)?;
+                i += 2;
+                continue;
+            }
+            b"PL" => {
+                if sign_seen {
+                    return Err(sql_err!("42601", "cannot use \"S\" and \"PL\" together"));
+                }
+                plus = true;
+                push(&mut toks, &mut ntok, Tok::SignPlus)?;
+                i += 2;
+                continue;
+            }
+            b"SG" => {
+                if sign_seen {
+                    return Err(sql_err!("42601", "cannot use \"S\" and \"SG\" together"));
+                }
+                minus = true;
+                plus = true;
+                push(&mut toks, &mut ntok, Tok::SignSg)?;
+                i += 2;
+                continue;
+            }
+            b"PR" => {
+                if sign_seen || plus || minus {
+                    return Err(sql_err!(
+                        "42601",
+                        "cannot use \"PR\" and \"S\"/\"PL\"/\"MI\"/\"SG\" together"
+                    ));
+                }
+                bracket = true;
+                push(&mut toks, &mut ntok, Tok::BracketClose)?;
+                i += 2;
+                continue;
+            }
+            b"TH" => {
+                push(&mut toks, &mut ntok, Tok::Ordinal { upper: bytes[i] == b'T' })?;
+                i += 2;
+                continue;
+            }
+            b"RN" => {
+                if roman {
+                    return Err(sql_err!("42601", "cannot use \"RN\" twice"));
+                }
+                roman = true;
+                roman_upper = bytes[i] == b'R';
+                i += 2;
+                continue;
             }
             b"EE" => {
-                return Err(sql_err!("0A000", "to_char format code not supported: \"EEEE\""));
+                let four = i + 3 < bytes.len()
+                    && bytes[i + 2].eq_ignore_ascii_case(&b'E')
+                    && bytes[i + 3].eq_ignore_ascii_case(&b'E');
+                if !four {
+                    return Err(sql_err!(
+                        "0A000",
+                        "to_char format code not supported: \"E\""
+                    ));
+                }
+                if eeee {
+                    return Err(sql_err!("42601", "cannot use \"EEEE\" twice"));
+                }
+                if fm || sign_seen || bracket || minus || plus || roman || multi > 0 || in_multi {
+                    return Err(sql_err!("42601", "\"EEEE\" is incompatible with other formats"));
+                }
+                eeee = true;
+                i += 4;
+                continue;
             }
             _ => {}
         }
         match up {
             b'9' => {
+                if bracket {
+                    return Err(sql_err!("42601", "\"9\" must be ahead of \"PR\""));
+                }
                 push(&mut toks, &mut ntok, Tok::Nine)?;
-                if has_point {
+                if in_multi {
+                    multi += 1;
+                    int_digits += 1;
+                } else if has_point {
                     frac_digits += 1;
                 } else {
                     int_digits += 1;
@@ -112,17 +221,28 @@ pub fn number<'a>(
                 seen_digit = true;
             }
             b'0' => {
+                if bracket {
+                    return Err(sql_err!("42601", "\"0\" must be ahead of \"PR\""));
+                }
                 push(&mut toks, &mut ntok, Tok::Zero)?;
-                if has_point {
+                if has_point && !in_multi {
                     frac_digits += 1;
                 } else {
+                    // A `0` after `V` extends the integer field without
+                    // multiplying (PostgreSQL's NUMDesc_prepare quirk).
                     int_digits += 1;
                 }
                 seen_digit = true;
             }
             b'.' | b'D' => {
                 if has_point {
-                    return Err(sql_err!("22023", "cannot use \"{}\" twice", c as char));
+                    return Err(sql_err!("42601", "multiple decimal points"));
+                }
+                if in_multi {
+                    return Err(sql_err!(
+                        "42601",
+                        "cannot use \"V\" and decimal point together"
+                    ));
                 }
                 has_point = true;
                 push(&mut toks, &mut ntok, Tok::Point)?;
@@ -131,13 +251,28 @@ pub fn number<'a>(
             b'L' | b'$' => push(&mut toks, &mut ntok, Tok::Currency)?,
             b'S' => {
                 if sign_seen {
-                    return Err(sql_err!("22023", "cannot use \"S\" twice"));
+                    return Err(sql_err!("42601", "cannot use \"S\" twice"));
+                }
+                if plus || minus || bracket {
+                    return Err(sql_err!(
+                        "42601",
+                        "cannot use \"S\" and \"PL\"/\"MI\"/\"SG\"/\"PR\" together"
+                    ));
                 }
                 sign_seen = true;
                 sign_kind = SignKind::S;
                 sign_trailing = seen_digit;
             }
-            b'V' => return Err(sql_err!("0A000", "to_char format code not supported: \"V\"")),
+            b'V' => {
+                if has_point {
+                    return Err(sql_err!(
+                        "42601",
+                        "cannot use \"V\" and decimal point together"
+                    ));
+                }
+                in_multi = true;
+                push(&mut toks, &mut ntok, Tok::VMark)?;
+            }
             // Punctuation and spaces are literal; unrecognized letters are a
             // loud gap rather than a silent mis-format.
             _ => {
@@ -154,6 +289,33 @@ pub fn number<'a>(
         i += 1;
     }
 
+    // RN combines only with FM (plain digit positions carry no flag and are
+    // ignored); anything else is an error, as in PostgreSQL.
+    if roman && (sign_seen || plus || minus || bracket || multi > 0 || in_multi || eeee) {
+        return Err(sql_err!("42601", "\"RN\" is incompatible with other formats"));
+    }
+    if roman {
+        return render_roman(value, float_source, roman_upper, fm, arena);
+    }
+    if eeee {
+        return render_eeee(
+            value,
+            float_source,
+            int_digits,
+            frac_digits,
+            negative_sign_override,
+            arena,
+        );
+    }
+
+    if minus || bracket {
+        sign_kind = match sign_kind {
+            SignKind::Default if bracket => SignKind::Bracket,
+            SignKind::Default => SignKind::None,
+            other => other,
+        };
+    }
+
     render(
         value,
         &toks[..ntok],
@@ -163,10 +325,214 @@ pub fn number<'a>(
         has_point,
         int_digits,
         frac_digits,
+        multi,
         negative_sign_override,
         float_source,
         arena,
     )
+}
+
+/// The English ordinal suffix for the integer whose decimal digits end as
+/// given (`1st`, `2nd`, `3rd`, `11th`–`13th`, else `th`).
+fn ordinal_suffix(int_digits_text: &[u8]) -> &'static str {
+    let last = int_digits_text.last().copied().unwrap_or(b'0');
+    let prev = if int_digits_text.len() >= 2 {
+        int_digits_text[int_digits_text.len() - 2]
+    } else {
+        b'0'
+    };
+    if prev == b'1' {
+        return "TH";
+    }
+    match last {
+        b'1' => "ST",
+        b'2' => "ND",
+        b'3' => "RD",
+        _ => "TH",
+    }
+}
+
+/// `RN`/`rn`: the value rounded to an integer as a Roman numeral,
+/// right-justified to 15 characters (FM trims). Out of 1..=3999 fills with
+/// `#`, as PostgreSQL.
+fn render_roman<'a>(
+    value: &Numeric,
+    float_source: Option<f64>,
+    upper: bool,
+    fm: bool,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let text = match float_source {
+        Some(x) if x.is_finite() => stack_format!(512, "{:.0}", x),
+        _ => {
+            let rounded = value.round_scale(0, RoundMode::HalfAwayZero, arena)?;
+            stack_format!(512, "{}", rounded)
+        }
+    };
+    let n: i64 = text.as_str().parse().unwrap_or(-1);
+    let mut out = [0u8; 16];
+    let mut olen = 0usize;
+    if !(1..=3999).contains(&n) {
+        let filled = "###############";
+        return arena.alloc_str(filled).map_err(|_| sql_err!("53200", "out of memory"));
+    }
+    const ONES: [&str; 10] = ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"];
+    const TENS: [&str; 10] = ["", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"];
+    const HUNDREDS: [&str; 10] = ["", "C", "CC", "CCC", "CD", "D", "DC", "DCC", "DCCC", "CM"];
+    let emit = |s: &str, out: &mut [u8; 16], olen: &mut usize| {
+        for &b in s.as_bytes() {
+            out[*olen] = b;
+            *olen += 1;
+        }
+    };
+    for _ in 0..(n / 1000) {
+        emit("M", &mut out, &mut olen);
+    }
+    emit(HUNDREDS[(n / 100 % 10) as usize], &mut out, &mut olen);
+    emit(TENS[(n / 10 % 10) as usize], &mut out, &mut olen);
+    emit(ONES[(n % 10) as usize], &mut out, &mut olen);
+    let mut body = [0u8; 16];
+    for k in 0..olen {
+        body[k] = if upper { out[k] } else { out[k].to_ascii_lowercase() };
+    }
+    let roman = core::str::from_utf8(&body[..olen]).expect("ascii");
+    if fm {
+        return arena.alloc_str(roman).map_err(|_| sql_err!("53200", "out of memory"));
+    }
+    let padded = stack_format!(24, "{:>15}", roman);
+    arena.alloc_str(padded.as_str()).map_err(|_| sql_err!("53200", "out of memory"))
+}
+
+/// `EEEE`: scientific notation `[sign]d.<frac>e±XX`. A float8 source rounds
+/// half-even on its binary value; numeric rounds half-away on its decimal
+/// digits.
+fn render_eeee<'a>(
+    value: &Numeric,
+    float_source: Option<f64>,
+    int_digits: usize,
+    frac_digits: usize,
+    negative_sign_override: bool,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    // NaN/Infinity: a space, then `#` fill with the point after the integer
+    // positions — `pre + post + 6` characters total, as PostgreSQL.
+    let nonfinite = matches!(float_source, Some(x) if !x.is_finite())
+        || (float_source.is_none() && value.is_nan());
+    if nonfinite {
+        let total = int_digits.max(1) + frac_digits + 6;
+        let mut out = [b'#'; 64];
+        let n = total.min(out.len());
+        out[0] = b' ';
+        let dot = int_digits.max(1) + 1;
+        if dot < n {
+            out[dot] = b'.';
+        }
+        let text = core::str::from_utf8(&out[..n]).expect("ascii");
+        return arena.alloc_str(text).map_err(|_| sql_err!("53200", "out of memory"));
+    }
+    // Mantissa digits (1 + frac) and a base-10 exponent.
+    let (neg, mantissa, exponent) = match float_source {
+        Some(x) if x.is_finite() => {
+            let t = stack_format!(64, "{:.*e}", frac_digits, x.abs());
+            let s = t.as_str();
+            let (m, e) = s.split_once('e').expect("float scientific form");
+            let mut digits = [b'0'; 512];
+            let mut nd = 0usize;
+            for b in m.bytes() {
+                if b.is_ascii_digit() {
+                    digits[nd] = b;
+                    nd += 1;
+                }
+            }
+            let exponent: i32 = e.parse().expect("float exponent");
+            ((x < 0.0 && x != 0.0) || negative_sign_override, (digits, nd), exponent)
+        }
+        _ => {
+            let t = stack_format!(512, "{}", value);
+            let s = t.as_str();
+            let neg = s.starts_with('-') || negative_sign_override;
+            let body = s.strip_prefix('-').unwrap_or(s);
+            let (ip, fp) = body.split_once('.').unwrap_or((body, ""));
+            // Significant digits and the exponent of the first one.
+            let mut digits = [b'0'; 512];
+            let mut nd = 0usize;
+            let mut exponent = 0i32;
+            let mut seen = false;
+            for (k, b) in ip.bytes().enumerate() {
+                if !seen && b != b'0' {
+                    seen = true;
+                    exponent = (ip.len() - 1 - k) as i32;
+                }
+                if seen {
+                    digits[nd] = b;
+                    nd += 1;
+                }
+            }
+            for (k, b) in fp.bytes().enumerate() {
+                if !seen && b != b'0' {
+                    seen = true;
+                    exponent = -(k as i32 + 1);
+                }
+                if seen && nd < digits.len() {
+                    digits[nd] = b;
+                    nd += 1;
+                }
+            }
+            if !seen {
+                // Zero.
+                (false, ([b'0'; 512], 1), 0)
+            } else {
+                // Round the significant digits to 1 + frac places
+                // (half-away-from-zero), carrying into the exponent.
+                let keep = 1 + frac_digits;
+                if nd > keep {
+                    let round_up = digits[keep] >= b'5';
+                    nd = keep;
+                    if round_up {
+                        let mut k = keep;
+                        loop {
+                            if k == 0 {
+                                // 9.99… rolled over: mantissa becomes 1, the
+                                // exponent grows.
+                                digits[0] = b'1';
+                                for slot in digits[1..keep].iter_mut() {
+                                    *slot = b'0';
+                                }
+                                exponent += 1;
+                                break;
+                            }
+                            k -= 1;
+                            if digits[k] == b'9' {
+                                digits[k] = b'0';
+                            } else {
+                                digits[k] += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                (neg, (digits, nd), exponent)
+            }
+        }
+    };
+    let (digits, nd) = mantissa;
+    let mut out = StackStr::<128>::default();
+    let _ = write!(out, "{}", if neg { '-' } else { ' ' });
+    let _ = write!(out, "{}", digits[0] as char);
+    if frac_digits > 0 {
+        let _ = write!(out, ".");
+        for k in 1..=frac_digits {
+            let d = *digits.get(k).filter(|_| k < nd).unwrap_or(&b'0');
+            let _ = write!(out, "{}", d as char);
+        }
+    }
+    let _ = write!(out, "e{}", if exponent < 0 { '-' } else { '+' });
+    let e = exponent.unsigned_abs();
+    if e < 10 {
+        let _ = write!(out, "0");
+    }
+    let _ = write!(out, "{}", e);
+    arena.alloc_str(out.as_str()).map_err(|_| sql_err!("53200", "out of memory"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,6 +545,7 @@ fn render<'a>(
     has_point: bool,
     int_digits: usize,
     frac_digits: usize,
+    multi: usize,
     negative_sign_override: bool,
     float_source: Option<f64>,
     arena: &'a Arena,
@@ -186,16 +553,51 @@ fn render<'a>(
     // Round to the number of fractional positions the format provides. A
     // finite float8 input formats from its binary value with round-half-even
     // (C's `%.*f`, so `-120.975` — really `-120.97499…` — gives `-120.97`);
-    // a numeric input rounds half-away-from-zero on its decimal value. Both
-    // verified against PostgreSQL 18.4.
+    // a numeric input rounds half-away-from-zero on its decimal value. With
+    // `V`, the value is scaled by 10^multi instead (rounded at that many
+    // decimals, then the point dropped — `V` and `.` never combine).
+    // Non-finite values (pinned against PostgreSQL 18.4): NaN lays the text
+    // "NaN" into the digit positions with no fractional part; Infinity
+    // overflows every position (keeping its sign).
+    let nan = matches!(float_source, Some(x) if x.is_nan())
+        || (float_source.is_none() && value.is_nan());
+    let infinite = matches!(float_source, Some(x) if x.is_infinite());
+    if nan || infinite {
+        return render_nonfinite(
+            toks,
+            fm,
+            sign_kind,
+            sign_trailing,
+            int_digits,
+            nan,
+            negative_sign_override,
+            arena,
+        );
+    }
+    let scale = if multi > 0 { multi } else { frac_digits };
     let text = match float_source {
-        Some(x) if x.is_finite() => stack_format!(512, "{:.*}", frac_digits, x),
+        // A float8 with `V` multiplies the binary value by 10^multi first,
+        // then rounds to an integer (PostgreSQL's `float8_to_char`).
+        Some(x) if x.is_finite() && multi > 0 => {
+            stack_format!(512, "{:.0}", x * 10f64.powi(multi as i32))
+        }
+        Some(x) if x.is_finite() => stack_format!(512, "{:.*}", scale, x),
         _ => {
-            let rounded = value.round_scale(frac_digits, RoundMode::HalfAwayZero, arena)?;
+            let rounded = value.round_scale(scale, RoundMode::HalfAwayZero, arena)?;
             stack_format!(512, "{}", rounded)
         }
     };
-    let s = text.as_str();
+    let mut scaled = StackStr::<512>::default();
+    let s: &str = if multi > 0 {
+        for ch in text.as_str().chars() {
+            if ch != '.' {
+                let _ = write!(scaled, "{}", ch);
+            }
+        }
+        scaled.as_str()
+    } else {
+        text.as_str()
+    };
     let body = s.strip_prefix('-').unwrap_or(s);
     let (intpart, fracpart) = body.split_once('.').unwrap_or((body, ""));
     let body_zero = body.bytes().all(|b| !b.is_ascii_digit() || b == b'0');
@@ -255,6 +657,10 @@ fn render<'a>(
         int_trimmed.as_bytes()
     };
 
+    // The ordinal suffix reads the integer digits (blank for negatives and
+    // decimal formats).
+    let ordinal = ordinal_suffix(if intstr.is_empty() { b"0" } else { intstr });
+
     // A `0` code forces zero-fill from its integer position rightward; leading
     // `9` positions to its left stay blank.
     let dp = point_index(toks);
@@ -287,6 +693,17 @@ fn render<'a>(
             }
         }
         SignKind::S => Some(if neg { b'-' } else { b'+' }),
+        // MI / SG carry the sign at their own token position.
+        SignKind::None => None,
+        SignKind::Bracket => {
+            if neg {
+                Some(b'<')
+            } else if fm {
+                None
+            } else {
+                Some(b' ')
+            }
+        }
     };
     let sign_leading = !sign_trailing;
 
@@ -308,6 +725,17 @@ fn render<'a>(
         *olen += 1;
         Ok(())
     };
+    let emit_str =
+        |out: &mut [u8; MAX_OUT], olen: &mut usize, s: &str| -> Result<(), SqlError> {
+            for &b in s.as_bytes() {
+                if *olen >= MAX_OUT {
+                    return Err(sql_err!("22023", "to_char output too long"));
+                }
+                out[*olen] = b;
+                *olen += 1;
+            }
+            Ok(())
+        };
 
     let mut int_idx = 0usize; // integer digit tokens seen
     let mut frac_idx = 0usize; // fractional digit tokens seen
@@ -381,6 +809,47 @@ fn render<'a>(
                 }
             }
             Tok::Currency => emit(&mut out, &mut olen, b'$')?,
+            Tok::SignMinus => {
+                if neg {
+                    emit(&mut out, &mut olen, b'-')?;
+                } else if !fm {
+                    emit(&mut out, &mut olen, b' ')?;
+                }
+            }
+            Tok::SignPlus => {
+                if !neg {
+                    emit(&mut out, &mut olen, b'+')?;
+                } else if !fm {
+                    emit(&mut out, &mut olen, b' ')?;
+                }
+            }
+            Tok::SignSg => emit(&mut out, &mut olen, if neg { b'-' } else { b'+' })?,
+            Tok::BracketClose => {
+                if neg {
+                    emit(&mut out, &mut olen, b'>')?;
+                } else if !fm {
+                    emit(&mut out, &mut olen, b' ')?;
+                }
+            }
+            Tok::Ordinal { upper } => {
+                // Skipped for negatives and for formats carrying a decimal
+                // point, as PostgreSQL.
+                if !neg && !has_point {
+                    if upper {
+                        emit_str(&mut out, &mut olen, ordinal)?;
+                    } else {
+                        let mut low = [0u8; 2];
+                        low[0] = ordinal.as_bytes()[0].to_ascii_lowercase();
+                        low[1] = ordinal.as_bytes()[1].to_ascii_lowercase();
+                        emit_str(
+                            &mut out,
+                            &mut olen,
+                            core::str::from_utf8(&low).expect("ascii"),
+                        )?;
+                    }
+                }
+            }
+            Tok::VMark => {}
             Tok::Literal(c) => emit(&mut out, &mut olen, c)?,
         }
     }
@@ -398,6 +867,125 @@ fn render<'a>(
 /// Position (token index) of the decimal point, or `usize::MAX` if none.
 fn point_index(toks: &[Tok]) -> usize {
     toks.iter().position(|t| *t == Tok::Point).unwrap_or(usize::MAX)
+}
+
+/// NaN / Infinity through a plain digit format: NaN lays "NaN" into the
+/// integer positions (`#` on overflow); Infinity overflows every position.
+/// The decimal point and fractional positions disappear; the sign slot keeps
+/// its normal behavior (so `-Infinity` shows `-###`).
+#[allow(clippy::too_many_arguments)]
+fn render_nonfinite<'a>(
+    toks: &[Tok],
+    fm: bool,
+    sign_kind: SignKind,
+    sign_trailing: bool,
+    int_digits: usize,
+    nan: bool,
+    neg: bool,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let image: &[u8] = if nan { b"NaN" } else { b"" };
+    let overflow = !nan || image.len() > int_digits;
+    let fill_start = int_digits.saturating_sub(image.len());
+    let sig_start = if overflow { 0 } else { fill_start };
+    let sign_char: Option<u8> = match sign_kind {
+        SignKind::Default => {
+            if neg {
+                Some(b'-')
+            } else if fm {
+                None
+            } else {
+                Some(b' ')
+            }
+        }
+        SignKind::S => Some(if neg { b'-' } else { b'+' }),
+        SignKind::None => None,
+        SignKind::Bracket => {
+            if neg {
+                Some(b'<')
+            } else if fm {
+                None
+            } else {
+                Some(b' ')
+            }
+        }
+    };
+    let mut out = [0u8; MAX_OUT];
+    let mut olen = 0usize;
+    let emit = |out: &mut [u8; MAX_OUT], olen: &mut usize, ch: u8| -> Result<(), SqlError> {
+        if *olen >= MAX_OUT {
+            return Err(sql_err!("22023", "to_char output too long"));
+        }
+        out[*olen] = ch;
+        *olen += 1;
+        Ok(())
+    };
+    let mut int_idx = 0usize;
+    let mut sign_emitted = false;
+    for &t in toks {
+        match t {
+            Tok::Nine | Tok::Zero => {
+                if int_idx >= int_digits {
+                    // Fractional position: suppressed for non-finite values.
+                    continue;
+                }
+                if !sign_trailing && !sign_emitted && int_idx == sig_start {
+                    if let Some(sc) = sign_char {
+                        emit(&mut out, &mut olen, sc)?;
+                    }
+                    sign_emitted = true;
+                }
+                let ch = if overflow {
+                    b'#'
+                } else if int_idx >= fill_start {
+                    image[int_idx - fill_start]
+                } else if fm {
+                    int_idx += 1;
+                    continue;
+                } else {
+                    b' '
+                };
+                emit(&mut out, &mut olen, ch)?;
+                int_idx += 1;
+            }
+            Tok::Point => {}
+            Tok::Group => {
+                if !fm {
+                    emit(&mut out, &mut olen, b' ')?;
+                }
+            }
+            Tok::Currency => emit(&mut out, &mut olen, b'$')?,
+            Tok::SignMinus => {
+                if neg {
+                    emit(&mut out, &mut olen, b'-')?;
+                } else if !fm {
+                    emit(&mut out, &mut olen, b' ')?;
+                }
+            }
+            Tok::SignPlus => {
+                if !neg {
+                    emit(&mut out, &mut olen, b'+')?;
+                } else if !fm {
+                    emit(&mut out, &mut olen, b' ')?;
+                }
+            }
+            Tok::SignSg => emit(&mut out, &mut olen, if neg { b'-' } else { b'+' })?,
+            Tok::BracketClose => {
+                if neg {
+                    emit(&mut out, &mut olen, b'>')?;
+                } else if !fm {
+                    emit(&mut out, &mut olen, b' ')?;
+                }
+            }
+            Tok::Ordinal { .. } | Tok::VMark => {}
+            Tok::Literal(c) => emit(&mut out, &mut olen, c)?,
+        }
+    }
+    if !sign_emitted && let Some(sc) = sign_char {
+        emit(&mut out, &mut olen, sc)?;
+    }
+    let text = core::str::from_utf8(&out[..olen]).expect("ascii output");
+    arena.alloc_str(text).map_err(|_| sql_err!("53200", "out of memory"))
 }
 
 /// `to_number(text, fmt)`: parse a formatted number. The format determines the
@@ -716,9 +1304,14 @@ mod tests {
 
     #[test]
     fn unsupported_codes_are_loud() {
+        // Formerly-rejected codes now format (verified against PostgreSQL
+        // 18.4); invalid combinations still error loudly.
         let a = arena();
-        assert!(number(&Numeric::parse("5", &a).unwrap(), "999MI", false, None, &a).is_err());
-        assert!(number(&Numeric::parse("5", &a).unwrap(), "RN", false, None, &a).is_err());
-        assert!(number(&Numeric::parse("5", &a).unwrap(), "9EEEE", false, None, &a).is_err());
+        assert_eq!(number(&Numeric::parse("5", &a).unwrap(), "999MI", false, None, &a).unwrap(), "  5 ");
+        assert_eq!(number(&Numeric::parse("5", &a).unwrap(), "RN", false, None, &a).unwrap(), "              V");
+        assert_eq!(number(&Numeric::parse("5", &a).unwrap(), "9EEEE", false, None, &a).unwrap(), " 5e+00");
+        assert!(number(&Numeric::parse("5", &a).unwrap(), "S999MI", false, None, &a).is_err());
+        assert!(number(&Numeric::parse("5", &a).unwrap(), "9.9V9", false, None, &a).is_err());
+        assert!(number(&Numeric::parse("5", &a).unwrap(), "EEEE9", false, None, &a).is_err());
     }
 }

@@ -504,3 +504,7 @@ SELECT (json_each_text('{"k":"v"}'::json)).value;
 SELECT (ROW(1,2,3)).*, 99 AS extra;
 SELECT count(*) FROM (SELECT (json_each('{"a":1,"b":2,"c":3}'::json)).*) s;
 DROP TABLE rectest;
+-- _pg_expandarray field access (driver introspection): direct and via a
+-- derived-table column with a qualified base (must resolve, not error)
+SELECT (information_schema._pg_expandarray(ARRAY[10,20,30])).x, (information_schema._pg_expandarray(ARRAY[10,20,30])).n;
+SELECT (result.keys).x AS col, (result.keys).n AS seq FROM (SELECT information_schema._pg_expandarray(ARRAY[7,8,9]) AS keys) result ORDER BY seq;

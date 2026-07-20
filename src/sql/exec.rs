@@ -3262,16 +3262,16 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 _ => (oid::UNKNOWN, -2),
             }
         }
-        // A `_pg_expandarray` composite's `.x`/`.n` fields are integers (its
-        // shape is not a static record). Every other `(record).field` resolves
-        // the field's type from the record's shape.
-        Expr::Field { base, field }
-            if matches!(&**base, Expr::Call { name, .. } if name.eq_ignore_ascii_case("_pg_expandarray")) =>
-        {
-            let _ = field;
-            of(ColType::Int4)
-        }
-        Expr::Field { base, field } => of(record_field_type(base, field, columns)?),
+        // `(record).field`: the field's type from the record's shape. When the
+        // shape is not a statically known record (a `_pg_expandarray` result,
+        // reached directly or through a derived-table column — the shape driver
+        // introspection relies on), fall back to int4, matching its `.x`/`.n`
+        // ordinal fields; a *known* record with a missing field still errors.
+        Expr::Field { base, field } => match record_field_type(base, field, columns) {
+            Ok(t) => of(t),
+            Err(e) if e.sqlstate == "42809" => of(ColType::Int4),
+            Err(e) => return Err(e),
+        },
         Expr::Call { name, args, order_by, .. } => match *name {
             // Catalog-introspection helpers (for psql \d).
             "pg_get_userbyid" | "format_type" | "pg_get_expr" | "pg_get_indexdef"

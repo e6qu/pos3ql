@@ -51,3 +51,10 @@ SELECT '[1,2,3)'::int4range;
 SELECT int4range(1, 5) = numrange(1, 5);
 SELECT int4range(1, 5) + int4range(10, 20);
 SELECT int4range(1, 10) - int4range(3, 6);
+-- array @> <@ && operators
+SELECT '{1,2,3}'::int[] @> '{2}'::int[], '{2}'::int[] <@ '{1,2,3}'::int[], '{1,2}'::int[] && '{2,3}'::int[];
+SELECT '{1,2}'::int[] @> '{2,4}'::int[], '{1,2}'::int[] && '{5,6}'::int[];
+SELECT '{1,2,3}'::int[] @> '{}'::int[], '{}'::int[] <@ '{1}'::int[];
+SELECT ARRAY['a','b'] @> ARRAY['b'], ARRAY['a'] && ARRAY['c','a'];
+SELECT '{1,NULL,3}'::int[] @> '{1}'::int[], '{1,NULL}'::int[] && '{NULL}'::int[];
+SELECT k FROM (VALUES (ARRAY[1,2]),(ARRAY[3,4])) t(k) WHERE k @> ARRAY[2];

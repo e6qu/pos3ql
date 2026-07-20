@@ -3208,6 +3208,17 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
             "string_agg" => of(ColType::Text),
+            "array_agg" => {
+                // Element type from the argument; the result is elem[].
+                let elem = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .and_then(|(oid, _)| coltype_of_oid(oid))
+                    .and_then(super::types::ArrElem::from_coltype)
+                    .unwrap_or(super::types::ArrElem::Int4);
+                of(ColType::Array(elem))
+            }
             // Ordered-set aggregates: percentile_cont yields double precision
             // (numeric for a numeric input); percentile_disc/mode yield the
             // WITHIN GROUP input type.

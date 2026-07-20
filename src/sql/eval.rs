@@ -3659,6 +3659,12 @@ fn binary<'a>(
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_bitwise(operator, l, r, arena),
             _ => bitwise(operator, l, r),
         },
+        // Array containment/overlap: `@>` `<@` `&&` over two arrays.
+        Contains | ContainedBy | Overlaps
+            if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) =>
+        {
+            array_set_op(operator, l, r)
+        }
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent
             if matches!(l, Datum::Multirange { .. }) || matches!(r, Datum::Multirange { .. }) =>
         {
@@ -3697,6 +3703,61 @@ fn binary<'a>(
 /// (overlaps), `<<`/`>>` (strictly left/right), `&<`/`&>` (does not extend
 /// right/left), `-|-` (adjacent). `@>`/`<@` accept a range-vs-range or
 /// range-vs-element pair; the rest require two ranges of the same kind.
+/// Array set operators `@>` (contains), `<@` (contained by), `&&` (overlap).
+/// NULL operand → NULL; NULL elements never match (PostgreSQL semantics).
+fn array_set_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    use BinaryOp::{ContainedBy, Contains, Overlaps};
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let (Datum::Array { element: le, raw: lr }, Datum::Array { element: re, raw: rr }) = (l, r)
+    else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator requires two arrays"
+        ));
+    };
+    let member = |needle: &Datum<'a>, elem, raw: &'a [u8]| -> Result<bool, SqlError> {
+        if needle.is_null() {
+            return Ok(false);
+        }
+        for i in 0..super::array::len(raw) {
+            let v = super::array::get(raw, elem, i).unwrap_or(Datum::Null);
+            if !v.is_null() && compare_datums(needle, &v)?.is_eq() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    // Every element of `sub` is a member of `sup`.
+    let subset = |sub_elem, sub_raw: &'a [u8], sup_elem, sup_raw: &'a [u8]| -> Result<bool, SqlError> {
+        for i in 0..super::array::len(sub_raw) {
+            let v = super::array::get(sub_raw, sub_elem, i).unwrap_or(Datum::Null);
+            if !v.is_null() && !member(&v, sup_elem, sup_raw)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let result = match operator {
+        Contains => subset(re, rr, le, lr)?,
+        ContainedBy => subset(le, lr, re, rr)?,
+        Overlaps => {
+            let mut any = false;
+            for i in 0..super::array::len(lr) {
+                let v = super::array::get(lr, le, i).unwrap_or(Datum::Null);
+                if member(&v, re, rr)? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        }
+        _ => unreachable!("array_set_op only handles @>, <@, &&"),
+    };
+    Ok(Datum::Bool(result))
+}
+
 fn range_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
     use super::range;
     use BinaryOp::{Adjacent, ContainedBy, Contains, NotLeftOf, NotRightOf, Overlaps, Shl, Shr};

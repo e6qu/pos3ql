@@ -5188,6 +5188,9 @@ enum AggKind {
     BoolAnd,
     BoolOr,
     StringAgg,
+    /// `array_agg(expr [ORDER BY ...])`: buffers every value (NULLs kept),
+    /// optionally sorted / DISTINCT, then builds a one-dimensional array.
+    ArrayAgg,
     /// Ordered-set aggregates: the aggregated values come from `WITHIN GROUP
     /// (ORDER BY ...)` and are buffered (in `vals`), sorted, then reduced in
     /// `finish`. `sum_float` holds the percentile fraction.
@@ -5239,6 +5242,7 @@ impl<'a> AggState<'a> {
             "bool_and" | "every" => AggKind::BoolAnd,
             "bool_or" => AggKind::BoolOr,
             "string_agg" => AggKind::StringAgg,
+            "array_agg" => AggKind::ArrayAgg,
             "percentile_cont" => AggKind::PercentileCont,
             "percentile_disc" => AggKind::PercentileDisc,
             "mode" => AggKind::Mode,
@@ -5260,7 +5264,9 @@ impl<'a> AggState<'a> {
         }
         // ORDER BY only affects string_agg (other aggregates are commutative,
         // so their result is identical regardless of input order).
-        if !order_by.is_empty() && self.kind == AggKind::StringAgg {
+        if !order_by.is_empty()
+            && matches!(self.kind, AggKind::StringAgg | AggKind::ArrayAgg)
+        {
             if *distinct {
                 // With DISTINCT, PostgreSQL permits ORDER BY only on the
                 // aggregated expression itself.
@@ -5302,6 +5308,35 @@ impl<'a> AggState<'a> {
         }
         if self.kind == AggKind::StringAgg {
             return self.update_string_agg(args, arena, params, row, hooks);
+        }
+        if self.kind == AggKind::ArrayAgg {
+            if args.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "array_agg requires exactly one argument"
+                ));
+            }
+            // array_agg keeps NULL elements, unlike string_agg.
+            let value = eval_full(args[0], arena, params, row, hooks)?;
+            if self.ordered {
+                let mut tuple = [Datum::Null; 1 + MAX_PROJ];
+                tuple[0] = value;
+                for (i, o) in self.ord_spec.iter().enumerate() {
+                    tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
+                }
+                let enc = super::exec::encode_projected_pub(&tuple[..1 + self.ord_spec.len()], arena)?;
+                if self.distinct && self.ord_len > 0 {
+                    let seen = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
+                    if seen.contains(&enc) {
+                        return Ok(());
+                    }
+                }
+                self.push_ordered(enc, arena)?;
+            } else {
+                self.push_distinct(value, arena)?;
+            }
+            self.count += 1;
+            return Ok(());
         }
         // Ordered-set aggregates buffer their `WITHIN GROUP (ORDER BY expr)`
         // values (reduced in `finish`); `args[0]` is the percentile fraction.
@@ -5415,9 +5450,9 @@ impl<'a> AggState<'a> {
                 let sep = self.sep.unwrap_or("");
                 self.append_str_elem(sep, s, arena)?;
             }
-            // Ordered-set aggregates buffer their values and reduce in `finish`;
-            // they never fold through `accumulate`.
-            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => {}
+            // Ordered-set and array aggregates buffer their values and reduce
+            // in `finish`; they never fold through `accumulate`.
+            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode | AggKind::ArrayAgg => {}
         }
         Ok(())
     }
@@ -5741,6 +5776,9 @@ impl<'a> AggState<'a> {
         ) {
             return self.finish_ordered_set(arena);
         }
+        if self.kind == AggKind::ArrayAgg {
+            return self.finish_array_agg(arena);
+        }
         self.fold_distinct(arena)?;
         self.fold_ordered(arena)?;
         Ok(match self.kind {
@@ -5786,7 +5824,84 @@ impl<'a> AggState<'a> {
             }
             // Handled by `finish_ordered_set` before this match.
             AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => Datum::Null,
+            // Handled by `finish_array_agg` before this match.
+            AggKind::ArrayAgg => Datum::Null,
         })
+    }
+
+    /// Builds the `array_agg` result: the buffered values in ORDER BY order
+    /// (or scan order), DISTINCT-deduped if requested. Zero rows → NULL (as
+    /// PostgreSQL). The element type comes from the first non-null value.
+    fn finish_array_agg(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+        let values: &mut [Datum<'a>] = if self.ordered {
+            let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
+            let spec = self.ord_spec;
+            let mut cmp_err: Option<SqlError> = None;
+            rows.sort_by(|a, b| {
+                use core::cmp::Ordering;
+                for (k, o) in spec.iter().enumerate() {
+                    let ka = super::exec::decode_projected_pub(a, 1 + k);
+                    let kb = super::exec::decode_projected_pub(b, 1 + k);
+                    let ord = match (ka.is_null(), kb.is_null()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => if o.nulls_first { Ordering::Less } else { Ordering::Greater },
+                        (false, true) => if o.nulls_first { Ordering::Greater } else { Ordering::Less },
+                        (false, false) => match compare_datums(&ka, &kb) {
+                            Ok(c) => if o.descending { c.reverse() } else { c },
+                            Err(e) => {
+                                if cmp_err.is_none() { cmp_err = Some(e); }
+                                Ordering::Equal
+                            }
+                        },
+                    };
+                    if !ord.is_eq() {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+            if let Some(e) = cmp_err {
+                return Err(e);
+            }
+            let out = arena.alloc_slice_with(rows.len(), |_| Datum::Null).map_err(|_| arena_full())?;
+            for (i, &row) in rows.iter().enumerate() {
+                out[i] = super::exec::decode_projected_pub(row, 0);
+            }
+            out
+        } else if self.distinct {
+            let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
+            let mut cmp_err: Option<SqlError> = None;
+            vals.sort_by(|a, b| match compare_datums(a, b) {
+                Ok(o) => o,
+                Err(e) => {
+                    if cmp_err.is_none() { cmp_err = Some(e); }
+                    core::cmp::Ordering::Equal
+                }
+            });
+            if let Some(e) = cmp_err {
+                return Err(e);
+            }
+            let mut unique = 0usize;
+            for i in 0..vals.len() {
+                let same = i > 0 && compare_datums(&vals[i], &vals[i - 1])?.is_eq();
+                if !same {
+                    vals[unique] = vals[i];
+                    unique += 1;
+                }
+            }
+            &mut vals[..unique]
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) }
+        };
+        if values.is_empty() {
+            return Ok(Datum::Null);
+        }
+        let element = values
+            .iter()
+            .find_map(super::types::ArrElem::from_datum)
+            .unwrap_or(super::types::ArrElem::Int4);
+        let raw = super::array::build(values, arena)?;
+        Ok(Datum::Array { element, raw })
     }
 }
 
@@ -6577,6 +6692,43 @@ fn collect_set_leaves<'a>(
 }
 
 /// Column descriptions of a set-operation leaf (FROM-less or table-backed).
+/// Whether a set-operation leaf's `c`-th output column is an untyped UNKNOWN
+/// (a bare NULL or parameter), which the describe path coerces to text but a
+/// set operation should let adopt another branch's type.
+fn leaf_col_unknown<'a>(
+    storage: &'a Storage,
+    s: &'a Select<'a>,
+    c: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> bool {
+    if s.set_body.is_some() {
+        return false;
+    }
+    // Find the c-th expression item (wildcards expand to typed columns, never
+    // unknown, so they only advance the index).
+    let mut idx = 0usize;
+    for item in s.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                if idx == c {
+                    let raw = match &s.from {
+                        None => super::exec::infer_type_pub(expression, None).map(|t| t.0),
+                        Some(f) => QueryScope::resolve_schema(storage, f, txid, arena)
+                            .and_then(|sc| infer_scope_type(expression, &sc).map(|t| t.0)),
+                    };
+                    // infer_scope_type already coerces UNKNOWN→TEXT, so only the
+                    // FROM-less path (raw infer) can report UNKNOWN.
+                    return matches!(raw, Ok(super::types::oid::UNKNOWN));
+                }
+                idx += 1;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => return false,
+        }
+    }
+    false
+}
+
 fn describe_leaf<'a>(
     storage: &'a Storage,
     s: &'a Select<'a>,
@@ -6642,9 +6794,16 @@ fn describe_set_body<'a>(
     let mut n_leaves = 0;
     collect_set_leaves(tree, &mut leaves, &mut n_leaves)?;
     let n_cols = describe_leaf(storage, leaves[0].expect(">=1 leaf"), txid, columns, arena)?;
-    let mut target = [ColType::Bool; MAX_PROJ];
+    // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
+    // type of the other branches, as PostgreSQL resolves an unknown literal).
+    let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
+    let leaf0 = leaves[0].expect(">=1 leaf");
     for (c, col) in columns[..n_cols].iter().enumerate() {
-        target[c] = super::exec::coltype_of_oid(col.type_oid).unwrap_or(ColType::Text);
+        target[c] = if leaf_col_unknown(storage, leaf0, c, txid, arena) {
+            None
+        } else {
+            super::exec::coltype_of_oid(col.type_oid)
+        };
     }
     for leaf in leaves[1..n_leaves].iter() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -6655,21 +6814,30 @@ fn describe_set_body<'a>(
                 "each UNION query must have the same number of columns"
             ));
         }
+        let leaf_ref = leaf.expect("leaf");
         for c in 0..n_cols {
+            if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
+                continue; // an untyped NULL column adopts the running type
+            }
             let lt = super::exec::coltype_of_oid(lc[c].type_oid).unwrap_or(ColType::Text);
-            match unify_set_type(target[c], lt) {
-                Some(t) => target[c] = t,
-                None => {
-                    return Err(sql_err!(
-                        "42804",
-                        "UNION types {} and {} cannot be matched",
-                        target[c].name(),
-                        lt.name()
-                    ))
-                }
+            match target[c] {
+                None => target[c] = Some(lt),
+                Some(existing) => match unify_set_type(existing, lt) {
+                    Some(t) => target[c] = Some(t),
+                    None => {
+                        return Err(sql_err!(
+                            "42804",
+                            "UNION types {} and {} cannot be matched",
+                            existing.name(),
+                            lt.name()
+                        ))
+                    }
+                },
             }
         }
     }
+    // A column that stayed unknown across every branch (all NULL) is text.
+    let target: [ColType; MAX_PROJ] = core::array::from_fn(|c| target[c].unwrap_or(ColType::Text));
     for (c, col) in columns[..n_cols].iter_mut().enumerate() {
         col.type_oid = target[c].oid();
         col.typlen = target[c].typlen();
@@ -6746,8 +6914,12 @@ fn combine_sets<'a>(
     r: &'a mut [&'a [u8]],
     arena: &'a Arena,
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
-    l.sort_unstable();
-    r.sort_unstable();
+    // UNION ALL preserves order (left rows then right, as scanned); only the
+    // distinct set operations sort to merge/dedup.
+    if !(operator == SetOp::Union && all) {
+        l.sort_unstable();
+        r.sort_unstable();
+    }
     let empty: &[u8] = &[];
     let out = arena
         .alloc_slice_with(l.len() + r.len(), |_| empty)

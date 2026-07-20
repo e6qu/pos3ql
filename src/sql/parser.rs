@@ -306,7 +306,16 @@ impl<'a> Parser<'a> {
             } else {
                 let expression = self.expression(0)?;
                 let alias = self.alias()?;
-                SelectItem::Expr { expression, alias }
+                // A parenthesized `(t.*)` as a whole select item expands to
+                // the table's columns, exactly like `t.*` (PostgreSQL); only
+                // inside a larger expression (`(t.*)::text`, `row_to_json(t.*)`)
+                // does it stay a record.
+                match expression {
+                    Expr::WholeRow(table) if alias.is_none() => {
+                        SelectItem::TableWildcard(table)
+                    }
+                    _ => SelectItem::Expr { expression, alias },
+                }
             };
             n += 1;
             if !self.eat_op(",")? {
@@ -351,7 +360,26 @@ impl<'a> Parser<'a> {
     /// (those belong to the enclosing query so a set operation can share them).
     fn select_core(&mut self) -> Result<Select<'a>, ParseError> {
         self.expect_ident("select")?;
+        let mut distinct_on: &'a [&'a Expr<'a>] = &[];
         let distinct = if self.eat_ident("distinct")? {
+            // `DISTINCT ON (expr, ...)`: keep the first row per distinct key.
+            if self.eat_ident("on")? {
+                self.expect_op("(")?;
+                let mut exprs = [self.arena_expr(Expr::Null)?; MAX_LIST];
+                let mut n = 0;
+                loop {
+                    if n == MAX_LIST {
+                        return Err(self.limit("DISTINCT ON list", MAX_LIST));
+                    }
+                    exprs[n] = self.expression(0)?;
+                    n += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+                distinct_on = self.arena_slice(&exprs[..n])?;
+            }
             true
         } else {
             let _ = self.eat_ident("all")?;
@@ -379,6 +407,7 @@ impl<'a> Parser<'a> {
         Ok(Select {
             items,
             distinct,
+            distinct_on,
             from,
             where_clause,
             group_by,
@@ -468,6 +497,7 @@ impl<'a> Parser<'a> {
         Ok(Select {
             items: &[],
             distinct: false,
+            distinct_on: &[],
             from: None,
             where_clause: None,
             group_by: &[],
@@ -493,6 +523,7 @@ impl<'a> Parser<'a> {
             .alloc(Select {
                 items: &[],
                 distinct: false,
+                distinct_on: &[],
                 from: None,
                 where_clause: None,
                 group_by: &[],
@@ -607,6 +638,7 @@ impl<'a> Parser<'a> {
                 op => Select {
                     items: &[],
                     distinct: false,
+                    distinct_on: &[],
                     from: None,
                     where_clause: None,
                     group_by: &[],
@@ -648,6 +680,7 @@ impl<'a> Parser<'a> {
                 let sel = Select {
                     items: self.arena_slice(&items[..n])?,
                     distinct: false,
+                    distinct_on: &[],
                     from: None,
                     where_clause: None,
                     group_by: &[],

@@ -1148,6 +1148,44 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             )),
         }
     }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
+        let t = self.scope.table_index(table)?;
+        let def = self.scope.defs[t].expect("resolved");
+        let vals = match self.values[t] {
+            Some([]) => return Ok(None), // outer-join null row
+            Some(vals) => vals,
+            None => {
+                return Err(sql_err!(
+                    "42P10",
+                    "whole-row reference to \"{}\" before its table is joined",
+                    table
+                ))
+            }
+        };
+        // Copy field names into the arena so the record does not borrow the
+        // catalog (its lifetime is unrelated to the row's `'v`).
+        let cols = def.columns();
+        let mut fields = [super::types::RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        }; MAX_COLUMNS];
+        for (i, field) in fields.iter_mut().enumerate().take(def.n_columns) {
+            let name = arena.alloc_str(cols[i].name.as_str()).map_err(|_| arena_full())?;
+            field.name = name;
+            field.type_oid = cols[i].ctype.oid();
+            field.value = vals.get(i).copied().unwrap_or(Datum::Null);
+        }
+        let out = arena
+            .alloc_slice_copy(&fields[..def.n_columns])
+            .map_err(|_| arena_full())?;
+        Ok(Some(&*out))
+    }
 }
 
 /// Chains an inner row's column resolution to an optional outer row (for
@@ -1163,6 +1201,20 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             Ok(v) => Ok(v),
             Err(e) => match self.outer {
                 Some(o) => o.whole_row_present(table),
+                None => Err(e),
+            },
+        }
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        match self.inner.whole_row_fields(table, arena) {
+            Ok(v) => Ok(v),
+            Err(e) => match self.outer {
+                Some(o) => o.whole_row_fields(table, arena),
                 None => Err(e),
             },
         }
@@ -1864,6 +1916,7 @@ fn wrap_set_tree_with<'a>(
     let sel = Select {
         items: &[],
         distinct: false,
+        distinct_on: &[],
         from: None,
         where_clause: None,
         group_by: &[],
@@ -2062,6 +2115,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
     let sel = Select {
         items: &[],
         distinct: false,
+        distinct_on: &[],
         from: None,
         where_clause: None,
         group_by: &[],
@@ -2273,6 +2327,7 @@ fn subst_select<'a>(
     let new = Select {
         items,
         distinct: s.distinct,
+        distinct_on: s.distinct_on,
         from,
         where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,
@@ -3005,6 +3060,7 @@ fn rewrite_grouped_windows<'a>(
             .alloc_slice_copy(&inner_items[..n_keys + n_aggs])
             .map_err(|_| arena_full())?,
         distinct: false,
+        distinct_on: &[],
         from: statement.from,
         where_clause: statement.where_clause,
         group_by: statement.group_by,
@@ -3076,6 +3132,7 @@ fn rewrite_grouped_windows<'a>(
             .alloc_slice_copy(&outer_items[..statement.items.len()])
             .map_err(|_| arena_full())?,
         distinct: statement.distinct,
+        distinct_on: &[],
         from: Some(from),
         where_clause: None,
         group_by: &[],
@@ -3907,6 +3964,7 @@ fn project_window_rows<'a>(
     win_nodes: &[&'a Expr<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
@@ -3992,14 +4050,37 @@ fn project_window_rows<'a>(
         for (w, wval) in win_vals.iter().enumerate().take(win_nodes.len()) {
             wv[w] = wval[i];
         }
+        let jr = window_row(scope, rows[i], &offs);
+        // Correlated subqueries in the select list / ORDER BY re-evaluate per
+        // output row (their outer references resolve to this window row).
+        let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
+            [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+        let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
+            [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+        let row_subs;
+        let subs = if correlated.is_empty() {
+            hooks.subs
+        } else {
+            row_subs = merge_correlated(
+                correlated,
+                base,
+                &jr,
+                storage,
+                txid,
+                arena,
+                params,
+                &mut sc,
+                &mut ls,
+            )?;
+            Some(&row_subs)
+        };
         let win_hooks = EvalHooks {
             group: None,
             aggs: None,
-            subs: hooks.subs,
+            subs,
             windows: Some((win_ptrs, &wv[..win_nodes.len()])),
             catalog: hooks.catalog, srf_index: hooks.srf_index,
         };
-        let jr = window_row(scope, rows[i], &offs);
         let mut projected = [Datum::Null; MAX_PROJ];
         let np = project_row(statement.items, scope, &jr, arena, params, &win_hooks, &mut projected)?;
         proj_rows[i] = &*arena.alloc_slice_copy(&projected[..np]).map_err(|_| arena_full())?;
@@ -4022,6 +4103,7 @@ fn window_select<'a>(
     win_nodes: &[&'a Expr<'a>],
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     limit: u64,
@@ -4052,7 +4134,7 @@ fn window_select<'a>(
         }
     }
     let (proj_rows, sort_keys) = match project_window_rows(
-        storage, txid, statement, from, scope, win_nodes, hooks, correlated, arena, params,
+        storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
     ) {
         Ok(v) => v,
         Err(e) => return sql_fail(e),
@@ -5106,6 +5188,9 @@ enum AggKind {
     BoolAnd,
     BoolOr,
     StringAgg,
+    /// `array_agg(expr [ORDER BY ...])`: buffers every value (NULLs kept),
+    /// optionally sorted / DISTINCT, then builds a one-dimensional array.
+    ArrayAgg,
     /// Ordered-set aggregates: the aggregated values come from `WITHIN GROUP
     /// (ORDER BY ...)` and are buffered (in `vals`), sorted, then reduced in
     /// `finish`. `sum_float` holds the percentile fraction.
@@ -5157,6 +5242,7 @@ impl<'a> AggState<'a> {
             "bool_and" | "every" => AggKind::BoolAnd,
             "bool_or" => AggKind::BoolOr,
             "string_agg" => AggKind::StringAgg,
+            "array_agg" => AggKind::ArrayAgg,
             "percentile_cont" => AggKind::PercentileCont,
             "percentile_disc" => AggKind::PercentileDisc,
             "mode" => AggKind::Mode,
@@ -5178,7 +5264,9 @@ impl<'a> AggState<'a> {
         }
         // ORDER BY only affects string_agg (other aggregates are commutative,
         // so their result is identical regardless of input order).
-        if !order_by.is_empty() && self.kind == AggKind::StringAgg {
+        if !order_by.is_empty()
+            && matches!(self.kind, AggKind::StringAgg | AggKind::ArrayAgg)
+        {
             if *distinct {
                 // With DISTINCT, PostgreSQL permits ORDER BY only on the
                 // aggregated expression itself.
@@ -5220,6 +5308,35 @@ impl<'a> AggState<'a> {
         }
         if self.kind == AggKind::StringAgg {
             return self.update_string_agg(args, arena, params, row, hooks);
+        }
+        if self.kind == AggKind::ArrayAgg {
+            if args.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "array_agg requires exactly one argument"
+                ));
+            }
+            // array_agg keeps NULL elements, unlike string_agg.
+            let value = eval_full(args[0], arena, params, row, hooks)?;
+            if self.ordered {
+                let mut tuple = [Datum::Null; 1 + MAX_PROJ];
+                tuple[0] = value;
+                for (i, o) in self.ord_spec.iter().enumerate() {
+                    tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
+                }
+                let enc = super::exec::encode_projected_pub(&tuple[..1 + self.ord_spec.len()], arena)?;
+                if self.distinct && self.ord_len > 0 {
+                    let seen = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
+                    if seen.contains(&enc) {
+                        return Ok(());
+                    }
+                }
+                self.push_ordered(enc, arena)?;
+            } else {
+                self.push_distinct(value, arena)?;
+            }
+            self.count += 1;
+            return Ok(());
         }
         // Ordered-set aggregates buffer their `WITHIN GROUP (ORDER BY expr)`
         // values (reduced in `finish`); `args[0]` is the percentile fraction.
@@ -5333,9 +5450,9 @@ impl<'a> AggState<'a> {
                 let sep = self.sep.unwrap_or("");
                 self.append_str_elem(sep, s, arena)?;
             }
-            // Ordered-set aggregates buffer their values and reduce in `finish`;
-            // they never fold through `accumulate`.
-            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => {}
+            // Ordered-set and array aggregates buffer their values and reduce
+            // in `finish`; they never fold through `accumulate`.
+            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode | AggKind::ArrayAgg => {}
         }
         Ok(())
     }
@@ -5659,6 +5776,9 @@ impl<'a> AggState<'a> {
         ) {
             return self.finish_ordered_set(arena);
         }
+        if self.kind == AggKind::ArrayAgg {
+            return self.finish_array_agg(arena);
+        }
         self.fold_distinct(arena)?;
         self.fold_ordered(arena)?;
         Ok(match self.kind {
@@ -5704,7 +5824,84 @@ impl<'a> AggState<'a> {
             }
             // Handled by `finish_ordered_set` before this match.
             AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => Datum::Null,
+            // Handled by `finish_array_agg` before this match.
+            AggKind::ArrayAgg => Datum::Null,
         })
+    }
+
+    /// Builds the `array_agg` result: the buffered values in ORDER BY order
+    /// (or scan order), DISTINCT-deduped if requested. Zero rows → NULL (as
+    /// PostgreSQL). The element type comes from the first non-null value.
+    fn finish_array_agg(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+        let values: &mut [Datum<'a>] = if self.ordered {
+            let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
+            let spec = self.ord_spec;
+            let mut cmp_err: Option<SqlError> = None;
+            rows.sort_by(|a, b| {
+                use core::cmp::Ordering;
+                for (k, o) in spec.iter().enumerate() {
+                    let ka = super::exec::decode_projected_pub(a, 1 + k);
+                    let kb = super::exec::decode_projected_pub(b, 1 + k);
+                    let ord = match (ka.is_null(), kb.is_null()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => if o.nulls_first { Ordering::Less } else { Ordering::Greater },
+                        (false, true) => if o.nulls_first { Ordering::Greater } else { Ordering::Less },
+                        (false, false) => match compare_datums(&ka, &kb) {
+                            Ok(c) => if o.descending { c.reverse() } else { c },
+                            Err(e) => {
+                                if cmp_err.is_none() { cmp_err = Some(e); }
+                                Ordering::Equal
+                            }
+                        },
+                    };
+                    if !ord.is_eq() {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+            if let Some(e) = cmp_err {
+                return Err(e);
+            }
+            let out = arena.alloc_slice_with(rows.len(), |_| Datum::Null).map_err(|_| arena_full())?;
+            for (i, &row) in rows.iter().enumerate() {
+                out[i] = super::exec::decode_projected_pub(row, 0);
+            }
+            out
+        } else if self.distinct {
+            let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
+            let mut cmp_err: Option<SqlError> = None;
+            vals.sort_by(|a, b| match compare_datums(a, b) {
+                Ok(o) => o,
+                Err(e) => {
+                    if cmp_err.is_none() { cmp_err = Some(e); }
+                    core::cmp::Ordering::Equal
+                }
+            });
+            if let Some(e) = cmp_err {
+                return Err(e);
+            }
+            let mut unique = 0usize;
+            for i in 0..vals.len() {
+                let same = i > 0 && compare_datums(&vals[i], &vals[i - 1])?.is_eq();
+                if !same {
+                    vals[unique] = vals[i];
+                    unique += 1;
+                }
+            }
+            &mut vals[..unique]
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) }
+        };
+        if values.is_empty() {
+            return Ok(Datum::Null);
+        }
+        let element = values
+            .iter()
+            .find_map(super::types::ArrElem::from_datum)
+            .unwrap_or(super::types::ArrElem::Int4);
+        let raw = super::array::build(values, arena)?;
+        Ok(Datum::Array { element, raw })
     }
 }
 
@@ -5785,13 +5982,20 @@ pub fn select_query<'a>(
     };
 
     // Subqueries first (uncorrelated, evaluated once).
-    let mut sub_exprs: [Option<&Expr>; 4 + super::parser::MAX_LIST] =
-        [None; 4 + super::parser::MAX_LIST];
+    let mut sub_exprs: [Option<&Expr>; 4 + 2 * super::parser::MAX_LIST] =
+        [None; 4 + 2 * super::parser::MAX_LIST];
     sub_exprs[0] = statement.where_clause;
     sub_exprs[1] = statement.having;
     for (i, item) in statement.items.iter().enumerate() {
         if let SelectItem::Expr { expression, .. } = item {
             sub_exprs[4 + i] = Some(expression);
+        }
+    }
+    // ORDER BY expressions may carry (correlated) subqueries too; a bare
+    // ordinal resolves to a select item already covered above.
+    for (i, ob) in statement.order_by.iter().enumerate() {
+        if !matches!(ob.expression, Expr::Int(_)) {
+            sub_exprs[4 + super::parser::MAX_LIST + i] = Some(ob.expression);
         }
     }
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
@@ -5890,15 +6094,9 @@ pub fn select_query<'a>(
         }
     }
     if n_win > 0 {
-        if correlated_outside_where(correlated, statement) {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "correlated subqueries in the select list of a window-function query are not supported yet"
-            ));
-        }
         return window_select(
             storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, correlated,
-            arena, params, limit, offset, responder,
+            &outer_subs.base, arena, params, limit, offset, responder,
         );
     }
 
@@ -6494,6 +6692,43 @@ fn collect_set_leaves<'a>(
 }
 
 /// Column descriptions of a set-operation leaf (FROM-less or table-backed).
+/// Whether a set-operation leaf's `c`-th output column is an untyped UNKNOWN
+/// (a bare NULL or parameter), which the describe path coerces to text but a
+/// set operation should let adopt another branch's type.
+fn leaf_col_unknown<'a>(
+    storage: &'a Storage,
+    s: &'a Select<'a>,
+    c: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> bool {
+    if s.set_body.is_some() {
+        return false;
+    }
+    // Find the c-th expression item (wildcards expand to typed columns, never
+    // unknown, so they only advance the index).
+    let mut idx = 0usize;
+    for item in s.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                if idx == c {
+                    let raw = match &s.from {
+                        None => super::exec::infer_type_pub(expression, None).map(|t| t.0),
+                        Some(f) => QueryScope::resolve_schema(storage, f, txid, arena)
+                            .and_then(|sc| infer_scope_type(expression, &sc).map(|t| t.0)),
+                    };
+                    // infer_scope_type already coerces UNKNOWN→TEXT, so only the
+                    // FROM-less path (raw infer) can report UNKNOWN.
+                    return matches!(raw, Ok(super::types::oid::UNKNOWN));
+                }
+                idx += 1;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => return false,
+        }
+    }
+    false
+}
+
 fn describe_leaf<'a>(
     storage: &'a Storage,
     s: &'a Select<'a>,
@@ -6559,9 +6794,16 @@ fn describe_set_body<'a>(
     let mut n_leaves = 0;
     collect_set_leaves(tree, &mut leaves, &mut n_leaves)?;
     let n_cols = describe_leaf(storage, leaves[0].expect(">=1 leaf"), txid, columns, arena)?;
-    let mut target = [ColType::Bool; MAX_PROJ];
+    // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
+    // type of the other branches, as PostgreSQL resolves an unknown literal).
+    let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
+    let leaf0 = leaves[0].expect(">=1 leaf");
     for (c, col) in columns[..n_cols].iter().enumerate() {
-        target[c] = super::exec::coltype_of_oid(col.type_oid).unwrap_or(ColType::Text);
+        target[c] = if leaf_col_unknown(storage, leaf0, c, txid, arena) {
+            None
+        } else {
+            super::exec::coltype_of_oid(col.type_oid)
+        };
     }
     for leaf in leaves[1..n_leaves].iter() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -6572,21 +6814,30 @@ fn describe_set_body<'a>(
                 "each UNION query must have the same number of columns"
             ));
         }
+        let leaf_ref = leaf.expect("leaf");
         for c in 0..n_cols {
+            if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
+                continue; // an untyped NULL column adopts the running type
+            }
             let lt = super::exec::coltype_of_oid(lc[c].type_oid).unwrap_or(ColType::Text);
-            match unify_set_type(target[c], lt) {
-                Some(t) => target[c] = t,
-                None => {
-                    return Err(sql_err!(
-                        "42804",
-                        "UNION types {} and {} cannot be matched",
-                        target[c].name(),
-                        lt.name()
-                    ))
-                }
+            match target[c] {
+                None => target[c] = Some(lt),
+                Some(existing) => match unify_set_type(existing, lt) {
+                    Some(t) => target[c] = Some(t),
+                    None => {
+                        return Err(sql_err!(
+                            "42804",
+                            "UNION types {} and {} cannot be matched",
+                            existing.name(),
+                            lt.name()
+                        ))
+                    }
+                },
             }
         }
     }
+    // A column that stayed unknown across every branch (all NULL) is text.
+    let target: [ColType; MAX_PROJ] = core::array::from_fn(|c| target[c].unwrap_or(ColType::Text));
     for (c, col) in columns[..n_cols].iter_mut().enumerate() {
         col.type_oid = target[c].oid();
         col.typlen = target[c].typlen();
@@ -6663,8 +6914,12 @@ fn combine_sets<'a>(
     r: &'a mut [&'a [u8]],
     arena: &'a Arena,
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
-    l.sort_unstable();
-    r.sort_unstable();
+    // UNION ALL preserves order (left rows then right, as scanned); only the
+    // distinct set operations sort to merge/dedup.
+    if !(operator == SetOp::Union && all) {
+        l.sort_unstable();
+        r.sort_unstable();
+    }
     let empty: &[u8] = &[];
     let out = arena
         .alloc_slice_with(l.len() + r.len(), |_| empty)
@@ -7236,12 +7491,6 @@ pub fn select_into_rows<'a>(
         }
     }
     if n_win > 0 {
-        if correlated_outside_where(correlated, statement) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "correlated subqueries in the select list of a window-function query are not supported yet"
-            ));
-        }
         // Windows over a grouped query: rewrite to the two-level form.
         let mut grouped_aggs: [(*const Expr, &Expr); MAX_AGGS] =
             [(core::ptr::null(), &Expr::Null); MAX_AGGS];
@@ -7257,7 +7506,7 @@ pub fn select_into_rows<'a>(
         }
         let (proj_rows, sort_keys) = project_window_rows(
             storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, correlated,
-            arena, params,
+            &outer_subs.base, arena, params,
         )?;
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
@@ -7650,6 +7899,10 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         let entry = self.0.find_column(qualifier, name)?;
         Ok(self.0.output_type(entry))
     }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.0.table_index(name).is_ok()
+    }
 }
 
 fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {
@@ -7675,29 +7928,6 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
         Ok(())
     });
     found
-}
-
-/// True when any correlated subquery node appears outside the WHERE clause
-/// (select items, HAVING, GROUP BY keys): those would have to re-evaluate per
-/// group, which the grouped executor does not do yet. WHERE-level correlated
-/// subqueries re-evaluate per scanned row and are supported.
-fn correlated_outside_where<'a>(
-    correlated: &[&'a Expr<'a>],
-    statement: &'a Select<'a>,
-) -> bool {
-    let in_expr = |e: &'a Expr<'a>| {
-        correlated.iter().any(|c| expr_contains_node(e, *c as *const Expr))
-    };
-    if statement.having.is_some_and(in_expr) {
-        return true;
-    }
-    if statement.group_by.iter().any(|g| in_expr(g)) {
-        return true;
-    }
-    statement.items.iter().any(|item| match item {
-        SelectItem::Expr { expression, .. } => in_expr(expression),
-        _ => false,
-    })
 }
 
 /// With correlated subqueries in WHERE, the filter cannot run inside
@@ -8770,17 +9000,36 @@ fn materialized_rows<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let n_order = statement.order_by.len();
+    // `DISTINCT ON (exprs)`: its keys are materialized as hidden columns
+    // after the ORDER BY keys, and the result is deduped on them (keeping the
+    // first row per key, in ORDER BY order — PostgreSQL requires the ON
+    // expressions to match the leftmost ORDER BY).
+    let n_on = statement.distinct_on.len();
     // With correlated subqueries WHERE is applied per row (against merged
     // hooks); otherwise the scan applies it directly.
     let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
 
-    // Resolve ORDER BY ordinals to item expressions.
+    // Resolve ORDER BY ordinals to item expressions, then the DISTINCT ON keys.
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     for (k, ob) in statement.order_by.iter().enumerate() {
         order_exprs[k] = Some(resolve_order_target(ob.expression, statement.items, scope, arena)?);
     }
-    // DISTINCT restriction: keys must be select-list members.
-    if statement.distinct {
+    for (j, on) in statement.distinct_on.iter().enumerate() {
+        let resolved = resolve_order_target(on, statement.items, scope, arena)?;
+        // PostgreSQL requires each DISTINCT ON expression to match the
+        // ORDER BY expression at the same leftmost position (when ORDER BY is
+        // present); otherwise the "first" row per key is ill-defined.
+        if n_order > 0 && (j >= n_order || *order_exprs[j].expect("resolved") != *resolved) {
+            return Err(sql_err!(
+                "42P10",
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+            ));
+        }
+        order_exprs[n_order + j] = Some(resolved);
+    }
+    let n_keys = n_order + n_on;
+    // DISTINCT (not DISTINCT ON) restriction: ORDER BY keys must be members.
+    if statement.distinct && n_on == 0 {
         for oe in order_exprs.iter().take(n_order) {
             let target = oe.expect("resolved");
             let in_list = statement.items.iter().any(|item| {
@@ -8892,7 +9141,7 @@ fn materialized_rows<'a>(
                     statement.items, if any_postponed { Some(&postponed) } else { None },
                     scope, row, arena, params, use_hooks, &mut projected,
                 )?;
-                for oe in order_exprs.iter().take(n_order) {
+                for oe in order_exprs.iter().take(n_keys) {
                     eval_full(oe.expect("resolved"), arena, params, row, use_hooks)?;
                 }
                 count += 1;
@@ -8952,13 +9201,13 @@ fn materialized_rows<'a>(
                     let mut full =
                         [Datum::Null; MAX_PROJ + MAX_PROJ + MAX_COLUMNS * MAX_JOIN_TABLES];
                     full[..width].copy_from_slice(&projected[..width]);
-                    for (key, oe) in order_exprs.iter().take(n_order).enumerate() {
+                    for (key, oe) in order_exprs.iter().take(n_keys).enumerate() {
                         full[width + key] =
                             eval_full(oe.expect("resolved"), arena, params, row, use_hooks)?;
                     }
                     // Raw source columns for deferred projection after the sort.
                     if any_postponed {
-                        let mut flat = width + n_order;
+                        let mut flat = width + n_keys;
                         for t in 0..scope.n {
                             let def = scope.defs[t].expect("resolved");
                             let vals = row.values[t].expect("bound");
@@ -8969,7 +9218,7 @@ fn materialized_rows<'a>(
                         }
                     }
                     rows[at] = super::exec::encode_projected_pub(
-                        &full[..width + n_order + n_raw],
+                        &full[..width + n_keys + n_raw],
                         arena,
                     )?;
                     at += 1;
@@ -8979,10 +9228,11 @@ fn materialized_rows<'a>(
         )?;
     }
 
+    // Plain DISTINCT dedups on the visible prefix before the ORDER BY sort.
+    // DISTINCT ON dedups on its keys *after* the sort (below), so the first
+    // row per key in ORDER BY order survives.
     let mut live = rows.len();
-    if statement.distinct {
-        // Dedupe on the visible prefix: sort whole rows (visible prefix
-        // dominates the encoding), then drop adjacent equal prefixes.
+    if statement.distinct && n_on == 0 {
         rows.sort_unstable();
         let mut unique = 0usize;
         for i in 0..rows.len() {
@@ -8997,8 +9247,13 @@ fn materialized_rows<'a>(
     }
     let rows = &mut rows[..live];
 
-    if n_order > 0 {
-        rows.sort_unstable_by(|a, b| {
+    // Sort by ORDER BY (a stable sort so DISTINCT ON without ORDER BY keeps
+    // the first-scanned row per key). For DISTINCT ON the ON keys are appended
+    // ascending as a tiebreak — a no-op when ORDER BY already begins with them
+    // (as PostgreSQL requires), but it groups equal keys when ORDER BY is
+    // absent so the run dedup below works.
+    if n_order > 0 || n_on > 0 {
+        rows.sort_by(|a, b| {
             for (k, ob) in statement.order_by.iter().enumerate() {
                 let ka = super::exec::decode_projected_pub(a, width + k);
                 let kb = super::exec::decode_projected_pub(b, width + k);
@@ -9022,13 +9277,54 @@ fn materialized_rows<'a>(
                     return ord;
                 }
             }
+            for j in 0..n_on {
+                let ka = super::exec::decode_projected_pub(a, width + n_order + j);
+                let kb = super::exec::decode_projected_pub(b, width + n_order + j);
+                let ord = match (ka.is_null(), kb.is_null()) {
+                    (true, true) => core::cmp::Ordering::Equal,
+                    (true, false) => core::cmp::Ordering::Greater,
+                    (false, true) => core::cmp::Ordering::Less,
+                    (false, false) => {
+                        compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal)
+                    }
+                };
+                if !ord.is_eq() {
+                    return ord;
+                }
+            }
             core::cmp::Ordering::Equal
         });
     }
 
+    // DISTINCT ON: keep the first row of each run of equal ON keys.
+    let rows: &mut [&[u8]] = if n_on > 0 {
+        let mut unique = 0usize;
+        for i in 0..rows.len() {
+            let same = i > 0
+                && (0..n_on).all(|j| {
+                    let ka = super::exec::decode_projected_pub(rows[i], width + n_order + j);
+                    let kb = super::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
+                    match (ka.is_null(), kb.is_null()) {
+                        (true, true) => true,
+                        (true, false) | (false, true) => false,
+                        (false, false) => {
+                            compare_datums(&ka, &kb).map(|o| o.is_eq()).unwrap_or(false)
+                        }
+                    }
+                });
+            if !same {
+                rows[unique] = rows[i];
+                unique += 1;
+            }
+        }
+        &mut rows[..unique]
+    } else {
+        rows
+    };
+
     let deferred = any_postponed.then_some(PostponedProjection {
         postponed,
-        raw_at: width + n_order,
+        raw_at: width + n_keys,
         n_raw,
     });
     Ok((rows, width, deferred))
@@ -9182,7 +9478,45 @@ fn synth_derived_def<'a>(
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
-                describe_scope_items(sub.items, &ss, &mut descriptors)?
+                let n = describe_scope_items(sub.items, &ss, &mut descriptors)?;
+                // A bare scalar/array subquery item (possibly correlated) has
+                // no static type from the scope and describes as text; infer
+                // its real type from the inner select's projection so the
+                // derived-table column is typed correctly.
+                let mut slot = 0usize;
+                for item in sub.items {
+                    match item {
+                        SelectItem::Wildcard => slot += ss.star_columns(),
+                        SelectItem::TableWildcard(q) => {
+                            slot += ss.defs[ss.table_index(q)?].expect("resolved").n_columns;
+                        }
+                        SelectItem::Expr { expression, .. } => {
+                            if slot < n
+                                && descriptors[slot].type_oid == super::types::oid::TEXT
+                                && let Expr::Subquery(inner_sub) = &**expression
+                                && let Some(SelectItem::Expr { expression: inner, .. }) =
+                                    inner_sub.items.first()
+                            {
+                                let inner_scope = inner_sub.from.as_ref().and_then(|inf| {
+                                    QueryScope::resolve_schema(storage, inf, txid, arena).ok()
+                                });
+                                let witness = subquery_witness(
+                                    inner,
+                                    inner_scope.as_ref().or(Some(&ss)),
+                                );
+                                if !witness.is_null() {
+                                    descriptors[slot] = ColDesc::new(
+                                        descriptors[slot].name,
+                                        witness.type_oid(),
+                                        -1,
+                                    );
+                                }
+                            }
+                            slot += 1;
+                        }
+                    }
+                }
+                n
             }
             None => describe_items(sub.items, None, &mut descriptors)?,
         },

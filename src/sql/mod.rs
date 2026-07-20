@@ -3839,9 +3839,14 @@ mod tests {
         // Column-count mismatch.
         let a = run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 1, 2");
         assert!(String::from_utf8_lossy(&a).contains("42601"), "{:?}", String::from_utf8_lossy(&a));
-        // Incompatible types.
+        // An untyped literal adopts the other branch's type, then fails to
+        // coerce (22P02) — matching PostgreSQL, which resolves the unknown
+        // `'x'` to integer before parsing it.
         let c = run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 'x'");
-        assert!(String::from_utf8_lossy(&c).contains("42804"), "{:?}", String::from_utf8_lossy(&c));
+        assert!(String::from_utf8_lossy(&c).contains("22P02"), "{:?}", String::from_utf8_lossy(&c));
+        // A concretely-typed incompatible column is the type-mismatch error.
+        let d = run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 'x'::text");
+        assert!(String::from_utf8_lossy(&d).contains("42804"), "{:?}", String::from_utf8_lossy(&d));
     }
 
     #[test]

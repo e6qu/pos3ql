@@ -377,6 +377,30 @@ impl<'b> Responder<'b> {
                     m.i32(text.as_str().len() as i32);
                     m.bytes(text.as_str().as_bytes());
                 }
+                Datum::Record(_) => {
+                    // A record's text can be arbitrarily wide; count the
+                    // length, emit it, then stream Display straight to the
+                    // send buffer (no fixed-size scratch).
+                    use core::fmt::Write as _;
+                    struct Counter(usize);
+                    impl core::fmt::Write for Counter {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            self.0 += s.len();
+                            Ok(())
+                        }
+                    }
+                    struct MsgWriter<'w, 'b>(&'w mut MsgOut<'b>);
+                    impl core::fmt::Write for MsgWriter<'_, '_> {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            self.0.bytes(s.as_bytes());
+                            Ok(())
+                        }
+                    }
+                    let mut counter = Counter(0);
+                    let _ = write!(counter, "{v}");
+                    m.i32(counter.0 as i32);
+                    let _ = write!(MsgWriter(m), "{v}");
+                }
                 other => {
                     let text = stack_format!(40, "{}", other);
                     debug_assert!(!text.is_truncated());
@@ -466,6 +490,27 @@ impl<'b> Responder<'b> {
                     let text = stack_format!(256, "{}", Datum::Array { element: *element, raw });
                     m.i32(text.as_str().len() as i32);
                     m.bytes(text.as_str().as_bytes());
+                }
+                Datum::Record(_) => {
+                    use core::fmt::Write as _;
+                    struct Counter(usize);
+                    impl core::fmt::Write for Counter {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            self.0 += s.len();
+                            Ok(())
+                        }
+                    }
+                    struct MsgWriter<'w, 'b>(&'w mut MsgOut<'b>);
+                    impl core::fmt::Write for MsgWriter<'_, '_> {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            self.0.bytes(s.as_bytes());
+                            Ok(())
+                        }
+                    }
+                    let mut counter = Counter(0);
+                    let _ = write!(counter, "{v}");
+                    m.i32(counter.0 as i32);
+                    let _ = write!(MsgWriter(m), "{v}");
                 }
                 Datum::Numeric(nm) => {
                     // PostgreSQL numeric binary: i16 ndigits, weight, sign,

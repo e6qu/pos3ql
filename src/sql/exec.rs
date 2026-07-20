@@ -56,6 +56,35 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         }
     }
 
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
+        if table != self.def.name.as_str() {
+            return Err(sql_err!(
+                "42P01",
+                "missing FROM-clause entry for table \"{}\"",
+                table
+            ));
+        }
+        let cols = self.def.columns();
+        let mut fields = [super::types::RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        }; MAX_COLUMNS];
+        let too_large =
+            || sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "record exceeds the arena");
+        for (i, field) in fields.iter_mut().enumerate().take(self.def.n_columns) {
+            field.name = arena.alloc_str(cols[i].name.as_str()).map_err(|_| too_large())?;
+            field.type_oid = cols[i].ctype.oid();
+            field.value = self.values.get(i).copied().unwrap_or(Datum::Null);
+        }
+        let out = arena.alloc_slice_copy(&fields[..self.def.n_columns]).map_err(|_| too_large())?;
+        Ok(Some(&*out))
+    }
+
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if let Some(q) = qualifier
             && q != self.def.name.as_str() {
@@ -2693,6 +2722,7 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
     }
     match expression {
         Expr::Case { .. } => "case",
+        Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
         Expr::ArraySubquery(_) => "array",
         // A scalar subquery is named by its single output column.
@@ -2709,6 +2739,12 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
 /// error for an unknown column (or absent FROM clause).
 pub trait ColTypeResolver {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError>;
+
+    /// Whether an unqualified `name` names a FROM item (so a bare reference to
+    /// it is a whole-row/record value). Defaults to false.
+    fn is_whole_row(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// No FROM clause: any column reference is an error.
@@ -2731,6 +2767,10 @@ impl ColTypeResolver for DefCols<'_> {
             Some(i) => Ok(self.0.columns()[i].ctype),
             None => Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name)),
         }
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        name == self.0.name.as_str()
     }
 }
 
@@ -2781,15 +2821,8 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
     let of = |t: ColType| (t.oid(), t.typlen());
     Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
-        // `count(t.*)` never infers its argument (count is typed int8
-        // directly); everywhere else a whole-row value has no type here.
-        Expr::WholeRow(t) => {
-            return Err(sql_err!(
-                "0A000",
-                "whole-row reference to \"{}\" is only supported as a count() argument",
-                t
-            ))
-        }
+        // A whole-row reference is an anonymous record.
+        Expr::WholeRow(_) => (oid::RECORD, -1),
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {
@@ -2797,7 +2830,16 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
         }
         Expr::Float(_) => of(ColType::Float8),
         Expr::NumericLit(_) => of(ColType::Numeric),
-        Expr::Column { qualifier, name } => of(columns.resolve(*qualifier, name)?),
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
+            Ok(t) => of(t),
+            // A bare name that is not a column but names a FROM item is a
+            // whole-row/record value.
+            Err(e) if qualifier.is_none() && columns.is_whole_row(name) => {
+                let _ = e;
+                (oid::RECORD, -1)
+            }
+            Err(e) => return Err(e),
+        },
         Expr::Unary { operator, operand } => match operator {
             super::ast::UnaryOp::Not => of(ColType::Bool),
             super::ast::UnaryOp::Neg | super::ast::UnaryOp::BitNot => infer_type_res(operand, columns)?,
@@ -3045,6 +3087,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 .transpose()?
                 .unwrap_or_else(|| of(ColType::Int8)),
             "count" => of(ColType::Int8),
+            "row_to_json" | "to_json" => of(ColType::Json),
+            "to_jsonb" => of(ColType::Jsonb),
+            "row" => (oid::RECORD, -1),
             "sum" | "avg" => {
                 let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                 match a {
@@ -3163,6 +3208,17 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
             "string_agg" => of(ColType::Text),
+            "array_agg" => {
+                // Element type from the argument; the result is elem[].
+                let elem = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .and_then(|(oid, _)| coltype_of_oid(oid))
+                    .and_then(super::types::ArrElem::from_coltype)
+                    .unwrap_or(super::types::ArrElem::Int4);
+                of(ColType::Array(elem))
+            }
             // Ordered-set aggregates: percentile_cont yields double precision
             // (numeric for a numeric input); percentile_disc/mode yield the
             // WITHIN GROUP input type.
@@ -3333,30 +3389,7 @@ pub fn resolve_order_expr_pub<'a>(
 pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
     let mut len = 1usize;
     for v in values {
-        len += 1 + match v {
-            Datum::Null => 0,
-            Datum::Bool(_) => 1,
-            Datum::Int4(_) | Datum::Date(_) => 4,
-            Datum::Int8(_)
-            | Datum::Float8(_)
-            | Datum::Timestamp(_)
-            | Datum::Timestamptz(_)
-            | Datum::Time(_) => 8,
-            Datum::Interval(_) => 16,
-            Datum::Uuid(_) => 16,
-            Datum::Text(s) => 4 + s.len(),
-            Datum::Json { text, .. } => 5 + text.len(),
-            Datum::Array { raw, .. } => 6 + raw.len(),
-            Datum::Bytea(b) => 4 + b.len(),
-            // sign(1) weight(2) dscale(2) ndigits(2) + packed digits
-            Datum::Numeric(nm) => 7 + nm.digits.len(),
-            // kind(1) + len(4) + text
-            Datum::Range { text, .. } => 5 + text.len(),
-            // varying(1) + len(4) + bits
-            Datum::Bit { bits, .. } => 5 + bits.len(),
-            // kind(1) + len(4) + text
-            Datum::Multirange { text, .. } => 5 + text.len(),
-        };
+        len += projected_value_len(v);
     }
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
         sql_err!(
@@ -3367,126 +3400,198 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
     out[0] = values.len() as u8;
     let mut at = 1usize;
     for v in values {
-        match v {
-            Datum::Null => {
-                out[at] = 0;
-                at += 1;
-            }
-            Datum::Bool(b) => {
-                out[at] = 1;
-                out[at + 1] = u8::from(*b);
-                at += 2;
-            }
-            Datum::Int4(x) => {
-                out[at] = 2;
-                out[at + 1..at + 5].copy_from_slice(&x.to_le_bytes());
-                at += 5;
-            }
-            Datum::Int8(x) => {
-                out[at] = 3;
-                out[at + 1..at + 9].copy_from_slice(&x.to_le_bytes());
-                at += 9;
-            }
-            Datum::Float8(x) => {
-                out[at] = 4;
-                out[at + 1..at + 9].copy_from_slice(&x.to_bits().to_le_bytes());
-                at += 9;
-            }
-            Datum::Text(s) => {
-                out[at] = 5;
-                out[at + 1..at + 5].copy_from_slice(&(s.len() as u32).to_le_bytes());
-                out[at + 5..at + 5 + s.len()].copy_from_slice(s.as_bytes());
-                at += 5 + s.len();
-            }
-            Datum::Date(x) => {
-                out[at] = 6;
-                out[at + 1..at + 5].copy_from_slice(&x.to_le_bytes());
-                at += 5;
-            }
-            Datum::Timestamp(x) => {
-                out[at] = 7;
-                out[at + 1..at + 9].copy_from_slice(&x.to_le_bytes());
-                at += 9;
-            }
-            Datum::Timestamptz(x) => {
-                out[at] = 8;
-                out[at + 1..at + 9].copy_from_slice(&x.to_le_bytes());
-                at += 9;
-            }
-            Datum::Time(x) => {
-                out[at] = 12;
-                out[at + 1..at + 9].copy_from_slice(&x.to_le_bytes());
-                at += 9;
-            }
-            Datum::Interval(interval) => {
-                out[at] = 13;
-                out[at + 1..at + 5].copy_from_slice(&interval.months.to_le_bytes());
-                out[at + 5..at + 9].copy_from_slice(&interval.days.to_le_bytes());
-                out[at + 9..at + 17].copy_from_slice(&interval.micros.to_le_bytes());
-                at += 17;
-            }
-            Datum::Json { text, jsonb } => {
-                out[at] = 14;
-                out[at + 1] = u8::from(*jsonb);
-                out[at + 2..at + 6].copy_from_slice(&(text.len() as u32).to_le_bytes());
-                out[at + 6..at + 6 + text.len()].copy_from_slice(text.as_bytes());
-                at += 6 + text.len();
-            }
-            Datum::Array { element, raw } => {
-                out[at] = 15;
-                out[at + 1] = element.code();
-                out[at + 2..at + 6].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-                out[at + 6..at + 6 + raw.len()].copy_from_slice(raw);
-                at += 6 + raw.len();
-            }
-            Datum::Uuid(b) => {
-                out[at] = 9;
-                out[at + 1..at + 17].copy_from_slice(b);
-                at += 17;
-            }
-            Datum::Bytea(b) => {
-                out[at] = 10;
-                out[at + 1..at + 5].copy_from_slice(&(b.len() as u32).to_le_bytes());
-                out[at + 5..at + 5 + b.len()].copy_from_slice(b);
-                at += 5 + b.len();
-            }
-            Datum::Numeric(nm) => {
-                out[at] = 11;
-                out[at + 1] = match nm.sign {
-                    crate::sql::numeric::Sign::Pos => 0,
-                    crate::sql::numeric::Sign::Neg => 1,
-                    crate::sql::numeric::Sign::NaN => 2,
-                };
-                out[at + 2..at + 4].copy_from_slice(&nm.weight.to_le_bytes());
-                out[at + 4..at + 6].copy_from_slice(&nm.dscale.to_le_bytes());
-                out[at + 6..at + 8].copy_from_slice(&(nm.ndigits() as u16).to_le_bytes());
-                out[at + 8..at + 8 + nm.digits.len()].copy_from_slice(nm.digits);
-                at += 8 + nm.digits.len();
-            }
-            Datum::Range { text, kind } => {
-                out[at] = 16;
-                out[at + 1] = kind.code();
-                out[at + 2..at + 6].copy_from_slice(&(text.len() as u32).to_le_bytes());
-                out[at + 6..at + 6 + text.len()].copy_from_slice(text.as_bytes());
-                at += 6 + text.len();
-            }
-            Datum::Bit { bits, varying } => {
-                out[at] = 17;
-                out[at + 1] = u8::from(*varying);
-                out[at + 2..at + 6].copy_from_slice(&(bits.len() as u32).to_le_bytes());
-                out[at + 6..at + 6 + bits.len()].copy_from_slice(bits.as_bytes());
-                at += 6 + bits.len();
-            }
-            Datum::Multirange { text, kind } => {
-                out[at] = 18;
-                out[at + 1] = kind.code();
-                out[at + 2..at + 6].copy_from_slice(&(text.len() as u32).to_le_bytes());
-                out[at + 6..at + 6 + text.len()].copy_from_slice(text.as_bytes());
-                at += 6 + text.len();
-            }
-        }
+        at += write_projected_value(v, &mut out[at..]);
     }
     Ok(&*out)
+}
+
+/// The projected-encoding byte length of one value (tag + payload).
+pub fn projected_value_len(v: &Datum) -> usize {
+    1 + match v {
+        Datum::Null => 0,
+        Datum::Bool(_) => 1,
+        Datum::Int4(_) | Datum::Date(_) => 4,
+        Datum::Int8(_)
+        | Datum::Float8(_)
+        | Datum::Timestamp(_)
+        | Datum::Timestamptz(_)
+        | Datum::Time(_) => 8,
+        Datum::Interval(_) => 16,
+        Datum::Uuid(_) => 16,
+        Datum::Text(s) => 4 + s.len(),
+        Datum::Json { text, .. } => 5 + text.len(),
+        Datum::Array { raw, .. } => 6 + raw.len(),
+        Datum::Bytea(b) => 4 + b.len(),
+        Datum::Numeric(nm) => 7 + nm.digits.len(),
+        Datum::Range { text, .. } => 5 + text.len(),
+        Datum::Bit { bits, .. } => 5 + bits.len(),
+        Datum::Multirange { text, .. } => 5 + text.len(),
+        // A record is stored as its rendered text (decode has no arena to
+        // rebuild the field slice); the column's RECORD type comes from the
+        // describe pass, so output is unaffected.
+        Datum::Record(_) => 4 + record_text_len(v),
+    }
+}
+
+/// The byte length of a value's `Display` output (no allocation).
+fn record_text_len(v: &Datum) -> usize {
+    use core::fmt::Write as _;
+    struct Counter(usize);
+    impl core::fmt::Write for Counter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0 += s.len();
+            Ok(())
+        }
+    }
+    let mut c = Counter(0);
+    let _ = write!(c, "{v}");
+    c.0
+}
+
+/// Writes one value's tag+payload into `out[0..]` (already sized by
+/// `projected_value_len`), returning the bytes written. Shared by the
+/// top-level encoder and a record's nested fields.
+fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
+    match v {
+        Datum::Null => {
+            out[0] = 0;
+            1
+        }
+        Datum::Bool(b) => {
+            out[0] = 1;
+            out[1] = u8::from(*b);
+            2
+        }
+        Datum::Int4(x) => {
+            out[0] = 2;
+            out[1..5].copy_from_slice(&x.to_le_bytes());
+            5
+        }
+        Datum::Int8(x) => {
+            out[0] = 3;
+            out[1..9].copy_from_slice(&x.to_le_bytes());
+            9
+        }
+        Datum::Float8(x) => {
+            out[0] = 4;
+            out[1..9].copy_from_slice(&x.to_bits().to_le_bytes());
+            9
+        }
+        Datum::Text(str_value) => {
+            out[0] = 5;
+            out[1..5].copy_from_slice(&(str_value.len() as u32).to_le_bytes());
+            out[5..5 + str_value.len()].copy_from_slice(str_value.as_bytes());
+            5 + str_value.len()
+        }
+        Datum::Date(x) => {
+            out[0] = 6;
+            out[1..5].copy_from_slice(&x.to_le_bytes());
+            5
+        }
+        Datum::Timestamp(x) => {
+            out[0] = 7;
+            out[1..9].copy_from_slice(&x.to_le_bytes());
+            9
+        }
+        Datum::Timestamptz(x) => {
+            out[0] = 8;
+            out[1..9].copy_from_slice(&x.to_le_bytes());
+            9
+        }
+        Datum::Time(x) => {
+            out[0] = 12;
+            out[1..9].copy_from_slice(&x.to_le_bytes());
+            9
+        }
+        Datum::Interval(interval) => {
+            out[0] = 13;
+            out[1..5].copy_from_slice(&interval.months.to_le_bytes());
+            out[5..9].copy_from_slice(&interval.days.to_le_bytes());
+            out[9..17].copy_from_slice(&interval.micros.to_le_bytes());
+            17
+        }
+        Datum::Json { text, jsonb } => {
+            out[0] = 14;
+            out[1] = u8::from(*jsonb);
+            out[2..6].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[6..6 + text.len()].copy_from_slice(text.as_bytes());
+            6 + text.len()
+        }
+        Datum::Array { element, raw } => {
+            out[0] = 15;
+            out[1] = element.code();
+            out[2..6].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            out[6..6 + raw.len()].copy_from_slice(raw);
+            6 + raw.len()
+        }
+        Datum::Uuid(b) => {
+            out[0] = 9;
+            out[1..17].copy_from_slice(b);
+            17
+        }
+        Datum::Bytea(b) => {
+            out[0] = 10;
+            out[1..5].copy_from_slice(&(b.len() as u32).to_le_bytes());
+            out[5..5 + b.len()].copy_from_slice(b);
+            5 + b.len()
+        }
+        Datum::Numeric(nm) => {
+            out[0] = 11;
+            out[1] = match nm.sign {
+                crate::sql::numeric::Sign::Pos => 0,
+                crate::sql::numeric::Sign::Neg => 1,
+                crate::sql::numeric::Sign::NaN => 2,
+            };
+            out[2..4].copy_from_slice(&nm.weight.to_le_bytes());
+            out[4..6].copy_from_slice(&nm.dscale.to_le_bytes());
+            out[6..8].copy_from_slice(&(nm.ndigits() as u16).to_le_bytes());
+            out[8..8 + nm.digits.len()].copy_from_slice(nm.digits);
+            8 + nm.digits.len()
+        }
+        Datum::Range { text, kind } => {
+            out[0] = 16;
+            out[1] = kind.code();
+            out[2..6].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[6..6 + text.len()].copy_from_slice(text.as_bytes());
+            6 + text.len()
+        }
+        Datum::Bit { bits, varying } => {
+            out[0] = 17;
+            out[1] = u8::from(*varying);
+            out[2..6].copy_from_slice(&(bits.len() as u32).to_le_bytes());
+            out[6..6 + bits.len()].copy_from_slice(bits.as_bytes());
+            6 + bits.len()
+        }
+        Datum::Multirange { text, kind } => {
+            out[0] = 18;
+            out[1] = kind.code();
+            out[2..6].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[6..6 + text.len()].copy_from_slice(text.as_bytes());
+            6 + text.len()
+        }
+        Datum::Record(_) => {
+            use core::fmt::Write as _;
+            // A cursor writing Display output straight into `out` after the
+            // 5-byte header (tag + u32 length).
+            struct SliceWriter<'b> {
+                buf: &'b mut [u8],
+                at: usize,
+            }
+            impl core::fmt::Write for SliceWriter<'_> {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    self.buf[self.at..self.at + s.len()].copy_from_slice(s.as_bytes());
+                    self.at += s.len();
+                    Ok(())
+                }
+            }
+            out[0] = 19;
+            let mut w = SliceWriter { buf: out, at: 5 };
+            let _ = write!(w, "{v}");
+            let text_len = w.at - 5;
+            out[1..5].copy_from_slice(&(text_len as u32).to_le_bytes());
+            5 + text_len
+        }
+    }
 }
 
 /// Reads column `col` back out of an [`encode_projected`] row.
@@ -3576,6 +3681,13 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
                 let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
                 let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
                 (Datum::Multirange { text: s, kind }, 5 + len)
+            }
+            19 => {
+                // A record is stored as its rendered text; the column's RECORD
+                // type comes from describe, so returning Text renders it right.
+                let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                let s = core::str::from_utf8(&bytes[at + 4..at + 4 + len]).unwrap_or("");
+                (Datum::Text(s), 4 + len)
             }
             9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
             10 => {

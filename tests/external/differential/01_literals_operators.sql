@@ -120,3 +120,10 @@ SHOW bytea_output;
 SET bytea_output = 'hex';
 SELECT '\x00ff5c20'::bytea;
 SET bytea_output = 'bogus';
+-- constant FALSE OR FALSE folds, dropping a dead CASE arm (no spurious div-by-zero)
+CREATE TABLE fzc (id int, a numeric);
+INSERT INTO fzc VALUES (1, 5.0);
+SELECT CASE WHEN (('a_b' NOT ILIKE 'a%' AND id IN (3)) OR -2147483648 >= -2.25) THEN (a - (3.14 / (-2.25 - -2.25))) END FROM fzc;
+SELECT CASE WHEN (false OR false) THEN 1/0 ELSE 9 END;
+SELECT CASE WHEN (true AND true) THEN 7 ELSE 1/0 END;
+DROP TABLE fzc;

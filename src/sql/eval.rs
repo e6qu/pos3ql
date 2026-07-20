@@ -1517,13 +1517,19 @@ fn call<'a>(
                 .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?
                 as i64;
             let start = eval_full(args[0], arena, params, row, hooks)?;
+            let stop = eval_full(args[1], arena, params, row, hooks)?;
             let step = if args.len() == 3 {
                 eval_full(args[2], arena, params, row, hooks)?
             } else {
                 Datum::Int4(1)
             };
-            if let (Some(s), Some(st)) = (as_i64(&start), as_i64(&step)) {
+            if let (Some(s), Some(e), Some(st)) = (as_i64(&start), as_i64(&stop), as_i64(&step)) {
                 let v = s + (k - 1) * st;
+                // Past the end of this series (a shorter SRF paired with a longer
+                // one runs out): NULL, matching PostgreSQL's lockstep expansion.
+                if st == 0 || (st > 0 && v > e) || (st < 0 && v < e) {
+                    return Ok(Datum::Null);
+                }
                 // int4 unless an argument is int8 or the value overflows int4.
                 let wide = matches!(start, Datum::Int8(_)) || matches!(step, Datum::Int8(_));
                 return Ok(if !wide && i32::try_from(v).is_ok() {
@@ -1542,6 +1548,7 @@ fn call<'a>(
                     "generate_series is supported for integer and timestamp arguments"
                 ));
             };
+            let stop_micros = timestamp_series_start(&cast_to(stop, kind.coltype(), arena)?).map(|(m, _)| m);
             // The step is an interval — coerce a bare string literal, as
             // PostgreSQL's function resolution does.
             let Datum::Interval(step_iv) = cast_to(step, ColType::Interval, arena)? else {
@@ -1554,7 +1561,13 @@ fn call<'a>(
             for _ in 1..k {
                 v = super::datetime::add_interval(v, step_iv);
             }
-            Ok(kind.datum(v))
+            // Past the end of this series (lockstep with a longer SRF): NULL.
+            let positive = interval_is_positive(step_iv);
+            match stop_micros {
+                Some(stop) if (positive && v > stop) || (!positive && v < stop) => Ok(Datum::Null),
+                Some(_) => Ok(kind.datum(v)),
+                None => Ok(Datum::Null),
+            }
         }
         // Set-returning `regexp_matches(string, pattern [, flags])`: for the
         // current expansion index k, the capture groups of the k-th match as a

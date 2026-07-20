@@ -6362,10 +6362,7 @@ pub fn select_query<'a>(
                     }
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
-                let count = match srf_call {
-                    None => 1,
-                    Some(c) => srf_count(c, arena, params, row, row_hooks)?,
-                };
+                let count = srf_max_count(statement.items, arena, params, row, row_hooks)?;
                 for k in 1..=count {
                     if emitted >= limit {
                         break;
@@ -7329,12 +7326,9 @@ pub fn constant_select<'a>(
     // A set-returning function in the select list expands the single virtual
     // row into one output row per element/value.
     let srf_call = find_srf(statement.items);
-    let count = match srf_call {
-        None => 1,
-        Some(c) => match srf_count(c, arena, params, &super::eval::NoColumns, &hooks) {
-            Ok(n) => n,
-            Err(e) => return sql_fail(e),
-        },
+    let count = match srf_max_count(statement.items, arena, params, &super::eval::NoColumns, &hooks) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
     };
     responder.row_description(&columns[..n])?;
     // Resolve ORDER BY targets against the select list: ordinals and output
@@ -7657,10 +7651,7 @@ pub fn select_into_rows<'a>(
             prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
         let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
         let srf_call = find_srf(statement.items);
-        let count = match srf_call {
-            None => 1,
-            Some(c) => srf_count(c, arena, params, &super::eval::NoColumns, &hooks)?,
-        };
+        let count = srf_max_count(statement.items, arena, params, &super::eval::NoColumns, &hooks)?;
         for k in 1..=count {
             let khooks = if srf_call.is_some() {
                 EvalHooks { srf_index: Some(k), ..hooks }
@@ -7851,25 +7842,54 @@ fn is_srf_name(name: &str) -> bool {
         || is_json_each_name(name)
 }
 
+/// The set-returning function call (if any) driving a single expression's
+/// expansion — the outermost SRF reachable through wrapping expressions.
+fn srf_in_expr<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+    match e {
+        Expr::Call { name, .. } if is_srf_name(name) => Some(e),
+        Expr::Field { base, .. } => srf_in_expr(base),
+        Expr::Cast { operand, .. } => srf_in_expr(operand),
+        Expr::Unary { operand, .. } => srf_in_expr(operand),
+        Expr::Binary { left, right, .. } => srf_in_expr(left).or_else(|| srf_in_expr(right)),
+        Expr::Call { args, .. } => args.iter().find_map(|a| srf_in_expr(a)),
+        _ => None,
+    }
+}
+
+/// The SRF (if any) driving a single select item's expansion.
+fn srf_in_item<'a>(item: &'a SelectItem<'a>) -> Option<&'a Expr<'a>> {
+    match item {
+        SelectItem::Expr { expression, .. } => srf_in_expr(expression),
+        SelectItem::RecordStar(base) => srf_in_expr(base),
+        SelectItem::Wildcard | SelectItem::TableWildcard(_) => None,
+    }
+}
+
 /// Finds a set-returning function call among the SELECT items (the whole call
 /// node, so the caller can compute its row count), or None for a single row.
-fn find_srf<'a>(items: &[SelectItem<'a>]) -> Option<&'a Expr<'a>> {
-    fn walk<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
-        match e {
-            Expr::Call { name, .. } if is_srf_name(name) => Some(e),
-            Expr::Field { base, .. } => walk(base),
-            Expr::Cast { operand, .. } => walk(operand),
-            Expr::Unary { operand, .. } => walk(operand),
-            Expr::Binary { left, right, .. } => walk(left).or_else(|| walk(right)),
-            Expr::Call { args, .. } => args.iter().find_map(|a| walk(a)),
-            _ => None,
+fn find_srf<'a>(items: &'a [SelectItem<'a>]) -> Option<&'a Expr<'a>> {
+    items.iter().find_map(srf_in_item)
+}
+
+/// The number of output rows a select list's set-returning functions expand to:
+/// the maximum length over all of them (each shorter one NULL-pads), matching
+/// PostgreSQL's lockstep evaluation. Returns 1 when there is no SRF.
+fn srf_max_count<'a, R: ColumnLookup<'a>>(
+    items: &'a [SelectItem<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<usize, SqlError> {
+    let mut any = false;
+    let mut max = 0usize;
+    for item in items {
+        if let Some(call) = srf_in_item(item) {
+            max = max.max(srf_count(call, arena, params, row, hooks)?);
+            any = true;
         }
     }
-    items.iter().find_map(|it| match it {
-        SelectItem::Expr { expression, .. } => walk(expression),
-        SelectItem::RecordStar(base) => walk(base),
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => None,
-    })
+    Ok(if any { max } else { 1 })
 }
 
 /// Number of output rows a set-returning call yields for the current source row.
@@ -9533,10 +9553,7 @@ fn materialized_rows<'a>(
                     }
                 &row_hooks_owned
             };
-            let expansions = match srf_call {
-                None => 1,
-                Some(c) => srf_count(c, arena, params, row, row_hooks)?,
-            };
+            let expansions = srf_max_count(statement.items, arena, params, row, row_hooks)?;
             for k in 1..=expansions {
                 let srf_hooks;
                 let use_hooks: &EvalHooks = if srf_call.is_some() {
@@ -9589,10 +9606,7 @@ fn materialized_rows<'a>(
                         }
                     &row_hooks_owned
                 };
-                let expansions = match srf_call {
-                    None => 1,
-                    Some(c) => srf_count(c, arena, params, row, row_hooks)?,
-                };
+                let expansions = srf_max_count(statement.items, arena, params, row, row_hooks)?;
                 for k in 1..=expansions {
                     let srf_hooks;
                     let use_hooks: &EvalHooks = if srf_call.is_some() {

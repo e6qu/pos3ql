@@ -55,6 +55,13 @@ max_tables = 64
 table_rows = 65536
 memtable_bytes = 256MiB
 EOF
+# A leftover server on our port would silently answer the readiness probe
+# below and the whole run would test a stale binary. Refuse to start.
+if nc -z 127.0.0.1 $P3_PORT 2>/dev/null; then
+  bad "port $P3_PORT is already in use (stale pos3ql from an earlier run?) — kill it first"
+  exit 1
+fi
+
 ./target/release/pos3ql --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 
@@ -66,6 +73,11 @@ for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $P3_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
+# The probe succeeding proves *a* server answered — make sure it is ours.
+if ! kill -0 "$P3_PID" 2>/dev/null; then
+  bad "pos3ql under test exited at startup (see $WORK/p3.log)"
+  exit 1
+fi
 
 # Normalizer: error wording differs between implementations; SQLSTATEs and
 # result rows must not.

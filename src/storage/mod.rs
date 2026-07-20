@@ -531,6 +531,20 @@ pub struct ViewDef {
     pub name: SqlName,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub live: bool,
+    /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
+    /// mirroring `Table::pending_ddl`): other transactions see `live`; the
+    /// owner sees the pending existence.
+    pub pending: Option<PendingDdl>,
+}
+
+impl ViewDef {
+    /// Whether `txid` sees this view exist.
+    pub fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(p) if p.txid == txid => p.creating,
+            _ => self.live,
+        }
+    }
 }
 
 /// Maximum columns in an index key.
@@ -547,6 +561,19 @@ pub struct IndexDef {
     pub n_cols: usize,
     pub unique: bool,
     pub live: bool,
+    /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
+    /// mirroring `Table::pending_ddl`).
+    pub pending: Option<PendingDdl>,
+}
+
+impl IndexDef {
+    /// Whether `txid` sees this index exist.
+    pub fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(p) if p.txid == txid => p.creating,
+            _ => self.live,
+        }
+    }
 }
 
 pub struct Storage {
@@ -604,6 +631,7 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     live: false,
+                    pending: None,
                 })
                 .expect("sized to max_tables");
         }
@@ -617,6 +645,7 @@ impl Storage {
                     n_cols: 0,
                     unique: false,
                     live: false,
+                    pending: None,
                 })
                 .expect("sized to max_tables");
         }
@@ -972,10 +1001,10 @@ impl Storage {
 
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
-        self.views.iter().any(|v| v.live)
+        self.views.iter().any(|v| v.live || v.pending.is_some())
     }
 
-    /// Live views as (name, SELECT text), for checkpoint serialization.
+    /// Committed views as (name, SELECT text), for checkpoint serialization.
     pub fn live_views(&self) -> impl Iterator<Item = (&str, &str)> {
         self.views
             .iter()
@@ -983,23 +1012,27 @@ impl Storage {
             .map(|v| (v.name.as_str(), v.sql.as_str()))
     }
 
-    /// The stored SELECT text of a live view, if `name` names one.
-    pub fn find_view(&self, name: &str) -> Option<&str> {
+    /// The stored SELECT text of a view visible to `txid`, if `name` names one
+    /// (own uncommitted CREATE/DROP included; another transaction's excluded).
+    pub fn find_view(&self, name: &str, txid: u32) -> Option<&str> {
         self.views
             .iter()
-            .find(|v| v.live && v.name.as_str() == name)
+            .find(|v| v.visible_to(txid) && v.name.as_str() == name)
             .map(|v| v.sql.as_str())
     }
 
-    /// Registers a view. `or_replace` supersedes an existing one by marking it
-    /// dead and installing a fresh slot (so a rollback can revive the old and
-    /// drop the new). Returns `(new_slot, replaced_old_slot)`. Errors if the
-    /// name is taken by a table, or by a view when `or_replace` is false.
+    /// Registers a view as an uncommitted CREATE owned by `txid` (other
+    /// transactions keep seeing the committed catalog until commit).
+    /// `or_replace` marks an existing visible view pending-dropped. Returns
+    /// `(new_slot, replaced_old_slot)`. Errors if the name is taken by a
+    /// table, by a view visible to `txid` (without `or_replace`), or by
+    /// another transaction's uncommitted view DDL.
     pub fn create_view(
         &mut self,
         name: SqlName,
         sql: StackStr<VIEW_SQL_MAX>,
         or_replace: bool,
+        txid: u32,
     ) -> Result<(usize, Option<usize>), SqlError> {
         if self.find_table(name.as_str()).is_some() {
             return Err(sql_err!(
@@ -1008,10 +1041,22 @@ impl Storage {
                 name.as_str()
             ));
         }
+        // Another transaction's uncommitted CREATE/DROP holds the name; a
+        // fail-fast conflict replaces PostgreSQL's lock wait.
+        if self.views.iter().any(|v| {
+            v.name.as_str() == name.as_str()
+                && matches!(v.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                "40001",
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name.as_str()
+            ));
+        }
         let existing = self
             .views
             .iter()
-            .position(|v| v.live && v.name.as_str() == name.as_str());
+            .position(|v| v.visible_to(txid) && v.name.as_str() == name.as_str());
         if existing.is_some() && !or_replace {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
@@ -1019,8 +1064,11 @@ impl Storage {
                 name.as_str()
             ));
         }
-        // Find the fresh slot while the old is still live, so they differ.
-        let Some(new) = self.views.iter().position(|v| !v.live) else {
+        let Some(new) = self
+            .views
+            .iter()
+            .position(|v| !v.live && v.pending.is_none())
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many views (limit {})",
@@ -1028,101 +1076,244 @@ impl Storage {
             ));
         };
         if let Some(old) = existing {
-            self.views[old].live = false;
+            self.pending_drop_view(old, txid);
         }
-        self.views[new] = ViewDef { name, sql, live: true };
+        self.views[new] = ViewDef {
+            name,
+            sql,
+            live: false,
+            pending: Some(PendingDdl { txid, creating: true }),
+        };
         Ok((new, existing))
     }
 
-    /// Marks a view dropped; returns its slot (for undo). None if absent.
-    pub fn drop_view(&mut self, name: &str) -> Option<usize> {
-        let i = self
+    /// Marks the view visible to `txid` pending-dropped; returns its slot (for
+    /// undo). None if absent. Errors if another transaction's uncommitted DDL
+    /// holds the name.
+    pub fn drop_view(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+        if self.views.iter().any(|v| {
+            v.name.as_str() == name && matches!(v.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                "40001",
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name
+            ));
+        }
+        let Some(i) = self
             .views
             .iter()
-            .position(|v| v.live && v.name.as_str() == name)?;
-        self.views[i].live = false;
-        Some(i)
+            .position(|v| v.visible_to(txid) && v.name.as_str() == name)
+        else {
+            return Ok(None);
+        };
+        self.pending_drop_view(i, txid);
+        Ok(Some(i))
     }
 
-    pub fn revive_view(&mut self, slot: usize) {
+    /// Overlays a pending DROP on a slot: the owner's own pending-create
+    /// simply evaporates (never committed, nothing to keep).
+    fn pending_drop_view(&mut self, slot: usize, txid: u32) {
+        let v = &mut self.views[slot];
+        if matches!(v.pending, Some(p) if p.txid == txid && p.creating) {
+            v.live = false;
+            v.pending = None;
+        } else {
+            v.pending = Some(PendingDdl { txid, creating: false });
+        }
+    }
+
+    /// Promotes an uncommitted CREATE VIEW into the committed catalog.
+    pub fn commit_view_create(&mut self, slot: usize) {
         self.views[slot].live = true;
+        self.views[slot].pending = None;
+    }
+
+    /// Promotes an uncommitted DROP VIEW into the committed catalog.
+    pub fn commit_view_drop(&mut self, slot: usize) {
+        self.views[slot].live = false;
+        self.views[slot].pending = None;
+    }
+
+    /// Discards an uncommitted CREATE VIEW (rollback): the slot is freed.
+    pub fn rollback_view_create(&mut self, slot: usize) {
+        self.views[slot].live = false;
+        self.views[slot].pending = None;
+    }
+
+    /// Discards an uncommitted DROP VIEW (rollback). A committed view becomes
+    /// visible again; a same-transaction pending-create (create + drop, then
+    /// the drop rolled back to a savepoint) reverts to pending-create.
+    pub fn rollback_view_drop(&mut self, slot: usize, txid: u32) {
+        let v = &mut self.views[slot];
+        if v.live {
+            v.pending = None;
+        } else {
+            v.pending = Some(PendingDdl { txid, creating: true });
+        }
     }
 
     pub fn drop_view_slot(&mut self, slot: usize) {
         self.views[slot].live = false;
     }
 
-    pub fn index_exists(&self, name: &str) -> bool {
-        self.indexes.iter().any(|x| x.live && x.name.as_str() == name)
+    pub fn index_exists(&self, name: &str, txid: u32) -> bool {
+        self.indexes
+            .iter()
+            .any(|x| x.visible_to(txid) && x.name.as_str() == name)
     }
 
-    /// Registers an index; returns its slot. Errors on a duplicate name.
-    pub fn create_index(&mut self, def: IndexDef) -> Result<usize, SqlError> {
-        if self.index_exists(def.name.as_str()) {
+    /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
+    /// transaction; returns its slot. Errors on a duplicate visible name or
+    /// another transaction's uncommitted DDL on the name.
+    pub fn create_index(&mut self, def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+        if self.indexes.iter().any(|x| {
+            x.name.as_str() == def.name.as_str()
+                && matches!(x.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                "40001",
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                def.name.as_str()
+            ));
+        }
+        if self.index_exists(def.name.as_str(), txid) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
                 def.name.as_str()
             ));
         }
-        let Some(i) = self.indexes.iter().position(|x| !x.live) else {
+        let Some(i) = self
+            .indexes
+            .iter()
+            .position(|x| !x.live && x.pending.is_none())
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many indexes (limit {})",
                 self.indexes.len()
             ));
         };
-        self.indexes[i] = def;
+        self.indexes[i] = IndexDef {
+            live: false,
+            pending: Some(PendingDdl { txid, creating: true }),
+            ..def
+        };
         Ok(i)
     }
 
-    /// Drops every live index on a table (PostgreSQL drops a table's indexes
-    /// when the table itself is dropped). Reviving the table (rollback) revives
-    /// these via [`Self::revive_indexes_for`].
-    pub fn drop_indexes_for(&mut self, table: &str) {
+    /// Marks every index visible to `txid` on a table pending-dropped
+    /// (PostgreSQL drops a table's indexes when the table itself is dropped).
+    /// Commit finalizes via [`Self::commit_indexes_for`]; rollback reverts via
+    /// [`Self::rollback_indexes_for`].
+    pub fn drop_indexes_for(&mut self, table: &str, txid: u32) {
+        for i in 0..self.indexes.len() {
+            if self.indexes[i].visible_to(txid) && self.indexes[i].table.as_str() == table {
+                self.pending_drop_index(i, txid);
+            }
+        }
+    }
+
+    /// Promotes this transaction's pending index drops on a table (cascaded
+    /// from its DROP TABLE) into the committed catalog.
+    pub fn commit_indexes_for(&mut self, table: &str, txid: u32) {
         for x in self.indexes.iter_mut() {
-            if x.live && x.table.as_str() == table {
+            if x.table.as_str() == table
+                && matches!(x.pending, Some(p) if p.txid == txid && !p.creating)
+            {
                 x.live = false;
+                x.pending = None;
             }
         }
     }
 
-    /// Revives every dead index on a table (used when a DROP TABLE is rolled
-    /// back).
-    pub fn revive_indexes_for(&mut self, table: &str) {
+    /// Discards this transaction's pending index drops on a table (a rolled
+    /// back DROP TABLE): committed indexes become visible again.
+    pub fn rollback_indexes_for(&mut self, table: &str, txid: u32) {
         for x in self.indexes.iter_mut() {
-            if !x.live && x.table.as_str() == table {
-                x.live = true;
+            if x.table.as_str() == table
+                && matches!(x.pending, Some(p) if p.txid == txid && !p.creating)
+            {
+                x.pending = None;
             }
         }
     }
 
-    /// Marks an index dropped; returns its slot (for undo). None if absent.
-    pub fn drop_index(&mut self, name: &str) -> Option<usize> {
-        let i = self
+    /// Marks the index visible to `txid` pending-dropped; returns its slot
+    /// (for undo). None if absent. Errors if another transaction's uncommitted
+    /// DDL holds the name.
+    pub fn drop_index(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+        if self.indexes.iter().any(|x| {
+            x.name.as_str() == name && matches!(x.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                "40001",
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name
+            ));
+        }
+        let Some(i) = self
             .indexes
             .iter()
-            .position(|x| x.live && x.name.as_str() == name)?;
-        self.indexes[i].live = false;
-        Some(i)
+            .position(|x| x.visible_to(txid) && x.name.as_str() == name)
+        else {
+            return Ok(None);
+        };
+        self.pending_drop_index(i, txid);
+        Ok(Some(i))
     }
 
-    pub fn revive_index(&mut self, slot: usize) {
+    /// Overlays a pending DROP on a slot: the owner's own pending-create
+    /// simply evaporates.
+    fn pending_drop_index(&mut self, slot: usize, txid: u32) {
+        let x = &mut self.indexes[slot];
+        if matches!(x.pending, Some(p) if p.txid == txid && p.creating) {
+            x.live = false;
+            x.pending = None;
+        } else {
+            x.pending = Some(PendingDdl { txid, creating: false });
+        }
+    }
+
+    /// Promotes an uncommitted CREATE INDEX into the committed catalog.
+    pub fn commit_index_create(&mut self, slot: usize) {
         self.indexes[slot].live = true;
+        self.indexes[slot].pending = None;
     }
 
-    pub fn drop_index_slot(&mut self, slot: usize) {
+    /// Promotes an uncommitted DROP INDEX into the committed catalog.
+    pub fn commit_index_drop(&mut self, slot: usize) {
         self.indexes[slot].live = false;
+        self.indexes[slot].pending = None;
     }
 
-    /// Live unique indexes over the named table (for constraint enforcement).
-    pub fn unique_indexes_for(&self, table: &str) -> impl Iterator<Item = &IndexDef> {
+    /// Discards an uncommitted CREATE INDEX (rollback): the slot is freed.
+    pub fn rollback_index_create(&mut self, slot: usize) {
+        self.indexes[slot].live = false;
+        self.indexes[slot].pending = None;
+    }
+
+    /// Discards an uncommitted DROP INDEX (rollback); a same-transaction
+    /// pending-create reverts to pending-create.
+    pub fn rollback_index_drop(&mut self, slot: usize, txid: u32) {
+        let x = &mut self.indexes[slot];
+        if x.live {
+            x.pending = None;
+        } else {
+            x.pending = Some(PendingDdl { txid, creating: true });
+        }
+    }
+
+    /// Unique indexes visible to `txid` over the named table (for constraint
+    /// enforcement — an uncommitted CREATE UNIQUE INDEX binds its owner).
+    pub fn unique_indexes_for(&self, table: &str, txid: u32) -> impl Iterator<Item = &IndexDef> {
         self.indexes
             .iter()
-            .filter(move |x| x.live && x.unique && x.table.as_str() == table)
+            .filter(move |x| x.visible_to(txid) && x.unique && x.table.as_str() == table)
     }
 
-    /// All live indexes, for checkpoint serialization.
+    /// All committed indexes, for checkpoint serialization.
     pub fn live_indexes(&self) -> impl Iterator<Item = &IndexDef> {
         self.indexes.iter().filter(|x| x.live)
     }

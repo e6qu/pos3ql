@@ -53,7 +53,7 @@ fn is_reserved(word: &str) -> bool {
             | "begin" | "commit" | "rollback" | "primary" | "key" | "references"
             | "default" | "unique" | "check" | "constraint" | "returning"
             | "distinct" | "between" | "like" | "ilike" | "in" | "left"
-            | "right" | "full" | "inner" | "outer" | "cross" | "using"
+            | "right" | "full" | "inner" | "outer" | "cross" | "using" | "natural"
     )
 }
 
@@ -61,6 +61,9 @@ fn is_reserved(word: &str) -> bool {
 pub struct ParseError {
     pub at: usize,
     pub message: StackStr<96>,
+    /// SQLSTATE; almost always 42601 (syntax error), but some parse-analysis
+    /// errors carry their own (e.g. 42P20 for window-frame shape).
+    pub sqlstate: &'static str,
 }
 
 impl ParseError {
@@ -68,6 +71,7 @@ impl ParseError {
         Self {
             at,
             message: stack_format!(96, "{}", text),
+            sqlstate: "42601",
         }
     }
 }
@@ -297,6 +301,8 @@ impl<'a> Parser<'a> {
             items[n] = if self.peeked == Tok::Op("*") {
                 self.advance()?;
                 SelectItem::Wildcard
+            } else if let Some(table) = self.table_wildcard()? {
+                SelectItem::TableWildcard(table)
             } else {
                 let expression = self.expression(0)?;
                 let alias = self.alias()?;
@@ -308,6 +314,29 @@ impl<'a> Parser<'a> {
             }
         }
         self.arena_slice(&items[..n])
+    }
+
+    /// `t.*` (two tokens of lookahead: restores the parser when the item
+    /// turns out to be an ordinary expression).
+    fn table_wildcard(&mut self) -> Result<Option<&'a str>, ParseError> {
+        let table = match self.peeked {
+            Tok::Ident(name) | Tok::QuotedIdent(name) => name,
+            _ => return Ok(None),
+        };
+        let mark = self.lexer.mark();
+        let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        self.advance()?;
+        if self.peeked == Tok::Op(".") {
+            self.advance()?;
+            if self.peeked == Tok::Op("*") {
+                self.advance()?;
+                return Ok(Some(table));
+            }
+        }
+        self.lexer.reset(mark);
+        self.peeked = saved_peeked;
+        self.peek_at = saved_peek_at;
+        Ok(None)
     }
 
     fn returning(&mut self) -> Result<&'a [SelectItem<'a>], ParseError> {
@@ -500,14 +529,16 @@ impl<'a> Parser<'a> {
             }
         }
         let ctes = self.arena_slice(&ctes[..n])?;
-        // Body must be a plain SELECT (a set-operation body carrying WITH is
-        // not supported yet).
         match self.query()? {
             Stmt::Select(mut sel) => {
                 sel.with = ctes;
                 Ok(Stmt::Select(sel))
             }
-            _ => Err(self.err_here("WITH before a set operation is not supported")),
+            Stmt::SetQuery(mut q) => {
+                q.with = ctes;
+                Ok(Stmt::SetQuery(q))
+            }
+            _ => Err(self.err_here("WITH must be followed by SELECT")),
         }
     }
 
@@ -521,7 +552,7 @@ impl<'a> Parser<'a> {
             sel.offset = offset;
             return Ok(Stmt::Select(sel));
         }
-        Ok(Stmt::SetQuery(SetQuery { body, order_by, limit, offset }))
+        Ok(Stmt::SetQuery(SetQuery { with: &[], body, order_by, limit, offset }))
     }
 
     /// UNION / EXCEPT level (lowest precedence, left-associative).
@@ -752,17 +783,34 @@ impl<'a> Parser<'a> {
             table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None, cte: None },
             kind: JoinKind::Inner,
             on: None,
+            using_columns: None,
+            natural: false,
         };
         let mut joins = [dummy; 8];
         let mut n = 0;
         loop {
-            // NATURAL joins require plan-time common-column resolution and a
-            // merged `SELECT *`; not yet supported — reject clearly rather than
-            // mis-parsing it as an ordinary join.
-            if self.peeked == Tok::Ident("natural") {
-                return Err(self.err_here("NATURAL JOIN is not supported; use JOIN ... ON/USING"));
-            }
-            let kind = if self.eat_op(",")? {
+            let natural = self.eat_ident("natural")?;
+            let kind = if natural {
+                if self.eat_ident("inner")? {
+                    self.expect_ident("join")?;
+                    JoinKind::Inner
+                } else if self.eat_ident("left")? {
+                    let _ = self.eat_ident("outer")?;
+                    self.expect_ident("join")?;
+                    JoinKind::Left
+                } else if self.eat_ident("right")? {
+                    let _ = self.eat_ident("outer")?;
+                    self.expect_ident("join")?;
+                    JoinKind::Right
+                } else if self.eat_ident("full")? {
+                    let _ = self.eat_ident("outer")?;
+                    self.expect_ident("join")?;
+                    JoinKind::Full
+                } else {
+                    self.expect_ident("join")?;
+                    JoinKind::Inner
+                }
+            } else if self.eat_op(",")? {
                 JoinKind::Cross
             } else if self.eat_ident("cross")? {
                 self.expect_ident("join")?;
@@ -791,41 +839,34 @@ impl<'a> Parser<'a> {
                 return Err(self.limit("joins", joins.len()));
             }
             let table = self.table_ref()?;
-            let on = if kind == JoinKind::Cross {
+            let mut using_columns = None;
+            let on = if natural || kind == JoinKind::Cross {
                 None
             } else if self.eat_ident("using")? {
-                // JOIN ... USING (c, ...) is sugar for ON left.c = right.c AND …
-                let left_q = if n == 0 {
-                    base.alias.unwrap_or(base.table)
-                } else {
-                    let p = &joins[n - 1].table;
-                    p.alias.unwrap_or(p.table)
-                };
-                let right_q = table.alias.unwrap_or(table.table);
+                // The merged-column semantics (single output column, resolved
+                // against the whole left join tree) are applied at plan time,
+                // where the joined tables' columns are known.
                 self.expect_op("(")?;
-                let mut acc: Option<&'a Expr<'a>> = None;
+                let mut cols = [""; MAX_USING_COLUMNS];
+                let mut n_cols = 0;
                 loop {
-                    let col = self.any_ident("column name")?;
-                    let l = self.arena_expr(Expr::Column { qualifier: Some(left_q), name: col })?;
-                    let r = self.arena_expr(Expr::Column { qualifier: Some(right_q), name: col })?;
-                    let eq = self.arena_expr(Expr::Binary { operator: BinaryOp::Eq, left: l, right: r })?;
-                    acc = Some(match acc {
-                        None => eq,
-                        Some(prev) => {
-                            self.arena_expr(Expr::Binary { operator: BinaryOp::And, left: prev, right: eq })?
-                        }
-                    });
+                    if n_cols == cols.len() {
+                        return Err(self.limit("USING columns", cols.len()));
+                    }
+                    cols[n_cols] = self.any_ident("column name")?;
+                    n_cols += 1;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
-                acc
+                using_columns = Some(self.arena_slice(&cols[..n_cols])?);
+                None
             } else {
                 self.expect_ident("on")?;
                 Some(self.expression(0)?)
             };
-            joins[n] = Join { table, kind, on };
+            joins[n] = Join { table, kind, on, using_columns, natural };
             n += 1;
         }
         Ok(FromClause {
@@ -1700,11 +1741,40 @@ impl<'a> Parser<'a> {
                 return Ok(left);
             }
             self.advance()?;
-            // Quantified comparison: `operand operator ANY/ALL (array)`.
+            // Quantified comparison: `operand operator ANY/ALL (array)` or
+            // `... (subquery)`.
             if matches!(self.peeked, Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")) {
                 let all = self.peeked == Tok::Ident("all");
                 self.advance()?;
                 self.expect_op("(")?;
+                if self.peeked == Tok::Ident("select") {
+                    let select = self.select()?;
+                    self.expect_op(")")?;
+                    let boxed = self
+                        .arena
+                        .alloc(select)
+                        .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                    // `= ANY (sub)` is IN, `<> ALL (sub)` is NOT IN; the rest
+                    // quantify over the subquery's collected result column
+                    // (same truth table as the array forms, per PostgreSQL).
+                    left = if operator == BinaryOp::Eq && !all {
+                        self.arena_expr(Expr::InSubquery {
+                            operand: left,
+                            select: boxed,
+                            negated: false,
+                        })?
+                    } else if operator == BinaryOp::NotEq && all {
+                        self.arena_expr(Expr::InSubquery {
+                            operand: left,
+                            select: boxed,
+                            negated: true,
+                        })?
+                    } else {
+                        let array = self.arena_expr(Expr::ArraySubquery(boxed))?;
+                        self.arena_expr(Expr::AnyAll { operand: left, operator, array, all })?
+                    };
+                    continue;
+                }
                 let array = self.expression(0)?;
                 self.expect_op(")")?;
                 left = self.arena_expr(Expr::AnyAll { operand: left, operator, array, all })?;
@@ -2265,6 +2335,28 @@ impl<'a> Parser<'a> {
     /// Parses an optional `OVER (PARTITION BY ... ORDER BY ...)` window clause.
     /// An explicit frame (ROWS/RANGE ...) is rejected — only the default frame
     /// is supported.
+    /// One frame bound: UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, or
+    /// `<expression> PRECEDING/FOLLOWING`.
+    fn frame_bound(&mut self) -> Result<FrameBound<'a>, ParseError> {
+        if self.eat_ident("unbounded")? {
+            if self.eat_ident("preceding")? {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            self.expect_ident("following")?;
+            return Ok(FrameBound::UnboundedFollowing);
+        }
+        if self.eat_ident("current")? {
+            self.expect_ident("row")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let offset = self.expression(0)?;
+        if self.eat_ident("preceding")? {
+            return Ok(FrameBound::Preceding(offset));
+        }
+        self.expect_ident("following")?;
+        Ok(FrameBound::Following(offset))
+    }
+
     fn parse_over(&mut self) -> Result<Option<&'a WindowSpec<'a>>, ParseError> {
         if !self.eat_ident("over")? {
             return Ok(None);
@@ -2294,11 +2386,60 @@ impl<'a> Parser<'a> {
         } else {
             &[]
         };
-        if matches!(self.peeked, Tok::Ident("rows") | Tok::Ident("range") | Tok::Ident("groups")) {
-            return Err(self.err_here("explicit window frames (ROWS/RANGE) are not supported"));
-        }
+        let frame = if matches!(
+            self.peeked,
+            Tok::Ident("rows") | Tok::Ident("range") | Tok::Ident("groups")
+        ) {
+            let units = match self.peeked {
+                Tok::Ident("rows") => FrameUnits::Rows,
+                Tok::Ident("range") => FrameUnits::Range,
+                _ => FrameUnits::Groups,
+            };
+            self.advance()?;
+            let (start, end) = if self.eat_ident("between")? {
+                let start = self.frame_bound()?;
+                self.expect_ident("and")?;
+                let end = self.frame_bound()?;
+                (start, end)
+            } else {
+                (self.frame_bound()?, FrameBound::CurrentRow)
+            };
+            // PostgreSQL's frame-shape validation (42P20).
+            if matches!(start, FrameBound::UnboundedFollowing) {
+                return Err(ParseError { sqlstate: "42P20", ..self.err_here("frame start cannot be UNBOUNDED FOLLOWING") });
+            }
+            if matches!(end, FrameBound::UnboundedPreceding) {
+                return Err(ParseError { sqlstate: "42P20", ..self.err_here("frame end cannot be UNBOUNDED PRECEDING") });
+            }
+            if matches!(start, FrameBound::CurrentRow) && matches!(end, FrameBound::Preceding(_)) {
+                return Err(
+                    ParseError { sqlstate: "42P20", ..self.err_here("frame starting from current row cannot have preceding rows") }
+                );
+            }
+            if matches!(start, FrameBound::Following(_))
+                && matches!(end, FrameBound::Preceding(_) | FrameBound::CurrentRow)
+            {
+                return Err(
+                    ParseError { sqlstate: "42P20", ..self.err_here("frame starting from following row cannot have preceding rows") }
+                );
+            }
+            if self.eat_ident("exclude")? {
+                // EXCLUDE NO OTHERS is the default; the row/group/ties forms
+                // are not implemented — reject loudly rather than mis-frame.
+                if self.eat_ident("no")? {
+                    self.expect_ident("others")?;
+                } else {
+                    return Err(self.err_here(
+                        "frame exclusion (EXCLUDE CURRENT ROW/GROUP/TIES) is not supported",
+                    ));
+                }
+            }
+            Some(WindowFrame { units, start, end })
+        } else {
+            None
+        };
         self.expect_op(")")?;
-        let spec = WindowSpec { partition_by, order_by };
+        let spec = WindowSpec { partition_by, order_by, frame };
         Ok(Some(
             self.arena.alloc(spec).map_err(|_| self.err_here("window spec too large for arena"))?,
         ))
@@ -2462,14 +2603,12 @@ impl<'a> Parser<'a> {
         Ok((name, type_mod))
     }
 
-    /// A type name in a position where a modifier is not yet honored (casts,
-    /// prepared-parameter types): a modifier is rejected loudly rather than
-    /// quietly dropped.
+    /// A type name for a prepared-statement parameter: PostgreSQL parses and
+    /// then ignores any modifier here (`PREPARE q(varchar(2))` does not
+    /// truncate its argument — verified against 18.4), so the modifier is
+    /// accepted and dropped.
     fn type_name(&mut self) -> Result<&'a str, ParseError> {
-        let (name, type_mod) = self.type_name_mod()?;
-        if type_mod != -1 {
-            return Err(self.unexpected("type modifier is not supported in this position yet"));
-        }
+        let (name, _type_mod) = self.type_name_mod()?;
         Ok(name)
     }
 
@@ -2533,6 +2672,18 @@ impl<'a> Parser<'a> {
                 }
                 Ok(nums[0] as i32 + 4)
             }
+            // Fractional-second precision, 0..=6. PostgreSQL clamps a larger
+            // value to 6 with a warning; the clamp is matched here (the parser
+            // has no notice channel for the warning's wording).
+            "timestamp" | "timestamptz" | "time" | "timetz" | "interval" => {
+                if n != 1 {
+                    return Err(self.unexpected("precision for this type takes one argument"));
+                }
+                if nums[0] < 0 {
+                    return Err(self.unexpected("precision must be between 0 and 6"));
+                }
+                Ok(nums[0].min(6) as i32 + 4)
+            }
             _ => Err(self.unexpected("type modifier is not supported for this type yet")),
         }
     }
@@ -2591,6 +2742,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "expected '{}'", operator),
+                sqlstate: "42601",
             });
         }
         Ok(())
@@ -2609,6 +2761,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "expected '{}'", word),
+                sqlstate: "42601",
             });
         }
         Ok(())
@@ -2624,6 +2777,7 @@ impl<'a> Parser<'a> {
             _ => Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "expected {}", what),
+                sqlstate: "42601",
             }),
         }
     }
@@ -2885,6 +3039,7 @@ impl<'a> Parser<'a> {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "syntax error: {}", expected),
+            sqlstate: "42601",
         }
     }
 
@@ -2896,6 +3051,7 @@ impl<'a> Parser<'a> {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "{} exceeds fixed limit of {}", what, max),
+            sqlstate: "42601",
         }
     }
 }

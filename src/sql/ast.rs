@@ -77,6 +77,8 @@ pub enum SetTree<'a> {
 /// to the whole combined result.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SetQuery<'a> {
+    /// WITH CTEs prefixed to the whole set operation.
+    pub with: &'a [Cte<'a>],
     pub body: &'a SetTree<'a>,
     pub order_by: &'a [OrderBy<'a>],
     pub limit: Option<&'a Expr<'a>>,
@@ -161,12 +163,25 @@ pub struct TableRef<'a> {
     pub cte: Option<&'a MaterializedCte<'a>>,
 }
 
+/// Upper bound on `USING (c1, ...)` column-list length (and thus on merged
+/// columns per join).
+pub const MAX_USING_COLUMNS: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Join<'a> {
     pub table: TableRef<'a>,
     pub kind: JoinKind,
-    /// ON condition; None for CROSS JOIN.
+    /// ON condition; None for CROSS JOIN and for USING/NATURAL joins (whose
+    /// equality predicate is synthesized at plan time, where the joined
+    /// tables' columns are known).
     pub on: Option<&'a Expr<'a>>,
+    /// `USING (c1, ...)` column names. Each names one column of the left join
+    /// tree and one of the right table; the pair is merged into a single
+    /// output column.
+    pub using_columns: Option<&'a [&'a str]>,
+    /// NATURAL join: the using-column list is every common column name,
+    /// resolved at plan time.
+    pub natural: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +197,9 @@ pub enum JoinKind {
 pub enum SelectItem<'a> {
     /// `*`
     Wildcard,
+    /// `t.*`: every column of the named FROM item (its own copies, even for
+    /// USING/NATURAL-merged columns).
+    TableWildcard(&'a str),
     Expr { expression: &'a Expr<'a>, alias: Option<&'a str> },
 }
 
@@ -191,6 +209,33 @@ pub enum SelectItem<'a> {
 pub struct WindowSpec<'a> {
     pub partition_by: &'a [&'a Expr<'a>],
     pub order_by: &'a [OrderBy<'a>],
+    /// Explicit `ROWS`/`RANGE`/`GROUPS` frame; None = the default frame
+    /// (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW`).
+    pub frame: Option<WindowFrame<'a>>,
+}
+
+/// An explicit window frame clause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowFrame<'a> {
+    pub units: FrameUnits,
+    pub start: FrameBound<'a>,
+    pub end: FrameBound<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameBound<'a> {
+    UnboundedPreceding,
+    Preceding(&'a Expr<'a>),
+    CurrentRow,
+    Following(&'a Expr<'a>),
+    UnboundedFollowing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

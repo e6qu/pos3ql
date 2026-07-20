@@ -136,8 +136,9 @@ pub trait CatalogAccess {
 
 /// Pre-evaluated (uncorrelated) subquery results.
 pub struct SubqueryValues<'h, 'a> {
-    /// Scalar subqueries: (node address, value).
-    pub scalars: &'h [(*const Expr<'h>, Datum<'a>)],
+    /// Scalar subqueries: (node address, value, type-witness datum — the
+    /// result column's type even when the value is NULL, for describes).
+    pub scalars: &'h [(*const Expr<'h>, Datum<'a>, Datum<'a>)],
     /// IN-subqueries: (node address, member list, saw a NULL member, a
     /// type-witness datum of the subquery's result column). The witness lets
     /// the operand be coerced to the column type even when the set is empty or
@@ -610,7 +611,7 @@ pub fn eval_full<'a>(
         )),
         Expr::Subquery(_) | Expr::ArraySubquery(_) => {
             if let Some(subs) = hooks.subs {
-                for (node, v) in subs.scalars {
+                for (node, v, _) in subs.scalars {
                     if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
@@ -683,7 +684,7 @@ pub fn eval_full<'a>(
             // outer row (correlated) and stored as a boolean scalar keyed by
             // node identity, alongside scalar subqueries.
             if let Some(subs) = hooks.subs {
-                for (node, v) in subs.scalars {
+                for (node, v, _) in subs.scalars {
                     if core::ptr::eq(*node, expression as *const _) {
                         return Ok(*v);
                     }
@@ -2624,7 +2625,12 @@ fn call<'a>(
             // to zero (covers -0.0 and small negatives) — PostgreSQL behavior.
             let float_negative = matches!(v, Datum::Float8(x) if x.is_sign_negative());
             let float_source = if let Datum::Float8(x) = v { Some(x) } else { None };
-            let n = datum_numeric(name, v, arena)?;
+            // NaN/Infinity have no numeric form; the formatter reads them
+            // from `float_source` (and fills with `#`, as PostgreSQL).
+            let n = match float_source {
+                Some(x) if !x.is_finite() => super::numeric::Numeric::parse("0", arena)?,
+                _ => datum_numeric(name, v, arena)?,
+            };
             Ok(Datum::Text(super::to_char::number(&n, fmt, float_negative, float_source, arena)?))
         }
         "to_number" => {
@@ -4381,7 +4387,7 @@ fn compare<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn arithmetic<'a>(
+pub(crate) fn arithmetic<'a>(
     operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,

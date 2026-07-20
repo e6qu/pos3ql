@@ -489,18 +489,6 @@ fn attach_fkey(
             crate::storage::MAX_FKEYS
         ));
     }
-    // Referential actions that rewrite child rows (CASCADE / SET NULL / SET
-    // DEFAULT) are not yet implemented; only the default NO ACTION / RESTRICT
-    // (which block an orphaning change) are. Reject the rest loudly.
-    for (act, clause) in [(on_delete, "ON DELETE"), (on_update, "ON UPDATE")] {
-        if !matches!(act, FkAction::NoAction | FkAction::Restrict) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "{} referential action is not supported (only NO ACTION / RESTRICT)",
-                clause
-            ));
-        }
-    }
     let (child_idxs, n_child) = resolve_cols(def, child_cols)?;
 
     // The parent may be this very table (self-reference), not yet in storage.
@@ -691,7 +679,7 @@ fn find_conflict(
                 return Some(rowid);
             }
         }
-        for index in storage.unique_indexes_for(table_name) {
+        for index in storage.unique_indexes_for(table_name, txid) {
             let icols = &index.columns[..index.n_cols];
             if !icols.iter().any(|&c| values[c as usize].is_null())
                 && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
@@ -932,7 +920,7 @@ pub fn check_unique_indexes(
     txid: u32,
 ) -> Result<(), SqlError> {
     let table_name = def.name.as_str();
-    for index in storage.unique_indexes_for(table_name) {
+    for index in storage.unique_indexes_for(table_name, txid) {
         let icols = &index.columns[..index.n_cols];
         tuple_uniqueness(
             storage, table_index, schema, icols, values, self_rowid, txid, index.name.as_str(),
@@ -1149,48 +1137,213 @@ fn parent_has_key(
     Ok(false)
 }
 
-/// Before removing or key-changing a parent row, block the change if any other
-/// table's foreign key still references it (NO ACTION / RESTRICT → 23503).
-/// `old_values` is the parent row as it exists now.
-fn check_fk_parent_referenced(
-    storage: &Storage,
+/// Referential-action cascades can chase foreign keys through many tables
+/// (or a cycle); past this depth the statement fails loudly.
+const MAX_FK_CASCADE_DEPTH: u32 = 32;
+
+/// After a parent row is deleted (`new_parent` None) or its referenced key
+/// updated (Some), applies every referencing foreign key's action:
+/// NO ACTION / RESTRICT block (23503); CASCADE deletes or re-keys the
+/// referencing rows; SET NULL / SET DEFAULT rewrite the referencing columns
+/// (re-checking the child's own constraints). Rewritten or deleted child
+/// rows recursively apply their own referential actions. `old_parent` /
+/// `new_parent` must not borrow storage (the cascade mutates it) — decode
+/// them from arena-copied row bytes.
+#[allow(clippy::too_many_arguments)]
+fn apply_fk_parent_actions(
+    storage: &mut Storage,
+    txn: &mut TxnState,
     parent_name: &str,
-    old_values: &[Datum],
-    txid: u32,
+    old_parent: &[Datum],
+    new_parent: Option<&[Datum]>,
+    arena: &Arena,
+    params: &[Datum],
+    depth: u32,
 ) -> Result<(), SqlError> {
-    for column_index in 0..storage.table_count() {
-        let cdef = storage.table(column_index).def;
-        if !storage.table(column_index).visible_to(txid) {
+    if depth == 0 {
+        return Err(sql_err!(
+            "54001",
+            "foreign key cascade nested more than {} levels deep",
+            MAX_FK_CASCADE_DEPTH
+        ));
+    }
+    for child_index in 0..storage.table_count() {
+        if !storage.table(child_index).visible_to(txn.txid) {
             continue;
         }
+        let cdef = storage.table(child_index).def;
         let mut cschema = [ColType::Bool; MAX_COLUMNS];
         cdef.schema(&mut cschema);
-        for fk in cdef.fkeys() {
+        let cschema = &cschema[..cdef.n_columns];
+        for fk_index in 0..cdef.n_fkeys {
+            let fk = cdef.fkeys[fk_index];
             if fk.parent.as_str() != parent_name {
                 continue;
             }
-            // Does any child row reference the parent's current key tuple?
-            let table = storage.table(column_index);
-            for (_, state) in table.rows.iter() {
-                let Some(loc) = state.visible_to(txid) else { continue };
-                let mut crow = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(storage.heap.get(loc), &cschema[..cdef.n_columns], &mut crow)?;
-                if fk.columns().iter().any(|&c| crow[c as usize].is_null()) {
+            // An update triggers this key's action only when the key changed.
+            if let Some(new_parent) = new_parent {
+                let changed = fk.parent_cols().iter().any(|&pc| {
+                    let (a, b) = (&old_parent[pc as usize], &new_parent[pc as usize]);
+                    match (a.is_null(), b.is_null()) {
+                        (true, true) => false,
+                        (true, false) | (false, true) => true,
+                        (false, false) => {
+                            !compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false)
+                        }
+                    }
+                });
+                if !changed {
                     continue;
                 }
-                let refers = fk.columns().iter().zip(fk.parent_cols()).all(|(&cc, &pc)| {
-                    let cv = &crow[cc as usize];
-                    let pv = &old_values[pc as usize];
-                    !pv.is_null() && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
-                });
-                if refers {
-                    return Err(sql_err!(
-                        "23503",
-                        "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
-                        parent_name,
-                        fk.name.as_str(),
-                        cdef.name.as_str()
-                    ));
+            }
+            let action = if new_parent.is_none() { fk.on_delete } else { fk.on_update };
+
+            // Collect the referencing rows first: the rewrites below mutate
+            // the row map, so the scan must complete before them.
+            let refers = |crow: &[Datum]| {
+                !fk.columns().iter().any(|&c| crow[c as usize].is_null())
+                    && fk.columns().iter().zip(fk.parent_cols()).all(|(&cc, &pc)| {
+                        let (cv, pv) = (&crow[cc as usize], &old_parent[pc as usize]);
+                        !pv.is_null()
+                            && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
+                    })
+            };
+            let mut n_match = 0usize;
+            {
+                let table = storage.table(child_index);
+                for (_, state) in table.rows.iter() {
+                    let Some(loc) = state.visible_to(txn.txid) else { continue };
+                    let mut crow = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(storage.heap.get(loc), cschema, &mut crow)?;
+                    if refers(&crow[..cdef.n_columns]) {
+                        n_match += 1;
+                    }
+                }
+            }
+            if n_match == 0 {
+                continue;
+            }
+            use crate::storage::FkAction as StorageFkAction;
+            if matches!(action, StorageFkAction::NoAction | StorageFkAction::Restrict) {
+                // NO ACTION raises 23503; RESTRICT the distinct 23001, as
+                // PostgreSQL (same message, different SQLSTATE).
+                let code =
+                    if action == StorageFkAction::Restrict { "23001" } else { "23503" };
+                return Err(sql_err!(
+                    code,
+                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                    parent_name,
+                    fk.name.as_str(),
+                    cdef.name.as_str()
+                ));
+            }
+            let matches: &mut [(u64, &[u8])] = arena
+                .alloc_slice_with(n_match, |_| (0u64, &[] as &[u8]))
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "foreign key cascade exceeds the statement arena"
+                    )
+                })?;
+            {
+                let mut at = 0usize;
+                let table = storage.table(child_index);
+                for (rowid, state) in table.rows.iter() {
+                    let Some(loc) = state.visible_to(txn.txid) else { continue };
+                    let bytes = storage.heap.get(loc);
+                    let mut crow = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, cschema, &mut crow)?;
+                    if refers(&crow[..cdef.n_columns]) {
+                        // Copy the row bytes out of the heap so the decoded
+                        // values survive the mutations below.
+                        let copy = arena.alloc_slice_copy(bytes).map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "foreign key cascade exceeds the statement arena"
+                            )
+                        })?;
+                        matches[at] = (*rowid, &*copy);
+                        at += 1;
+                    }
+                }
+            }
+
+            let child_name = cdef.name.as_str();
+            for &(rowid, old_bytes) in matches.iter() {
+                let mut crow = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(old_bytes, cschema, &mut crow)?;
+                let crow = &crow[..cdef.n_columns];
+                if new_parent.is_none() && action == StorageFkAction::Cascade {
+                    // Cascade the delete: grandchildren first, then this row.
+                    apply_fk_parent_actions(
+                        storage, txn, child_name, crow, None, arena, params, depth - 1,
+                    )?;
+                    let prior = storage.write_pending(child_index, rowid, txn.txid, None)?;
+                    if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
+                        storage.restore_pending(child_index, rowid, txn.txid, prior);
+                        return Err(e);
+                    }
+                    continue;
+                }
+                // The rewriting actions produce a new child row image.
+                let mut new_child = [Datum::Null; MAX_COLUMNS];
+                new_child[..cdef.n_columns].copy_from_slice(crow);
+                for (&cc, &pc) in fk.columns().iter().zip(fk.parent_cols()) {
+                    new_child[cc as usize] = match action {
+                        StorageFkAction::Cascade => {
+                            new_parent.expect("delete-cascade handled above")[pc as usize]
+                        }
+                        StorageFkAction::SetNull => Datum::Null,
+                        StorageFkAction::SetDefault => cdef.columns()[cc as usize]
+                            .default_value
+                            .as_ref()
+                            .map(|d| d.as_datum())
+                            .unwrap_or(Datum::Null),
+                        StorageFkAction::NoAction | StorageFkAction::Restrict => {
+                            unreachable!("blocking actions handled above")
+                        }
+                    };
+                }
+                let new_child = &new_child[..cdef.n_columns];
+                check_not_null(&cdef, new_child)?;
+                let checks = parse_checks(&cdef, arena)?;
+                enforce_row_constraints(
+                    storage,
+                    child_index,
+                    &cdef,
+                    cschema,
+                    new_child,
+                    Some(rowid),
+                    txn.txid,
+                    &checks,
+                    arena,
+                    params,
+                )?;
+                // The child's own referenced keys may have changed — recurse.
+                apply_fk_parent_actions(
+                    storage,
+                    txn,
+                    child_name,
+                    crow,
+                    Some(new_child),
+                    arena,
+                    params,
+                    depth - 1,
+                )?;
+                let len = rowenc::encoded_len(new_child);
+                let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "foreign key cascade exceeds the statement arena"
+                    )
+                })?;
+                rowenc::encode(new_child, out);
+                let (new_loc, slice) = storage.heap.append(out.len())?;
+                slice.copy_from_slice(out);
+                let prior = storage.write_pending(child_index, rowid, txn.txid, Some(new_loc))?;
+                if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
+                    storage.restore_pending(child_index, rowid, txn.txid, prior);
+                    return Err(e);
                 }
             }
         }
@@ -1279,11 +1432,12 @@ pub fn drop_table(
             storage.drop_table_in(index, txn.txid);
             // A table's indexes are dropped with it (no separate journal record;
             // DropTable replay re-applies this).
-            storage.drop_indexes_for(statement.name);
+            storage.drop_indexes_for(statement.name, txn.txid);
         }
         None if statement.if_exists => {
+            // PostgreSQL's skip notice carries SQLSTATE 00000.
             responder.notice(
-                sqlstate::UNDEFINED_TABLE,
+                "00000",
                 stack_format!(128, "table \"{}\" does not exist, skipping", statement.name).as_str(),
             )?;
         }
@@ -1319,21 +1473,21 @@ pub fn create_view(
     }
     // Validate the definition now (tables/views exist, columns resolve), as
     // PostgreSQL does at CREATE VIEW time.
-    if let Err(e) = super::query::validate_view(buffer.as_str(), storage, arena) {
+    if let Err(e) = super::query::validate_view(buffer.as_str(), storage, txn.txid, arena) {
         return sql_fail(e);
     }
     let sqlname = match SqlName::parse(name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    match storage.create_view(sqlname, buffer, or_replace) {
+    match storage.create_view(sqlname, buffer, or_replace, txn.txid) {
         Ok((new_slot, old_slot)) => {
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(lsn, &WalOp::CreateView { name, sql }) {
                 // The journal rejected the record; undo the in-memory apply.
-                storage.drop_view_slot(new_slot);
+                storage.rollback_view_create(new_slot);
                 if let Some(o) = old_slot {
-                    storage.revive_view(o);
+                    storage.rollback_view_drop(o, txn.txid);
                 }
                 return sql_fail(e);
             }
@@ -1362,12 +1516,16 @@ pub fn drop_view(
     if_exists: bool,
     responder: &mut Responder,
 ) -> Outcome {
-    if storage.find_view(name).is_some() {
+    if storage.find_view(name, txn.txid).is_some() {
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(lsn, &WalOp::DropView(name)) {
             return sql_fail(e);
         }
-        if let Some(slot) = storage.drop_view(name)
+        let dropped = match storage.drop_view(name, txn.txid) {
+            Ok(d) => d,
+            Err(e) => return sql_fail(e),
+        };
+        if let Some(slot) = dropped
             && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
         {
             return sql_fail(e);
@@ -1431,10 +1589,10 @@ pub fn create_index(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let def = IndexDef { name: sqlname, table: table_name, columns, n_cols, unique, live: true };
+    let def = IndexDef { name: sqlname, table: table_name, columns, n_cols, unique, live: true, pending: None };
     // Register first so the UNIQUE validation below sees this index; on any
     // failure the registration is rolled back.
-    let slot = match storage.create_index(def) {
+    let slot = match storage.create_index(def, txn.txid) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -1461,20 +1619,22 @@ pub fn create_index(
                 &schema[..tdef.n_columns],
                 &values[..tdef.n_columns],
                 Some(rowid),
-                0,
+                // The just-registered index is an uncommitted CREATE owned by
+                // this transaction; validation must see it.
+                txn.txid,
             ) {
                 conflict = Some(e);
                 break;
             }
         }
         if let Some(e) = conflict {
-            storage.drop_index_slot(slot);
+            storage.rollback_index_create(slot);
             return sql_fail(e);
         }
     }
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.append(lsn, &WalOp::CreateIndex { name, table, columns, n_cols, unique }) {
-        storage.drop_index_slot(slot);
+        storage.rollback_index_create(slot);
         return sql_fail(e);
     }
     if let Err(e) = txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32)) {
@@ -1493,12 +1653,16 @@ pub fn drop_index(
     if_exists: bool,
     responder: &mut Responder,
 ) -> Outcome {
-    if storage.index_exists(name) {
+    if storage.index_exists(name, txn.txid) {
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(lsn, &WalOp::DropIndex(name)) {
             return sql_fail(e);
         }
-        if let Some(slot) = storage.drop_index(name)
+        let dropped = match storage.drop_index(name, txn.txid) {
+            Ok(d) => d,
+            Err(e) => return sql_fail(e),
+        };
+        if let Some(slot) = dropped
             && let Err(e) = txn.record_ddl(super::txn::DdlUndo::IndexDropped(slot as u32))
         {
             return sql_fail(e);
@@ -1759,6 +1923,19 @@ fn emit_projected(
                     n += 1;
                 }
             }
+            SelectItem::TableWildcard(q) => {
+                if *q != def.name.as_str() {
+                    return Ok(Err(sql_err!(
+                        "42P01",
+                        "missing FROM-clause entry for table \"{}\"",
+                        q
+                    )));
+                }
+                for v in context.values {
+                    projected[n] = *v;
+                    n += 1;
+                }
+            }
             SelectItem::Expr { expression, .. } => match eval(expression, arena, params, &context) {
                 Ok(v) => {
                     projected[n] = v;
@@ -1840,9 +2017,20 @@ pub fn update(
         let (rowid, loc) = scratch[i];
         // Build the new row image in the statement arena so the heap
         // borrow ends before the heap is appended to.
+        // An arena-owned copy of the old row bytes: the referential-action
+        // pass below needs the old values after storage mutates.
+        let row_bytes = match arena.alloc_slice_copy(storage.heap.get(loc)) {
+            Ok(b) => &*b,
+            Err(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "updated rows exceed the statement arena"
+                ))
+            }
+        };
         let new_bytes = {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) = rowenc::decode(storage.heap.get(loc), schema, &mut values) {
+            if let Err(e) = rowenc::decode(row_bytes, schema, &mut values) {
                 return sql_fail(e);
             }
             let mut new_values = [Datum::Null; MAX_COLUMNS];
@@ -1899,23 +2087,6 @@ pub fn update(
             ) {
                 return sql_fail(e);
             }
-            // If this row is referenced by a foreign key and the update changes
-            // a referenced column, the old referents would be orphaned — block
-            // it (NO ACTION / RESTRICT).
-            if referenced_key_changed(
-                storage,
-                statement.table,
-                &values[..def.n_columns],
-                &new_values[..def.n_columns],
-                txn.txid,
-            ) && let Err(e) = check_fk_parent_referenced(
-                storage,
-                statement.table,
-                &values[..def.n_columns],
-                txn.txid,
-            ) {
-                return sql_fail(e);
-            }
             let len = rowenc::encoded_len(&new_values[..def.n_columns]);
             let out = match arena.alloc_slice_with(len, |_| 0u8) {
                 Ok(o) => o,
@@ -1942,6 +2113,40 @@ pub fn update(
                 }
             }
             Err(e) => return sql_fail(e),
+        }
+        // With the new parent row in place, apply each referencing key's
+        // ON UPDATE action when a referenced column changed (NO ACTION /
+        // RESTRICT block; CASCADE / SET NULL / SET DEFAULT rewrite the
+        // referencing rows — their own constraints re-check against the new
+        // key). Both row images are arena-owned, so the cascade may mutate
+        // storage.
+        {
+            let mut old_row = [Datum::Null; MAX_COLUMNS];
+            if let Err(e) = rowenc::decode(row_bytes, schema, &mut old_row) {
+                return sql_fail(e);
+            }
+            let mut new_row = [Datum::Null; MAX_COLUMNS];
+            if let Err(e) = rowenc::decode(new_bytes, schema, &mut new_row) {
+                return sql_fail(e);
+            }
+            if referenced_key_changed(
+                storage,
+                statement.table,
+                &old_row[..def.n_columns],
+                &new_row[..def.n_columns],
+                txn.txid,
+            ) && let Err(e) = apply_fk_parent_actions(
+                storage,
+                txn,
+                statement.table,
+                &old_row[..def.n_columns],
+                Some(&new_row[..def.n_columns]),
+                arena,
+                params,
+                MAX_FK_CASCADE_DEPTH,
+            ) {
+                return sql_fail(e);
+            }
         }
         if !statement.returning.is_empty() {
             let mut new_values = [Datum::Null; MAX_COLUMNS];
@@ -2013,18 +2218,34 @@ pub fn delete(
     for i in 0..scratch.len() {
         let (rowid, old_loc) = scratch[i];
         if !statement.returning.is_empty() || referenced {
+            // The cascade below mutates storage, so the row image is decoded
+            // from an arena-owned copy.
+            let old_copy = match arena.alloc_slice_copy(storage.heap.get(old_loc)) {
+                Ok(c) => c,
+                Err(_) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "deleted rows exceed the statement arena"
+                    ))
+                }
+            };
             let mut old_values = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) = rowenc::decode(storage.heap.get(old_loc), schema, &mut old_values) {
+            if let Err(e) = rowenc::decode(old_copy, schema, &mut old_values) {
                 return sql_fail(e);
             }
-            // Removing a row referenced by a foreign key is blocked (NO ACTION
-            // / RESTRICT).
+            // Apply each referencing key's ON DELETE action (NO ACTION /
+            // RESTRICT block; CASCADE / SET NULL / SET DEFAULT rewrite the
+            // referencing rows).
             if referenced
-                && let Err(e) = check_fk_parent_referenced(
+                && let Err(e) = apply_fk_parent_actions(
                     storage,
+                    txn,
                     statement.table,
                     &old_values[..def.n_columns],
-                    txn.txid,
+                    None,
+                    arena,
+                    params,
+                    MAX_FK_CASCADE_DEPTH,
                 )
             {
                 return sql_fail(e);
@@ -2327,6 +2548,19 @@ pub fn describe_items<'q>(
                     push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
                 }
             }
+            SelectItem::TableWildcard(q) => {
+                let matches = def.is_some_and(|d| d.name.as_str() == *q);
+                if !matches {
+                    return Err(sql_err!(
+                        "42P01",
+                        "missing FROM-clause entry for table \"{}\"",
+                        q
+                    ));
+                }
+                for c in def.expect("matched").columns() {
+                    push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
+                }
+            }
             SelectItem::Expr { expression, alias } => {
                 let (mut type_oid, mut typlen) = infer_type_pub(expression, def)?;
                 // A bare unknown (string literal / param) resolves to text
@@ -2452,6 +2686,14 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
     }
     match expression {
         Expr::Case { .. } => "case",
+        Expr::Exists(_) => "exists",
+        Expr::ArraySubquery(_) => "array",
+        // A scalar subquery is named by its single output column.
+        Expr::Subquery(s) => match s.items.first() {
+            Some(SelectItem::Expr { alias: Some(a), .. }) => a,
+            Some(SelectItem::Expr { expression, alias: None }) => derived_name(expression),
+            _ => "?column?",
+        },
         _ => "?column?",
     }
 }
@@ -3065,24 +3307,9 @@ pub fn resolve_order_expr_pub<'a>(
             return Ok(item_expr);
         }
     }
-    let Expr::Int(n) = expression else {
-        return Ok(expression);
-    };
-    let index = *n;
-    if index < 1 || index as usize > items.len() {
-        return Err(sql_err!(
-            "42P10",
-            "ORDER BY position {} is not in select list",
-            index
-        ));
-    }
-    match &items[index as usize - 1] {
-        SelectItem::Expr { expression, .. } => Ok(expression),
-        SelectItem::Wildcard => Err(sql_err!(
-            "42P10",
-            "ORDER BY position cannot reference *"
-        )),
-    }
+    // Ordinal positions (`ORDER BY 2`) are resolved by the caller against the
+    // expanded output columns (stars count per column, as in PostgreSQL).
+    Ok(expression)
 }
 
 /// Tagged, order-preserving-for-equality encoding of a projected row:
@@ -3626,7 +3853,40 @@ pub fn apply_typmod<'a>(
         (ColType::Bit { varying }, Datum::Bit { bits, .. }) => {
             super::eval::fit_bits(bits, (type_mod - 4) as usize, varying, arena)
         }
+        // Fractional-second precision: micros round half-away-from-zero in
+        // integer arithmetic, as PostgreSQL's AdjustTimestampForTypmod.
+        (ColType::Timestamp, Datum::Timestamp(t)) => {
+            Ok(Datum::Timestamp(round_micros(t, type_mod - 4)))
+        }
+        (ColType::Timestamptz, Datum::Timestamptz(t)) => {
+            Ok(Datum::Timestamptz(round_micros(t, type_mod - 4)))
+        }
+        (ColType::Time, Datum::Time(t)) => Ok(Datum::Time(round_micros(t, type_mod - 4))),
+        (ColType::Interval, Datum::Interval(iv)) => Ok(Datum::Interval(
+            crate::sql::types::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: round_micros(iv.micros, type_mod - 4),
+            },
+        )),
         _ => Ok(v),
+    }
+}
+
+/// Rounds microseconds to `p` (0..=6) fractional-second digits,
+/// half-away-from-zero in integer arithmetic (PostgreSQL's
+/// `AdjustTimestampForTypmod`).
+fn round_micros(micros: i64, p: i32) -> i64 {
+    let p = p.clamp(0, 6) as u32;
+    let scale = 10i64.pow(6 - p);
+    if scale == 1 {
+        return micros;
+    }
+    let offset = scale / 2;
+    if micros >= 0 {
+        (micros + offset) / scale * scale
+    } else {
+        -((-micros + offset) / scale * scale)
     }
 }
 

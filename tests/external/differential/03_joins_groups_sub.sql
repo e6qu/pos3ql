@@ -567,3 +567,14 @@ SELECT make_timestamptz(2024,1,1,12,0,0);
 SELECT isfinite(DATE '2024-01-01'), isfinite(TIMESTAMP '2024-01-01'), isfinite(INTERVAL '1 day');
 SELECT generate_series('2024-01-01'::timestamp, '2024-01-02', '0 hour');
 SELECT date_bin('1 month', TIMESTAMP '2024-06-15', TIMESTAMP '2024-01-01');
+-- multiple set-returning functions in the select list run in lockstep to the
+-- longest, shorter ones NULL-padding (PostgreSQL 10+ semantics)
+SELECT generate_series(1,3), generate_series(1,2);
+SELECT generate_series(1,2), generate_series(1,4);
+SELECT generate_series(1,3) a, generate_series(10,40,10) b;
+SELECT unnest(ARRAY[1,2,3]), unnest(ARRAY['a','b']);
+SELECT generate_series(1,4), generate_series(1,2), generate_series(1,3);
+SELECT generate_series('2024-01-01'::timestamp, '2024-01-03', '1 day'), generate_series(1,2);
+SELECT generate_series(1,3), unnest(ARRAY['x','y','z','w']);
+SELECT generate_series(5,1,-1), generate_series(1,2);
+SELECT g, generate_series(1,2) FROM generate_series(1,2) g;

@@ -3266,12 +3266,15 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
         Expr::InSubquery { .. } | Expr::Exists(_) => of(ColType::Bool),
         Expr::AnyAll { .. } => of(ColType::Bool),
         Expr::Array(items) => {
+            // An unknown-typed element (a bare string literal) makes the array
+            // text[], as PostgreSQL coerces it; only a concrete element type
+            // narrows it further.
             let element = items
                 .first()
                 .and_then(|e| infer_type_res(e, columns).ok())
                 .and_then(|(o, _)| coltype_of_oid(o))
                 .and_then(super::types::ArrElem::from_coltype)
-                .unwrap_or(super::types::ArrElem::Int4);
+                .unwrap_or(super::types::ArrElem::Text);
             of(ColType::Array(element))
         }
         Expr::Subscript { base, .. } => {

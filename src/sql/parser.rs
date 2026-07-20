@@ -306,7 +306,16 @@ impl<'a> Parser<'a> {
             } else {
                 let expression = self.expression(0)?;
                 let alias = self.alias()?;
-                SelectItem::Expr { expression, alias }
+                // A parenthesized `(t.*)` as a whole select item expands to
+                // the table's columns, exactly like `t.*` (PostgreSQL); only
+                // inside a larger expression (`(t.*)::text`, `row_to_json(t.*)`)
+                // does it stay a record.
+                match expression {
+                    Expr::WholeRow(table) if alias.is_none() => {
+                        SelectItem::TableWildcard(table)
+                    }
+                    _ => SelectItem::Expr { expression, alias },
+                }
             };
             n += 1;
             if !self.eat_op(",")? {

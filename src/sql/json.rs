@@ -11,6 +11,7 @@ use crate::sql_err;
 
 use super::eval::SqlError;
 use super::numeric::Numeric;
+use core::fmt::Write as _;
 
 /// Maximum elements in one array / members in one object while parsing.
 const MAX_ELEMS: usize = 1024;
@@ -337,4 +338,77 @@ fn write_json_string(s: &str, out: &mut dyn core::fmt::Write) -> core::fmt::Resu
         }
     }
     out.write_str("\"")
+}
+
+/// Escapes a raw string into a JSON string literal (used by `row_to_json` and
+/// friends, whose inputs are raw text, not pre-escaped JSON).
+pub fn write_json_raw_string(s: &str, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    out.write_str("\"")?;
+    for c in s.chars() {
+        match c {
+            '"' => out.write_str("\\\"")?,
+            '\\' => out.write_str("\\\\")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            '\t' => out.write_str("\\t")?,
+            '\x08' => out.write_str("\\b")?,
+            '\x0c' => out.write_str("\\f")?,
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32)?,
+            c => out.write_char(c)?,
+        }
+    }
+    out.write_str("\"")
+}
+
+/// Renders a datum as JSON (`row_to_json`/`to_json` → compact spacing;
+/// `to_jsonb` → jsonb spacing with `": "` / `", "`), following PostgreSQL's
+/// `datum_to_json`: numbers and booleans bare, everything else a quoted
+/// string of its text form, records as objects, arrays as JSON arrays, and an
+/// existing json/jsonb value embedded verbatim.
+pub fn write_datum_json(
+    v: &crate::sql::types::Datum,
+    jsonb: bool,
+    out: &mut dyn core::fmt::Write,
+) -> core::fmt::Result {
+    use crate::sql::types::Datum;
+    let colon = if jsonb { ": " } else { ":" };
+    let comma = if jsonb { ", " } else { "," };
+    match v {
+        Datum::Null => out.write_str("null"),
+        Datum::Bool(b) => out.write_str(if *b { "true" } else { "false" }),
+        Datum::Int4(_) | Datum::Int8(_) | Datum::Float8(_) | Datum::Numeric(_) => {
+            write!(out, "{v}")
+        }
+        Datum::Json { text, .. } => out.write_str(text),
+        Datum::Array { element, raw } => {
+            out.write_char('[')?;
+            let count = crate::sql::array::len(raw);
+            for i in 0..count {
+                if i > 0 {
+                    out.write_str(comma)?;
+                }
+                let elem = crate::sql::array::get(raw, *element, i).unwrap_or(Datum::Null);
+                write_datum_json(&elem, jsonb, out)?;
+            }
+            out.write_char(']')
+        }
+        Datum::Record(fields) => {
+            out.write_char('{')?;
+            for (i, field) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(comma)?;
+                }
+                write_json_raw_string(field.name, out)?;
+                out.write_str(colon)?;
+                write_datum_json(&field.value, jsonb, out)?;
+            }
+            out.write_char('}')
+        }
+        // Everything else renders as a quoted string of its text form.
+        other => {
+            let mut buf = crate::util::StackStr::<8192>::default();
+            let _ = write!(buf, "{other}");
+            write_json_raw_string(buf.as_str(), out)
+        }
+    }
 }

@@ -18,6 +18,9 @@ pub fn encoded_len(values: &[Datum]) -> usize {
     let mut n = 2 + values.len().div_ceil(8);
     for v in values {
         n += match v {
+            // Records are transient values, never stored in a row (a column
+            // cannot be composite-typed here).
+            Datum::Record(_) => unreachable!("record cannot be a stored column value"),
             Datum::Null => 0,
             Datum::Bool(_) => 1,
             Datum::Int4(_) | Datum::Date(_) => 4,
@@ -52,6 +55,7 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
         }
         let take;
         match v {
+            Datum::Record(_) => unreachable!("record cannot be a stored column value"),
             Datum::Bool(b) => {
                 rest[0] = u8::from(*b);
                 take = 1;

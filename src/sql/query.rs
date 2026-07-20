@@ -1148,6 +1148,44 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             )),
         }
     }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
+        let t = self.scope.table_index(table)?;
+        let def = self.scope.defs[t].expect("resolved");
+        let vals = match self.values[t] {
+            Some([]) => return Ok(None), // outer-join null row
+            Some(vals) => vals,
+            None => {
+                return Err(sql_err!(
+                    "42P10",
+                    "whole-row reference to \"{}\" before its table is joined",
+                    table
+                ))
+            }
+        };
+        // Copy field names into the arena so the record does not borrow the
+        // catalog (its lifetime is unrelated to the row's `'v`).
+        let cols = def.columns();
+        let mut fields = [super::types::RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        }; MAX_COLUMNS];
+        for (i, field) in fields.iter_mut().enumerate().take(def.n_columns) {
+            let name = arena.alloc_str(cols[i].name.as_str()).map_err(|_| arena_full())?;
+            field.name = name;
+            field.type_oid = cols[i].ctype.oid();
+            field.value = vals.get(i).copied().unwrap_or(Datum::Null);
+        }
+        let out = arena
+            .alloc_slice_copy(&fields[..def.n_columns])
+            .map_err(|_| arena_full())?;
+        Ok(Some(&*out))
+    }
 }
 
 /// Chains an inner row's column resolution to an optional outer row (for
@@ -1163,6 +1201,20 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             Ok(v) => Ok(v),
             Err(e) => match self.outer {
                 Some(o) => o.whole_row_present(table),
+                None => Err(e),
+            },
+        }
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        match self.inner.whole_row_fields(table, arena) {
+            Ok(v) => Ok(v),
+            Err(e) => match self.outer {
+                Some(o) => o.whole_row_fields(table, arena),
                 None => Err(e),
             },
         }
@@ -7649,6 +7701,10 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let entry = self.0.find_column(qualifier, name)?;
         Ok(self.0.output_type(entry))
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.0.table_index(name).is_ok()
     }
 }
 

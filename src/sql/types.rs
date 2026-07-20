@@ -42,6 +42,8 @@ pub mod oid {
     /// PostgreSQL's pseudo-type for a string literal / parameter before its
     /// type is resolved from context.
     pub const UNKNOWN: i32 = 705;
+    /// Anonymous composite / record type.
+    pub const RECORD: i32 = 2249;
 }
 
 /// Column types the engine stores. A deliberately small, growing set.
@@ -517,6 +519,19 @@ pub enum Datum<'a> {
     Bit { bits: &'a str, varying: bool },
     /// A multirange value in canonical text form (e.g. `{[1,3),[5,7)}`, `{}`).
     Multirange { text: &'a str, kind: RangeKind },
+    /// A composite/record value: each field's name (for `row_to_json` etc.),
+    /// its type OID (for JSON/typed output), and its value. Records are
+    /// transient — produced by `t.*`, a bare table reference, or `ROW(...)` —
+    /// never stored in a column.
+    Record(&'a [RecordField<'a>]),
+}
+
+/// One field of a [`Datum::Record`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecordField<'a> {
+    pub name: &'a str,
+    pub type_oid: i32,
+    pub value: Datum<'a>,
 }
 
 impl<'a> Datum<'a> {
@@ -526,6 +541,7 @@ impl<'a> Datum<'a> {
 
     pub fn type_oid(&self) -> i32 {
         match self {
+            Datum::Record(_) => oid::RECORD,
             Datum::Null => oid::TEXT,
             Datum::Bool(_) => oid::BOOL,
             Datum::Int4(_) => oid::INT4,
@@ -602,8 +618,46 @@ impl fmt::Display for Datum<'_> {
                 Ok(())
             }
             Datum::Numeric(n) => write!(f, "{n}"),
+            Datum::Record(fields) => {
+                f.write_char('(')?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_char(',')?;
+                    }
+                    write_record_field(f, &field.value)?;
+                }
+                f.write_char(')')
+            }
         }
     }
+}
+
+/// Renders one record field for PostgreSQL's `record_out` text form: NULL is
+/// empty (unquoted); everything else is quoted when the rendered text is
+/// empty or contains a delimiter, paren, quote, backslash, or whitespace,
+/// with `"` and `\` doubled inside the quotes.
+pub(crate) fn write_record_field(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Result {
+    if v.is_null() {
+        return Ok(());
+    }
+    let mut buf = crate::util::StackStr::<8192>::default();
+    let _ = write!(buf, "{v}");
+    let text = buf.as_str();
+    let needs_quote = text.is_empty()
+        || text
+            .chars()
+            .any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace());
+    if !needs_quote {
+        return f.write_str(text);
+    }
+    f.write_char('"')?;
+    for c in text.chars() {
+        if c == '"' || c == '\\' {
+            f.write_char(c)?;
+        }
+        f.write_char(c)?;
+    }
+    f.write_char('"')
 }
 
 /// Renders one array element, quoting text that would otherwise be ambiguous

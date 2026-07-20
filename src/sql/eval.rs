@@ -53,6 +53,21 @@ pub mod sqlstate {
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// The named table's row as record fields (name + type + value), or None
+    /// for an outer-join null row. Used to build a `Datum::Record` for a
+    /// whole-row reference; contexts without join rows reject it.
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        Err(sql_err!(
+            "0A000",
+            "whole-row reference to \"{}\" is not supported in this context",
+            table
+        ))
+    }
+
     /// A whole-row reference (`t.*` as a value): Ok(true) when the row is
     /// present, Ok(false) when it is an outer-join null row. Contexts without
     /// join rows reject it.
@@ -80,6 +95,14 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         (**self).whole_row_present(table)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        (**self).whole_row_fields(table, arena)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
@@ -369,11 +392,10 @@ pub fn eval_full<'a>(
         Expr::Null => Ok(Datum::Null),
         // A whole-row value: NULL for an outer-join null row, else a non-null
         // marker — consumable only by count() (type analysis rejects the rest).
-        Expr::WholeRow(table) => Ok(if row.whole_row_present(table)? {
-            Datum::Bool(true)
-        } else {
-            Datum::Null
-        }),
+        Expr::WholeRow(table) => match row.whole_row_fields(table, arena)? {
+            Some(fields) => Ok(Datum::Record(fields)),
+            None => Ok(Datum::Null), // outer-join null row
+        },
         Expr::Bool(b) => Ok(Datum::Bool(b)),
         Expr::Int(v) => Ok(if let Ok(small) = i32::try_from(v) {
             Datum::Int4(small)
@@ -384,7 +406,19 @@ pub fn eval_full<'a>(
         Expr::NumericLit(s) => Ok(Datum::Numeric(Numeric::parse(s, arena)?)),
         Expr::Str(s) => Ok(Datum::Text(s)),
         Expr::BitLit(s) => Ok(Datum::Bit { bits: s, varying: false }),
-        Expr::Column { qualifier, name } => row.lookup(qualifier, name),
+        Expr::Column { qualifier, name } => match row.lookup(qualifier, name) {
+            Ok(v) => Ok(v),
+            // A bare name that is not a column but names a FROM item is a
+            // whole-row reference (`SELECT t FROM t`, `row_to_json(r)`).
+            Err(e) if qualifier.is_none() && e.sqlstate == sqlstate::UNDEFINED_COLUMN => {
+                match row.whole_row_fields(name, arena) {
+                    Ok(Some(fields)) => Ok(Datum::Record(fields)),
+                    Ok(None) => Ok(Datum::Null),
+                    Err(_) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        },
         Expr::Param(n) => params
             .get(n as usize - 1)
             .copied()
@@ -1467,6 +1501,46 @@ fn call<'a>(
             }
             Ok(Datum::Null)
         }
+        // Record constructor `ROW(a, b, ...)` / `row(...)`: fields are named
+        // f1, f2, ... as PostgreSQL does for an anonymous record.
+        "row" => {
+            if args.len() > super::parser::MAX_LIST {
+                return Err(sql_err!("54000", "too many fields in ROW()"));
+            }
+            let mut fields = [super::types::RecordField {
+                name: "",
+                type_oid: 0,
+                value: Datum::Null,
+            }; super::parser::MAX_LIST];
+            for (i, arg) in args.iter().enumerate() {
+                let v = eval_full(arg, arena, params, row, hooks)?;
+                let name = stack_format!(12, "f{}", i + 1);
+                fields[i] = super::types::RecordField {
+                    name: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
+                    type_oid: v.type_oid(),
+                    value: v,
+                };
+            }
+            let out = arena.alloc_slice_copy(&fields[..args.len()]).map_err(|_| arena_full())?;
+            Ok(Datum::Record(&*out))
+        }
+        // `row_to_json(record)` / `to_json` → json; `to_jsonb` → jsonb.
+        "row_to_json" | "to_json" | "to_jsonb" => {
+            if star || args.is_empty() || args.len() > 2 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) does not exist",
+                    name
+                ));
+            }
+            let v = eval_full(args[0], arena, params, row, hooks)?;
+            let jsonb = name == "to_jsonb";
+            let mut buf = crate::util::StackStr::<16384>::default();
+            let _ = super::json::write_datum_json(&v, jsonb, &mut buf);
+            debug_assert!(!buf.is_truncated());
+            let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+            Ok(Datum::Json { text, jsonb })
+        }
         "pg_typeof" => {
             arity(1)?;
             let v = eval_full(args[0], arena, params, row, hooks)?;
@@ -1492,6 +1566,7 @@ fn call<'a>(
                 Datum::Bit { varying: false, .. } => "bit",
                 Datum::Bit { varying: true, .. } => "bit varying",
                 Datum::Multirange { kind, .. } => kind.multirange_name(),
+                Datum::Record(_) => "record",
             }))
         }
         "trim" | "btrim" | "ltrim" | "rtrim" => {
@@ -4224,6 +4299,23 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         | (Datum::Timestamptz(a), Datum::Timestamp(b)) => a.cmp(b),
         (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
         (Datum::Json { text: a, .. }, Datum::Json { text: b, .. }) => a.cmp(b),
+        (Datum::Record(a), Datum::Record(b)) => {
+            // Field-wise, with a NULL field comparing greater (PostgreSQL
+            // record ordering); shorter record sorts first on a common prefix.
+            for i in 0..a.len().min(b.len()) {
+                let (x, y) = (&a[i].value, &b[i].value);
+                let c = match (x.is_null(), y.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => compare_datums(x, y)?,
+                };
+                if !c.is_eq() {
+                    return Ok(c);
+                }
+            }
+            a.len().cmp(&b.len())
+        }
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             // Element-wise, then by length (PostgreSQL array ordering).
             let (length_a, length_b) = (super::array::len(ra), super::array::len(rb));
@@ -5082,6 +5174,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Bit { varying: false, .. } => "bit",
         Datum::Bit { varying: true, .. } => "bit varying",
         Datum::Multirange { kind, .. } => kind.multirange_name(),
+        Datum::Record(_) => "record",
     }
 }
 

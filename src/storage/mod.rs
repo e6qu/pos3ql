@@ -87,6 +87,12 @@ impl OwnedDatum {
     pub fn from_datum(d: &crate::sql::types::Datum) -> Result<Self, SqlError> {
         use crate::sql::types::Datum;
         Ok(match d {
+            Datum::Record(_) => {
+                return Err(sql_err!(
+                    "0A000",
+                    "cannot store a composite (record) value in a column"
+                ))
+            }
             Datum::Null => Self::Null,
             Datum::Bool(b) => Self::Bool(*b),
             Datum::Int4(v) => Self::Int4(*v),

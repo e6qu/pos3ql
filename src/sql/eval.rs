@@ -1176,6 +1176,196 @@ fn call<'a>(
             }
             Ok(Datum::Null)
         }
+        // `array_append(arr, elem)` / `array_prepend(elem, arr)`: a NULL array
+        // is treated as empty (its element type taken from `elem`).
+        "array_append" | "array_prepend" => {
+            arity(2)?;
+            let (array_index, elem_index) = if name == "array_append" { (0, 1) } else { (1, 0) };
+            let array = eval_full(args[array_index], arena, params, row, hooks)?;
+            let elem = eval_full(args[elem_index], arena, params, row, hooks)?;
+            let (source, raw) = match array {
+                Datum::Array { element, raw } => (element, raw),
+                Datum::Null => (
+                    super::types::ArrElem::from_datum(&elem).unwrap_or(super::types::ArrElem::Text),
+                    &[0u8, 0u8][..],
+                ),
+                _ => return Err(type_mismatch("array_append/prepend requires an array", &array)),
+            };
+            // The result element type promotes to hold both the array's elements
+            // and the new one (PostgreSQL's polymorphic anyarray/anyelement).
+            let element = match super::types::ArrElem::from_datum(&elem) {
+                Some(e) => unify_arr_elem(source, e),
+                None => source,
+            };
+            let mut items = [Datum::Null; 1024];
+            let mut n = 0usize;
+            let coerced = if elem.is_null() {
+                Datum::Null
+            } else {
+                cast_to(elem, element.to_coltype(), arena)?
+            };
+            if name == "array_prepend" {
+                items[n] = coerced;
+                n += 1;
+            }
+            n = load_array(raw, source, element, &mut items, n, arena)?;
+            if name == "array_append" {
+                if n == items.len() {
+                    return Err(sql_err!("54000", "array value too large"));
+                }
+                items[n] = coerced;
+                n += 1;
+            }
+            Ok(Datum::Array { element, raw: super::array::build(&items[..n], arena)? })
+        }
+        // `array_cat(a, b)`: concatenate two arrays of the same element type.
+        "array_cat" => {
+            arity(2)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let b = eval_full(args[1], arena, params, row, hooks)?;
+            let (a_elem, a_raw, b_elem, b_raw) = match (a, b) {
+                (Datum::Array { element: ae, raw: ar }, Datum::Array { element: be, raw: br }) => {
+                    (ae, ar, be, br)
+                }
+                (Datum::Array { element, raw }, Datum::Null)
+                | (Datum::Null, Datum::Array { element, raw }) => {
+                    return Ok(Datum::Array { element, raw });
+                }
+                (Datum::Null, Datum::Null) => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("array_cat requires arrays", &a)),
+            };
+            let element = unify_arr_elem(a_elem, b_elem);
+            let mut items = [Datum::Null; 1024];
+            let mut n = load_array(a_raw, a_elem, element, &mut items, 0, arena)?;
+            n = load_array(b_raw, b_elem, element, &mut items, n, arena)?;
+            Ok(Datum::Array { element, raw: super::array::build(&items[..n], arena)? })
+        }
+        // `array_remove(arr, elem)`: drop every element equal to `elem`
+        // (NULL-safe). `array_replace(arr, from, to)`: replace every match.
+        "array_remove" | "array_replace" => {
+            let is_replace = name == "array_replace";
+            arity(if is_replace { 3 } else { 2 })?;
+            let array = eval_full(args[0], arena, params, row, hooks)?;
+            let target = eval_full(args[1], arena, params, row, hooks)?;
+            let (source, raw) = match array {
+                Datum::Array { element, raw } => (element, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch(name, &array)),
+            };
+            let (element, replacement) = if is_replace {
+                let to = eval_full(args[2], arena, params, row, hooks)?;
+                // The result promotes to hold both the kept and replaced values.
+                let element = match super::types::ArrElem::from_datum(&to) {
+                    Some(e) => unify_arr_elem(source, e),
+                    None => source,
+                };
+                let replacement = if to.is_null() {
+                    Datum::Null
+                } else {
+                    cast_to(to, element.to_coltype(), arena)?
+                };
+                (element, replacement)
+            } else {
+                (source, Datum::Null)
+            };
+            let to_coltype = element.to_coltype();
+            let mut items = [Datum::Null; 1024];
+            let mut n = 0usize;
+            for i in 0..super::array::len(raw) {
+                let el = super::array::get(raw, source, i).unwrap_or(Datum::Null);
+                let matches = if target.is_null() {
+                    el.is_null()
+                } else if el.is_null() {
+                    false
+                } else {
+                    compare_datums(&el, &target)?.is_eq()
+                };
+                if is_replace {
+                    items[n] = if matches {
+                        replacement
+                    } else if el.is_null() || source == element {
+                        el
+                    } else {
+                        cast_to(el, to_coltype, arena)?
+                    };
+                    n += 1;
+                } else if !matches {
+                    items[n] = el;
+                    n += 1;
+                }
+            }
+            Ok(Datum::Array { element, raw: super::array::build(&items[..n], arena)? })
+        }
+        // `trim_array(arr, n)`: drop the last `n` elements; `n` must be in range.
+        "trim_array" => {
+            arity(2)?;
+            let array = eval_full(args[0], arena, params, row, hooks)?;
+            let count = eval_full(args[1], arena, params, row, hooks)?;
+            let (element, raw) = match array {
+                Datum::Array { element, raw } => (element, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("trim_array requires an array", &array)),
+            };
+            if count.is_null() {
+                return Ok(Datum::Null);
+            }
+            let total = super::array::len(raw);
+            let trim = match count {
+                Datum::Int4(v) => v as i64,
+                Datum::Int8(v) => v,
+                _ => return Err(type_mismatch("trim_array count must be an integer", &count)),
+            };
+            if trim < 0 || trim as usize > total {
+                return Err(sql_err!(
+                    "2202E",
+                    "number of elements to trim must be between 0 and {}",
+                    total
+                ));
+            }
+            let keep = total - trim as usize;
+            let mut items = [Datum::Null; 1024];
+            let n = load_array(raw, element, element, &mut items, 0, arena)?;
+            Ok(Datum::Array { element, raw: super::array::build(&items[..keep.min(n)], arena)? })
+        }
+        // `array_ndims`: 1 for a non-empty array, NULL for an empty one (we only
+        // have one-dimensional arrays). `array_dims`: the `[1:n]` bound text.
+        "array_ndims" | "array_dims" => {
+            arity(1)?;
+            let array = eval_full(args[0], arena, params, row, hooks)?;
+            let raw = match array {
+                Datum::Array { raw, .. } => raw,
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch(name, &array)),
+            };
+            let total = super::array::len(raw);
+            if total == 0 {
+                return Ok(Datum::Null);
+            }
+            if name == "array_ndims" {
+                Ok(Datum::Int4(1))
+            } else {
+                Ok(Datum::Text(arena.alloc_str_display(format_args!("[1:{total}]")).map_err(|_| arena_full())?))
+            }
+        }
+        // `array_to_json(arr)`: render the array as a JSON array.
+        "array_to_json" => {
+            if !(1..=2).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let array = eval_full(args[0], arena, params, row, hooks)?;
+            if array.is_null() {
+                return Ok(Datum::Null);
+            }
+            if !matches!(array, Datum::Array { .. }) {
+                return Err(type_mismatch("array_to_json requires an array", &array));
+            }
+            let mut buffer = crate::util::StackStr::<16384>::new();
+            let _ = super::json::write_datum_json(&array, false, &mut buffer);
+            if buffer.is_truncated() {
+                return Err(sql_err!("54000", "array_to_json value exceeds the supported size"));
+            }
+            Ok(Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb: false })
+        }
         "jsonb_array_length" | "json_array_length" => {
             arity(1)?;
             let s = match eval_full(args[0], arena, params, row, hooks)? {
@@ -1845,7 +2035,20 @@ fn call<'a>(
                 Datum::Interval(_) => "interval",
                 Datum::Json { jsonb: false, .. } => "json",
                 Datum::Json { jsonb: true, .. } => "jsonb",
-                Datum::Array { .. } => "array",
+                Datum::Array { element, .. } => {
+                    use super::types::ArrElem::*;
+                    match element {
+                        Bool => "boolean[]",
+                        Int4 => "integer[]",
+                        Int8 => "bigint[]",
+                        Float8 => "double precision[]",
+                        Text => "text[]",
+                        Numeric => "numeric[]",
+                        Date => "date[]",
+                        Timestamp => "timestamp without time zone[]",
+                        Timestamptz => "timestamp with time zone[]",
+                    }
+                }
                 Datum::Uuid(_) => "uuid",
                 Datum::Bytea(_) => "bytea",
                 Datum::Numeric(_) => "numeric",
@@ -4466,6 +4669,30 @@ pub fn json_to_text_pub<'a>(
     json_to_text(v, arena)
 }
 
+/// Decodes every element of an array blob into `items` starting at `start`,
+/// coercing each to `to` (PostgreSQL promotes the element type when array
+/// functions mix numeric widths). Returns the new count; errors on overflow.
+fn load_array<'a>(
+    raw: &'a [u8],
+    from: super::types::ArrElem,
+    to: super::types::ArrElem,
+    items: &mut [Datum<'a>],
+    start: usize,
+    arena: &'a Arena,
+) -> Result<usize, SqlError> {
+    let mut n = start;
+    let to_coltype = to.to_coltype();
+    for i in 0..super::array::len(raw) {
+        if n == items.len() {
+            return Err(sql_err!("54000", "array value too large"));
+        }
+        let el = super::array::get(raw, from, i).unwrap_or(Datum::Null);
+        items[n] = if el.is_null() || from == to { el } else { cast_to(el, to_coltype, arena)? };
+        n += 1;
+    }
+    Ok(n)
+}
+
 fn json_to_text<'a>(v: &super::json::Json<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     // Render straight into the arena at exact length — a jsonb value can be
     // larger than any fixed scratch buffer, and truncating it would corrupt it.
@@ -5468,6 +5695,12 @@ pub fn cast_to<'a>(
         },
         ColType::Array(element) => match v {
             Datum::Array { element: e, .. } if e == element => v,
+            // A different element type: re-encode each element cast to it.
+            Datum::Array { element: e, raw } => {
+                let mut items = [Datum::Null; 1024];
+                let n = load_array(raw, e, element, &mut items, 0, arena)?;
+                Datum::Array { element, raw: super::array::build(&items[..n], arena)? }
+            }
             Datum::Text(s) => Datum::Array { element, raw: super::array::parse_literal(s, element, arena)? },
             _ => return Err(cast_unsupported(&v, "array")),
         },

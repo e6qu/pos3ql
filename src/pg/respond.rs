@@ -377,10 +377,11 @@ impl<'b> Responder<'b> {
                     m.i32(text.as_str().len() as i32);
                     m.bytes(text.as_str().as_bytes());
                 }
-                Datum::Record(_) => {
-                    // A record's text can be arbitrarily wide; count the
-                    // length, emit it, then stream Display straight to the
-                    // send buffer (no fixed-size scratch).
+                // Records, JSON, ranges, multiranges, bit strings — anything
+                // whose text can be arbitrarily wide: count the length, emit it,
+                // then stream Display straight to the send buffer (no fixed-size
+                // scratch that would silently truncate a long value).
+                other => {
                     use core::fmt::Write as _;
                     struct Counter(usize);
                     impl core::fmt::Write for Counter {
@@ -397,15 +398,9 @@ impl<'b> Responder<'b> {
                         }
                     }
                     let mut counter = Counter(0);
-                    let _ = write!(counter, "{v}");
+                    let _ = write!(counter, "{other}");
                     m.i32(counter.0 as i32);
-                    let _ = write!(MsgWriter(m), "{v}");
-                }
-                other => {
-                    let text = stack_format!(40, "{}", other);
-                    debug_assert!(!text.is_truncated());
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
+                    let _ = write!(MsgWriter(m), "{other}");
                 }
             }
         }
@@ -487,9 +482,27 @@ impl<'b> Responder<'b> {
                     // binary) is not emitted; a binary-requesting client gets
                     // the canonical text form instead (arrays are near-always
                     // consumed in text format). Documented as a known gap.
-                    let text = stack_format!(256, "{}", Datum::Array { element: *element, raw });
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
+                    // Stream Display so a long array is never silently truncated.
+                    use core::fmt::Write as _;
+                    struct Counter(usize);
+                    impl core::fmt::Write for Counter {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            self.0 += s.len();
+                            Ok(())
+                        }
+                    }
+                    struct MsgWriter<'w, 'b>(&'w mut MsgOut<'b>);
+                    impl core::fmt::Write for MsgWriter<'_, '_> {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            self.0.bytes(s.as_bytes());
+                            Ok(())
+                        }
+                    }
+                    let array = Datum::Array { element: *element, raw };
+                    let mut counter = Counter(0);
+                    let _ = write!(counter, "{array}");
+                    m.i32(counter.0 as i32);
+                    let _ = write!(MsgWriter(m), "{array}");
                 }
                 Datum::Record(_) => {
                     use core::fmt::Write as _;

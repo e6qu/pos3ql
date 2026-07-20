@@ -158,6 +158,11 @@ pub struct QueryScope<'d> {
     /// self-describing-encoded. `None` marks a physical table (scanned from
     /// storage by `slots`).
     pub derived: [Option<&'d [&'d [u8]]>; MAX_JOIN_TABLES],
+    /// Marks a set-returning-function scan (`FROM func(args)`), whose output row
+    /// type is its single scalar column — so a whole-row reference to the table
+    /// alias yields that scalar, not a one-field record (which is how a
+    /// subquery- or storage-derived table's whole-row reference behaves).
+    pub func_scalar: [bool; MAX_JOIN_TABLES],
     pub n: usize,
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
     pub merged: [MergedColumn<'d>; MAX_MERGED_COLUMNS],
@@ -182,6 +187,7 @@ impl<'d> QueryScope<'d> {
             defs: [None; MAX_JOIN_TABLES],
             slots: [0; MAX_JOIN_TABLES],
             derived: [None; MAX_JOIN_TABLES],
+            func_scalar: [false; MAX_JOIN_TABLES],
             n: 0,
             merged: [MergedColumn {
                 name: "",
@@ -477,6 +483,7 @@ impl<'d> QueryScope<'d> {
         self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
+        self.func_scalar[self.n] = true;
         self.n += 1;
         Ok(())
     }
@@ -782,6 +789,19 @@ impl<'d> QueryScope<'d> {
         self.names[..self.n].iter().position(|n| *n == name).ok_or_else(|| {
             sql_err!("42P01", "missing FROM-clause entry for table \"{}\"", name)
         })
+    }
+
+    /// If `name` refers to a set-returning-function scan, the type of its single
+    /// scalar output column — the type a whole-row reference to it carries. A
+    /// storage- or subquery-derived table returns None (its whole-row reference
+    /// is a record).
+    pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
+        let t = self.table_index(name).ok()?;
+        if !self.func_scalar[t] {
+            return None;
+        }
+        let def = self.defs[t]?;
+        (def.n_columns == 1).then(|| def.columns()[0].ctype)
     }
 
     pub fn find_column(
@@ -1135,6 +1155,10 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<super::types::ColType> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.scope.func_scalar_type(table).is_some()
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
@@ -7729,6 +7753,12 @@ fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
         || name.eq_ignore_ascii_case("regexp_matches")
+        || name.eq_ignore_ascii_case("jsonb_object_keys")
+        || name.eq_ignore_ascii_case("json_object_keys")
+        || name.eq_ignore_ascii_case("jsonb_array_elements")
+        || name.eq_ignore_ascii_case("json_array_elements")
+        || name.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || name.eq_ignore_ascii_case("json_array_elements_text")
 }
 
 /// Finds a set-returning function call among the SELECT items (the whole call
@@ -7836,6 +7866,50 @@ fn srf_count<'a, R: ColumnLookup<'a>>(
             }
         }
         Ok(n)
+    } else if name.eq_ignore_ascii_case("jsonb_object_keys")
+        || name.eq_ignore_ascii_case("json_object_keys")
+    {
+        let text = match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(0),
+            _ => return Err(super::json::object_keys_error(name, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Object {
+            return Err(super::json::object_keys_error(name, kind));
+        }
+        if name.eq_ignore_ascii_case("jsonb_object_keys") {
+            return match super::json::parse(text, arena)? {
+                super::json::Json::Object(members) => Ok(members.len()),
+                _ => Err(super::json::object_keys_error(name, kind)),
+            };
+        }
+        Ok(super::json::object_members_source(text, arena)?.len())
+    } else if name.eq_ignore_ascii_case("jsonb_array_elements")
+        || name.eq_ignore_ascii_case("json_array_elements")
+        || name.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || name.eq_ignore_ascii_case("json_array_elements_text")
+    {
+        let jsonb = name.eq_ignore_ascii_case("jsonb_array_elements")
+            || name.eq_ignore_ascii_case("jsonb_array_elements_text");
+        let text = match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(0),
+            _ => return Err(super::json::array_elements_error(name, jsonb, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Array {
+            return Err(super::json::array_elements_error(name, jsonb, kind));
+        }
+        if jsonb {
+            return match super::json::parse(text, arena)? {
+                super::json::Json::Array(items) => Ok(items.len()),
+                _ => Err(super::json::array_elements_error(name, jsonb, kind)),
+            };
+        }
+        Ok(super::json::array_elements_source(text, arena)?.len())
     } else {
         // unnest / _pg_expandarray over an array.
         match eval_full(args[0], arena, params, row, hooks)? {
@@ -8010,6 +8084,10 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.0.table_index(name).is_ok()
+    }
+
+    fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.0.func_scalar_type(name)
     }
 }
 
@@ -9698,20 +9776,29 @@ fn table_func_def<'a>(
     let is_gs = tref.table.eq_ignore_ascii_case("generate_series");
     let is_unnest = tref.table.eq_ignore_ascii_case("unnest");
     let is_re = tref.table.eq_ignore_ascii_case("regexp_matches");
-    if !is_gs && !is_unnest && !is_re {
+    let is_keys = tref.table.eq_ignore_ascii_case("jsonb_object_keys")
+        || tref.table.eq_ignore_ascii_case("json_object_keys");
+    let is_elems = tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+        || tref.table.eq_ignore_ascii_case("json_array_elements")
+        || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || tref.table.eq_ignore_ascii_case("json_array_elements_text");
+    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
             tref.table
         ));
     }
-    let name = tref.alias.unwrap_or(if is_gs {
+    let base_name = if is_gs {
         "generate_series"
     } else if is_re {
         "regexp_matches"
+    } else if is_keys || is_elems {
+        tref.table
     } else {
         "unnest"
-    });
+    };
+    let name = tref.alias.unwrap_or(base_name);
     // A table function has a single output column, so at most one alias.
     if let Some(aliases) = tref.col_alias
         && aliases.len() > 1
@@ -9723,8 +9810,10 @@ fn table_func_def<'a>(
             aliases.len()
         ));
     }
-    // The column takes the explicit column-alias if given, else the table name.
-    let col_name = tref.col_alias.and_then(|a| a.first().copied()).unwrap_or(name);
+    // The column takes the explicit column-alias if given, else the function's
+    // default output name: `value` for array_elements, else the function name.
+    let default_col = if is_elems { "value" } else { name };
+    let col_name = tref.col_alias.and_then(|a| a.first().copied()).unwrap_or(default_col);
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
@@ -9741,6 +9830,16 @@ fn table_func_def<'a>(
         ColType::Int8
     } else if is_re {
         ColType::Array(super::types::ArrElem::Text)
+    } else if is_keys {
+        ColType::Text
+    } else if is_elems {
+        if tref.table.eq_ignore_ascii_case("json_array_elements") {
+            ColType::Json
+        } else if tref.table.eq_ignore_ascii_case("jsonb_array_elements") {
+            ColType::Jsonb
+        } else {
+            ColType::Text
+        }
     } else {
         let args = tref.func_args.unwrap_or(&[]);
         match args.first() {
@@ -9835,6 +9934,99 @@ fn table_func_rows<'a>(
         }
         let out = arena.alloc_slice_with(n, |i| rows[i]).map_err(|_| arena_full())?;
         return Ok(&*out);
+    }
+    // jsonb_object_keys(obj) / json_object_keys(obj): one text row per key.
+    if tref.table.eq_ignore_ascii_case("jsonb_object_keys")
+        || tref.table.eq_ignore_ascii_case("json_object_keys")
+    {
+        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
+        let text = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(super::json::object_keys_error(tref.table, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Object {
+            return Err(super::json::object_keys_error(tref.table, kind));
+        }
+        const EMPTY: &[u8] = &[];
+        // jsonb: normalized/sorted keys; json: source order with duplicates.
+        if jsonb {
+            let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
+                return Err(super::json::object_keys_error(tref.table, kind));
+            };
+            let rows = arena.alloc_slice_with(members.len(), |_| EMPTY).map_err(|_| arena_full())?;
+            for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
+                *slot = super::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
+            }
+            return Ok(&*rows);
+        }
+        let members = super::json::object_members_source(text, arena)?;
+        let rows = arena.alloc_slice_with(members.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
+            *slot = super::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
+        }
+        return Ok(&*rows);
+    }
+    // jsonb_array_elements / json_array_elements[_text]: one row per element.
+    if tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+        || tref.table.eq_ignore_ascii_case("json_array_elements")
+        || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+        || tref.table.eq_ignore_ascii_case("json_array_elements_text")
+    {
+        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+            || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
+        let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+            || tref.table.eq_ignore_ascii_case("json_array_elements_text");
+        let text = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(super::json::array_elements_error(tref.table, jsonb, super::json::Kind::Scalar)),
+        };
+        let kind = super::json::kind_of(text);
+        if kind != super::json::Kind::Array {
+            return Err(super::json::array_elements_error(tref.table, jsonb, kind));
+        }
+        const EMPTY: &[u8] = &[];
+        if jsonb {
+            let super::json::Json::Array(items) = super::json::parse(text, arena)? else {
+                return Err(super::json::array_elements_error(tref.table, jsonb, kind));
+            };
+            let rows = arena.alloc_slice_with(items.len(), |_| EMPTY).map_err(|_| arena_full())?;
+            for (slot, element) in rows.iter_mut().zip(items.iter()) {
+                let datum = if as_text {
+                    match *element {
+                        super::json::Json::Str(s) => {
+                            Datum::Text(super::json::decode_string(s, arena)?)
+                        }
+                        super::json::Json::Null => Datum::Null,
+                        _ => Datum::Text(super::eval::json_to_text_pub(element, arena)?),
+                    }
+                } else {
+                    Datum::Json { text: super::eval::json_to_text_pub(element, arena)?, jsonb }
+                };
+                *slot = super::exec::encode_projected_pub(&[datum], arena)?;
+            }
+            return Ok(&*rows);
+        }
+        // json: each element's verbatim source text.
+        let items = super::json::array_elements_source(text, arena)?;
+        let rows = arena.alloc_slice_with(items.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        for (slot, element) in rows.iter_mut().zip(items.iter()) {
+            let datum = if as_text {
+                match super::json::parse(element, arena)? {
+                    super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                    super::json::Json::Null => Datum::Null,
+                    _ => Datum::Text(element),
+                }
+            } else {
+                Datum::Json { text: element, jsonb }
+            };
+            *slot = super::exec::encode_projected_pub(&[datum], arena)?;
+        }
+        return Ok(&*rows);
     }
     // unnest(array): one row per element.
     if tref.table.eq_ignore_ascii_case("unnest") {

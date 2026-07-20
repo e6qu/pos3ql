@@ -543,6 +543,12 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("generate_series")
                 || name.eq_ignore_ascii_case("_pg_expandarray")
                 || name.eq_ignore_ascii_case("regexp_matches")
+                || name.eq_ignore_ascii_case("jsonb_object_keys")
+                || name.eq_ignore_ascii_case("json_object_keys")
+                || name.eq_ignore_ascii_case("jsonb_array_elements")
+                || name.eq_ignore_ascii_case("json_array_elements")
+                || name.eq_ignore_ascii_case("jsonb_array_elements_text")
+                || name.eq_ignore_ascii_case("json_array_elements_text")
         }
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
@@ -613,6 +619,16 @@ pub enum BinaryOp {
     JsonGet,
     /// `json ->> key/index` — returns text.
     JsonGetText,
+    /// `json #> path` — extract by text[] path, returns json/jsonb.
+    JsonPath,
+    /// `json #>> path` — extract by text[] path, returns text.
+    JsonPathText,
+    /// `jsonb ? key` — does the object have the key (or the array the element)?
+    JsonExists,
+    /// `jsonb ?| array` — does it have any of the keys?
+    JsonExistsAny,
+    /// `jsonb ?& array` — does it have all of the keys?
+    JsonExistsAll,
     /// Integer bitwise operators.
     BitAnd,
     BitOr,
@@ -649,6 +665,7 @@ impl BinaryOp {
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
             Self::Like | Self::ILike => 4,
+            Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll => 4,
             Self::Concat => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,
             // matching PostgreSQL (they are non-standard, mid-precedence).
@@ -660,7 +677,7 @@ impl BinaryOp {
             // Exponentiation binds tighter than multiplication.
             Self::Pow => 8,
             // JSON accessors bind tightest among binary operators.
-            Self::JsonGet | Self::JsonGetText => 9,
+            Self::JsonGet | Self::JsonGetText | Self::JsonPath | Self::JsonPathText => 9,
         }
     }
 }

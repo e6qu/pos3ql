@@ -84,6 +84,13 @@ pub trait ColumnLookup<'a> {
     fn col_type(&self, _qualifier: Option<&str>, _name: &str) -> Option<ColType> {
         None
     }
+
+    /// Whether a whole-row reference to `table` is a scalar (a
+    /// set-returning-function scan's single output column) rather than a record.
+    /// Defaults to false.
+    fn whole_row_is_scalar(&self, _table: &str) -> bool {
+        false
+    }
 }
 
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
@@ -107,6 +114,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         (**self).col_type(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        (**self).whole_row_is_scalar(table)
     }
 }
 
@@ -408,6 +419,10 @@ pub fn eval_full<'a>(
         // A whole-row value: NULL for an outer-join null row, else a non-null
         // marker — consumable only by count() (type analysis rejects the rest).
         Expr::WholeRow(table) => match row.whole_row_fields(table, arena)? {
+            // A function scan's whole row is its single scalar column.
+            Some(fields) if row.whole_row_is_scalar(table) => {
+                Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
+            }
             Some(fields) => Ok(Datum::Record(fields)),
             None => Ok(Datum::Null), // outer-join null row
         },
@@ -427,6 +442,9 @@ pub fn eval_full<'a>(
             // whole-row reference (`SELECT t FROM t`, `row_to_json(r)`).
             Err(e) if qualifier.is_none() && e.sqlstate == sqlstate::UNDEFINED_COLUMN => {
                 match row.whole_row_fields(name, arena) {
+                    Ok(Some(fields)) if row.whole_row_is_scalar(name) => {
+                        Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
+                    }
                     Ok(Some(fields)) => Ok(Datum::Record(fields)),
                     Ok(None) => Ok(Datum::Null),
                     Err(_) => Err(e),
@@ -1162,6 +1180,66 @@ fn call<'a>(
                 _ => Err(sql_err!("22023", "cannot get array length of a scalar")),
             }
         }
+        // The JSON type name of the value, as PostgreSQL's json_typeof.
+        "jsonb_typeof" | "json_typeof" => {
+            arity(1)?;
+            let s = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch(name, &other)),
+            };
+            Ok(Datum::Text(match super::json::parse(s, arena)? {
+                super::json::Json::Null => "null",
+                super::json::Json::Bool(_) => "boolean",
+                super::json::Json::Number(_) => "number",
+                super::json::Json::Str(_) => "string",
+                super::json::Json::Array(_) => "array",
+                super::json::Json::Object(_) => "object",
+            }))
+        }
+        // `json_extract_path(json, VARIADIC keys)` / `_text`: navigate by keys.
+        "json_extract_path" | "jsonb_extract_path" | "json_extract_path_text"
+        | "jsonb_extract_path_text" => {
+            if star || args.is_empty() {
+                return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}(...) does not exist", name));
+            }
+            let (text, jsonb) = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Json { text, jsonb } => (text, jsonb),
+                Datum::Text(s) => (s, name.starts_with("jsonb")),
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch(name, &other)),
+            };
+            let as_text = name.ends_with("_text");
+            let mut node = super::json::parse(text, arena)?;
+            for key_arg in &args[1..] {
+                let step = eval_full(key_arg, arena, params, row, hooks)?;
+                let Datum::Text(key) = step else {
+                    return Ok(Datum::Null);
+                };
+                let next = match &node {
+                    super::json::Json::Object(_) => node.get_field(key),
+                    super::json::Json::Array(_) => {
+                        key.parse::<i64>().ok().and_then(|n| node.get_index(n))
+                    }
+                    _ => None,
+                };
+                let Some(next) = next else {
+                    return Ok(Datum::Null);
+                };
+                node = next;
+            }
+            if as_text {
+                if let super::json::Json::Str(str_value) = node {
+                    return Ok(Datum::Text(super::json::decode_string(str_value, arena)?));
+                }
+                if matches!(node, super::json::Json::Null) {
+                    return Ok(Datum::Null);
+                }
+                return Ok(Datum::Text(json_to_text(&node, arena)?));
+            }
+            Ok(Datum::Json { text: json_to_text(&node, arena)?, jsonb })
+        }
         "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible"
         | "has_table_privilege" | "has_column_privilege" | "has_schema_privilege"
         | "pg_relation_is_publishable" => {
@@ -1291,6 +1369,89 @@ fn call<'a>(
                 element: super::types::ArrElem::Int4,
                 raw: super::array::build(&comp, arena)?,
             })
+        }
+        // Set-returning `jsonb_object_keys(obj)` / `json_object_keys(obj)`
+        // yield each key of the object as one text row.
+        "jsonb_object_keys" | "json_object_keys" => {
+            arity(1)?;
+            let jsonb = name.starts_with("jsonb");
+            let text = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("object_keys requires an object", &other)),
+            };
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            let kind = super::json::kind_of(text);
+            if kind != super::json::Kind::Object {
+                return Err(super::json::object_keys_error(name, kind));
+            }
+            if jsonb {
+                // jsonb keys: sorted, deduplicated (the normalized parse order).
+                let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
+                    return Err(super::json::object_keys_error(name, kind));
+                };
+                return Ok(members.get(k - 1).map(|(key, _)| Datum::Text(key)).unwrap_or(Datum::Null));
+            }
+            // json keys: original source order, duplicates kept.
+            let members = super::json::object_members_source(text, arena)?;
+            Ok(members.get(k - 1).map(|(key, _)| Datum::Text(key)).unwrap_or(Datum::Null))
+        }
+        // Set-returning `jsonb_array_elements` / `json_array_elements` yield each
+        // array element as a json/jsonb row; the `_text` variants yield text.
+        "jsonb_array_elements" | "json_array_elements" | "jsonb_array_elements_text"
+        | "json_array_elements_text" => {
+            arity(1)?;
+            let jsonb = name.starts_with("jsonb");
+            let as_text = name.ends_with("_text");
+            let text = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("array_elements requires an array", &other)),
+            };
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            let kind = super::json::kind_of(text);
+            if kind != super::json::Kind::Array {
+                return Err(super::json::array_elements_error(name, jsonb, kind));
+            }
+            if jsonb {
+                // jsonb elements: normalized (re-rendered) json values.
+                let super::json::Json::Array(items) = super::json::parse(text, arena)? else {
+                    return Err(super::json::array_elements_error(name, jsonb, kind));
+                };
+                let Some(element) = items.get(k - 1) else {
+                    return Ok(Datum::Null);
+                };
+                if as_text {
+                    return Ok(match *element {
+                        super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                        super::json::Json::Null => Datum::Null,
+                        _ => Datum::Text(json_to_text(element, arena)?),
+                    });
+                }
+                return Ok(Datum::Json { text: json_to_text(element, arena)?, jsonb });
+            }
+            // json elements: verbatim source text (interior whitespace kept).
+            let items = super::json::array_elements_source(text, arena)?;
+            let Some(element) = items.get(k - 1) else {
+                return Ok(Datum::Null);
+            };
+            if as_text {
+                // The text form of a json element: a string's decoded value,
+                // anything else its verbatim json (NULL for a json null).
+                let parsed = super::json::parse(element, arena)?;
+                return Ok(match parsed {
+                    super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                    super::json::Json::Null => Datum::Null,
+                    _ => Datum::Text(element),
+                });
+            }
+            Ok(Datum::Json { text: element, jsonb })
         }
         "pg_get_indexdef" => {
             // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole
@@ -3542,10 +3703,7 @@ fn datum_numeric<'a>(name: &str, d: Datum<'a>, arena: &'a Arena) -> Result<Numer
 fn datum_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
         Datum::Text(s) => Ok(s),
-        other => {
-            let s = stack_format!(64, "{}", other);
-            arena.alloc_str(s.as_str()).map_err(|_| arena_full())
-        }
+        other => arena.alloc_str_display(other).map_err(|_| arena_full()),
     }
 }
 
@@ -3708,6 +3866,13 @@ fn binary<'a>(
         And | Or => logic(operator, l, r),
         Concat => match (l, r) {
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_concat(l, r, arena),
+            // jsonb || jsonb: object merge (right wins), array concat, else
+            // wrap-and-concat. (Plain json has no `||` operator in PostgreSQL,
+            // but our `Datum::Json` carries a `jsonb` flag; concat applies only
+            // to the jsonb form.)
+            (Datum::Json { jsonb: true, .. }, _) | (_, Datum::Json { jsonb: true, .. }) => {
+                jsonb_concat(l, r, arena)
+            }
             _ => concat(l, r, l_unknown, r_unknown, arena),
         },
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
@@ -3723,8 +3888,10 @@ fn binary<'a>(
             _ => arithmetic(operator, l, r, l_unknown, r_unknown, arena),
         },
         JsonGet | JsonGetText => json_get(l, r, operator == JsonGetText, arena),
+        JsonPath | JsonPathText => json_path(l, r, operator == JsonPathText, arena),
+        JsonExists | JsonExistsAny | JsonExistsAll => json_exists(operator, l, r, arena),
         Shl | Shr => match (l, r) {
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r, arena),
             (Datum::Bit { .. }, _) => bit_shift(operator, l, r, arena),
             _ => bitwise(operator, l, r),
         },
@@ -3743,7 +3910,9 @@ fn binary<'a>(
         {
             multirange_op(operator, l, r, arena)
         }
-        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => range_op(operator, l, r),
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => {
+            range_op(operator, l, r, arena)
+        }
         // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
         Like | ILike => {
             if l.is_null() || r.is_null() {
@@ -3831,15 +4000,20 @@ fn array_set_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Da
     Ok(Datum::Bool(result))
 }
 
-fn range_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn range_op<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     use super::range;
     use BinaryOp::{Adjacent, ContainedBy, Contains, NotLeftOf, NotRightOf, Overlaps, Shl, Shr};
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
     match operator {
-        Contains => range_contains(l, r),
-        ContainedBy => range_contains(r, l),
+        Contains => range_contains(l, r, arena),
+        ContainedBy => range_contains(r, l, arena),
         _ => {
             let (lt, lk) = as_range(&l)?;
             let (rt, rk) = as_range(&r)?;
@@ -3891,7 +4065,11 @@ fn range_mismatch() -> SqlError {
 
 /// Whether `container` (a range) contains `contained` (a range of the same kind
 /// or a bare element).
-fn range_contains<'a>(container: Datum<'a>, contained: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+fn range_contains<'a>(
+    container: Datum<'a>,
+    contained: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let (container_text, container_kind) = as_range(&container)?;
     match contained {
         Datum::Range { text, kind } => {
@@ -3901,11 +4079,11 @@ fn range_contains<'a>(container: Datum<'a>, contained: Datum<'a>) -> Result<Datu
             Ok(Datum::Bool(super::range::contains_range(container_text, text, container_kind)?))
         }
         element => {
-            let element_text = stack_format!(64, "{}", element);
+            let element_text = arena.alloc_str_display(element).map_err(|_| arena_full())?;
             Ok(Datum::Bool(super::range::contains_elem(
                 container_text,
                 container_kind,
-                element_text.as_str(),
+                element_text,
             )?))
         }
     }
@@ -4036,8 +4214,8 @@ fn multirange_contains<'a>(
             range::multirange_contains_multirange(ct, mr, ck, arena)?
         }
         element => {
-            let element_text = stack_format!(64, "{}", element);
-            range::multirange_contains_elem(ct, ck, element_text.as_str())?
+            let element_text = arena.alloc_str_display(element).map_err(|_| arena_full())?;
+            range::multirange_contains_elem(ct, ck, element_text)?
         }
     };
     Ok(Datum::Bool(held))
@@ -4214,7 +4392,7 @@ fn json_get<'a>(
         // ->> renders a JSON string as its unescaped text; other values as
         // their canonical JSON.
         if let super::json::Json::Str(s) = child {
-            return Ok(Datum::Text(s));
+            return Ok(Datum::Text(super::json::decode_string(s, arena)?));
         }
         let mut buffer = crate::util::StackStr::<8192>::new();
         let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
@@ -4223,6 +4401,206 @@ fn json_get<'a>(
     let mut buffer = crate::util::StackStr::<8192>::new();
     let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
     Ok(Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb })
+}
+
+/// Renders a `Json` value to canonical jsonb text in the arena.
+/// Renders a parsed JSON node back to its canonical text, for callers outside
+/// this module (set-returning-function materialization in the query layer).
+pub fn json_to_text_pub<'a>(
+    v: &super::json::Json<'a>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    json_to_text(v, arena)
+}
+
+fn json_to_text<'a>(v: &super::json::Json<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let mut buffer = crate::util::StackStr::<16384>::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut buffer,
+        format_args!("{}", super::json::JsonWrite(v)),
+    );
+    arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())
+}
+
+/// `jsonb || jsonb`: merge two objects (right key wins), concatenate two
+/// arrays, else concatenate as arrays wrapping any non-array operand.
+fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    use super::json::Json;
+    let text_of = |d: Datum<'a>| -> Result<Option<&'a str>, SqlError> {
+        match d {
+            Datum::Json { text, .. } => Ok(Some(text)),
+            Datum::Null => Ok(None),
+            other => Err(type_mismatch("|| requires jsonb", &other)),
+        }
+    };
+    let (Some(lt), Some(rt)) = (text_of(l)?, text_of(r)?) else {
+        return Ok(Datum::Null);
+    };
+    let lj = super::json::parse(lt, arena)?;
+    let rj = super::json::parse(rt, arena)?;
+    let merged = match (&lj, &rj) {
+        (Json::Object(a), Json::Object(b)) => {
+            // Concatenate then re-sort/dedup (last wins) by re-serializing an
+            // object literal through the parser.
+            let mut buffer = crate::util::StackStr::<32768>::new();
+            let _ = core::fmt::Write::write_str(&mut buffer, "{");
+            let mut first = true;
+            for (k, v) in a.iter().chain(b.iter()) {
+                if !first {
+                    let _ = core::fmt::Write::write_str(&mut buffer, ",");
+                }
+                first = false;
+                let _ = super::json::write_json_raw_string(k, &mut buffer);
+                let _ = core::fmt::Write::write_str(&mut buffer, ":");
+                let _ = core::fmt::Write::write_fmt(
+                    &mut buffer,
+                    format_args!("{}", super::json::JsonWrite(v)),
+                );
+            }
+            let _ = core::fmt::Write::write_str(&mut buffer, "}");
+            let owned = arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?;
+            return Ok(Datum::Json { text: json_to_text(&super::json::parse(owned, arena)?, arena)?, jsonb: true });
+        }
+        (Json::Array(a), Json::Array(b)) => {
+            let items = arena
+                .alloc_slice_with(a.len() + b.len(), |_| Json::Null)
+                .map_err(|_| arena_full())?;
+            items[..a.len()].copy_from_slice(a);
+            items[a.len()..].copy_from_slice(b);
+            Json::Array(items)
+        }
+        // Non-array || anything (or vice-versa): each non-array becomes a
+        // one-element array, then concatenate.
+        _ => {
+            let as_items = |j: &Json<'a>| -> &'a [Json<'a>] {
+                match j {
+                    Json::Array(items) => items,
+                    _ => core::slice::from_ref(arena.alloc(*j).expect("arena")),
+                }
+            };
+            let (ai, bi) = (as_items(&lj), as_items(&rj));
+            let items = arena
+                .alloc_slice_with(ai.len() + bi.len(), |_| Json::Null)
+                .map_err(|_| arena_full())?;
+            items[..ai.len()].copy_from_slice(ai);
+            items[ai.len()..].copy_from_slice(bi);
+            Json::Array(items)
+        }
+    };
+    Ok(Datum::Json { text: json_to_text(&merged, arena)?, jsonb: true })
+}
+
+/// `json #> path` / `#>>`: extract the value at a `text[]` path.
+fn json_path<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    as_text: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (text, jsonb) = match l {
+        Datum::Json { text, jsonb } => (text, jsonb),
+        Datum::Null => return Ok(Datum::Null),
+        other => return Err(type_mismatch("#> requires json/jsonb", &other)),
+    };
+    // The path is a `text[]`; an unknown literal (`'{a,b}'`) arrives as text
+    // and is parsed as a text-array literal, as PostgreSQL coerces it.
+    let (element, raw) = match r {
+        Datum::Array { element, raw } => (element, raw),
+        Datum::Text(lit) => (
+            super::types::ArrElem::Text,
+            super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
+        ),
+        Datum::Null => return Ok(Datum::Null),
+        other => return Err(type_mismatch("#> path must be a text array", &other)),
+    };
+    let mut node = super::json::parse(text, arena)?;
+    for i in 0..super::array::len(raw) {
+        let step = super::array::get(raw, element, i).unwrap_or(Datum::Null);
+        let Datum::Text(key) = step else {
+            return Ok(Datum::Null);
+        };
+        let next = match &node {
+            super::json::Json::Object(_) => node.get_field(key),
+            super::json::Json::Array(_) => key.parse::<i64>().ok().and_then(|n| node.get_index(n)),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return Ok(Datum::Null);
+        };
+        node = next;
+    }
+    if as_text {
+        if let super::json::Json::Str(str_value) = node {
+            return Ok(Datum::Text(super::json::decode_string(str_value, arena)?));
+        }
+        if matches!(node, super::json::Json::Null) {
+            return Ok(Datum::Null);
+        }
+        return Ok(Datum::Text(json_to_text(&node, arena)?));
+    }
+    Ok(Datum::Json { text: json_to_text(&node, arena)?, jsonb })
+}
+
+/// `jsonb ? key` / `?|` / `?&`: key/element existence tests.
+fn json_exists<'a>(
+    operator: super::ast::BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::ast::BinaryOp::{JsonExistsAll, JsonExistsAny};
+    use super::json::Json;
+    let text = match l {
+        Datum::Json { text, .. } => text,
+        Datum::Null => return Ok(Datum::Null),
+        other => return Err(type_mismatch("? requires jsonb", &other)),
+    };
+    let node = super::json::parse(text, arena)?;
+    // Does a single string key exist (object key, or array string element)?
+    let has = |key: &str| -> bool {
+        match &node {
+            Json::Object(members) => members.iter().any(|(k, _)| *k == key),
+            Json::Array(items) => items.iter().any(|it| matches!(it, Json::Str(s) if *s == key)),
+            _ => false,
+        }
+    };
+    match operator {
+        super::ast::BinaryOp::JsonExists => {
+            let Datum::Text(key) = r else {
+                if r.is_null() {
+                    return Ok(Datum::Null);
+                }
+                return Err(type_mismatch("? key must be text", &r));
+            };
+            Ok(Datum::Bool(has(key)))
+        }
+        JsonExistsAny | JsonExistsAll => {
+            let (element, raw) = match r {
+                Datum::Array { element, raw } => (element, raw),
+                Datum::Text(lit) => (
+                    super::types::ArrElem::Text,
+                    super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
+                ),
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("?|/?& require a text array", &other)),
+            };
+            let n = super::array::len(raw);
+            let all = operator == JsonExistsAll;
+            let mut result = all;
+            for i in 0..n {
+                let key = super::array::get(raw, element, i).unwrap_or(Datum::Null);
+                let present = matches!(key, Datum::Text(k) if has(k));
+                if all {
+                    result = result && present;
+                } else if present {
+                    result = true;
+                    break;
+                }
+            }
+            Ok(Datum::Bool(result))
+        }
+        _ => unreachable!("json_exists only handles ?, ?|, ?&"),
+    }
 }
 
 /// Evaluates `left AND right` / `left OR right` with PostgreSQL's short-circuit
@@ -5155,10 +5533,7 @@ fn cast_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError>
             }
             Ok(unsafe { core::str::from_utf8_unchecked(out) })
         }
-        other => {
-            let s = stack_format!(40, "{}", other);
-            arena.alloc_str(s.as_str()).map_err(|_| arena_full())
-        }
+        other => arena.alloc_str_display(other).map_err(|_| arena_full()),
     }
 }
 

@@ -97,6 +97,39 @@ impl Arena {
         Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
     }
 
+    /// Renders a `Display` value straight into the arena at its exact length —
+    /// no fixed-size scratch buffer, so arbitrarily long values (JSON, arrays,
+    /// ranges) never truncate. Measures once, then writes once.
+    pub fn alloc_str_display(&self, value: impl core::fmt::Display) -> Result<&str, ArenaFull> {
+        use core::fmt::Write;
+        struct Counter(usize);
+        impl Write for Counter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.0 += s.len();
+                Ok(())
+            }
+        }
+        let mut counter = Counter(0);
+        // Display's fmt is total for our Datum types, so this never errors.
+        let _ = write!(counter, "{value}");
+        let bytes = self.alloc_slice_with(counter.0, |_| 0u8)?;
+        struct SliceWriter<'a> {
+            buffer: &'a mut [u8],
+            at: usize,
+        }
+        impl Write for SliceWriter<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let end = self.at + s.len();
+                self.buffer[self.at..end].copy_from_slice(s.as_bytes());
+                self.at = end;
+                Ok(())
+            }
+        }
+        let mut writer = SliceWriter { buffer: bytes, at: 0 };
+        let _ = write!(writer, "{value}");
+        Ok(unsafe { core::str::from_utf8_unchecked(writer.buffer) })
+    }
+
     #[expect(
         clippy::mut_from_ref,
         reason = "each call returns a disjoint region; reset() takes &mut self, so no returned borrow can outlive rewinding"

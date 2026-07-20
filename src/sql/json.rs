@@ -59,6 +59,160 @@ pub fn validate(input: &str, arena: &Arena) -> Result<(), SqlError> {
     parse(input, arena).map(|_| ())
 }
 
+/// The shape of a JSON value at the top level, for the diagnostic messages the
+/// `*_object_keys` / `*_array_elements` functions raise on the wrong input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Scalar,
+    Array,
+    Object,
+}
+
+/// Classifies a JSON value by its first non-whitespace byte.
+pub fn kind_of(text: &str) -> Kind {
+    for &b in text.as_bytes() {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            b'{' => return Kind::Object,
+            b'[' => return Kind::Array,
+            _ => return Kind::Scalar,
+        }
+    }
+    Kind::Scalar
+}
+
+/// PostgreSQL's error for calling `*_object_keys` on a non-object.
+pub fn object_keys_error(name: &str, kind: Kind) -> SqlError {
+    let what = match kind {
+        Kind::Scalar => "a scalar",
+        Kind::Array => "an array",
+        Kind::Object => "an object",
+    };
+    sql_err!("22023", "cannot call {} on {}", name, what)
+}
+
+/// PostgreSQL's error for calling `*_array_elements` on a non-array. The `json`
+/// variants phrase it as `cannot call <fn> on a scalar / a non-array`; the
+/// `jsonb` variants as `cannot extract elements from a scalar / an object`.
+pub fn array_elements_error(name: &str, jsonb: bool, kind: Kind) -> SqlError {
+    if jsonb {
+        let what = match kind {
+            Kind::Scalar => "a scalar",
+            Kind::Object => "an object",
+            Kind::Array => "an array",
+        };
+        sql_err!("22023", "cannot extract elements from {}", what)
+    } else {
+        let what = match kind {
+            Kind::Scalar => "a scalar",
+            Kind::Object | Kind::Array => "a non-array",
+        };
+        sql_err!("22023", "cannot call {} on {}", name, what)
+    }
+}
+
+/// Top-level members of a JSON object in source order, keys decoded and each
+/// value kept as its verbatim source text. Unlike [`parse`], this preserves the
+/// input's key order, duplicate keys, and interior whitespace — the behavior of
+/// `json_object_keys` / `json_each` on the `json` type (not `jsonb`).
+pub fn object_members_source<'a>(
+    input: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, &'a str)], SqlError> {
+    let mut p = P { b: input.as_bytes(), at: 0, arena };
+    p.ws();
+    if p.b.get(p.at) != Some(&b'{') {
+        return Err(sql_err!("22023", "cannot call json_object_keys on a non-object"));
+    }
+    p.at += 1;
+    let mut members: [(&str, &str); MAX_ELEMS] = [("", ""); MAX_ELEMS];
+    let mut n = 0;
+    p.ws();
+    if p.b.get(p.at) == Some(&b'}') {
+        return Ok(&[]);
+    }
+    loop {
+        if n == MAX_ELEMS {
+            return Err(sql_err!("54000", "JSON object too large"));
+        }
+        p.ws();
+        if p.b.get(p.at) != Some(&b'"') {
+            return Err(bad());
+        }
+        let key = decode_string(p.string()?, arena)?;
+        p.ws();
+        if p.b.get(p.at) != Some(&b':') {
+            return Err(bad());
+        }
+        p.at += 1;
+        p.ws();
+        let start = p.at;
+        p.value(0)?;
+        let value = core::str::from_utf8(&p.b[start..p.at]).map_err(|_| bad())?;
+        members[n] = (key, value);
+        n += 1;
+        p.ws();
+        match p.b.get(p.at) {
+            Some(b',') => p.at += 1,
+            Some(b'}') => {
+                p.at += 1;
+                break;
+            }
+            _ => return Err(bad()),
+        }
+    }
+    p.ws();
+    if p.at != p.b.len() {
+        return Err(bad());
+    }
+    Ok(arena.alloc_slice_copy(&members[..n]).map_err(|_| bad())?)
+}
+
+/// Top-level elements of a JSON array in source order, each kept as its verbatim
+/// source text. Preserves interior whitespace — the behavior of
+/// `json_array_elements` on the `json` type (not `jsonb`).
+pub fn array_elements_source<'a>(
+    input: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a [&'a str], SqlError> {
+    let mut p = P { b: input.as_bytes(), at: 0, arena };
+    p.ws();
+    if p.b.get(p.at) != Some(&b'[') {
+        return Err(sql_err!("22023", "cannot extract elements from a non-array"));
+    }
+    p.at += 1;
+    let mut items: [&str; MAX_ELEMS] = [""; MAX_ELEMS];
+    let mut n = 0;
+    p.ws();
+    if p.b.get(p.at) == Some(&b']') {
+        return Ok(&[]);
+    }
+    loop {
+        if n == MAX_ELEMS {
+            return Err(sql_err!("54000", "JSON array too large"));
+        }
+        p.ws();
+        let start = p.at;
+        p.value(0)?;
+        items[n] = core::str::from_utf8(&p.b[start..p.at]).map_err(|_| bad())?;
+        n += 1;
+        p.ws();
+        match p.b.get(p.at) {
+            Some(b',') => p.at += 1,
+            Some(b']') => {
+                p.at += 1;
+                break;
+            }
+            _ => return Err(bad()),
+        }
+    }
+    p.ws();
+    if p.at != p.b.len() {
+        return Err(bad());
+    }
+    Ok(arena.alloc_slice_copy(&items[..n]).map_err(|_| bad())?)
+}
+
 impl<'a> P<'a> {
     fn ws(&mut self) {
         while self.at < self.b.len() && matches!(self.b[self.at], b' ' | b'\t' | b'\n' | b'\r') {
@@ -225,8 +379,12 @@ impl<'a> P<'a> {
             }
         }
         // Stable-sort by key, then drop earlier duplicates (last value wins).
+        // jsonb orders object keys by length first, then bytewise — the same
+        // order PostgreSQL stores and prints them in.
         let ms = &mut members[..n];
-        ms.sort_by(|a, b| a.0.cmp(b.0));
+        ms.sort_by(|a, b| {
+            a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        });
         let mut out: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
         let mut m = 0;
         for i in 0..n {
@@ -338,6 +496,84 @@ fn write_json_string(s: &str, out: &mut dyn core::fmt::Write) -> core::fmt::Resu
         }
     }
     out.write_str("\"")
+}
+
+/// Decodes a JSON string body (the bytes between the quotes, with escapes still
+/// present) into its raw text. This is what the `->>`, `#>>` and
+/// `*_text` accessors return: a JSON string's *value*, with `\n`, `\t`,
+/// `\uXXXX`, surrogate pairs, etc. resolved to the characters they denote.
+/// Strings without a backslash are returned by reference with no allocation.
+pub fn decode_string<'a>(raw: &'a str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    if !raw.as_bytes().contains(&b'\\') {
+        return Ok(raw);
+    }
+    let mut buffer = crate::util::StackStr::<65536>::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            buffer.write_char(b as char).map_err(|_| bad())?;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&esc) = bytes.get(i) else {
+            return Err(bad());
+        };
+        match esc {
+            b'"' => buffer.write_char('"').map_err(|_| bad())?,
+            b'\\' => buffer.write_char('\\').map_err(|_| bad())?,
+            b'/' => buffer.write_char('/').map_err(|_| bad())?,
+            b'b' => buffer.write_char('\u{08}').map_err(|_| bad())?,
+            b'f' => buffer.write_char('\u{0c}').map_err(|_| bad())?,
+            b'n' => buffer.write_char('\n').map_err(|_| bad())?,
+            b'r' => buffer.write_char('\r').map_err(|_| bad())?,
+            b't' => buffer.write_char('\t').map_err(|_| bad())?,
+            b'u' => {
+                let code = hex4(bytes, i + 1)?;
+                i += 4;
+                let scalar = if (0xD800..=0xDBFF).contains(&code) {
+                    // High surrogate: must be followed by `\uXXXX` low surrogate.
+                    if bytes.get(i + 1) == Some(&b'\\') && bytes.get(i + 2) == Some(&b'u') {
+                        let low = hex4(bytes, i + 3)?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return Err(bad());
+                        }
+                        i += 6;
+                        0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                    } else {
+                        return Err(bad());
+                    }
+                } else if (0xDC00..=0xDFFF).contains(&code) {
+                    return Err(bad());
+                } else {
+                    code
+                };
+                let ch = char::from_u32(scalar).ok_or_else(bad)?;
+                buffer.write_char(ch).map_err(|_| bad())?;
+            }
+            _ => return Err(bad()),
+        }
+        i += 1;
+    }
+    arena.alloc_str(buffer.as_str()).map_err(|_| bad())
+}
+
+/// Parses four hex digits at `bytes[at..at+4]` into a code point.
+fn hex4(bytes: &[u8], at: usize) -> Result<u32, SqlError> {
+    let mut value = 0u32;
+    for offset in 0..4 {
+        let digit = bytes.get(at + offset).ok_or_else(bad)?;
+        let nibble = match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'a'..=b'f' => digit - b'a' + 10,
+            b'A'..=b'F' => digit - b'A' + 10,
+            _ => return Err(bad()),
+        };
+        value = (value << 4) | nibble as u32;
+    }
+    Ok(value)
 }
 
 /// Escapes a raw string into a JSON string literal (used by `row_to_json` and

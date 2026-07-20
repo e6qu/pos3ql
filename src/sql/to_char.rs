@@ -627,16 +627,14 @@ fn render<'a>(
     // its ~15 significant digits leave past the integer part; a large enough
     // magnitude leaves none, so PostgreSQL prints the point but no `#` fill
     // there (a numeric always keeps every fractional position).
-    if overflow {
-        if let Some(x) = float_source {
-            let digits_before = if x.abs() >= 1.0 {
-                x.abs().log10().floor() as i32 + 1
-            } else {
-                1
-            };
-            let available = (15 - digits_before).max(0);
-            frac_emit = frac_emit.min(available as usize);
-        }
+    if overflow && let Some(x) = float_source {
+        let digits_before = if x.abs() >= 1.0 {
+            x.abs().log10().floor() as i32 + 1
+        } else {
+            1
+        };
+        let available = (15 - digits_before).max(0);
+        frac_emit = frac_emit.min(available as usize);
     }
     if fm && !overflow {
         let mut p = toks.len();

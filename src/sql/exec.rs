@@ -1972,6 +1972,17 @@ fn emit_projected(
                     n += 1;
                 }
             }
+            SelectItem::RecordStar(base) => {
+                match super::eval::record_star_expand(base, arena, params, &context, &super::eval::NO_HOOKS) {
+                    Ok(fields) => {
+                        for f in fields {
+                            projected[n] = f.value;
+                            n += 1;
+                        }
+                    }
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
             SelectItem::Expr { expression, .. } => match eval(expression, arena, params, &context) {
                 Ok(v) => {
                     projected[n] = v;
@@ -2597,6 +2608,9 @@ pub fn describe_items<'q>(
                     push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
                 }
             }
+            SelectItem::RecordStar(base) => {
+                describe_record_star(base, def, &mut push)?;
+            }
             SelectItem::Expr { expression, alias } => {
                 let (mut type_oid, mut typlen) = infer_type_pub(expression, def)?;
                 // A bare unknown (string literal / param) resolves to text
@@ -2611,6 +2625,46 @@ pub fn describe_items<'q>(
         }
     }
     Ok(n)
+}
+
+/// Emits one `ColDesc` per field of a `(record).*` expansion, resolving field
+/// names and types at the caller's `'q` lifetime (single-table describe path).
+fn describe_record_star<'q>(
+    base: &Expr<'q>,
+    def: Option<&'q TableDef>,
+    push: &mut impl FnMut(ColDesc<'q>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    match base {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+            let resolver: &dyn ColTypeResolver = match def {
+                Some(d) => &DefCols(d),
+                None => &NoCols,
+            };
+            check_row_field_types(base, resolver)?;
+            for (i, arg) in args.iter().take(RECORD_FIELD_NAMES.len()).enumerate() {
+                let (oid, typlen) = infer_type_pub(arg, def)?;
+                push(ColDesc::new(RECORD_FIELD_NAMES[i], oid, typlen))?;
+            }
+            Ok(())
+        }
+        Expr::Call { name, .. } if json_each_value_type(name).is_some() => {
+            push(ColDesc::of_type("key", ColType::Text))?;
+            push(ColDesc::of_type("value", json_each_value_type(name).expect("checked")))?;
+            Ok(())
+        }
+        Expr::WholeRow(table) | Expr::Column { qualifier: None, name: table }
+            if def.is_some_and(|d| d.name.as_str() == *table) =>
+        {
+            for c in def.expect("matched").columns() {
+                push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
+            }
+            Ok(())
+        }
+        _ => Err(sql_err!(
+            "42809",
+            "row expansion is not supported on this expression"
+        )),
+    }
 }
 
 /// Maps a type oid back to a ColType (numeric tower + common types).
@@ -2710,6 +2764,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         Expr::Case { otherwise: Some(e), .. } => name_of(e),
         // An array subscript keeps the base column's name (`m[1]` → `m`).
         Expr::Subscript { base, .. } => name_of(base),
+        // `(record).field` is named after the field.
+        Expr::Field { field, .. } => Some(field),
         _ => None,
     }
 }
@@ -2752,6 +2808,129 @@ pub trait ColTypeResolver {
     fn whole_row_scalar_type(&self, _name: &str) -> Option<ColType> {
         None
     }
+
+    /// The columns of the FROM item exposed as `name`, for resolving a
+    /// whole-row record's field shape (`(t).c`, `(t).*`). Defaults to None.
+    fn table_columns(&self, _name: &str) -> Option<&[ColumnMeta]> {
+        None
+    }
+}
+
+/// Static field names PostgreSQL assigns an anonymous record (`ROW(...)`):
+/// `f1`, `f2`, … Indexed 1-based by the caller.
+pub const RECORD_FIELD_NAMES: [&str; 64] = [
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14",
+    "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24", "f25", "f26", "f27",
+    "f28", "f29", "f30", "f31", "f32", "f33", "f34", "f35", "f36", "f37", "f38", "f39", "f40",
+    "f41", "f42", "f43", "f44", "f45", "f46", "f47", "f48", "f49", "f50", "f51", "f52", "f53",
+    "f54", "f55", "f56", "f57", "f58", "f59", "f60", "f61", "f62", "f63", "f64",
+];
+
+/// The value type of `json_each`-family output's `value` column, for callers
+/// outside this module (scope-based record-star expansion).
+pub fn json_each_value_type_pub(name: &str) -> Option<ColType> {
+    json_each_value_type(name)
+}
+
+/// The value type of `json_each`-family output's `value` column.
+fn json_each_value_type(name: &str) -> Option<ColType> {
+    if name.eq_ignore_ascii_case("json_each") {
+        Some(ColType::Json)
+    } else if name.eq_ignore_ascii_case("jsonb_each") {
+        Some(ColType::Jsonb)
+    } else if name.eq_ignore_ascii_case("json_each_text") || name.eq_ignore_ascii_case("jsonb_each_text") {
+        Some(ColType::Text)
+    } else {
+        None
+    }
+}
+
+/// Visits each `(field_name, type)` of a record-valued expression's shape,
+/// returning the field count, or None when `base` is not a record whose shape
+/// is statically known. Handles `ROW(...)`, a whole-row reference to a FROM
+/// table, and the `json_each` family. The visited names borrow only for the
+/// call, so callers copy them (into the arena, or into a `ColDesc`).
+pub fn record_shape(
+    base: &Expr,
+    columns: &dyn ColTypeResolver,
+    mut visit: impl FnMut(&str, ColType),
+) -> Option<usize> {
+    match base {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+            let n = args.len().min(RECORD_FIELD_NAMES.len());
+            for (i, arg) in args[..n].iter().enumerate() {
+                let oid = infer_type_res(arg, columns).ok()?.0;
+                visit(RECORD_FIELD_NAMES[i], coltype_of_oid(oid).unwrap_or(ColType::Text));
+            }
+            Some(n)
+        }
+        Expr::Call { name, .. } if json_each_value_type(name).is_some() => {
+            visit("key", ColType::Text);
+            visit("value", json_each_value_type(name)?);
+            Some(2)
+        }
+        Expr::WholeRow(table) => shape_from_columns(columns.table_columns(table)?, visit),
+        Expr::Column { qualifier: None, name } if columns.is_whole_row(name) => {
+            shape_from_columns(columns.table_columns(name)?, visit)
+        }
+        _ => None,
+    }
+}
+
+fn shape_from_columns(cols: &[ColumnMeta], mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
+    for col in cols {
+        visit(col.name.as_str(), col.ctype);
+    }
+    Some(cols.len())
+}
+
+/// PostgreSQL cannot form the composite type of a `ROW(...)` that contains a
+/// bare unknown literal, so selecting a field of (or expanding) such a record
+/// fails — even for a well-typed sibling field. Mirror that so `(ROW(1,'x')).f1`
+/// errors exactly as PostgreSQL does.
+pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Result<(), SqlError> {
+    if let Expr::Call { name, args, .. } = base
+        && name.eq_ignore_ascii_case("row")
+    {
+        for arg in *args {
+            if infer_type_res(arg, columns)?.0 == oid::UNKNOWN {
+                return Err(sql_err!(
+                    "XX000",
+                    "failed to find conversion function from unknown to text"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The type of a record's field `field` (for `(base).field`), or an error if
+/// `base` is not a record whose shape is known or the field does not exist.
+pub fn record_field_type(
+    base: &Expr,
+    field: &str,
+    columns: &dyn ColTypeResolver,
+) -> Result<ColType, SqlError> {
+    check_row_field_types(base, columns)?;
+    let mut found = None;
+    let shape = record_shape(base, columns, |name, ctype| {
+        if found.is_none() && name.eq_ignore_ascii_case(field) {
+            found = Some(ctype);
+        }
+    });
+    if shape.is_none() {
+        return Err(sql_err!(
+            "42809",
+            "field selection is not supported on this expression"
+        ));
+    }
+    found.ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "could not identify column \"{}\" in record data type",
+            field
+        )
+    })
 }
 
 /// No FROM clause: any column reference is an error.
@@ -2778,6 +2957,10 @@ impl ColTypeResolver for DefCols<'_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         name == self.0.name.as_str()
+    }
+
+    fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
+        (name == self.0.name.as_str()).then(|| self.0.columns())
     }
 }
 
@@ -3079,8 +3262,16 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 _ => (oid::UNKNOWN, -2),
             }
         }
-        // A `_pg_expandarray` composite's `.x`/`.n` fields are integers.
-        Expr::Field { .. } => of(ColType::Int4),
+        // `(record).field`: the field's type from the record's shape. When the
+        // shape is not a statically known record (a `_pg_expandarray` result,
+        // reached directly or through a derived-table column — the shape driver
+        // introspection relies on), fall back to int4, matching its `.x`/`.n`
+        // ordinal fields; a *known* record with a missing field still errors.
+        Expr::Field { base, field } => match record_field_type(base, field, columns) {
+            Ok(t) => of(t),
+            Err(e) if e.sqlstate == "42809" => of(ColType::Int4),
+            Err(e) => return Err(e),
+        },
         Expr::Call { name, args, order_by, .. } => match *name {
             // Catalog-introspection helpers (for psql \d).
             "pg_get_userbyid" | "format_type" | "pg_get_expr" | "pg_get_indexdef"

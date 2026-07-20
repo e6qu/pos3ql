@@ -314,6 +314,10 @@ impl<'a> Parser<'a> {
                     Expr::WholeRow(table) if alias.is_none() => {
                         SelectItem::TableWildcard(table)
                     }
+                    // `(record).*` parsed as the `*`-sentinel field access.
+                    Expr::Field { base, field: "*" } if alias.is_none() => {
+                        SelectItem::RecordStar(base)
+                    }
                     _ => SelectItem::Expr { expression, alias },
                 }
             };
@@ -1894,10 +1898,18 @@ impl<'a> Parser<'a> {
                 }
                 let inner = self.expression(0)?;
                 self.expect_op(")")?;
-                // `(expression).field` composite field access (chained).
+                // `(expression).field` composite field access (chained), or
+                // `(expression).*` record expansion. The star is carried as a
+                // `Field` with the sentinel field name `*` (no real column can
+                // be named that); `select_items` turns a top-level one into a
+                // `RecordStar` item and every other position rejects it.
                 let mut base = inner;
                 while self.peeked == Tok::Op(".") {
                     self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        return self.arena_expr(Expr::Field { base, field: "*" });
+                    }
                     let field = self.any_ident("field name")?;
                     base = self.arena_expr(Expr::Field { base, field })?;
                 }

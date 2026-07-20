@@ -203,6 +203,9 @@ pub enum SelectItem<'a> {
     /// `t.*`: every column of the named FROM item (its own copies, even for
     /// USING/NATURAL-merged columns).
     TableWildcard(&'a str),
+    /// `(expr).*`: expand a record-valued expression into its fields as
+    /// separate columns (`(ROW(1,2)).*`, `(json_each(j)).*`, `(t).*`).
+    RecordStar(&'a Expr<'a>),
     Expr { expression: &'a Expr<'a>, alias: Option<&'a str> },
 }
 

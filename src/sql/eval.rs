@@ -832,12 +832,21 @@ pub fn eval_full<'a>(
             }
         }
         Expr::Field { base, field } => {
-            // The only composite we produce is the `_pg_expandarray` result,
-            // encoded as the 2-element array `[x, n]`. `.x` is the element and
-            // `.n` the 1-based ordinal.
             let b = eval_full(base, arena, params, row, hooks)?;
             match b {
                 Datum::Null => Ok(Datum::Null),
+                // A record: select the field by name (records carry lowercase
+                // field names — `f1,f2,…` for ROW(), column names for a row).
+                Datum::Record(fields) => match fields.iter().find(|f| f.name.eq_ignore_ascii_case(field)) {
+                    Some(f) => Ok(f.value),
+                    None => Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "could not identify column \"{}\" in record data type",
+                        field
+                    )),
+                },
+                // The `_pg_expandarray` result is encoded as the 2-element array
+                // `[x, n]`; `.x`/`.f1` is the element and `.n`/`.f2` the ordinal.
                 Datum::Array { element, raw } => {
                     let index = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
                     {
@@ -4461,6 +4470,24 @@ fn json_to_text<'a>(v: &super::json::Json<'a>, arena: &'a Arena) -> Result<&'a s
     // Render straight into the arena at exact length — a jsonb value can be
     // larger than any fixed scratch buffer, and truncating it would corrupt it.
     arena.alloc_str_display(super::json::JsonWrite(v)).map_err(|_| arena_full())
+}
+
+/// Expands a `(record).*` base to its fields for a projection. The runtime
+/// field count matches the static shape (`exec::record_shape`) for every
+/// supported record source, so describe and data-row column counts agree.
+/// A null or non-composite value is rejected loudly (a `(t).*` over an
+/// outer-join null row is the one shape whose width is not carried at runtime).
+pub fn record_star_expand<'a>(
+    base: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+    match eval_full(base, arena, params, row, hooks)? {
+        Datum::Record(fields) => Ok(fields),
+        other => Err(type_mismatch("record expansion of a non-composite value", &other)),
+    }
 }
 
 /// The `(key, value)` members a `json_each` / `jsonb_each` family call yields

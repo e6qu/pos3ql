@@ -164,6 +164,9 @@ pub struct TableRef<'a> {
     /// Materialized recursive-CTE reference: when set, this FROM item reads the
     /// pre-computed row set instead of a table or subquery.
     pub cte: Option<&'a MaterializedCte<'a>>,
+    /// `func(args) WITH ORDINALITY`: append a 1-based `bigint` ordinality column
+    /// to a table function's output. Only valid on a table-function FROM item.
+    pub with_ordinality: bool,
 }
 
 /// Upper bound on `USING (c1, ...)` column-list length (and thus on merged
@@ -556,6 +559,8 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("jsonb_each")
                 || name.eq_ignore_ascii_case("json_each_text")
                 || name.eq_ignore_ascii_case("jsonb_each_text")
+                || name.eq_ignore_ascii_case("regexp_split_to_table")
+                || name.eq_ignore_ascii_case("generate_subscripts")
         }
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)

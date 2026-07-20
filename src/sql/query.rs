@@ -3633,7 +3633,10 @@ fn compute_window<'a>(
         }
     }
 
-    let is_ranking = matches!(*name, "row_number" | "rank" | "dense_rank");
+    let is_ranking = matches!(
+        *name,
+        "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist"
+    );
     let is_offset = matches!(*name, "lag" | "lead");
 
     let part = arena.alloc_slice_with(n, |_| 0usize).map_err(|_| arena_full())?;
@@ -3666,31 +3669,52 @@ fn compute_window<'a>(
         let p = &part[..m];
 
         if is_ranking {
+            // Peer flags on the sorted partition: `same[j]` means row `p[j]`
+            // ties `p[j-1]` on the ORDER BY keys (with no ORDER BY the whole
+            // partition is one peer group). `rank`/`percent_rank`/`cume_dist`
+            // all read from these boundaries.
+            let same = arena.alloc_slice_with(m, |_| false).map_err(|_| arena_full())?;
+            for j in 1..m {
+                same[j] = spec.order_by.iter().try_fold(true, |acc, o| {
+                    Ok::<bool, SqlError>(acc && {
+                        let ra = window_row(scope, rows[p[j - 1]], offs);
+                        let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                        let rb = window_row(scope, rows[p[j]], offs);
+                        let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                        match (va.is_null(), vb.is_null()) {
+                            (true, true) => true,
+                            (true, false) | (false, true) => false,
+                            (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                        }
+                    })
+                })?;
+            }
             let mut rank = 1i64;
             let mut dense = 1i64;
             for j in 0..m {
-                let peer = j > 0
-                    && spec.order_by.iter().try_fold(true, |acc, o| {
-                        Ok::<bool, SqlError>(acc && {
-                            let ra = window_row(scope, rows[p[j - 1]], offs);
-                            let va = eval_full(o.expression, arena, params, &ra, hooks)?;
-                            let rb = window_row(scope, rows[p[j]], offs);
-                            let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-                            match (va.is_null(), vb.is_null()) {
-                                (true, true) => true,
-                                (true, false) | (false, true) => false,
-                                (false, false) => compare_datums(&va, &vb)?.is_eq(),
-                            }
-                        })
-                    })?;
-                if j > 0 && !peer {
+                if j > 0 && !same[j] {
                     rank = j as i64 + 1;
                     dense += 1;
                 }
                 out[p[j]] = match *name {
                     "row_number" => Datum::Int8(j as i64 + 1),
                     "rank" => Datum::Int8(rank),
-                    _ => Datum::Int8(dense),
+                    "dense_rank" => Datum::Int8(dense),
+                    // percent_rank: (rank - 1) / (rows - 1); a lone row is 0.
+                    "percent_rank" => Datum::Float8(if m <= 1 {
+                        0.0
+                    } else {
+                        (rank - 1) as f64 / (m as f64 - 1.0)
+                    }),
+                    // cume_dist: fraction of rows at or before this peer group
+                    // (the peer group's last index, one-based, over the count).
+                    _ => {
+                        let mut end = j;
+                        while end + 1 < m && same[end + 1] {
+                            end += 1;
+                        }
+                        Datum::Float8((end + 1) as f64 / m as f64)
+                    }
                 };
             }
         } else if is_offset {
@@ -4999,7 +5023,8 @@ fn run_subquery<'a>(
             aggs: Some((&*ptrs, agg_values)),
             subs: hooks.subs,
         windows: None, catalog: None, srf_index: None };
-        let base = Chained { inner: &super::eval::NoColumns, outer };
+        let schema = ScopeSchema(&scope);
+        let base = Chained { inner: &schema, outer };
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;
         let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
         return Ok((&*out, v.is_null(), subquery_witness(item, Some(&scope))));
@@ -5203,6 +5228,15 @@ pub struct AggState<'a> {
     sum_int: i128,
     sum_float: f64,
     sum_numeric: Option<super::numeric::Numeric<'a>>,
+    // Statistical-aggregate accumulators (all in f64). `sum_float` holds Σx (the
+    // second argument for the two-argument regression/covariance aggregates).
+    sum_sq: f64,  // Σx²
+    sum_y: f64,   // Σy (first argument of a two-arg aggregate)
+    sum_xy: f64,  // Σxy
+    sum_yy: f64,  // Σy²
+    // Exact Σx² for the single-argument variance/stddev family over
+    // integer/numeric inputs, which return numeric (Σx reuses `sum_numeric`).
+    sum_sq_numeric: Option<super::numeric::Numeric<'a>>,
     arg_kind: ArgKind,
     best: Option<Datum<'a>>,
     bool_acc: Option<bool>,
@@ -5267,6 +5301,54 @@ enum AggKind {
     PercentileCont,
     PercentileDisc,
     Mode,
+    /// Single-argument statistical aggregates over `n`, `Σx`, `Σx²`.
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
+    /// Two-argument `(Y, X)` statistical aggregates, also accumulating `Σy`,
+    /// `Σxy`, `Σy²`. Rows where either argument is NULL are skipped.
+    Corr,
+    CovarPop,
+    CovarSamp,
+    RegrSlope,
+    RegrIntercept,
+    RegrR2,
+    RegrCount,
+    RegrAvgx,
+    RegrAvgy,
+    RegrSxx,
+    RegrSyy,
+    RegrSxy,
+}
+
+impl AggKind {
+    /// The two-argument statistical aggregates `agg(Y, X)`.
+    fn is_two_arg_stat(self) -> bool {
+        matches!(
+            self,
+            AggKind::Corr
+                | AggKind::CovarPop
+                | AggKind::CovarSamp
+                | AggKind::RegrSlope
+                | AggKind::RegrIntercept
+                | AggKind::RegrR2
+                | AggKind::RegrCount
+                | AggKind::RegrAvgx
+                | AggKind::RegrAvgy
+                | AggKind::RegrSxx
+                | AggKind::RegrSyy
+                | AggKind::RegrSxy
+        )
+    }
+
+    /// The single-argument statistical aggregates over `n`, `Σx`, `Σx²`.
+    fn is_one_arg_stat(self) -> bool {
+        matches!(
+            self,
+            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp
+        )
+    }
 }
 
 impl Default for AggState<'_> {
@@ -5278,6 +5360,11 @@ impl Default for AggState<'_> {
             sum_int: 0,
             sum_float: 0.0,
             sum_numeric: None,
+            sum_sq: 0.0,
+            sum_y: 0.0,
+            sum_xy: 0.0,
+            sum_yy: 0.0,
+            sum_sq_numeric: None,
             arg_kind: ArgKind::None,
             best: None,
             bool_acc: None,
@@ -5295,6 +5382,18 @@ impl Default for AggState<'_> {
             ord_len: 0,
             ord_cap: 0,
         }
+    }
+}
+
+/// A numeric datum as `f64` for the statistical aggregates (None = NULL or a
+/// non-numeric value).
+fn agg_f64(d: &Datum) -> Option<f64> {
+    match d {
+        Datum::Int4(v) => Some(*v as f64),
+        Datum::Int8(v) => Some(*v as f64),
+        Datum::Float8(v) => Some(*v),
+        Datum::Numeric(n) => Some(n.to_f64()),
+        _ => None,
     }
 }
 
@@ -5320,6 +5419,22 @@ impl<'a> AggState<'a> {
             "percentile_cont" => AggKind::PercentileCont,
             "percentile_disc" => AggKind::PercentileDisc,
             "mode" => AggKind::Mode,
+            "var_pop" => AggKind::VarPop,
+            "var_samp" | "variance" => AggKind::VarSamp,
+            "stddev_pop" => AggKind::StddevPop,
+            "stddev_samp" | "stddev" => AggKind::StddevSamp,
+            "corr" => AggKind::Corr,
+            "covar_pop" => AggKind::CovarPop,
+            "covar_samp" => AggKind::CovarSamp,
+            "regr_slope" => AggKind::RegrSlope,
+            "regr_intercept" => AggKind::RegrIntercept,
+            "regr_r2" => AggKind::RegrR2,
+            "regr_count" => AggKind::RegrCount,
+            "regr_avgx" => AggKind::RegrAvgx,
+            "regr_avgy" => AggKind::RegrAvgy,
+            "regr_sxx" => AggKind::RegrSxx,
+            "regr_syy" => AggKind::RegrSyy,
+            "regr_sxy" => AggKind::RegrSxy,
             other => {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
@@ -5463,6 +5578,25 @@ impl<'a> AggState<'a> {
             }
             return self.push_distinct(value, arena);
         }
+        // Two-argument statistical aggregates `agg(Y, X)`: skip a row where
+        // either argument is NULL, else fold Σx, Σx², Σy, Σxy, Σy².
+        if self.kind.is_two_arg_stat() {
+            if args.len() != 2 {
+                return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "aggregate requires two arguments"));
+            }
+            let y = eval_full(args[0], arena, params, row, hooks)?;
+            let x = eval_full(args[1], arena, params, row, hooks)?;
+            let (Some(y), Some(x)) = (agg_f64(&y), agg_f64(&x)) else {
+                return Ok(());
+            };
+            self.count += 1;
+            self.sum_float += x;
+            self.sum_sq += x * x;
+            self.sum_y += y;
+            self.sum_xy += x * y;
+            self.sum_yy += y * y;
+            return Ok(());
+        }
         let Some(arg) = args.first() else {
             return Err(sql_err!("42803", "aggregate requires an argument"));
         };
@@ -5546,14 +5680,66 @@ impl<'a> AggState<'a> {
                 let sep = self.sep.unwrap_or("");
                 self.append_str_elem(sep, s, arena)?;
             }
-            // Ordered-set, array, and json aggregates buffer their values and
-            // reduce in `finish`; they never fold through `accumulate`.
+            // Single-argument statistical aggregates fold Σx and Σx². Over
+            // integer/numeric inputs PostgreSQL computes and returns an exact
+            // numeric result, so those sums are kept in numeric; float8 inputs
+            // yield a float8 result and fold in f64.
+            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
+                use super::numeric::{self as num, Numeric};
+                let as_numeric = match v {
+                    Datum::Int4(x) => {
+                        self.arg_kind = self.arg_kind.max(ArgKind::Int4);
+                        Some(Numeric::from_i64(i64::from(x), arena)?)
+                    }
+                    Datum::Int8(x) => {
+                        self.arg_kind = self.arg_kind.max(ArgKind::Int8);
+                        Some(Numeric::from_i64(x, arena)?)
+                    }
+                    Datum::Numeric(n) => {
+                        self.arg_kind = self.arg_kind.max(ArgKind::Numeric);
+                        Some(n)
+                    }
+                    Datum::Float8(x) => {
+                        self.arg_kind = ArgKind::Float;
+                        self.sum_float += x;
+                        self.sum_sq += x * x;
+                        None
+                    }
+                    other => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "statistical aggregate requires a numeric argument, got {:?}",
+                            other
+                        ))
+                    }
+                };
+                if let Some(x) = as_numeric {
+                    let sum_x = self.sum_numeric.unwrap_or(Numeric::ZERO);
+                    self.sum_numeric = Some(num::add(&sum_x, &x, arena)?);
+                    let sum_x2 = self.sum_sq_numeric.unwrap_or(Numeric::ZERO);
+                    self.sum_sq_numeric = Some(num::add(&sum_x2, &num::mul(&x, &x, arena)?, arena)?);
+                }
+            }
+            // Ordered-set, array, json, and two-arg statistical aggregates buffer
+            // or fold elsewhere; they never reach `accumulate`.
             AggKind::PercentileCont
             | AggKind::PercentileDisc
             | AggKind::Mode
             | AggKind::ArrayAgg
             | AggKind::JsonAgg { .. }
-            | AggKind::JsonObjectAgg { .. } => {}
+            | AggKind::JsonObjectAgg { .. }
+            | AggKind::Corr
+            | AggKind::CovarPop
+            | AggKind::CovarSamp
+            | AggKind::RegrSlope
+            | AggKind::RegrIntercept
+            | AggKind::RegrR2
+            | AggKind::RegrCount
+            | AggKind::RegrAvgx
+            | AggKind::RegrAvgy
+            | AggKind::RegrSxx
+            | AggKind::RegrSyy
+            | AggKind::RegrSxy => {}
         }
         Ok(())
     }
@@ -5890,8 +6076,84 @@ impl<'a> AggState<'a> {
         self.fold_ordered(arena)?;
         Ok(match self.kind {
             AggKind::Count => Datum::Int8(self.count as i64),
+            // regr_count over an empty group is 0, not NULL.
+            AggKind::RegrCount => Datum::Int8(self.count as i64),
             AggKind::Min | AggKind::Max => self.best.unwrap_or(Datum::Null),
             _ if self.count == 0 => Datum::Null,
+            // Statistical aggregates (count >= 1 here). `Sxx`/`Syy`/`Sxy` are the
+            // corrected sums of squares/products; `_samp` needs count >= 2.
+            AggKind::VarPop
+            | AggKind::VarSamp
+            | AggKind::StddevPop
+            | AggKind::StddevSamp
+            | AggKind::Corr
+            | AggKind::CovarPop
+            | AggKind::CovarSamp
+            | AggKind::RegrSlope
+            | AggKind::RegrIntercept
+            | AggKind::RegrR2
+            | AggKind::RegrAvgx
+            | AggKind::RegrAvgy
+            | AggKind::RegrSxx
+            | AggKind::RegrSyy
+            | AggKind::RegrSxy => {
+                // Single-argument variance/stddev over integer/numeric inputs
+                // return an exact numeric result (PostgreSQL's numeric path);
+                // float8 inputs and all two-argument aggregates fold in f64.
+                if self.kind.is_one_arg_stat() && self.arg_kind != ArgKind::Float {
+                    let sum_x = self.sum_numeric.unwrap_or(Numeric::ZERO);
+                    let sum_x2 = self.sum_sq_numeric.unwrap_or(Numeric::ZERO);
+                    let sample = matches!(self.kind, AggKind::VarSamp | AggKind::StddevSamp);
+                    let want_stddev =
+                        matches!(self.kind, AggKind::StddevPop | AggKind::StddevSamp);
+                    return Ok(
+                        match num::var_stddev(self.count, &sum_x, &sum_x2, sample, want_stddev, arena)? {
+                            Some(result) => Datum::Numeric(result),
+                            None => Datum::Null,
+                        },
+                    );
+                }
+                let n = self.count as f64;
+                let sxx = self.sum_sq - self.sum_float * self.sum_float / n;
+                let syy = self.sum_yy - self.sum_y * self.sum_y / n;
+                let sxy = self.sum_xy - self.sum_float * self.sum_y / n;
+                let samp_ok = self.count >= 2;
+                let value = match self.kind {
+                    AggKind::VarPop => Some(sxx / n),
+                    AggKind::VarSamp => samp_ok.then(|| sxx / (n - 1.0)),
+                    AggKind::StddevPop => Some((sxx / n).max(0.0).sqrt()),
+                    AggKind::StddevSamp => samp_ok.then(|| (sxx / (n - 1.0)).max(0.0).sqrt()),
+                    AggKind::CovarPop => Some(sxy / n),
+                    AggKind::CovarSamp => samp_ok.then(|| sxy / (n - 1.0)),
+                    AggKind::Corr => {
+                        if sxx == 0.0 || syy == 0.0 {
+                            None
+                        } else {
+                            Some(sxy / (sxx * syy).sqrt())
+                        }
+                    }
+                    AggKind::RegrSlope => (sxx != 0.0).then(|| sxy / sxx),
+                    AggKind::RegrIntercept => {
+                        (sxx != 0.0).then(|| self.sum_y / n - (sxy / sxx) * (self.sum_float / n))
+                    }
+                    AggKind::RegrR2 => {
+                        if sxx == 0.0 {
+                            None
+                        } else if syy == 0.0 {
+                            Some(1.0)
+                        } else {
+                            Some(sxy * sxy / (sxx * syy))
+                        }
+                    }
+                    AggKind::RegrAvgx => Some(self.sum_float / n),
+                    AggKind::RegrAvgy => Some(self.sum_y / n),
+                    AggKind::RegrSxx => Some(sxx),
+                    AggKind::RegrSyy => Some(syy),
+                    AggKind::RegrSxy => Some(sxy),
+                    _ => None,
+                };
+                value.map_or(Datum::Null, Datum::Float8)
+            }
             // SUM result type: int4->int8, int8->numeric, numeric->numeric,
             // float8->float8 (PostgreSQL's aggregate signatures).
             AggKind::Sum => match self.arg_kind {
@@ -8654,8 +8916,9 @@ fn groups_for_mask<'a>(
             aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
             subs: group_subs,
         windows: None, catalog: None, srf_index: None };
+        let schema = ScopeSchema(scope);
         if let Some(h) = statement.having {
-            match eval_full(h, arena, params, &super::eval::NoColumns, &group_hooks)? {
+            match eval_full(h, arena, params, &schema, &group_hooks)? {
                 Datum::Bool(true) => {}
                 Datum::Bool(false) | Datum::Null => continue,
                 _ => {
@@ -8669,14 +8932,14 @@ fn groups_for_mask<'a>(
         let mut full = [Datum::Null; MAX_PROJ];
         for (n, item) in statement.items.iter().enumerate() {
             let SelectItem::Expr { expression, .. } = item else { unreachable!() };
-            full[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &group_hooks)?;
+            full[n] = eval_full(expression, arena, params, &schema, &group_hooks)?;
         }
         for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
             full[width + k] = eval_full(
                 oe.expect("resolved"),
                 arena,
                 params,
-                &super::eval::NoColumns,
+                &schema,
                 &group_hooks,
             )?;
         }
@@ -9352,6 +9615,23 @@ impl<'a> ColumnLookup<'a> for RawRow<'_, '_, 'a> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
+    }
+}
+
+/// A schema-only lookup for aggregate and grouped projections: it exposes the
+/// scope's column *types* — so static type inference (e.g. `pg_typeof`) still
+/// names a column's type when an aggregate over an empty or all-NULL group
+/// yields NULL — while resolving no values. Value lookups fail exactly as an
+/// empty row's would, so grouped columns still resolve through the group hook
+/// and bare ungrouped references remain the same error.
+struct ScopeSchema<'s, 'd>(&'s QueryScope<'d>);
+impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name))
+    }
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        let entry = self.0.find_column(qualifier, name).ok()?;
+        Some(self.0.output_type(entry))
     }
 }
 

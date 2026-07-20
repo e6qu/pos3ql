@@ -2982,6 +2982,44 @@ impl ColTypeResolver for DefCols<'_> {
     }
 }
 
+/// Adapts a runtime row (`ColumnLookup`) to the static `ColTypeResolver` that
+/// `infer_type_res` needs, so an expression's declared type can be recovered
+/// during evaluation even when its value is NULL.
+struct RowCols<'r, 'a>(&'r dyn super::eval::ColumnLookup<'a>);
+impl<'a> ColTypeResolver for RowCols<'_, 'a> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        self.0.col_type(qualifier, name).ok_or_else(|| {
+            sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name)
+        })
+    }
+}
+
+/// The PostgreSQL type name `pg_typeof` reports for `expression` evaluated
+/// against `row`, resolved statically (so a NULL value still names its declared
+/// type, matching PostgreSQL). `None` when the static type can't be pinned down
+/// (the caller then falls back to the runtime datum's type).
+pub fn typeof_static<'a>(
+    expression: &Expr,
+    row: &dyn super::eval::ColumnLookup<'a>,
+) -> Option<&'static str> {
+    use super::types::ArrElem;
+    let (type_oid, _) = infer_type_res(expression, &RowCols(row)).ok()?;
+    Some(match coltype_of_oid(type_oid)? {
+        ColType::Array(elem) => match elem {
+            ArrElem::Bool => "boolean[]",
+            ArrElem::Int4 => "integer[]",
+            ArrElem::Int8 => "bigint[]",
+            ArrElem::Float8 => "double precision[]",
+            ArrElem::Text => "text[]",
+            ArrElem::Numeric => "numeric[]",
+            ArrElem::Date => "date[]",
+            ArrElem::Timestamp => "timestamp without time zone[]",
+            ArrElem::Timestamptz => "timestamp with time zone[]",
+        },
+        other => other.name(),
+    })
+}
+
 /// Whether two concrete types have a comparison operator, per PostgreSQL:
 /// same type, both numeric-tower, or both in the date/time family.
 /// Whether an OID names a range type (so range operators apply).
@@ -3351,6 +3389,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             // Window-only functions.
             "row_number" | "rank" | "dense_rank" | "ntile" => of(ColType::Int8),
+            "percent_rank" | "cume_dist" => of(ColType::Float8),
             "lag" | "lead" | "first_value" | "last_value" | "nth_value" => args
                 .first()
                 .map(|a| infer_type_res(a, columns))
@@ -3477,7 +3516,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     of(ColType::Int4)
                 }
             }
-            "to_hex" | "md5" | "to_char" => of(ColType::Text),
+            "to_hex" | "md5" | "to_char" | "pg_size_pretty" => of(ColType::Text),
             "factorial" => of(ColType::Numeric),
             "bit_length" => of(ColType::Int4),
             "starts_with" => of(ColType::Bool),
@@ -3486,6 +3525,23 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 of(ColType::Float8)
             }
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
+            // Single-argument variance/stddev mirror the input class: numeric for
+            // integer/numeric inputs, double precision for float8 (PostgreSQL's
+            // aggregate signatures).
+            "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" => {
+                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                match a {
+                    Some(oid::FLOAT8) | Some(oid::FLOAT4) => of(ColType::Float8),
+                    _ => of(ColType::Numeric),
+                }
+            }
+            // The two-argument regression/covariance/correlation aggregates take
+            // and return double precision; regr_count returns bigint.
+            "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept" | "regr_r2"
+            | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy" => {
+                of(ColType::Float8)
+            }
+            "regr_count" => of(ColType::Int8),
             "string_agg" => of(ColType::Text),
             "array_agg" => {
                 // Element type from the argument; the result is elem[].

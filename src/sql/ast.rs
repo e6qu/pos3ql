@@ -89,6 +89,9 @@ pub struct SetQuery<'a> {
 pub struct Select<'a> {
     pub items: &'a [SelectItem<'a>],
     pub distinct: bool,
+    /// `DISTINCT ON (exprs)`: keep the first row per distinct value of these
+    /// expressions (in ORDER BY order). Empty = plain DISTINCT or none.
+    pub distinct_on: &'a [&'a Expr<'a>],
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],

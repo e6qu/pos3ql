@@ -1916,6 +1916,7 @@ fn wrap_set_tree_with<'a>(
     let sel = Select {
         items: &[],
         distinct: false,
+        distinct_on: &[],
         from: None,
         where_clause: None,
         group_by: &[],
@@ -2114,6 +2115,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
     let sel = Select {
         items: &[],
         distinct: false,
+        distinct_on: &[],
         from: None,
         where_clause: None,
         group_by: &[],
@@ -2325,6 +2327,7 @@ fn subst_select<'a>(
     let new = Select {
         items,
         distinct: s.distinct,
+        distinct_on: s.distinct_on,
         from,
         where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,
@@ -3057,6 +3060,7 @@ fn rewrite_grouped_windows<'a>(
             .alloc_slice_copy(&inner_items[..n_keys + n_aggs])
             .map_err(|_| arena_full())?,
         distinct: false,
+        distinct_on: &[],
         from: statement.from,
         where_clause: statement.where_clause,
         group_by: statement.group_by,
@@ -3128,6 +3132,7 @@ fn rewrite_grouped_windows<'a>(
             .alloc_slice_copy(&outer_items[..statement.items.len()])
             .map_err(|_| arena_full())?,
         distinct: statement.distinct,
+        distinct_on: &[],
         from: Some(from),
         where_clause: None,
         group_by: &[],
@@ -8823,17 +8828,36 @@ fn materialized_rows<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let n_order = statement.order_by.len();
+    // `DISTINCT ON (exprs)`: its keys are materialized as hidden columns
+    // after the ORDER BY keys, and the result is deduped on them (keeping the
+    // first row per key, in ORDER BY order — PostgreSQL requires the ON
+    // expressions to match the leftmost ORDER BY).
+    let n_on = statement.distinct_on.len();
     // With correlated subqueries WHERE is applied per row (against merged
     // hooks); otherwise the scan applies it directly.
     let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
 
-    // Resolve ORDER BY ordinals to item expressions.
+    // Resolve ORDER BY ordinals to item expressions, then the DISTINCT ON keys.
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     for (k, ob) in statement.order_by.iter().enumerate() {
         order_exprs[k] = Some(resolve_order_target(ob.expression, statement.items, scope, arena)?);
     }
-    // DISTINCT restriction: keys must be select-list members.
-    if statement.distinct {
+    for (j, on) in statement.distinct_on.iter().enumerate() {
+        let resolved = resolve_order_target(on, statement.items, scope, arena)?;
+        // PostgreSQL requires each DISTINCT ON expression to match the
+        // ORDER BY expression at the same leftmost position (when ORDER BY is
+        // present); otherwise the "first" row per key is ill-defined.
+        if n_order > 0 && (j >= n_order || *order_exprs[j].expect("resolved") != *resolved) {
+            return Err(sql_err!(
+                "42P10",
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+            ));
+        }
+        order_exprs[n_order + j] = Some(resolved);
+    }
+    let n_keys = n_order + n_on;
+    // DISTINCT (not DISTINCT ON) restriction: ORDER BY keys must be members.
+    if statement.distinct && n_on == 0 {
         for oe in order_exprs.iter().take(n_order) {
             let target = oe.expect("resolved");
             let in_list = statement.items.iter().any(|item| {
@@ -8945,7 +8969,7 @@ fn materialized_rows<'a>(
                     statement.items, if any_postponed { Some(&postponed) } else { None },
                     scope, row, arena, params, use_hooks, &mut projected,
                 )?;
-                for oe in order_exprs.iter().take(n_order) {
+                for oe in order_exprs.iter().take(n_keys) {
                     eval_full(oe.expect("resolved"), arena, params, row, use_hooks)?;
                 }
                 count += 1;
@@ -9005,13 +9029,13 @@ fn materialized_rows<'a>(
                     let mut full =
                         [Datum::Null; MAX_PROJ + MAX_PROJ + MAX_COLUMNS * MAX_JOIN_TABLES];
                     full[..width].copy_from_slice(&projected[..width]);
-                    for (key, oe) in order_exprs.iter().take(n_order).enumerate() {
+                    for (key, oe) in order_exprs.iter().take(n_keys).enumerate() {
                         full[width + key] =
                             eval_full(oe.expect("resolved"), arena, params, row, use_hooks)?;
                     }
                     // Raw source columns for deferred projection after the sort.
                     if any_postponed {
-                        let mut flat = width + n_order;
+                        let mut flat = width + n_keys;
                         for t in 0..scope.n {
                             let def = scope.defs[t].expect("resolved");
                             let vals = row.values[t].expect("bound");
@@ -9022,7 +9046,7 @@ fn materialized_rows<'a>(
                         }
                     }
                     rows[at] = super::exec::encode_projected_pub(
-                        &full[..width + n_order + n_raw],
+                        &full[..width + n_keys + n_raw],
                         arena,
                     )?;
                     at += 1;
@@ -9032,10 +9056,11 @@ fn materialized_rows<'a>(
         )?;
     }
 
+    // Plain DISTINCT dedups on the visible prefix before the ORDER BY sort.
+    // DISTINCT ON dedups on its keys *after* the sort (below), so the first
+    // row per key in ORDER BY order survives.
     let mut live = rows.len();
-    if statement.distinct {
-        // Dedupe on the visible prefix: sort whole rows (visible prefix
-        // dominates the encoding), then drop adjacent equal prefixes.
+    if statement.distinct && n_on == 0 {
         rows.sort_unstable();
         let mut unique = 0usize;
         for i in 0..rows.len() {
@@ -9050,8 +9075,13 @@ fn materialized_rows<'a>(
     }
     let rows = &mut rows[..live];
 
-    if n_order > 0 {
-        rows.sort_unstable_by(|a, b| {
+    // Sort by ORDER BY (a stable sort so DISTINCT ON without ORDER BY keeps
+    // the first-scanned row per key). For DISTINCT ON the ON keys are appended
+    // ascending as a tiebreak — a no-op when ORDER BY already begins with them
+    // (as PostgreSQL requires), but it groups equal keys when ORDER BY is
+    // absent so the run dedup below works.
+    if n_order > 0 || n_on > 0 {
+        rows.sort_by(|a, b| {
             for (k, ob) in statement.order_by.iter().enumerate() {
                 let ka = super::exec::decode_projected_pub(a, width + k);
                 let kb = super::exec::decode_projected_pub(b, width + k);
@@ -9075,13 +9105,54 @@ fn materialized_rows<'a>(
                     return ord;
                 }
             }
+            for j in 0..n_on {
+                let ka = super::exec::decode_projected_pub(a, width + n_order + j);
+                let kb = super::exec::decode_projected_pub(b, width + n_order + j);
+                let ord = match (ka.is_null(), kb.is_null()) {
+                    (true, true) => core::cmp::Ordering::Equal,
+                    (true, false) => core::cmp::Ordering::Greater,
+                    (false, true) => core::cmp::Ordering::Less,
+                    (false, false) => {
+                        compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal)
+                    }
+                };
+                if !ord.is_eq() {
+                    return ord;
+                }
+            }
             core::cmp::Ordering::Equal
         });
     }
 
+    // DISTINCT ON: keep the first row of each run of equal ON keys.
+    let rows: &mut [&[u8]] = if n_on > 0 {
+        let mut unique = 0usize;
+        for i in 0..rows.len() {
+            let same = i > 0
+                && (0..n_on).all(|j| {
+                    let ka = super::exec::decode_projected_pub(rows[i], width + n_order + j);
+                    let kb = super::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
+                    match (ka.is_null(), kb.is_null()) {
+                        (true, true) => true,
+                        (true, false) | (false, true) => false,
+                        (false, false) => {
+                            compare_datums(&ka, &kb).map(|o| o.is_eq()).unwrap_or(false)
+                        }
+                    }
+                });
+            if !same {
+                rows[unique] = rows[i];
+                unique += 1;
+            }
+        }
+        &mut rows[..unique]
+    } else {
+        rows
+    };
+
     let deferred = any_postponed.then_some(PostponedProjection {
         postponed,
-        raw_at: width + n_order,
+        raw_at: width + n_keys,
         n_raw,
     });
     Ok((rows, width, deferred))

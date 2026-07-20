@@ -635,6 +635,8 @@ pub enum BinaryOp {
     JsonPath,
     /// `json #>> path` — extract by text[] path, returns text.
     JsonPathText,
+    /// `jsonb #- path` — delete the value at a text[] path, returns jsonb.
+    JsonDeletePath,
     /// `jsonb ? key` — does the object have the key (or the array the element)?
     JsonExists,
     /// `jsonb ?| array` — does it have any of the keys?
@@ -689,7 +691,8 @@ impl BinaryOp {
             // Exponentiation binds tighter than multiplication.
             Self::Pow => 8,
             // JSON accessors bind tightest among binary operators.
-            Self::JsonGet | Self::JsonGetText | Self::JsonPath | Self::JsonPathText => 9,
+            Self::JsonGet | Self::JsonGetText | Self::JsonPath | Self::JsonPathText
+            | Self::JsonDeletePath => 9,
         }
     }
 }

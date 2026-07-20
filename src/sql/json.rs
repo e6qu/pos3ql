@@ -457,6 +457,346 @@ impl<'a> Json<'a> {
     }
 }
 
+/// Sorts and deduplicates object members into a fresh arena slice, in jsonb key
+/// order (length, then bytewise; last duplicate wins).
+fn build_object<'a>(
+    members: &[(&'a str, Json<'a>)],
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    if members.len() > MAX_ELEMS {
+        return Err(sql_err!("54000", "JSON object too large"));
+    }
+    let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+    buffer[..members.len()].copy_from_slice(members);
+    let ms = &mut buffer[..members.len()];
+    ms.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes())));
+    let mut out: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+    let mut m = 0;
+    for i in 0..members.len() {
+        if i + 1 < members.len() && ms[i].0 == ms[i + 1].0 {
+            continue;
+        }
+        out[m] = ms[i];
+        m += 1;
+    }
+    Ok(Json::Object(arena.alloc_slice_copy(&out[..m]).map_err(|_| bad())?))
+}
+
+/// Resolves a signed array index (negative counts from the end) into a bound.
+fn array_index(index: &str, len: usize) -> Option<usize> {
+    let i: i64 = index.parse().ok()?;
+    let resolved = if i < 0 { len as i64 + i } else { i };
+    (resolved >= 0 && (resolved as usize) < len).then_some(resolved as usize)
+}
+
+/// `jsonb_set(target, path, value, create_if_missing)`: replaces the value at
+/// `path`, optionally creating a final missing object key.
+pub fn set<'a>(
+    root: Json<'a>,
+    path: &[&'a str],
+    value: Json<'a>,
+    create: bool,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    let Some((head, rest)) = path.split_first() else {
+        return Ok(value);
+    };
+    match root {
+        Json::Object(members) => {
+            let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+            let n = members.len();
+            buffer[..n].copy_from_slice(members);
+            if let Some(i) = members.iter().position(|(k, _)| k == head) {
+                buffer[i].1 = set(members[i].1, rest, value, create, arena)?;
+            } else if rest.is_empty() && create {
+                if n == MAX_ELEMS {
+                    return Err(sql_err!("54000", "JSON object too large"));
+                }
+                buffer[n] = (*head, value);
+                return build_object(&buffer[..n + 1], arena);
+            } else {
+                return Ok(root); // Missing intermediate key: unchanged.
+            }
+            build_object(&buffer[..n], arena)
+        }
+        Json::Array(items) => {
+            let Some(i) = array_index(head, items.len()) else {
+                return Ok(root);
+            };
+            let mut buffer = [Json::Null; MAX_ELEMS];
+            buffer[..items.len()].copy_from_slice(items);
+            buffer[i] = set(items[i], rest, value, create, arena)?;
+            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+        }
+        // Cannot descend into a scalar; leave it unchanged.
+        _ => Ok(root),
+    }
+}
+
+/// `jsonb_insert(target, path, value, insert_after)`: inserts `value` into the
+/// array at `path` before (or after) the indexed element, or a new object key.
+pub fn insert<'a>(
+    root: Json<'a>,
+    path: &[&'a str],
+    value: Json<'a>,
+    after: bool,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    let Some((head, rest)) = path.split_first() else {
+        return Ok(root);
+    };
+    match root {
+        Json::Object(members) => {
+            let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+            let n = members.len();
+            buffer[..n].copy_from_slice(members);
+            if let Some(i) = members.iter().position(|(k, _)| k == head) {
+                if rest.is_empty() {
+                    return Err(sql_err!("22023", "cannot replace existing key"));
+                }
+                buffer[i].1 = insert(members[i].1, rest, value, after, arena)?;
+                build_object(&buffer[..n], arena)
+            } else if rest.is_empty() {
+                if n == MAX_ELEMS {
+                    return Err(sql_err!("54000", "JSON object too large"));
+                }
+                buffer[n] = (*head, value);
+                build_object(&buffer[..n + 1], arena)
+            } else {
+                Ok(root)
+            }
+        }
+        Json::Array(items) => {
+            if rest.is_empty() {
+                // Insert into this array at the (possibly negative) position.
+                let raw: i64 = head.parse().map_err(|_| bad())?;
+                let len = items.len() as i64;
+                let mut at = if raw < 0 { len + raw } else { raw };
+                at = at.clamp(0, len);
+                if after {
+                    at = (at + 1).min(len);
+                }
+                let at = at as usize;
+                if items.len() + 1 > MAX_ELEMS {
+                    return Err(sql_err!("54000", "JSON array too large"));
+                }
+                let mut buffer = [Json::Null; MAX_ELEMS];
+                buffer[..at].copy_from_slice(&items[..at]);
+                buffer[at] = value;
+                buffer[at + 1..items.len() + 1].copy_from_slice(&items[at..]);
+                Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len() + 1]).map_err(|_| bad())?))
+            } else {
+                let Some(i) = array_index(head, items.len()) else {
+                    return Ok(root);
+                };
+                let mut buffer = [Json::Null; MAX_ELEMS];
+                buffer[..items.len()].copy_from_slice(items);
+                buffer[i] = insert(items[i], rest, value, after, arena)?;
+                Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+            }
+        }
+        _ => Ok(root),
+    }
+}
+
+/// `jsonb_strip_nulls`: removes object members whose value is JSON null,
+/// recursively (array elements that are null are kept, as in PostgreSQL).
+pub fn strip_nulls<'a>(root: Json<'a>, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
+    match root {
+        Json::Object(members) => {
+            let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+            let mut n = 0;
+            for (k, v) in members {
+                if matches!(v, Json::Null) {
+                    continue;
+                }
+                buffer[n] = (*k, strip_nulls(*v, arena)?);
+                n += 1;
+            }
+            Ok(Json::Object(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+        }
+        Json::Array(items) => {
+            let mut buffer = [Json::Null; MAX_ELEMS];
+            for (i, v) in items.iter().enumerate() {
+                buffer[i] = strip_nulls(*v, arena)?;
+            }
+            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+        }
+        other => Ok(other),
+    }
+}
+
+/// `jsonb - text`: removes a top-level object key (no-op for a missing key).
+pub fn delete_key<'a>(root: Json<'a>, key: &str, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
+    match root {
+        Json::Object(members) => {
+            let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+            let mut n = 0;
+            for (k, v) in members {
+                if *k == key {
+                    continue;
+                }
+                buffer[n] = (*k, *v);
+                n += 1;
+            }
+            Ok(Json::Object(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+        }
+        // `jsonb - text` on an array removes matching string elements.
+        Json::Array(items) => {
+            let mut buffer = [Json::Null; MAX_ELEMS];
+            let mut n = 0;
+            for v in items {
+                if matches!(v, Json::Str(s) if *s == key) {
+                    continue;
+                }
+                buffer[n] = *v;
+                n += 1;
+            }
+            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+        }
+        _ => Err(sql_err!("22023", "cannot delete from scalar")),
+    }
+}
+
+/// `jsonb - integer`: removes the element at a signed array index.
+pub fn delete_index<'a>(root: Json<'a>, index: i64, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
+    let Json::Array(items) = root else {
+        return Err(sql_err!("22023", "cannot delete from object using integer index"));
+    };
+    let resolved = if index < 0 { items.len() as i64 + index } else { index };
+    if resolved < 0 || resolved as usize >= items.len() {
+        return Ok(root);
+    }
+    let skip = resolved as usize;
+    let mut buffer = [Json::Null; MAX_ELEMS];
+    let mut n = 0;
+    for (i, v) in items.iter().enumerate() {
+        if i == skip {
+            continue;
+        }
+        buffer[n] = *v;
+        n += 1;
+    }
+    Ok(Json::Array(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+}
+
+/// `jsonb #- path`: removes the value at a path.
+pub fn delete_path<'a>(
+    root: Json<'a>,
+    path: &[&'a str],
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    let Some((head, rest)) = path.split_first() else {
+        return Ok(root);
+    };
+    if rest.is_empty() {
+        return match root {
+            Json::Object(_) => delete_key(root, head, arena),
+            Json::Array(items) => {
+                let raw: i64 = head.parse().map_err(|_| bad())?;
+                delete_index(Json::Array(items), raw, arena)
+            }
+            _ => Ok(root),
+        };
+    }
+    match root {
+        Json::Object(members) => {
+            let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+            let n = members.len();
+            buffer[..n].copy_from_slice(members);
+            if let Some(i) = members.iter().position(|(k, _)| k == head) {
+                buffer[i].1 = delete_path(members[i].1, rest, arena)?;
+            } else {
+                return Ok(root);
+            }
+            Ok(Json::Object(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+        }
+        Json::Array(items) => {
+            let Some(i) = array_index(head, items.len()) else {
+                return Ok(root);
+            };
+            let mut buffer = [Json::Null; MAX_ELEMS];
+            buffer[..items.len()].copy_from_slice(items);
+            buffer[i] = delete_path(items[i], rest, arena)?;
+            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+        }
+        _ => Ok(root),
+    }
+}
+
+/// `jsonb_pretty`: renders `root` with two-space-per-level indentation (4 in
+/// PostgreSQL's output — matched below).
+pub fn pretty(root: &Json, indent: usize, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    let pad = |out: &mut dyn core::fmt::Write, n: usize| -> core::fmt::Result {
+        for _ in 0..n * 4 {
+            out.write_char(' ')?;
+        }
+        Ok(())
+    };
+    match root {
+        Json::Object(members) if !members.is_empty() => {
+            out.write_str("{\n")?;
+            for (i, (k, v)) in members.iter().enumerate() {
+                pad(out, indent + 1)?;
+                write_json_string(k, out)?;
+                out.write_str(": ")?;
+                pretty(v, indent + 1, out)?;
+                if i + 1 < members.len() {
+                    out.write_char(',')?;
+                }
+                out.write_char('\n')?;
+            }
+            pad(out, indent)?;
+            out.write_char('}')
+        }
+        Json::Array(items) if !items.is_empty() => {
+            out.write_str("[\n")?;
+            for (i, v) in items.iter().enumerate() {
+                pad(out, indent + 1)?;
+                pretty(v, indent + 1, out)?;
+                if i + 1 < items.len() {
+                    out.write_char(',')?;
+                }
+                out.write_char('\n')?;
+            }
+            pad(out, indent)?;
+            out.write_char(']')
+        }
+        // Empty containers and scalars render on a single line.
+        scalar => scalar.write(out),
+    }
+}
+
+/// Renders `root` with [`pretty`] straight into the arena (measure, then write),
+/// so no large stack buffer is needed.
+pub fn pretty_to_arena<'a>(root: &Json, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    struct Counter(usize);
+    impl core::fmt::Write for Counter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0 += s.len();
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = pretty(root, 0, &mut counter);
+    let bytes = arena.alloc_slice_with(counter.0, |_| 0u8).map_err(|_| bad())?;
+    struct SliceWriter<'b> {
+        buffer: &'b mut [u8],
+        at: usize,
+    }
+    impl core::fmt::Write for SliceWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let end = self.at + s.len();
+            self.buffer[self.at..end].copy_from_slice(s.as_bytes());
+            self.at = end;
+            Ok(())
+        }
+    }
+    let mut writer = SliceWriter { buffer: bytes, at: 0 };
+    let _ = pretty(root, 0, &mut writer);
+    Ok(unsafe { core::str::from_utf8_unchecked(writer.buffer) })
+}
+
 /// A `Display` adapter that renders a `Json` value in canonical jsonb form.
 pub struct JsonWrite<'a, 'b>(pub &'b Json<'a>);
 

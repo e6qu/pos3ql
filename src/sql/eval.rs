@@ -2096,6 +2096,75 @@ fn call<'a>(
         // `json_build_object(k1, v1, ...)` / `jsonb_build_object(...)`: an
         // object from alternating key/value arguments. json uses `" : "`
         // spacing, jsonb the canonical `": "`; both separate with `, `.
+        // `jsonb_set(target, path, new_value [, create_if_missing])`.
+        "jsonb_set" | "jsonb_set_lax" => {
+            if !(3..=4).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let target = eval_full(args[0], arena, params, row, hooks)?;
+            if target.is_null() {
+                return Ok(Datum::Null);
+            }
+            let root = json_tree_arg(target, arena)?;
+            let path = json_path_parts(eval_full(args[1], arena, params, row, hooks)?, arena)?;
+            let value = json_tree_arg(eval_full(args[2], arena, params, row, hooks)?, arena)?;
+            let create = if args.len() == 4 {
+                match eval_full(args[3], arena, params, row, hooks)? {
+                    Datum::Bool(b) => b,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch("create_if_missing must be boolean", &other)),
+                }
+            } else {
+                true
+            };
+            let result = super::json::set(root, path, value, create, arena)?;
+            Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+        }
+        // `jsonb_insert(target, path, new_value [, insert_after])`.
+        "jsonb_insert" => {
+            if !(3..=4).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let target = eval_full(args[0], arena, params, row, hooks)?;
+            if target.is_null() {
+                return Ok(Datum::Null);
+            }
+            let root = json_tree_arg(target, arena)?;
+            let path = json_path_parts(eval_full(args[1], arena, params, row, hooks)?, arena)?;
+            let value = json_tree_arg(eval_full(args[2], arena, params, row, hooks)?, arena)?;
+            let after = if args.len() == 4 {
+                match eval_full(args[3], arena, params, row, hooks)? {
+                    Datum::Bool(b) => b,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch("insert_after must be boolean", &other)),
+                }
+            } else {
+                false
+            };
+            let result = super::json::insert(root, path, value, after, arena)?;
+            Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+        }
+        // `jsonb_strip_nulls` / `json_strip_nulls`: drop null-valued members.
+        "jsonb_strip_nulls" | "json_strip_nulls" => {
+            arity(1)?;
+            let d = eval_full(args[0], arena, params, row, hooks)?;
+            if d.is_null() {
+                return Ok(Datum::Null);
+            }
+            let jsonb = matches!(d, Datum::Json { jsonb: true, .. }) || name.starts_with("jsonb");
+            let result = super::json::strip_nulls(json_tree_arg(d, arena)?, arena)?;
+            Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb })
+        }
+        // `jsonb_pretty`: indented rendering of a jsonb value.
+        "jsonb_pretty" => {
+            arity(1)?;
+            let d = eval_full(args[0], arena, params, row, hooks)?;
+            if d.is_null() {
+                return Ok(Datum::Null);
+            }
+            let tree = json_tree_arg(d, arena)?;
+            Ok(Datum::Text(super::json::pretty_to_arena(&tree, arena)?))
+        }
         "json_build_object" | "jsonb_build_object" => {
             if star {
                 return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}() does not exist", name));
@@ -3844,17 +3913,7 @@ fn call<'a>(
                 return Ok(Datum::Null);
             };
             if ident_needs_quotes(s) {
-                let mut out = crate::util::StackStr::<8192>::new();
-                let _ = core::fmt::Write::write_char(&mut out, '"');
-                for c in s.chars() {
-                    if c == '"' {
-                        let _ = core::fmt::Write::write_str(&mut out, "\"\"");
-                    } else {
-                        let _ = core::fmt::Write::write_char(&mut out, c);
-                    }
-                }
-                let _ = core::fmt::Write::write_char(&mut out, '"');
-                Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+                Ok(Datum::Text(quote_ident_str(s, arena)?))
             } else {
                 Ok(Datum::Text(s))
             }
@@ -3871,29 +3930,7 @@ fn call<'a>(
                     Datum::Null
                 });
             }
-            let text = datum_to_text(v, arena)?;
-            let has_backslash = text.contains('\\');
-            let mut out = crate::util::StackStr::<16384>::new();
-            use core::fmt::Write as _;
-            if has_backslash {
-                let _ = out.write_char('E');
-            }
-            let _ = out.write_char('\'');
-            for c in text.chars() {
-                match c {
-                    '\'' => {
-                        let _ = out.write_str("''");
-                    }
-                    '\\' => {
-                        let _ = out.write_str("\\\\");
-                    }
-                    _ => {
-                        let _ = out.write_char(c);
-                    }
-                }
-            }
-            let _ = out.write_char('\'');
-            Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+            Ok(Datum::Text(quote_literal_str(datum_to_text(v, arena)?, arena)?))
         }
         // `parse_ident(text)`: split a qualified name into its parts as text[].
         "parse_ident" => {
@@ -4461,6 +4498,55 @@ fn ident_needs_quotes(s: &str) -> bool {
     !valid || super::parser::is_reserved(s)
 }
 
+/// Double-quotes an identifier into the arena, doubling embedded quotes. The
+/// buffer lives here rather than on the huge `call()` frame.
+fn quote_ident_str<'a>(s: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    use core::fmt::Write as _;
+    let mut out = crate::util::StackStr::<8192>::new();
+    let _ = out.write_char('"');
+    for c in s.chars() {
+        if c == '"' {
+            let _ = out.write_str("\"\"");
+        } else {
+            let _ = out.write_char(c);
+        }
+    }
+    let _ = out.write_char('"');
+    if out.is_truncated() {
+        return Err(sql_err!("54000", "identifier too long to quote"));
+    }
+    arena.alloc_str(out.as_str()).map_err(|_| arena_full())
+}
+
+/// Wraps `text` as a SQL string literal into the arena, doubling single quotes
+/// and backslashes (and prefixing `E` when a backslash is present).
+fn quote_literal_str<'a>(text: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    use core::fmt::Write as _;
+    let mut out = crate::util::StackStr::<16384>::new();
+    if text.contains('\\') {
+        let _ = out.write_char('E');
+    }
+    let _ = out.write_char('\'');
+    for c in text.chars() {
+        match c {
+            '\'' => {
+                let _ = out.write_str("''");
+            }
+            '\\' => {
+                let _ = out.write_str("\\\\");
+            }
+            _ => {
+                let _ = out.write_char(c);
+            }
+        }
+    }
+    let _ = out.write_char('\'');
+    if out.is_truncated() {
+        return Err(sql_err!("54000", "literal too long to quote"));
+    }
+    arena.alloc_str(out.as_str()).map_err(|_| arena_full())
+}
+
 /// Splits a possibly-qualified identifier (`schema.table`, `"Weird Name".col`)
 /// into its parts, folding unquoted parts to lowercase and unescaping quoted
 /// ones. Returns the part count.
@@ -4715,6 +4801,8 @@ fn binary<'a>(
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
+        // `jsonb - text`/`text[]`/`integer` deletes a key, keys, or an element.
+        Sub if matches!(l, Datum::Json { jsonb: true, .. }) => jsonb_delete(l, r, arena),
         Add | Sub | Mul | Div | Mod => match (l, r) {
             (Datum::Multirange { .. }, _) | (_, Datum::Multirange { .. }) => {
                 multirange_setop(operator, l, r, arena)
@@ -4724,6 +4812,7 @@ fn binary<'a>(
         },
         JsonGet | JsonGetText => json_get(l, r, operator == JsonGetText, arena),
         JsonPath | JsonPathText => json_path(l, r, operator == JsonPathText, arena),
+        JsonDeletePath => jsonb_delete_path(l, r, arena),
         JsonExists | JsonExistsAny | JsonExistsAll => json_exists(operator, l, r, arena),
         Shl | Shr => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r, arena),
@@ -5601,6 +5690,8 @@ fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
     let text_of = |d: Datum<'a>| -> Result<Option<&'a str>, SqlError> {
         match d {
             Datum::Json { text, .. } => Ok(Some(text)),
+            // An unknown text literal (`'{"b":2}'`) coerces to jsonb.
+            Datum::Text(s) => Ok(Some(s)),
             Datum::Null => Ok(None),
             other => Err(type_mismatch("|| requires jsonb", &other)),
         }
@@ -5663,6 +5754,82 @@ fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
 }
 
 /// `json #> path` / `#>>`: extract the value at a `text[]` path.
+/// Extracts a JSON path (`text[]`, or an unknown `'{a,b}'` literal) into its
+/// string parts, for `jsonb_set` / `jsonb_insert` / `#-`.
+fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], SqlError> {
+    let (element, raw) = match r {
+        Datum::Array { element, raw } => (element, raw),
+        Datum::Text(lit) => (
+            super::types::ArrElem::Text,
+            super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
+        ),
+        other => return Err(type_mismatch("path must be a text array", &other)),
+    };
+    let n = super::array::len(raw);
+    if n > 64 {
+        return Err(sql_err!("54000", "JSON path too long"));
+    }
+    let mut buffer = [""; 64];
+    for (i, slot) in buffer[..n].iter_mut().enumerate() {
+        *slot = match super::array::get(raw, element, i) {
+            Some(Datum::Text(s)) => s,
+            _ => return Err(sql_err!("22023", "path element is not text")),
+        };
+    }
+    Ok(&*arena.alloc_slice_copy(&buffer[..n]).map_err(|_| arena_full())?)
+}
+
+/// `jsonb - text`/`text[]`/`integer`: delete a key, several keys, or an element.
+fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let Datum::Json { text, .. } = l else {
+        return Err(type_mismatch("- requires jsonb", &l));
+    };
+    let root = super::json::parse(text, arena)?;
+    let result = match r {
+        Datum::Null => return Ok(Datum::Null),
+        Datum::Text(key) => super::json::delete_key(root, key, arena)?,
+        Datum::Int4(i) => super::json::delete_index(root, i as i64, arena)?,
+        Datum::Int8(i) => super::json::delete_index(root, i, arena)?,
+        Datum::Array { element, raw } => {
+            // `jsonb - text[]`: delete each named key.
+            let mut node = root;
+            for i in 0..super::array::len(raw) {
+                if let Some(Datum::Text(key)) = super::array::get(raw, element, i) {
+                    node = super::json::delete_key(node, key, arena)?;
+                }
+            }
+            node
+        }
+        other => return Err(type_mismatch("- requires text, text[], or integer", &other)),
+    };
+    Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+}
+
+/// `jsonb #- text[]`: delete the value at a path.
+fn jsonb_delete_path<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let text = match l {
+        Datum::Json { text, .. } => text,
+        Datum::Null => return Ok(Datum::Null),
+        other => return Err(type_mismatch("#- requires jsonb", &other)),
+    };
+    if r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let root = super::json::parse(text, arena)?;
+    let path = json_path_parts(r, arena)?;
+    let result = super::json::delete_path(root, path, arena)?;
+    Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+}
+
+/// Parses a json/jsonb argument (or unknown text literal) into a tree.
+fn json_tree_arg<'a>(d: Datum<'a>, arena: &'a Arena) -> Result<super::json::Json<'a>, SqlError> {
+    match d {
+        Datum::Json { text, .. } => super::json::parse(text, arena),
+        Datum::Text(s) => super::json::parse(s, arena),
+        other => Err(type_mismatch("argument is not jsonb", &other)),
+    }
+}
+
 fn json_path<'a>(
     l: Datum<'a>,
     r: Datum<'a>,

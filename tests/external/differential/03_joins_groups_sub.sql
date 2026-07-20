@@ -598,3 +598,16 @@ SELECT (DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-01-15', DATE 
 SELECT (DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-02-01', DATE '2024-03-01');
 SELECT (DATE '2024-01-01', INTERVAL '1 month') OVERLAPS (DATE '2024-01-15', DATE '2024-03-01');
 SELECT (TIMESTAMP '2024-01-01 10:00', TIMESTAMP '2024-01-01 12:00') OVERLAPS (TIMESTAMP '2024-01-01 11:00', TIMESTAMP '2024-01-01 13:00');
+-- jsonb manipulation: set/insert/strip_nulls/pretty, delete operators
+SELECT jsonb_set('{"a":1,"b":2}', '{a}', '9'), jsonb_set('{"a":{"b":1}}', '{a,b}', '9');
+SELECT jsonb_set('[0,1,2]', '{1}', '9'), jsonb_set('[0,1,2]', '{-1}', '9');
+SELECT jsonb_set('{"a":1}', '{b}', '9', false), jsonb_set('{"a":1}', '{b}', '9', true);
+SELECT jsonb_insert('{"a":[1,2]}', '{a,1}', '5'), jsonb_insert('{"a":[1,2]}', '{a,1}', '5', true);
+SELECT jsonb_strip_nulls('{"a":1,"b":null,"c":{"d":null}}');
+SELECT jsonb_pretty('{"a":1,"b":[1,2]}');
+SELECT '{"a":1,"b":2}'::jsonb - 'b';
+SELECT '[0,1,2,3]'::jsonb - 1, '[0,1,2,3]'::jsonb - -1;
+SELECT '{"a":1,"b":2,"c":3}'::jsonb - ARRAY['a','c'];
+SELECT '{"a":{"b":1,"c":2}}'::jsonb #- '{a,b}';
+SELECT '{"a":1}'::jsonb || '{"b":2}', '{"a":1}'::jsonb || '{"a":5,"c":3}';
+SELECT jsonb_set('{"x":1}'::jsonb, '{x}', to_jsonb('hi'::text));

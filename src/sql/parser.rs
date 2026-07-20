@@ -2659,6 +2659,7 @@ impl<'a> Parser<'a> {
             Tok::Op("->>") => Some(BinaryOp::JsonGetText),
             Tok::Op("#>") => Some(BinaryOp::JsonPath),
             Tok::Op("#>>") => Some(BinaryOp::JsonPathText),
+            Tok::Op("#-") => Some(BinaryOp::JsonDeletePath),
             Tok::Op("?") => Some(BinaryOp::JsonExists),
             Tok::Op("?|") => Some(BinaryOp::JsonExistsAny),
             Tok::Op("?&") => Some(BinaryOp::JsonExistsAll),

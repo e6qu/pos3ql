@@ -85,6 +85,10 @@ pub struct RenderContext {
     pub parsed_timezone: super::timezone::Timezone,
     /// The client_min_messages threshold: NOTICE/WARNING below it are dropped.
     pub min_message_level: MessageLevel,
+    /// `bytea_output = escape`: text-format bytea renders in the escape
+    /// format (printable ASCII verbatim, `\\` for backslash, `\nnn` octal)
+    /// instead of `\x` hex.
+    pub bytea_escape: bool,
 }
 
 impl Default for RenderContext {
@@ -93,6 +97,7 @@ impl Default for RenderContext {
             datestyle: DateStyle::default(),
             parsed_timezone: super::timezone::Timezone::utc(),
             min_message_level: MessageLevel::Notice,
+            bytea_escape: false,
         }
     }
 }
@@ -112,6 +117,8 @@ pub struct GucState {
     /// boundaries during execution.
     statement_timeout: StackStr<24>,
     row_security: StackStr<4>,
+    /// bytea_output = escape (false = hex, the default).
+    bytea_escape: bool,
 }
 
 impl Default for GucState {
@@ -134,6 +141,7 @@ impl GucState {
             lock_timeout: StackStr::new(),
             statement_timeout: StackStr::new(),
             row_security: StackStr::new(),
+            bytea_escape: false,
         };
         let _ = write!(g.datestyle, "ISO, MDY");
         let _ = write!(g.timezone, "UTC");
@@ -297,11 +305,16 @@ impl GucState {
         }
         if name.eq_ignore_ascii_case("bytea_output") {
             if is_default || v.eq_ignore_ascii_case("hex") {
+                self.bytea_escape = false;
+                return Ok(());
+            }
+            if v.eq_ignore_ascii_case("escape") {
+                self.bytea_escape = true;
                 return Ok(());
             }
             return Err(sql_err!(
-                "0A000",
-                "bytea_output \"{}\" is not supported (only hex)",
+                "22023",
+                "invalid value for parameter \"bytea_output\": \"{}\"",
                 v
             ));
         }
@@ -356,7 +369,7 @@ impl GucState {
         } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
             Some("0")
         } else if name.eq_ignore_ascii_case("bytea_output") {
-            Some("hex")
+            Some(if self.bytea_escape { "escape" } else { "hex" })
         } else {
             None
         }
@@ -370,6 +383,7 @@ impl GucState {
             datestyle: DateStyle { format, order },
             parsed_timezone: self.parsed_timezone,
             min_message_level: self.client_min_messages,
+            bytea_escape: self.bytea_escape,
         }
     }
 }

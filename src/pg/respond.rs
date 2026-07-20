@@ -312,12 +312,44 @@ impl<'b> Responder<'b> {
                     m.bytes(s.as_bytes());
                 }
                 Datum::Bytea(b) => {
-                    // \x hex, streamed straight into the send buffer.
-                    m.i32((2 + b.len() * 2) as i32);
-                    m.bytes(b"\\x");
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    for byte in *b {
-                        m.bytes(&[HEX[(byte >> 4) as usize], HEX[(byte & 0xf) as usize]]);
+                    if render.bytea_escape {
+                        // bytea_output = escape: printable ASCII verbatim,
+                        // backslash doubled, everything else \nnn octal.
+                        let escaped_len: usize = b
+                            .iter()
+                            .map(|&byte| match byte {
+                                b'\\' => 2,
+                                0x20..=0x7e => 1,
+                                _ => 4,
+                            })
+                            .sum();
+                        m.i32(escaped_len as i32);
+                        for &byte in *b {
+                            match byte {
+                                b'\\' => {
+                                    m.bytes(b"\\\\");
+                                }
+                                0x20..=0x7e => {
+                                    m.bytes(&[byte]);
+                                }
+                                _ => {
+                                    m.bytes(&[
+                                        b'\\',
+                                        b'0' + (byte >> 6),
+                                        b'0' + ((byte >> 3) & 7),
+                                        b'0' + (byte & 7),
+                                    ]);
+                                }
+                            }
+                        }
+                    } else {
+                        // \x hex, streamed straight into the send buffer.
+                        m.i32((2 + b.len() * 2) as i32);
+                        m.bytes(b"\\x");
+                        const HEX: &[u8; 16] = b"0123456789abcdef";
+                        for byte in *b {
+                            m.bytes(&[HEX[(byte >> 4) as usize], HEX[(byte & 0xf) as usize]]);
+                        }
                     }
                 }
                 Datum::Numeric(nm) => {

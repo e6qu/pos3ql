@@ -1916,7 +1916,12 @@ mod tests {
         // malformed value is still rejected loudly.
         assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5000"));
         assert!(run("SET statement_timeout = 'bogus'").contains("22023"), "bad timeout");
-        assert!(run("SET bytea_output = 'escape'").contains("0A000"), "unsupported format");
+        // bytea_output escape is honored (verified against PostgreSQL 18.4);
+        // an unknown format is rejected loudly. The GUC store is per-batch in
+        // this harness, so SET and SELECT share one statement string.
+        let escaped = run("SET bytea_output = 'escape'; SELECT '\\x5c00'::bytea");
+        assert!(escaped.contains("\\\\000"), "escape rendering: {escaped}");
+        assert!(run("SET bytea_output = 'bogus'").contains("22023"), "unknown format");
     }
 
     #[test]

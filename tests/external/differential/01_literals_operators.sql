@@ -108,3 +108,15 @@ SELECT '['||to_char('-Infinity'::float8, '999')||']';
 SELECT '['||to_char('NaN'::numeric, '999.9')||']';
 SELECT '['||to_char('NaN'::float8, 'RN')||']';
 SELECT '['||to_char('NaN'::numeric, '9V9')||']';
+-- parenthesized set-op branches with ORDER BY/LIMIT; bytea_output escape
+WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL (SELECT n+1 FROM r WHERE n < 3 LIMIT 1)) SELECT * FROM r;
+SELECT 1 UNION ALL (SELECT 2 LIMIT 1);
+SELECT * FROM (SELECT 3 UNION ALL (SELECT v FROM (VALUES (5),(4)) t(v) ORDER BY v LIMIT 1)) q ORDER BY 1;
+(SELECT 2) UNION ALL (SELECT 1) ORDER BY 1;
+SET bytea_output = 'escape';
+SELECT '\x6162'::bytea;
+SELECT '\x00ff5c20'::bytea;
+SHOW bytea_output;
+SET bytea_output = 'hex';
+SELECT '\x00ff5c20'::bytea;
+SET bytea_output = 'bogus';

@@ -219,3 +219,102 @@ SELECT count(*) FROM (SELECT DISTINCT v % 2 AS p, rank() OVER (ORDER BY v % 2) F
 SELECT g, sum(v), sum(sum(v)) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM gw GROUP BY g ORDER BY g;
 SELECT v, rank() OVER (ORDER BY nosuch) FROM gw GROUP BY v;
 DROP TABLE gw;
+-- RIGHT/FULL JOIN in any chain position
+DROP TABLE IF EXISTS mj1; DROP TABLE IF EXISTS mj2; DROP TABLE IF EXISTS mj3; DROP TABLE IF EXISTS mj4;
+CREATE TABLE mj1 (a int); CREATE TABLE mj2 (b int); CREATE TABLE mj3 (c int); CREATE TABLE mj4 (d int);
+INSERT INTO mj1 VALUES (1),(2);
+INSERT INTO mj2 VALUES (2),(3);
+INSERT INTO mj3 VALUES (3),(4);
+INSERT INTO mj4 VALUES (4),(5);
+SELECT * FROM mj1 FULL JOIN mj2 ON a = b JOIN mj3 ON b = c ORDER BY 1,2,3;
+SELECT * FROM mj1 RIGHT JOIN mj2 ON a = b LEFT JOIN mj3 ON b = c ORDER BY 1,2,3;
+SELECT * FROM mj1 FULL JOIN mj2 ON a = b FULL JOIN mj3 ON b = c ORDER BY 1,2,3;
+SELECT * FROM mj1 RIGHT JOIN mj2 ON a = b RIGHT JOIN mj3 ON b = c ORDER BY 1,2,3;
+SELECT * FROM mj1 FULL JOIN mj2 ON a = b FULL JOIN mj3 ON b = c FULL JOIN mj4 ON c = d ORDER BY 1,2,3,4;
+SELECT * FROM mj1 RIGHT JOIN mj2 ON a = b JOIN mj3 ON b = c RIGHT JOIN mj4 ON c = d ORDER BY 1,2,3,4;
+SELECT * FROM mj1 FULL JOIN mj2 ON a = b LEFT JOIN mj3 ON b = c JOIN mj4 ON c = d ORDER BY 1,2,3,4;
+SELECT count(*) FROM mj1 FULL JOIN mj2 ON a = b FULL JOIN mj3 ON b = c;
+SELECT * FROM mj1 FULL JOIN mj2 ON a = b JOIN mj3 ON c = coalesce(b, 3) ORDER BY 1,2,3;
+DROP TABLE mj1; DROP TABLE mj2; DROP TABLE mj3; DROP TABLE mj4;
+-- set-returning functions with aggregates / DISTINCT / ORDER BY / LIMIT
+DROP TABLE IF EXISTS st;
+CREATE TABLE st (g text, v int);
+INSERT INTO st VALUES ('a',1),('a',2),('b',10);
+SELECT count(*), generate_series(1,2);
+SELECT sum(x), generate_series(1,2) FROM (VALUES (5),(6)) v(x);
+SELECT DISTINCT generate_series(1,3) % 2 ORDER BY 1;
+SELECT generate_series(1,3) ORDER BY 1 DESC;
+SELECT generate_series(1,3) AS n ORDER BY n DESC;
+SELECT g, generate_series(1,2) FROM st ORDER BY g DESC, 2;
+SELECT DISTINCT g, generate_series(1,2) AS s2 FROM st ORDER BY g, s2;
+SELECT g, sum(v), generate_series(1,2) FROM st GROUP BY g ORDER BY g;
+SELECT v, generate_series(1,2) FROM st ORDER BY v LIMIT 3;
+SELECT * FROM (SELECT generate_series(1,3) AS n) t ORDER BY n DESC;
+SELECT unnest(ARRAY[3,1,2]) ORDER BY 1;
+DROP TABLE st;
+CREATE TABLE st (g text, v int);
+INSERT INTO st VALUES ('a',1),('a',2),('b',10);
+SELECT generate_series(1,5) LIMIT 2;
+SELECT generate_series(1,5) ORDER BY 1 DESC LIMIT 2 OFFSET 1;
+SELECT DISTINCT g, generate_series(1,2) AS s FROM st ORDER BY g, s;
+SELECT g, sum(v), generate_series(1,2) FROM st GROUP BY g HAVING sum(v) > 2 ORDER BY g, 3;
+SELECT count(*), generate_series(1,2) ORDER BY 2 DESC;
+DROP TABLE st;
+-- window frames EXCLUDE + windows over grouping sets
+DROP TABLE IF EXISTS ex;
+CREATE TABLE ex (v int);
+INSERT INTO ex VALUES (1),(2),(2),(3);
+SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM ex ORDER BY v;
+SELECT v, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM ex ORDER BY v;
+SELECT v, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM ex ORDER BY v;
+SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM ex ORDER BY v;
+SELECT v, count(*) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM ex ORDER BY v;
+SELECT v, first_value(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM ex ORDER BY v;
+SELECT v, last_value(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM ex ORDER BY v;
+SELECT v, nth_value(v, 2) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM ex ORDER BY v;
+SELECT v, sum(v) OVER (EXCLUDE CURRENT ROW) FROM ex;
+DROP TABLE ex;
+DROP TABLE IF EXISTS gw2;
+CREATE TABLE gw2 (a text, b text, v int);
+INSERT INTO gw2 VALUES ('x','p',1),('x','q',2),('y','p',4),('y','q',8);
+SELECT a, b, sum(v), rank() OVER (ORDER BY sum(v)) FROM gw2 GROUP BY ROLLUP(a, b) ORDER BY a, b, 4;
+SELECT a, grouping(a) AS ga, sum(v), row_number() OVER (ORDER BY grouping(a), a) FROM gw2 GROUP BY ROLLUP(a) ORDER BY 4;
+SELECT a, b, sum(v), sum(sum(v)) OVER (PARTITION BY grouping(a, b)) FROM gw2 GROUP BY GROUPING SETS ((a,b),(a),()) ORDER BY a, b, 3;
+DROP TABLE gw2;
+-- whole-row count(t.*); per-group and inner-grouped correlated subqueries
+DROP TABLE IF EXISTS wr1; DROP TABLE IF EXISTS wr2;
+CREATE TABLE wr1 (a int); CREATE TABLE wr2 (b int);
+INSERT INTO wr1 VALUES (1),(2);
+INSERT INTO wr2 VALUES (2);
+SELECT count(wr2.*) FROM wr1 LEFT JOIN wr2 ON a = b;
+SELECT count(wr1.*) FROM wr1;
+SELECT count(w.*) FROM wr1 w;
+SELECT count(wr1.*) FROM wr1 FULL JOIN wr2 ON a = b;
+SELECT a, count(wr2.*) FROM wr1 LEFT JOIN wr2 ON a = b GROUP BY a ORDER BY a;
+DROP TABLE wr1; DROP TABLE wr2;
+DROP TABLE IF EXISTS c1; DROP TABLE IF EXISTS c2;
+CREATE TABLE c1 (k int, v int);
+CREATE TABLE c2 (k int, w int);
+INSERT INTO c1 VALUES (1,10),(1,20),(2,30),(2,40),(3,50);
+INSERT INTO c2 VALUES (1,100),(2,15),(3,60),(3,5);
+-- correlated in the select list of a grouped query (per group)
+SELECT k, sum(v), (SELECT max(w) FROM c2 WHERE c2.k = c1.k) FROM c1 GROUP BY k ORDER BY k;
+-- correlated in HAVING (per group)
+SELECT k FROM c1 GROUP BY k HAVING sum(v) > (SELECT min(w) FROM c2 WHERE c2.k = c1.k) ORDER BY k;
+-- correlated in an aggregate argument (per input row)
+SELECT k, sum(v + (SELECT count(*) FROM c2 WHERE c2.k = c1.k)) FROM c1 GROUP BY k ORDER BY k;
+-- correlated EXISTS in the select list of a grouped query
+SELECT k, EXISTS (SELECT 1 FROM c2 WHERE c2.k = c1.k AND c2.w > 50) FROM c1 GROUP BY k ORDER BY k;
+-- ungrouped outer column in a grouped-query subquery errors
+SELECT k, (SELECT max(w) FROM c2 WHERE c2.w = c1.v) FROM c1 GROUP BY k ORDER BY k;
+DROP TABLE c1; DROP TABLE c2;
+CREATE TABLE c1 (k int, v int);
+CREATE TABLE c2 (k int, w int);
+INSERT INTO c1 VALUES (1,10),(1,20),(2,30),(2,40),(3,50);
+INSERT INTO c2 VALUES (1,100),(2,15),(3,60),(3,5);
+-- inner query groups over the outer reference
+SELECT k, v FROM c1 WHERE v IN (SELECT max(w) FROM c2 WHERE c2.k = c1.k GROUP BY c2.k) ORDER BY k;
+SELECT k, (SELECT sum(w) FROM c2 WHERE c2.k = c1.k GROUP BY c2.k) FROM c1 GROUP BY k ORDER BY k;
+SELECT count(*) FROM c1 WHERE EXISTS (SELECT c2.k FROM c2 WHERE c2.k = c1.k GROUP BY c2.k HAVING sum(w) > 50);
+SELECT k, v FROM c1 WHERE v > ALL (SELECT DISTINCT w FROM c2 WHERE c2.k = c1.k) ORDER BY k, v;
+DROP TABLE c1; DROP TABLE c2;

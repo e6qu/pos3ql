@@ -220,6 +220,20 @@ pub struct WindowFrame<'a> {
     pub units: FrameUnits,
     pub start: FrameBound<'a>,
     pub end: FrameBound<'a>,
+    pub exclusion: FrameExclusion,
+}
+
+/// The frame's `EXCLUDE` clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameExclusion {
+    /// `EXCLUDE NO OTHERS` (the default): nothing removed.
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`.
+    CurrentRow,
+    /// `EXCLUDE GROUP`: the current row and its ORDER BY peers.
+    Group,
+    /// `EXCLUDE TIES`: the peers but not the current row itself.
+    Ties,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,6 +505,10 @@ pub enum Expr<'a> {
     /// the `_pg_expandarray` set function, whose result exposes `.x` (element)
     /// and `.n` (1-based ordinal).
     Field { base: &'a Expr<'a>, field: &'a str },
+    /// `t.*` in an expression position (a whole-row reference). Supported
+    /// only as a `count()` argument; anywhere else it is rejected at type
+    /// analysis (record values are not first-class here).
+    WholeRow(&'a str),
     /// `operand operator ANY/ALL (array)` — quantified comparison.
     AnyAll {
         operand: &'a Expr<'a>,
@@ -526,6 +544,7 @@ impl Expr<'_> {
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
             | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) => true,
+            Expr::WholeRow(_) => false,
             Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_)
             | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,

@@ -623,6 +623,21 @@ fn render<'a>(
     // zeros that sit on `9` positions, keeping `0` positions and the point);
     // overflow keeps every position as `#`, so no trimming there.
     let mut frac_emit = frac_digits;
+    // On overflow a float8 source only carries as many fractional positions as
+    // its ~15 significant digits leave past the integer part; a large enough
+    // magnitude leaves none, so PostgreSQL prints the point but no `#` fill
+    // there (a numeric always keeps every fractional position).
+    if overflow {
+        if let Some(x) = float_source {
+            let digits_before = if x.abs() >= 1.0 {
+                x.abs().log10().floor() as i32 + 1
+            } else {
+                1
+            };
+            let available = (15 - digits_before).max(0);
+            frac_emit = frac_emit.min(available as usize);
+        }
+    }
     if fm && !overflow {
         let mut p = toks.len();
         let mut fi = frac_digits;

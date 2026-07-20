@@ -3094,6 +3094,8 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     (if is_range_oid(lo) { lo } else { ro }, -1)
                 }
                 Shl | Shr if is_range_oid(lo) || is_range_oid(ro) => of(ColType::Bool),
+                // `jsonb - key/keys/index` deletes and returns jsonb.
+                Sub if lo == oid::JSONB => (oid::JSONB, -1),
                 // `||` concatenates arrays when either side is an array (the
                 // array type is preserved), otherwise it is text concatenation.
                 Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => {
@@ -3129,6 +3131,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 // `json -> k` keeps the json/jsonb type; `->>` yields text.
                 JsonGet | JsonPath => (if lo == oid::JSONB { oid::JSONB } else { oid::JSON }, -1),
                 JsonGetText | JsonPathText => (oid::TEXT, -1),
+                JsonDeletePath => (oid::JSONB, -1),
                 JsonExists | JsonExistsAny | JsonExistsAll => of(ColType::Bool),
                 // On bit strings the bitwise/shift operators return a bit
                 // string; on integers they keep the wider integer width.

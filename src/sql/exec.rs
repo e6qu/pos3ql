@@ -2719,6 +2719,24 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
 
 /// Unifies two types by PostgreSQL's numeric preference (int4<int8<numeric<
 /// float8); non-numeric or equal types keep the first.
+/// The result type (oid, typlen) of an array function that promotes an array's
+/// element type to also hold a new scalar element (`array_append`/`prepend`/
+/// `replace`). Falls back to the array's own type when either is unknown.
+fn array_promoted(array_oid: Option<i32>, elem_oid: Option<i32>) -> (i32, i16) {
+    let fallback = (array_oid.unwrap_or(oid::TEXT), -1i16);
+    let (Some(ao), Some(eo)) = (array_oid, elem_oid) else {
+        return fallback;
+    };
+    let (Some(ColType::Array(ae)), Some(et)) = (coltype_of_oid(ao), coltype_of_oid(eo)) else {
+        return fallback;
+    };
+    let unified = unify_numeric_tower(ae.to_coltype(), et);
+    match super::types::ArrElem::from_coltype(unified) {
+        Some(e) => (ColType::Array(e).oid(), -1),
+        None => fallback,
+    }
+}
+
 pub(crate) fn unify_numeric_tower(a: ColType, b: ColType) -> ColType {
     use ColType::*;
     let rank = |t: ColType| match t {
@@ -3284,7 +3302,44 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             | "pg_relation_is_publishable" => {
                 of(ColType::Bool)
             }
-            "array_length" | "cardinality" | "array_upper" | "array_lower" => of(ColType::Int4),
+            "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
+                of(ColType::Int4)
+            }
+            "array_dims" => of(ColType::Text),
+            "array_to_json" => of(ColType::Json),
+            // Array-manipulation functions keep the array argument's type, but
+            // promote its element type to hold a wider new/replacement element
+            // (PostgreSQL's polymorphic anyarray/anyelement resolution).
+            "array_append" => {
+                let array_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let elem_oid = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                array_promoted(array_oid, elem_oid)
+            }
+            "array_prepend" => {
+                let elem_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let array_oid = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                array_promoted(array_oid, elem_oid)
+            }
+            "array_replace" => {
+                let array_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let to_oid = args.get(2).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                array_promoted(array_oid, to_oid)
+            }
+            "array_cat" => {
+                let a_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let b_oid = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                // Element-type promotion across the two arrays.
+                match (a_oid.and_then(coltype_of_oid), b_oid.and_then(coltype_of_oid)) {
+                    (Some(ColType::Array(ae)), Some(ColType::Array(be))) => {
+                        let e = unify_numeric_tower(ae.to_coltype(), be.to_coltype());
+                        of(ColType::Array(super::types::ArrElem::from_coltype(e).unwrap_or(ae)))
+                    }
+                    _ => (a_oid.unwrap_or(oid::TEXT), -1),
+                }
+            }
+            "array_remove" | "trim_array" => {
+                args.first().map(|a| infer_type_res(a, columns)).transpose()?.unwrap_or((oid::TEXT, -1))
+            }
             "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
                 args.first().map(|a| infer_type_res(a, columns)).transpose()?.unwrap_or((oid::INT4, 4))
             }

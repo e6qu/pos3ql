@@ -508,3 +508,21 @@ DROP TABLE rectest;
 -- derived-table column with a qualified base (must resolve, not error)
 SELECT (information_schema._pg_expandarray(ARRAY[10,20,30])).x, (information_schema._pg_expandarray(ARRAY[10,20,30])).n;
 SELECT (result.keys).x AS col, (result.keys).n AS seq FROM (SELECT information_schema._pg_expandarray(ARRAY[7,8,9]) AS keys) result ORDER BY seq;
+-- array manipulation functions (append/prepend/cat/remove/replace/dims/trim + to_json)
+SELECT array_append(ARRAY[1,2], 3), array_prepend(0, ARRAY[1,2]);
+SELECT array_append(NULL::int[], 5), array_append(ARRAY[1,2], NULL::int);
+SELECT array_cat(ARRAY[1,2], ARRAY[3,4]), array_cat(ARRAY[]::int[], ARRAY[9]);
+SELECT array_remove(ARRAY[1,2,2,3], 2), array_remove(ARRAY[1,NULL,2], NULL);
+SELECT array_remove(ARRAY['a','b','a'], 'a');
+SELECT array_replace(ARRAY[1,2,2,3], 2, 9), array_replace(ARRAY[1,NULL,2], NULL, 0);
+SELECT array_ndims(ARRAY[1,2]), array_ndims(ARRAY[]::int[]);
+SELECT array_dims(ARRAY[1,2,3]), array_dims(ARRAY[]::int[]);
+SELECT trim_array(ARRAY[1,2,3,4], 1), trim_array(ARRAY[1,2,3], 3);
+SELECT trim_array(ARRAY[1,2], 5);
+SELECT array_to_json(ARRAY[1,2,3]), array_to_json(ARRAY['a','b']);
+-- element-type promotion (polymorphic anyarray/anyelement)
+SELECT array_append(ARRAY[1,2], 3.5), array_cat(ARRAY[1,2], ARRAY[3.5,4.5]);
+SELECT pg_typeof(array_append(ARRAY[1,2], 3)), pg_typeof(array_append(ARRAY[1,2], 3.5));
+-- array-to-array cast (element re-encode)
+SELECT ARRAY[1,2]::int8[], ARRAY[1,2]::numeric[];
+SELECT pg_typeof(ARRAY[1,2]::int8[]);

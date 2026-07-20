@@ -640,3 +640,29 @@ SELECT width_bucket(5.5, ARRAY[1.0,3.0,7.0]), width_bucket('m', ARRAY['a','g','q
 SELECT pg_typeof(NULL::integer), pg_typeof(NULL::numeric), pg_typeof(NULL::text), pg_typeof(NULL::int[]);
 SELECT pg_typeof(max(x)) FROM (VALUES (1)) t(x) WHERE false;
 SELECT pg_typeof(sum(x)) FROM (VALUES (1::bigint)) t(x) WHERE false;
+-- EXTRACT / date_part on intervals (interval2tm field decomposition)
+SELECT extract(hour FROM INTERVAL '2 hours 30 min'), extract(minute FROM INTERVAL '2 hours 30 min'), extract(day FROM INTERVAL '40 days');
+SELECT extract(year FROM INTERVAL '30 months'), extract(month FROM INTERVAL '30 months'), extract(quarter FROM INTERVAL '14 months');
+SELECT extract(second FROM INTERVAL '1.234567 sec'), extract(milliseconds FROM INTERVAL '1.5 sec'), extract(microseconds FROM INTERVAL '1.5 sec');
+SELECT extract(epoch FROM INTERVAL '2 years 1 month'), extract(epoch FROM INTERVAL '1 day 2 hours'), extract(epoch FROM INTERVAL '-1 day -2 hours');
+SELECT extract(hour FROM INTERVAL '30 hours'), extract(hour FROM INTERVAL '-90 minutes'), extract(minute FROM INTERVAL '-90 minutes');
+SELECT date_part('second', INTERVAL '1.5 sec'), date_part('hour', INTERVAL '2 hours'), date_part('epoch', INTERVAL '1 day 2 hours');
+-- extract isoyear (the ISO year owning the week's Thursday)
+SELECT extract(isoyear FROM DATE '2021-01-01'), extract(isoyear FROM DATE '2024-06-15');
+-- interval comparison (canonical microsecond value: 1 month = 30 days)
+SELECT INTERVAL '1 year' = INTERVAL '12 months', INTERVAL '1 month' = INTERVAL '30 days', INTERVAL '1 day' < INTERVAL '25 hours';
+SELECT x FROM (VALUES (INTERVAL '2 hours'),(INTERVAL '1 hour'),(INTERVAL '90 min')) t(x) ORDER BY x;
+SELECT max(x), min(x) FROM (VALUES (INTERVAL '2 hours'),(INTERVAL '90 min')) t(x);
+SELECT count(DISTINCT x) FROM (VALUES (INTERVAL '1 hour'),(INTERVAL '60 min'),(INTERVAL '2 hours')) t(x);
+-- bit_and / bit_or / bit_xor aggregates (integer and bit-string)
+SELECT bit_and(x), bit_or(x), bit_xor(x) FROM (VALUES (5),(3),(6)) t(x);
+SELECT bit_and(x), bit_or(x), bit_xor(x) FROM (VALUES (5::bigint),(3),(6)) t(x);
+SELECT bit_and(x), bit_or(x), bit_xor(x) FROM (VALUES (B'101'),(B'011')) t(x);
+SELECT g, bit_and(x) FROM (VALUES ('a',7),('a',6),('b',15)) t(g,x) GROUP BY g ORDER BY g;
+SELECT bit_xor(DISTINCT x) FROM (VALUES (5),(5),(3)) t(x);
+-- num_nonnulls / num_nulls, array_fill, array_positions
+SELECT num_nonnulls(1, NULL, 2, NULL, 3), num_nulls(1, NULL, 2, NULL, 3), num_nonnulls('a','b');
+SELECT array_fill(7, ARRAY[3]), array_fill('x'::text, ARRAY[2]), array_fill(1, ARRAY[0]);
+SELECT array_positions(ARRAY[1,2,1,3,1], 1), array_positions(ARRAY[5,6,7], 9), array_positions(ARRAY[1,NULL,2,NULL], NULL);
+SELECT bit_or(x) FROM (VALUES (1),(NULL),(4)) t(x);
+SELECT bit_and(x) FROM (VALUES (NULL::int)) t(x);

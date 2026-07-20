@@ -1225,6 +1225,47 @@ fn call<'a>(
             }
             Ok(Datum::Null)
         }
+        "array_positions" => {
+            // 1-based indices of every element equal to the target (NULL-safe),
+            // as an int[] (`{}` when none); NULL only for a NULL array argument.
+            arity(2)?;
+            let a = eval_full(args[0], arena, params, row, hooks)?;
+            let target = eval_full(args[1], arena, params, row, hooks)?;
+            let (element, raw) = match a {
+                Datum::Array { element, raw } => (element, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("array_positions requires an array", &a)),
+            };
+            let matches = |el: &Datum| -> Result<bool, SqlError> {
+                Ok(if target.is_null() {
+                    el.is_null()
+                } else if el.is_null() {
+                    false
+                } else {
+                    compare_datums(el, &target)?.is_eq()
+                })
+            };
+            let len = super::array::len(raw);
+            let mut count = 0usize;
+            for i in 0..len {
+                if matches(&super::array::get(raw, element, i).unwrap_or(Datum::Null))? {
+                    count += 1;
+                }
+            }
+            let positions: &mut [Datum] =
+                arena.alloc_slice_with(count, |_| Datum::Null).map_err(|_| arena_full())?;
+            let mut at = 0usize;
+            for i in 0..len {
+                if matches(&super::array::get(raw, element, i).unwrap_or(Datum::Null))? {
+                    positions[at] = Datum::Int4((i + 1) as i32);
+                    at += 1;
+                }
+            }
+            Ok(Datum::Array {
+                element: super::types::ArrElem::Int4,
+                raw: super::array::build(positions, arena)?,
+            })
+        }
         // `array_append(arr, elem)` / `array_prepend(elem, arr)`: a NULL array
         // is treated as empty (its element type taken from `elem`).
         "array_append" | "array_prepend" => {
@@ -2052,6 +2093,57 @@ fn call<'a>(
                 }
             }
             Ok(Datum::Null)
+        }
+        // Count the non-null / null arguments (PostgreSQL's variadic
+        // num_nonnulls / num_nulls; never NULL themselves).
+        "num_nonnulls" | "num_nulls" => {
+            if args.is_empty() {
+                return Err(arity_err(name, 0));
+            }
+            let mut nulls = 0i32;
+            for arg in args {
+                if eval_full(arg, arena, params, row, hooks)?.is_null() {
+                    nulls += 1;
+                }
+            }
+            Ok(Datum::Int4(if name == "num_nulls" {
+                nulls
+            } else {
+                args.len() as i32 - nulls
+            }))
+        }
+        // array_fill(value, dims[]) — a one-based array of `dims[0]` copies of
+        // `value`. PostgreSQL supports multi-dimensional fills and custom lower
+        // bounds; only the one-dimensional, one-based form is representable here.
+        "array_fill" => {
+            arity(2)?;
+            let value = eval_full(args[0], arena, params, row, hooks)?;
+            let dims = eval_full(args[1], arena, params, row, hooks)?;
+            if dims.is_null() {
+                return Err(sql_err!("22004", "dimension array or low bound array cannot be null"));
+            }
+            let Datum::Array { element, raw } = dims else {
+                return Err(type_mismatch(name, &dims));
+            };
+            if super::array::len(raw) != 1 {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "only one-dimensional array_fill is supported"
+                ));
+            }
+            let count = match super::array::get(raw, element, 0) {
+                Some(Datum::Int4(n)) => n,
+                _ => return Err(sql_err!("22004", "dimension values cannot be null")),
+            };
+            if count < 0 {
+                return Err(sql_err!("2202E", "array size exceeds the maximum allowed"));
+            }
+            let elem = super::types::ArrElem::from_datum(&value)
+                .unwrap_or(super::types::ArrElem::Int4);
+            let filled = arena
+                .alloc_slice_with(count as usize, |_| value)
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Array { element: elem, raw: super::array::build(filled, arena)? })
         }
         // Record constructor `ROW(a, b, ...)` / `row(...)`: fields are named
         // f1, f2, ... as PostgreSQL does for an anonymous record.
@@ -4082,6 +4174,11 @@ fn call<'a>(
                 Datum::Timestamp(t) | Datum::Timestamptz(t) => {
                     (t.div_euclid(86_400_000_000), t.rem_euclid(86_400_000_000))
                 }
+                // Interval fields come straight from the (months, days, micros)
+                // components (PostgreSQL's interval2tm), not a calendar date.
+                Datum::Interval(interval) => {
+                    return interval_extract(name == "extract", field, interval, arena)
+                }
                 other => return Err(type_mismatch(name, &other)),
             };
             use super::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS, PG_EPOCH_SECS};
@@ -4123,6 +4220,11 @@ fn call<'a>(
                 let thursday = days + (4 - isodow);
                 let (ty, tm, td) = civil_from_days(thursday + PG_EPOCH_DAYS);
                 Some((days_from_civil(ty, tm, td) - days_from_civil(ty, 1, 1)) / 7 + 1)
+            } else if eq("isoyear") {
+                // ISO year: the year owning the ISO week (i.e. of that Thursday).
+                let isodow = if dow0 == 0 { 7 } else { dow0 };
+                let thursday = days + (4 - isodow);
+                Some(civil_from_days(thursday + PG_EPOCH_DAYS).0)
             } else {
                 None
             };
@@ -4843,6 +4945,18 @@ fn is_unknown_literal(expression: &Expr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Bitwise combine of two `bit_and`/`bit_or`/`bit_xor` aggregate inputs, over
+/// integers or bit strings, reusing the operator machinery (bit strings of
+/// differing lengths error, as in PostgreSQL).
+pub fn bit_aggregate<'a>(
+    operator: BinaryOp,
+    a: Datum<'a>,
+    b: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    binary(operator, a, b, false, false, arena)
+}
+
 fn binary<'a>(
     operator: BinaryOp,
     l: Datum<'a>,
@@ -5528,7 +5642,12 @@ fn bit_bitwise<'a>(
     }
     let (a, b) = (bit_operand(&l)?, bit_operand(&r)?);
     if a.len() != b.len() {
-        return Err(sql_err!("22026", "cannot AND/OR/XOR bit strings of different sizes"));
+        let verb = match operator {
+            BinaryOp::BitAnd => "AND",
+            BinaryOp::BitOr => "OR",
+            _ => "XOR",
+        };
+        return Err(sql_err!("22026", "cannot {} bit strings of different sizes", verb));
     }
     let varying = bit_is_varying(&l) || bit_is_varying(&r);
     let out = arena
@@ -6257,6 +6376,12 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         }
         (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
         (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
+        // Intervals compare by canonical microsecond value (PostgreSQL's
+        // interval_cmp_value: months count as 30 days, days as 24 hours), so
+        // `1 month` = `30 days` = `720 hours`.
+        (Datum::Interval(a), Datum::Interval(b)) => {
+            interval_cmp_value(*a).cmp(&interval_cmp_value(*b))
+        }
         // Bit strings compare bit-by-bit, shorter-is-prefix sorting first —
         // exactly lexicographic order of the '0'/'1' characters.
         (Datum::Bit { bits: a, .. }, Datum::Bit { bits: b, .. }) => a.cmp(b),
@@ -7094,6 +7219,105 @@ fn to_numeric<'a>(d: &Datum, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> 
 }
 
 /// PostgreSQL type name for a datum, for operator-error messages.
+/// PostgreSQL's `interval_cmp_value`: the canonical microsecond magnitude used
+/// to order intervals, counting a month as 30 days and a day as 24 hours. i128
+/// keeps the full range exact.
+fn interval_cmp_value(interval: super::types::Interval) -> i128 {
+    i128::from(interval.months) * 30 * 86_400_000_000
+        + i128::from(interval.days) * 86_400_000_000
+        + i128::from(interval.micros)
+}
+
+/// `EXTRACT` / `date_part` on an interval, decomposing its `(months, days,
+/// micros)` components exactly as PostgreSQL's `interval2tm` does (truncating
+/// division toward zero, so negative intervals split the same way). Hours are
+/// not rolled into days, and the year-scaled fields (decade/century/millennium)
+/// use plain division, not the AD/BC-adjusted timestamp rule. `numeric_result`
+/// selects `EXTRACT` (numeric) over `date_part` (double precision).
+fn interval_extract<'a>(
+    numeric_result: bool,
+    field: &str,
+    interval: super::types::Interval,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::numeric::Numeric;
+    let eq = |k: &str| field.eq_ignore_ascii_case(k);
+    let months = i64::from(interval.months);
+    let days = i64::from(interval.days);
+    let micros = interval.micros;
+    let year = months / 12;
+    let hour = micros / 3_600_000_000;
+    let after_hour = micros % 3_600_000_000;
+    let minute = after_hour / 60_000_000;
+    let sub_minute = after_hour % 60_000_000; // whole seconds + fractional micros
+    let int_val: Option<i64> = if eq("year") || eq("years") {
+        Some(year)
+    } else if eq("month") || eq("months") {
+        Some(months % 12)
+    } else if eq("day") || eq("days") {
+        Some(days)
+    } else if eq("hour") || eq("hours") {
+        Some(hour)
+    } else if eq("minute") || eq("minutes") {
+        Some(minute)
+    } else if eq("microseconds") {
+        Some(sub_minute)
+    } else if eq("decade") || eq("decades") {
+        Some(year / 10)
+    } else if eq("century") || eq("centuries") {
+        Some(year / 100)
+    } else if eq("millennium") || eq("millennia") {
+        Some(year / 1000)
+    } else if eq("quarter") {
+        Some((months % 12) / 3 + 1)
+    } else {
+        None
+    };
+    if let Some(v) = int_val {
+        return Ok(if numeric_result {
+            Datum::Numeric(Numeric::from_i64(v, arena)?)
+        } else {
+            Datum::Float8(v as f64)
+        });
+    }
+    // Fractional fields carried in microseconds, with PostgreSQL's per-unit
+    // display scale (seconds/epoch → 6 fractional digits, milliseconds → 3).
+    // `epoch` scales whole years by 365.25 days and residual months by 30 days
+    // (PostgreSQL's DAYS_PER_YEAR / DAYS_PER_MONTH); i128 keeps it exact.
+    let (value_micros, divisor, decimals): (i128, i128, usize) = if eq("second") || eq("seconds") {
+        (i128::from(sub_minute), 1_000_000, 6)
+    } else if eq("milliseconds") {
+        (i128::from(sub_minute), 1_000, 3)
+    } else if eq("epoch") {
+        let epoch = (i128::from(months) / 12) * 31_557_600_000_000
+            + (i128::from(months) % 12) * 2_592_000_000_000
+            + i128::from(days) * 86_400_000_000
+            + i128::from(micros);
+        (epoch, 1_000_000, 6)
+    } else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "unit \"{}\" not supported for type interval",
+            field
+        ));
+    };
+    if numeric_result {
+        let neg = value_micros < 0;
+        let magnitude = value_micros.unsigned_abs();
+        let text = stack_format!(
+            48,
+            "{}{}.{:0width$}",
+            if neg { "-" } else { "" },
+            magnitude / divisor as u128,
+            magnitude % divisor as u128,
+            width = decimals
+        );
+        Ok(Datum::Numeric(Numeric::parse(text.as_str(), arena)?))
+    } else {
+        Ok(Datum::Float8(value_micros as f64 / divisor as f64))
+    }
+}
+
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Null => "unknown",

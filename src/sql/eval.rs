@@ -1453,6 +1453,50 @@ fn call<'a>(
             }
             Ok(Datum::Json { text: element, jsonb })
         }
+        // Set-returning `json_each` / `jsonb_each[_text]` yield, for the current
+        // expansion index k, the composite `(key, value)` of the k-th object
+        // member as a record (`SELECT * FROM json_each(...)` expands it to two
+        // columns; a bare `SELECT json_each(...)` shows the record).
+        "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => {
+            arity(1)?;
+            let jsonb = name.starts_with("jsonb");
+            let as_text = name.ends_with("_text");
+            let value_oid = if as_text {
+                super::types::oid::TEXT
+            } else if jsonb {
+                super::types::oid::JSONB
+            } else {
+                super::types::oid::JSON
+            };
+            let text = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(sql_err!("22023", "cannot deconstruct a scalar")),
+            };
+            let pairs = json_each_pairs(text, jsonb, as_text, arena)?;
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            let Some((key, value)) = pairs.get(k - 1) else {
+                return Ok(Datum::Null);
+            };
+            let fields = arena
+                .alloc_slice_copy(&[
+                    super::types::RecordField {
+                        name: "key",
+                        type_oid: super::types::oid::TEXT,
+                        value: Datum::Text(key),
+                    },
+                    super::types::RecordField {
+                        name: "value",
+                        type_oid: value_oid,
+                        value: *value,
+                    },
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Record(fields))
+        }
         "pg_get_indexdef" => {
             // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole
             // `btree (columns)` definition; `(oid, n, _)` with n>0 returns the name
@@ -4414,12 +4458,70 @@ pub fn json_to_text_pub<'a>(
 }
 
 fn json_to_text<'a>(v: &super::json::Json<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let mut buffer = crate::util::StackStr::<16384>::new();
-    let _ = core::fmt::Write::write_fmt(
-        &mut buffer,
-        format_args!("{}", super::json::JsonWrite(v)),
-    );
-    arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())
+    // Render straight into the arena at exact length — a jsonb value can be
+    // larger than any fixed scratch buffer, and truncating it would corrupt it.
+    arena.alloc_str_display(super::json::JsonWrite(v)).map_err(|_| arena_full())
+}
+
+/// The `(key, value)` members a `json_each` / `jsonb_each` family call yields
+/// for the object `text`. `jsonb` selects normalized (sorted, deduplicated,
+/// re-rendered) members over the `json` variants' source-order/verbatim members;
+/// `as_text` makes each value the `_text` form (a decoded string, else the
+/// value's json text). Errors match PostgreSQL's `cannot deconstruct ...`.
+pub fn json_each_pairs<'a>(
+    text: &'a str,
+    jsonb: bool,
+    as_text: bool,
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, Datum<'a>)], SqlError> {
+    match super::json::kind_of(text) {
+        super::json::Kind::Object => {}
+        super::json::Kind::Array => {
+            return Err(sql_err!("22023", "cannot deconstruct an array as an object"));
+        }
+        super::json::Kind::Scalar => {
+            return Err(sql_err!("22023", "cannot deconstruct a scalar"));
+        }
+    }
+    if jsonb {
+        let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
+            return Err(sql_err!("22023", "cannot deconstruct an array as an object"));
+        };
+        let out = arena
+            .alloc_slice_with(members.len(), |_| ("", Datum::Null))
+            .map_err(|_| arena_full())?;
+        for (slot, (key, value)) in out.iter_mut().zip(members.iter()) {
+            let datum = if as_text {
+                match *value {
+                    super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                    super::json::Json::Null => Datum::Null,
+                    _ => Datum::Text(json_to_text(value, arena)?),
+                }
+            } else {
+                Datum::Json { text: json_to_text(value, arena)?, jsonb: true }
+            };
+            *slot = (*key, datum);
+        }
+        return Ok(&*out);
+    }
+    // json: source order, duplicates kept, values verbatim.
+    let members = super::json::object_members_source(text, arena)?;
+    let out = arena
+        .alloc_slice_with(members.len(), |_| ("", Datum::Null))
+        .map_err(|_| arena_full())?;
+    for (slot, (key, value)) in out.iter_mut().zip(members.iter()) {
+        let datum = if as_text {
+            match super::json::parse(value, arena)? {
+                super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                super::json::Json::Null => Datum::Null,
+                _ => Datum::Text(value),
+            }
+        } else {
+            Datum::Json { text: value, jsonb: false }
+        };
+        *slot = (*key, datum);
+    }
+    Ok(&*out)
 }
 
 /// `jsonb || jsonb`: merge two objects (right key wins), concatenate two

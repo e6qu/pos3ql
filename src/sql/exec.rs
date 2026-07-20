@@ -3287,6 +3287,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             | "json_array_elements_text" => of(ColType::Text),
             "jsonb_array_elements" => of(ColType::Jsonb),
             "json_array_elements" => of(ColType::Json),
+            // The `each` family yields a `(key, value)` composite per member.
+            "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => {
+                (oid::RECORD, -1)
+            }
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),

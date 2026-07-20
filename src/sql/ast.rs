@@ -549,6 +549,10 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("json_array_elements")
                 || name.eq_ignore_ascii_case("jsonb_array_elements_text")
                 || name.eq_ignore_ascii_case("json_array_elements_text")
+                || name.eq_ignore_ascii_case("json_each")
+                || name.eq_ignore_ascii_case("jsonb_each")
+                || name.eq_ignore_ascii_case("json_each_text")
+                || name.eq_ignore_ascii_case("jsonb_each_text")
         }
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)

@@ -7759,6 +7759,7 @@ fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("json_array_elements")
         || name.eq_ignore_ascii_case("jsonb_array_elements_text")
         || name.eq_ignore_ascii_case("json_array_elements_text")
+        || is_json_each_name(name)
 }
 
 /// Finds a set-returning function call among the SELECT items (the whole call
@@ -7910,6 +7911,18 @@ fn srf_count<'a, R: ColumnLookup<'a>>(
             };
         }
         Ok(super::json::array_elements_source(text, arena)?.len())
+    } else if is_json_each_name(name) {
+        let jsonb = name.eq_ignore_ascii_case("jsonb_each")
+            || name.eq_ignore_ascii_case("jsonb_each_text");
+        let as_text = name.eq_ignore_ascii_case("json_each_text")
+            || name.eq_ignore_ascii_case("jsonb_each_text");
+        let text = match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(0),
+            _ => return Err(sql_err!("22023", "cannot deconstruct a scalar")),
+        };
+        Ok(super::eval::json_each_pairs(text, jsonb, as_text, arena)?.len())
     } else {
         // unnest / _pg_expandarray over an array.
         match eval_full(args[0], arena, params, row, hooks)? {
@@ -9782,7 +9795,8 @@ fn table_func_def<'a>(
         || tref.table.eq_ignore_ascii_case("json_array_elements")
         || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
         || tref.table.eq_ignore_ascii_case("json_array_elements_text");
-    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems {
+    let is_each = is_json_each_name(tref.table);
+    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems && !is_each {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
@@ -9793,27 +9807,12 @@ fn table_func_def<'a>(
         "generate_series"
     } else if is_re {
         "regexp_matches"
-    } else if is_keys || is_elems {
+    } else if is_keys || is_elems || is_each {
         tref.table
     } else {
         "unnest"
     };
     let name = tref.alias.unwrap_or(base_name);
-    // A table function has a single output column, so at most one alias.
-    if let Some(aliases) = tref.col_alias
-        && aliases.len() > 1
-    {
-        return Err(sql_err!(
-            "42P10",
-            "table \"{}\" has 1 columns available but {} columns specified",
-            name,
-            aliases.len()
-        ));
-    }
-    // The column takes the explicit column-alias if given, else the function's
-    // default output name: `value` for array_elements, else the function name.
-    let default_col = if is_elems { "value" } else { name };
-    let col_name = tref.col_alias.and_then(|a| a.first().copied()).unwrap_or(default_col);
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
@@ -9824,41 +9823,87 @@ fn table_func_def<'a>(
         auto_increment: false,
         default_value: None,
     };
+    // Each supported function's output columns: `key`/`value` for the `each`
+    // family (two columns), a single column named per the function otherwise.
     // generate_series yields int8; regexp_matches yields text[]; unnest yields
-    // the array's element type.
-    let ctype = if is_gs {
-        ColType::Int8
-    } else if is_re {
-        ColType::Array(super::types::ArrElem::Text)
-    } else if is_keys {
-        ColType::Text
-    } else if is_elems {
-        if tref.table.eq_ignore_ascii_case("json_array_elements") {
+    // the array's element type; array_elements' default column is `value`.
+    let mut default_cols: [(&str, ColType); 2] = [("", ColType::Bool); 2];
+    let n_default = if is_each {
+        let value_type = if tref.table.eq_ignore_ascii_case("json_each") {
             ColType::Json
-        } else if tref.table.eq_ignore_ascii_case("jsonb_array_elements") {
+        } else if tref.table.eq_ignore_ascii_case("jsonb_each") {
             ColType::Jsonb
         } else {
-            ColType::Text
-        }
+            ColType::Text // json_each_text / jsonb_each_text
+        };
+        default_cols[0] = ("key", ColType::Text);
+        default_cols[1] = ("value", value_type);
+        2
     } else {
-        let args = tref.func_args.unwrap_or(&[]);
-        match args.first() {
-            Some(e) => match super::eval::eval(e, arena, params, &super::eval::NoColumns)? {
-                Datum::Array { element, .. } => element.to_coltype(),
-                _ => ColType::Text,
-            },
-            None => ColType::Text,
-        }
+        let single_type = if is_gs {
+            ColType::Int8
+        } else if is_re {
+            ColType::Array(super::types::ArrElem::Text)
+        } else if is_keys {
+            ColType::Text
+        } else if is_elems {
+            if tref.table.eq_ignore_ascii_case("json_array_elements") {
+                ColType::Json
+            } else if tref.table.eq_ignore_ascii_case("jsonb_array_elements") {
+                ColType::Jsonb
+            } else {
+                ColType::Text
+            }
+        } else {
+            let args = tref.func_args.unwrap_or(&[]);
+            match args.first() {
+                Some(e) => match super::eval::eval(e, arena, params, &super::eval::NoColumns)? {
+                    Datum::Array { element, .. } => element.to_coltype(),
+                    _ => ColType::Text,
+                },
+                None => ColType::Text,
+            }
+        };
+        // A single-column function's default column name is `value` for
+        // array_elements, else the (aliased) function name.
+        default_cols[0] = (if is_elems { "value" } else { name }, single_type);
+        1
     };
+    // Column aliases rename the columns positionally; too many is an error.
+    if let Some(aliases) = tref.col_alias
+        && aliases.len() > n_default
+    {
+        return Err(sql_err!(
+            "42P10",
+            "table \"{}\" has {} columns available but {} columns specified",
+            name,
+            n_default,
+            aliases.len()
+        ));
+    }
     let mut columns = [blank; MAX_COLUMNS];
-    columns[0] = ColumnMeta { name: SqlName::parse(col_name)?, ctype, ..blank };
+    for (i, (default_name, ctype)) in default_cols[..n_default].iter().enumerate() {
+        let col_name = tref
+            .col_alias
+            .and_then(|a| a.get(i).copied())
+            .unwrap_or(default_name);
+        columns[i] = ColumnMeta { name: SqlName::parse(col_name)?, ctype: *ctype, ..blank };
+    }
     let def = TableDef {
         name: SqlName::parse(name)?,
         columns,
-        n_columns: 1,
+        n_columns: n_default,
         ..TableDef::empty()
     };
     Ok(&*arena.alloc(def).map_err(|_| arena_full())?)
+}
+
+/// Whether `name` is one of the two-column `json_each` set-returning functions.
+fn is_json_each_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("json_each")
+        || name.eq_ignore_ascii_case("jsonb_each")
+        || name.eq_ignore_ascii_case("json_each_text")
+        || name.eq_ignore_ascii_case("jsonb_each_text")
 }
 
 /// Materializes a table function's rows. Currently `generate_series(start, stop
@@ -9871,6 +9916,26 @@ fn table_func_rows<'a>(
     params: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
+    // json_each / jsonb_each[_text]: one (key, value) row per object member.
+    if is_json_each_name(tref.table) {
+        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_each")
+            || tref.table.eq_ignore_ascii_case("jsonb_each_text");
+        let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
+            || tref.table.eq_ignore_ascii_case("jsonb_each_text");
+        let text = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Json { text, .. } => text,
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(sql_err!("22023", "cannot deconstruct a scalar")),
+        };
+        let pairs = super::eval::json_each_pairs(text, jsonb, as_text, arena)?;
+        const EMPTY: &[u8] = &[];
+        let rows = arena.alloc_slice_with(pairs.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        for (slot, (key, value)) in rows.iter_mut().zip(pairs.iter()) {
+            *slot = super::exec::encode_projected_pub(&[Datum::Text(key), *value], arena)?;
+        }
+        return Ok(&*rows);
+    }
     // regexp_matches(string, pattern [, flags]): one row per match, each a
     // text[] of the capture groups (or the whole match when there are no groups).
     if tref.table.eq_ignore_ascii_case("regexp_matches") {

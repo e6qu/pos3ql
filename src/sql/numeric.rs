@@ -1271,6 +1271,52 @@ pub fn sqrt<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError
     x.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
 }
 
+/// Exact numeric variance / standard deviation, matching PostgreSQL
+/// `numeric_stddev_internal` in numeric.c. `count` is the number of non-null
+/// rows folded into `sum_x` (Σx) and `sum_x2` (Σx²). `sample` selects the
+/// sample estimator (divide by N·(N−1)) over the population one (divide by
+/// N²); `want_stddev` takes the square root of the variance. Returns `None`
+/// when the estimator is undefined (sample with fewer than two rows); the
+/// population estimator with `count == 0` is guarded by the caller.
+pub fn var_stddev<'a>(
+    count: u64,
+    sum_x: &Numeric,
+    sum_x2: &Numeric,
+    sample: bool,
+    want_stddev: bool,
+    arena: &'a Arena,
+) -> Result<Option<Numeric<'a>>, SqlError> {
+    if sample && count < 2 {
+        return Ok(None);
+    }
+    let n = Numeric::from_i64(count as i64, arena)?;
+    // Sxx = N·Σx² − (Σx)²  — PostgreSQL's numerically-stable corrected form.
+    let sum_x_squared = mul(sum_x, sum_x, arena)?;
+    let n_sum_x2 = mul(&n, sum_x2, arena)?;
+    let sxx = sub(&n_sum_x2, &sum_x_squared, arena)?;
+    // Roundoff on real inputs can push Sxx slightly negative; clamp to zero
+    // exactly as PostgreSQL does before dividing.
+    if compare(&sxx, &Numeric::ZERO) != Ordering::Greater {
+        return Ok(Some(Numeric { sign: Sign::Pos, weight: 0, dscale: 0, digits: &[] }));
+    }
+    // divisor = N·(N−1) for the sample estimator, N² for the population one.
+    let divisor = if sample {
+        let n_minus_one = sub(&n, &Numeric::from_i64(1, arena)?, arena)?;
+        mul(&n, &n_minus_one, arena)?
+    } else {
+        mul(&n, &n, arena)?
+    };
+    let rscale = div_result_scale(&sxx, &divisor);
+    let variance = div_with_scale(&sxx, &divisor, rscale, true, arena)?;
+    if !want_stddev {
+        return Ok(Some(variance));
+    }
+    // Standard deviation is the square root of the variance taken at the
+    // variance's own result scale (PostgreSQL's sqrt_var(&var, &var, rscale)).
+    let root = sqrt_to_scale(&variance, rscale + 8, arena)?;
+    Ok(Some(root.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)?))
+}
+
 /// `ln(arg)` in the numeric domain (arg must be > 0; caller checks).
 /// PostgreSQL `ln_var`: reduce the argument toward 1 by repeated square roots,
 /// then sum the `atanh` series `2*(z + z^3/3 + z^5/5 + ...)`, `z=(x-1)/(x+1)`.
@@ -1754,6 +1800,24 @@ mod tests {
         assert_eq!(p("42.7", &a).to_i64().unwrap(), 43);
         assert_eq!(p("42.4", &a).to_i64().unwrap(), 42);
         assert_eq!(p("-42.5", &a).to_i64().unwrap(), -43);
+    }
+
+    #[test]
+    fn variance_stddev_matches_postgres() {
+        let a = arena();
+        let n = |v: i64| Numeric::from_i64(v, &a).unwrap();
+        // Sample variance/stddev over {2,4,6,7}: Σx=19, Σx²=105, count=4.
+        let var = var_stddev(4, &n(19), &n(105), true, false, &a).unwrap().unwrap();
+        assert_eq!(disp(&var), "4.9166666666666667");
+        let stddev = var_stddev(4, &n(19), &n(105), true, true, &a).unwrap().unwrap();
+        assert_eq!(disp(&stddev), "2.2173557826083451");
+        // Population variance over {2,4,6}: Σx=12, Σx²=56, count=3.
+        let var_pop = var_stddev(3, &n(12), &n(56), false, false, &a).unwrap().unwrap();
+        assert_eq!(disp(&var_pop), "2.6666666666666667");
+        // The sample estimator is undefined for a single row.
+        assert!(var_stddev(1, &n(5), &n(25), true, false, &a).unwrap().is_none());
+        // Population variance of a single (or all-equal) value is exactly zero.
+        assert_eq!(disp(&var_stddev(1, &n(5), &n(25), false, false, &a).unwrap().unwrap()), "0");
     }
 
     #[test]

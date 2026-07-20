@@ -2223,6 +2223,14 @@ fn call<'a>(
         "pg_typeof" => {
             arity(1)?;
             let v = eval_full(args[0], arena, params, row, hooks)?;
+            // PostgreSQL's pg_typeof reports the argument's static type, so a
+            // NULL value still names its declared type. A concrete value carries
+            // its own type; only for NULL do we recover the type statically.
+            if v.is_null()
+                && let Some(name) = super::exec::typeof_static(args[0], row)
+            {
+                return Ok(Datum::Text(name));
+            }
             Ok(Datum::Text(match v {
                 Datum::Null => "unknown",
                 Datum::Bool(_) => "boolean",
@@ -3243,7 +3251,68 @@ fn call<'a>(
                 Datum::Int4(i32::try_from(out).map_err(|_| range())?)
             })
         }
+        "pg_size_pretty" => {
+            // Human-readable byte size, matching PostgreSQL's pg_size_pretty:
+            // "N bytes" below 10 kB, then half-rounded kB/MB/GB/TB/PB via the
+            // same successive right-shifts (÷512 once, then ÷1024 per step).
+            arity(1)?;
+            // PostgreSQL exposes pg_size_pretty(bigint) and pg_size_pretty(numeric)
+            // only; a narrower integer (int2/int4) is rejected there as ambiguous,
+            // so it is not accepted here either.
+            let size = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => return Ok(Datum::Null),
+                Datum::Int8(v) => v,
+                Datum::Numeric(n) => n.to_i64()?,
+                other => return Err(type_mismatch(name, &other)),
+            };
+            const UNITS: [&str; 6] = ["bytes", "kB", "MB", "GB", "TB", "PB"];
+            let limit: i64 = 10 * 1024;
+            let limit2 = limit * 2 - 1;
+            let half_rounded = |x: i64| (x + if x < 0 { -1 } else { 1 }) / 2;
+            let text = if size.unsigned_abs() < limit as u64 {
+                stack_format!(64, "{} bytes", size)
+            } else {
+                let mut scaled = size >> 9;
+                let mut index = 1usize;
+                while index < UNITS.len() - 1 {
+                    if scaled.unsigned_abs() < limit2 as u64 {
+                        break;
+                    }
+                    scaled >>= 10;
+                    index += 1;
+                }
+                stack_format!(64, "{} {}", half_rounded(scaled), UNITS[index])
+            };
+            Ok(Datum::Text(arena.alloc_str(text.as_str()).map_err(|_| arena_full())?))
+        }
         "width_bucket" => {
+            // 2-arg form: width_bucket(operand, thresholds[]) — the bucket index
+            // by binary search over an ascending array of bucket lower bounds
+            // (0 below the first bound), matching PostgreSQL's width_bucket_array.
+            if args.len() == 2 {
+                let operand = eval_full(args[0], arena, params, row, hooks)?;
+                let thresholds = eval_full(args[1], arena, params, row, hooks)?;
+                if operand.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let Datum::Array { element, raw } = thresholds else {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "width_bucket: thresholds argument must be an array"
+                    ));
+                };
+                let (mut left, mut right) = (0usize, super::array::len(raw));
+                while left < right {
+                    let mid = left + (right - left) / 2;
+                    let bound = super::array::get(raw, element, mid).unwrap_or(Datum::Null);
+                    if compare_datums(&operand, &bound)?.is_lt() {
+                        right = mid;
+                    } else {
+                        left = mid + 1;
+                    }
+                }
+                return Ok(Datum::Int4(left as i32));
+            }
             // 4-arg form: which of `count` equal-width buckets over [low, high]
             // the operand falls in (0 below, count+1 at/above). Numeric args use
             // exact numeric arithmetic; a float argument uses double precision.

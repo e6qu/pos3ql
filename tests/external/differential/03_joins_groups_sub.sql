@@ -611,3 +611,32 @@ SELECT '{"a":1,"b":2,"c":3}'::jsonb - ARRAY['a','c'];
 SELECT '{"a":{"b":1,"c":2}}'::jsonb #- '{a,b}';
 SELECT '{"a":1}'::jsonb || '{"b":2}', '{"a":1}'::jsonb || '{"a":5,"c":3}';
 SELECT jsonb_set('{"x":1}'::jsonb, '{x}', to_jsonb('hi'::text));
+-- statistical aggregates: exact numeric variance/stddev over integer/numeric,
+-- float8 regression/correlation/covariance family (rounded for determinism)
+SELECT variance(x), var_pop(x), stddev(x), stddev_pop(x) FROM (VALUES (2),(4),(6),(7)) t(x);
+SELECT variance(x), stddev_samp(x) FROM (VALUES (1.5),(2.5),(3.5),(4.5)) t(x);
+SELECT var_pop(x), stddev_pop(x) FROM (VALUES (5)) t(x);
+SELECT var_samp(x), stddev_samp(x) FROM (VALUES (5)) t(x);
+SELECT variance(x::float8), stddev(x::float8) FROM (VALUES (2),(4),(6)) t(x);
+SELECT regr_count(y,x), regr_avgx(y,x), regr_avgy(y,x) FROM (VALUES (1,1),(2,3),(3,2),(4,5)) t(x,y);
+SELECT round(regr_slope(y,x)::numeric,6), round(regr_intercept(y,x)::numeric,6) FROM (VALUES (1,1),(2,3),(3,2),(4,5)) t(x,y);
+SELECT round(corr(y,x)::numeric,6), round(regr_r2(y,x)::numeric,6) FROM (VALUES (1,1),(2,3),(3,2),(4,5)) t(x,y);
+SELECT round(covar_pop(y,x)::numeric,6), round(covar_samp(y,x)::numeric,6) FROM (VALUES (1,1),(2,3),(3,2),(4,5)) t(x,y);
+SELECT round(regr_sxx(y,x)::numeric,6), round(regr_syy(y,x)::numeric,6), round(regr_sxy(y,x)::numeric,6) FROM (VALUES (1,1),(2,3),(3,2),(4,5)) t(x,y);
+SELECT g, var_pop(x) FROM (VALUES ('a',1),('a',3),('b',10)) t(g,x) GROUP BY g ORDER BY g;
+SELECT x, stddev(x) OVER (ORDER BY x) FROM (VALUES (2),(4),(6),(8)) t(x) ORDER BY x;
+SELECT variance(DISTINCT x) FROM (VALUES (2),(2),(4),(6),(6)) t(x);
+-- percent_rank / cume_dist window functions
+SELECT x, round(percent_rank() OVER (ORDER BY x)::numeric,6), round(cume_dist() OVER (ORDER BY x)::numeric,6) FROM (VALUES (1),(2),(2),(3)) t(x) ORDER BY x;
+SELECT g, x, round(percent_rank() OVER (PARTITION BY g ORDER BY x)::numeric,4), round(cume_dist() OVER (PARTITION BY g ORDER BY x)::numeric,4) FROM (VALUES ('a',1),('a',2),('b',5),('b',5),('b',9)) t(g,x) ORDER BY g,x;
+-- pg_size_pretty (bigint): bytes/kB/MB/GB/TB/PB with half rounding
+SELECT pg_size_pretty(0::bigint), pg_size_pretty(1023::bigint), pg_size_pretty(1536::bigint), pg_size_pretty(10240::bigint);
+SELECT pg_size_pretty(5000000::bigint), pg_size_pretty(1073741824::bigint), pg_size_pretty(1099511627776::bigint), pg_size_pretty((-1536)::bigint);
+SELECT pg_size_pretty(1125899906842624000::bigint), pg_size_pretty(9223372036854775807::bigint);
+-- width_bucket over a thresholds array (binary search)
+SELECT width_bucket(5, ARRAY[1,3,7,10]), width_bucket(0, ARRAY[1,3,7,10]), width_bucket(3, ARRAY[1,3,7,10]), width_bucket(100, ARRAY[1,3,7,10]);
+SELECT width_bucket(5.5, ARRAY[1.0,3.0,7.0]), width_bucket('m', ARRAY['a','g','q']), width_bucket(3, ARRAY[]::int[]);
+-- pg_typeof reports the static type of a NULL-valued argument
+SELECT pg_typeof(NULL::integer), pg_typeof(NULL::numeric), pg_typeof(NULL::text), pg_typeof(NULL::int[]);
+SELECT pg_typeof(max(x)) FROM (VALUES (1)) t(x) WHERE false;
+SELECT pg_typeof(sum(x)) FROM (VALUES (1::bigint)) t(x) WHERE false;

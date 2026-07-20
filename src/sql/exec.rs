@@ -236,6 +236,13 @@ fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_INDEX_COLS]
 /// (which PostgreSQL forbids in CHECK).
 fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError> {
     match expression {
+        Expr::WholeRow(t) => {
+            return Err(sql_err!(
+                "0A000",
+                "whole-row reference to \"{}\" is not supported in CHECK",
+                t
+            ))
+        }
         Expr::Column { name, .. } => {
             if def.column_index(name).is_none() {
                 return Err(sql_err!(
@@ -1734,7 +1741,7 @@ pub fn insert(
         // Pass 1: count.
         let mut count = 0usize;
         if let Err(e) = super::query::select_into_rows(
-            storage, txn.txid, sel, arena, params, &mut |_| {
+            storage, txn.txid, sel, arena, params, None, &mut |_| {
                 count += 1;
                 Ok(())
             },
@@ -1756,7 +1763,7 @@ pub fn insert(
             at += 1;
             Ok(())
         };
-        if let Err(e) = super::query::select_into_rows(storage, txn.txid, sel, arena, params, &mut fill) {
+        if let Err(e) = super::query::select_into_rows(storage, txn.txid, sel, arena, params, None, &mut fill) {
             return sql_fail(e);
         }
 
@@ -2774,6 +2781,15 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
     let of = |t: ColType| (t.oid(), t.typlen());
     Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
+        // `count(t.*)` never infers its argument (count is typed int8
+        // directly); everywhere else a whole-row value has no type here.
+        Expr::WholeRow(t) => {
+            return Err(sql_err!(
+                "0A000",
+                "whole-row reference to \"{}\" is only supported as a count() argument",
+                t
+            ))
+        }
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {

@@ -53,6 +53,17 @@ pub mod sqlstate {
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// A whole-row reference (`t.*` as a value): Ok(true) when the row is
+    /// present, Ok(false) when it is an outer-join null row. Contexts without
+    /// join rows reject it.
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            "0A000",
+            "whole-row reference to \"{}\" is not supported in this context",
+            table
+        ))
+    }
+
     /// Static column type, if known — used to unify CASE branch types so a
     /// column reference contributes its declared type. Defaults to unknown.
     fn col_type(&self, _qualifier: Option<&str>, _name: &str) -> Option<ColType> {
@@ -66,6 +77,11 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         (**self).lookup(qualifier, name)
     }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        (**self).whole_row_present(table)
+    }
+
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         (**self).col_type(qualifier, name)
     }
@@ -191,6 +207,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
     match expression {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
         | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. }
+        | Expr::WholeRow(_)
         | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
@@ -350,6 +367,13 @@ pub fn eval_full<'a>(
     }
     match *expression {
         Expr::Null => Ok(Datum::Null),
+        // A whole-row value: NULL for an outer-join null row, else a non-null
+        // marker — consumable only by count() (type analysis rejects the rest).
+        Expr::WholeRow(table) => Ok(if row.whole_row_present(table)? {
+            Datum::Bool(true)
+        } else {
+            Datum::Null
+        }),
         Expr::Bool(b) => Ok(Datum::Bool(b)),
         Expr::Int(v) => Ok(if let Ok(small) = i32::try_from(v) {
             Datum::Int4(small)

@@ -585,12 +585,45 @@ impl<'a> Parser<'a> {
     }
 
     fn set_leaf(&mut self) -> Result<&'a SetTree<'a>, ParseError> {
-        // A parenthesized branch is itself a set-operation query.
+        // A parenthesized branch is itself a set-operation query, and may
+        // carry its own trailing ORDER BY / LIMIT / OFFSET (applied to the
+        // branch before the outer set operator combines it).
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             let inner = self.set_union()?;
+            let (order_by, limit, offset) = self.order_limit()?;
             self.expect_op(")")?;
-            return Ok(inner);
+            if order_by.is_empty() && limit.is_none() && offset.is_none() {
+                return Ok(inner);
+            }
+            let sel = match inner {
+                SetTree::Select(s) => {
+                    let mut sel = **s;
+                    sel.order_by = order_by;
+                    sel.limit = limit;
+                    sel.offset = offset;
+                    sel
+                }
+                op => Select {
+                    items: &[],
+                    distinct: false,
+                    from: None,
+                    where_clause: None,
+                    group_by: &[],
+                    grouping_sets: &[],
+                    having: None,
+                    order_by,
+                    limit,
+                    offset,
+                    with: &[],
+                    set_body: Some(op),
+                },
+            };
+            let boxed = self
+                .arena
+                .alloc(sel)
+                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+            return self.alloc_set(SetTree::Select(boxed));
         }
         // `VALUES (row), (row), ...` is a set-operator branch: desugar to
         // `SELECT row UNION ALL SELECT row ...` (each row a FROM-less SELECT).
@@ -2033,6 +2066,10 @@ impl<'a> Parser<'a> {
                     }
                 if self.peeked == Tok::Op(".") {
                     self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        return self.arena_expr(Expr::WholeRow(name));
+                    }
                     let column = self.any_ident("column name")?;
                     return self.arena_expr(Expr::Column {
                         qualifier: Some(name),
@@ -2065,6 +2102,10 @@ impl<'a> Parser<'a> {
                 }
                 if self.peeked == Tok::Op(".") {
                     self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        return self.arena_expr(Expr::WholeRow(name));
+                    }
                     let column = self.any_ident("column name")?;
                     return self.arena_expr(Expr::Column {
                         qualifier: Some(name),
@@ -2423,18 +2464,26 @@ impl<'a> Parser<'a> {
                     ParseError { sqlstate: "42P20", ..self.err_here("frame starting from following row cannot have preceding rows") }
                 );
             }
-            if self.eat_ident("exclude")? {
-                // EXCLUDE NO OTHERS is the default; the row/group/ties forms
-                // are not implemented — reject loudly rather than mis-frame.
+            let exclusion = if self.eat_ident("exclude")? {
                 if self.eat_ident("no")? {
                     self.expect_ident("others")?;
+                    FrameExclusion::NoOthers
+                } else if self.eat_ident("current")? {
+                    self.expect_ident("row")?;
+                    FrameExclusion::CurrentRow
+                } else if self.eat_ident("group")? {
+                    FrameExclusion::Group
+                } else if self.eat_ident("ties")? {
+                    FrameExclusion::Ties
                 } else {
                     return Err(self.err_here(
-                        "frame exclusion (EXCLUDE CURRENT ROW/GROUP/TIES) is not supported",
+                        "expected NO OTHERS, CURRENT ROW, GROUP, or TIES after EXCLUDE",
                     ));
                 }
-            }
-            Some(WindowFrame { units, start, end })
+            } else {
+                FrameExclusion::NoOthers
+            };
+            Some(WindowFrame { units, start, end, exclusion })
         } else {
             None
         };

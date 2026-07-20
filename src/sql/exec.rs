@@ -3546,6 +3546,17 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),
+            "make_timestamptz" => of(ColType::Timestamptz),
+            "isfinite" => of(ColType::Bool),
+            // date_bin returns the type of its source timestamp (arg 1).
+            "date_bin" => {
+                let src = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                if src == Some(oid::TIMESTAMPTZ) {
+                    of(ColType::Timestamptz)
+                } else {
+                    of(ColType::Timestamp)
+                }
+            }
             "age" | "justify_hours" | "justify_days" | "justify_interval" | "make_interval" => {
                 of(ColType::Interval)
             }

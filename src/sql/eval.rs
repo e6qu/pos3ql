@@ -1067,9 +1067,58 @@ fn call<'a>(
             "42803",
             "aggregate functions are not allowed here"
         )),
-        "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp" => {
+        "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
+        | "clock_timestamp" => {
             arity(0)?;
             Ok(Datum::Timestamptz(super::datetime::now_micros()))
+        }
+        // `date_bin(stride, source, origin)`: the stride-aligned bucket start at
+        // or before `source`, measured from `origin`. Strides with a month or
+        // year component are rejected, as in PostgreSQL.
+        "date_bin" => {
+            arity(3)?;
+            // The stride is an interval — coerce a bare string literal.
+            let stride = match cast_to(eval_full(args[0], arena, params, row, hooks)?, ColType::Interval, arena)? {
+                Datum::Interval(iv) => iv,
+                _ => return Ok(Datum::Null),
+            };
+            let source = eval_full(args[1], arena, params, row, hooks)?;
+            let origin = eval_full(args[2], arena, params, row, hooks)?;
+            let (source_micros, tz) = match source {
+                Datum::Timestamp(v) => (v, false),
+                Datum::Timestamptz(v) => (v, true),
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("date_bin source must be a timestamp", &other)),
+            };
+            let origin_micros = match origin {
+                Datum::Timestamp(v) | Datum::Timestamptz(v) => v,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("date_bin origin must be a timestamp", &other)),
+            };
+            if stride.months != 0 {
+                return Err(sql_err!(
+                    "0A000",
+                    "timestamps cannot be binned into intervals containing months or years"
+                ));
+            }
+            let stride_micros = (stride.days as i64) * 86_400_000_000 + stride.micros;
+            if stride_micros <= 0 {
+                return Err(sql_err!("22008", "stride must be greater than zero"));
+            }
+            let delta = source_micros - origin_micros;
+            // Floor-division so the bucket start is at or before the source.
+            let binned = origin_micros + delta.div_euclid(stride_micros) * stride_micros;
+            Ok(if tz { Datum::Timestamptz(binned) } else { Datum::Timestamp(binned) })
+        }
+        // `isfinite`: always true — no infinite date/timestamp/interval exists.
+        "isfinite" => {
+            arity(1)?;
+            match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Date(_) | Datum::Timestamp(_) | Datum::Timestamptz(_)
+                | Datum::Interval(_) => Ok(Datum::Bool(true)),
+                other => Err(type_mismatch("isfinite requires a date/time/interval", &other)),
+            }
         }
         "current_date" => {
             arity(0)?;
@@ -1473,20 +1522,39 @@ fn call<'a>(
             } else {
                 Datum::Int4(1)
             };
-            let (Some(s), Some(st)) = (as_i64(&start), as_i64(&step)) else {
+            if let (Some(s), Some(st)) = (as_i64(&start), as_i64(&step)) {
+                let v = s + (k - 1) * st;
+                // int4 unless an argument is int8 or the value overflows int4.
+                let wide = matches!(start, Datum::Int8(_)) || matches!(step, Datum::Int8(_));
+                return Ok(if !wide && i32::try_from(v).is_ok() {
+                    Datum::Int4(v as i32)
+                } else {
+                    Datum::Int8(v)
+                });
+            }
+            // Temporal series: date/timestamp[tz] start with an interval step.
+            let Some((base, kind)) = timestamp_series_start(&start) else {
+                if start.is_null() {
+                    return Ok(Datum::Null);
+                }
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "generate_series is supported for integer arguments"
+                    "generate_series is supported for integer and timestamp arguments"
                 ));
             };
-            let v = s + (k - 1) * st;
-            // int4 unless an argument is int8 or the value overflows int4.
-            let wide = matches!(start, Datum::Int8(_)) || matches!(step, Datum::Int8(_));
-            if !wide && i32::try_from(v).is_ok() {
-                Ok(Datum::Int4(v as i32))
-            } else {
-                Ok(Datum::Int8(v))
+            // The step is an interval — coerce a bare string literal, as
+            // PostgreSQL's function resolution does.
+            let Datum::Interval(step_iv) = cast_to(step, ColType::Interval, arena)? else {
+                return Ok(Datum::Null);
+            };
+            // Iterative addition — calendar month/day arithmetic does not
+            // distribute over multiplication, so the k-th value is `start`
+            // stepped k-1 times (matching PostgreSQL).
+            let mut v = base;
+            for _ in 1..k {
+                v = super::datetime::add_interval(v, step_iv);
             }
+            Ok(kind.datum(v))
         }
         // Set-returning `regexp_matches(string, pattern [, flags])`: for the
         // current expansion index k, the capture groups of the k-th match as a
@@ -3375,8 +3443,8 @@ fn call<'a>(
                 Ok(Datum::Timestamptz(super::datetime::to_timestamp(s, fmt)?))
             }
         }
-        "make_date" | "make_time" | "make_timestamp" => {
-            let want = if name == "make_timestamp" { 6 } else { 3 };
+        "make_date" | "make_time" | "make_timestamp" | "make_timestamptz" => {
+            let want = if name == "make_timestamp" || name == "make_timestamptz" { 6 } else { 3 };
             arity(want)?;
             // The seconds field is a double; every other field is an integer.
             let sec_idx = if name == "make_date" { usize::MAX } else { want - 1 };
@@ -3405,6 +3473,9 @@ fn call<'a>(
                 "make_time" => {
                     Ok(Datum::Time(super::datetime::make_time(ints[0], ints[1], sec)?))
                 }
+                "make_timestamptz" => Ok(Datum::Timestamptz(super::datetime::make_timestamp(
+                    ints[0], ints[1], ints[2], ints[3], ints[4], sec,
+                )?)),
                 _ => Ok(Datum::Timestamp(super::datetime::make_timestamp(
                     ints[0], ints[1], ints[2], ints[3], ints[4], sec,
                 )?)),
@@ -4570,6 +4641,78 @@ fn sql_regex_substring<'a>(
             };
             Ok(Datum::Text(arena.alloc_str(&s[from..to]).map_err(|_| arena_full())?))
         }
+    }
+}
+
+/// The result kind of a temporal `generate_series` / `date_bin`: a plain
+/// timestamp, or a timestamptz (which a `date` argument resolves to, matching
+/// PostgreSQL's preference for the timestamptz overload).
+#[derive(Clone, Copy)]
+pub enum SeriesKind {
+    Timestamp,
+    Timestamptz,
+}
+
+impl SeriesKind {
+    pub fn datum<'a>(self, micros: i64) -> Datum<'a> {
+        match self {
+            SeriesKind::Timestamp => Datum::Timestamp(micros),
+            SeriesKind::Timestamptz => Datum::Timestamptz(micros),
+        }
+    }
+
+    pub fn coltype(self) -> ColType {
+        match self {
+            SeriesKind::Timestamp => ColType::Timestamp,
+            SeriesKind::Timestamptz => ColType::Timestamptz,
+        }
+    }
+}
+
+/// Whether a `generate_series` interval step advances toward larger timestamps.
+/// Uses PostgreSQL's canonical interval ordering (30-day months, 24-hour days).
+fn interval_is_positive(step: super::types::Interval) -> bool {
+    let canonical = step.months as i128 * 2_592_000_000_000
+        + step.days as i128 * 86_400_000_000
+        + step.micros as i128;
+    canonical > 0
+}
+
+/// The number of values a temporal `generate_series(base, stop, step)` yields,
+/// iterating by calendar addition. A zero step errors; a runaway series is a
+/// loud error rather than an unbounded loop.
+pub fn timestamp_series_count(
+    base: i64,
+    stop: i64,
+    step: super::types::Interval,
+) -> Result<usize, SqlError> {
+    if step.months == 0 && step.days == 0 && step.micros == 0 {
+        return Err(sql_err!("22023", "step size cannot equal zero"));
+    }
+    let positive = interval_is_positive(step);
+    let mut v = base;
+    let mut n = 0usize;
+    while if positive { v <= stop } else { v >= stop } {
+        n += 1;
+        // A generous backstop against a pathologically large series; real limits
+        // come from the row arena when the values are materialized.
+        if n > 100_000_000 {
+            return Err(sql_err!("54000", "generate_series produces too many rows"));
+        }
+        v = super::datetime::add_interval(v, step);
+    }
+    Ok(n)
+}
+
+/// The base micros and result kind of a temporal `generate_series` start value,
+/// or None when it is not a date/timestamp. A `date` becomes UTC-midnight
+/// timestamptz.
+pub fn timestamp_series_start(d: &Datum) -> Option<(i64, SeriesKind)> {
+    match d {
+        Datum::Timestamp(v) => Some((*v, SeriesKind::Timestamp)),
+        Datum::Timestamptz(v) => Some((*v, SeriesKind::Timestamptz)),
+        Datum::Date(days) => Some((*days as i64 * 86_400_000_000, SeriesKind::Timestamptz)),
+        _ => None,
     }
 }
 

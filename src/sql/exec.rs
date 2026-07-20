@@ -3481,7 +3481,20 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             "div" | "trim_scale" | "to_number" => of(ColType::Numeric),
             "scale" | "min_scale" | "width_bucket" | "regexp_count" | "regexp_instr"
-            | "array_position" | "jsonb_array_length" | "json_array_length" => of(ColType::Int4),
+            | "array_position" | "jsonb_array_length" | "json_array_length"
+            | "num_nonnulls" | "num_nulls" => of(ColType::Int4),
+            "array_positions" => of(ColType::Array(super::types::ArrElem::Int4)),
+            // array_fill returns an array of its value argument's element type.
+            "array_fill" => {
+                let elem = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .and_then(|(oid, _)| coltype_of_oid(oid))
+                    .and_then(super::types::ArrElem::from_coltype)
+                    .unwrap_or(super::types::ArrElem::Int4);
+                of(ColType::Array(elem))
+            }
             "jsonb_typeof" | "json_typeof" | "json_extract_path_text"
             | "jsonb_extract_path_text" => of(ColType::Text),
             "json_extract_path" => of(ColType::Json),
@@ -3525,6 +3538,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 of(ColType::Float8)
             }
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
+            // Bitwise aggregates preserve the argument's (integer or bit) type.
+            "bit_and" | "bit_or" | "bit_xor" => {
+                args.first().map(|a| infer_type_res(a, columns)).transpose()?.unwrap_or(of(ColType::Int4))
+            }
             // Single-argument variance/stddev mirror the input class: numeric for
             // integer/numeric inputs, double precision for float8 (PostgreSQL's
             // aggregate signatures).

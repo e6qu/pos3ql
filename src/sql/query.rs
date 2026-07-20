@@ -5285,6 +5285,11 @@ enum AggKind {
     Max,
     BoolAnd,
     BoolOr,
+    /// Bitwise aggregates over integer or bit-string inputs, reducing with
+    /// `&`/`|`/`^`; the running value (its input type preserved) lives in `best`.
+    BitAnd,
+    BitOr,
+    BitXor,
     StringAgg,
     /// `array_agg(expr [ORDER BY ...])`: buffers every value (NULLs kept),
     /// optionally sorted / DISTINCT, then builds a one-dimensional array.
@@ -5410,6 +5415,9 @@ impl<'a> AggState<'a> {
             "max" => AggKind::Max,
             "bool_and" | "every" => AggKind::BoolAnd,
             "bool_or" => AggKind::BoolOr,
+            "bit_and" => AggKind::BitAnd,
+            "bit_or" => AggKind::BitOr,
+            "bit_xor" => AggKind::BitXor,
             "string_agg" => AggKind::StringAgg,
             "array_agg" => AggKind::ArrayAgg,
             "json_agg" => AggKind::JsonAgg { jsonb: false },
@@ -5667,6 +5675,19 @@ impl<'a> AggState<'a> {
                 };
                 let acc = self.bool_acc.get_or_insert(matches!(self.kind, AggKind::BoolAnd));
                 *acc = if self.kind == AggKind::BoolAnd { *acc && x } else { *acc || x };
+            }
+            // Bitwise aggregates reduce the running value (kept in `best`) with
+            // the incoming one via the corresponding bitwise operator.
+            AggKind::BitAnd | AggKind::BitOr | AggKind::BitXor => {
+                let operator = match self.kind {
+                    AggKind::BitAnd => super::ast::BinaryOp::BitAnd,
+                    AggKind::BitOr => super::ast::BinaryOp::BitOr,
+                    _ => super::ast::BinaryOp::BitXor,
+                };
+                self.best = Some(match self.best {
+                    None => v,
+                    Some(acc) => super::eval::bit_aggregate(operator, acc, v, arena)?,
+                });
             }
             // Only reached through the DISTINCT fold; the streaming path handles
             // string_agg directly (it needs the per-row delimiter).
@@ -6078,7 +6099,11 @@ impl<'a> AggState<'a> {
             AggKind::Count => Datum::Int8(self.count as i64),
             // regr_count over an empty group is 0, not NULL.
             AggKind::RegrCount => Datum::Int8(self.count as i64),
-            AggKind::Min | AggKind::Max => self.best.unwrap_or(Datum::Null),
+            // Min/Max and the bitwise aggregates return the running value in
+            // `best` (NULL for an all-NULL or empty group).
+            AggKind::Min | AggKind::Max | AggKind::BitAnd | AggKind::BitOr | AggKind::BitXor => {
+                self.best.unwrap_or(Datum::Null)
+            }
             _ if self.count == 0 => Datum::Null,
             // Statistical aggregates (count >= 1 here). `Sxx`/`Syy`/`Sxy` are the
             // corrected sums of squares/products; `_samp` needs count >= 2.

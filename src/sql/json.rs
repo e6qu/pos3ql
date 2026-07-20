@@ -370,9 +370,21 @@ pub fn write_datum_json(
     jsonb: bool,
     out: &mut dyn core::fmt::Write,
 ) -> core::fmt::Result {
+    // `row_to_json`/`to_json` use compact spacing; `to_jsonb` the jsonb form.
+    let (colon, comma) = if jsonb { (": ", ", ") } else { (":", ",") };
+    write_datum_json_styled(v, colon, comma, out)
+}
+
+/// Like [`write_datum_json`] but with explicit object-`:` and element-`,`
+/// spacing, so the `json_build_*` family (which uses `" : "` / `, `) and the
+/// `jsonb_build_*` family (which uses `": "` / `, `) can share the renderer.
+pub fn write_datum_json_styled(
+    v: &crate::sql::types::Datum,
+    colon: &str,
+    comma: &str,
+    out: &mut dyn core::fmt::Write,
+) -> core::fmt::Result {
     use crate::sql::types::Datum;
-    let colon = if jsonb { ": " } else { ":" };
-    let comma = if jsonb { ", " } else { "," };
     match v {
         Datum::Null => out.write_str("null"),
         Datum::Bool(b) => out.write_str(if *b { "true" } else { "false" }),
@@ -388,7 +400,7 @@ pub fn write_datum_json(
                     out.write_str(comma)?;
                 }
                 let elem = crate::sql::array::get(raw, *element, i).unwrap_or(Datum::Null);
-                write_datum_json(&elem, jsonb, out)?;
+                write_datum_json_styled(&elem, colon, comma, out)?;
             }
             out.write_char(']')
         }
@@ -400,7 +412,7 @@ pub fn write_datum_json(
                 }
                 write_json_raw_string(field.name, out)?;
                 out.write_str(colon)?;
-                write_datum_json(&field.value, jsonb, out)?;
+                write_datum_json_styled(&field.value, colon, comma, out)?;
             }
             out.write_char('}')
         }

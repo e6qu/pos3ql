@@ -3087,8 +3087,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 .transpose()?
                 .unwrap_or_else(|| of(ColType::Int8)),
             "count" => of(ColType::Int8),
-            "row_to_json" | "to_json" => of(ColType::Json),
-            "to_jsonb" => of(ColType::Jsonb),
+            "row_to_json" | "to_json" | "json_build_object" | "json_build_array" => {
+                of(ColType::Json)
+            }
+            "to_jsonb" | "jsonb_build_object" | "jsonb_build_array" => of(ColType::Jsonb),
             "row" => (oid::RECORD, -1),
             "sum" | "avg" => {
                 let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);

@@ -1556,6 +1556,64 @@ fn call<'a>(
             let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
             Ok(Datum::Json { text, jsonb })
         }
+        // `json_build_object(k1, v1, ...)` / `jsonb_build_object(...)`: an
+        // object from alternating key/value arguments. json uses `" : "`
+        // spacing, jsonb the canonical `": "`; both separate with `, `.
+        "json_build_object" | "jsonb_build_object" => {
+            if star {
+                return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}() does not exist", name));
+            }
+            if !args.len().is_multiple_of(2) {
+                return Err(sql_err!(
+                    "22023",
+                    "argument list must have even number of elements"
+                ));
+            }
+            let jsonb = name == "jsonb_build_object";
+            let colon = if jsonb { ": " } else { " : " };
+            let mut buf = crate::util::StackStr::<16384>::default();
+            let _ = buf.write_char('{');
+            for pair in args.chunks(2) {
+                let key = eval_full(pair[0], arena, params, row, hooks)?;
+                if key.is_null() {
+                    return Err(sql_err!("22004", "argument {}: key must not be null", 1));
+                }
+                let value = eval_full(pair[1], arena, params, row, hooks)?;
+                if !core::ptr::eq(pair.as_ptr(), args.as_ptr()) {
+                    let _ = buf.write_str(", ");
+                }
+                let mut key_text = crate::util::StackStr::<4096>::default();
+                let _ = write!(key_text, "{key}");
+                let _ = super::json::write_json_raw_string(key_text.as_str(), &mut buf);
+                let _ = buf.write_str(colon);
+                let _ = super::json::write_datum_json_styled(&value, colon, ", ", &mut buf);
+            }
+            let _ = buf.write_char('}');
+            debug_assert!(!buf.is_truncated());
+            let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+            Ok(Datum::Json { text, jsonb })
+        }
+        // `json_build_array(v1, v2, ...)` / `jsonb_build_array(...)`.
+        "json_build_array" | "jsonb_build_array" => {
+            if star {
+                return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}() does not exist", name));
+            }
+            let jsonb = name == "jsonb_build_array";
+            let colon = if jsonb { ": " } else { " : " };
+            let mut buf = crate::util::StackStr::<16384>::default();
+            let _ = buf.write_char('[');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    let _ = buf.write_str(", ");
+                }
+                let value = eval_full(a, arena, params, row, hooks)?;
+                let _ = super::json::write_datum_json_styled(&value, colon, ", ", &mut buf);
+            }
+            let _ = buf.write_char(']');
+            debug_assert!(!buf.is_truncated());
+            let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+            Ok(Datum::Json { text, jsonb })
+        }
         "pg_typeof" => {
             arity(1)?;
             let v = eval_full(args[0], arena, params, row, hooks)?;

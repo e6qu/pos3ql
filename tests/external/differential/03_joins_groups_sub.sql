@@ -409,3 +409,18 @@ SELECT * FROM (VALUES ('a', 1),(NULL, 2),('c', NULL)) t(a,b) ORDER BY b;
 SELECT 1 UNION SELECT NULL ORDER BY 1;
 SELECT NULL UNION SELECT NULL;
 SELECT a FROM (VALUES (NULL),(NULL)) t(a);
+-- json_build_object/array, json_agg/jsonb_agg, json_object_agg
+SELECT json_build_object('a', 1, 'b', 'x');
+SELECT jsonb_build_object('a', 1, 'b', true, 'c', null);
+SELECT json_build_array(1, 'x', true, null);
+SELECT jsonb_build_array(1, 2.5, 'y');
+SELECT json_agg(k) FROM (VALUES (1),(3),(2)) t(k);
+SELECT jsonb_agg(k ORDER BY k DESC) FROM (VALUES (1),(3),(2)) t(k);
+SELECT json_agg(row_to_json(t)) FROM (VALUES (1,'a'),(2,'b')) t(k,v);
+SELECT json_object_agg(k, v) FROM (VALUES ('a',1),('b',2)) t(k,v);
+SELECT jsonb_object_agg(k, v) FROM (VALUES ('a',1),('b',2)) t(k,v);
+SELECT json_agg(k) FROM (VALUES (1)) t(k) WHERE k > 5;
+SELECT g, json_agg(v ORDER BY v) FROM (VALUES ('x',2),('x',1),('y',3)) t(g,v) GROUP BY g ORDER BY g;
+SELECT json_build_object('nested', json_build_array(1,2), 'obj', json_build_object('x',1));
+SELECT jsonb_build_object('arr', ARRAY[1,2,3]);
+SELECT json_agg(DISTINCT k ORDER BY k) FROM (VALUES (3),(1),(1),(2)) t(k);

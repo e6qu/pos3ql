@@ -477,8 +477,23 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let rows: &'a [&'a [u8]] =
+        let mut rows: &'a [&'a [u8]] =
             if materialize { table_func_rows(tref, arena, params)? } else { &[] };
+        // `WITH ORDINALITY` appends a 1-based bigint to each materialized row.
+        if tref.with_ordinality && materialize {
+            let base_cols = def_reference.n_columns - 1;
+            const EMPTY: &[u8] = &[];
+            let wrapped = arena.alloc_slice_with(rows.len(), |_| EMPTY).map_err(|_| arena_full())?;
+            for (i, row) in rows.iter().enumerate() {
+                let mut vals = [Datum::Null; MAX_COLUMNS];
+                for (c, slot) in vals[..base_cols].iter_mut().enumerate() {
+                    *slot = super::exec::decode_projected_pub(row, c);
+                }
+                vals[base_cols] = Datum::Int8((i + 1) as i64);
+                wrapped[i] = super::exec::encode_projected_pub(&vals[..base_cols + 1], arena)?;
+            }
+            rows = &*wrapped;
+        }
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
@@ -2454,6 +2469,7 @@ fn subst_tableref<'a>(
             func_args: None,
             col_alias: t.col_alias,
             cte: Some(m),
+            with_ordinality: false,
         });
     }
     // An unqualified name matching a CTE becomes a derived table over the
@@ -2474,6 +2490,7 @@ fn subst_tableref<'a>(
             func_args: None,
             col_alias: renames,
             cte: None,
+            with_ordinality: false,
         });
     }
     // A name matching a view (and not shadowed by a CTE or table) expands to a
@@ -2507,6 +2524,7 @@ fn subst_tableref<'a>(
             func_args: None,
             col_alias: None,
             cte: None,
+            with_ordinality: false,
         });
     }
     Ok(*t)
@@ -3167,6 +3185,7 @@ fn rewrite_grouped_windows<'a>(
             func_args: None,
             col_alias: None,
             cte: None,
+            with_ordinality: false,
         },
         joins: &[],
     };
@@ -7827,6 +7846,8 @@ fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("json_array_elements")
         || name.eq_ignore_ascii_case("jsonb_array_elements_text")
         || name.eq_ignore_ascii_case("json_array_elements_text")
+        || name.eq_ignore_ascii_case("regexp_split_to_table")
+        || name.eq_ignore_ascii_case("generate_subscripts")
         || is_json_each_name(name)
 }
 
@@ -7992,6 +8013,34 @@ fn srf_count<'a, R: ColumnLookup<'a>>(
             _ => return Err(sql_err!("22023", "cannot deconstruct a scalar")),
         };
         Ok(super::eval::json_each_pairs(text, jsonb, as_text, arena)?.len())
+    } else if name.eq_ignore_ascii_case("regexp_split_to_table") {
+        let (src, pat) = match (
+            eval_full(args[0], arena, params, row, hooks)?,
+            eval_full(args[1], arena, params, row, hooks)?,
+        ) {
+            (Datum::Text(s), Datum::Text(p)) => (s, p),
+            _ => return Ok(0),
+        };
+        let ci = if args.len() == 3 {
+            match eval_full(args[2], arena, params, row, hooks)? {
+                Datum::Text(f) => super::eval::regexp_flags(f)?.1,
+                _ => return Ok(0),
+            }
+        } else {
+            false
+        };
+        Ok(super::eval::regex_split_pub(src, pat, ci, arena)?.len())
+    } else if name.eq_ignore_ascii_case("generate_subscripts") {
+        let raw = match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Array { raw, .. } => raw,
+            _ => return Ok(0),
+        };
+        let dim = match eval_full(args[1], arena, params, row, hooks)? {
+            Datum::Int4(v) => v as i64,
+            Datum::Int8(v) => v,
+            _ => return Ok(0),
+        };
+        Ok(if dim == 1 { super::array::len(raw) } else { 0 })
     } else {
         // unnest / _pg_expandarray over an array.
         match eval_full(args[0], arena, params, row, hooks)? {
@@ -9945,7 +9994,9 @@ fn table_func_def<'a>(
         || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
         || tref.table.eq_ignore_ascii_case("json_array_elements_text");
     let is_each = is_json_each_name(tref.table);
-    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems && !is_each {
+    let is_rstt = tref.table.eq_ignore_ascii_case("regexp_split_to_table");
+    let is_gsub = tref.table.eq_ignore_ascii_case("generate_subscripts");
+    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems && !is_each && !is_rstt && !is_gsub {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
@@ -9956,7 +10007,7 @@ fn table_func_def<'a>(
         "generate_series"
     } else if is_re {
         "regexp_matches"
-    } else if is_keys || is_elems || is_each {
+    } else if is_keys || is_elems || is_each || is_rstt || is_gsub {
         tref.table
     } else {
         "unnest"
@@ -9991,9 +10042,11 @@ fn table_func_def<'a>(
     } else {
         let single_type = if is_gs {
             ColType::Int8
+        } else if is_gsub {
+            ColType::Int4
         } else if is_re {
             ColType::Array(super::types::ArrElem::Text)
-        } else if is_keys {
+        } else if is_keys || is_rstt {
             ColType::Text
         } else if is_elems {
             if tref.table.eq_ignore_ascii_case("json_array_elements") {
@@ -10018,15 +10071,17 @@ fn table_func_def<'a>(
         default_cols[0] = (if is_elems { "value" } else { name }, single_type);
         1
     };
+    // `WITH ORDINALITY` appends a `bigint` ordinality column.
+    let n_out = if tref.with_ordinality { n_default + 1 } else { n_default };
     // Column aliases rename the columns positionally; too many is an error.
     if let Some(aliases) = tref.col_alias
-        && aliases.len() > n_default
+        && aliases.len() > n_out
     {
         return Err(sql_err!(
             "42P10",
             "table \"{}\" has {} columns available but {} columns specified",
             name,
-            n_default,
+            n_out,
             aliases.len()
         ));
     }
@@ -10038,10 +10093,17 @@ fn table_func_def<'a>(
             .unwrap_or(default_name);
         columns[i] = ColumnMeta { name: SqlName::parse(col_name)?, ctype: *ctype, ..blank };
     }
+    if tref.with_ordinality {
+        let col_name = tref
+            .col_alias
+            .and_then(|a| a.get(n_default).copied())
+            .unwrap_or("ordinality");
+        columns[n_default] = ColumnMeta { name: SqlName::parse(col_name)?, ctype: ColType::Int8, ..blank };
+    }
     let def = TableDef {
         name: SqlName::parse(name)?,
         columns,
-        n_columns: n_default,
+        n_columns: n_out,
         ..TableDef::empty()
     };
     Ok(&*arena.alloc(def).map_err(|_| arena_full())?)
@@ -10082,6 +10144,61 @@ fn table_func_rows<'a>(
         let rows = arena.alloc_slice_with(pairs.len(), |_| EMPTY).map_err(|_| arena_full())?;
         for (slot, (key, value)) in rows.iter_mut().zip(pairs.iter()) {
             *slot = super::exec::encode_projected_pub(&[Datum::Text(key), *value], arena)?;
+        }
+        return Ok(&*rows);
+    }
+    // regexp_split_to_table(string, pattern [, flags]): one text row per piece.
+    if tref.table.eq_ignore_ascii_case("regexp_split_to_table") {
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!("42883", "regexp_split_to_table(...) argument count"));
+        }
+        let (src, pat) = match (
+            super::eval::eval(args[0], arena, params, &super::eval::NoColumns)?,
+            super::eval::eval(args[1], arena, params, &super::eval::NoColumns)?,
+        ) {
+            (Datum::Text(s), Datum::Text(p)) => (s, p),
+            (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
+            (a, _) => return Err(super::eval::type_mismatch_pub("regexp_split_to_table", &a)),
+        };
+        let case_insensitive = if args.len() == 3 {
+            match super::eval::eval(args[2], arena, params, &super::eval::NoColumns)? {
+                Datum::Text(f) => super::eval::regexp_flags(f)?.1,
+                Datum::Null => return Ok(&[]),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let pieces = super::eval::regex_split_pub(src, pat, case_insensitive, arena)?;
+        const EMPTY: &[u8] = &[];
+        let rows = arena.alloc_slice_with(pieces.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        for (slot, piece) in rows.iter_mut().zip(pieces.iter()) {
+            *slot = super::exec::encode_projected_pub(&[*piece], arena)?;
+        }
+        return Ok(&*rows);
+    }
+    // generate_subscripts(array, dim): the 1-based indices of `array` along
+    // `dim`; empty for a dim other than 1 (arrays are one-dimensional here).
+    if tref.table.eq_ignore_ascii_case("generate_subscripts") {
+        if args.len() != 2 {
+            return Err(sql_err!("42883", "generate_subscripts(...) argument count"));
+        }
+        let raw = match super::eval::eval(args[0], arena, params, &super::eval::NoColumns)? {
+            Datum::Array { raw, .. } => raw,
+            Datum::Null => return Ok(&[]),
+            a => return Err(super::eval::type_mismatch_pub("generate_subscripts", &a)),
+        };
+        let dim = match super::eval::eval(args[1], arena, params, &super::eval::NoColumns)? {
+            Datum::Int4(v) => v as i64,
+            Datum::Int8(v) => v,
+            Datum::Null => return Ok(&[]),
+            a => return Err(super::eval::type_mismatch_pub("generate_subscripts", &a)),
+        };
+        let count = if dim == 1 { super::array::len(raw) } else { 0 };
+        const EMPTY: &[u8] = &[];
+        let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
+        for (i, slot) in rows.iter_mut().enumerate() {
+            *slot = super::exec::encode_projected_pub(&[Datum::Int4((i + 1) as i32)], arena)?;
         }
         return Ok(&*rows);
     }

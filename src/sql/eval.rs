@@ -1571,6 +1571,56 @@ fn call<'a>(
         }
         // Set-returning `jsonb_object_keys(obj)` / `json_object_keys(obj)`
         // yield each key of the object as one text row.
+        // Set-returning `regexp_split_to_table(source, pattern [, flags])`:
+        // the k-th split piece for the current expansion index.
+        "regexp_split_to_table" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let (Some(src), Some(pat)) = (
+                text_arg(name, args, 0, arena, params, row, hooks)?,
+                text_arg(name, args, 1, arena, params, row, hooks)?,
+            ) else {
+                return Ok(Datum::Null);
+            };
+            let case_insensitive = if args.len() == 3 {
+                let Some(flags) = text_arg(name, args, 2, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                regexp_flags(flags)?.1
+            } else {
+                false
+            };
+            let pieces = regex_split_pub(src, pat, case_insensitive, arena)?;
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            Ok(pieces.get(k - 1).copied().unwrap_or(Datum::Null))
+        }
+        // Set-returning `generate_subscripts(array, dim)`: the k-th 1-based index
+        // of the array along `dim` (only dimension 1 exists here).
+        "generate_subscripts" => {
+            arity(2)?;
+            let raw = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Array { raw, .. } => raw,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("generate_subscripts requires an array", &other)),
+            };
+            let dim = match eval_full(args[1], arena, params, row, hooks)? {
+                Datum::Int4(v) => v as i64,
+                Datum::Int8(v) => v,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("generate_subscripts dim must be an integer", &other)),
+            };
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            if dim == 1 && k <= super::array::len(raw) {
+                Ok(Datum::Int4(k as i32))
+            } else {
+                Ok(Datum::Null)
+            }
+        }
         "jsonb_object_keys" | "json_object_keys" => {
             arity(1)?;
             let jsonb = name.starts_with("jsonb");
@@ -4523,6 +4573,19 @@ fn sql_regex_substring<'a>(
     }
 }
 
+/// Splits `src` on every match of `pattern` into an arena slice of text pieces,
+/// for callers outside this module (`regexp_split_to_table` in the FROM clause).
+pub fn regex_split_pub<'a>(
+    src: &'a str,
+    pattern: &str,
+    case_insensitive: bool,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let mut pieces = [Datum::Null; 1024];
+    let n = regex_split(src, pattern, case_insensitive, &mut pieces)?;
+    Ok(&*arena.alloc_slice_copy(&pieces[..n]).map_err(|_| arena_full())?)
+}
+
 /// Splits `src` on every match of `pattern`, writing the pieces into `out` and
 /// returning the count. An empty pattern splits into individual characters.
 fn regex_split<'a>(
@@ -6292,6 +6355,11 @@ fn overflow(what: &'static str) -> SqlError {
 
 fn division_by_zero() -> SqlError {
     sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero")
+}
+
+/// [`type_mismatch`] for callers outside this module (table-function args).
+pub fn type_mismatch_pub(operator: &str, d: &Datum) -> SqlError {
+    type_mismatch(operator, d)
 }
 
 fn type_mismatch(operator: &str, d: &Datum) -> SqlError {

@@ -537,3 +537,16 @@ SELECT regexp_split_to_array('a,b,c', ','), regexp_split_to_array('the quick bro
 SELECT regexp_split_to_array('abc', ''), regexp_split_to_array('a1b22c', '[0-9]+');
 SELECT regexp_split_to_array('a,b,', ',');
 SELECT pg_typeof(regexp_split_to_array('a,b', ',')), pg_typeof(regexp_like('a','a'));
+-- regexp_split_to_table, generate_subscripts, and WITH ORDINALITY
+SELECT regexp_split_to_table('a,b,c', ',');
+SELECT v FROM regexp_split_to_table('a1b22c', '[0-9]+') AS s(v);
+SELECT regexp_split_to_table('the quick brown', '\s+');
+SELECT generate_subscripts(ARRAY[10,20,30], 1);
+SELECT sub FROM generate_subscripts(ARRAY['a','b'], 1) AS g(sub) ORDER BY sub;
+SELECT generate_subscripts(ARRAY[10,20], 2);
+SELECT * FROM unnest(ARRAY['x','y','z']) WITH ORDINALITY;
+SELECT elem, idx FROM unnest(ARRAY['x','y']) WITH ORDINALITY AS t(elem, idx) ORDER BY idx DESC;
+SELECT * FROM generate_series(5,7) WITH ORDINALITY;
+SELECT w, n FROM regexp_split_to_table('a,b,c', ',') WITH ORDINALITY AS t(w, n) ORDER BY n;
+SELECT key, value, ordinality FROM json_each('{"a":1,"b":2}') WITH ORDINALITY ORDER BY ordinality;
+SELECT sum(ordinality) FROM unnest(ARRAY[10,20,30]) WITH ORDINALITY;

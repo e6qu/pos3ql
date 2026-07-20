@@ -3532,6 +3532,8 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             // regexp_matches returns each match's capture groups as text[].
             "regexp_matches" => of(ColType::Array(super::types::ArrElem::Text)),
+            "regexp_split_to_table" => of(ColType::Text),
+            "generate_subscripts" => of(ColType::Int4),
             "jsonb_object_keys" | "json_object_keys" | "jsonb_array_elements_text"
             | "json_array_elements_text" => of(ColType::Text),
             "jsonb_array_elements" => of(ColType::Jsonb),

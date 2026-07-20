@@ -769,6 +769,7 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 col_alias,
                 cte: None,
+                with_ordinality: false,
             });
         }
         let first = self.any_ident("table name")?;
@@ -777,8 +778,8 @@ impl<'a> Parser<'a> {
         } else {
             (None, first)
         };
-        // Table function: `func(args) [AS] alias`. Only valid immediately after
-        // the (possibly schema-qualified) name, before any alias.
+        // Table function: `func(args) [WITH ORDINALITY] [AS] alias`. Only valid
+        // immediately after the (possibly schema-qualified) name.
         let func_args = if self.peeked == Tok::Op("(") {
             self.advance()?;
             let mut args: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
@@ -800,6 +801,13 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // `WITH ORDINALITY` follows the argument list, before any alias.
+        let with_ordinality = if func_args.is_some() && self.eat_ident("with")? {
+            self.expect_ident("ordinality")?;
+            true
+        } else {
+            false
+        };
         let alias = if self.eat_ident("as")? {
             Some(self.any_ident("alias")?)
         } else if let Tok::Ident(word) = self.peeked {
@@ -820,7 +828,16 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(TableRef { schema, table, alias, subquery: None, func_args, col_alias, cte: None })
+        Ok(TableRef {
+            schema,
+            table,
+            alias,
+            subquery: None,
+            func_args,
+            col_alias,
+            cte: None,
+            with_ordinality,
+        })
     }
 
     /// Parses an optional column-alias list `(col1, col2, ...)` following a FROM
@@ -850,7 +867,7 @@ impl<'a> Parser<'a> {
     fn from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
         let base = self.table_ref()?;
         let dummy = Join {
-            table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None, cte: None },
+            table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None, cte: None, with_ordinality: false },
             kind: JoinKind::Inner,
             on: None,
             using_columns: None,

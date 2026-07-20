@@ -3551,6 +3551,16 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "make_timestamp" => of(ColType::Timestamp),
             "make_timestamptz" => of(ColType::Timestamptz),
             "isfinite" => of(ColType::Bool),
+            // Encoding / hashing / bytea manipulation.
+            "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "set_bit"
+            | "convert_to" => of(ColType::Bytea),
+            "encode" | "convert_from" | "quote_ident" | "quote_literal" | "quote_nullable" => {
+                of(ColType::Text)
+            }
+            "get_byte" | "get_bit" => of(ColType::Int4),
+            "overlaps" => of(ColType::Bool),
+            "bit_count" => of(ColType::Int8),
+            "parse_ident" => of(ColType::Array(super::types::ArrElem::Text)),
             // date_bin returns the type of its source timestamp (arg 1).
             "date_bin" => {
                 let src = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);

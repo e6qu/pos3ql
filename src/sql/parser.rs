@@ -1914,28 +1914,47 @@ impl<'a> Parser<'a> {
                     return self.arena_expr(Expr::Subquery(boxed));
                 }
                 let inner = self.expression(0)?;
-                // `(start, end) OVERLAPS (start, end)`: a time-period pair. The
-                // only place a bare parenthesized comma pair is valid; desugars
-                // to the internal `overlaps(s1, e1, s2, e2)` call.
+                // A parenthesized comma list is either an OVERLAPS period pair
+                // `(start, end) OVERLAPS (start, end)` (desugared to the internal
+                // `overlaps(s1, e1, s2, e2)` call) or, in every other position,
+                // an implicit row constructor equivalent to `ROW(...)`.
+                let mut base = inner;
                 if self.peeked == Tok::Op(",") {
-                    self.advance()?;
-                    let inner_end = self.expression(0)?;
+                    let mut items = [inner; MAX_LIST];
+                    let mut n = 1usize;
+                    while self.peeked == Tok::Op(",") {
+                        self.advance()?;
+                        if n == MAX_LIST {
+                            return Err(self.limit("row constructor", MAX_LIST));
+                        }
+                        items[n] = self.expression(0)?;
+                        n += 1;
+                    }
                     self.expect_op(")")?;
-                    self.expect_ident("overlaps")?;
-                    self.expect_op("(")?;
-                    let other_start = self.expression(0)?;
-                    self.expect_op(",")?;
-                    let other_end = self.expression(0)?;
+                    if self.peeked == Tok::Ident("overlaps") {
+                        if n != 2 {
+                            return Err(self.err_here("OVERLAPS requires a (start, end) pair"));
+                        }
+                        self.advance()?;
+                        self.expect_op("(")?;
+                        let other_start = self.expression(0)?;
+                        self.expect_op(",")?;
+                        let other_end = self.expression(0)?;
+                        self.expect_op(")")?;
+                        return self.plain_call(
+                            "overlaps",
+                            &[items[0], items[1], other_start, other_end],
+                        );
+                    }
+                    base = self.plain_call("row", &items[..n])?;
+                } else {
                     self.expect_op(")")?;
-                    return self.plain_call("overlaps", &[inner, inner_end, other_start, other_end]);
                 }
-                self.expect_op(")")?;
                 // `(expression).field` composite field access (chained), or
                 // `(expression).*` record expansion. The star is carried as a
                 // `Field` with the sentinel field name `*` (no real column can
                 // be named that); `select_items` turns a top-level one into a
                 // `RecordStar` item and every other position rejects it.
-                let mut base = inner;
                 while self.peeked == Tok::Op(".") {
                     self.advance()?;
                     if self.peeked == Tok::Op("*") {
@@ -2218,6 +2237,13 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(")")?;
                 return self.plain_call("substring", &cargs[..cn]);
+            }
+            // `substring(str FOR len)` — no FROM; PostgreSQL implies FROM 1.
+            if self.eat_ident("for")? {
+                let len = self.expression(0)?;
+                let one = self.arena_expr(Expr::Int(1))?;
+                self.expect_op(")")?;
+                return self.plain_call("substring", &[target, one, len]);
             }
             // Comma form `substring(str, start[, len])`.
             let mut cargs = [target, target, target];

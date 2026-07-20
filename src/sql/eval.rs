@@ -554,6 +554,18 @@ pub fn eval_full<'a>(
         }
         Expr::IsNull { operand, negated } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
+            // A row `IS NULL` is true only when *every* field is null, and
+            // `IS NOT NULL` only when every field is non-null — so a mixed row
+            // is false for both (PostgreSQL's row null-test, not a plain
+            // negation).
+            if let Datum::Record(fields) = v {
+                let result = if negated {
+                    fields.iter().all(|f| !f.value.is_null())
+                } else {
+                    fields.iter().all(|f| f.value.is_null())
+                };
+                return Ok(Datum::Bool(result));
+            }
             Ok(Datum::Bool(v.is_null() != negated))
         }
         Expr::Call { name, args, star, distinct, over, .. } => {
@@ -4944,6 +4956,55 @@ fn is_unknown_literal(expression: &Expr) -> bool {
     matches!(expression, Expr::Str(_) | Expr::Param(_))
 }
 
+/// PostgreSQL row comparison (`(a,b) = (c,d)`, `<`, …): three-valued and
+/// short-circuiting, distinct from the total order `compare_datums` gives
+/// ORDER BY. Equality scans every pair — a definite inequality is `false`, an
+/// all-equal row is `true`, and an otherwise-equal row with a NULL pair is
+/// NULL. Ordering walks left to right — the first non-equal pair decides, and a
+/// NULL pair reached before then yields NULL. The rows must have equal arity.
+fn row_compare<'a>(
+    operator: BinaryOp,
+    a: &[super::types::RecordField<'a>],
+    b: &[super::types::RecordField<'a>],
+) -> Result<Datum<'a>, SqlError> {
+    use BinaryOp::*;
+    if a.len() != b.len() {
+        return Err(sql_err!("42601", "unequal number of entries in row expressions"));
+    }
+    match operator {
+        Eq | NotEq => {
+            let mut saw_null = false;
+            for (x, y) in a.iter().zip(b) {
+                if x.value.is_null() || y.value.is_null() {
+                    saw_null = true;
+                } else if !compare_datums(&x.value, &y.value)?.is_eq() {
+                    return Ok(Datum::Bool(operator == NotEq));
+                }
+            }
+            if saw_null {
+                Ok(Datum::Null)
+            } else {
+                Ok(Datum::Bool(operator == Eq))
+            }
+        }
+        _ => {
+            for (x, y) in a.iter().zip(b) {
+                if x.value.is_null() || y.value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let ordering = compare_datums(&x.value, &y.value)?;
+                if !ordering.is_eq() {
+                    return Ok(Datum::Bool(match operator {
+                        Lt | LtEq => ordering.is_lt(),
+                        _ => ordering.is_gt(),
+                    }));
+                }
+            }
+            Ok(Datum::Bool(matches!(operator, LtEq | GtEq)))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Bitwise combine of two `bit_and`/`bit_or`/`bit_xor` aggregate inputs, over
 /// integers or bit strings, reusing the operator machinery (bit strings of
@@ -4982,6 +5043,10 @@ fn binary<'a>(
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),
+            // Row comparison uses PostgreSQL's three-valued, short-circuiting
+            // semantics (NULL-propagating), distinct from the total order that
+            // `compare_datums` gives ORDER BY / DISTINCT.
+            (Datum::Record(a), Datum::Record(b)) => row_compare(operator, a, b),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         // `jsonb - text`/`text[]`/`integer` deletes a key, keys, or an element.

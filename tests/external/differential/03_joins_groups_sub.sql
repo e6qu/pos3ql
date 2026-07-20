@@ -666,3 +666,14 @@ SELECT array_fill(7, ARRAY[3]), array_fill('x'::text, ARRAY[2]), array_fill(1, A
 SELECT array_positions(ARRAY[1,2,1,3,1], 1), array_positions(ARRAY[5,6,7], 9), array_positions(ARRAY[1,NULL,2,NULL], NULL);
 SELECT bit_or(x) FROM (VALUES (1),(NULL),(4)) t(x);
 SELECT bit_and(x) FROM (VALUES (NULL::int)) t(x);
+-- implicit row constructors and three-valued row comparison
+SELECT (1,2) = (1,2), (1,2) < (1,3), (1,2) <> (1,3), (1,2,3) = (1,2,3), (1,2,3) < (1,2,4);
+SELECT (1, 'a'), (1, 'a')::text, ROW(1,2) = (1,2);
+SELECT (1,2) <= (1,2), (2,1) > (1,9), (1,2,3) >= (1,2,3);
+SELECT (1,NULL) = (1,NULL), (1,NULL) = (2,NULL), (1,NULL) < (2,1), (NULL,1) < (NULL,2);
+SELECT (1,NULL) <> (1,3), (1,NULL) IS NULL, (NULL,NULL) IS NULL;
+SELECT (a, b) FROM (VALUES (3,4),(1,2)) t(a,b) ORDER BY (a, b);
+SELECT CASE WHEN (1,2) < (1,3) THEN 'less' ELSE 'ge' END;
+-- substring(str FOR len) (implies FROM 1)
+SELECT substring('abcdef' for 3), substring('hello world' for 5), substring('abc' for 0), substring('abc' for 10);
+SELECT (1,NULL) IS NOT NULL, (1,2) IS NOT NULL, (NULL,NULL) IS NOT NULL, ROW(NULL,NULL) IS NULL;

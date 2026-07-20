@@ -968,6 +968,9 @@ fn patch_subquery_column_types<'a>(
                     }))
                     .unwrap_or(0);
             }
+            SelectItem::RecordStar(base) => {
+                slot += scope.map_or(0, |s| record_star_width(base, s));
+            }
             SelectItem::Expr { expression, .. } => {
                 if slot < columns.len()
                     && matches!(**expression, Expr::Subquery(_) | Expr::ArraySubquery(_))
@@ -1073,6 +1076,18 @@ fn resolve_order_target<'a>(
                     );
                 }
                 remaining -= def.n_columns;
+            }
+            SelectItem::RecordStar(base) => {
+                let width = record_star_width(base, scope);
+                if remaining < width {
+                    // A positional (ORDER BY/GROUP BY ordinal) reference into a
+                    // `(record).*` expansion has no simple column to resolve to.
+                    return Err(sql_err!(
+                        "0A000",
+                        "ORDER BY/GROUP BY position into a record expansion is not supported"
+                    ));
+                }
+                remaining -= width;
             }
         }
     }
@@ -2325,6 +2340,9 @@ fn subst_select<'a>(
         items[i] = match it {
             SelectItem::Wildcard => SelectItem::Wildcard,
             SelectItem::TableWildcard(q) => SelectItem::TableWildcard(q),
+            SelectItem::RecordStar(base) => {
+                SelectItem::RecordStar(subst_expr(base, context, arena)?)
+            }
             SelectItem::Expr { expression, alias } => SelectItem::Expr {
                 expression: subst_expr(expression, context, arena)?,
                 alias: *alias,
@@ -4827,7 +4845,9 @@ fn run_subquery<'a>(
     };
     let item: &Expr = match &select.items[0] {
         SelectItem::Expr { expression, .. } => expression,
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => &Expr::Null,
+        SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+            &Expr::Null
+        }
     };
     if !select.group_by.is_empty() || select.having.is_some() || select.distinct {
         // Grouped/DISTINCT subquery: the row-source executor already handles
@@ -6855,7 +6875,9 @@ fn leaf_col_unknown<'a>(
                 }
                 idx += 1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => return false,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+                return false
+            }
         }
     }
     false
@@ -7300,7 +7322,24 @@ pub fn constant_select<'a>(
     // names/expressions bind to an item (whose computed value is the key —
     // a set-returning item cannot re-evaluate outside its hook); anything
     // else evaluates per output row.
-    let width = statement.items.len();
+    // Each item occupies `col_start[i]..col_start[i+1]` output columns; a
+    // `(record).*` item expands to several, everything else to one. `width` is
+    // the true visible column count (matching the row description).
+    let mut col_start = [0usize; MAX_PROJ + 1];
+    {
+        let mut col = 0usize;
+        for (i, item) in statement.items.iter().enumerate() {
+            col_start[i] = col;
+            col += match item {
+                SelectItem::RecordStar(base) => {
+                    super::exec::record_shape(base, &super::exec::NoCols, |_, _| {}).unwrap_or(0)
+                }
+                _ => 1,
+            };
+        }
+        col_start[statement.items.len()] = col;
+    }
+    let width = col_start[statement.items.len()];
     let n_order = statement.order_by.len();
     let mut order_item: [Option<usize>; MAX_PROJ] = [None; MAX_PROJ];
     for (j, ob) in statement.order_by.iter().enumerate() {
@@ -7315,12 +7354,14 @@ pub fn constant_select<'a>(
             order_item[j] = Some(*pos as usize - 1);
             continue;
         }
+        // A non-ordinal key binds to the (single-column) item whose expression
+        // or output name it matches; record-star items never match by name.
         order_item[j] = statement.items.iter().position(|item| {
             matches!(item, SelectItem::Expr { expression, alias }
                 if **expression == *ob.expression
                     || matches!(ob.expression, Expr::Column { qualifier: None, name }
                         if *name == alias.unwrap_or(super::exec::derived_name(expression))))
-        });
+        }).map(|i| col_start[i]);
         if statement.distinct && order_item[j].is_none() {
             return sql_fail(sql_err!(
                 "42P10",
@@ -7345,12 +7386,24 @@ pub fn constant_select<'a>(
         };
         let mut values = [Datum::Null; MAX_PROJ + MAX_PROJ];
         for (i, item) in statement.items.iter().enumerate() {
-            let SelectItem::Expr { expression, .. } = item else {
-                unreachable!("wildcard rejected by describe_items");
-            };
-            match eval_full(expression, arena, params, &super::eval::NoColumns, &khooks) {
-                Ok(v) => values[i] = v,
-                Err(e) => return sql_fail(e),
+            match item {
+                SelectItem::Expr { expression, .. } => {
+                    match eval_full(expression, arena, params, &super::eval::NoColumns, &khooks) {
+                        Ok(v) => values[col_start[i]] = v,
+                        Err(e) => return sql_fail(e),
+                    }
+                }
+                SelectItem::RecordStar(base) => {
+                    match super::eval::record_star_expand(base, arena, params, &super::eval::NoColumns, &khooks) {
+                        Ok(fields) => {
+                            for (k, f) in fields.iter().enumerate() {
+                                values[col_start[i] + k] = f.value;
+                            }
+                        }
+                        Err(e) => return sql_fail(e),
+                    }
+                }
+                _ => unreachable!("wildcard rejected by describe_items in a FROM-less select"),
             }
         }
         if let Some(w) = statement.where_clause {
@@ -7522,15 +7575,22 @@ pub fn select_into_rows<'a>(
             let mut vals = [Datum::Null; MAX_PROJ];
             let mut n = 0;
             for item in statement.items {
-                let SelectItem::Expr { expression, .. } = item else {
-                    return Err(sql_err!(
+                match item {
+                    SelectItem::Expr { expression, .. } => {
+                        vals[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &agg_hooks)?;
+                        n += 1;
+                    }
+                    SelectItem::RecordStar(base) => {
+                        for field in super::eval::record_star_expand(base, arena, params, &super::eval::NoColumns, &agg_hooks)? {
+                            vals[n] = field.value;
+                            n += 1;
+                        }
+                    }
+                    _ => return Err(sql_err!(
                         "42601",
                         "SELECT * with no tables specified is not valid"
-                    ));
-                };
-                vals[n] =
-                    eval_full(expression, arena, params, &super::eval::NoColumns, &agg_hooks)?;
-                n += 1;
+                    )),
+                }
             }
             emit(&vals[..n])?;
             return Ok(());
@@ -7596,11 +7656,19 @@ pub fn select_into_rows<'a>(
             let mut vals = [Datum::Null; MAX_PROJ];
             let mut n = 0;
             for item in statement.items {
-                let SelectItem::Expr { expression, .. } = item else {
-                    return Err(sql_err!("42601", "SELECT * with no tables specified is not valid"));
-                };
-                vals[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &khooks)?;
-                n += 1;
+                match item {
+                    SelectItem::Expr { expression, .. } => {
+                        vals[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &khooks)?;
+                        n += 1;
+                    }
+                    SelectItem::RecordStar(base) => {
+                        for field in super::eval::record_star_expand(base, arena, params, &super::eval::NoColumns, &khooks)? {
+                            vals[n] = field.value;
+                            n += 1;
+                        }
+                    }
+                    _ => return Err(sql_err!("42601", "SELECT * with no tables specified is not valid")),
+                }
             }
             emit(&vals[..n])?;
         }
@@ -7778,6 +7846,7 @@ fn find_srf<'a>(items: &[SelectItem<'a>]) -> Option<&'a Expr<'a>> {
     }
     items.iter().find_map(|it| match it {
         SelectItem::Expr { expression, .. } => walk(expression),
+        SelectItem::RecordStar(base) => walk(base),
         SelectItem::Wildcard | SelectItem::TableWildcard(_) => None,
     })
 }
@@ -8018,6 +8087,19 @@ fn project_row_skipping<'a>(
                     n += 1;
                 }
             }
+            SelectItem::RecordStar(base) => {
+                for field in super::eval::record_star_expand(base, arena, params, row, hooks)? {
+                    if n == MAX_PROJ {
+                        return Err(sql_err!(
+                            "54000",
+                            "select list expands past {} columns",
+                            MAX_PROJ
+                        ));
+                    }
+                    out[n] = field.value;
+                    n += 1;
+                }
+            }
             SelectItem::Expr { expression, .. } => {
                 if n == MAX_PROJ {
                     return Err(sql_err!(
@@ -8072,6 +8154,9 @@ pub fn describe_scope_items<'q>(
                     n += 1;
                 }
             }
+            SelectItem::RecordStar(base) => {
+                n = describe_scope_record_star(base, scope, out, n)?;
+            }
             SelectItem::Expr { expression, alias } => {
                 if n == out.len() {
                     return Err(sql_err!("54000", "select list too wide"));
@@ -8082,6 +8167,55 @@ pub fn describe_scope_items<'q>(
                 out[n] = ColDesc::new(name, oid, typlen);
                 n += 1;
             }
+        }
+    }
+    Ok(n)
+}
+
+/// Emits one `ColDesc` per field of a `(record).*` expansion against a join
+/// scope, resolving whole-row bases to their table's columns. Returns the new
+/// column count.
+fn describe_scope_record_star<'q>(
+    base: &Expr<'q>,
+    scope: &QueryScope<'q>,
+    out: &mut [ColDesc<'q>],
+    mut n: usize,
+) -> Result<usize, SqlError> {
+    let mut push = |desc: ColDesc<'q>, n: &mut usize| -> Result<(), SqlError> {
+        if *n == out.len() {
+            return Err(sql_err!("54000", "select list too wide"));
+        }
+        out[*n] = desc;
+        *n += 1;
+        Ok(())
+    };
+    match base {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+            super::exec::check_row_field_types(base, &ScopeCols(scope))?;
+            for (i, arg) in args.iter().take(super::exec::RECORD_FIELD_NAMES.len()).enumerate() {
+                let (oid, typlen) = infer_scope_type(arg, scope)?;
+                push(ColDesc::new(super::exec::RECORD_FIELD_NAMES[i], oid, typlen), &mut n)?;
+            }
+        }
+        Expr::WholeRow(table) | Expr::Column { qualifier: None, name: table }
+            if scope.table_index(table).is_ok() =>
+        {
+            let t = scope.table_index(table)?;
+            for c in &scope.defs[t].expect("resolved").columns()[..scope.defs[t].expect("resolved").n_columns] {
+                push(ColDesc::of_type(c.name.as_str(), c.ctype), &mut n)?;
+            }
+        }
+        // json_each family: `(key, value)` with statically-known names/types.
+        Expr::Call { name, .. } if super::exec::json_each_value_type_pub(name).is_some() => {
+            push(ColDesc::of_type("key", ColType::Text), &mut n)?;
+            let value_type = super::exec::json_each_value_type_pub(name).expect("checked");
+            push(ColDesc::of_type("value", value_type), &mut n)?;
+        }
+        _ => {
+            return Err(sql_err!(
+                "42809",
+                "row expansion is not supported on this expression"
+            ));
         }
     }
     Ok(n)
@@ -8102,6 +8236,18 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
         self.0.func_scalar_type(name)
     }
+
+    fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
+        let t = self.0.table_index(name).ok()?;
+        let def = self.0.defs[t]?;
+        Some(&def.columns()[..def.n_columns])
+    }
+}
+
+/// The number of columns a `(base).*` record expansion contributes, or 0 when
+/// its shape is not statically known (surfaced loudly at projection time).
+fn record_star_width(base: &Expr, scope: &QueryScope) -> usize {
+    super::exec::record_shape(base, &ScopeCols(scope), |_, _| {}).unwrap_or(0)
 }
 
 fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {
@@ -9170,6 +9316,7 @@ fn finalize_projected_row<'a>(
             SelectItem::TableWildcard(q) => {
                 slot += scope.defs[scope.table_index(q)?].expect("resolved").n_columns;
             }
+            SelectItem::RecordStar(base) => slot += record_star_width(base, scope),
             SelectItem::Expr { expression, .. } => {
                 if d.postponed[i] {
                     out[slot] = eval_full(expression, arena, params, &raw_row, hooks)?;
@@ -9252,6 +9399,7 @@ fn materialized_rows<'a>(
                 SelectItem::TableWildcard(q) => {
                     scope.defs[scope.table_index(q)?].expect("resolved").n_columns
                 }
+                SelectItem::RecordStar(base) => record_star_width(base, scope),
                 SelectItem::Expr { .. } => 1,
             };
         }
@@ -9689,6 +9837,7 @@ fn synth_derived_def<'a>(
                         SelectItem::TableWildcard(q) => {
                             slot += ss.defs[ss.table_index(q)?].expect("resolved").n_columns;
                         }
+                        SelectItem::RecordStar(base) => slot += record_star_width(base, &ss),
                         SelectItem::Expr { expression, .. } => {
                             if slot < n
                                 && descriptors[slot].type_oid == super::types::oid::TEXT

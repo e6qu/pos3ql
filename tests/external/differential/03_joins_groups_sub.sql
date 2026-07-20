@@ -487,3 +487,20 @@ SELECT json_each('[1,2]'::json);
 SELECT jsonb_each('5'::jsonb);
 -- KEY is a non-reserved keyword: usable as a column name
 SELECT key FROM (SELECT 1 AS key, 2 AS value) t;
+-- composite field access (record).field and expansion (record).*
+SELECT (ROW(1,2)).f1, (ROW(1,2)).f2;
+SELECT (ROW(10,'x',true)).*;
+SELECT (ROW(1,'hi',true)).f2;
+SELECT (ROW(1,2)).f3;
+DROP TABLE IF EXISTS rectest;
+CREATE TABLE rectest(a int, b text, c bool);
+INSERT INTO rectest VALUES (1,'x',true),(2,'y',false);
+SELECT (rectest).a, (rectest).b FROM rectest ORDER BY 1;
+SELECT (rectest.*).c FROM rectest ORDER BY a;
+SELECT (rectest).* FROM rectest ORDER BY a;
+SELECT (json_each('{"a":1,"b":2}'::json)).*;
+SELECT (jsonb_each('{"b":1,"aa":2}'::jsonb)).key;
+SELECT (json_each_text('{"k":"v"}'::json)).value;
+SELECT (ROW(1,2,3)).*, 99 AS extra;
+SELECT count(*) FROM (SELECT (json_each('{"a":1,"b":2,"c":3}'::json)).*) s;
+DROP TABLE rectest;

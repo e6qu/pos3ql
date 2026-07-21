@@ -7883,7 +7883,32 @@ fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 {
         Like { operand, pattern, .. } | Match { operand, pattern, .. } => {
             postpone_cost(operand, scope, arena) + postpone_cost(pattern, scope, arena) + 2
         }
-        Call { args, .. } => args.iter().map(|a| postpone_cost(a, scope, arena)).sum::<u32>() + 2,
+        Call { name, args, .. } => {
+            // GREATEST/LEAST/COALESCE unify their arguments' types, and
+            // PostgreSQL charges one operator for each argument it has to cast
+            // (a constant is pre-cast at plan time, as in the CASE arm below).
+            // GREATEST and LEAST are a MinMaxExpr, which costs one operator of
+            // its own; COALESCE is a CoalesceExpr, which like CASE costs
+            // nothing beyond its casts.
+            let unifying = name.eq_ignore_ascii_case("greatest")
+                || name.eq_ignore_ascii_case("least")
+                || name.eq_ignore_ascii_case("coalesce");
+            let node = if name.eq_ignore_ascii_case("coalesce") { 0 } else { 2 };
+            let mut c = args.iter().map(|a| postpone_cost(a, scope, arena)).sum::<u32>() + node;
+            if unifying {
+                let unified = oid_of(e).and_then(rank);
+                for a in *args {
+                    if a.is_constant() {
+                        continue;
+                    }
+                    match (oid_of(a).and_then(rank), unified) {
+                        (Some(x), Some(y)) if x != y => c += 2,
+                        _ => {}
+                    }
+                }
+            }
+            c
+        }
         Case { operand, whens, otherwise } => {
             let mut c = operand.map_or(0, |o| postpone_cost(o, scope, arena));
             // Non-constant branch results whose type differs from the CASE's

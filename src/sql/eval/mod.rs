@@ -1097,6 +1097,9 @@ fn call<'a>(
     if let Some(result) = funcs::array::dispatch(name, args, star, arena, params, row, hooks) {
         return result;
     }
+    if let Some(result) = funcs::range::dispatch(name, args, star, arena, params, row, hooks) {
+        return result;
+    }
     match name {
         "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every"
         | "string_agg" => Err(sql_err!(
@@ -1975,95 +1978,6 @@ fn call<'a>(
                 }
             }
             Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
-        }
-        "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
-            let kind = super::types::RangeKind::from_name(name).expect("matched a range name");
-            if !(2..=3).contains(&args.len()) {
-                return Err(arity_err(name, args.len()));
-            }
-            let lo = eval_full(args[0], arena, params, row, hooks)?;
-            let hi = eval_full(args[1], arena, params, row, hooks)?;
-            let flags = if args.len() == 3 {
-                text_arg(name, args, 2, arena, params, row, hooks)?
-            } else {
-                None
-            };
-            Ok(Datum::Range { text: super::range::construct(lo, hi, flags, kind, arena)?, kind })
-        }
-        "int4multirange" | "int8multirange" | "nummultirange" | "datemultirange"
-        | "tsmultirange" | "tstzmultirange" => {
-            let kind = super::types::RangeKind::from_multirange_name(name).expect("matched a multirange name");
-            // Each argument is a range of the matching subtype; non-empty
-            // component texts are collected then canonicalized. A NULL argument
-            // makes the whole result NULL, matching PostgreSQL's strict
-            // multirange constructors.
-            let mut comps: [&str; super::range::MAX_MULTIRANGE] =
-                [""; super::range::MAX_MULTIRANGE];
-            let mut n = 0usize;
-            for arg in args.iter() {
-                match eval_full(arg, arena, params, row, hooks)? {
-                    Datum::Null => return Ok(Datum::Null),
-                    Datum::Range { text, kind: k } if k == kind => {
-                        if !super::range::is_empty(text) {
-                            if n == super::range::MAX_MULTIRANGE {
-                                return Err(sql_err!("54000", "multirange has too many component ranges"));
-                            }
-                            comps[n] = text;
-                            n += 1;
-                        }
-                    }
-                    other => return Err(type_mismatch(name, &other)),
-                }
-            }
-            let text = super::range::canonicalize_multirange(&mut comps[..n], kind, arena)?;
-            Ok(Datum::Multirange { text, kind })
-        }
-        "isempty" => {
-            arity(1)?;
-            match eval_full(args[0], arena, params, row, hooks)? {
-                Datum::Null => Ok(Datum::Null),
-                Datum::Range { text, .. } => Ok(Datum::Bool(super::range::is_empty(text))),
-                Datum::Multirange { text, .. } => Ok(Datum::Bool(text.trim() == "{}")),
-                other => Err(type_mismatch(name, &other)),
-            }
-        }
-        "lower_inc" | "upper_inc" => {
-            arity(1)?;
-            match eval_full(args[0], arena, params, row, hooks)? {
-                Datum::Null => Ok(Datum::Null),
-                Datum::Range { text, kind } => {
-                    Ok(Datum::Bool(super::range::bound_inc(text, kind, name == "lower_inc")?))
-                }
-                other => Err(type_mismatch(name, &other)),
-            }
-        }
-        "lower_inf" | "upper_inf" => {
-            arity(1)?;
-            match eval_full(args[0], arena, params, row, hooks)? {
-                Datum::Null => Ok(Datum::Null),
-                Datum::Range { text, kind } => Ok(Datum::Bool(if name == "lower_inf" {
-                    super::range::lower_inf(text, kind)?
-                } else {
-                    super::range::upper_inf(text, kind)?
-                })),
-                other => Err(type_mismatch(name, &other)),
-            }
-        }
-        "range_merge" => {
-            arity(2)?;
-            let a = eval_full(args[0], arena, params, row, hooks)?;
-            let b = eval_full(args[1], arena, params, row, hooks)?;
-            if a.is_null() || b.is_null() {
-                return Ok(Datum::Null);
-            }
-            let (Datum::Range { text: at, kind: ak }, Datum::Range { text: bt, kind: bk }) = (a, b)
-            else {
-                return Err(type_mismatch(name, &a));
-            };
-            if ak != bk {
-                return Err(range_mismatch());
-            }
-            Ok(Datum::Range { text: super::range::merge(at, bt, ak, arena)?, kind: ak })
         }
         "to_number" => {
             arity(2)?;

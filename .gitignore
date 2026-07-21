@@ -1,7 +1,9 @@
 /target
 
-# Python bytecode cache from external test scripts
+# Python bytecode cache and virtualenv for external test scripts (fuzz_diff.py
+# needs psycopg; the venv is a local dev artifact, never committed).
 __pycache__/
+/venv/
 
 # Runtime data directory (WAL/SSTs/manifest)
 /data/

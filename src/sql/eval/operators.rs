@@ -4,16 +4,17 @@
 //! only on the value modules, not on `eval_full`.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::BinaryOp;
+use crate::sql::ast::{BinaryOp, UnaryOp};
 use crate::sql::numeric::{self, Numeric};
-use crate::sql::types::{Datum, Interval, RangeKind};
+use crate::sql::types::{Datum, Interval, RangeKind, RecordField};
 use crate::sql::{array, datetime, range};
 use crate::sql_err;
 
 use super::{
-    arena_full, as_f64, as_i64, bad_text, division_by_zero, interval_cmp_value, num_factor,
-    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of,
-    validate_bits, SqlError,
+    arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
+    division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
+    jsonb_delete, jsonb_delete_path, like_match, num_factor, overflow, parse_bool, parse_uuid,
+    sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits, SqlError,
 };
 
 pub(crate) fn array_set_op<'a>(
@@ -859,4 +860,211 @@ pub(crate) fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Res
     } else {
         Ok(Datum::Int4(v as i32))
     }
+}
+
+pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    match (operator, v) {
+        (_, Datum::Null) => Ok(Datum::Null),
+        // ~bit flips every bit, preserving length and type.
+        (UnaryOp::BitNot, Datum::Bit { bits, varying }) => {
+            let out = arena
+                .alloc_slice_with(bits.len(), |i| if bits.as_bytes()[i] == b'1' { b'0' } else { b'1' })
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+        }
+        (UnaryOp::Neg, Datum::Int4(x)) => x
+            .checked_neg()
+            .map(Datum::Int4)
+            .ok_or_else(|| overflow("integer")),
+        (UnaryOp::Neg, Datum::Int8(x)) => x
+            .checked_neg()
+            .map(Datum::Int8)
+            .ok_or_else(|| overflow("bigint")),
+        (UnaryOp::Neg, Datum::Float8(x)) => Ok(Datum::Float8(-x)),
+        (UnaryOp::Neg, Datum::Numeric(n)) => Ok(Datum::Numeric(Numeric {
+            // Negating zero stays positive (no negative zero).
+            sign: if n.is_zero() {
+                numeric::Sign::Pos
+            } else {
+                match n.sign {
+                    numeric::Sign::Pos => numeric::Sign::Neg,
+                    numeric::Sign::Neg => numeric::Sign::Pos,
+                    numeric::Sign::NaN => numeric::Sign::NaN,
+                }
+            },
+            ..n
+        })),
+        (UnaryOp::Not, Datum::Bool(b)) => Ok(Datum::Bool(!b)),
+        (UnaryOp::BitNot, Datum::Int4(x)) => Ok(Datum::Int4(!x)),
+        (UnaryOp::BitNot, Datum::Int8(x)) => Ok(Datum::Int8(!x)),
+        (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
+        (UnaryOp::Not, other) => Err(type_mismatch("NOT", &other)),
+        (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
+    }
+}
+
+/// PostgreSQL row comparison (`(a,b) = (c,d)`, `<`, …): three-valued and
+/// short-circuiting, distinct from the total order `compare_datums` gives
+/// ORDER BY. Equality scans every pair — a definite inequality is `false`, an
+/// all-equal row is `true`, and an otherwise-equal row with a NULL pair is
+/// NULL. Ordering walks left to right — the first non-equal pair decides, and a
+/// NULL pair reached before then yields NULL. The rows must have equal arity.
+fn row_compare<'a>(
+    operator: BinaryOp,
+    a: &[RecordField<'a>],
+    b: &[RecordField<'a>],
+) -> Result<Datum<'a>, SqlError> {
+    use BinaryOp::*;
+    if a.len() != b.len() {
+        return Err(sql_err!("42601", "unequal number of entries in row expressions"));
+    }
+    match operator {
+        Eq | NotEq => {
+            let mut saw_null = false;
+            for (x, y) in a.iter().zip(b) {
+                if x.value.is_null() || y.value.is_null() {
+                    saw_null = true;
+                } else if !compare_datums(&x.value, &y.value)?.is_eq() {
+                    return Ok(Datum::Bool(operator == NotEq));
+                }
+            }
+            if saw_null {
+                Ok(Datum::Null)
+            } else {
+                Ok(Datum::Bool(operator == Eq))
+            }
+        }
+        _ => {
+            for (x, y) in a.iter().zip(b) {
+                if x.value.is_null() || y.value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let ordering = compare_datums(&x.value, &y.value)?;
+                if !ordering.is_eq() {
+                    return Ok(Datum::Bool(match operator {
+                        Lt | LtEq => ordering.is_lt(),
+                        _ => ordering.is_gt(),
+                    }));
+                }
+            }
+            Ok(Datum::Bool(matches!(operator, LtEq | GtEq)))
+        }
+    }
+}
+
+pub(crate) fn binary<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    l_unknown: bool,
+    r_unknown: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use BinaryOp::*;
+    match operator {
+        And | Or => logic(operator, l, r),
+        Concat => match (l, r) {
+            (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_concat(l, r, arena),
+            // jsonb || jsonb: object merge (right wins), array concat, else
+            // wrap-and-concat. (Plain json has no `||` operator in PostgreSQL,
+            // but our `Datum::Json` carries a `jsonb` flag; concat applies only
+            // to the jsonb form.)
+            (Datum::Json { jsonb: true, .. }, _) | (_, Datum::Json { jsonb: true, .. }) => {
+                jsonb_concat(l, r, arena)
+            }
+            _ => concat(l, r, l_unknown, r_unknown, arena),
+        },
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
+            (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),
+            // Row comparison uses PostgreSQL's three-valued, short-circuiting
+            // semantics (NULL-propagating), distinct from the total order that
+            // `compare_datums` gives ORDER BY / DISTINCT.
+            (Datum::Record(a), Datum::Record(b)) => row_compare(operator, a, b),
+            _ => compare(operator, l, r, l_unknown, r_unknown),
+        },
+        // `jsonb - text`/`text[]`/`integer` deletes a key, keys, or an element.
+        Sub if matches!(l, Datum::Json { jsonb: true, .. }) => jsonb_delete(l, r, arena),
+        Add | Sub | Mul | Div | Mod => match (l, r) {
+            (Datum::Multirange { .. }, _) | (_, Datum::Multirange { .. }) => {
+                multirange_setop(operator, l, r, arena)
+            }
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(operator, l, r, arena),
+            _ => arithmetic(operator, l, r, l_unknown, r_unknown, arena),
+        },
+        JsonGet | JsonGetText => json_get(l, r, operator == JsonGetText, arena),
+        JsonPath | JsonPathText => json_path(l, r, operator == JsonPathText, arena),
+        JsonDeletePath => jsonb_delete_path(l, r, arena),
+        JsonExists | JsonExistsAny | JsonExistsAll => json_exists(operator, l, r, arena),
+        Shl | Shr => match (l, r) {
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r, arena),
+            (Datum::Bit { .. }, _) => bit_shift(operator, l, r, arena),
+            _ => bitwise(operator, l, r),
+        },
+        BitAnd | BitOr | BitXor => match (l, r) {
+            (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_bitwise(operator, l, r, arena),
+            _ => bitwise(operator, l, r),
+        },
+        // Array containment/overlap: `@>` `<@` `&&` over two arrays.
+        Contains | ContainedBy | Overlaps
+            if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) =>
+        {
+            array_set_op(operator, l, r)
+        }
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent
+            if matches!(l, Datum::Multirange { .. }) || matches!(r, Datum::Multirange { .. }) =>
+        {
+            multirange_op(operator, l, r, arena)
+        }
+        Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => {
+            range_op(operator, l, r, arena)
+        }
+        // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
+        Like | ILike => {
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = cast_to_text(l, arena)?;
+            let pattern = cast_to_text(r, arena)?;
+            Ok(Datum::Bool(like_match(text, pattern, operator == ILike)))
+        }
+        Pow => {
+            // PostgreSQL `^` stays numeric when an operand is numeric (and none
+            // is float8); otherwise it is double-precision exponentiation.
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let any_numeric = matches!(l, Datum::Numeric(_)) || matches!(r, Datum::Numeric(_));
+            let any_float = matches!(l, Datum::Float8(_)) || matches!(r, Datum::Float8(_));
+            if any_numeric && !any_float {
+                let a = datum_numeric("^", l, arena)?;
+                let b = datum_numeric("^", r, arena)?;
+                return Ok(Datum::Numeric(numeric::pow(&a, &b, arena)?));
+            }
+            let (a, b) = (datum_f64("^", l)?, datum_f64("^", r)?);
+            Ok(Datum::Float8(a.powf(b)))
+        }
+    }
+}
+
+/// SQL three-valued AND/OR.
+pub(crate) fn logic<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    let as_bool = |d: &Datum| -> Result<Option<bool>, SqlError> {
+        match d {
+            Datum::Null => Ok(None),
+            Datum::Bool(b) => Ok(Some(*b)),
+            other => Err(type_mismatch("boolean operator", other)),
+        }
+    };
+    let (a, b) = (as_bool(&l)?, as_bool(&r)?);
+    let out = match (operator, a, b) {
+        (BinaryOp::And, Some(false), _) | (BinaryOp::And, _, Some(false)) => Some(false),
+        (BinaryOp::And, Some(true), Some(true)) => Some(true),
+        (BinaryOp::And, _, _) => None,
+        (BinaryOp::Or, Some(true), _) | (BinaryOp::Or, _, Some(true)) => Some(true),
+        (BinaryOp::Or, Some(false), Some(false)) => Some(false),
+        (BinaryOp::Or, _, _) => None,
+        _ => unreachable!(),
+    };
+    Ok(out.map_or(Datum::Null, Datum::Bool))
 }

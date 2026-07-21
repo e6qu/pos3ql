@@ -107,6 +107,7 @@ pub struct GucState {
     timezone: StackStr<64>,
     /// Parsed current time zone, so rendering does not re-parse it.
     parsed_timezone: super::timezone::Timezone,
+
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
     search_path: StackStr<128>,
@@ -376,6 +377,11 @@ impl GucState {
     }
 
     /// Value-rendering settings for the wire layer (DateStyle + zone).
+    /// The session's resolved `TimeZone`.
+    pub fn timezone(&self) -> super::timezone::Timezone {
+        self.parsed_timezone
+    }
+
     pub fn render(&self) -> RenderContext {
         let (format, ord) = parse_full(self.datestyle.as_str());
         let order = if ord == Order3::Dmy { FieldOrder::Dmy } else { FieldOrder::Mdy };

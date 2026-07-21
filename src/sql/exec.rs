@@ -2934,6 +2934,7 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::TIMESTAMP => ColType::Timestamp,
         oid::TIMESTAMPTZ => ColType::Timestamptz,
         oid::TIME => ColType::Time,
+        oid::TIMETZ => ColType::Timetz,
         oid::INTERVAL => ColType::Interval,
         oid::JSON => ColType::Json,
         oid::JSONB => ColType::Jsonb,
@@ -3288,8 +3289,12 @@ fn comparable(a: ColType, b: ColType) -> bool {
     }
     let numeric = |t: ColType| matches!(t, Int4 | Int8 | Numeric | Float8);
     let datetime = |t: ColType| matches!(t, Date | Timestamp | Timestamptz);
+    let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
-    (numeric(a) && numeric(b)) || (datetime(a) && datetime(b)) || (bit(a) && bit(b))
+    (numeric(a) && numeric(b))
+        || (datetime(a) && datetime(b))
+        || (timeofday(a) && timeofday(b))
+        || (bit(a) && bit(b))
 }
 
 fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
@@ -3467,6 +3472,15 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                         }
                         if matches!(operator, Add) && lo == oid::INTERVAL && is_dt(ro) {
                             return Ok(of(if ro == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
+                        }
+                        // A time of day keeps its own type, and its zone; the
+                        // result wraps within the day.
+                        let time_of_day = |o: i32| matches!(o, oid::TIME | oid::TIMETZ);
+                        if time_of_day(lo) && ro == oid::INTERVAL {
+                            return Ok(of(if lo == oid::TIMETZ { ColType::Timetz } else { ColType::Time }));
+                        }
+                        if matches!(operator, Add) && lo == oid::INTERVAL && time_of_day(ro) {
+                            return Ok(of(if ro == oid::TIMETZ { ColType::Timetz } else { ColType::Time }));
                         }
                     }
                     // interval * number / number * interval / interval / number.
@@ -4049,6 +4063,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         | Datum::Timestamp(_)
         | Datum::Timestamptz(_)
         | Datum::Time(_) => 8,
+        Datum::Timetz(..) => 12,
         Datum::Interval(_) => 16,
         Datum::Uuid(_) => 16,
         Datum::Text(s) => 4 + s.len(),
@@ -4135,6 +4150,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 12;
             out[1..9].copy_from_slice(&x.to_le_bytes());
             9
+        }
+        Datum::Timetz(x, zone) => {
+            out[0] = 20;
+            out[1..9].copy_from_slice(&x.to_le_bytes());
+            out[9..13].copy_from_slice(&zone.to_le_bytes());
+            13
         }
         Datum::Interval(interval) => {
             out[0] = 13;
@@ -4227,6 +4248,148 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
     }
 }
 
+/// Reads the value whose tag is `tag` at byte `at`, returning it and its
+/// payload length. This is the one place the projected encoding's tag
+/// sizes live: a second, hand-written copy in the sort path drifted from
+/// it and panicked the server on every tag it had not been taught.
+pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, usize) {
+    match tag {
+        0 => (Datum::Null, 0),
+        1 => (Datum::Bool(bytes[at] != 0), 1),
+        2 => (
+            Datum::Int4(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
+            4,
+        ),
+        3 => (
+            Datum::Int8(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
+            8,
+        ),
+        4 => (
+            Datum::Float8(f64::from_bits(u64::from_le_bytes(
+                bytes[at..at + 8].try_into().unwrap(),
+            ))),
+            8,
+        ),
+        5 => {
+            let len =
+                u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (
+                Datum::Text(
+                    core::str::from_utf8(&bytes[at + 4..at + 4 + len])
+                        .expect("encoded from valid UTF-8"),
+                ),
+                4 + len,
+            )
+        }
+        6 => (
+            Datum::Date(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
+            4,
+        ),
+        7 => (
+            Datum::Timestamp(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
+            8,
+        ),
+        8 => (
+            Datum::Timestamptz(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
+            8,
+        ),
+        12 => (
+            Datum::Time(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
+            8,
+        ),
+        13 => (
+            Datum::Interval(crate::sql::types::Interval {
+                months: i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+                days: i32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                micros: i64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()),
+            }),
+            16,
+        ),
+        14 => {
+            let jsonb = bytes[at] != 0;
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            (Datum::Json { text: s, jsonb }, 5 + len)
+        }
+        15 => {
+            let element = crate::sql::types::ArrElem::from_code(bytes[at]).unwrap_or(crate::sql::types::ArrElem::Int4);
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            (Datum::Array { element, raw: &bytes[at + 5..at + 5 + len] }, 5 + len)
+        }
+        16 => {
+            let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            (Datum::Range { text: s, kind }, 5 + len)
+        }
+        17 => {
+            let varying = bytes[at] != 0;
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            (Datum::Bit { bits: s, varying }, 5 + len)
+        }
+        18 => {
+            let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            (Datum::Multirange { text: s, kind }, 5 + len)
+        }
+        19 => {
+            // A record is stored as its rendered text; the column's RECORD
+            // type comes from describe, so returning Text renders it right.
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let s = core::str::from_utf8(&bytes[at + 4..at + 4 + len]).unwrap_or("");
+            (Datum::Text(s), 4 + len)
+        }
+        9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
+        10 => {
+            let len =
+                u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (Datum::Bytea(&bytes[at + 4..at + 4 + len]), 4 + len)
+        }
+        11 => {
+            let sign = match bytes[at] {
+                0 => crate::sql::numeric::Sign::Pos,
+                1 => crate::sql::numeric::Sign::Neg,
+                _ => crate::sql::numeric::Sign::NaN,
+            };
+            let weight = i16::from_le_bytes(bytes[at + 1..at + 3].try_into().unwrap());
+            let dscale = u16::from_le_bytes(bytes[at + 3..at + 5].try_into().unwrap());
+            let ndigits =
+                u16::from_le_bytes(bytes[at + 5..at + 7].try_into().unwrap()) as usize;
+            (
+                Datum::Numeric(crate::sql::numeric::Numeric {
+                    sign,
+                    weight,
+                    dscale,
+                    digits: &bytes[at + 7..at + 7 + ndigits * 2],
+                }),
+                7 + ndigits * 2,
+            )
+        }
+        20 => (
+            Datum::Timetz(
+                i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+                i32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()),
+            ),
+            12,
+        ),
+        _ => unreachable!("tags are exhaustive"),
+    }
+}
+
+/// Byte length of an encoded row's first `width` values, tags included.
+pub fn projected_prefix_len(bytes: &[u8], width: usize) -> usize {
+    let mut at = 1usize;
+    for _ in 0..width {
+        let tag = bytes[at];
+        // The reader takes the offset *past* the tag, as its own caller does.
+        at += 1;
+        at += decode_projected_value(bytes, tag, at).1;
+    }
+    at
+}
+
 /// Reads column `col` back out of an [`encode_projected`] row.
 pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
     let mut at = 1usize;
@@ -4234,122 +4397,7 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
     loop {
         let tag = bytes[at];
         at += 1;
-        let (value, size) = match tag {
-            0 => (Datum::Null, 0),
-            1 => (Datum::Bool(bytes[at] != 0), 1),
-            2 => (
-                Datum::Int4(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
-                4,
-            ),
-            3 => (
-                Datum::Int8(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
-                8,
-            ),
-            4 => (
-                Datum::Float8(f64::from_bits(u64::from_le_bytes(
-                    bytes[at..at + 8].try_into().unwrap(),
-                ))),
-                8,
-            ),
-            5 => {
-                let len =
-                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-                (
-                    Datum::Text(
-                        core::str::from_utf8(&bytes[at + 4..at + 4 + len])
-                            .expect("encoded from valid UTF-8"),
-                    ),
-                    4 + len,
-                )
-            }
-            6 => (
-                Datum::Date(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
-                4,
-            ),
-            7 => (
-                Datum::Timestamp(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
-                8,
-            ),
-            8 => (
-                Datum::Timestamptz(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
-                8,
-            ),
-            12 => (
-                Datum::Time(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
-                8,
-            ),
-            13 => (
-                Datum::Interval(crate::sql::types::Interval {
-                    months: i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
-                    days: i32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
-                    micros: i64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()),
-                }),
-                16,
-            ),
-            14 => {
-                let jsonb = bytes[at] != 0;
-                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-                let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
-                (Datum::Json { text: s, jsonb }, 5 + len)
-            }
-            15 => {
-                let element = crate::sql::types::ArrElem::from_code(bytes[at]).unwrap_or(crate::sql::types::ArrElem::Int4);
-                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-                (Datum::Array { element, raw: &bytes[at + 5..at + 5 + len] }, 5 + len)
-            }
-            16 => {
-                let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
-                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-                let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
-                (Datum::Range { text: s, kind }, 5 + len)
-            }
-            17 => {
-                let varying = bytes[at] != 0;
-                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-                let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
-                (Datum::Bit { bits: s, varying }, 5 + len)
-            }
-            18 => {
-                let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
-                let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-                let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
-                (Datum::Multirange { text: s, kind }, 5 + len)
-            }
-            19 => {
-                // A record is stored as its rendered text; the column's RECORD
-                // type comes from describe, so returning Text renders it right.
-                let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-                let s = core::str::from_utf8(&bytes[at + 4..at + 4 + len]).unwrap_or("");
-                (Datum::Text(s), 4 + len)
-            }
-            9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
-            10 => {
-                let len =
-                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-                (Datum::Bytea(&bytes[at + 4..at + 4 + len]), 4 + len)
-            }
-            11 => {
-                let sign = match bytes[at] {
-                    0 => crate::sql::numeric::Sign::Pos,
-                    1 => crate::sql::numeric::Sign::Neg,
-                    _ => crate::sql::numeric::Sign::NaN,
-                };
-                let weight = i16::from_le_bytes(bytes[at + 1..at + 3].try_into().unwrap());
-                let dscale = u16::from_le_bytes(bytes[at + 3..at + 5].try_into().unwrap());
-                let ndigits =
-                    u16::from_le_bytes(bytes[at + 5..at + 7].try_into().unwrap()) as usize;
-                (
-                    Datum::Numeric(crate::sql::numeric::Numeric {
-                        sign,
-                        weight,
-                        dscale,
-                        digits: &bytes[at + 7..at + 7 + ndigits * 2],
-                    }),
-                    7 + ndigits * 2,
-                )
-            }
-            _ => unreachable!("tags are exhaustive"),
-        };
+        let (value, size) = decode_projected_value(bytes, tag, at);
         if current == col {
             return value;
         }
@@ -4623,6 +4671,9 @@ pub fn apply_typmod<'a>(
             Ok(Datum::Timestamptz(round_micros(t, type_mod - 4)))
         }
         (ColType::Time, Datum::Time(t)) => Ok(Datum::Time(round_micros(t, type_mod - 4))),
+        (ColType::Timetz, Datum::Timetz(t, zone)) => {
+            Ok(Datum::Timetz(round_micros(t, type_mod - 4), zone))
+        }
         (ColType::Interval, Datum::Interval(iv)) => Ok(Datum::Interval(
             crate::sql::types::Interval {
                 months: iv.months,

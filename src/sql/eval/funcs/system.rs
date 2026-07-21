@@ -215,6 +215,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Timestamp(_) => "timestamp without time zone",
                     Datum::Timestamptz(_) => "timestamp with time zone",
                     Datum::Time(_) => "time without time zone",
+                    Datum::Timetz(..) => "time with time zone",
                     Datum::Interval(_) => "interval",
                     Datum::Json { jsonb: false, .. } => "json",
                     Datum::Json { jsonb: true, .. } => "jsonb",

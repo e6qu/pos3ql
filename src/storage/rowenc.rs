@@ -25,6 +25,7 @@ pub fn encoded_len(values: &[Datum]) -> usize {
             Datum::Bool(_) => 1,
             Datum::Int4(_) | Datum::Date(_) => 4,
             Datum::Int8(_) | Datum::Float8(_) | Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Time(_) => 8,
+            Datum::Timetz(..) => 12,
             Datum::Interval(_) => 16,
             Datum::Uuid(_) => 16,
             Datum::Text(s) => 4 + s.len(),
@@ -98,6 +99,11 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[4..8].copy_from_slice(&interval.days.to_le_bytes());
                 rest[8..16].copy_from_slice(&interval.micros.to_le_bytes());
                 take = 16;
+            }
+            Datum::Timetz(t, zone) => {
+                rest[..8].copy_from_slice(&t.to_le_bytes());
+                rest[8..12].copy_from_slice(&zone.to_le_bytes());
+                take = 12;
             }
             Datum::Timestamp(x) | Datum::Timestamptz(x) | Datum::Time(x) => {
                 rest[..8].copy_from_slice(&x.to_le_bytes());
@@ -209,6 +215,14 @@ pub fn decode<'a>(
                 let b = bytes.get(at..at + 8).ok_or_else(corrupt)?;
                 out[i] = Datum::Timestamptz(i64::from_le_bytes(b.try_into().unwrap()));
                 at += 8;
+            }
+            ColType::Timetz => {
+                let b = bytes.get(at..at + 12).ok_or_else(corrupt)?;
+                out[i] = Datum::Timetz(
+                    i64::from_le_bytes(b[..8].try_into().unwrap()),
+                    i32::from_le_bytes(b[8..].try_into().unwrap()),
+                );
+                at += 12;
             }
             ColType::Time => {
                 let b = bytes.get(at..at + 8).ok_or_else(corrupt)?;

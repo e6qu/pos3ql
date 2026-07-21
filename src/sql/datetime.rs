@@ -342,13 +342,47 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
 
 /// Parses a `time` value (`HH:MM[:SS[.ffffff]]`) into microseconds since
 /// midnight. A trailing zone is ignored (we model `time`, not `timetz`).
+/// Parses a time of day, returning the microseconds since midnight and the
+/// zone offset (seconds east) when the text carried one. Both `time` and
+/// `timetz` come through here: PostgreSQL accepts a zone on either and simply
+/// ignores it for the zoneless type, so `'12:00:00-05'::time` is `12:00:00`.
+pub fn parse_timetz(s: &str) -> Result<(i64, Option<i32>), SqlError> {
+    parse_time_parts(s, "time with time zone")
+}
+
+/// Microseconds since midnight, discarding any zone the text carried.
 pub fn parse_time(s: &str) -> Result<i64, SqlError> {
-    let bad = || sql_err!("22007", "invalid input syntax for type time: \"{}\"", s);
+    Ok(parse_time_parts(s, "time")?.0)
+}
+
+fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlError> {
+    let bad =
+        || sql_err!("22007", "invalid input syntax for type {}: \"{}\"", type_name, s);
     let t = s.trim();
-    // Drop any zone suffix.
-    let t = match t.find(['+', 'Z']) {
-        Some(i) if i > 0 => &t[..i],
-        _ => t,
+    // Split off a trailing zone: `Z`, a named `UTC`, or `±HH[:MM[:SS]]`. The
+    // sign has to be past the start so a lone offset is not read as a time.
+    let (t, zone) = if let Some(stripped) = t.strip_suffix('Z').or_else(|| t.strip_suffix('z')) {
+        (stripped, Some(0))
+    } else if let Some((head, name)) = t.rsplit_once(' ') {
+        let name = name.trim();
+        // `UTC`/`GMT` are the zone names PostgreSQL accepts here that are not
+        // in the region table; anything else goes through the usual lookup.
+        if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
+            (head, Some(0))
+        } else {
+            match super::timezone::lookup(name) {
+                Some(z) => (head, Some(z.resolve(now_micros()).0)),
+                None => return Err(bad()),
+            }
+        }
+    } else {
+        match t.rfind(['+', '-']) {
+            Some(i) if i > 0 => {
+                let (head, zone) = t.split_at(i);
+                (head, Some(parse_zone_offset(zone).ok_or_else(bad)?))
+            }
+            _ => (t, None),
+        }
     };
     let t = t.trim();
     let mut it = t.splitn(3, ':');
@@ -370,10 +404,35 @@ pub fn parse_time(s: &str) -> Result<i64, SqlError> {
             }
         },
     };
-    if !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..61).contains(&sec) {
+    // 24:00:00 is the one hour-24 time PostgreSQL accepts.
+    let hour_ok = (0..24).contains(&h) || (h == 24 && m == 0 && sec == 0 && micros == 0);
+    if !hour_ok || !(0..60).contains(&m) || !(0..61).contains(&sec) {
         return Err(sql_err!("22008", "date/time field value out of range: \"{}\"", s));
     }
-    Ok((h * 3600 + m * 60 + sec) * 1_000_000 + micros)
+    Ok(((h * 3600 + m * 60 + sec) * 1_000_000 + micros, zone))
+}
+
+/// `±HH`, `±HH:MM` or `±HH:MM:SS` as seconds east of UTC.
+fn parse_zone_offset(zone: &str) -> Option<i32> {
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1i32,
+        b'-' => -1,
+        _ => return None,
+    };
+    let mut parts = zone[1..].split(':');
+    let h: i32 = parts.next()?.parse().ok()?;
+    let m: i32 = match parts.next() {
+        Some(p) => p.parse().ok()?,
+        None => 0,
+    };
+    let sec: i32 = match parts.next() {
+        Some(p) => p.parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() || !(0..=15).contains(&h) || !(0..60).contains(&m) || !(0..60).contains(&sec) {
+        return None;
+    }
+    Some(sign * (h * 3600 + m * 60 + sec))
 }
 
 /// Formats microseconds since midnight as `HH:MM:SS[.ffffff]` (PostgreSQL

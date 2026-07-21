@@ -315,6 +315,14 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         | (Datum::Timestamp(a), Datum::Timestamptz(b))
         | (Datum::Timestamptz(a), Datum::Timestamp(b)) => a.cmp(b),
         (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
+        // PostgreSQL orders by the instant each denotes, then by zone, so two
+        // values naming the same instant in different zones are ordered but
+        // never equal — `12:00+00` and `13:00+01` are both 12:00 UTC, and the
+        // first sorts after. The zone tiebreak runs on PostgreSQL's westward
+        // sign, the negation of the stored offset.
+        (Datum::Timetz(a, za), Datum::Timetz(b, zb)) => (a - *za as i64 * 1_000_000)
+            .cmp(&(b - *zb as i64 * 1_000_000))
+            .then_with(|| (-za).cmp(&-zb)),
         (Datum::Json { text: a, .. }, Datum::Json { text: b, .. }) => a.cmp(b),
         (Datum::Record(a), Datum::Record(b)) => {
             // Field-wise, with a NULL field comparing greater (PostgreSQL
@@ -450,6 +458,12 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
             Datum::Timestamptz(datetime::parse_timestamp(s, true)?)
         }
         Datum::Uuid(_) => Datum::Uuid(parse_uuid(s)?),
+        Datum::Time(_) => Datum::Time(datetime::parse_time(s)?),
+        Datum::Timetz(..) => {
+            let (t, zone) = datetime::parse_timetz(s)?;
+            Datum::Timetz(t, zone.unwrap_or_else(|| crate::sql::timezone::session().resolve(datetime::now_micros()).0))
+        }
+        Datum::Interval(_) => Datum::Interval(datetime::parse_interval(s)?),
         _ => v,
     })
 }
@@ -581,6 +595,18 @@ pub(crate) fn arithmetic<'a>(
                 Datum::Timestamptz(_) => Datum::Timestamptz(out),
                 _ => Datum::Timestamp(out),
             });
+        }
+        // A time of day takes only the interval's time part and wraps within
+        // the day; a timetz keeps the zone it already had.
+        (BinaryOp::Add | BinaryOp::Sub, Datum::Time(t), Datum::Interval(interval))
+        | (BinaryOp::Add, Datum::Interval(interval), Datum::Time(t)) => {
+            let delta = if operator == BinaryOp::Sub { -interval.micros } else { interval.micros };
+            return Ok(Datum::Time((t + delta).rem_euclid(86_400_000_000)));
+        }
+        (BinaryOp::Add | BinaryOp::Sub, Datum::Timetz(t, zone), Datum::Interval(interval))
+        | (BinaryOp::Add, Datum::Interval(interval), Datum::Timetz(t, zone)) => {
+            let delta = if operator == BinaryOp::Sub { -interval.micros } else { interval.micros };
+            return Ok(Datum::Timetz((t + delta).rem_euclid(86_400_000_000), zone));
         }
         _ => {}
     }

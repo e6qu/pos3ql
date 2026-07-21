@@ -69,3 +69,43 @@ SELECT '2020-01-01'::timestamp(7), '12:00'::time(8);
 -- in range: no warning
 SELECT '2020-01-01'::timestamp(6);
 SELECT '2020-01-01'::timestamp(0);
+-- timetz (time with time zone)
+SELECT '12:00:00'::timetz, '12:00:00+05'::timetz, '12:00:00-05:30'::timetz;
+SELECT '12:00:00.123456+02:00'::timetz, '12:00:00.1+02:00'::timetz, '12:00:00+05:45'::timetz;
+SELECT '24:00:00'::timetz, '12:00:00 UTC'::timetz;
+SELECT pg_typeof('12:00:00+05'::timetz), '12:00:00+05'::timetz::text;
+-- casts in both directions; a zoneless source takes the session zone
+SELECT '12:00:00'::time::timetz, '12:00:00+05'::timetz::time;
+SELECT '2020-06-15 12:00:00+00'::timestamptz::timetz;
+-- precision is clamped and rounded like the other temporal types
+SELECT '12:00:00.123456+02'::timetz(2), '12:00:00.125+02'::timetz(2), '12:00:00.987654+02'::timetz(0);
+-- ordering is by the instant, then by zone, so equal instants in different
+-- zones are ordered but never equal
+SELECT ('12:00:00+00'::timetz = '13:00:00+01'::timetz), ('12:00:00+00'::timetz > '13:00:00+01'::timetz);
+SELECT ('12:00:00+00'::timetz < '12:00:00+01'::timetz), ('12:00:00+00'::timetz = '12:00:00+00'::timetz);
+SELECT v.x::text FROM (VALUES ('12:00:00+00'::timetz),('12:00:00+01'),('12:00:00-01'),('13:00:00+01')) v(x) ORDER BY v.x;
+SELECT count(*) FROM (SELECT DISTINCT v.x FROM (VALUES ('12:00:00+00'::timetz),('13:00:00+01')) v(x)) q;
+-- interval arithmetic wraps within the day and keeps the zone
+SELECT ('12:00:00+05'::timetz + '1 hour'::interval)::text, ('12:00:00+05'::timetz - '1 hour'::interval)::text;
+SELECT ('23:30:00+00'::timetz + '1 hour'::interval)::text;
+SELECT ('12:00:00'::time + '1 hour'::interval)::text, ('00:30:00'::time - '1 hour'::interval)::text;
+SELECT ('1 hour'::interval + '12:00:00'::time)::text, ('12:00:00'::time + '90 minutes'::interval)::text;
+-- extract
+SELECT extract(hour FROM '12:34:56+05'::timetz), extract(minute FROM '12:34:56+05'::timetz);
+SELECT extract(second FROM '12:34:56+05'::timetz), extract(timezone FROM '12:00:00+05'::timetz);
+SELECT extract(timezone_hour FROM '12:00:00+05:30'::timetz), extract(hour FROM '12:34:56'::time);
+SELECT date_part('minute', '12:34:00+05'::timetz);
+-- stored, compared against a bare literal, aggregated
+CREATE TABLE tzt(a timetz);
+INSERT INTO tzt VALUES ('12:00:00+05'),('08:30:00-03:30'),('00:00:00+00');
+SELECT a::text FROM tzt ORDER BY a;
+SELECT a::text FROM tzt WHERE a > '00:00:00+00' ORDER BY a;
+SELECT max(a)::text, min(a)::text, count(DISTINCT a) FROM tzt;
+DROP TABLE tzt;
+-- a zone suffix on a plain `time` is accepted and ignored, as PostgreSQL does
+SELECT '12:00:00-05'::time, '12:00:00+05'::time, '12:00:00Z'::time;
+CREATE TABLE tmt(a time);
+INSERT INTO tmt VALUES ('12:00:00');
+SELECT a FROM tmt WHERE a > '01:00:00';
+SELECT a FROM tmt WHERE a = '12:00:00';
+DROP TABLE tmt;

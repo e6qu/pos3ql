@@ -102,6 +102,7 @@ impl OwnedDatum {
             | Datum::Timestamp(_)
             | Datum::Timestamptz(_)
             | Datum::Time(_)
+            | Datum::Timetz(..)
             | Datum::Interval(_)
             | Datum::Json { .. }
             | Datum::Array { .. }

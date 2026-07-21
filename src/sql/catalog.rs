@@ -1050,6 +1050,7 @@ fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ColType::Int2,
         ColType::Float4,
         ColType::Time,
+        ColType::Timetz,
         ColType::Interval,
     ];
     let category = |t: &ColType| match t {

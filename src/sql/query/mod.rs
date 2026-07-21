@@ -3592,6 +3592,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Int2 | ColType::Int4 => Datum::Int4(0),
         ColType::Int8 => Datum::Int8(0),
         ColType::Time => Datum::Time(0),
+        ColType::Timetz => Datum::Timetz(0, 0),
         ColType::Interval => Datum::Interval(crate::sql::types::Interval { months: 0, days: 0, micros: 0 }),
         ColType::Json => Datum::Json { text: "null", jsonb: false },
         ColType::Jsonb => Datum::Json { text: "null", jsonb: true },
@@ -7275,24 +7276,11 @@ fn materialized_select<'a>(
 
 /// Byte span of the first `width` encoded columns.
 fn visible_prefix(bytes: &[u8], width: usize) -> &[u8] {
-    let mut at = 1usize;
-    for _ in 0..width {
-        let tag = bytes[at];
-        at += 1;
-        at += match tag {
-            0 => 0,
-            1 => 1,
-            2 | 6 => 4,
-            3 | 4 | 7 | 8 => 8,
-            9 => 16,
-            5 | 10 => {
-                let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-                4 + len
-            }
-            _ => unreachable!(),
-        };
-    }
-    &bytes[..at]
+    // Sizes come from the decoder itself. This used to carry its own tag table
+    // covering only the first eleven, so `SELECT DISTINCT` over a time, an
+    // interval, a json, a range — anything encoded with a later tag — reached
+    // its `unreachable!()` and took the server down with it.
+    &bytes[..super::exec::projected_prefix_len(bytes, width)]
 }
 
 /// Order helpers exported for update/delete WHERE-subquery support.

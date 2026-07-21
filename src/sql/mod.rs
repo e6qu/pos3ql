@@ -811,6 +811,9 @@ impl Engine {
         // Arm this statement's `statement_timeout` deadline (0 clears it); each
         // statement re-arms, so no explicit disarm is needed.
         query::arm_timeout(guc.statement_timeout_ms());
+        // Publish the session zone for the same span, so a cast that has to
+        // supply one (`'12:00'::timetz`) sees what the client set.
+        timezone::set_session(guc.timezone());
         // Render output with the current session settings (a SET earlier in the
         // same batch takes effect here).
         responder.set_render(guc.render());

@@ -1283,10 +1283,14 @@ impl Storage {
 
     /// Unique indexes visible to `txid` over the named table (for constraint
     /// enforcement — an uncommitted CREATE UNIQUE INDEX binds its owner).
+    /// Every index on `table` that `txid` can see, including one it created in
+    /// its own still-open transaction.
+    pub fn indexes_for(&self, table: &str, txid: u32) -> impl Iterator<Item = &IndexDef> {
+        self.indexes.iter().filter(move |x| x.visible_to(txid) && x.table.as_str() == table)
+    }
+
     pub fn unique_indexes_for(&self, table: &str, txid: u32) -> impl Iterator<Item = &IndexDef> {
-        self.indexes
-            .iter()
-            .filter(move |x| x.visible_to(txid) && x.unique && x.table.as_str() == table)
+        self.indexes_for(table, txid).filter(|x| x.unique)
     }
 
     /// All committed indexes, for checkpoint serialization.

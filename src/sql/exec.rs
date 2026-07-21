@@ -20,7 +20,7 @@ use crate::wal::{Wal, WalOp};
 
 use super::ast::{
     AlterAction, AlterTable, ColumnDef, CreateTable, Delete, DropTable, Expr, FkAction, Insert,
-    SelectItem, TableConstraint, Update,
+    LikeClause, SelectItem, TableConstraint, Update,
 };
 use super::eval::{cast_to, compare_datums, eval, sqlstate, ColumnLookup, NoColumns, SqlError};
 use super::types::{ColDesc, ColType, Datum, oid};
@@ -112,10 +112,18 @@ pub fn create_table(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let mut def = match build_def(statement.name, statement.columns, arena) {
+    let mut def = match build_def_with_likes(storage, statement, txn.txid, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    // A copied constraint lands before the explicitly written ones, so a
+    // duplicate primary key is caught with PostgreSQL's own message.
+    if let Err(e) = copy_like_constraints(storage, &mut def, statement, txn.txid) {
+        return sql_fail(e);
+    }
+    if let Err(e) = reject_multiple_primary(&def) {
+        return sql_fail(e);
+    }
     if let Err(e) = attach_constraints(storage, &mut def, statement.constraints, txn.txid, arena) {
         return sql_fail(e);
     }
@@ -140,9 +148,247 @@ pub fn create_table(
         }
         Err(e) => return sql_fail(e),
     }
+    if let Err(e) = copy_like_indexes(storage, wal, txn, statement, &def) {
+        return sql_fail(e);
+    }
     responder.command_complete("CREATE TABLE")?;
     sql_ok()
 }
+
+/// A table gets one primary key. A column-level `PRIMARY KEY` sets the column's
+/// flag directly and never reaches [`attach_constraints`], so two of them — or
+/// one alongside a key copied by `LIKE ... INCLUDING INDEXES` — is only caught
+/// by counting the assembled definition.
+fn reject_multiple_primary(def: &TableDef) -> Result<(), SqlError> {
+    let declared = def.columns().iter().filter(|c| c.primary).count()
+        + def.uniques[..def.n_uniques].iter().filter(|k| k.is_primary).count();
+    if declared > 1 {
+        return Err(sql_err!(
+            "42P16",
+            "multiple primary keys for table \"{}\" are not allowed",
+            def.name.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// The source table of a `LIKE`, or PostgreSQL's undefined-table error.
+fn like_source<'s>(
+    storage: &'s Storage,
+    like: &LikeClause,
+    txid: u32,
+) -> Result<&'s TableDef, SqlError> {
+    match storage.find_visible(like.source, txid) {
+        Some(i) => Ok(&storage.table(i).def),
+        None => Err(undefined_table(like.source)),
+    }
+}
+
+/// [`build_def`] with each `LIKE source` element's columns spliced in where it
+/// was written. A copied column always keeps its name, type and NOT NULL; the
+/// rest of its properties follow the element's `INCLUDING` flags.
+fn build_def_with_likes(
+    storage: &Storage,
+    statement: &CreateTable,
+    txid: u32,
+    arena: &Arena,
+) -> Result<TableDef, SqlError> {
+    if statement.likes.is_empty() {
+        return build_def(statement.name, statement.columns, arena);
+    }
+    let mut def = TableDef { name: SqlName::parse(statement.name)?, ..TableDef::empty() };
+    let mut n = 0usize;
+    for position in 0..=statement.columns.len() {
+        for like in statement.likes.iter().filter(|l| l.at == position) {
+            let source = like_source(storage, like, txid)?;
+            for column in source.columns() {
+                let mut copied = *column;
+                if !like.defaults {
+                    copied.default_value = None;
+                }
+                if !like.indexes {
+                    copied.unique = false;
+                    copied.primary = false;
+                }
+                if !like.identity {
+                    copied.auto_increment = false;
+                }
+                push_column(&mut def, &mut n, copied)?;
+            }
+        }
+        if let Some(column) = statement.columns.get(position) {
+            push_column(&mut def, &mut n, build_column(column, arena)?)?;
+        }
+    }
+    def.n_columns = n;
+    Ok(def)
+}
+
+/// Appends one column, rejecting a name already taken.
+fn push_column(def: &mut TableDef, n: &mut usize, column: ColumnMeta) -> Result<(), SqlError> {
+    if *n == MAX_COLUMNS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "tables can have at most {} columns",
+            MAX_COLUMNS
+        ));
+    }
+    if def.columns[..*n].iter().any(|prev| prev.name == column.name) {
+        return Err(sql_err!(
+            "42701",
+            "column \"{}\" specified more than once",
+            column.name.as_str()
+        ));
+    }
+    def.columns[*n] = column;
+    *n += 1;
+    Ok(())
+}
+
+/// Copies the CHECK constraints and multi-column keys of each `LIKE` source
+/// that asked for them. Foreign keys are never copied, as in PostgreSQL.
+fn copy_like_constraints(
+    storage: &Storage,
+    def: &mut TableDef,
+    statement: &CreateTable,
+    txid: u32,
+) -> Result<(), SqlError> {
+    for like in statement.likes {
+        let source = like_source(storage, like, txid)?;
+        if like.constraints {
+            for check in &source.checks[..source.n_checks] {
+                if def.n_checks == crate::storage::MAX_CHECKS {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "a table can have at most {} CHECK constraints",
+                        crate::storage::MAX_CHECKS
+                    ));
+                }
+                let mut copied = *check;
+                // The name is regenerated from the new table, as PostgreSQL
+                // does, so the two tables' constraints stay distinguishable.
+                copied.name = auto_key_name(def, &[], "check", false)?;
+                def.checks[def.n_checks] = copied;
+                def.n_checks += 1;
+            }
+        }
+        if like.indexes {
+            for key in &source.uniques[..source.n_uniques] {
+                let columns = remap_columns(def, source, &key.columns[..key.n_cols])?;
+                add_unique_key(
+                    def,
+                    None,
+                    if key.is_primary { "pkey" } else { "key" },
+                    &columns,
+                    key.n_cols,
+                    key.is_primary,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Maps column positions in `source` onto the new table, which may have shifted
+/// them by preceding columns.
+fn remap_columns(
+    def: &TableDef,
+    source: &TableDef,
+    columns: &[u16],
+) -> Result<[u16; crate::storage::MAX_INDEX_COLS], SqlError> {
+    let mut out = [0u16; crate::storage::MAX_INDEX_COLS];
+    for (slot, &c) in out.iter_mut().zip(columns) {
+        let name = source.columns()[c as usize].name.as_str();
+        match def.column_index(name) {
+            Some(i) => *slot = i as u16,
+            None => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One source index, captured before the mutable borrow that creates its copy.
+#[derive(Clone, Copy)]
+struct CopiedIndex {
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    n_cols: usize,
+    unique: bool,
+}
+
+/// Recreates each `LIKE` source's secondary indexes on the new table. It has no
+/// rows yet, so the uniqueness scan [`create_index`] performs is unnecessary.
+fn copy_like_indexes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &CreateTable,
+    def: &TableDef,
+) -> Result<(), SqlError> {
+    use crate::storage::IndexDef;
+    for like in statement.likes.iter().filter(|l| l.indexes) {
+        // Collected up front: creating one needs `storage` mutably.
+        let mut copied = [CopiedIndex { columns: [0; crate::storage::MAX_INDEX_COLS], n_cols: 0, unique: false };
+            MAX_LIKE_INDEXES];
+        let mut n_copied = 0;
+        for index in storage.indexes_for(like.source, txn.txid) {
+            if n_copied == MAX_LIKE_INDEXES {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "cannot copy more than {} indexes",
+                    MAX_LIKE_INDEXES
+                ));
+            }
+            copied[n_copied] =
+                CopiedIndex { columns: index.columns, n_cols: index.n_cols, unique: index.unique };
+            n_copied += 1;
+        }
+        let source = match storage.find_visible(like.source, txn.txid) {
+            Some(i) => storage.table(i).def,
+            None => return Err(undefined_table(like.source)),
+        };
+        for index in &copied[..n_copied] {
+            let columns = remap_columns(def, &source, &index.columns[..index.n_cols])?;
+            let name = auto_key_name(def, &columns[..index.n_cols], "idx", true)?;
+            let slot = storage.create_index(
+                IndexDef {
+                    name,
+                    table: def.name,
+                    columns,
+                    n_cols: index.n_cols,
+                    unique: index.unique,
+                    live: true,
+                    pending: None,
+                },
+                txn.txid,
+            )?;
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(
+                lsn,
+                &WalOp::CreateIndex {
+                    name: name.as_str(),
+                    table: def.name.as_str(),
+                    columns,
+                    n_cols: index.n_cols,
+                    unique: index.unique,
+                },
+            ) {
+                storage.rollback_index_create(slot);
+                return Err(e);
+            }
+            txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))?;
+        }
+    }
+    Ok(())
+}
+
+/// Upper bound on the secondary indexes one `LIKE ... INCLUDING INDEXES` copies.
+const MAX_LIKE_INDEXES: usize = 8;
 
 fn build_def(name: &str, columns: &[ColumnDef], arena: &Arena) -> Result<TableDef, SqlError> {
     if columns.len() > MAX_COLUMNS {
@@ -364,7 +610,11 @@ fn attach_constraints(
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let mut has_primary = def.columns().iter().any(|c| c.primary);
+    // A multi-column primary key lives in `uniques`, not on a column flag, so
+    // looking only at the columns would miss one a `LIKE ... INCLUDING INDEXES`
+    // had already copied in and let the table end up with two.
+    let mut has_primary = def.columns().iter().any(|c| c.primary)
+        || def.uniques[..def.n_uniques].iter().any(|k| k.is_primary);
     for con in constraints {
         match con {
             TableConstraint::PrimaryKey { name, columns } => {

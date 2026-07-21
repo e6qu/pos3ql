@@ -277,7 +277,30 @@ pub struct CreateTable<'a> {
     /// Table-level constraints (multi-column PK/UNIQUE, CHECK, FOREIGN KEY),
     /// plus column-level CHECK/REFERENCES desugared into this list.
     pub constraints: &'a [TableConstraint<'a>],
+    /// `LIKE source [INCLUDING ...]` elements, expanded against the catalog
+    /// when the statement runs.
+    pub likes: &'a [LikeClause<'a>],
     pub if_not_exists: bool,
+}
+
+/// One `LIKE source [INCLUDING ...]` element of a `CREATE TABLE`. The copied
+/// columns always carry their name, type and NOT NULL; each flag adds one more
+/// group, exactly as PostgreSQL splits them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LikeClause<'a> {
+    /// How many of `CreateTable::columns` precede this element, so
+    /// `(z int, LIKE src, w text)` keeps PostgreSQL's column order.
+    pub at: usize,
+    pub source: &'a str,
+    /// `INCLUDING DEFAULTS`.
+    pub defaults: bool,
+    /// `INCLUDING CONSTRAINTS` — CHECK constraints. NOT NULL is not part of
+    /// this group; it always copies.
+    pub constraints: bool,
+    /// `INCLUDING INDEXES` — PRIMARY KEY, UNIQUE, and secondary indexes.
+    pub indexes: bool,
+    /// `INCLUDING IDENTITY` or `GENERATED` — the auto-increment flag.
+    pub identity: bool,
 }
 
 /// A table-level constraint, or a column-level CHECK/REFERENCES desugared to

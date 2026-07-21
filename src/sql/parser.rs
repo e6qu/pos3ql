@@ -1311,9 +1311,26 @@ impl<'a> Parser<'a> {
         let mut n = 0;
         let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
         let mut n_cons = 0;
+        let mut likes =
+            [LikeClause { at: 0, source: "", defaults: false, constraints: false, indexes: false, identity: false };
+                MAX_LIST];
+        let mut n_likes = 0;
         loop {
             if n == MAX_LIST {
                 return Err(self.limit("column list", MAX_LIST));
+            }
+            // `LIKE source [INCLUDING ...]` copies another table's columns in
+            // at this position; the catalog is only consulted when it runs.
+            if self.eat_ident("like")? {
+                if n_likes == MAX_LIST {
+                    return Err(self.limit("LIKE clauses", MAX_LIST));
+                }
+                likes[n_likes] = self.like_clause(n)?;
+                n_likes += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+                continue;
             }
             // An optional CONSTRAINT <name> prefixes a table- or column-level
             // constraint; it names the following constraint.
@@ -1402,7 +1419,53 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         let columns = self.arena_slice(&columns[..n])?;
         let constraints = self.arena_slice(&cons[..n_cons])?;
-        Ok(Stmt::CreateTable(CreateTable { name, columns, constraints, if_not_exists }))
+        let likes = self.arena_slice(&likes[..n_likes])?;
+        Ok(Stmt::CreateTable(CreateTable { name, columns, constraints, likes, if_not_exists }))
+    }
+
+    /// The rest of a `LIKE source [ { INCLUDING | EXCLUDING } option ]...`
+    /// element, `LIKE` already consumed. `at` is how many columns precede it.
+    fn like_clause(&mut self, at: usize) -> Result<LikeClause<'a>, ParseError> {
+        let source = self.col_ident("source table name")?;
+        let mut clause =
+            LikeClause { at, source, defaults: false, constraints: false, indexes: false, identity: false };
+        loop {
+            let including = if self.eat_ident("including")? {
+                true
+            } else if self.eat_ident("excluding")? {
+                false
+            } else {
+                return Ok(clause);
+            };
+            // PostgreSQL's option set. The four this engine has no notion of
+            // are rejected rather than accepted and quietly dropped; ALL does
+            // not name them, so it stays legal.
+            match self.peeked {
+                Tok::Ident("defaults") => clause.defaults = including,
+                Tok::Ident("constraints") => clause.constraints = including,
+                Tok::Ident("indexes") => clause.indexes = including,
+                Tok::Ident("identity" | "generated") => clause.identity = including,
+                Tok::Ident("all") => {
+                    clause.defaults = including;
+                    clause.constraints = including;
+                    clause.indexes = including;
+                    clause.identity = including;
+                }
+                Tok::Ident(other @ ("comments" | "compression" | "statistics" | "storage")) => {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "INCLUDING {} is not supported: this engine has no such column property",
+                            other
+                        ),
+                        sqlstate: "0A000",
+                    })
+                }
+                _ => return Err(self.err_here("expected a LIKE option after INCLUDING/EXCLUDING")),
+            }
+            self.advance()?;
+        }
     }
 
     /// Parses a parenthesized, comma-separated column-name list.

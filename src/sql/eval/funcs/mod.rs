@@ -10,5 +10,6 @@
 
 pub(super) mod bytea;
 pub(super) mod datetime;
+pub(super) mod json;
 pub(super) mod math;
 pub(super) mod string;

@@ -9,3 +9,4 @@
 //! relocated here without depending on where they sat in the original `match`.
 
 pub(super) mod bytea;
+pub(super) mod math;

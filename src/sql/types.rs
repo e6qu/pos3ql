@@ -768,27 +768,67 @@ pub(crate) fn write_record_field(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::
 /// Renders one array element, quoting text that would otherwise be ambiguous
 /// (empty, or containing a delimiter/brace/quote/backslash/whitespace), and
 /// spelling NULL unquoted — matching PostgreSQL's array output.
-pub(crate) fn write_array_elem(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Result {
-    match v {
-        Datum::Null => f.write_str("NULL"),
-        Datum::Text(s) => {
-            let needs_quote = s.is_empty()
-                || s.eq_ignore_ascii_case("null")
-                || s.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
-            if needs_quote {
-                f.write_str("\"")?;
-                for c in s.chars() {
-                    if c == '"' || c == '\\' {
-                        f.write_char('\\')?;
-                    }
-                    f.write_char(c)?;
-                }
-                f.write_str("\"")
-            } else {
-                f.write_str(s)
-            }
+/// Whether an element's rendered text has to be quoted inside an array
+/// literal, decided while the value renders so no buffer bounds it.
+struct QuoteScan {
+    empty: bool,
+    special: bool,
+    text: [u8; 4],
+    len: usize,
+}
+
+impl fmt::Write for QuoteScan {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if !s.is_empty() {
+            self.empty = false;
         }
-        other => write!(f, "{other}"),
+        if s.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace()) {
+            self.special = true;
+        }
+        // Only the first four bytes are kept, enough to recognize `null`.
+        for b in s.bytes() {
+            if self.len < self.text.len() {
+                self.text[self.len] = b;
+            }
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Escapes `"` and `\` as it forwards, for an element being quoted.
+struct EscapeTo<'x, 'y>(&'x mut fmt::Formatter<'y>);
+
+impl fmt::Write for EscapeTo<'_, '_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            if c == '"' || c == '\\' {
+                self.0.write_char('\\')?;
+            }
+            self.0.write_char(c)?;
+        }
+        Ok(())
+    }
+}
+
+/// One element of an array literal. PostgreSQL quotes an element whose text is
+/// empty, spells `null`, or carries a comma, brace, quote, backslash or space —
+/// which is why a timestamp, a range and a json value all come out quoted, not
+/// only a string. The value is rendered twice rather than buffered, so nothing
+/// caps how long an element may be.
+pub(crate) fn write_array_elem(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Result {
+    if matches!(v, Datum::Null) {
+        return f.write_str("NULL");
+    }
+    let mut scan = QuoteScan { empty: true, special: false, text: [0; 4], len: 0 };
+    write!(scan, "{v}")?;
+    let is_null_word = scan.len == 4 && scan.text.eq_ignore_ascii_case(b"null");
+    if scan.empty || scan.special || is_null_word {
+        f.write_str("\"")?;
+        write!(EscapeTo(f), "{v}")?;
+        f.write_str("\"")
+    } else {
+        write!(f, "{v}")
     }
 }
 

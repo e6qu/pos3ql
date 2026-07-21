@@ -1075,10 +1075,16 @@ impl<'a> AggState<'a> {
         if values.is_empty() {
             return Ok(Datum::Null);
         }
-        let element = values
-            .iter()
-            .find_map(crate::sql::types::ArrElem::from_datum)
-            .unwrap_or(crate::sql::types::ArrElem::Int4);
+        // No default here. Falling back to int4 for an element type arrays
+        // cannot yet carry relabelled the values rather than failing, so
+        // `array_agg` over a time or a uuid came back as meaningless integers.
+        let Some(element) = values.iter().find_map(crate::sql::types::ArrElem::from_datum) else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "array_agg over {} is not supported yet",
+                crate::sql::eval::type_name_of_pub(&values[0])
+            ));
+        };
         let raw = crate::sql::array::build(values, arena)?;
         Ok(Datum::Array { element, raw })
     }

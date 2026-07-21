@@ -3479,6 +3479,10 @@ fn session_zone_at(utc_micros: i64) -> i32 {
     super::timezone::session().resolve(utc_micros).0
 }
 
+pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
+    type_name_of(d)
+}
+
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Null => "unknown",

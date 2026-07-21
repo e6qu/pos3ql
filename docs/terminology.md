@@ -130,6 +130,43 @@ vocabulary — with the meaning they carry in this codebase.
 - **transaction id (`transaction_id`)** — the identifier of a transaction's
   snapshot, used for row visibility. (Field name: previously `txid`.)
 
+### Object-storage read path & execution (roadmap)
+
+The performance vocabulary of the object-storage LSM and its adaptive executor
+(see [PLAN.md](../PLAN.md), Stages A–I). All roadmap terms.
+
+- **SSTable** — long form of *SST* above; the immutable sorted block-structured
+  object of rows on object storage.
+- **sparse index** — one entry per SST data block (its first key → block offset),
+  small enough to keep resident so a lookup finds the single block to fetch
+  without scanning the SST.
+- **bloom filter** — a compact probabilistic set summary stored per SST; a
+  "not present" answer is certain, so a point lookup skips an SST that cannot
+  hold the key (no false negatives; rare false positives).
+- **zone map** (min-max) — the stored minimum and maximum of a column per block
+  or SST, letting the planner *prune* blocks a predicate cannot match.
+- **read amplification / write amplification** — the extra blocks read per
+  logical read, and extra bytes written per logical write; the two costs an LSM
+  compaction shape trades off (leveled minimizes read-amp, tiered write-amp).
+- **prefetch / read-ahead** — issuing block GETs ahead of the scan cursor,
+  concurrently, so object-storage latency is overlapped into throughput.
+- **hedged request** — issuing a duplicate GET once the first passes a latency
+  deadline and taking whichever returns first, to cut object-storage tail latency.
+- **late materialization** — carrying only the key and the columns a stage needs,
+  assembling full rows only for those that survive filters/joins/LIMIT, so fewer
+  blocks are fetched.
+- **vectorized execution** (block-at-a-time) — operators processing a whole
+  block's worth of rows per step in a push-based batched pipeline, rather than one
+  row per call, for throughput.
+- **PAX** (row-group) — a within-block layout that keeps rows grouped by key but
+  clusters columns inside the block (Parquet-row-group style), enabling column
+  projection and better compression without leaving the row model.
+- **free set** — the fixed structure tracking which grid blocks are free vs.
+  allocated (after TigerBeetle's grid free set).
+- **cost model** — the planner's estimate of a plan's cost; the *storage-aware*
+  version prices object-storage request latency, request count, bandwidth, and
+  cache residency so the planner adapts plans to the bucket.
+
 ### Memory discipline
 
 - **slab** — the single, up-front reservation of the process's entire memory

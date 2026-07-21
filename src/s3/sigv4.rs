@@ -96,20 +96,6 @@ fn update_signed_headers(hasher: &mut Sha256, headers: &[(&str, &str)]) {
     }
 }
 
-/// Writes the signed-headers list into a formatter target.
-pub fn write_signed_headers<W: core::fmt::Write>(
-    out: &mut W,
-    headers: &[(&str, &str)],
-) -> core::fmt::Result {
-    for (i, (name, _)) in headers.iter().enumerate() {
-        if i > 0 {
-            out.write_char(';')?;
-        }
-        out.write_str(name)?;
-    }
-    Ok(())
-}
-
 /// Percent-encodes into `out` per SigV4 rules: unreserved bytes
 /// (A–Z a–z 0–9 - . _ ~) pass through; `/` passes when `is_path`;
 /// everything else becomes uppercase %XX.

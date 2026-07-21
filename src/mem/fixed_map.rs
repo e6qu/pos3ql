@@ -120,10 +120,6 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
             .map(|i| &mut self.slots[i].as_mut().unwrap().1)
     }
 
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.find(key).is_some()
-    }
-
     /// Removes a key, restoring the probe invariant by backward-shifting
     /// any displaced entries into the hole.
     pub fn remove(&mut self, key: &K) -> Option<V> {

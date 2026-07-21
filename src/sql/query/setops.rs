@@ -103,7 +103,7 @@ fn collect_set_leaves<'a>(
     match tree {
         SetTree::Select(s) => {
             if *n == MAX_SET_LEAVES {
-                return Err(sql_err!("54000", "too many set-operation branches"));
+                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many set-operation branches"));
             }
             out[*n] = Some(s);
             *n += 1;
@@ -116,7 +116,6 @@ fn collect_set_leaves<'a>(
     }
 }
 
-/// Column descriptions of a set-operation leaf (FROM-less or table-backed).
 /// Whether a set-operation leaf's `c`-th output column is an untyped UNKNOWN
 /// (a bare NULL or parameter), which the describe path coerces to text but a
 /// set operation should let adopt another branch's type.
@@ -156,6 +155,7 @@ fn leaf_col_unknown<'a>(
     false
 }
 
+/// Column descriptions of a set-operation leaf (FROM-less or table-backed).
 fn describe_leaf<'a>(
     storage: &'a Storage,
     s: &'a Select<'a>,
@@ -237,7 +237,7 @@ pub(crate) fn describe_set_body<'a>(
         let ln = describe_leaf(storage, leaf.expect("leaf"), txid, &mut lc, arena)?;
         if ln != n_cols {
             return Err(sql_err!(
-                "42601",
+                sqlstate::SYNTAX_ERROR,
                 "each UNION query must have the same number of columns"
             ));
         }
@@ -253,7 +253,7 @@ pub(crate) fn describe_set_body<'a>(
                     Some(t) => target[c] = Some(t),
                     None => {
                         return Err(sql_err!(
-                            "42804",
+                            sqlstate::DATATYPE_MISMATCH,
                             "UNION types {} and {} cannot be matched",
                             existing.name(),
                             lt.name()
@@ -317,7 +317,7 @@ fn eval_set_leaf<'a>(
     select_into_rows(storage, txid, s, arena, params, None, &mut |vals| {
         if vals.len() != n {
             return Err(sql_err!(
-                "42601",
+                sqlstate::SYNTAX_ERROR,
                 "each UNION query must have the same number of columns"
             ));
         }

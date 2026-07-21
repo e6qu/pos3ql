@@ -132,7 +132,9 @@ fi
 step "durability: kill -9, restart, data intact"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
   -c "CREATE TABLE crashy (id int, v text)" \
-  -c "INSERT INTO crashy VALUES (1,'pre-crash'),(2,'also here')"
+  -c "INSERT INTO crashy VALUES (1,'pre-crash'),(2,'also here')" \
+  -c "CREATE TABLE crashy_types (a int[], b bool[], c text[], m tsmultirange, r int4range)" \
+  -c "INSERT INTO crashy_types VALUES ('{1,2}','{t,f}','{x}','{[2020-01-01,2020-02-01)}','[1,5)')"
 # With asynchronous wal_upload, a commit is durable on local disk immediately
 # but its S3 upload drains just after; a trailing query plus a short pause lets
 # that drain reach MinIO before the abrupt kill, so the later disk-wipe steps
@@ -147,6 +149,16 @@ for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
+# A column's type is stored as a one-byte code; two families once shared codes,
+# so an int4[]/bool[] column came back as a multirange with its values gone.
+types=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' \
+  -c "SELECT pg_typeof(a),pg_typeof(b),pg_typeof(c),pg_typeof(m),pg_typeof(r) FROM crashy_types" 2>&1)
+want="integer[]|boolean[]|text[]|tsmultirange|int4range"
+[[ "$types" == "$want" ]] && ok "column types survive restart" \
+  || bad "column types after restart: got '$types' want '$want'"
+vals=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT a,b,c FROM crashy_types" 2>&1)
+[[ "$vals" == "{1,2}|{t,f}|{x}" ]] && ok "array values survive restart" \
+  || bad "array values after restart: '$vals'"
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(*) FROM crashy" 2>&1)
 [[ "$out" == "2" ]] && ok "kill -9 recovery" || bad "kill -9 recovery: '$out'"
 

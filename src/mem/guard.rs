@@ -36,10 +36,6 @@ pub fn freeze() {
     FROZEN.store(true, Ordering::SeqCst);
 }
 
-pub fn is_frozen() -> bool {
-    FROZEN.load(Ordering::SeqCst)
-}
-
 /// Runs `f` with heap allocation treated as a fault on this thread.
 /// Used by tests to prove hot paths allocate nothing.
 pub fn forbid_alloc<R>(f: impl FnOnce() -> R) -> R {

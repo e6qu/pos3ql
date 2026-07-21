@@ -94,11 +94,6 @@ impl<'b> Responder<'b> {
     }
 
     /// Sets the session value-rendering context (DateStyle / time zone).
-    pub fn with_render(mut self, render: crate::sql::guc::RenderContext) -> Self {
-        self.render = render;
-        self
-    }
-
     /// Updates the value-rendering context in place (e.g. after a SET changed
     /// DateStyle mid-batch).
     pub fn set_render(&mut self, render: crate::sql::guc::RenderContext) {

@@ -848,23 +848,6 @@ impl Storage {
         }
     }
 
-    /// Discards a row's pending change.
-    pub fn rollback_row(&mut self, table_index: usize, rowid: u64, txid: u32) {
-        let table = &mut self.tables[table_index];
-        let Some(state) = table.rows.get_mut(&rowid) else {
-            return;
-        };
-        match state.pending {
-            Some(p) if p.txid == txid => {
-                state.pending = None;
-                if state.committed.is_none() {
-                    table.rows.remove(&rowid);
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
     /// replay and any context that operates on the durable image.
     pub fn find_table(&self, name: &str) -> Option<usize> {
@@ -968,10 +951,6 @@ impl Storage {
         self.tables[index].dirty = true;
     }
 
-    pub fn finalize_drop(&mut self, index: usize) {
-        self.tables[index].rows.clear();
-    }
-
     /// Promotes an uncommitted CREATE to the committed image.
     pub fn commit_create(&mut self, index: usize) {
         self.tables[index].live = true;
@@ -999,11 +978,6 @@ impl Storage {
         self.tables[index].pending_ddl = None;
     }
 
-    /// Rolls back an uncommitted DROP TABLE (journal-replay / committed path).
-    pub fn revive_table(&mut self, index: usize) {
-        self.tables[index].live = true;
-        self.tables[index].pending_ddl = None;
-    }
 
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
@@ -1157,10 +1131,6 @@ impl Storage {
         } else {
             v.pending = Some(PendingDdl { txid, creating: true });
         }
-    }
-
-    pub fn drop_view_slot(&mut self, slot: usize) {
-        self.views[slot].live = false;
     }
 
     pub fn index_exists(&self, name: &str, txid: u32) -> bool {

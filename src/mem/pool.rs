@@ -118,17 +118,6 @@ impl<T> Pool<T> {
     }
 
     /// Live handles in unspecified order.
-    pub fn iter_handles(&self) -> impl Iterator<Item = Handle> + '_ {
-        self.occupied
-            .iter()
-            .enumerate()
-            .filter(|(_, occupied)| **occupied)
-            .map(|(i, _)| Handle {
-                index: i as u32,
-                generation: self.generations[i],
-            })
-    }
-
     fn check(&self, handle: Handle) -> usize {
         let i = handle.index as usize;
         assert!(

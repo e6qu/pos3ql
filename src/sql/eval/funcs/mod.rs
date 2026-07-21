@@ -10,3 +10,4 @@
 
 pub(super) mod bytea;
 pub(super) mod math;
+pub(super) mod string;

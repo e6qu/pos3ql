@@ -3284,6 +3284,12 @@ fn is_multirange_oid(oid: i32) -> bool {
 
 fn comparable(a: ColType, b: ColType) -> bool {
     use ColType::*;
+    // `json` has no equality operator in PostgreSQL — two documents that differ
+    // only in whitespace or key order are the same value but not the same text,
+    // so it declines to say. `jsonb`, which is canonicalized, does compare.
+    if matches!(a, Json) || matches!(b, Json) {
+        return false;
+    }
     if a == b {
         return true;
     }

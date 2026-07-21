@@ -323,7 +323,16 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
         (Datum::Timetz(a, za), Datum::Timetz(b, zb)) => (a - *za as i64 * 1_000_000)
             .cmp(&(b - *zb as i64 * 1_000_000))
             .then_with(|| (-za).cmp(&-zb)),
-        (Datum::Json { text: a, .. }, Datum::Json { text: b, .. }) => a.cmp(b),
+        // Only `jsonb` compares; `json` keeps its original text, so equal
+        // documents can differ byte for byte and PostgreSQL offers no operator.
+        (Datum::Json { text: a, jsonb: true }, Datum::Json { text: b, jsonb: true }) => a.cmp(b),
+        (Datum::Json { jsonb: false, .. }, Datum::Json { .. })
+        | (Datum::Json { .. }, Datum::Json { jsonb: false, .. }) => {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: json = json"
+            ))
+        }
         (Datum::Record(a), Datum::Record(b)) => {
             // Field-wise, with a NULL field comparing greater (PostgreSQL
             // record ordering); shorter record sorts first on a common prefix.

@@ -10,9 +10,11 @@
 
 pub(super) mod array;
 pub(super) mod bytea;
+pub(super) mod conditional;
 pub(super) mod datetime;
 pub(super) mod json;
 pub(super) mod math;
+pub(super) mod misc;
 pub(super) mod range;
 pub(super) mod regex;
 pub(super) mod string;

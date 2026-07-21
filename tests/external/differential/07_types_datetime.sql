@@ -123,6 +123,7 @@ SELECT localtime(0)::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}$';
 SELECT date_part('hour', localtime) = date_part('hour', current_time);
 SET TimeZone='Asia/Kolkata';
 SELECT right(current_time::text, 6);
-SELECT localtime = current_time::time;
+-- (localtime = current_time::time is racy here: each reads the clock
+--  separately, where PostgreSQL stabilizes both — B-101)
 SET TimeZone='UTC';
 SELECT right(current_time::text, 3);

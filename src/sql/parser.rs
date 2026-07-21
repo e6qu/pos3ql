@@ -610,6 +610,11 @@ impl<'a> Parser<'a> {
         let mut offset = None;
         loop {
             if limit.is_none() && self.eat_ident("limit")? {
+                // `LIMIT ALL` is the standard spelling of "no limit"; it leaves
+                // the clause unset rather than binding an expression.
+                if self.eat_ident("all")? {
+                    continue;
+                }
                 limit = Some(self.expression(0)?);
             } else if offset.is_none() && self.eat_ident("offset")? {
                 offset = Some(self.expression(0)?);
@@ -1631,6 +1636,12 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.err_here("statement too large for SQL arena"))?
                     as &_,
             );
+        } else if self.eat_ident("default")? {
+            // `DEFAULT VALUES` inserts one row of nothing but defaults, which
+            // is exactly a row of `DEFAULT` markers over no named columns.
+            self.expect_ident("values")?;
+            rows[0] = &[];
+            n_rows = 1;
         } else {
             self.expect_ident("values")?;
             loop {
@@ -2393,8 +2404,8 @@ impl<'a> Parser<'a> {
                 if matches!(
                     name,
                     "current_date" | "current_timestamp" | "current_time" | "localtimestamp"
-                        | "localtime" | "current_user" | "session_user" | "current_catalog"
-                        | "current_schema"
+                        | "localtime" | "current_user" | "session_user" | "user"
+                        | "current_catalog" | "current_schema"
                 ) {
                     let mut args: &[&'a Expr<'a>] = &[];
                     if self.peeked == Tok::Op("(")
@@ -2517,7 +2528,10 @@ impl<'a> Parser<'a> {
             if self.eat_ident("in")? {
                 let haystack = self.expression(0)?;
                 self.expect_op(")")?;
-                return self.plain_call("strpos", &[haystack, needle]);
+                // Kept under its own name, not desugared to `strpos`: the two
+                // compute the same thing, but PostgreSQL labels the output
+                // column `position`, and the label comes from the call name.
+                return self.plain_call("position", &[haystack, needle]);
             }
             let mut cargs = [needle, needle];
             let mut cn = 1;

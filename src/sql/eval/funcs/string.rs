@@ -53,6 +53,7 @@ pub(crate) fn dispatch<'a>(
             | "left"
             | "right"
             | "strpos"
+            | "position"
             | "concat"
             | "concat_ws"
             | "initcap"
@@ -353,7 +354,7 @@ pub(crate) fn dispatch<'a>(
                 };
                 Ok(Datum::Text(out))
             }
-            "strpos" => {
+            "strpos" | "position" => {
                 arity(2)?;
                 let (Some(s), Some(sub)) = (
                     text_arg(name, args, 0, arena, params, row, hooks)?,

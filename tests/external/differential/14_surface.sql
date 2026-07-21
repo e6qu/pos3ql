@@ -123,3 +123,17 @@ SELECT '{"a":1}'::jsonb <> '{"a":2}'::jsonb;
 SELECT '{"a":1}'::json->>'a', '{"a":1}'::json::text, ('{"a":1}'::json) IS NULL;
 SELECT json_agg(x)::text FROM (VALUES (1),(2)) v(x);
 SELECT count(x) FROM (VALUES ('{}'::json)) v(x);
+-- min/max exist only where PostgreSQL defines them: the numeric tower,
+-- strings, the temporal types, bytea and arrays — not boolean, uuid, json,
+-- jsonb, bit strings, ranges or multiranges
+SELECT min(x)::text, max(x)::text FROM (VALUES (3),(1),(2)) v(x);
+SELECT min(x)::text FROM (VALUES ('12:00:00'::time),('09:00:00')) v(x);
+SELECT min(x)::text FROM (VALUES ('1 day'::interval),('2 hours')) v(x);
+SELECT max(x)::text FROM (VALUES (ARRAY[1,2]),(ARRAY[1,3])) v(x);
+SELECT min(true);
+SELECT min('a1b2c3d4-e5f6-7890-abcd-ef1234567890'::uuid);
+SELECT min(x) FROM (VALUES ('{}'::json)) v(x);
+SELECT min(x) FROM (VALUES ('{}'::jsonb)) v(x);
+SELECT min(x) FROM (VALUES (B'101')) v(x);
+SELECT min(x) FROM (VALUES ('[1,5)'::int4range)) v(x);
+SELECT min(x) FROM (VALUES ('{[1,5)}'::int4multirange)) v(x);

@@ -137,3 +137,13 @@ SELECT min(x) FROM (VALUES ('{}'::jsonb)) v(x);
 SELECT min(x) FROM (VALUES (B'101')) v(x);
 SELECT min(x) FROM (VALUES ('[1,5)'::int4range)) v(x);
 SELECT min(x) FROM (VALUES ('{[1,5)}'::int4multirange)) v(x);
+-- a cast keeps the name of what it casts when that names itself, and does not
+-- chain through another cast
+SELECT ARRAY[1]::text;
+SELECT ARRAY(SELECT 1)::text;
+-- (a `now()::text` probe would print the clock; its label is covered by
+--  the column-name checks above)
+SELECT 1::text;
+SELECT (1+1)::text;
+SELECT int4range(1,5)::int4multirange;
+SELECT 'empty'::int4range::int4multirange;

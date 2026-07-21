@@ -248,6 +248,69 @@ impl ColType {
             Self::Multirange(k) => k.multirange_name(),
         }
     }
+
+    /// Stable byte code for the schema-less on-disk encodings — the single
+    /// source of truth shared by WAL records and checkpoint SSTs, so the two
+    /// can never drift. Composite types fold in their element/kind `code()`.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Bool => 1,
+            Self::Int4 => 2,
+            Self::Int8 => 3,
+            Self::Float8 => 4,
+            Self::Text => 5,
+            Self::Date => 6,
+            Self::Timestamp => 7,
+            Self::Timestamptz => 8,
+            Self::Uuid => 9,
+            Self::Bytea => 10,
+            Self::Numeric => 11,
+            Self::Int2 => 12,
+            Self::Float4 => 13,
+            Self::Varchar => 14,
+            Self::Bpchar => 15,
+            Self::Time => 16,
+            Self::Interval => 17,
+            Self::Json => 18,
+            Self::Jsonb => 19,
+            Self::Range(k) => 20 + k.code(),
+            Self::Bit { varying: false } => 26,
+            Self::Bit { varying: true } => 27,
+            Self::Multirange(k) => 28 + k.code(),
+            Self::Array(e) => 32 + e.code(),
+        }
+    }
+
+    /// Inverse of [`ColType::code`]; `None` for an unknown or corrupt code.
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Bool,
+            2 => Self::Int4,
+            3 => Self::Int8,
+            4 => Self::Float8,
+            5 => Self::Text,
+            6 => Self::Date,
+            7 => Self::Timestamp,
+            8 => Self::Timestamptz,
+            9 => Self::Uuid,
+            10 => Self::Bytea,
+            11 => Self::Numeric,
+            12 => Self::Int2,
+            13 => Self::Float4,
+            14 => Self::Varchar,
+            15 => Self::Bpchar,
+            16 => Self::Time,
+            17 => Self::Interval,
+            18 => Self::Json,
+            19 => Self::Jsonb,
+            26 => Self::Bit { varying: false },
+            27 => Self::Bit { varying: true },
+            c if (20..26).contains(&c) => Self::Range(RangeKind::from_code(c - 20)),
+            c if (28..34).contains(&c) => Self::Multirange(RangeKind::from_code(c - 28)),
+            c if c >= 32 => Self::Array(ArrElem::from_code(c - 32)?),
+            _ => return None,
+        })
+    }
 }
 
 /// The element type of a one-dimensional array. A distinct (non-recursive)

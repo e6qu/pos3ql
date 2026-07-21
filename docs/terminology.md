@@ -21,7 +21,7 @@ and naming rules.
    `UUID`, `URL`, `CPU`, `OS`, `ID`. These are recognized without expansion.
 3. **Established short names for well-known concepts are allowed**, because a
    senior engineer reading this project already knows them — the module names
-   (`exec`, `eval`, `mem`, `io`, `wal`, `guc`, `ast`, `vsr`, `lsm`, `pg`, `sim`)
+   (`exec`, `eval`, `mem`, `io`, `wal`, `guc`, `ast`, `vsr`, `pg`, `sim`)
    and a few universal computer-science idioms (`cmp`, `len`, `ptr`, `fd`). Each
    one is defined below so the choice is explicit, not assumed. Do not add new
    ones; anything not listed here gets spelled out.
@@ -52,8 +52,6 @@ short names are kept (rule 3) and defined here.
 - **`vsr`** — Viewstamped Replication: messages, the replica state machine, the
   journal, view change, and recovery.
 - **`wal`** — the write-ahead log / VSR journal format and replay.
-- **`lsm`** — the log-structured merge storage engine (memtable, sorted string
-  tables, manifest, compaction).
 - **`s3`** — the object-storage client (HTTP/1.1, AWS Signature Version 4,
   hand-rolled SHA-256 / HMAC, conditional writes, retries).
 - **`pg`** (PostgreSQL) — the PostgreSQL wire protocol: framing, authentication,
@@ -64,8 +62,12 @@ short names are kept (rule 3) and defined here.
   planning and joins), **`catalog`** (`pg_catalog` / `information_schema`),
   **`guc`** (session/server configuration parameters), **`numeric`**,
   **`datetime`**, **`range`**, **`timezone`**, **`to_char`**, **`regex`**.
-- **`storage`** — the row/table catalog, row encoding, and the visibility model.
-- **`checkpoint`** — serialize and restore the catalog and table data.
+- **`storage`** — the in-memory LSM write path: the *memtable* row heap, the
+  row/table catalog, row encoding, and the visibility model. (There is no
+  `lsm` module; the LSM is realized across `storage` + `checkpoint` + `wal`,
+  and the leveled read/compaction half is roadmapped — see [PLAN.md](../PLAN.md).)
+- **`checkpoint`** — snapshot live tables to SST objects and publish the
+  compare-and-swap *manifest*; cold-start rehydration from the bucket.
 - **`sim`** (simulator) — the deterministic whole-cluster simulator (VOPR).
 - **`util`** (utilities) — small shared helpers (e.g. `StackStr`, a stack-backed
   string).
@@ -82,11 +84,36 @@ vocabulary — with the meaning they carry in this codebase.
   node is a cluster of one.
 - **Log-Structured Merge tree (LSM)** — the storage model: writes land in an
   in-memory table and are later flushed to immutable sorted files, with
-  background compaction.
-- **memtable** — the in-memory, sorted write buffer at the top of the LSM. On
-  flush it becomes a sorted string table.
-- **Sorted String Table (SST)** — an immutable, sorted, block-structured file of
-  rows on object storage; the on-disk (on-S3) form of flushed data.
+  background compaction. *Current state:* pos3ql implements the in-memory half
+  (the memtable) plus checkpoint SSTs; memtable flush, leveled SSTs, and a
+  queryable multi-level read path with compaction are roadmapped (PLAN.md).
+- **memtable** — the in-memory, sorted write buffer at the top of the LSM.
+  Today it holds the whole live working set (`memtable_bytes`); flushing a
+  frozen memtable to an SST is roadmapped.
+- **Sorted String Table (SST)** — an immutable, sorted, block-structured object
+  of rows on object storage. Today an SST is a per-table *checkpoint snapshot*;
+  block-granular SSTs read a block at a time are roadmapped.
+- **block** — the fixed-size, checksummed, content-addressed unit the roadmapped
+  storage engine reads and caches: SST data/index/filter blocks, the manifest
+  log, and cache frames are all blocks (after TigerBeetle's *grid*). Roadmap.
+- **block grid** — the fixed array of blocks unifying on-object and cached
+  storage; the seam (`BlockStore`) with a local backend and an object-storage
+  backend. Roadmap.
+- **block cache / disk cache** — the RAM and local-disk read-through tiers in
+  front of object storage (`block_cache_bytes` / `disk_cache_bytes`), the
+  "ClickHouse/Loki-style" cache of the founding vision. Reserved in config
+  today; wired in the roadmap.
+- **manifest log** — an append-only log of SST-added/removed records rooted by a
+  CAS'd *superblock*, replacing the monolithic manifest rewrite (after
+  TigerBeetle's `manifest_log` / Loki's index shipping). Roadmap.
+- **superblock** — the single compare-and-swap root object naming the manifest
+  log's tail; the storage engine's linearization point. Roadmap.
+- **content-addressed** — an object keyed by the hash of its bytes, hence
+  immutable and safe to cache indefinitely and to reference across an eventually
+  consistent LIST.
+- **leveled / tiered compaction** — the two LSM compaction shapes (low
+  read-amplification vs low write-amplification) weighed against object-storage
+  economics in the roadmap. Roadmap.
 - **Write-Ahead Log (WAL)** — the durable operation log; here it doubles as the
   VSR journal. Replayed on recovery.
 - **manifest** — the single object-storage object naming the current set of SSTs

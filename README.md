@@ -10,9 +10,14 @@ engineering discipline.
   simple *and* extended query) and the SQL dialect follow PostgreSQL so that
   psql, JDBC, npgsql, psycopg, node-postgres, etc. work — including the
   introspection queries drivers issue on connect.
-- **Object storage is the database.** SSTs, WAL segments, and the manifest
-  live in an S3-compatible bucket. Local disk is only a cache (ClickHouse /
-  Loki style). A node can cold-start from an empty disk.
+- **Object storage is the durable home.** Checkpoint SSTs, WAL segments, and
+  the manifest live in an S3-compatible bucket, and a node can cold-start from
+  an empty disk. *Today* this is a snapshot model: the live working set is held
+  in a fixed in-memory heap (`memtable_bytes`) and object storage is written at
+  checkpoint and read at cold start, not paged on the query path. The
+  ClickHouse/Loki-style **local disk + RAM cache in front of the bucket**, and
+  a leveled LSM so the working set can exceed RAM, are the planned next arc —
+  see the *Object-storage LSM roadmap* in [PLAN.md](PLAN.md).
 - **Static allocation.** All memory is acquired at startup, sized from
   config. No heap allocation after init — enforced by a guarding global
   allocator. Every pool and queue has a fixed limit; exhaustion is a loud
@@ -109,6 +114,13 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
 - **Checkpoint S3 calls are synchronous.** A `CHECKPOINT` (and cold-start load)
   stalls other connections while it runs. WAL-segment upload, by contrast, is
   asynchronous (B-008).
+- **The live working set must fit RAM.** All live rows are held in one fixed
+  in-memory heap (`memtable_bytes`); object storage is written at checkpoint and
+  read only at cold start, not paged on the query path, and there is no
+  read-through cache yet (`block_cache_bytes` / `disk_cache_bytes` are reserved
+  but not yet wired). A full memtable fails loudly. Lifting this — a block-grid
+  cache tier and a leveled LSM that pages from the bucket — is the
+  *Object-storage LSM roadmap* in [PLAN.md](PLAN.md).
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.

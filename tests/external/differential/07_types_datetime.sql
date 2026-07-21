@@ -109,3 +109,20 @@ INSERT INTO tmt VALUES ('12:00:00');
 SELECT a FROM tmt WHERE a > '01:00:00';
 SELECT a FROM tmt WHERE a = '12:00:00';
 DROP TABLE tmt;
+-- the SQL-standard functions written without parentheses. Their values move
+-- with the clock, so the probes assert type and shape; a keyword-classification
+-- change once made every one of these a syntax error with nothing to catch it.
+SELECT pg_typeof(current_date), pg_typeof(current_timestamp), pg_typeof(localtimestamp);
+SELECT pg_typeof(current_time), pg_typeof(localtime);
+SELECT pg_typeof(current_time(0)), pg_typeof(localtime(3)), pg_typeof(current_timestamp(0));
+SELECT current_date <= current_date, current_timestamp <= clock_timestamp();
+SELECT current_time::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?[+-][0-9]{2}(:[0-9]{2})?$';
+SELECT localtime::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$';
+SELECT current_time(0)::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}(:[0-9]{2})?$';
+SELECT localtime(0)::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}$';
+SELECT date_part('hour', localtime) = date_part('hour', current_time);
+SET TimeZone='Asia/Kolkata';
+SELECT right(current_time::text, 6);
+SELECT localtime = current_time::time;
+SET TimeZone='UTC';
+SELECT right(current_time::text, 3);

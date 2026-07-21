@@ -3949,7 +3949,8 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
             }
             "current_date" => of(ColType::Date),
-            "current_time" => of(ColType::Time),
+            "current_time" => of(ColType::Timetz),
+            "localtime" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),
             "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
             | "clock_timestamp" => of(ColType::Timestamptz),

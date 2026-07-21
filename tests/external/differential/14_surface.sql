@@ -99,3 +99,16 @@ INSERT INTO sfc DEFAULT VALUES RETURNING a, b;
 INSERT INTO sfc DEFAULT VALUES;
 SELECT count(*) FROM sfc;
 DROP TABLE sfc;
+-- array element quoting: PostgreSQL quotes an element that is empty, spells
+-- `null`, or carries a comma, brace, quote, backslash or space — so a
+-- timestamp comes out quoted, not only a string
+-- (the column label of `ARRAY[...]::text` is `text` here, `array` in
+--  PostgreSQL — same family as B-102)
+SELECT ARRAY['a b','c,d','','null','q"r']::text AS a;
+SELECT ARRAY[1,2]::text AS a, ARRAY['x','y']::text AS b, ARRAY[1.5,2.5]::text AS c, ARRAY[true,false]::text AS d;
+SELECT ARRAY['2020-01-01'::date]::text AS a;
+SELECT ARRAY['2020-01-01 00:00:00'::timestamp]::text AS a;
+SELECT ARRAY['2020-01-01 00:00:00+00'::timestamptz]::text AS a;
+SELECT array_agg(x)::text FROM (VALUES ('2020-01-01 12:00:00'::timestamp)) v(x);
+SELECT array_agg(x)::text FROM (VALUES (1),(2)) v(x);
+SELECT array_agg(x)::text FROM (VALUES ('a b'),('c')) v(x);

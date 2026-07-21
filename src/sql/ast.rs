@@ -537,6 +537,14 @@ impl Expr<'_> {
         )
     }
 
+    /// True for an aggregate *use* — an aggregate call with no `OVER` clause,
+    /// which is what makes a query grouped. `sum(x) OVER (...)` names an
+    /// aggregate but is a window function: it groups nothing, and asking
+    /// [`Self::is_aggregate`] (which only looks at the name) would say it does.
+    pub fn is_aggregate_use(&self) -> bool {
+        self.is_aggregate() && matches!(self, Expr::Call { over: None, .. })
+    }
+
     /// True when the expression is a compile-time constant: only literals
     /// and pure operations over them, with no column/parameter/subquery/
     /// aggregate reference. PostgreSQL evaluates these at plan time, so

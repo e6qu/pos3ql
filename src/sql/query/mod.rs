@@ -1298,6 +1298,15 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .col_type(q, name)
             .or_else(|| self.outer.and_then(|o| o.col_type(q, name)))
     }
+
+    /// Forwarded like the rest: a wrapper that answered this from the trait
+    /// default would report a single-column table function (`FROM
+    /// json_array_elements_text(...) AS x`) as a record, so `x` would render
+    /// `(p)` instead of `p`.
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.inner.whole_row_is_scalar(table)
+            || self.outer.is_some_and(|o| o.whole_row_is_scalar(table))
+    }
 }
 
 /// Enumerates source rows (visibility-filtered, ON conditions applied,
@@ -2722,13 +2731,16 @@ fn subst_expr<'a>(
     Ok(&*arena.alloc(rebuilt).map_err(|_| arena_full())?)
 }
 
-/// Walks an expression tree collecting aggregate call nodes.
+/// Walks an expression tree collecting aggregate call nodes. A windowed call
+/// (`sum(x) OVER (...)`) is not one: it is a window function, and counting it
+/// here would send the query down the grouped executor instead of the window
+/// one — so its arguments are walked into like any other expression.
 fn collect_aggs<'a>(
     expression: &'a Expr<'a>,
     out: &mut [(*const Expr<'a>, &'a Expr<'a>); MAX_AGGS],
     n: &mut usize,
 ) -> Result<(), SqlError> {
-    if expression.is_aggregate() {
+    if expression.is_aggregate_use() {
         if out[..*n].iter().any(|(p, _)| core::ptr::eq(*p, expression)) {
             return Ok(());
         }
@@ -3648,9 +3660,19 @@ fn run_subquery<'a>(
             &Expr::Null
         }
     };
-    if !select.group_by.is_empty() || select.having.is_some() || select.distinct {
-        // Grouped/DISTINCT subquery: the row-source executor already handles
-        // grouping, HAVING, and DISTINCT; collect its single output column.
+    // A window function needs rows materialized before it can be computed, so
+    // its body belongs to the row-source executor just as a grouped one does.
+    let mut win_probe: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
+    let mut n_win_probe = 0;
+    collect_windows(item, &mut win_probe, &mut n_win_probe)?;
+    for ob in select.order_by {
+        collect_windows(ob.expression, &mut win_probe, &mut n_win_probe)?;
+    }
+    if !select.group_by.is_empty() || select.having.is_some() || select.distinct || n_win_probe > 0
+    {
+        // Grouped/DISTINCT/windowed subquery: the row-source executor already
+        // handles grouping, HAVING, DISTINCT, and windows; collect its single
+        // output column.
         let mut count = 0usize;
         select_into_rows(storage, txid, select, arena, params, outer, &mut |_| {
             count += 1;
@@ -5298,12 +5320,19 @@ pub fn select_query<'a>(
     }
 
     // Window functions? They run over materialized rows before ORDER BY/LIMIT.
+    // An ORDER BY key may be a window function without the select list holding
+    // one (`ORDER BY rank() OVER (...)`), so it counts toward the decision.
     let mut win_nodes: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
     let mut n_win = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item
             && let Err(e) = collect_windows(expression, &mut win_nodes, &mut n_win)
         {
+            return sql_fail(e);
+        }
+    }
+    for ob in statement.order_by {
+        if let Err(e) = collect_windows(ob.expression, &mut win_nodes, &mut n_win) {
             return sql_fail(e);
         }
     }
@@ -5422,7 +5451,7 @@ pub fn select_query<'a>(
                         row_hooks
                     };
                     let mut projected = [Datum::Null; MAX_PROJ];
-                    let n = project_row(statement.items, &scope, row, arena, params, use_hooks, &mut projected)?;
+                    let n = project_row(statement.items, &scope, row, arena, params, use_hooks, &mut projected, None)?;
                     if let Err(w) = responder.data_row(&projected[..n]) {
                         wire_full = true;
                         wire_result = Err(w);
@@ -6276,6 +6305,9 @@ pub fn select_into_rows<'a>(
             collect_windows(expression, &mut win_nodes, &mut n_win)?;
         }
     }
+    for ob in statement.order_by {
+        collect_windows(ob.expression, &mut win_nodes, &mut n_win)?;
+    }
     if n_win > 0 {
         // Windows over a grouped query: rewrite to the two-level form.
         let mut grouped_aggs: [(*const Expr, &Expr); MAX_AGGS] =
@@ -6292,7 +6324,7 @@ pub fn select_into_rows<'a>(
         }
         let (proj_rows, sort_keys) = project_window_rows(
             storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, correlated,
-            &outer_subs.base, arena, params,
+            &outer_subs.base, arena, params, outer,
         )?;
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
@@ -6384,14 +6416,14 @@ pub fn select_into_rows<'a>(
             let mut projected = [Datum::Null; MAX_PROJ];
             match srf_call {
                 None => {
-                    let n = project_row(statement.items, &scope, row, arena, params, row_hooks, &mut projected)?;
+                    let n = project_row(statement.items, &scope, row, arena, params, row_hooks, &mut projected, None)?;
                     emit(&projected[..n])?;
                 }
                 Some(c) => {
                     let count = srf_count(c, arena, params, row, row_hooks)?;
                     for k in 1..=count {
                         let srf_hooks = EvalHooks { srf_index: Some(k), ..*row_hooks };
-                        let n = project_row(statement.items, &scope, row, arena, params, &srf_hooks, &mut projected)?;
+                        let n = project_row(statement.items, &scope, row, arena, params, &srf_hooks, &mut projected, None)?;
                         emit(&projected[..n])?;
                     }
                 }
@@ -6661,6 +6693,7 @@ fn srf_count<'a, R: ColumnLookup<'a>>(
 }
 
 /// Projects one source row through the select items.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn project_row<'a>(
     items: &[SelectItem<'a>],
     scope: &QueryScope,
@@ -6669,8 +6702,11 @@ fn project_row<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     out: &mut [Datum<'a>; MAX_PROJ],
+    // Enclosing query's row when this is a correlated subquery's body, so an
+    // outer column in the select list resolves after this row's own.
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
-    project_row_skipping(items, None, scope, row, arena, params, hooks, out)
+    project_row_skipping(items, None, scope, row, arena, params, hooks, out, outer)
 }
 
 /// [`project_row`], with `skip` marking items whose evaluation is deferred
@@ -6685,7 +6721,11 @@ fn project_row_skipping<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     out: &mut [Datum<'a>; MAX_PROJ],
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
+    // Star expansion reads this query's tables directly; only expressions may
+    // reach past them to the enclosing row.
+    let chained = Chained { inner: row, outer };
     let mut n = 0;
     for (item_index, item) in items.iter().enumerate() {
         if skip.is_some_and(|s| s[item_index]) {
@@ -6766,7 +6806,7 @@ fn project_row_skipping<'a>(
                         MAX_PROJ
                     ));
                 }
-                out[n] = eval_full(expression, arena, params, row, hooks)?;
+                out[n] = eval_full(expression, arena, params, &chained, hooks)?;
                 n += 1;
             }
         }
@@ -8159,7 +8199,7 @@ fn materialized_rows<'a>(
                 let mut projected = [Datum::Null; MAX_PROJ];
                 project_row_skipping(
                     statement.items, if any_postponed { Some(&postponed) } else { None },
-                    scope, row, arena, params, use_hooks, &mut projected,
+                    scope, row, arena, params, use_hooks, &mut projected, None,
                 )?;
                 for oe in order_exprs.iter().take(n_keys) {
                     eval_full(oe.expect("resolved"), arena, params, row, use_hooks)?;
@@ -8212,7 +8252,7 @@ fn materialized_rows<'a>(
                     let mut projected = [Datum::Null; MAX_PROJ];
                     let n = project_row_skipping(
                         statement.items, if any_postponed { Some(&postponed) } else { None },
-                        scope, row, arena, params, use_hooks, &mut projected,
+                        scope, row, arena, params, use_hooks, &mut projected, None,
                     )?;
                     debug_assert_eq!(n, width);
                     let mut full =

@@ -12,7 +12,9 @@ use crate::sql::ast::{
     BinaryOp, Expr, FrameBound, FrameUnits, FromClause, OrderBy, Select, SelectItem, TableRef,
     WindowFrame,
 };
-use crate::sql::eval::{compare_datums, eval_full, sqlstate, EvalHooks, SqlError, SubqueryValues};
+use crate::sql::eval::{
+    compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError, SubqueryValues,
+};
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::Datum;
 use crate::storage::Storage;
@@ -999,6 +1001,9 @@ pub(crate) fn project_window_rows<'a>(
     base: &SubqueryValues<'a, 'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    // Enclosing query's row, when this window query is a correlated subquery's
+    // body; its columns resolve after this query's own.
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
     // WHERE with correlated subqueries is applied per row in the callbacks.
     let scan_where = if correlated.is_empty() { statement.where_clause } else { None };
@@ -1013,7 +1018,7 @@ pub(crate) fn project_window_rows<'a>(
     // Pass 1: count source rows.
     let mut count = 0usize;
     scan_source(
-        storage, scope, from, txid, scan_where, arena, params, hooks, None,
+        storage, scope, from, txid, scan_where, arena, params, hooks, outer,
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
@@ -1029,7 +1034,7 @@ pub(crate) fn project_window_rows<'a>(
     let rows: &mut [&[Datum]] = arena.alloc_slice_with(count, |_| empty).map_err(|_| arena_full())?;
     let mut at = 0usize;
     scan_source(
-        storage, scope, from, txid, scan_where, arena, params, hooks, None,
+        storage, scope, from, txid, scan_where, arena, params, hooks, outer,
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
@@ -1114,11 +1119,12 @@ pub(crate) fn project_window_rows<'a>(
             catalog: hooks.catalog, srf_index: hooks.srf_index,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
-        let np = project_row(statement.items, scope, &jr, arena, params, &win_hooks, &mut projected)?;
+        let np =
+            project_row(statement.items, scope, &jr, arena, params, &win_hooks, &mut projected, outer)?;
         proj_rows[i] = &*arena.alloc_slice_copy(&projected[..np]).map_err(|_| arena_full())?;
         let mut keys = [Datum::Null; MAX_WIN_KEYS];
         for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
-            keys[k] = eval_full(oe.expect("set"), arena, params, &jr, &win_hooks)?;
+            keys[k] = eval_full(oe.expect("set"), arena, params, &super::Chained { inner: &jr, outer }, &win_hooks)?;
         }
         sort_keys[i] = &*arena.alloc_slice_copy(&keys[..n_order]).map_err(|_| arena_full())?;
     }
@@ -1166,7 +1172,9 @@ pub(crate) fn window_select<'a>(
         }
     }
     let (proj_rows, sort_keys) = match project_window_rows(
+        // The top-level query has no enclosing row to resolve against.
         storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
+        None,
     ) {
         Ok(v) => v,
         Err(e) => return sql_fail(e),

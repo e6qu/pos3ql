@@ -677,3 +677,50 @@ SELECT CASE WHEN (1,2) < (1,3) THEN 'less' ELSE 'ge' END;
 -- substring(str FOR len) (implies FROM 1)
 SELECT substring('abcdef' for 3), substring('hello world' for 5), substring('abc' for 0), substring('abc' for 10);
 SELECT (1,NULL) IS NOT NULL, (1,2) IS NOT NULL, (NULL,NULL) IS NOT NULL, ROW(NULL,NULL) IS NULL;
+-- named window definitions (WINDOW name AS (...)) and OVER <name>
+DROP TABLE IF EXISTS nw;
+CREATE TABLE nw(k text, v int, t int);
+INSERT INTO nw VALUES ('a',1,1),('a',3,2),('a',3,3),('a',7,4),('b',2,1),('b',5,2),('b',5,3),('c',9,1);
+SELECT k, t, sum(v) OVER w FROM nw WINDOW w AS (PARTITION BY k ORDER BY t) ORDER BY k, t;
+SELECT k, t, sum(v) OVER (w) FROM nw WINDOW w AS (PARTITION BY k) ORDER BY k, t;
+-- a copy inherits PARTITION BY and may add an ORDER BY the copied window lacks
+SELECT k, t, sum(v) OVER (w ORDER BY t) FROM nw WINDOW w AS (PARTITION BY k) ORDER BY k, t;
+SELECT k, t, sum(v) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM nw WINDOW w AS (PARTITION BY k ORDER BY t) ORDER BY k, t;
+-- one definition may reference an earlier one
+SELECT k, t, sum(v) OVER w2 FROM nw WINDOW w AS (PARTITION BY k), w2 AS (w ORDER BY t) ORDER BY k, t;
+SELECT k, t, sum(v) OVER a, count(*) OVER b FROM nw WINDOW a AS (PARTITION BY k), b AS (ORDER BY t) ORDER BY k, t;
+-- a bare name uses the window as it stands, frame included
+SELECT k, t, sum(v) OVER w FROM nw WINDOW w AS (PARTITION BY k ORDER BY t ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY k, t;
+SELECT k, sum(v) OVER x FROM nw WINDOW x AS () ORDER BY k;
+-- names fold like other identifiers, and quoted ones keep their case
+SELECT k, sum(v) OVER W FROM nw WINDOW w AS (PARTITION BY k) ORDER BY k;
+SELECT k, sum(v) OVER "My W" FROM nw WINDOW "My W" AS (PARTITION BY k) ORDER BY k;
+SELECT v FROM nw WINDOW unused AS (PARTITION BY k) ORDER BY v;
+SELECT 1 AS window;
+-- a named window is usable from the trailing ORDER BY
+SELECT k, v FROM nw WINDOW w AS (PARTITION BY k) ORDER BY sum(v) OVER w, k, v;
+-- error cases: undefined name, the copy restrictions, and a duplicate name
+SELECT sum(v) OVER nope FROM nw;
+SELECT sum(v) OVER (w PARTITION BY t) FROM nw WINDOW w AS (PARTITION BY k);
+SELECT sum(v) OVER (w ORDER BY v) FROM nw WINDOW w AS (PARTITION BY k ORDER BY t);
+SELECT sum(v) OVER (w ORDER BY t) FROM nw WINDOW w AS (PARTITION BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW);
+SELECT 1 FROM nw WINDOW x AS (), x AS ();
+-- windows are scoped to their own SELECT: a subquery does not see the outer's
+SELECT (SELECT sum(v) OVER w2 FROM nw LIMIT 1) FROM nw WINDOW w2 AS (PARTITION BY k) LIMIT 1;
+-- window functions in the contexts that route through the row-source executor
+SELECT * FROM (SELECT k, sum(v) OVER (PARTITION BY k) s FROM nw) x ORDER BY k, s;
+WITH c AS (SELECT k, sum(v) OVER (PARTITION BY k) s FROM nw) SELECT * FROM c ORDER BY k, s;
+SELECT sum(v) OVER (PARTITION BY k) FROM nw UNION SELECT 99 ORDER BY 1;
+SELECT (SELECT sum(v) OVER (PARTITION BY k) FROM nw LIMIT 1);
+SELECT 14 IN (SELECT sum(v) OVER (PARTITION BY k) FROM nw);
+SELECT EXISTS (SELECT sum(v) OVER (PARTITION BY k) FROM nw);
+-- window functions in ORDER BY, with and without one in the select list
+SELECT k, v FROM nw ORDER BY sum(v) OVER (PARTITION BY k), k, v;
+SELECT k, v FROM nw ORDER BY sum(v) OVER (PARTITION BY k) DESC, k, v;
+SELECT k, v FROM nw ORDER BY rank() OVER (ORDER BY v), v;
+SELECT k, sum(v) OVER (PARTITION BY k) s FROM nw ORDER BY sum(v) OVER (PARTITION BY k), k;
+-- correlated subqueries whose body computes a window
+SELECT k, (SELECT sum(v) OVER (PARTITION BY k) FROM nw z WHERE z.k = nw.k LIMIT 1) FROM nw ORDER BY k;
+SELECT k, (SELECT sum(v) OVER (ORDER BY v) FROM nw z WHERE z.k = nw.k ORDER BY v LIMIT 1) FROM nw ORDER BY k;
+SELECT k, (SELECT nw.k || count(*) OVER () FROM nw z WHERE z.k = nw.k LIMIT 1) FROM nw ORDER BY k;
+DROP TABLE nw;

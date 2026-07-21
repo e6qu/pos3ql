@@ -13,6 +13,8 @@ use super::lexer::{LexError, Lexer, Tok};
 
 pub const MAX_LIST: usize = 64;
 pub const MAX_CTES: usize = 16;
+/// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
+pub const MAX_WINDOW_DEFS: usize = 16;
 /// Upper bound on the number of grouping sets a single `GROUP BY` may expand to
 /// (after ROLLUP/CUBE expansion and cross-multiplication). Exceeding it is a
 /// loud error, never silent truncation.
@@ -37,6 +39,12 @@ pub const MAX_ROWS: usize = 256;
 /// Words that cannot appear as a bare column reference; mirrors the
 /// reserved entries of PostgreSQL's keyword table that this grammar uses.
 /// Whether a numeric token carries a `0x`/`0o`/`0b` base prefix.
+/// Whether `text` mentions the word `window` in any case — the cheap pre-filter
+/// that keeps the WINDOW-clause lookahead off the path of ordinary queries.
+fn mentions_window(text: &str) -> bool {
+    text.as_bytes().windows(6).any(|w| w.eq_ignore_ascii_case(b"window"))
+}
+
 fn is_base_prefixed(text: &str) -> bool {
     let b = text.as_bytes();
     b.len() > 2 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
@@ -54,6 +62,7 @@ pub(crate) fn is_reserved(word: &str) -> bool {
             | "default" | "unique" | "check" | "constraint" | "returning"
             | "distinct" | "between" | "like" | "ilike" | "in" | "left"
             | "right" | "full" | "inner" | "outer" | "cross" | "using" | "natural"
+            | "window"
     )
 }
 
@@ -90,6 +99,11 @@ pub struct Parser<'a> {
     arena: &'a Arena,
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
+    /// The `WINDOW name AS (...)` definitions of the SELECT being parsed, which
+    /// `OVER name` resolves against. Scoped to that SELECT: saved and cleared
+    /// around a nested one, since a subquery neither sees nor exports them.
+    windows: [Option<(&'a str, &'a WindowSpec<'a>)>; MAX_WINDOW_DEFS],
+    n_windows: usize,
 }
 
 /// Parses a stored view definition (a single SELECT) into a `Select` in the
@@ -147,6 +161,8 @@ impl<'a> Parser<'a> {
             peek_at,
             arena,
             max_param: 0,
+            windows: [None; MAX_WINDOW_DEFS],
+            n_windows: 0,
         })
     }
 
@@ -364,6 +380,13 @@ impl<'a> Parser<'a> {
     /// (those belong to the enclosing query so a set operation can share them).
     fn select_core(&mut self) -> Result<Select<'a>, ParseError> {
         self.expect_ident("select")?;
+        // The WINDOW clause is written after HAVING, but the names it defines
+        // are used in the select list above it, so it is parsed ahead of the
+        // list. The scope stays live past this function because the trailing
+        // ORDER BY — parsed by our caller — may also use those names; the
+        // caller restores the enclosing query's windows once it is done.
+        self.n_windows = 0;
+        self.prescan_windows()?;
         let mut distinct_on: &'a [&'a Expr<'a>] = &[];
         let distinct = if self.eat_ident("distinct")? {
             // `DISTINCT ON (expr, ...)`: keep the first row per distinct key.
@@ -408,6 +431,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // Consume the clause in its written position; the lookahead above left
+        // the cursor before it.
+        if self.eat_ident("window")? {
+            self.window_definitions()?;
+        }
         Ok(Select {
             items,
             distinct,
@@ -423,6 +451,51 @@ impl<'a> Parser<'a> {
             with: &[],
             set_body: None,
         })
+    }
+
+    /// Parses this SELECT's `WINDOW` clause ahead of the cursor, then restores
+    /// the cursor, so `OVER name` resolves while the select list — written
+    /// before the clause — is being parsed.
+    fn prescan_windows(&mut self) -> Result<(), ParseError> {
+        // The overwhelming majority of queries have no WINDOW clause at all;
+        // skip the token scan unless the word appears somewhere ahead.
+        if !mentions_window(&self.text[self.peek_at..]) {
+            return Ok(());
+        }
+        let mark = self.lexer.mark();
+        let (peeked, peek_at) = (self.peeked, self.peek_at);
+        let mut depth = 0usize;
+        // `AS window` is a column label, not this clause — a reserved word is
+        // allowed there, as PostgreSQL allows `SELECT 1 AS window`.
+        let mut after_as = false;
+        loop {
+            if matches!(self.peeked, Tok::Ident("window")) && after_as {
+                after_as = false;
+                self.advance()?;
+                continue;
+            }
+            after_as = matches!(self.peeked, Tok::Ident("as"));
+            match self.peeked {
+                Tok::Eof => break,
+                Tok::Op("(") => depth += 1,
+                // Leaving this SELECT's parentheses: the clause is not ours.
+                Tok::Op(")") if depth == 0 => break,
+                Tok::Op(")") => depth -= 1,
+                Tok::Op(";") if depth == 0 => break,
+                // A set operation ends this leaf; the next has its own clause.
+                Tok::Ident("union" | "intersect" | "except") if depth == 0 => break,
+                Tok::Ident("window") if depth == 0 => {
+                    self.advance()?;
+                    self.window_definitions()?;
+                    break;
+                }
+                _ => {}
+            }
+            self.advance()?;
+        }
+        self.lexer.reset(mark);
+        (self.peeked, self.peek_at) = (peeked, peek_at);
+        Ok(())
     }
 
     /// Trailing ORDER BY / LIMIT / OFFSET (any may be absent).
@@ -489,8 +562,12 @@ impl<'a> Parser<'a> {
     /// (no set operator) folds those clauses back into itself; a genuine
     /// set-operation is carried in `set_body`.
     fn select(&mut self) -> Result<Select<'a>, ParseError> {
+        // This is the nesting boundary for every subquery, so it is where a
+        // nested SELECT's named windows stop being visible.
+        let enclosing_windows = (self.windows, self.n_windows);
         let body = self.set_union()?;
         let (order_by, limit, offset) = self.order_limit()?;
+        (self.windows, self.n_windows) = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
             sel.order_by = order_by;
@@ -578,8 +655,10 @@ impl<'a> Parser<'a> {
     }
 
     fn query(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let enclosing_windows = (self.windows, self.n_windows);
         let body = self.set_union()?;
         let (order_by, limit, offset) = self.order_limit()?;
+        (self.windows, self.n_windows) = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
             sel.order_by = order_by;
@@ -625,8 +704,10 @@ impl<'a> Parser<'a> {
         // branch before the outer set operator combines it).
         if self.peeked == Tok::Op("(") {
             self.advance()?;
+            let enclosing_windows = (self.windows, self.n_windows);
             let inner = self.set_union()?;
             let (order_by, limit, offset) = self.order_limit()?;
+            (self.windows, self.n_windows) = enclosing_windows;
             self.expect_op(")")?;
             if order_by.is_empty() && limit.is_none() && offset.is_none() {
                 return Ok(inner);
@@ -2476,9 +2557,6 @@ impl<'a> Parser<'a> {
         self.arena_slice(&ord[..m])
     }
 
-    /// Parses an optional `OVER (PARTITION BY ... ORDER BY ...)` window clause.
-    /// An explicit frame (ROWS/RANGE ...) is rejected — only the default frame
-    /// is supported.
     /// One frame bound: UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, or
     /// `<expression> PRECEDING/FOLLOWING`.
     fn frame_bound(&mut self) -> Result<FrameBound<'a>, ParseError> {
@@ -2501,11 +2579,95 @@ impl<'a> Parser<'a> {
         Ok(FrameBound::Following(offset))
     }
 
+    /// An optional `OVER` clause: either `OVER name`, naming one of the query's
+    /// `WINDOW` definitions, or an inline `OVER (...)` specification.
     fn parse_over(&mut self) -> Result<Option<&'a WindowSpec<'a>>, ParseError> {
         if !self.eat_ident("over")? {
             return Ok(None);
         }
+        // `OVER name` uses the named window as it stands, frame included; only
+        // the parenthesized form copies it, and a copy may not carry a frame.
+        if !matches!(self.peeked, Tok::Op("(")) {
+            let name = self.any_ident("window name or '('")?;
+            return Ok(Some(self.named_window(name)?));
+        }
         self.expect_op("(")?;
+        let spec = self.window_spec_body()?;
+        Ok(Some(self.arena_window(spec)?))
+    }
+
+    /// Resolves a name against the query's `WINDOW` definitions.
+    fn named_window(&mut self, name: &str) -> Result<&'a WindowSpec<'a>, ParseError> {
+        for entry in &self.windows[..self.n_windows] {
+            match entry {
+                Some((defined, spec)) if *defined == name => return Ok(spec),
+                _ => {}
+            }
+        }
+        Err(ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "window \"{}\" does not exist", name),
+            sqlstate: "42704",
+        })
+    }
+
+    fn arena_window(&self, spec: WindowSpec<'a>) -> Result<&'a WindowSpec<'a>, ParseError> {
+        let spec = self.arena.alloc(spec).map_err(|_| self.err_here("window spec too large for arena"))?;
+        Ok(&*spec)
+    }
+
+    /// `WINDOW name AS ( ... ) [, ...]`, replacing any definitions already
+    /// parsed (the lookahead in [`Self::prescan_windows`] parses the same
+    /// clause, and re-parsing it in its written position must not see itself
+    /// as a redefinition).
+    fn window_definitions(&mut self) -> Result<(), ParseError> {
+        self.n_windows = 0;
+        loop {
+            let name = self.any_ident("window name")?;
+            if self.named_window(name).is_ok() {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "window \"{}\" is already defined", name),
+                    sqlstate: "42P20",
+                });
+            }
+            if self.n_windows == MAX_WINDOW_DEFS {
+                return Err(self.limit("WINDOW definitions", MAX_WINDOW_DEFS));
+            }
+            self.expect_ident("as")?;
+            self.expect_op("(")?;
+            let spec = self.window_spec_body()?;
+            self.windows[self.n_windows] = Some((name, self.arena_window(spec)?));
+            self.n_windows += 1;
+            if !self.eat_op(",")? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The inside of a window specification, `(` already consumed: an optional
+    /// existing window name to copy, then PARTITION BY / ORDER BY / frame.
+    fn window_spec_body(&mut self) -> Result<WindowSpec<'a>, ParseError> {
+        // A leading identifier that is not one of the clause keywords names an
+        // existing window to copy, as in `OVER (w ORDER BY x)`.
+        let copied = match self.peeked {
+            // `exclude` is not a window name either: it only follows a frame,
+            // so a leading one is the syntax error PostgreSQL reports.
+            Tok::Ident(name)
+                if !matches!(
+                    name,
+                    "partition" | "order" | "rows" | "range" | "groups" | "exclude"
+                ) =>
+            {
+                self.advance()?;
+                Some((name, *self.named_window(name)?))
+            }
+            Tok::QuotedIdent(name) => {
+                self.advance()?;
+                Some((name, *self.named_window(name)?))
+            }
+            _ => None,
+        };
         let partition_by = if self.eat_ident("partition")? {
             self.expect_ident("by")?;
             let mut parts: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
@@ -2591,10 +2753,37 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_op(")")?;
-        let spec = WindowSpec { partition_by, order_by, frame };
-        Ok(Some(
-            self.arena.alloc(spec).map_err(|_| self.err_here("window spec too large for arena"))?,
-        ))
+        let Some((name, base)) = copied else {
+            return Ok(WindowSpec { partition_by, order_by, frame });
+        };
+        // A copy inherits the partitioning, may add an ORDER BY only where the
+        // copied window has none, and may not copy a window that has a frame.
+        if !partition_by.is_empty() {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "cannot override PARTITION BY clause of window \"{}\"", name),
+                sqlstate: "42P20",
+            });
+        }
+        if !base.order_by.is_empty() && !order_by.is_empty() {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "cannot override ORDER BY clause of window \"{}\"", name),
+                sqlstate: "42P20",
+            });
+        }
+        if base.frame.is_some() {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "cannot copy window \"{}\" because it has a frame clause", name),
+                sqlstate: "42P20",
+            });
+        }
+        Ok(WindowSpec {
+            partition_by: base.partition_by,
+            order_by: if order_by.is_empty() { base.order_by } else { order_by },
+            frame,
+        })
     }
 
     /// Consumes an operator or identifier token, returning its text (used
@@ -2855,7 +3044,7 @@ impl<'a> Parser<'a> {
             let reserved = matches!(
                 name,
                 "from" | "where" | "order" | "limit" | "group" | "having" | "union"
-                    | "intersect" | "except"
+                    | "intersect" | "except" | "window"
                     | "and" | "or" | "is" | "as" | "asc" | "desc" | "offset"
             );
             if !reserved {

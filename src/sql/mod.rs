@@ -487,6 +487,7 @@ impl Engine {
             match parser.next_stmt() {
                 Ok(Some(statement)) => {
                     executed_any = true;
+                    emit_parse_warnings(&mut parser, responder)?;
                     if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, guc, responder)? {
                         if txn.is_explicit() {
                             txn.failed = true;
@@ -542,7 +543,10 @@ impl Engine {
         };
         self.ensure_txn(txn, TxnMode::Implicit);
         let outcome = match parser.next_stmt() {
-            Ok(Some(statement)) => self.execute_stmt(&statement, arena, params, txn, sqlprep, guc, responder)?,
+            Ok(Some(statement)) => {
+                emit_parse_warnings(&mut parser, responder)?;
+                self.execute_stmt(&statement, arena, params, txn, sqlprep, guc, responder)?
+            }
             Ok(None) => {
                 responder.empty_query_response()?;
                 Ok(())
@@ -1323,6 +1327,19 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
         "is_superuser" => Some("on"),
         _ => None,
     }
+}
+
+/// Emits the warnings a statement's parse raised, ahead of running it —
+/// PostgreSQL reports them in that order (e.g. `timestamp(7)` clamping).
+fn emit_parse_warnings(
+    parser: &mut parser::Parser,
+    responder: &mut Responder,
+) -> Result<(), WireFull> {
+    let (messages, n) = parser.take_warnings();
+    for message in &messages[..n] {
+        responder.warning(eval::sqlstate::INVALID_PARAMETER_VALUE, message.as_str())?;
+    }
+    Ok(())
 }
 
 fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), WireFull> {

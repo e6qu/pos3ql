@@ -109,3 +109,32 @@ CREATE TABLE lk_bad (a int, LIKE lk_src);
 DROP TABLE lk_icopy; DROP TABLE lk_inone; DROP TABLE lk_isrc;
 DROP TABLE lk_mix; DROP TABLE lk_exc; DROP TABLE lk_all; DROP TABLE lk_idx;
 DROP TABLE lk_con; DROP TABLE lk_def; DROP TABLE lk_plain; DROP TABLE lk_src;
+-- projection postponement: with ORDER BY + LIMIT an expensive select-list
+-- expression is evaluated above the Sort, so an error in a row that sorts past
+-- the limit never surfaces. Whether an expression is "expensive" is a cost
+-- decision, and these straddle the threshold in both directions.
+CREATE TABLE pz(id int, z int, f float8, n numeric);
+INSERT INTO pz VALUES (1,5,1.5,2.5),(2,4,2.5,3.5),(3,3,3.5,4.5),(9,0,9.5,9.5);
+-- GREATEST/LEAST/COALESCE cast each argument to the common type, and each cast
+-- counts toward the cost
+SELECT greatest(100/z, f) FROM pz ORDER BY id LIMIT 2;
+SELECT greatest(100/z, f, n) FROM pz ORDER BY id LIMIT 2;
+SELECT greatest(100/z + f*2 - f/3, n, id) FROM pz ORDER BY id LIMIT 2;
+SELECT greatest(100/z + f*2 - f/3 + f*4 - f/5, n, id) FROM pz ORDER BY id LIMIT 2;
+SELECT least(100/z, f, n, id) FROM pz ORDER BY id LIMIT 2;
+SELECT coalesce(100/z, id) FROM pz ORDER BY id LIMIT 2;
+SELECT coalesce(100/z + f*2 - f/3 + f*4, n) FROM pz ORDER BY id LIMIT 2;
+-- plain arithmetic across the same threshold
+SELECT 100/z FROM pz ORDER BY id LIMIT 2;
+SELECT 100/z + id*2 + id*3 + id*4 FROM pz ORDER BY id LIMIT 2;
+SELECT 100/z + id*2 + id*3 + id*4 + id*5 + id*6 FROM pz ORDER BY id LIMIT 2;
+-- CASE and ordinary functions
+SELECT case when id > 0 then 100/z else 0 end FROM pz ORDER BY id LIMIT 2;
+SELECT case when id > 0 then 100/z + f*2 - f/3 + f*4 - f/5 else 0 end FROM pz ORDER BY id LIMIT 2;
+SELECT abs(100/z) FROM pz ORDER BY id LIMIT 2;
+SELECT sqrt(100/z) FROM pz ORDER BY id LIMIT 2;
+-- a conjunct that raises is not reordered away
+SELECT id FROM pz WHERE (100/z) > 0 AND id IS NULL;
+SELECT id FROM pz WHERE ((100/z) > 0 AND id IS NULL) OR id = 1;
+SELECT id FROM pz WHERE z <> 0 AND (100/z) > 0;
+DROP TABLE pz;

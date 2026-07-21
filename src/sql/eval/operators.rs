@@ -4,15 +4,15 @@
 //! only on the value modules, not on `eval_full`.
 
 use crate::mem::arena::Arena;
-use crate::sql::array;
 use crate::sql::ast::BinaryOp;
-use crate::sql::range;
+use crate::sql::numeric::{self, Numeric};
 use crate::sql::types::{Datum, RangeKind};
+use crate::sql::{array, datetime, range};
 use crate::sql_err;
 
 use super::{
-    arena_full, as_i64, compare_datums, sqlstate, type_mismatch, type_name_of, validate_bits,
-    SqlError,
+    arena_full, as_f64, as_i64, bad_text, interval_cmp_value, parse_bool, parse_uuid, sqlstate,
+    type_mismatch, type_name_of, validate_bits, SqlError,
 };
 
 pub(crate) fn array_set_op<'a>(
@@ -280,4 +280,245 @@ pub(crate) fn compare_bits<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -
         BinaryOp::Gt => ordering.is_gt(),
         _ => ordering.is_ge(),
     }))
+}
+
+/// Total order used by comparisons and ORDER BY. NULL handling differs
+/// between the two, so NULL never reaches here.
+/// Exact comparison between a Numeric and an integer, allocation-free.
+fn compare_numeric_int(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlError> {
+    let mut buffer = [0u8; 20];
+    match (l, r) {
+        (Datum::Numeric(n), other) => {
+            let interval = as_i64(other).expect("integer side");
+            let t = Numeric::from_i64_stack(interval, &mut buffer);
+            Ok(numeric::compare(n, &t))
+        }
+        (other, Datum::Numeric(n)) => {
+            let interval = as_i64(other).expect("integer side");
+            let t = Numeric::from_i64_stack(interval, &mut buffer);
+            Ok(numeric::compare(&t, n))
+        }
+        _ => unreachable!("compare_numeric_int only for numeric/int pairs"),
+    }
+}
+
+pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlError> {
+    use core::cmp::Ordering;
+    let ord = match (l, r) {
+        (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
+        (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
+        (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
+        (Datum::Timestamp(a), Datum::Timestamp(b))
+        | (Datum::Timestamptz(a), Datum::Timestamptz(b))
+        | (Datum::Timestamp(a), Datum::Timestamptz(b))
+        | (Datum::Timestamptz(a), Datum::Timestamp(b)) => a.cmp(b),
+        (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
+        (Datum::Json { text: a, .. }, Datum::Json { text: b, .. }) => a.cmp(b),
+        (Datum::Record(a), Datum::Record(b)) => {
+            // Field-wise, with a NULL field comparing greater (PostgreSQL
+            // record ordering); shorter record sorts first on a common prefix.
+            for i in 0..a.len().min(b.len()) {
+                let (x, y) = (&a[i].value, &b[i].value);
+                let c = match (x.is_null(), y.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => compare_datums(x, y)?,
+                };
+                if !c.is_eq() {
+                    return Ok(c);
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+        (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
+            // Element-wise, then by length (PostgreSQL array ordering).
+            let (length_a, length_b) = (array::len(ra), array::len(rb));
+            for i in 0..length_a.min(length_b) {
+                let x = array::get(ra, *element, i).unwrap_or(Datum::Null);
+                let y = array::get(rb, *element, i).unwrap_or(Datum::Null);
+                let c = compare_datums(&x, &y)?;
+                if !c.is_eq() {
+                    return Ok(c);
+                }
+            }
+            length_a.cmp(&length_b)
+        }
+        (Datum::Date(a), Datum::Timestamp(b) | Datum::Timestamptz(b)) => {
+            (i64::from(*a) * 86_400_000_000).cmp(b)
+        }
+        (Datum::Timestamp(a) | Datum::Timestamptz(a), Datum::Date(b)) => {
+            a.cmp(&(i64::from(*b) * 86_400_000_000))
+        }
+        (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
+        (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
+        // Intervals compare by canonical microsecond value (PostgreSQL's
+        // interval_cmp_value: months count as 30 days, days as 24 hours), so
+        // `1 month` = `30 days` = `720 hours`.
+        (Datum::Interval(a), Datum::Interval(b)) => {
+            interval_cmp_value(*a).cmp(&interval_cmp_value(*b))
+        }
+        // Bit strings compare bit-by-bit, shorter-is-prefix sorting first —
+        // exactly lexicographic order of the '0'/'1' characters.
+        (Datum::Bit { bits: a, .. }, Datum::Bit { bits: b, .. }) => a.cmp(b),
+        (Datum::Numeric(a), Datum::Numeric(b)) => numeric::compare(a, b),
+        (Datum::Range { text: a, kind: ka }, Datum::Range { text: b, kind: kb }) => {
+            if ka != kb {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} = {}",
+                    ka.name(),
+                    kb.name()
+                ));
+            }
+            range::cmp_ranges(a, b, *ka)?
+        }
+        (Datum::Multirange { text: a, kind: ka }, Datum::Multirange { text: b, kind: kb }) => {
+            if ka != kb {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} = {}",
+                    ka.multirange_name(),
+                    kb.multirange_name()
+                ));
+            }
+            range::cmp_multiranges(a, b, *ka)?
+        }
+        // Numeric vs integer: compare exactly via numeric.
+        (Datum::Numeric(_), Datum::Int4(_) | Datum::Int8(_))
+        | (Datum::Int4(_) | Datum::Int8(_), Datum::Numeric(_)) => {
+            // Fall through to the float comparison below only if exactness is
+            // not required; integers convert to numeric exactly.
+            return compare_numeric_int(l, r);
+        }
+        _ => {
+            if let (Some(a), Some(b)) = (as_i64(l), as_i64(r)) {
+                a.cmp(&b)
+            } else if let (Some(a), Some(b)) = (as_f64(l), as_f64(r)) {
+                // PostgreSQL float comparison treats NaN as largest.
+                return Ok(a.partial_cmp(&b).unwrap_or_else(|| {
+                    match (a.is_nan(), b.is_nan()) {
+                        (true, false) => Ordering::Greater,
+                        (false, true) => Ordering::Less,
+                        _ => Ordering::Equal,
+                    }
+                }));
+            } else {
+                // PostgreSQL reports incompatible comparisons as
+                // "operator does not exist" (42883), not a datatype mismatch.
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} = {}",
+                    type_name_of(l),
+                    type_name_of(r)
+                ));
+            }
+        }
+    };
+    Ok(ord)
+}
+
+/// PostgreSQL's unknown-literal rule, approximated: a text value meeting a
+/// typed value in a comparison or arithmetic context converts to the typed
+/// side (text parameters and quoted literals are "unknown", not text).
+pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a>, SqlError> {
+    let Datum::Text(s) = v else {
+        return Ok(v);
+    };
+    Ok(match other {
+        Datum::Int4(_) => Datum::Int4(
+            s.trim()
+                .parse()
+                .map_err(|_| bad_text(s, "integer"))?,
+        ),
+        Datum::Int8(_) => Datum::Int8(
+            s.trim()
+                .parse()
+                .map_err(|_| bad_text(s, "bigint"))?,
+        ),
+        Datum::Float8(_) => Datum::Float8(
+            s.trim()
+                .parse()
+                .map_err(|_| bad_text(s, "double precision"))?,
+        ),
+        Datum::Bool(_) => Datum::Bool(parse_bool(s)?),
+        Datum::Date(_) => Datum::Date(datetime::parse_date(s)?),
+        Datum::Timestamp(_) => Datum::Timestamp(datetime::parse_timestamp(s, false)?),
+        Datum::Timestamptz(_) => {
+            Datum::Timestamptz(datetime::parse_timestamp(s, true)?)
+        }
+        Datum::Uuid(_) => Datum::Uuid(parse_uuid(s)?),
+        _ => v,
+    })
+}
+
+/// Range comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`). Both operands
+/// must be ranges of the same kind; ordering follows PostgreSQL `range_cmp`.
+pub(crate) fn compare_ranges<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let sym = match operator {
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::GtEq => ">=",
+        _ => unreachable!(),
+    };
+    let (Datum::Range { text: lt, kind: lk }, Datum::Range { text: rt, kind: rk }) = (l, r) else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            type_name_of(&l),
+            sym,
+            type_name_of(&r)
+        ));
+    };
+    if lk != rk {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            lk.name(),
+            sym,
+            rk.name()
+        ));
+    }
+    let ord = range::cmp_ranges(lt, rt, lk)?;
+    let out = match operator {
+        BinaryOp::Eq => ord.is_eq(),
+        BinaryOp::NotEq => ord.is_ne(),
+        BinaryOp::Lt => ord.is_lt(),
+        BinaryOp::LtEq => ord.is_le(),
+        BinaryOp::Gt => ord.is_gt(),
+        BinaryOp::GtEq => ord.is_ge(),
+        _ => unreachable!(),
+    };
+    Ok(Datum::Bool(out))
+}
+
+pub(crate) fn compare<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    l_unknown: bool,
+    r_unknown: bool,
+) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let l = if l_unknown { coerce_unknown(l, &r)? } else { l };
+    let r = if r_unknown { coerce_unknown(r, &l)? } else { r };
+    let ord = compare_datums(&l, &r)?;
+    let out = match operator {
+        BinaryOp::Eq => ord.is_eq(),
+        BinaryOp::NotEq => ord.is_ne(),
+        BinaryOp::Lt => ord.is_lt(),
+        BinaryOp::LtEq => ord.is_le(),
+        BinaryOp::Gt => ord.is_gt(),
+        BinaryOp::GtEq => ord.is_ge(),
+        _ => unreachable!(),
+    };
+    Ok(Datum::Bool(out))
 }

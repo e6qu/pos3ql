@@ -115,7 +115,14 @@ pub(crate) fn dispatch<'a>(
         match name {
             "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
             | "clock_timestamp" | "localtimestamp" => {
-                let micros = round_to_precision(name, args, arena, params, row, hooks, datetime::now_micros())?;
+                // Only `clock_timestamp` reads the clock; `statement_timestamp`
+                // is fixed for the statement and the rest for the transaction.
+                let base = match name {
+                    "clock_timestamp" => datetime::now_micros(),
+                    "statement_timestamp" => datetime::statement_micros(),
+                    _ => datetime::transaction_micros(),
+                };
+                let micros = round_to_precision(name, args, arena, params, row, hooks, base)?;
                 Ok(if name == "localtimestamp" {
                     // The session's wall clock, with no zone attached.
                     Datum::Timestamp(micros + session_offset(micros) as i64 * 1_000_000)
@@ -126,7 +133,7 @@ pub(crate) fn dispatch<'a>(
             // `current_time` carries the session's offset; `localtime` is the
             // same wall clock with the zone dropped.
             "current_time" | "localtime" => {
-                let now = datetime::now_micros();
+                let now = datetime::transaction_micros();
                 let offset = session_offset(now);
                 let local = round_to_precision(name, args, arena, params, row, hooks, now)?
                     + offset as i64 * 1_000_000;
@@ -187,9 +194,10 @@ pub(crate) fn dispatch<'a>(
             }
             "current_date" => {
                 arity(0)?;
-                Ok(Datum::Date(
-                    datetime::now_micros().div_euclid(86_400_000_000) as i32,
-                ))
+                // Today in the session zone, as of the transaction's clock.
+                let local = datetime::transaction_micros()
+                    + session_offset(datetime::transaction_micros()) as i64 * 1_000_000;
+                Ok(Datum::Date(local.div_euclid(86_400_000_000) as i32))
             }
             "to_char" => {
                 arity(2)?;

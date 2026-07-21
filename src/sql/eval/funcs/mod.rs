@@ -8,6 +8,7 @@
 //! `matches!` guard at the top of each `dispatch`, so a category's arms can be
 //! relocated here without depending on where they sat in the original `match`.
 
+pub(super) mod array;
 pub(super) mod bytea;
 pub(super) mod datetime;
 pub(super) mod json;

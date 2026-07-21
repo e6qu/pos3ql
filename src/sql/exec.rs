@@ -3682,11 +3682,30 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
             }
             "min" | "max" => {
+                // PostgreSQL defines min/max only where a total order is part
+                // of the type's contract: the numeric tower, strings, the
+                // temporal types, bytea and arrays. It has none for boolean,
+                // uuid, json or jsonb, bit strings, ranges or multiranges —
+                // this engine can order most of those internally, but ordering
+                // them is not the same as PostgreSQL offering the aggregate.
                 let t = args.first().map(|a| infer_type_res(a, columns)).transpose()?;
-                if let Some((o, _)) = t
-                    && (o == oid::BOOL || o == oid::UUID) {
+                if let Some((o, _)) = t {
+                    let unordered = o == oid::BOOL
+                        || o == oid::UUID
+                        || matches!(
+                            coltype_of_oid(o),
+                            Some(
+                                ColType::Json
+                                    | ColType::Jsonb
+                                    | ColType::Bit { .. }
+                                    | ColType::Range(_)
+                                    | ColType::Multirange(_)
+                            )
+                        );
+                    if unordered {
                         return Err(agg_undefined(name, o));
                     }
+                }
                 t.unwrap_or_else(|| of(ColType::Int8))
             }
             // Functions returning the common type of their arguments (numeric

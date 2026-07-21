@@ -889,6 +889,51 @@ pub fn iso_offset_string(off_secs: i32) -> StackStr<10> {
 }
 
 /// Wall-clock now, as PG-epoch microseconds (UTC).
+use core::cell::Cell;
+std::thread_local! {
+    /// When the running statement started, and when its transaction did.
+    /// PostgreSQL freezes `now()`/`current_timestamp` at transaction start and
+    /// `statement_timestamp` at statement start, leaving only
+    /// `clock_timestamp` reading the clock; taking the clock afresh per call
+    /// instead lets two `now()`s in one statement differ. Single-threaded per
+    /// connection, like the statement deadline and the session zone.
+    static STATEMENT_START: Cell<i64> = const { Cell::new(0) };
+    static TRANSACTION_START: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Marks the start of a statement.
+pub fn begin_statement() {
+    STATEMENT_START.with(|t| t.set(now_micros()));
+}
+
+/// Marks the start of a transaction, which always begins at some statement —
+/// so it anchors to that statement's clock rather than taking its own reading.
+/// A lone statement is its own implicit transaction, and PostgreSQL has
+/// `now() = statement_timestamp()` there; a second reading would not.
+pub fn begin_transaction() {
+    TRANSACTION_START.with(|t| t.set(statement_micros()));
+}
+
+/// Releases the transaction anchor at commit or rollback; the next statement
+/// takes a fresh one.
+pub fn end_transaction() {
+    TRANSACTION_START.with(|t| t.set(0));
+}
+
+/// `statement_timestamp()`: fixed for the running statement.
+pub fn statement_micros() -> i64 {
+    let at = STATEMENT_START.with(|t| t.get());
+    if at == 0 { now_micros() } else { at }
+}
+
+/// `now()` / `current_timestamp` / `transaction_timestamp()`: fixed for the
+/// running transaction.
+pub fn transaction_micros() -> i64 {
+    let at = TRANSACTION_START.with(|t| t.get());
+    if at == 0 { statement_micros() } else { at }
+}
+
+/// `clock_timestamp()`: the actual wall clock, read afresh each call.
 pub fn now_micros() -> i64 {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

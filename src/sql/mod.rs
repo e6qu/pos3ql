@@ -196,6 +196,7 @@ impl Engine {
         self.next_txid = self.next_txid.wrapping_add(1).max(1);
         txn.txid = self.next_txid;
         txn.mode = mode;
+        datetime::begin_transaction();
         txn.failed = false;
         txn.wal_mark = self.wal.mark();
     }
@@ -203,6 +204,8 @@ impl Engine {
     /// Commits: journals every touched row, fsyncs once, then promotes the
     /// in-memory images. On failure the transaction rolls back entirely.
     pub fn commit_txn(&mut self, txn: &mut TxnState) -> Result<(), SqlError> {
+        // The next statement starts a fresh transaction clock.
+        datetime::end_transaction();
         if !txn.is_active() {
             return Ok(());
         }
@@ -284,6 +287,8 @@ impl Engine {
     /// Discards every uncommitted change and journal byte of the
     /// transaction.
     pub fn rollback_txn(&mut self, txn: &mut TxnState) {
+        // The next statement starts a fresh transaction clock.
+        datetime::end_transaction();
         // Reverse-replay every write to its prior image (newest first), so a
         // row written multiple times unwinds to its pre-transaction state.
         for &(table, rowid, prior) in txn.touched().iter().rev() {
@@ -481,6 +486,10 @@ impl Engine {
         // The whole message runs in one implicit transaction unless an
         // explicit block is open — an error undoes the entire message,
         // matching PostgreSQL's implicit-transaction rule.
+        // Freeze this statement's clock before anything anchors a transaction
+        // to it, so `now()` and `statement_timestamp()` agree on a lone
+        // statement as they do in PostgreSQL.
+        datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit);
         let mut executed_any = false;
         loop {
@@ -541,6 +550,10 @@ impl Engine {
                 return Ok(false);
             }
         };
+        // Freeze this statement's clock before anything anchors a transaction
+        // to it, so `now()` and `statement_timestamp()` agree on a lone
+        // statement as they do in PostgreSQL.
+        datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit);
         let outcome = match parser.next_stmt() {
             Ok(Some(statement)) => {
@@ -993,7 +1006,10 @@ impl Engine {
                 }
                 responder.command_complete(tag)?;
                 // Later statements in this message get a fresh implicit txn.
-                self.ensure_txn(txn, TxnMode::Implicit);
+                // Freeze this statement's clock before anything anchors a
+                // transaction to it.
+                datetime::begin_statement();
+        self.ensure_txn(txn, TxnMode::Implicit);
                 Ok(Ok(()))
             }
             Stmt::Rollback => {
@@ -1002,7 +1018,10 @@ impl Engine {
                 }
                 self.rollback_txn(txn);
                 responder.command_complete("ROLLBACK")?;
-                self.ensure_txn(txn, TxnMode::Implicit);
+                // Freeze this statement's clock before anything anchors a
+                // transaction to it.
+                datetime::begin_statement();
+        self.ensure_txn(txn, TxnMode::Implicit);
                 Ok(Ok(()))
             }
             Stmt::Savepoint(name) => {
@@ -1092,7 +1111,10 @@ impl Engine {
                 if let Err(e) = self.commit_txn(txn) {
                     return Ok(Err(e));
                 }
-                self.ensure_txn(txn, TxnMode::Implicit);
+                // Freeze this statement's clock before anything anchors a
+                // transaction to it.
+                datetime::begin_statement();
+        self.ensure_txn(txn, TxnMode::Implicit);
                 let out = exec::alter_table(
                     &mut self.storage,
                     &mut self.wal,
@@ -1106,12 +1128,18 @@ impl Engine {
                         if let Err(e) = self.commit_txn(txn) {
                             return Ok(Err(e));
                         }
-                        self.ensure_txn(txn, TxnMode::Implicit);
+                        // Freeze this statement's clock before anything anchors a
+                // transaction to it.
+                datetime::begin_statement();
+        self.ensure_txn(txn, TxnMode::Implicit);
                         Ok(Ok(()))
                     }
                     Err(e) => {
                         self.rollback_txn(txn);
-                        self.ensure_txn(txn, TxnMode::Implicit);
+                        // Freeze this statement's clock before anything anchors a
+                // transaction to it.
+                datetime::begin_statement();
+        self.ensure_txn(txn, TxnMode::Implicit);
                         Ok(Err(e))
                     }
                 }

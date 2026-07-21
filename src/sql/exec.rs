@@ -3717,16 +3717,32 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
                 best.unwrap_or(of(ColType::Int8))
             }
-            // Functions that return the type of their first argument.
+            // `abs`/`nullif` take their first argument's type. `coalesce`
+            // unifies across all of them, so an untyped NULL in front must not
+            // decide the result: `coalesce(NULL, 1)` is integer, not text.
             "coalesce" | "abs" | "nullif" => {
-                if let Some(first) = args.first() {
-                    infer_type_res(first, columns)?
-                } else {
-                    of(ColType::Int8)
+                let mut chosen = None;
+                for a in args.iter() {
+                    let t = infer_type_res(a, columns)?;
+                    if t.0 != oid::UNKNOWN {
+                        chosen = Some(t);
+                        break;
+                    }
+                    if !name.eq_ignore_ascii_case("coalesce") {
+                        break;
+                    }
+                }
+                match chosen {
+                    Some(t) => t,
+                    None if args.is_empty() => of(ColType::Int8),
+                    // All arguments untyped: PostgreSQL resolves the unknown
+                    // to text, exactly as it does for a bare literal.
+                    None if name.eq_ignore_ascii_case("coalesce") => of(ColType::Text),
+                    None => infer_type_res(args[0], columns)?,
                 }
             }
             "length" | "char_length" | "character_length" | "octet_length" | "strpos"
-            | "ascii" => of(ColType::Int4),
+            | "position" | "ascii" => of(ColType::Int4),
             // Math: sqrt/exp/ln/power stay numeric for a numeric argument (and
             // no float argument outranking it), else double; floor/ceil/trunc/
             // round/sign are numeric for a numeric argument and double

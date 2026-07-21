@@ -2798,7 +2798,7 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
         Expr::Case { .. } => "case",
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
-        Expr::ArraySubquery(_) => "array",
+        Expr::ArraySubquery(_) | Expr::Array(_) => "array",
         // A scalar subquery is named by its single output column.
         Expr::Subquery(s) => match s.items.first() {
             Some(SelectItem::Expr { alias: Some(a), .. }) => a,

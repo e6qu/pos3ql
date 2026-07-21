@@ -112,3 +112,14 @@ SELECT ARRAY['2020-01-01 00:00:00+00'::timestamptz]::text AS a;
 SELECT array_agg(x)::text FROM (VALUES ('2020-01-01 12:00:00'::timestamp)) v(x);
 SELECT array_agg(x)::text FROM (VALUES (1),(2)) v(x);
 SELECT array_agg(x)::text FROM (VALUES ('a b'),('c')) v(x);
+-- json has no equality operator in PostgreSQL: two documents differing only in
+-- whitespace or key order are the same value but not the same text, so it
+-- declines to say. jsonb, being canonicalized, does compare.
+SELECT '{"a":1}'::json = '{"a":1}'::json;
+SELECT '{"a":1}'::jsonb = '{"a":1}'::jsonb;
+SELECT '{"a":1}'::json <> '{"a":2}'::json;
+SELECT '{"a":1}'::jsonb <> '{"a":2}'::jsonb;
+-- everything json can still do
+SELECT '{"a":1}'::json->>'a', '{"a":1}'::json::text, ('{"a":1}'::json) IS NULL;
+SELECT json_agg(x)::text FROM (VALUES (1),(2)) v(x);
+SELECT count(x) FROM (VALUES ('{}'::json)) v(x);

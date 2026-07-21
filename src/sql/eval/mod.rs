@@ -2968,12 +2968,33 @@ pub fn cast_to<'a>(
         },
         ColType::Time => match v {
             Datum::Time(_) => v,
+            Datum::Timetz(t, _) => Datum::Time(t),
             // The time-of-day portion of a timestamp (microseconds past midnight).
             Datum::Timestamp(t) | Datum::Timestamptz(t) => {
                 Datum::Time(t.rem_euclid(86_400_000_000))
             }
             Datum::Text(s) => Datum::Time(super::datetime::parse_time(s)?),
             _ => return Err(cast_unsupported(&v, "time without time zone")),
+        },
+        ColType::Timetz => match v {
+            Datum::Timetz(..) => v,
+            // A value with no zone of its own takes the session's, as
+            // PostgreSQL does — for a timestamptz that means converting the
+            // instant into that zone first.
+            Datum::Time(t) => Datum::Timetz(t, session_zone_at(super::datetime::now_micros())),
+            Datum::Timestamptz(t) => {
+                let zone = session_zone_at(t);
+                let local = t + zone as i64 * 1_000_000;
+                Datum::Timetz(local.rem_euclid(86_400_000_000), zone)
+            }
+            Datum::Timestamp(t) => {
+                Datum::Timetz(t.rem_euclid(86_400_000_000), session_zone_at(t))
+            }
+            Datum::Text(s) => {
+                let (t, zone) = super::datetime::parse_timetz(s)?;
+                Datum::Timetz(t, zone.unwrap_or_else(|| session_zone_at(super::datetime::now_micros())))
+            }
+            _ => return Err(cast_unsupported(&v, "time with time zone")),
         },
         ColType::Interval => match v {
             Datum::Interval(_) => v,
@@ -3452,6 +3473,12 @@ fn interval_extract<'a>(
     }
 }
 
+/// The session zone's offset (seconds east) in effect at an instant — DST means
+/// the answer depends on when.
+fn session_zone_at(utc_micros: i64) -> i32 {
+    super::timezone::session().resolve(utc_micros).0
+}
+
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Null => "unknown",
@@ -3465,6 +3492,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Timestamp(_) => "timestamp without time zone",
         Datum::Timestamptz(_) => "timestamp with time zone",
         Datum::Time(_) => "time without time zone",
+        Datum::Timetz(..) => "time with time zone",
         Datum::Interval(_) => "interval",
         Datum::Json { jsonb: false, .. } => "json",
         Datum::Json { jsonb: true, .. } => "jsonb",

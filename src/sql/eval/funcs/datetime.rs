@@ -153,6 +153,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Timestamp(t) | Datum::Timestamptz(t) => Some(t),
                     Datum::Date(d) => Some(d as i64 * 86_400_000_000),
                     Datum::Time(t) => Some(t),
+                    Datum::Timetz(t, _) => Some(t),
                     _ => None,
                 };
                 if let Some(m) = micros {
@@ -380,9 +381,17 @@ pub(crate) fn dispatch<'a>(
                 let Some(field) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
+                // A time of day has no date, so its date fields read zero and
+                // only the time ones — plus, for timetz, `timezone` — apply.
+                let mut zone_secs: Option<i32> = None;
                 let (days, in_day) = match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Date(d) => (d as i64, 0i64),
+                    Datum::Time(t) => (0, t),
+                    Datum::Timetz(t, zone) => {
+                        zone_secs = Some(zone);
+                        (0, t)
+                    }
                     Datum::Timestamp(t) | Datum::Timestamptz(t) => {
                         (t.div_euclid(86_400_000_000), t.rem_euclid(86_400_000_000))
                     }
@@ -398,6 +407,24 @@ pub(crate) fn dispatch<'a>(
                 let (seconds, frac) = (in_day / 1_000_000, in_day % 1_000_000);
                 let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
                 let eq = |k: &str| field.eq_ignore_ascii_case(k);
+                // `timezone` is the offset in seconds east, which only a value
+                // carrying its own zone has.
+                if let Some(zone) = zone_secs
+                    && (eq("timezone") || eq("timezone_hour") || eq("timezone_minute"))
+                {
+                    let v = if eq("timezone") {
+                        zone as i64
+                    } else if eq("timezone_hour") {
+                        (zone / 3600) as i64
+                    } else {
+                        ((zone % 3600) / 60) as i64
+                    };
+                    return Ok(if name == "extract" {
+                        Datum::Numeric(crate::sql::numeric::Numeric::from_i64(v, arena)?)
+                    } else {
+                        Datum::Float8(v as f64)
+                    });
+                }
                 let dow0 = day_of_week(days) as i64;
                 // Integer-valued fields.
                 let int_val: Option<i64> = if eq("year") || eq("years") {

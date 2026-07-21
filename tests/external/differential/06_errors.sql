@@ -138,3 +138,14 @@ SELECT id FROM pz WHERE (100/z) > 0 AND id IS NULL;
 SELECT id FROM pz WHERE ((100/z) > 0 AND id IS NULL) OR id = 1;
 SELECT id FROM pz WHERE z <> 0 AND (100/z) > 0;
 DROP TABLE pz;
+-- DISTINCT materializes rows and walks their encoding to find the visible
+-- prefix; that walk once carried its own tag table covering only the first few
+-- types, and reaching an unlisted one killed the server.
+SELECT DISTINCT v.x::text FROM (VALUES ('12:00:00'::time),('13:00:00'),('12:00:00')) v(x) ORDER BY 1;
+SELECT DISTINCT v.x::text FROM (VALUES ('1 hour'::interval),('2 hours'),('1 hour')) v(x) ORDER BY 1;
+SELECT DISTINCT v.x::text FROM (VALUES ('{"a":1}'::json),('{"a":1}')) v(x) ORDER BY 1;
+SELECT DISTINCT v.x::text FROM (VALUES ('[1,5)'::int4range),('[1,5)'),('[2,6)')) v(x) ORDER BY 1;
+SELECT DISTINCT v.x::text FROM (VALUES (B'101'),(B'101'),(B'110')) v(x) ORDER BY 1;
+SELECT DISTINCT v.x::text FROM (VALUES ('{[1,5)}'::int4multirange),('{[1,5)}')) v(x) ORDER BY 1;
+SELECT DISTINCT v.x::text FROM (VALUES ('a1b2c3d4-e5f6-7890-abcd-ef1234567890'::uuid),('a1b2c3d4-e5f6-7890-abcd-ef1234567890')) v(x) ORDER BY 1;
+SELECT DISTINCT v.x::text FROM (VALUES (1.5::numeric),(1.5),(2.5)) v(x) ORDER BY 1;

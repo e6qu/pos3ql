@@ -21,6 +21,7 @@ pub mod oid {
     pub const TIMESTAMP: i32 = 1114;
     pub const TIMESTAMPTZ: i32 = 1184;
     pub const TIME: i32 = 1083;
+    pub const TIMETZ: i32 = 1266;
     pub const INTERVAL: i32 = 1186;
     pub const JSON: i32 = 114;
     pub const JSONB: i32 = 3802;
@@ -72,6 +73,8 @@ pub enum ColType {
     Timestamptz,
     /// Microseconds since midnight (time of day, no zone).
     Time,
+    /// Time of day carrying its own UTC offset.
+    Timetz,
     /// A duration (months, days, microseconds).
     Interval,
     /// Textual JSON (stored verbatim).
@@ -141,6 +144,7 @@ impl ColType {
             "timestamp" => Self::Timestamp,
             "timestamptz" => Self::Timestamptz,
             "time" => Self::Time,
+            "timetz" | "time with time zone" => Self::Timetz,
             "interval" => Self::Interval,
             "json" => Self::Json,
             "jsonb" => Self::Jsonb,
@@ -170,6 +174,7 @@ impl ColType {
             Self::Timestamp => oid::TIMESTAMP,
             Self::Timestamptz => oid::TIMESTAMPTZ,
             Self::Time => oid::TIME,
+            Self::Timetz => oid::TIMETZ,
             Self::Interval => oid::INTERVAL,
             Self::Json => oid::JSON,
             Self::Jsonb => oid::JSONB,
@@ -189,6 +194,7 @@ impl ColType {
             Self::Bool => 1,
             Self::Int2 | Self::Int4 | Self::Date => 4,
             Self::Int8 | Self::Float4 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
+            Self::Timetz => 12,
             Self::Interval => 16,
             Self::Uuid => 16,
             Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
@@ -223,6 +229,7 @@ impl ColType {
             Self::Timestamp => "timestamp",
             Self::Timestamptz => "timestamptz",
             Self::Time => "time",
+            Self::Timetz => "timetz",
             Self::Interval => "interval",
             Self::Json => "json",
             Self::Jsonb => "jsonb",
@@ -252,6 +259,7 @@ impl ColType {
             Self::Timestamp => "timestamp without time zone",
             Self::Timestamptz => "timestamp with time zone",
             Self::Time => "time without time zone",
+            Self::Timetz => "time with time zone",
             Self::Interval => "interval",
             Self::Json => "json",
             Self::Jsonb => "jsonb",
@@ -287,6 +295,7 @@ impl ColType {
             Self::Varchar => 14,
             Self::Bpchar => 15,
             Self::Time => 16,
+            Self::Timetz => 41,
             Self::Interval => 17,
             Self::Json => 18,
             Self::Jsonb => 19,
@@ -317,6 +326,7 @@ impl ColType {
             14 => Self::Varchar,
             15 => Self::Bpchar,
             16 => Self::Time,
+            41 => Self::Timetz,
             17 => Self::Interval,
             18 => Self::Json,
             19 => Self::Jsonb,
@@ -584,6 +594,12 @@ pub enum Datum<'a> {
     Timestamptz(i64),
     /// Microseconds since midnight (time of day).
     Time(i64),
+    /// Time of day with its own UTC offset: microseconds since midnight in
+    /// that offset, then the offset itself in seconds **east** of UTC, which
+    /// is the sign [`super::datetime::iso_offset_string`] renders and that
+    /// `EXTRACT(timezone FROM ...)` reports. PostgreSQL stores and sends the
+    /// opposite sign, so the binary wire path negates it.
+    Timetz(i64, i32),
     /// A duration.
     Interval(Interval),
     /// JSON text; `jsonb` is true for the binary/normalized form.
@@ -635,6 +651,7 @@ impl<'a> Datum<'a> {
             Datum::Date(_) => oid::DATE,
             Datum::Timestamp(_) => oid::TIMESTAMP,
             Datum::Timestamptz(_) => oid::TIMESTAMPTZ,
+            Datum::Timetz(..) => oid::TIMETZ,
             Datum::Time(_) => oid::TIME,
             Datum::Interval(_) => oid::INTERVAL,
             Datum::Json { jsonb: false, .. } => oid::JSON,
@@ -679,6 +696,10 @@ impl fmt::Display for Datum<'_> {
                 f.write_str(super::datetime::format_timestamp(*t, true).as_str())
             }
             Datum::Time(t) => f.write_str(super::datetime::format_time(*t).as_str()),
+            Datum::Timetz(t, zone) => {
+                f.write_str(super::datetime::format_time(*t).as_str())?;
+                f.write_str(super::datetime::iso_offset_string(*zone).as_str())
+            }
             Datum::Interval(interval) => f.write_str(super::datetime::format_interval(*interval).as_str()),
             Datum::Json { text, .. } => f.write_str(text),
             Datum::Range { text, .. } => f.write_str(text),
@@ -824,7 +845,7 @@ mod code_roundtrip_tests {
         let mut types = vec![
             ColType::Bool, ColType::Int2, ColType::Int4, ColType::Int8, ColType::Float4,
             ColType::Float8, ColType::Text, ColType::Varchar, ColType::Bpchar, ColType::Date,
-            ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Interval,
+            ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Timetz, ColType::Interval,
             ColType::Json, ColType::Jsonb, ColType::Uuid, ColType::Bytea, ColType::Numeric,
             ColType::Bit { varying: false }, ColType::Bit { varying: true },
         ];
@@ -839,10 +860,16 @@ mod code_roundtrip_tests {
         // The layout this replaced could emit any code in 20..=40; a moved
         // family must not reuse one, or old data decodes as the wrong type
         // instead of failing.
+        // 20..=40 is what the pre-B-095 layout could emit. Only the families
+        // that legitimately held codes there then may hold them now; anything
+        // else would decode old data as itself instead of failing.
         for t in &types {
             let c = t.code();
-            let moved = matches!(t, ColType::Multirange(_) | ColType::Array(_));
-            assert!(!(moved && (20..=40).contains(&c)), "{t:?} reuses retired code {c}");
+            let held_them_before = matches!(t, ColType::Range(_) | ColType::Bit { .. });
+            assert!(
+                held_them_before || !(20..=40).contains(&c),
+                "{t:?} takes retired code {c}, which old data may still carry"
+            );
         }
         // No two types may share a code, and each must decode back to itself.
         let mut seen: Vec<(u8, ColType)> = Vec::new();

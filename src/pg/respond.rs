@@ -426,6 +426,13 @@ impl<'b> Responder<'b> {
                     m.i32(8);
                     m.bytes(&x.to_be_bytes());
                 }
+                Datum::Timetz(t, zone) => {
+                    // 8 bytes of time then the zone, which PostgreSQL counts
+                    // west of UTC — the opposite sign to the stored offset.
+                    m.i32(12);
+                    m.bytes(&t.to_be_bytes());
+                    m.bytes(&(-*zone).to_be_bytes());
+                }
                 Datum::Interval(interval) => {
                     // PostgreSQL binary interval: int64 micros, int32 days, int32 months.
                     m.i32(16);

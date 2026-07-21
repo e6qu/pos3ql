@@ -43,6 +43,25 @@ pub struct Timezone {
     dst: Option<Dst>,
 }
 
+use core::cell::Cell;
+std::thread_local! {
+    /// The session's `TimeZone`, published once per statement so evaluation can
+    /// resolve a value that carries no zone of its own — `'12:00'::timetz` and
+    /// `timestamptz::timetz` both take it — without threading the GUC through
+    /// every call. Single-threaded per connection, like the statement deadline.
+    static SESSION: Cell<Option<Timezone>> = const { Cell::new(None) };
+}
+
+/// Publishes the session zone for the statement about to run.
+pub fn set_session(zone: Timezone) {
+    SESSION.with(|z| z.set(Some(zone)));
+}
+
+/// The session zone, or UTC before any statement has published one.
+pub fn session() -> Timezone {
+    SESSION.with(|z| z.get()).unwrap_or_else(Timezone::utc)
+}
+
 impl Timezone {
     /// A fixed-offset zone (no DST): UTC, `Etc/GMT±N`, bare numeric offsets.
     pub fn fixed(off_secs: i32, abbrev: &str) -> Timezone {

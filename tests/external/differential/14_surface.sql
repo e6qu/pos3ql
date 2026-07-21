@@ -72,6 +72,23 @@ SELECT * FROM generate_series(1,2) WITH ORDINALITY;
 SELECT * FROM (SELECT 1) x CROSS JOIN (SELECT 2) y;
 SELECT * FROM (SELECT 1 a) x JOIN (SELECT 1 a) y USING (a);
 SELECT * FROM (SELECT 1 a) x NATURAL JOIN (SELECT 1 a) y;
+-- window functions with no FROM: the single virtual row is a one-row source
+SELECT row_number() OVER ();
+SELECT rank() OVER (), dense_rank() OVER ();
+SELECT sum(1) OVER (), count(*) OVER (), avg(2.5) OVER ();
+SELECT sum(1) OVER (PARTITION BY 1 ORDER BY 1 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW);
+SELECT lag(5) OVER (), lead(5) OVER ();
+SELECT first_value(7) OVER (), last_value(7) OVER (), nth_value(7,1) OVER ();
+SELECT ntile(1) OVER (), percent_rank() OVER (), cume_dist() OVER ();
+SELECT row_number() OVER () AS r, 1+1 AS x;
+SELECT row_number() OVER () ORDER BY 1;
+SELECT row_number() OVER () WHERE false;
+SELECT (SELECT row_number() OVER ());
+WITH c AS (SELECT row_number() OVER () n) SELECT n FROM c;
+SELECT 1 IN (SELECT row_number() OVER ());
+SELECT EXISTS (SELECT row_number() OVER ());
+SELECT * FROM (SELECT row_number() OVER () n) x;
+SELECT row_number() OVER () UNION SELECT 5 ORDER BY 1;
 -- forms whose value moves, asserted by shape instead
 -- (PostgreSQL types these as `name`; this engine has no such type — B-103)
 SELECT user = current_user;

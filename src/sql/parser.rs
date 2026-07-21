@@ -2364,9 +2364,6 @@ impl<'a> Parser<'a> {
                 // `ARRAY` is itself reserved, which is why this cannot come
                 // first. A `can be function or type name` keyword may continue:
                 // it is exactly the category PostgreSQL allows to name one.
-                if is_reserved_keyword(name) {
-                    return Err(ParseError { at: name_at, ..self.unexpected("expected an expression") });
-                }
                 if self.peeked == Tok::Op("(") {
                     return self.call(name);
                 }
@@ -2391,22 +2388,39 @@ impl<'a> Parser<'a> {
                         name: column,
                     });
                 }
-                // SQL-standard paren-less functions.
+                // SQL-standard functions written without parentheses. The
+                // temporal ones also take an optional precision.
                 if matches!(
                     name,
                     "current_date" | "current_timestamp" | "current_time" | "localtimestamp"
-                        | "current_user" | "session_user" | "current_catalog"
+                        | "localtime" | "current_user" | "session_user" | "current_catalog"
                         | "current_schema"
                 ) {
+                    let mut args: &[&'a Expr<'a>] = &[];
+                    if self.peeked == Tok::Op("(")
+                        && matches!(name, "current_timestamp" | "current_time" | "localtimestamp" | "localtime")
+                    {
+                        self.advance()?;
+                        let precision = self.expression(0)?;
+                        self.expect_op(")")?;
+                        args = self.arena_slice(&[precision])?;
+                    }
                     return self.arena_expr(Expr::Call {
                         name,
-                        args: &[],
+                        args,
                         star: false,
                         distinct: false,
                         order_by: &[],
                         over: None,
                         filter: None,
                     });
+                }
+                // Only now, every construct this arm knows having had its
+                // chance: a still-unconsumed reserved word cannot begin an
+                // expression. It cannot come earlier — `ARRAY` is reserved and
+                // so is `current_date`, yet both are ordinary expressions.
+                if is_reserved_keyword(name) {
+                    return Err(ParseError { at: name_at, ..self.unexpected("expected an expression") });
                 }
                 self.arena_expr(Expr::Column { qualifier: None, name })
             }

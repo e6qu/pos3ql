@@ -22,6 +22,38 @@ use super::super::{
     ColumnLookup, EvalHooks, SqlError,
 };
 
+/// The session zone's offset (seconds east) at an instant.
+fn session_offset(utc_micros: i64) -> i32 {
+    crate::sql::timezone::session().resolve(utc_micros).0
+}
+
+/// Rounds `micros` to an optional fractional-second precision argument, which
+/// the SQL-standard niladic functions accept as `current_time(3)`.
+#[allow(clippy::too_many_arguments)]
+fn round_to_precision<'a, R: ColumnLookup<'a>>(
+    name: &str,
+    args: &[&Expr<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+    micros: i64,
+) -> Result<i64, SqlError> {
+    if args.is_empty() {
+        return Ok(micros);
+    }
+    if args.len() > 1 {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {} takes at most one argument",
+            name
+        ));
+    }
+    let p = int_arg(name, args, 0, arena, params, row, hooks)?.unwrap_or(6).clamp(0, 6);
+    let scale = 10i64.pow(6 - p as u32);
+    Ok(micros.div_euclid(scale) * scale)
+}
+
 /// Handles the date/time family. Returns `None` if `name` is not one of these
 /// functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -44,6 +76,9 @@ pub(crate) fn dispatch<'a>(
             | "date_bin"
             | "isfinite"
             | "current_date"
+            | "current_time"
+            | "localtime"
+            | "localtimestamp"
             | "to_char"
             | "to_timestamp"
             | "to_date"
@@ -79,9 +114,28 @@ pub(crate) fn dispatch<'a>(
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
             "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
-            | "clock_timestamp" => {
-                arity(0)?;
-                Ok(Datum::Timestamptz(datetime::now_micros()))
+            | "clock_timestamp" | "localtimestamp" => {
+                let micros = round_to_precision(name, args, arena, params, row, hooks, datetime::now_micros())?;
+                Ok(if name == "localtimestamp" {
+                    // The session's wall clock, with no zone attached.
+                    Datum::Timestamp(micros + session_offset(micros) as i64 * 1_000_000)
+                } else {
+                    Datum::Timestamptz(micros)
+                })
+            }
+            // `current_time` carries the session's offset; `localtime` is the
+            // same wall clock with the zone dropped.
+            "current_time" | "localtime" => {
+                let now = datetime::now_micros();
+                let offset = session_offset(now);
+                let local = round_to_precision(name, args, arena, params, row, hooks, now)?
+                    + offset as i64 * 1_000_000;
+                let in_day = local.rem_euclid(86_400_000_000);
+                Ok(if name == "current_time" {
+                    Datum::Timetz(in_day, offset)
+                } else {
+                    Datum::Time(in_day)
+                })
             }
             // `date_bin(stride, source, origin)`: the stride-aligned bucket start at
             // or before `source`, measured from `origin`. Strides with a month or

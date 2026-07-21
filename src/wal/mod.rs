@@ -466,7 +466,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3);
-                ok &= buffer.append(&[type_code(c.ctype), flags]);
+                ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 ok &= append_default(buffer, &c.default_value);
             }
@@ -586,7 +586,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let default_value = decode_default(payload, &mut at)?;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
-                    ctype: code_type(meta[0])?,
+                    ctype: ColType::from_code(meta[0])?,
                     type_mod,
                     not_null: meta[1] & 1 != 0,
                     unique: meta[1] & 2 != 0,
@@ -878,64 +878,7 @@ pub fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<OwnedDatu
     })
 }
 
-fn type_code(t: ColType) -> u8 {
-    match t {
-        ColType::Bool => 1,
-        ColType::Int2 => 12,
-        ColType::Float4 => 13,
-        ColType::Varchar => 14,
-        ColType::Bpchar => 15,
-        ColType::Int4 => 2,
-        ColType::Int8 => 3,
-        ColType::Float8 => 4,
-        ColType::Text => 5,
-        ColType::Date => 6,
-        ColType::Timestamp => 7,
-        ColType::Timestamptz => 8,
-        ColType::Time => 16,
-        ColType::Interval => 17,
-        ColType::Json => 18,
-        ColType::Jsonb => 19,
-        ColType::Array(e) => 32 + e.code(),
-        ColType::Uuid => 9,
-        ColType::Bytea => 10,
-        ColType::Numeric => 11,
-        ColType::Range(k) => 20 + k.code(),
-        ColType::Multirange(k) => 28 + k.code(),
-        ColType::Bit { varying: false } => 26,
-        ColType::Bit { varying: true } => 27,
-    }
-}
 
-fn code_type(code: u8) -> Option<ColType> {
-    Some(match code {
-        1 => ColType::Bool,
-        12 => ColType::Int2,
-        13 => ColType::Float4,
-        14 => ColType::Varchar,
-        15 => ColType::Bpchar,
-        2 => ColType::Int4,
-        3 => ColType::Int8,
-        4 => ColType::Float8,
-        5 => ColType::Text,
-        6 => ColType::Date,
-        7 => ColType::Timestamp,
-        8 => ColType::Timestamptz,
-        16 => ColType::Time,
-        17 => ColType::Interval,
-        18 => ColType::Json,
-        19 => ColType::Jsonb,
-        26 => ColType::Bit { varying: false },
-        27 => ColType::Bit { varying: true },
-        c if (28..34).contains(&c) => ColType::Multirange(crate::sql::types::RangeKind::from_code(c - 28)),
-        c if (20..26).contains(&c) => ColType::Range(crate::sql::types::RangeKind::from_code(c - 20)),
-        c if c >= 32 => ColType::Array(crate::sql::types::ArrElem::from_code(c - 32)?),
-        9 => ColType::Uuid,
-        10 => ColType::Bytea,
-        11 => ColType::Numeric,
-        _ => return None,
-    })
-}
 
 #[cfg(test)]
 mod tests {

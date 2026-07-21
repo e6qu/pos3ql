@@ -40,14 +40,408 @@ Phase discipline: fine-grained commit per task; PLAN.md and BUGS.md updated in
 the same commit series as the phase they describe; no phase numbers or bug IDs
 in code or code comments (the "why" goes in commit messages).
 
+## Object-storage LSM roadmap (realizing the original vision)
+
+The phases above built a **RAM-resident** database: every live row is in one
+fixed in-memory heap (`storage::RowHeap`, `memtable_bytes`), durability is the
+local WAL, and object storage holds **full/delta checkpoint snapshots** behind a
+CAS'd manifest (see *Deviations* below). Three things still separate this from
+the founding vision of *object storage is the database, with a local disk/memory
+cache in front of it*:
+
+1. **The working set must fit RAM.** A full memtable fails loudly
+   (`storage/mod.rs`: *"flush to object storage is not implemented yet"*).
+2. **There is no read-through cache.** `block_cache_bytes` / `disk_cache_bytes`
+   are declared in `config` but wired to nothing.
+3. **The bucket is a snapshot target, not a block-addressable backing store.**
+   SSTs are read whole on cold start, never a block at a time on the query path.
+
+This roadmap closes that gap. Structural cues are taken from **Loki** (object
+storage as the system of record; immutable content-addressed chunks; a small
+cacheable index shipped to the bucket; multi-tier read caches; ingester
+WAL-then-flush; a compactor for retention/GC) and **TigerBeetle** (a fixed-size
+checksummed *block grid*; a superblock / manifest-log root updated by CAS; a
+statically-allocated block cache; amortized "paced" compaction; deterministic
+fault-injected simulation).
+
+**Invariants every stage keeps** (unchanged from the founding discipline):
+static memory (no heap after startup; pool exhaustion is a loud error); no
+silent fallback or no-op; **PostgreSQL fidelity is frozen** — the differential +
+sqllogictest + fuzzer stay green through every stage (storage is invisible to
+SQL semantics); all storage I/O behind the `io` traits so the simulator can
+drive it; every block and object is checksummed and a mismatch is fatal; one
+runtime dependency (`libc`), TLS the single flagged exception (Stage G).
+
+The hard dependency chain is **A → B → C → D → E → F**; **G** and **H** run in
+parallel once **A** exists; **I** (object-storage-adaptive execution) builds on
+the block-granular read path (**C**) and the snapshot read path (**F**). See
+[BUGS.md](BUGS.md) B-075 for the one open correctness caveat in the current
+executor (evaluation-order of error-raising expressions vs sort/limit),
+independent of this work.
+
+### Stage 0 — codebase organization & detection tooling (prerequisite, parallelizable)
+
+Two hygiene tracks that make room for the storage subsystems. Neither hard-blocks
+the stages (which land in new directories), but both run alongside the early ones.
+
+**Module structure.** `src/sql/` is ~75% of the tree in 23 flat files, four of them
+4k–11k lines (`query.rs`, `eval.rs`, `exec.rs`, `mod.rs`; the `call()` dispatch
+`match` alone is ~3.3k lines). New subsystems each get their own directory
+(`src/store/`, `src/cache/`, `src/lsm/`, `src/sched/`) — the flat `sql/` layout is
+not repeated. The existing monsters are split incrementally, one file per PR,
+diff-gated (the differential + fuzzer + tests are the guardrail): `query.rs →
+query/{scope,scan,join,cte,setop,aggregate,window,group,project,view_dml,select}`,
+`eval.rs → eval/{hooks,core,call/ (by category),operators,cast,like,series}`
+(splitting `call()` also removes its debug-build stack-frame risk), `exec.rs →
+exec/{ddl,infer,row,record}`.
+
+**Detection tooling — established tools, not hand-rolled** (checked against the Rust
+ecosystem rather than reinvented):
+- *Duplicates:* **jscpd** v5 (Rust-tokenizing Rabin-Karp copy-paste detector) —
+  `npx jscpd src --min-lines 25`. The tree is 0.05% duplicated: after unifying the
+  WAL/checkpoint on-disk type-code map into a single `ColType::code`/`from_code`
+  (the two were byte-identical — a single-source-of-truth fix), one clone remains
+  (the number-format loop in `to_char.rs`), tracked for extraction.
+- *Dead code:* rustc's own `dead_code` + `#![warn(unreachable_pub)]` are the precise
+  long-term path, but are blind to the library's `pub` surface until it is curated
+  down to what `main.rs`/tests use (a ~2000-edit `pub → pub(crate)` pass —
+  mechanical, incremental, and an encapsulation win). Until then,
+  **cargo-workspace-unused-pub** (rust-analyzer SCIP index; semantic, so it catches
+  `pub` *methods*, not just free items) is the audit tool: `rust-analyzer scip . &&
+  cargo workspace-unused-pub`.
+- Both tools **surface candidates for judgment** — zero consumers can mean cruft OR
+  intentional public API / protocol-and-format documentation / a companion
+  accessor, and each carries its own false positives (`#[test]` entry points, trait
+  impls, doc-comment references). A candidate is resolved by **wiring it in,
+  removing it, or recording why it stays** — never deleted by consumer count alone.
+
+Immediate next steps: gate jscpd in CI on a clone budget; run the dead-code audit
+periodically (its false positives make it a poor hard gate); adjudicate the current
+findings (the `to_char.rs` clone and ~15 unused-`pub` candidates — `is_frozen`,
+`write_signed_headers`, several `storage` methods, …).
+
+### Stage A — the block grid: a checksummed, content-addressed block store
+
+Introduce the one abstraction everything stands on: a fixed-size, self-describing,
+checksummed **block** (`header { checksum, block_type, block_id, lsn, len }` +
+payload; start at 256–512 KiB), and a `BlockStore` seam with a local backend and
+an object-storage backend. Blocks are **immutable and content-addressed** (key =
+content hash, Loki-chunk style), so writes are idempotent, retries are safe, and
+only the root needs CAS. SST data/index/filter blocks, the manifest log, and WAL
+segments all become blocks in the grid (TigerBeetle *Grid*), verified on read and
+used in place. Work: `Block` layout + `BlockId`; `trait BlockStore`; a static free
+set / ref-map for the local grid; re-express the current SST writer/reader in
+terms of blocks, behavior-preserving. **Milestone:** existing checkpoint/cold-start
+round-trip passes with every persisted byte a verified block; a flipped byte fails
+loudly. **Risk:** block size (latency vs. amplification) and object-per-block vs.
+pack-many (S3 request cost) — start object-per-block.
+
+### Stage B — the tiered read cache (RAM block cache + local disk cache)
+
+Build the missing cache and make `block_cache_bytes` / `disk_cache_bytes` real —
+the piece the founding "ClickHouse/Loki-style local cache" names. Two
+statically-allocated tiers behind `BlockStore`: a **RAM block cache** (fixed
+frames, CLOCK/CLOCK-Pro eviction — TigerBeetle's grid cache) and a **local disk
+cache** (fixed-budget files with an in-RAM `FixedMap<BlockId, DiskSlot>` index and
+CLOCK/LRU eviction — Loki's chunk cache + boltdb-shipper local store). Read path
+becomes **RAM cache → disk cache → object-storage ranged GET**, with
+hit/miss/evict counters surfaced. The disk cache is pure cache (always re-fetchable
+from the bucket), so a torn disk-cache write is a miss, never data loss. **Milestone:**
+a dataset whose hot set fits RAM but whose whole set does not is served mostly from
+cache; the config knobs finally do something; hit ratio is visible.
+
+### Stage C — a real SST: sorted data blocks + sparse index + bloom filter
+
+Replace the whole-table SST with a **block-granular** SST so a read fetches only the
+blocks it needs, decoupling dataset size from RAM. LevelDB/TigerBeetle shape, all
+grid blocks: sorted **data blocks** + a sparse **index block** (first-key → data
+block) + a **filter block** (bloom, to skip SSTs that cannot hold a key — Loki's
+bloom tier). Point lookup = bloom → index → one data block, each pulled through the
+Stage-B cache; range scan streams the covering blocks. **Milestone:** cold start no
+longer rehydrates whole tables into RAM; a point lookup touches O(1) blocks
+(verified by fetch counters).
+
+### Stage D — memtable flush + the manifest log (continuous ingest)
+
+Kill the "flush not implemented" wall: ingest becomes bounded by flush *rate*, not
+RAM *size*. The Loki **ingester** pattern, disciplined à la TigerBeetle: at a
+high-water mark, freeze the memtable (a read-only second memtable), flush it to a
+level-0 SST (Stage C), drop it, and keep writing against a fresh one — the WAL
+already protects the un-flushed tail. Replace the monolithic manifest rewrite with a
+**manifest log** (TigerBeetle `manifest_log` / Loki index shipping): append
+SST-added/removed records, compact the log periodically, and let a small
+**superblock** root — the only CAS'd object — point at the log tail. **Milestone:**
+insert far more than `memtable_bytes` of live rows with zero "memtable full" errors;
+kill -9 mid-flush recovers exactly. **Risk (crux invariant):** a flushed SST must be
+referenced in the manifest log *before* its WAL range is reclaimed — model it in
+Stage H.
+
+### Stage E — leveled compaction (background, paced, allocation-free)
+
+Keep read amplification and object count bounded under sustained update/delete load
+(the old P7 milestone, object-native). Leveled compaction **paced like TigerBeetle**:
+work amortized across operations ("beats") so it never spikes tail latency and never
+allocates — a merge iterator over a fixed number of input blocks into a fixed number
+of output blocks per beat. **Tombstones** become first-class SST entries, dropped when
+they fall below the oldest live snapshot (co-designed with Stage F's watermark). GC is
+Loki's compactor + retention: after new SSTs are committed to the manifest log, orphan
+blocks are swept (the existing bounded `collect_garbage`). **Milestone:** a sustained
+insert/update/delete workload holds steady-state read-amp and object count; latency
+histograms show no compaction spikes. **Note:** secondary indexes are a *forest* of
+LSM trees (one per index, TigerBeetle-style) reusing Stages A–E; introduce here or
+defer.
+
+### Stage F — MVCC snapshot reads over object-resident data
+
+Preserve snapshot isolation once the working set spills to the bucket. **This is more
+than "wire the existing snapshots to the LSM."** Today MVCC is **txid-based,
+single-writer, two-version** — each row is `RowState { committed, pending }`, at most
+one committed image plus one uncommitted pending change, visibility by `transaction_id`
+(not LSN), with a second concurrent writer failing fast (`40001`); `lsn` is only a
+write-sequence / WAL position (`storage/mod.rs`). A long-running reader therefore has
+**no historical version to see**, and Stage E's compaction would drop the only version
+it still needs. So Stage F grows a **prerequisite**: genuine **multi-version rows keyed
+by a commit LSN** (append versions instead of repoint-in-place; a read at snapshot `S`
+sees the newest version with `commit_lsn ≤ S`), and compaction must **retain any
+version still visible to the oldest live snapshot** (RocksDB sequence numbers /
+TigerBeetle per-op timestamps are the model). Then a read merges live + frozen memtable
++ level SSTs through a snapshot-aware merge iterator (point via bloom+index, scans via
+streamed blocks with bounded read-ahead), and the executor's scan path
+(`sql/query.rs`) is wired to it transparently. **Milestone:** concurrent sessions show
+identical SI semantics whether data is in RAM or on the bucket; the *full differential
+suite is green with `memtable_bytes` shrunk tiny* — a powerful new forced-spill CI mode.
+
+### Stage G — S3 client hardening & multi-provider reach
+
+Make the client production-shaped and reach real clouds, not just MinIO. Loki abstracts
+every backend behind one `ObjectClient`; mirror that with a **provider trait** while
+keeping the hand-rolled, static-memory discipline: **TLS** — the one explicitly-deferred
+decision, resolved *here* (isolated `rustls` vs. terminating proxy); **multipart upload**
+for large SSTs; **streaming (non-buffer-bound) response reads** so a large-block GET is
+not capped by a fixed buffer (today's `ResponseTooLarge`); chunked-transfer decoding
+(today a hard `Protocol` error); and **provider quirks** behind the trait — GCS
+(resumable, XML/JSON auth), Azure Blob (shared-key/SAS signing). **Milestone:** the full
+flush/compaction/cold-start pipeline runs against real AWS S3 and GCS over HTTPS —
+extend `tests/minio_it.rs` into a provider matrix. **Risk:** TLS is the single
+dependency-policy exception; keep it isolated behind the trait so the core stays
+`libc`-only.
+
+### Stage H — deterministic storage simulation (VOPR for the whole stack)
+
+Prove the above correct under adversarial faults — the TigerBeetle VOPR discipline,
+extended from consensus (`vsr`/`sim`) to storage. A **virtual object store + virtual
+grid disk** implementing the same `io` traits, PCG-driven, injecting latency,
+partial/torn writes, bit-rot, misdirected/duplicated I/O, and S3 outage/slowness/eventual-
+consistency edges. Invariant checkers assert, from seeds: no committed write is ever
+lost across crash-restart storms; the superblock/manifest CAS is never violated;
+every block read verifies its checksum (and repairs where redundancy exists);
+**cold-start state == pre-crash committed state**, including mid-flush and
+mid-compaction crashes (Stage D's ordering invariant). **Milestone:** long seeded runs
+clean; every failure reproduces from its seed — the gate that lets the object-storage
+tier be trusted the way the SQL layer is today. Stand this up as soon as **A** lands so
+every later stage is born simulation-tested, not retrofitted.
+
+### Stage I — object-storage-adaptive execution (the four pillars)
+
+The storage stages make data *reachable* from the bucket; this stage makes queries
+*adapt* to the bucket's latency/bandwidth/request-cost profile. It is the execution-
+side counterpart to A–H and the concrete answer to "rearrange queries smartly for
+object storage" — a **planner + scheduler + executor** concern, deliberately *not* a
+bytecode VM (see *Considered and deferred* below). Four pillars, all behind frozen SQL
+semantics (the differential + fuzzer are the guardrail — nothing here changes a result):
+
+1. **Storage-aware cost model.** Give the planner an object-storage cost vector — per-
+   request *latency*, request *count* (money + per-prefix rate limits), *bandwidth*, and
+   **cache residency** (a block likely in RAM/disk cache is ~free; a cold block pays an S3
+   GET). It then prefers one sequential, prefetchable scan over a nested-loop of cold point
+   lookups; picks hash/semi-joins that touch each side's blocks once; and pushes
+   predicates/aggregates/projection down into **block pruning** (zone-maps / min-max +
+   bloom from Stage C's index+filter blocks) so fewer objects are fetched at all. Extends
+   the existing predicate pushdown (B-037). *Depends on:* Stage C metadata.
+
+2. **Async batching I/O scheduler.** A runtime layer between the executor and `BlockStore`
+   that turns a plan's block demands into efficient traffic: **coalesce** adjacent/needed
+   reads into fewer, fatter ranged GETs; issue them **in parallel** up to a fixed in-flight
+   bound; **prefetch** ahead of the scan cursor; and **hedge** (a duplicate GET past a p95
+   deadline, take the first) to cut the S3 tail. A fixed in-flight I/O pool, no per-request
+   allocation (TigerBeetle's fixed grid I/O; Loki chunk prefetch). *Depends on:* Stage B
+   cache + the suspendable row-source (Stage F).
+
+3. **Block-at-a-time (vectorized) execution.** Operators process a whole fetched block's
+   worth of rows per step, not one row per recursive call — a **push-based, batched**
+   pipeline (Volcano-with-batching / DuckDB / MonetDB-X100), so a block fetched from S3 is
+   consumed as a batch, amortizing per-operator overhead and matching the bandwidth-bound
+   profile. This is the throughput lever, and the specific reason *not* to copy SQLite's
+   row-at-a-time VDBE. An executor refactor of the `sql/query.rs` scan/exec path, done
+   incrementally (vectorize the scan → filter → project hot path first) with the
+   differential suite as the guardrail. *Depends on:* Stage C.
+
+4. **Late materialization.** Fetch and carry only the key + the columns a stage needs;
+   assemble full rows only for the rows that survive filters/joins/LIMIT — so cold blocks
+   for unneeded columns are never fetched and full-row decode is paid only for survivors
+   (C-Store/Vertica late materialization; Parquet column projection). Enabled by the
+   **PAX / row-group within-block layout** noted in *Data structures & performance strategy*
+   (columns clustered inside a block, so a projection reads only its columns' sub-ranges).
+   *Depends on:* the PAX block refinement (Stage C) + Pillar 3.
+
+**Milestone.** A selective query over a bucket-resident dataset fetches O(surviving blocks),
+not O(table) — verified by GET counters — and the full differential suite is green in the
+Stage-F forced-spill mode (fidelity unchanged while the whole path is rewired for object
+storage). **Risk:** Pillar 3 is the largest refactor; keep it incremental and diff-gated so
+fidelity never regresses.
+
+### First slice (de-risks the whole plan)
+
+Land **A + a minimal B + the Stage-F forced-spill test harness** together, then run the
+existing differential suite with `memtable_bytes` shrunk to a few MiB and watch data
+page in and out of the bucket through the cache with fidelity intact. If that stays
+green, the architecture is sound and the rest is incremental. Bring up **H**'s virtual
+object store alongside **A**.
+
+### Data structures & performance strategy (why the stages are shaped this way)
+
+A row-oriented database that is *performant on object storage* is, above all, a
+machine for **hiding per-request latency**. Every structural choice below follows
+from the object-storage performance model, and the stages above exist to realize
+them.
+
+**The object-storage performance model (the constraints that dictate everything).**
+Object storage (S3/GCS/Azure Blob) inverts the assumptions a local-disk engine is
+built on:
+
+- **Per-request latency is high and tail-heavy** — a GET/PUT is ~10–100 ms (p99
+  far worse), versus microseconds for NVMe. Aggregate *throughput* is effectively
+  unlimited; *latency* is the enemy. So the read path must minimize the number of
+  **serial** round-trips and hide the rest behind cache, batching, prefetch, and
+  concurrency.
+- **Objects are immutable** — no in-place update, no append (bar multipart). A
+  write publishes a whole new object. This suits **append-only, content-addressed**
+  structures and an LSM (never update-in-place) perfectly.
+- **Ranged GET** lets a byte range be read out of a large object, so many logical
+  **blocks pack into one object** and are read individually — the escape from
+  "one tiny object per row" (which per-request overhead and rate limits forbid).
+- **Per-request cost and per-prefix rate limits** (money; ~3.5k PUT / 5.5k GET per
+  prefix/s, scaled by spreading keys across prefixes) push toward **fewer, larger
+  objects** and **key-prefix hashing**.
+- **Strong single-key read-after-write and CAS** (`If-Match`/`If-None-Match`) exist
+  now (pos3ql already relies on CAS for the manifest), but **LIST is only
+  eventually consistent** — so the design must never depend on LIST for
+  correctness, only address data by content hash reachable from the CAS'd root.
+
+**On-object row layout (Stage C).** Rows are sorted by key and grouped into
+compressed **data blocks** (target ~a few tens to low hundreds of KiB before
+compression), many blocks per SST object. Each SST carries a **sparse index block**
+(first-key of each data block → offset) and a **bloom filter block** (skip an SST
+that cannot hold a key). Within a block, LevelDB-style **restart points + prefix
+key compression** shrink keys, and per-block **compression** (lz4/zstd class) trades
+CPU for the bytes/cost that dominate on object storage. A point lookup is then
+**bloom → index → one ranged GET of one data block → decode the row**; a scan
+streams the covering blocks. The sparse index and filters are *small* and stay in
+RAM — you never pay an S3 round-trip to learn *where* data is, only to fetch it.
+
+**The in-RAM root and index (Stages A, D).** The manifest log + superblock (the
+only CAS'd object) names every live SST, its key range, and its level — small
+enough to hold in RAM and shipped to the bucket for bootstrap (Loki's index
+shipping). Query planning consults RAM, never the bucket. Because non-root objects
+are **content-addressed and immutable**, the cache is trivially correct (a block's
+bytes never change under its id) and a stale LIST can never mislead a reader.
+
+**MVCC on immutable objects (Stage F).** Immutability makes multi-version storage
+natural: versions are keyed by `(key, commit_lsn)` and appended, never overwritten;
+a snapshot read at LSN `S` takes the newest version with `commit_lsn ≤ S`; compaction
+drops versions once they fall below the **oldest live snapshot** watermark. This is
+exactly Neon's page-versioning model (below) at row granularity, and it is a real
+change from today's two-version, txid-based, single-writer `RowState`.
+
+**The cache hierarchy is the performance story (Stage B).** p50 latency is set by the
+**cache hit rate**, p99 by the S3 tail:
+
+- **Index + filters: always resident in RAM.** Every query needs them; they are tiny.
+- **RAM block cache** — fixed frames, CLOCK/CLOCK-Pro; optionally two-level (cache
+  *compressed* blocks for capacity, keep a small *decompressed* hot set).
+- **Local NVMe disk cache** — larger warm tier; because every block is re-fetchable
+  from the bucket, an evicted or torn disk-cache block is just a miss, never data loss.
+- **Negative caching** via blooms avoids fetching blocks that cannot contain a key.
+- **Prefetch / read-ahead** turns scan latency into throughput: issue the next N block
+  GETs concurrently.
+- **Hedged requests** tame the S3 tail: if a GET exceeds a p95 deadline, issue a second
+  and take the first to return — a standard, high-leverage object-store latency trick.
+
+**Write path & compaction economics (Stages D, E).** Never PUT per row: buffer in the
+memtable + WAL (**group-commit** fsyncs), then flush a *frozen* memtable to one large
+SST — few, big PUTs (**multipart** for large ones). Compaction shape is an explicit
+economic choice on object storage, where a write is money + latency: **leveled** gives
+low read-amp (good for point lookups) but high write-amp; **tiered/size-tiered** gives
+low write-amp but higher read-amp, which the cache + blooms cushion. pos3ql should start
+**leveled at the lower levels with a tiered top** (RocksDB/Scylla-style hybrid), tune by
+measured read/write-amp, and **spread object keys across hash prefixes** to stay under
+per-prefix rate limits. GC deletes orphaned objects only once unreferenced by any live
+manifest generation *and* below the oldest snapshot (bounded sweeps already exist).
+
+**Closest prior art — borrow deliberately.** **Neon** (Postgres-on-S3) is the most
+directly relevant system: it stores 8 KiB Postgres pages as **LSN-keyed image + delta
+layers** in object storage, served by a pageserver with a local cache — i.e. Postgres
+semantics + LSN-versioned MVCC + object storage + local cache, which is precisely
+Stage F at row rather than page granularity; its **layer-file** design informs the SST
++ version layout, and its pageserver cache informs Stage B. **RocksDB** informs the SST
+format, blooms, and leveled/tiered compaction knobs. **Loki** informs object-storage-native
+chunks, index shipping, the compactor, and the multi-tier chunk cache. **TigerBeetle**
+informs the checksummed block grid, the manifest-log + superblock root, statically-allocated
+caches, and paced allocation-free compaction. pos3ql's job is to compose these under its own
+stricter discipline (static memory, `libc`-only, differential-frozen fidelity, VOPR).
+
+**The row-oriented tradeoff (kept, with one refinement).** Row storage is the right call
+for the OLTP access this engine targets — point lookups and full-row reads fetch one block
+and get the whole row. Its weakness is wide analytical scans (a block carries all columns
+even when a query wants one). The founding decision keeps storage row-oriented; *if* analytical
+scans later matter, the low-risk refinement is a **PAX / row-group layout within a block**
+(rows grouped by key, but columns clustered inside the block, Parquet-row-group style), which
+buys scan/column-projection efficiency and better compression without abandoning the row model
+or the point-lookup path. Full columnar storage is out of scope and not planned.
+
+### Considered and deferred: an SQLite-style bytecode VM
+
+A VDBE-style bytecode VM was weighed and **deferred** — not adopted. SQLite's VM exists
+to separate prepare from execute, give a stable plan representation, and make execution
+step-wise/suspendable; for pos3ql the first two are already handled (arena AST + `sql::prep`),
+and re-expressing the executor as opcodes would mean **re-deriving every operator and
+function's PostgreSQL semantics in bytecode — putting the differential fidelity at
+serious risk** for little gain.
+
+**A bytecode VM would *not* make queries "rearrange more smartly" for object storage.**
+That adaptivity is three separable concerns, and none of them is bytecode: **(1) plan
+choice** — a *storage-aware cost model* that prices request latency, request *count*
+(money + per-prefix rate limits), bandwidth, and cache residency, so the planner prefers
+one sequential prefetchable scan over a nested-loop of cold point lookups, picks
+hash/semi-joins that touch each side's blocks once, and pushes predicates/aggregates/
+projection down to *prune blocks* (zone maps / min-max + bloom); **(2) I/O scheduling** —
+an async scheduler that coalesces, parallelizes, prefetches, and *hedges* block GETs; and
+**(3) block-at-a-time (vectorized) execution** for throughput once bytes are in RAM. A VM
+is merely one substrate for the scheduling slice — and the *wrong* one to copy here, since
+SQLite's VDBE is **row-at-a-time**, a throughput liability an object-store (bandwidth-bound)
+backend must move *away* from, toward the **push-based, batched, async operator pipeline**
+(Volcano-with-batching / DuckDB-style) that delivers all three concerns at a fraction of the
+fidelity risk. The one real execution-side pressure — a slow GET must not block the
+single-threaded reactor once Stage F pages from the bucket — is met by making **only the
+row-source suspendable** (an async cursor that yields while a block is fetched and resumes),
+leaving the tree-walking *expression* evaluator in `eval` untouched, since expressions only
+ever run over already-materialized batches.
+
+Revisit a bytecode layer only for reasons that are *not* object-storage-driven: fine-grained
+step-wise **server-side cursors**, a **persisted/portable compiled-plan cache** across a
+fleet, or a **JIT** to native for CPU-bound execution — none of which the
+storage-aware-planner + async-scheduler + push-based-pipeline approach needs.
+
 ## Deviations from the original plan (deliberate, revisitable)
 
 - **Snapshot checkpoints instead of a leveled LSM.** Each checkpoint uploads
   the full live state per table as one SST and swaps the manifest via
-  compare-and-swap; the working set is bounded by `memtable_bytes`. This gives
+  compare-and-swap; the working set is bounded by `memtable_bytes` (a full
+  memtable fails loudly — flush is not implemented). This gives
   cold-start-from-bucket and bounded read amplification (always 0 extra) at
   the cost of write amplification per checkpoint. Leveled SSTs + block/disk
-  cache become worthwhile when the working set must exceed RAM.
+  cache become worthwhile when the working set must exceed RAM — the path there
+  is the *Object-storage LSM roadmap* above (Stages A–H).
 - **Simple query strings run statement-by-statement without an implicit
   rollback** (see BUGS.md B-001) until real transactions land.
 - **Checkpoint S3 calls are synchronous** in the single-threaded loop: a
@@ -60,7 +454,7 @@ in code or code comments (the "why" goes in commit messages).
 
 ## Verification
 
-- `cargo test` — 236 unit/property tests (memory guard incl. unwind safety,
+- `cargo test` — 275 unit/property tests (memory guard incl. unwind safety,
   differential FixedMap vs std, PCG32/CRC-32C/SHA-256/HMAC/SigV4 official
   vectors, row codec fuzz-by-truncation, WAL corruption/floor/stale-tail,
   engine restart persistence, protocol framing).

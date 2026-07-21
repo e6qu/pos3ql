@@ -5,3 +5,4 @@ __pycache__/
 
 # Runtime data directory (WAL/SSTs/manifest)
 /data/
+index.scip

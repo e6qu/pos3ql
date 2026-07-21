@@ -15,6 +15,8 @@ pub const MAX_LIST: usize = 64;
 pub const MAX_CTES: usize = 16;
 /// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
 pub const MAX_WINDOW_DEFS: usize = 16;
+/// Upper bound on warnings one statement's parse may raise.
+pub const MAX_PARSE_WARNINGS: usize = 8;
 /// Upper bound on the number of grouping sets a single `GROUP BY` may expand to
 /// (after ROLLUP/CUBE expansion and cross-multiplication). Exceeding it is a
 /// loud error, never silent truncation.
@@ -162,6 +164,11 @@ pub struct Parser<'a> {
     /// around a nested one, since a subquery neither sees nor exports them.
     windows: [Option<(&'a str, &'a WindowSpec<'a>)>; MAX_WINDOW_DEFS],
     n_windows: usize,
+    /// Warnings raised while parsing. PostgreSQL reports these before the
+    /// statement's own output, so the engine drains them after each
+    /// `next_stmt` and emits them ahead of executing it.
+    warnings: [StackStr<96>; MAX_PARSE_WARNINGS],
+    n_warnings: usize,
 }
 
 /// Parses a stored view definition (a single SELECT) into a `Select` in the
@@ -221,6 +228,8 @@ impl<'a> Parser<'a> {
             max_param: 0,
             windows: [None; MAX_WINDOW_DEFS],
             n_windows: 0,
+            warnings: [StackStr::new(); MAX_PARSE_WARNINGS],
+            n_warnings: 0,
         })
     }
 
@@ -3148,15 +3157,32 @@ impl<'a> Parser<'a> {
                 }
                 Ok(nums[0] as i32 + 4)
             }
-            // Fractional-second precision, 0..=6. PostgreSQL clamps a larger
-            // value to 6 with a warning; the clamp is matched here (the parser
-            // has no notice channel for the warning's wording).
+            // Fractional-second precision, 0..=6. A larger value is clamped to
+            // 6, and PostgreSQL warns when it does so.
             "timestamp" | "timestamptz" | "time" | "timetz" | "interval" => {
                 if n != 1 {
                     return Err(self.unexpected("precision for this type takes one argument"));
                 }
                 if nums[0] < 0 {
                     return Err(self.unexpected("precision must be between 0 and 6"));
+                }
+                if nums[0] > 6 {
+                    // PostgreSQL names the SQL type, not the alias written:
+                    // `timestamptz(7)` is reported as TIMESTAMP(7) WITH TIME ZONE.
+                    let (sql_name, zoned) = match base {
+                        "timestamp" => ("TIMESTAMP", false),
+                        "timestamptz" => ("TIMESTAMP", true),
+                        "time" => ("TIME", false),
+                        "timetz" => ("TIME", true),
+                        _ => ("INTERVAL", false),
+                    };
+                    self.warn(stack_format!(
+                        96,
+                        "{}({}){} precision reduced to maximum allowed, 6",
+                        sql_name,
+                        nums[0],
+                        if zoned { " WITH TIME ZONE" } else { "" }
+                    ));
                 }
                 Ok(nums[0].min(6) as i32 + 4)
             }
@@ -3257,6 +3283,23 @@ impl<'a> Parser<'a> {
             });
         }
         self.any_ident(what)
+    }
+
+    /// Records a warning for the engine to emit before this statement runs.
+    /// Overflowing the fixed buffer drops the extra warnings rather than
+    /// failing the statement — PostgreSQL still executes it too.
+    fn warn(&mut self, message: StackStr<96>) {
+        if self.n_warnings < MAX_PARSE_WARNINGS {
+            self.warnings[self.n_warnings] = message;
+            self.n_warnings += 1;
+        }
+    }
+
+    /// Takes the warnings raised since the last call, in the order parsed.
+    pub fn take_warnings(&mut self) -> ([StackStr<96>; MAX_PARSE_WARNINGS], usize) {
+        let taken = self.n_warnings;
+        self.n_warnings = 0;
+        (self.warnings, taken)
     }
 
     /// Unquoted or quoted identifier.

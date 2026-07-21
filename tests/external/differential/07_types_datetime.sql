@@ -59,3 +59,13 @@ EXECUTE tmq3(12.345);
 CREATE TABLE tmt (a timestamp(2), b time(1), c interval(0));
 INSERT INTO tmt VALUES ('2024-01-01 00:00:00.126','01:02:03.45','5 minutes 3.6 seconds') RETURNING *;
 DROP TABLE tmt;
+-- fractional-second precision above 6 is clamped, with PostgreSQL's warning
+SELECT '2020-01-01 12:34:56'::timestamp(7);
+SELECT '12:00:00'::time(7);
+SELECT '2020-01-01'::timestamptz(7);
+-- (timetz is not implemented yet — B-092)
+SELECT '1 day'::interval(7);
+SELECT '2020-01-01'::timestamp(7), '12:00'::time(8);
+-- in range: no warning
+SELECT '2020-01-01'::timestamp(6);
+SELECT '2020-01-01'::timestamp(0);

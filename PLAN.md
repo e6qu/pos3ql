@@ -97,11 +97,13 @@ exec/{ddl,infer,row,record}`.
 
 **Detection tooling — established tools, not hand-rolled** (checked against the Rust
 ecosystem rather than reinvented):
-- *Duplicates:* **jscpd** v5 (Rust-tokenizing Rabin-Karp copy-paste detector) —
-  `npx jscpd src --min-lines 25`. The tree is 0.05% duplicated: after unifying the
-  WAL/checkpoint on-disk type-code map into a single `ColType::code`/`from_code`
-  (the two were byte-identical — a single-source-of-truth fix), one clone remains
-  (the number-format loop in `to_char.rs`), tracked for extraction.
+- *Duplicates:* **jscpd** v5 (Rust-tokenizing Rabin-Karp copy-paste detector),
+  gated in CI via `tools/check-dups.sh` against `.jscpd.json` (a ratchet threshold).
+  The tree is ~0.2% duplicated (three ~25–47 line clones, all fidelity-critical hot
+  paths — the INSERT/UPDATE row-fill in `exec.rs`, the grouping-set scan closure in
+  `query.rs`, and the sign/currency match arms in `to_char.rs` — baselined, not yet
+  extracted). A fourth, the byte-identical WAL/checkpoint on-disk type-code map, was
+  unified into a single `ColType::code`/`from_code` (a single-source-of-truth fix).
 - *Dead code:* rustc's own `dead_code` + `#![warn(unreachable_pub)]` are the precise
   long-term path, but are blind to the library's `pub` surface until it is curated
   down to what `main.rs`/tests use (a ~2000-edit `pub → pub(crate)` pass —
@@ -115,10 +117,13 @@ ecosystem rather than reinvented):
   impls, doc-comment references). A candidate is resolved by **wiring it in,
   removing it, or recording why it stays** — never deleted by consumer count alone.
 
-Immediate next steps: gate jscpd in CI on a clone budget; run the dead-code audit
-periodically (its false positives make it a poor hard gate); adjudicate the current
-findings (the `to_char.rs` clone and ~15 unused-`pub` candidates — `is_frozen`,
-`write_signed_headers`, several `storage` methods, …).
+Done so far: jscpd is gated in CI (`tools/check-dups.sh` + `.jscpd.json`), and the
+dead-code audit's 15 candidates were adjudicated — nine genuinely-dead items removed
+(superseded `storage` rollback/drop helpers, `is_frozen`, `FixedMap::contains_key`,
+`Pool::iter_handles`, `Responder::with_render`, `sigv4::write_signed_headers`), the
+rest being tool false positives. Remaining: extract the three baselined clones as
+they're touched, run the dead-code audit periodically (its false positives make it a
+poor hard gate), and split the four monster files incrementally.
 
 ### Stage A — the block grid: a checksummed, content-addressed block store
 

@@ -36,6 +36,16 @@ jobs:
       - name: No-op guard
         run: zsh tools/check-noops.sh
 
+      - name: Set up Node (for the duplicate-code guard)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Copy-paste gate: fails if source duplication exceeds the ratchet in
+      # .jscpd.json. See tools/check-dups.sh.
+      - name: Duplicate-code guard (jscpd)
+        run: sh tools/check-dups.sh
+
       - name: Build
         run: cargo build --all-targets --locked
 

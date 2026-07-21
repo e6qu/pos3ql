@@ -1,0 +1,11 @@
+{
+  "//": "Copy-paste gate (jscpd v5, Rabin-Karp). CI fails if duplication exceeds `threshold` (percent of lines). Ratchet: lower it as clones are removed; never raise it without a reason. Current debt — three ~25-47 line clones, all fidelity-critical hot paths not worth a risky extract yet: src/sql/exec.rs 1891 (INSERT/UPDATE row-fill loop), src/sql/query.rs 9889 (grouping-set scan closure), src/sql/to_char.rs 967 (shared sign/currency/bracket match arms). ~0.2% today; 0.3 leaves headroom for churn while catching a large new copy-paste.",
+  "path": ["src"],
+  "pattern": "**/*.rs",
+  "minLines": 25,
+  "minTokens": 150,
+  "threshold": 0.3,
+  "reporters": ["console"],
+  "absolute": true,
+  "gitignore": true
+}

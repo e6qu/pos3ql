@@ -93,6 +93,23 @@ pub enum ColType {
     Multirange(RangeKind),
 }
 
+/// Base storage codes for the parameterized type families. They must stay far
+/// enough apart that no two families can produce the same code: `Multirange`
+/// once began at 28 and `Array` at 32, which made `bool[]` and `int4[]`
+/// (32, 33) indistinguishable from `tsmultirange` and `tstzmultirange`, and
+/// [`ColType::from_code`] resolved both to the multirange — so a restart
+/// replayed those columns back as the wrong type, losing their values.
+///
+/// The two moved families are rebased clear of *every* code the old layout
+/// could produce (20..=40), so a column written by a build predating this fix
+/// decodes to `None` — a loud failure — instead of silently coming back as a
+/// different type. Codes outside every assigned span decode to `None` too.
+const RANGE_CODE_BASE: u8 = 20;
+const MULTIRANGE_CODE_BASE: u8 = 48;
+const ARRAY_CODE_BASE: u8 = 64;
+/// How many `RangeKind`s there are, i.e. the width of each range family's span.
+const RANGE_KINDS: u8 = 6;
+
 impl ColType {
     /// Maps a SQL type name (already case-folded) to a column type.
     pub fn from_sql_name(name: &str) -> Option<Self> {
@@ -273,11 +290,11 @@ impl ColType {
             Self::Interval => 17,
             Self::Json => 18,
             Self::Jsonb => 19,
-            Self::Range(k) => 20 + k.code(),
+            Self::Range(k) => RANGE_CODE_BASE + k.code(),
             Self::Bit { varying: false } => 26,
             Self::Bit { varying: true } => 27,
-            Self::Multirange(k) => 28 + k.code(),
-            Self::Array(e) => 32 + e.code(),
+            Self::Multirange(k) => MULTIRANGE_CODE_BASE + k.code(),
+            Self::Array(e) => ARRAY_CODE_BASE + e.code(),
         }
     }
 
@@ -305,9 +322,13 @@ impl ColType {
             19 => Self::Jsonb,
             26 => Self::Bit { varying: false },
             27 => Self::Bit { varying: true },
-            c if (20..26).contains(&c) => Self::Range(RangeKind::from_code(c - 20)),
-            c if (28..34).contains(&c) => Self::Multirange(RangeKind::from_code(c - 28)),
-            c if c >= 32 => Self::Array(ArrElem::from_code(c - 32)?),
+            c if (RANGE_CODE_BASE..RANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
+                Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE))
+            }
+            c if (MULTIRANGE_CODE_BASE..MULTIRANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
+                Self::Multirange(RangeKind::from_code(c - MULTIRANGE_CODE_BASE))
+            }
+            c if c >= ARRAY_CODE_BASE => Self::Array(ArrElem::from_code(c - ARRAY_CODE_BASE)?),
             _ => return None,
         })
     }
@@ -787,5 +808,51 @@ mod tests {
         assert_eq!(ColType::from_sql_name("integer"), Some(ColType::Int4));
         assert_eq!(ColType::from_sql_name("float8"), Some(ColType::Float8));
         assert_eq!(ColType::from_sql_name("geometry"), None);
+    }
+}
+
+#[cfg(test)]
+mod code_roundtrip_tests {
+    use super::*;
+
+    /// Every code any `ColType` can produce must decode back to that same type.
+    /// A family whose span overlaps another's silently becomes it — `bool[]`
+    /// once decoded as `tsmultirange` — and these codes are what the WAL and
+    /// the checkpoint store, so the confusion outlives the process.
+    #[test]
+    fn every_coltype_code_roundtrips() {
+        let mut types = vec![
+            ColType::Bool, ColType::Int2, ColType::Int4, ColType::Int8, ColType::Float4,
+            ColType::Float8, ColType::Text, ColType::Varchar, ColType::Bpchar, ColType::Date,
+            ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Interval,
+            ColType::Json, ColType::Jsonb, ColType::Uuid, ColType::Bytea, ColType::Numeric,
+            ColType::Bit { varying: false }, ColType::Bit { varying: true },
+        ];
+        for k in [RangeKind::Int4, RangeKind::Int8, RangeKind::Num, RangeKind::Date, RangeKind::Ts, RangeKind::Tstz] {
+            types.push(ColType::Range(k));
+            types.push(ColType::Multirange(k));
+        }
+        for e in [ArrElem::Bool, ArrElem::Int4, ArrElem::Int8, ArrElem::Float8, ArrElem::Text,
+                  ArrElem::Numeric, ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz] {
+            types.push(ColType::Array(e));
+        }
+        // The layout this replaced could emit any code in 20..=40; a moved
+        // family must not reuse one, or old data decodes as the wrong type
+        // instead of failing.
+        for t in &types {
+            let c = t.code();
+            let moved = matches!(t, ColType::Multirange(_) | ColType::Array(_));
+            assert!(!(moved && (20..=40).contains(&c)), "{t:?} reuses retired code {c}");
+        }
+        // No two types may share a code, and each must decode back to itself.
+        let mut seen: Vec<(u8, ColType)> = Vec::new();
+        for t in types {
+            let c = t.code();
+            assert_eq!(ColType::from_code(c), Some(t), "code {c} does not round-trip for {t:?}");
+            if let Some((_, other)) = seen.iter().find(|(code, _)| *code == c) {
+                panic!("code {c} is produced by both {other:?} and {t:?}");
+            }
+            seen.push((c, t));
+        }
     }
 }

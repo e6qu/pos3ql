@@ -2442,6 +2442,50 @@ fn reorder_qual<'a>(
 /// expressions may still contain subqueries — always uncorrelated here, since
 /// there is no outer row to reference — so they are prepared once and injected
 /// by node identity, exactly as the table path does.
+/// Rewrites a FROM-less SELECT to read from a one-row derived table, so the
+/// scanning path can run it. The virtual row a FROM-less SELECT already has is
+/// spelled out as `(SELECT 1)`; nothing in the select list refers to it.
+fn over_one_row<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let one = arena.alloc(Expr::Int(1)).map_err(|_| arena_full())?;
+    let items = arena
+        .alloc_slice_copy(&[SelectItem::Expr { expression: one, alias: None }])
+        .map_err(|_| arena_full())?;
+    let inner = Select { items, from: None, ..*statement };
+    // The inner select carries only the row; every clause stays outside.
+    let inner = Select {
+        distinct: false,
+        distinct_on: &[],
+        where_clause: None,
+        group_by: &[],
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with: &[],
+        set_body: None,
+        ..inner
+    };
+    let inner = &*arena.alloc(inner).map_err(|_| arena_full())?;
+    let from = FromClause {
+        base: TableRef {
+            schema: None,
+            table: "",
+            alias: Some("?onerow"),
+            subquery: Some(inner),
+            func_args: None,
+            col_alias: None,
+            cte: None,
+            with_ordinality: false,
+        },
+        joins: &[],
+    };
+    Ok(&*arena.alloc(Select { from: Some(from), ..*statement }).map_err(|_| arena_full())?)
+}
+
 pub fn constant_select<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -2452,6 +2496,26 @@ pub fn constant_select<'a>(
 ) -> Outcome {
     if let Err(e) = check_select_constants(statement, arena) {
         return sql_fail(e);
+    }
+    // A window function needs rows to compute over, and this path has no scan
+    // to give it. A FROM-less SELECT is exactly one row, though, so it can be
+    // written as a one-row derived table and handed to the ordinary path —
+    // which already knows about partitions, frames and every window function
+    // there is. Teaching this path any of that would be a second copy.
+    let mut win_probe: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
+    let mut n_win = 0;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && let Err(e) = collect_windows(expression, &mut win_probe, &mut n_win)
+        {
+            return sql_fail(e);
+        }
+    }
+    if n_win > 0 {
+        return match over_one_row(statement, arena) {
+            Ok(wrapped) => select_query(storage, txid, wrapped, arena, params, responder),
+            Err(e) => sql_fail(e),
+        };
     }
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n = match describe_items(statement.items, None, &mut columns) {
@@ -2852,6 +2916,20 @@ pub fn select_into_rows<'a>(
     }
 
     let Some(from) = &statement.from else {
+        // A window function here has nothing to compute over, so the single
+        // virtual row is spelled out as a derived table and the whole query
+        // re-enters through the scanning path (as `constant_select` does).
+        let mut win_probe: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
+        let mut n_win = 0;
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item {
+                collect_windows(expression, &mut win_probe, &mut n_win)?;
+            }
+        }
+        if n_win > 0 {
+            let wrapped = over_one_row(statement, arena)?;
+            return select_into_rows(storage, txid, wrapped, arena, params, outer, emit);
+        }
         // FROM-less: one row (or zero, when WHERE is false), unless a
         // set-returning function in the list expands it to several.
         let subs =

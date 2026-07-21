@@ -50,20 +50,78 @@ fn is_base_prefixed(text: &str) -> bool {
     b.len() > 2 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
 }
 
-pub(crate) fn is_reserved(word: &str) -> bool {
-    matches!(
-        word,
-        "select" | "from" | "where" | "order" | "group" | "having" | "union" | "limit"
-            | "intersect" | "except"
-            | "offset" | "insert" | "update" | "delete" | "create" | "drop" | "table"
-            | "values" | "into" | "set" | "as" | "on" | "join" | "and" | "or" | "not"
-            | "is" | "asc" | "desc" | "case" | "when" | "then" | "else" | "end"
-            | "begin" | "commit" | "rollback" | "primary" | "references"
-            | "default" | "unique" | "check" | "constraint" | "returning"
-            | "distinct" | "between" | "like" | "ilike" | "in" | "left"
-            | "right" | "full" | "inner" | "outer" | "cross" | "using" | "natural"
-            | "window"
-    )
+/// The PostgreSQL keyword categories that constrain where a word may be used
+/// unquoted. The fourth category, plain `unreserved`, behaves exactly like a
+/// non-keyword in both places this matters, so it is deliberately absent —
+/// `None` covers it.
+///
+/// Provenance: `SELECT word, catcode FROM pg_get_keywords()` on PostgreSQL
+/// 18.4 (Homebrew).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keyword {
+    /// `unreserved (cannot be function or type name)` — legal as a column or
+    /// table name, so only identifier quoting cares.
+    ColumnName,
+    /// `reserved (can be function or type name)`.
+    TypeFuncName,
+    /// `reserved`.
+    Reserved,
+}
+
+/// Categorizes `word`, or `None` when it is unreserved or not a keyword at all.
+pub(crate) fn keyword_category(word: &str) -> Option<Keyword> {
+    Some(match word {
+            "between" | "bigint" | "bit" | "boolean" | "char" | "character" | "coalesce" | "dec"
+                | "decimal" | "exists" | "extract" | "float" | "greatest" | "grouping" | "inout"
+                | "int" | "integer" | "interval" | "json" | "json_array" | "json_arrayagg"
+                | "json_exists" | "json_object" | "json_objectagg" | "json_query" | "json_scalar"
+                | "json_serialize" | "json_table" | "json_value" | "least" | "merge_action"
+                | "national" | "nchar" | "none" | "normalize" | "nullif" | "numeric" | "out"
+                | "overlay" | "position" | "precision" | "real" | "row" | "setof" | "smallint"
+                | "substring" | "time" | "timestamp" | "treat" | "trim" | "values" | "varchar"
+                | "xmlattributes" | "xmlconcat" | "xmlelement" | "xmlexists" | "xmlforest"
+                | "xmlnamespaces" | "xmlparse" | "xmlpi" | "xmlroot" | "xmlserialize" | "xmltable" => Keyword::ColumnName,
+            "authorization" | "binary" | "collation" | "concurrently" | "cross"
+                | "current_schema" | "freeze" | "full" | "ilike" | "inner" | "is" | "isnull" | "join"
+                | "left" | "like" | "natural" | "notnull" | "outer" | "overlaps" | "right" | "similar"
+                | "tablesample" | "verbose" => Keyword::TypeFuncName,
+            "all" | "analyse" | "analyze" | "and" | "any" | "array" | "as" | "asc"
+                | "asymmetric" | "both" | "case" | "cast" | "check" | "collate" | "column"
+                | "constraint" | "create" | "current_catalog" | "current_date" | "current_role"
+                | "current_time" | "current_timestamp" | "current_user" | "default" | "deferrable"
+                | "desc" | "distinct" | "do" | "else" | "end" | "except" | "false" | "fetch" | "for"
+                | "foreign" | "from" | "grant" | "group" | "having" | "in" | "initially" | "intersect"
+                | "into" | "lateral" | "leading" | "limit" | "localtime" | "localtimestamp" | "not"
+                | "null" | "offset" | "on" | "only" | "or" | "order" | "placing" | "primary"
+                | "references" | "returning" | "select" | "session_user" | "some" | "symmetric"
+                | "system_user" | "table" | "then" | "to" | "trailing" | "true" | "union" | "unique"
+                | "user" | "using" | "variadic" | "when" | "where" | "window" | "with" => Keyword::Reserved,
+        _ => return None,
+    })
+}
+
+/// Whether `word` is a keyword PostgreSQL refuses in a `ColId` position — a
+/// column name, a table name, or a FROM-item alias. Its two reserved categories
+/// are rejected there; the unreserved ones are accepted — `begin`, `values` and
+/// `set` are all perfectly legal column names.
+pub(crate) fn is_column_name_keyword(word: &str) -> bool {
+    matches!(keyword_category(word), Some(Keyword::TypeFuncName | Keyword::Reserved))
+}
+
+/// Whether `word` is one of PostgreSQL's fully `reserved` keywords — the ones
+/// that can never name anything. Distinct from [`is_column_name_keyword`],
+/// which also rejects the `can be function or type name` category: those may
+/// not name a column, but `left('abc', 2)` and `array[1]` are ordinary
+/// expressions, so an expression position must let them through.
+pub(crate) fn is_reserved_keyword(word: &str) -> bool {
+    matches!(keyword_category(word), Some(Keyword::Reserved))
+}
+
+/// Whether an identifier must be quoted to survive a round trip, mirroring
+/// PostgreSQL's `quote_ident`: any keyword outside the plain unreserved
+/// category would otherwise be reinterpreted.
+pub(crate) fn keyword_needs_quotes(word: &str) -> bool {
+    keyword_category(word).is_some()
 }
 
 #[derive(Debug)]
@@ -623,7 +681,7 @@ impl<'a> Parser<'a> {
             if n == MAX_CTES {
                 return Err(self.limit("WITH list", MAX_CTES));
             }
-            let name = self.any_ident("CTE name")?;
+            let name = self.col_ident("CTE name")?;
             // Optional output-column rename list `name(c1, c2, ...)`.
             let columns = self.column_alias_list()?.unwrap_or(&[]);
             self.expect_ident("as")?;
@@ -835,7 +893,7 @@ impl<'a> Parser<'a> {
             let Tok::Ident(word) = self.peeked else {
                 return Err(self.err_here("subquery in FROM must have an alias"));
             };
-            if is_reserved(word) {
+            if is_column_name_keyword(word) {
                 return Err(self.err_here("subquery in FROM must have an alias"));
             }
             self.advance()?;
@@ -853,9 +911,9 @@ impl<'a> Parser<'a> {
                 with_ordinality: false,
             });
         }
-        let first = self.any_ident("table name")?;
+        let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
-            (Some(first), self.any_ident("table name")?)
+            (Some(first), self.col_ident("table name")?)
         } else {
             (None, first)
         };
@@ -890,9 +948,9 @@ impl<'a> Parser<'a> {
             false
         };
         let alias = if self.eat_ident("as")? {
-            Some(self.any_ident("alias")?)
+            Some(self.col_ident("alias")?)
         } else if let Tok::Ident(word) = self.peeked {
-            if is_reserved(word) {
+            if is_column_name_keyword(word) {
                 None
             } else {
                 self.advance()?;
@@ -934,7 +992,7 @@ impl<'a> Parser<'a> {
             if n == MAX_LIST {
                 return Err(self.limit("column aliases", MAX_LIST));
             }
-            columns[n] = self.any_ident("column alias")?;
+            columns[n] = self.col_ident("column alias")?;
             n += 1;
             if !self.eat_op(",")? {
                 break;
@@ -1021,7 +1079,7 @@ impl<'a> Parser<'a> {
                     if n_cols == cols.len() {
                         return Err(self.limit("USING columns", cols.len()));
                     }
-                    cols[n_cols] = self.any_ident("column name")?;
+                    cols[n_cols] = self.col_ident("column name")?;
                     n_cols += 1;
                     if !self.eat_op(",")? {
                         break;
@@ -1046,20 +1104,20 @@ impl<'a> Parser<'a> {
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         self.expect_ident("table")?;
-        let table = self.any_ident("table name")?;
+        let table = self.col_ident("table name")?;
         let action = if self.eat_ident("rename")? {
             if self.eat_ident("to")? {
-                AlterAction::RenameTable(self.any_ident("new table name")?)
+                AlterAction::RenameTable(self.col_ident("new table name")?)
             } else {
                 self.expect_ident("column")?;
-                let from = self.any_ident("column name")?;
+                let from = self.col_ident("column name")?;
                 self.expect_ident("to")?;
-                let to = self.any_ident("new column name")?;
+                let to = self.col_ident("new column name")?;
                 AlterAction::RenameColumn { from, to }
             }
         } else if self.eat_ident("add")? {
             let _ = self.eat_ident("column")?;
-            let name = self.any_ident("column name")?;
+            let name = self.col_ident("column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
             let mut not_null = false;
             let mut unique = false;
@@ -1089,7 +1147,7 @@ impl<'a> Parser<'a> {
             })
         } else if self.eat_ident("drop")? {
             let _ = self.eat_ident("column")?;
-            AlterAction::DropColumn(self.any_ident("column name")?)
+            AlterAction::DropColumn(self.col_ident("column name")?)
         } else {
             return Err(self.unexpected("expected RENAME, ADD or DROP"));
         };
@@ -1179,9 +1237,9 @@ impl<'a> Parser<'a> {
     /// CREATE [UNIQUE] INDEX name ON table (col, ...) ("create [unique] index"
     /// consumed).
     fn create_index(&mut self, unique: bool) -> Result<Stmt<'a>, ParseError> {
-        let name = self.any_ident("index name")?;
+        let name = self.col_ident("index name")?;
         self.expect_ident("on")?;
-        let table = self.any_ident("table name")?;
+        let table = self.col_ident("table name")?;
         self.expect_op("(")?;
         let mut columns = [""; MAX_LIST];
         let mut n = 0;
@@ -1189,7 +1247,7 @@ impl<'a> Parser<'a> {
             if n == MAX_LIST {
                 return Err(self.limit("index columns", MAX_LIST));
             }
-            columns[n] = self.any_ident("column name")?;
+            columns[n] = self.col_ident("column name")?;
             n += 1;
             if !self.eat_op(",")? {
                 break;
@@ -1202,7 +1260,7 @@ impl<'a> Parser<'a> {
 
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
     fn create_view(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
-        let name = self.any_ident("view name")?;
+        let name = self.col_ident("view name")?;
         self.expect_ident("as")?;
         // Capture the raw SELECT text (re-parsed at query time).
         let start = self.peek_at;
@@ -1247,7 +1305,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.any_ident("table name")?;
+        let name = self.col_ident("table name")?;
         self.expect_op("(")?;
         let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None }; MAX_LIST];
         let mut n = 0;
@@ -1260,7 +1318,7 @@ impl<'a> Parser<'a> {
             // An optional CONSTRAINT <name> prefixes a table- or column-level
             // constraint; it names the following constraint.
             let cons_name = if self.eat_ident("constraint")? {
-                Some(self.any_ident("constraint name")?)
+                Some(self.col_ident("constraint name")?)
             } else {
                 None
             };
@@ -1283,7 +1341,7 @@ impl<'a> Parser<'a> {
             if cons_name.is_some() {
                 return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
             }
-            let col_name = self.any_ident("column name")?;
+            let col_name = self.col_ident("column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
             let mut not_null = false;
             let mut unique = false;
@@ -1292,7 +1350,7 @@ impl<'a> Parser<'a> {
             loop {
                 // Column-level constraints may carry their own CONSTRAINT name.
                 let col_cons_name = if self.eat_ident("constraint")? {
-                    Some(self.any_ident("constraint name")?)
+                    Some(self.col_ident("constraint name")?)
                 } else {
                     None
                 };
@@ -1356,7 +1414,7 @@ impl<'a> Parser<'a> {
             if k == MAX_INDEX_COLS {
                 return Err(self.limit("constraint column list", MAX_INDEX_COLS));
             }
-            columns[k] = self.any_ident("column name")?;
+            columns[k] = self.col_ident("column name")?;
             k += 1;
             if !self.eat_op(",")? {
                 break;
@@ -1405,7 +1463,7 @@ impl<'a> Parser<'a> {
         name: Option<&'a str>,
         columns: &'a [&'a str],
     ) -> Result<TableConstraint<'a>, ParseError> {
-        let parent = self.any_ident("referenced table")?;
+        let parent = self.col_ident("referenced table")?;
         let parent_cols = if self.peeked == Tok::Op("(") {
             self.column_name_list()?
         } else {
@@ -1465,14 +1523,14 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.any_ident("table name")?;
+        let name = self.col_ident("table name")?;
         Ok(Stmt::DropTable(DropTable { name, if_exists }))
     }
 
     fn insert(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
-        let table = self.any_ident("table name")?;
+        let table = self.col_ident("table name")?;
         let mut column_names: [&'a str; MAX_LIST] = [""; MAX_LIST];
         let mut n_cols = 0;
         if self.peeked == Tok::Op("(") {
@@ -1481,7 +1539,7 @@ impl<'a> Parser<'a> {
                 if n_cols == MAX_LIST {
                     return Err(self.limit("column list", MAX_LIST));
                 }
-                column_names[n_cols] = self.any_ident("column name")?;
+                column_names[n_cols] = self.col_ident("column name")?;
                 n_cols += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -1554,7 +1612,7 @@ impl<'a> Parser<'a> {
                 if nt == MAX_LIST {
                     return Err(self.limit("conflict target", MAX_LIST));
                 }
-                target[nt] = self.any_ident("column name")?;
+                target[nt] = self.col_ident("column name")?;
                 nt += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -1575,7 +1633,7 @@ impl<'a> Parser<'a> {
                 if na == MAX_LIST {
                     return Err(self.limit("assignments", MAX_LIST));
                 }
-                let col = self.any_ident("column name")?;
+                let col = self.col_ident("column name")?;
                 self.expect_op("=")?;
                 let value = self.expression(0)?;
                 assigns[na] = (col, value);
@@ -1600,7 +1658,7 @@ impl<'a> Parser<'a> {
 
     fn update(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("update")?;
-        let table = self.any_ident("table name")?;
+        let table = self.col_ident("table name")?;
         self.expect_ident("set")?;
         let dummy: (&'a str, &'a Expr<'a>) = ("", &Expr::Null);
         let mut assignments = [dummy; MAX_LIST];
@@ -1609,7 +1667,7 @@ impl<'a> Parser<'a> {
             if n == MAX_LIST {
                 return Err(self.limit("SET list", MAX_LIST));
             }
-            let col = self.any_ident("column name")?;
+            let col = self.col_ident("column name")?;
             self.expect_op("=")?;
             let value = self.expression(0)?;
             assignments[n] = (col, value);
@@ -1638,7 +1696,7 @@ impl<'a> Parser<'a> {
     fn delete(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("delete")?;
         self.expect_ident("from")?;
-        let table = self.any_ident("table name")?;
+        let table = self.col_ident("table name")?;
         let using = if self.eat_ident("using")? {
             let fc = self.from_clause()?;
             Some(&*self.arena.alloc(fc).map_err(|_| self.err_here("USING too large for SQL arena"))?)
@@ -2182,9 +2240,9 @@ impl<'a> Parser<'a> {
                 self.arena_expr(Expr::Cast { operand, type_name, type_mod })
             }
             Tok::Ident(name) => {
-                if is_reserved(name) {
-                    return Err(self.unexpected("expected an expression"));
-                }
+                // The reserved-word test below runs after the cursor has moved,
+                // so the word's own offset is kept for the error.
+                let name_at = self.peek_at;
                 self.advance()?;
                 // Qualified name: the pg_catalog / information_schema schemas are
                 // transparent (pg_catalog.version() == version()), so a leading
@@ -2228,6 +2286,14 @@ impl<'a> Parser<'a> {
                         .alloc(select)
                         .map_err(|_| self.err_here("statement too large for SQL arena"))?;
                     return self.arena_expr(Expr::ArraySubquery(boxed));
+                }
+                // Every construct this arm recognizes has now had its chance, so a
+                // still-unconsumed reserved word cannot begin an expression —
+                // `ARRAY` is itself reserved, which is why this cannot come
+                // first. A `can be function or type name` keyword may continue:
+                // it is exactly the category PostgreSQL allows to name one.
+                if is_reserved_keyword(name) {
+                    return Err(ParseError { at: name_at, ..self.unexpected("expected an expression") });
                 }
                 if self.peeked == Tok::Op("(") {
                     return self.call(name);
@@ -3112,6 +3178,22 @@ impl<'a> Parser<'a> {
             });
         }
         Ok(())
+    }
+
+    /// [`Self::any_ident`] for a `ColId` position — a column name, a table name,
+    /// or a bare alias. An unquoted keyword PostgreSQL rejects there is a syntax
+    /// error; quoting it (`"select"`) always makes it a plain identifier.
+    fn col_ident(&mut self, what: &str) -> Result<&'a str, ParseError> {
+        if let Tok::Ident(word) = self.peeked
+            && is_column_name_keyword(word)
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "syntax error at or near \"{}\"", word),
+                sqlstate: "42601",
+            });
+        }
+        self.any_ident(what)
     }
 
     /// Unquoted or quoted identifier.

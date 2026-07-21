@@ -1794,8 +1794,10 @@ fn overlaps_end_micros(start: &Datum, end: &Datum) -> Option<i64> {
 }
 
 /// Whether an identifier must be double-quoted to round-trip: it is not a bare
-/// `[a-z_][a-z0-9_]*` token, or it is a reserved keyword (which would otherwise
-/// be reinterpreted).
+/// `[a-z_][a-z0-9_]*` token, or it is a keyword that would otherwise be
+/// reinterpreted. "Keyword" here is PostgreSQL's own test, every category but
+/// plain `unreserved` — `insert` is a keyword yet needs no quotes, while
+/// `between` and `all` do.
 fn ident_needs_quotes(s: &str) -> bool {
     let mut chars = s.chars();
     let valid = match chars.next() {
@@ -1804,7 +1806,7 @@ fn ident_needs_quotes(s: &str) -> bool {
         }
         _ => false,
     };
-    !valid || super::parser::is_reserved(s)
+    !valid || super::parser::keyword_needs_quotes(s)
 }
 
 /// Double-quotes an identifier into the arena, doubling embedded quotes. The

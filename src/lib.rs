@@ -19,6 +19,7 @@ pub mod server;
 pub(crate) mod sim;
 pub mod sql;
 pub(crate) mod storage;
+pub(crate) mod store;
 pub(crate) mod wal;
 pub(crate) mod util;
 pub(crate) mod vsr;

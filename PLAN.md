@@ -117,7 +117,27 @@ ecosystem rather than reinvented):
   impls, doc-comment references). A candidate is resolved by **wiring it in,
   removing it, or recording why it stays** — never deleted by consumer count alone.
 
-Done so far: jscpd is gated in CI (`tools/check-dups.sh` + `.jscpd.json`), and the
+**Stage 0 is done.** The four monster files are split — `query.rs` into
+`query/{scope,scan,cte,setops,aggregate,window,group,plan,materialize,subquery,srf}`,
+`eval.rs` into `eval/{cast,args,pattern,operators,funcs/*}`, `exec.rs` into
+`exec/{ddl,constraints,describe,projected}`, and `sql/mod.rs`'s engine tests into
+`sql/tests.rs` — taking the largest file in the tree from 10787 lines to 2555 and
+leaving the four originals in the same band as the modules extracted from them.
+Every split was diff-gated by the differential, the fuzzer and the tests, and each
+turned up fidelity bugs in the code it moved (B-086 through B-140).
+
+The dead-code path this stage called "precise but blind until the `pub` surface is
+curated down" is now taken: `lib.rs` exported 14 `pub mod` for an API whose only
+consumers are `main.rs` and two integration tests, which made rustc treat the whole
+crate as reachable and disabled `dead_code` everywhere. Seven modules are now
+`pub(crate)`, `#![warn(unreachable_pub)]` keeps the surface from drifting back open,
+and the lint found and removed a genuinely dead accessor. `cargo-workspace-unused-pub`
+is no longer needed as a substitute. Coverage was added alongside it
+(`tools/coverage.sh`, ~78% line across both test layers, gated in CI) — measuring
+only the in-process tests reports 59% and the wire protocol at 6%, because the
+corpora and sqllogictest blocks drive the server binary as a subprocess.
+
+Earlier: jscpd is gated in CI (`tools/check-dups.sh` + `.jscpd.json`), and the
 dead-code audit's 15 candidates were adjudicated — nine genuinely-dead items removed
 (superseded `storage` rollback/drop helpers, `is_frozen`, `FixedMap::contains_key`,
 `Pool::iter_handles`, `Responder::with_render`, `sigv4::write_signed_headers`), the
@@ -140,6 +160,19 @@ terms of blocks, behavior-preserving. **Milestone:** existing checkpoint/cold-st
 round-trip passes with every persisted byte a verified block; a flipped byte fails
 loudly. **Risk:** block size (latency vs. amplification) and object-per-block vs.
 pack-many (S3 request cost) — start object-per-block.
+
+**Started.** `src/store/` holds the block format and the `BlockStore` seam: a
+256 KiB block carrying `checksum | block_type | lsn | len | block_id` and a
+payload, identified by the SHA-256 of that payload. Content-addressing is what
+makes a re-written block the same block, so a retry after an ambiguous failure
+costs nothing and only the root needs CAS. Both a CRC-32C and the identity hash
+are kept — the CRC catches damage cheaply on every read, the hash is what stops a
+bucket returning a *different* valid block from being believed, which the tests
+demonstrate by re-checksumming a substituted payload. Encoding writes into a
+caller's buffer and decoding borrows from one, so a block lives in the pool its
+owner reserved. Remaining for Stage A: the local and object-storage backends
+behind the trait, the free set / ref-map, and re-expressing the current SST
+writer/reader in terms of blocks.
 
 ### Stage B — the tiered read cache (RAM block cache + local disk cache)
 

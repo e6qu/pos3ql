@@ -618,7 +618,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
 /// The type witness for a subquery's single result column, inferred from its
 /// projection expression. Falls back to a text witness on any inference error
 /// (harmless — the real evaluation surfaces genuine errors).
-pub(super) fn subquery_witness(item: &Expr, scope: Option<&QueryScope>) -> Datum<'static> {
+pub(crate) fn subquery_witness(item: &Expr, scope: Option<&QueryScope>) -> Datum<'static> {
     let inferred = match scope {
         Some(s) => crate::sql::exec::infer_type_res(item, &ScopeCols(s)),
         None => crate::sql::exec::infer_type_res(item, &crate::sql::exec::NoCols),

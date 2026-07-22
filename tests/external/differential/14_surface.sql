@@ -147,3 +147,10 @@ SELECT 1::text;
 SELECT (1+1)::text;
 SELECT int4range(1,5)::int4multirange;
 SELECT 'empty'::int4range::int4multirange;
+-- a DROP names the kind of object it could not find, where other lookups say
+-- "relation"
+DROP TABLE nosuchthing;
+DROP VIEW nosuchthing;
+DROP INDEX nosuchthing;
+SELECT * FROM nosuchthing;
+DROP TABLE IF EXISTS nosuchthing;

@@ -296,6 +296,50 @@ fn patch_subquery_column_types<'a>(
     }
 }
 
+/// PostgreSQL has no equality or ordering for `json` — two documents differing
+/// only in whitespace or key order are the same value but not the same text, so
+/// it declines rather than answer by a rule it does not hold to, and offers
+/// canonicalized `jsonb` instead. The `=` operator already declines here; these
+/// three sort and deduplicate by the projected encoding and so never consult
+/// it, which is why each has to be checked where its keys are known rather than
+/// where they are compared.
+fn check_key_types<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let undefined = |ordering: bool| {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify an {} operator for type json",
+            if ordering { "ordering" } else { "equality" }
+        ))
+    };
+    let is_json =
+        |e: &Expr<'a>| matches!(infer_scope_type(e, scope), Ok((super::types::oid::JSON, _)));
+    for key in statement.group_by.iter().chain(statement.distinct_on) {
+        if is_json(key) {
+            return undefined(false);
+        }
+    }
+    for order in statement.order_by {
+        let target = resolve_order_target(order.expression, statement.items, scope, arena)?;
+        if is_json(target) {
+            return undefined(true);
+        }
+    }
+    if statement.distinct {
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item
+                && is_json(expression)
+            {
+                return undefined(false);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `GROUP BY <n>` names the *n*th select-list column, exactly as `ORDER BY <n>`
 /// does. Resolved once, against the scope so a star item expands the same way,
 /// and the resolved expressions replace the ordinals — so grouping, HAVING,
@@ -1024,6 +1068,9 @@ pub fn select_query<'a>(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    if let Err(e) = check_key_types(statement, &scope, arena) {
+        return sql_fail(e);
+    }
 
     // Subqueries first (uncorrelated, evaluated once).
     let mut sub_exprs: [Option<&Expr>; 4 + 2 * super::parser::MAX_LIST] =
@@ -1732,6 +1779,7 @@ pub fn select_into_rows<'a>(
         };
         let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
         let statement = resolve_group_ordinals(statement, &scope, arena)?;
+        check_key_types(statement, &scope, arena)?;
         let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ] = [None; 2 + MAX_PROJ];
         sub_exprs[0] = statement.where_clause;
         sub_exprs[1] = statement.having;

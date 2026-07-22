@@ -987,6 +987,23 @@ fn row_compare<'a>(
     }
 }
 
+/// SQL equality as the membership tests (`IN`, `NOT IN`) need it: three-valued,
+/// returning `None` for unknown. Rows go through [`row_compare`], so a NULL
+/// *inside* a row makes the membership unknown; `compare_datums` alone gives
+/// the total order ORDER BY wants, where a NULL field is just another value.
+pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<bool>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(None);
+    }
+    if let (Datum::Record(a), Datum::Record(b)) = (l, r) {
+        return Ok(match row_compare(BinaryOp::Eq, a, b)? {
+            Datum::Bool(equal) => Some(equal),
+            _ => None,
+        });
+    }
+    Ok(Some(compare_datums(l, r)?.is_eq()))
+}
+
 pub(crate) fn binary<'a>(
     operator: BinaryOp,
     l: Datum<'a>,

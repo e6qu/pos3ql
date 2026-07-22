@@ -39,3 +39,18 @@ SELECT 5 # 3;
 SELECT '{1}'::int[] @> '{1}'::int[];
 SELECT '{1}'::int[] <@ '{1}'::int[];
 SELECT -3 + 1;
+
+-- An undefined operator is reported under the operator the query wrote, and an
+-- array names its element type rather than calling itself "array".
+SELECT true < 1;
+SELECT true = 1;
+SELECT true > 1;
+SELECT true <> 1;
+SELECT ARRAY[1] + 1;
+SELECT ARRAY['a'] + 1;
+SELECT ARRAY[1.5] * 2;
+SELECT ARRAY[1] = 1;
+SELECT '{1}'::int[] = 1;
+SELECT int4range(1,2) = int8range(1,2);
+SELECT ARRAY[1] = ARRAY[1];
+SELECT 1 < 2;

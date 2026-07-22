@@ -2385,6 +2385,7 @@ pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
 
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
+        Datum::Array { element, .. } => element.array_name(),
         Datum::Null => "unknown",
         Datum::Bool(_) => "boolean",
         Datum::Int4(_) => "integer",
@@ -2400,7 +2401,6 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Interval(_) => "interval",
         Datum::Json { jsonb: false, .. } => "json",
         Datum::Json { jsonb: true, .. } => "jsonb",
-        Datum::Array { .. } => "array",
         Datum::Uuid(_) => "uuid",
         Datum::Bytea(_) => "bytea",
         Datum::Range { kind, .. } => kind.name(),

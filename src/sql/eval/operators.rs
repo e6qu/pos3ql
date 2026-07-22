@@ -305,6 +305,20 @@ fn compare_numeric_int(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlE
 }
 
 pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlError> {
+    // ORDER BY, DISTINCT and the aggregates ask for an order, not for a named
+    // operator; `=` is what PostgreSQL reports when one of those meets two
+    // types it has no comparison for.
+    compare_datums_as("=", l, r)
+}
+
+/// [`compare_datums`], reporting an undefined comparison under the operator the
+/// query actually wrote — `true < 1` is `boolean < integer`, not `boolean =
+/// integer`.
+pub(crate) fn compare_datums_as(
+    operator: &str,
+    l: &Datum,
+    r: &Datum,
+) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     let ord = match (l, r) {
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
@@ -385,8 +399,9 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
             if ka != kb {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
-                    "operator does not exist: {} = {}",
+                    "operator does not exist: {} {} {}",
                     ka.name(),
+                    operator,
                     kb.name()
                 ));
             }
@@ -396,8 +411,9 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
             if ka != kb {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
-                    "operator does not exist: {} = {}",
+                    "operator does not exist: {} {} {}",
                     ka.multirange_name(),
+                    operator,
                     kb.multirange_name()
                 ));
             }
@@ -427,8 +443,9 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
                 // "operator does not exist" (42883), not a datatype mismatch.
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
-                    "operator does not exist: {} = {}",
+                    "operator does not exist: {} {} {}",
                     type_name_of(l),
+                    operator,
                     type_name_of(r)
                 ));
             }
@@ -535,7 +552,15 @@ pub(crate) fn compare<'a>(
     }
     let l = if l_unknown { coerce_unknown(l, &r)? } else { l };
     let r = if r_unknown { coerce_unknown(r, &l)? } else { r };
-    let ord = compare_datums(&l, &r)?;
+    let symbol = match operator {
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::Gt => ">",
+        _ => ">=",
+    };
+    let ord = compare_datums_as(symbol, &l, &r)?;
     let out = match operator {
         BinaryOp::Eq => ord.is_eq(),
         BinaryOp::NotEq => ord.is_ne(),

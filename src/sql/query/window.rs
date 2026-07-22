@@ -20,13 +20,20 @@ use crate::sql::types::Datum;
 use crate::storage::Storage;
 use crate::{sql_err, stack_format};
 
+use super::group::row_passes_correlated_where;
 use super::{
     arena_full, collect_grouped_aggs, keys_equal, merge_correlated, project_row,
-    resolve_order_target, rewrite_grouped_expr, row_passes_correlated_where, scan_source, sql_fail,
+    resolve_order_target, rewrite_grouped_expr, scan_source, sql_fail,
     sql_ok, window_row, AggState, GroupedRewrite, Outcome, QueryScope, MAX_AGGS, MAX_JOIN_TABLES,
     MAX_SUBQUERIES, MAX_WINDOWS, MAX_WIN_KEYS,
 };
 
+/// Windows over a grouped query: PostgreSQL evaluates window functions after
+/// GROUP BY / HAVING, over the grouped rows. Rewrites the statement into the
+/// equivalent two-level form — an inner grouped select exposing every
+/// grouping key and aggregate as a named column, and an outer select (window
+/// calls, DISTINCT, ORDER BY, LIMIT) over it as a derived table — so the
+/// existing grouped and window executors compose.
 pub(crate) fn rewrite_grouped_windows<'a>(
     statement: &'a Select<'a>,
     storage: &'a Storage,
@@ -1131,6 +1138,9 @@ pub(crate) fn project_window_rows<'a>(
     Ok((proj_rows, sort_keys))
 }
 
+/// Window-function execution to the wire: projects each row with its window
+/// values computed over the materialized source, applies DISTINCT and ORDER
+/// BY, then pages with LIMIT/OFFSET and emits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn window_select<'a>(
     storage: &'a Storage,

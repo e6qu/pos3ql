@@ -28,7 +28,7 @@ psql:tests/external/sql/errors.sql:17: ERROR:  42883: function nosuchfunc() does
 SELECT 1 +;
 psql:tests/external/sql/errors.sql:18: ERROR:  42601: syntax error: expected an expression
 SELECT count(*), id FROM t_err;
-psql:tests/external/sql/errors.sql:19: ERROR:  42803: column must appear in the GROUP BY clause or be used in an aggregate function
+psql:tests/external/sql/errors.sql:19: ERROR:  42803: column "t_err.id" must appear in the GROUP BY clause or be used in an aggregate function
 DROP TABLE missing_table;
 psql:tests/external/sql/errors.sql:20: ERROR:  42P01: table "missing_table" does not exist
 -- psql sends each ;-separated statement as its own Query message and

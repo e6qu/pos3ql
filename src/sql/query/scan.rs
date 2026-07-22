@@ -15,11 +15,14 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{rowenc, Storage, MAX_COLUMNS};
 
+use super::plan::{
+    conjunct_passes, expr_tables, flatten_and, fold_null, is_error_safe, MAX_CONJUNCTS,
+};
 use super::{
-    arena_full, check_timeout, conjunct_passes, expr_tables, flatten_and, fold_null,
-    is_error_safe, join_order, reorder_qual, simplify_qual, where_passes, QueryScope,
+    arena_full, check_timeout, 
+     join_order, reorder_qual, simplify_qual, where_passes, QueryScope,
     ResolvedColumn,
-    MAX_CONJUNCTS, MAX_JOIN_TABLES,
+     MAX_JOIN_TABLES,
 };
 
 /// One assembled source row: per table, decoded values (empty slice =

@@ -137,6 +137,11 @@ pub(crate) fn finalize_projected_row<'a>(
 /// Materialized rows, their visible width, and any postponed-projection plan.
 type MaterializedSelect<'a> = (&'a [&'a [u8]], usize, Option<PostponedProjection>);
 
+/// The row-producing half of DISTINCT / ORDER BY execution: materialize
+/// projected rows (with hidden ORDER BY key columns), dedupe on the visible
+/// prefix for DISTINCT, and sort by the hidden keys. Returns `(rows, width)`;
+/// the caller pages with LIMIT/OFFSET and emits. Shared by the wire path
+/// (`materialized_select`) and the row-source path (`select_into_rows`).
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn materialized_rows<'a>(
     storage: &'a Storage,

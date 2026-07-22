@@ -340,8 +340,6 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     Ok(total)
 }
 
-/// Parses a `time` value (`HH:MM[:SS[.ffffff]]`) into microseconds since
-/// midnight. A trailing zone is ignored (we model `time`, not `timetz`).
 /// Parses a time of day, returning the microseconds since midnight and the
 /// zone offset (seconds east) when the text carried one. Both `time` and
 /// `timetz` come through here: PostgreSQL accepts a zone on either and simply

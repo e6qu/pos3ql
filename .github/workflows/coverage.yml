@@ -33,4 +33,5 @@ jobs:
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
+          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
         run: sh tools/coverage.sh

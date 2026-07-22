@@ -19,11 +19,14 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Install PostgreSQL 18 (the differential oracle)
+      # The suites are zsh scripts (`#!/bin/zsh`), which the Linux runner does
+      # not have by default; the differential workflow reaches them through a
+      # bash-compatible CI wrapper instead and so never needed it.
+      - name: Install PostgreSQL 18 (the differential oracle) and zsh
         run: |
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo apt-get update && sudo apt-get install -y postgresql-18
+          sudo apt-get update && sudo apt-get install -y postgresql-18 zsh
       - name: Python venv for the sqllogictest replay
         run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary
       - name: Measure

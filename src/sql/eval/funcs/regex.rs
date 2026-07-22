@@ -41,7 +41,7 @@ pub(crate) fn dispatch<'a>(
             | "regexp_substr"
             | "regexp_like"
             | "regexp_split_to_array"
-            | "similar_to"
+            | crate::sql::parser::SIMILAR_TO
     ) {
         return None;
     }
@@ -231,7 +231,7 @@ pub(crate) fn dispatch<'a>(
                     raw: array::build(&pieces[..n], arena)?,
                 })
             }
-            "similar_to" => {
+            crate::sql::parser::SIMILAR_TO => {
                 // `x SIMILAR TO p`: the SQL regular-expression pattern is translated
                 // to a POSIX regex anchored to the whole string, then matched by the
                 // shared regex engine.

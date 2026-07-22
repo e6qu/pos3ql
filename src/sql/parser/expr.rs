@@ -257,7 +257,7 @@ impl<'a> Parser<'a> {
                         None => self.arena_slice(&[left, pattern])?,
                     };
                     let call = self.arena_expr(Expr::Call {
-                        name: "similar_to",
+                        name: crate::sql::parser::SIMILAR_TO,
                         args,
                         star: false,
                         distinct: false,
@@ -414,11 +414,19 @@ impl<'a> Parser<'a> {
                         let other_end = self.expression(0)?;
                         self.expect_op(")")?;
                         return self.plain_call(
-                            "overlaps",
+                            crate::sql::parser::OVERLAPS_PERIODS,
                             &[items[0], items[1], other_start, other_end],
                         );
                     }
                     base = self.plain_call("row", &items[..n])?;
+                    // A bare row constructor is not a field-access target:
+                    // PostgreSQL's grammar reaches `.field` through a
+                    // parenthesized expression, so `(1,2).f1` is a syntax error
+                    // while `((1,2)).f1` — where the outer parens make it one —
+                    // is the spelling that works.
+                    if self.peeked == Tok::Op(".") {
+                        return Err(self.err_here("syntax error at or near \".\""));
+                    }
                 } else {
                     self.expect_op(")")?;
                 }

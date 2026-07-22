@@ -10,12 +10,32 @@ use crate::sql::types::{Datum, Interval, RangeKind, RecordField};
 use crate::sql::{array, datetime, range};
 use crate::sql_err;
 
+use super::cast_to;
+use crate::sql::types::ColType;
+
 use super::{
     arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
     division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
     jsonb_delete, jsonb_delete_path, like_match, num_factor, overflow, parse_bool, parse_uuid,
     sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits, SqlError,
 };
+
+/// An unknown-type literal facing an array operand takes the array's type, the
+/// way [`coerce_unknown`] gives it the type of a scalar one. It cannot live in
+/// `coerce_unknown` itself: building an array value needs an arena, and the
+/// callers that want an order rather than an operator do not have one.
+fn coerce_unknown_array<'a>(
+    v: Datum<'a>,
+    other: &Datum,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match (v, other) {
+        (Datum::Text(_), Datum::Array { element, .. }) => {
+            cast_to(v, ColType::Array(*element), arena)
+        }
+        _ => Ok(v),
+    }
+}
 
 pub(crate) fn array_set_op<'a>(
     operator: BinaryOp,
@@ -1059,6 +1079,13 @@ pub(crate) fn binary<'a>(
             }
             _ => concat(l, r, l_unknown, r_unknown, arena),
         },
+        Eq | NotEq | Lt | LtEq | Gt | GtEq
+            if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) =>
+        {
+            let l = coerce_unknown_array(l, &r, arena)?;
+            let r = coerce_unknown_array(r, &l, arena)?;
+            compare(operator, l, r, false, false)
+        }
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),
@@ -1094,6 +1121,8 @@ pub(crate) fn binary<'a>(
         Contains | ContainedBy | Overlaps
             if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) =>
         {
+            let l = coerce_unknown_array(l, &r, arena)?;
+            let r = coerce_unknown_array(r, &l, arena)?;
             array_set_op(operator, l, r)
         }
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent

@@ -11,7 +11,7 @@
 //! already ahead of the journal, and restart-and-replay is the only
 //! consistent recovery.
 
-pub mod crc32c;
+pub(crate) mod crc32c;
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -537,7 +537,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
 /// on-disk record header is `crc(4) len(4) lsn(8) kind(1) pad(7)`; callers
 /// pass the slice from the kind byte onward, so the payload begins 8 bytes
 /// in (kind + 7 pad), matching the local journal layout.
-pub fn decode_record(record: &[u8]) -> Option<WalOp<'_>> {
+pub(crate) fn decode_record(record: &[u8]) -> Option<WalOp<'_>> {
     if record.len() < 8 {
         return None;
     }
@@ -750,7 +750,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
     }
 }
 
-pub fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
+pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
     1 + match d {
         None | Some(OwnedDatum::Null) => 0,
         Some(OwnedDatum::Bool(_)) => 1,
@@ -761,17 +761,17 @@ pub fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
     }
 }
 
-pub fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> bool {
+pub(crate) fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> bool {
     let mut scratch = [0u8; MAX_DEFAULT_ENCODED];
     let n = encode_default_bytes(d, &mut scratch);
     buffer.append(&scratch[..n])
 }
 
 /// Largest encoded default: tag + len byte + 48 text bytes.
-pub const MAX_DEFAULT_ENCODED: usize = 7 + crate::storage::MAX_DEFAULT_TEXT;
+pub(crate) const MAX_DEFAULT_ENCODED: usize = 7 + crate::storage::MAX_DEFAULT_TEXT;
 
 /// Stack encoding of a column default; returns the byte count.
-pub fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> usize {
+pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> usize {
     match d {
         None => {
             out[0] = 0;
@@ -820,7 +820,7 @@ pub fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> usize {
 }
 
 /// Also used by the manifest codec.
-pub fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<OwnedDatum>> {
+pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<OwnedDatum>> {
     let tag = *payload.get(*at)?;
     *at += 1;
     Some(match tag {

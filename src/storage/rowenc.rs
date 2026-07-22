@@ -12,9 +12,9 @@ use crate::sql::eval::{sqlstate, SqlError};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
-pub const MAX_COLUMNS: usize = 64;
+pub(crate) const MAX_COLUMNS: usize = 64;
 
-pub fn encoded_len(values: &[Datum]) -> usize {
+pub(crate) fn encoded_len(values: &[Datum]) -> usize {
     let mut n = 2 + values.len().div_ceil(8);
     for v in values {
         n += match v {
@@ -42,7 +42,7 @@ pub fn encoded_len(values: &[Datum]) -> usize {
 }
 
 /// Encodes into `out`, which must be exactly `encoded_len` bytes.
-pub fn encode(values: &[Datum], out: &mut [u8]) {
+pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
     debug_assert_eq!(out.len(), encoded_len(values));
     let n = values.len();
     out[..2].copy_from_slice(&(n as u16).to_le_bytes());
@@ -145,7 +145,7 @@ pub fn encode(values: &[Datum], out: &mut [u8]) {
 
 /// Decodes a row into `out` (at least as many slots as the schema has
 /// columns). Text values borrow from `bytes`.
-pub fn decode<'a>(
+pub(crate) fn decode<'a>(
     bytes: &'a [u8],
     schema: &[ColType],
     out: &mut [Datum<'a>],

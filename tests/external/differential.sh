@@ -62,7 +62,7 @@ if nc -z 127.0.0.1 $P3_PORT 2>/dev/null; then
   exit 1
 fi
 
-./target/release/pos3ql --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 
 for i in {1..50}; do

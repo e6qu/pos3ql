@@ -11,6 +11,13 @@
 //! Everything is logical: virtual time is a tick counter, no wall clock, no
 //! sockets. Randomness is [`crate::prng::Pcg32`], seeded per run.
 
+#![expect(
+    dead_code,
+    reason = "built and unit-tested ahead of the phase that wires it into the \
+              running server; `expect` rather than `allow` so this marker fails \
+              once the code is actually reached"
+)]
+
 use crate::prng::Pcg32;
 use crate::vsr::message::Message;
 use crate::vsr::replica::{Committed, Replica, MAX_REPLICAS};
@@ -28,7 +35,7 @@ struct InFlight {
 }
 
 #[derive(Clone)]
-pub struct SimConfig {
+pub(crate) struct SimConfig {
     pub replicas: usize,
     pub ticks: u64,
     /// Per-mille chance a sent message is dropped.
@@ -65,7 +72,7 @@ impl Default for SimConfig {
 
 /// Outcome of a simulation run.
 #[derive(Debug, Clone)]
-pub struct SimReport {
+pub(crate) struct SimReport {
     pub seed: u64,
     pub committed: u64,
     pub acknowledged: u64,
@@ -428,7 +435,7 @@ impl Sim {
 }
 
 /// Runs one simulation from a seed.
-pub fn run(seed: u64, cfg: SimConfig) -> SimReport {
+pub(crate) fn run(seed: u64, cfg: SimConfig) -> SimReport {
     Sim::new(seed, cfg).run(seed)
 }
 

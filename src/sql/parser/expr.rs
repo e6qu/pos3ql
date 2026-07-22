@@ -438,6 +438,22 @@ impl<'a> Parser<'a> {
                 }
                 Ok(base)
             }
+            // PostgreSQL's prefix arithmetic operators are spelled as the
+            // functions they name, so they parse straight into those calls.
+            Tok::Op("|/") | Tok::Op("||/") | Tok::Op("@") => {
+                let operator = match self.peeked {
+                    Tok::Op("|/") => UnaryOp::SquareRoot,
+                    Tok::Op("||/") => UnaryOp::CubeRoot,
+                    _ => UnaryOp::AbsoluteValue,
+                };
+                self.advance()?;
+                // PostgreSQL puts "any other operator" below binary + - * /,
+                // so `@ -3 + 1` is `@ (-3 + 1)` and `|/ 4 * 2` is `|/ (4 * 2)`
+                // — the operand takes everything that binds tighter than this
+                // level, which is where `||` and the bitwise operators sit too.
+                let operand = self.expression(6)?;
+                self.arena_expr(Expr::Unary { operator, operand })
+            }
             Tok::Op("~") => {
                 self.advance()?;
                 let operand = self.expression(8)?;

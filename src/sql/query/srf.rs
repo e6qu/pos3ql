@@ -11,12 +11,16 @@ use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
 use crate::sql::eval::{eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
 use crate::sql::exec::{describe_items, MAX_PROJ};
+
+/// Pieces one `string_to_table` call may split into.
+const MAX_PIECES: usize = 1024;
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, SqlName, Storage, TableDef, MAX_COLUMNS};
 
 use super::setops::describe_set_body;
 use super::subquery::subquery_witness;
+
 use super::{
     arena_full, describe_scope_items, record_star_width, QueryScope,
 };
@@ -34,6 +38,7 @@ pub(super) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("jsonb_array_elements_text")
         || name.eq_ignore_ascii_case("json_array_elements_text")
         || name.eq_ignore_ascii_case("regexp_split_to_table")
+        || name.eq_ignore_ascii_case("string_to_table")
         || name.eq_ignore_ascii_case("generate_subscripts")
         || is_json_each_name(name)
 }
@@ -259,6 +264,18 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
             false
         };
         Ok(crate::sql::eval::regex_split_pub(src, pat, ci, arena)?.len())
+    } else if name.eq_ignore_ascii_case("string_to_table") {
+        let (src, delimiter) = match (
+            eval_full(args[0], arena, params, row, hooks)?,
+            eval_full(args[1], arena, params, row, hooks)?,
+        ) {
+            (Datum::Text(s), Datum::Text(d)) => (s, Some(d)),
+            // A NULL delimiter splits into characters; a NULL input yields nothing.
+            (Datum::Text(s), Datum::Null) => (s, None),
+            _ => return Ok(0),
+        };
+        let mut pieces: [&str; MAX_PIECES] = [""; MAX_PIECES];
+        Ok(crate::sql::eval::split_pieces(src, delimiter, &mut pieces)?)
     } else if name.eq_ignore_ascii_case("generate_subscripts") {
         let raw = match eval_full(args[0], arena, params, row, hooks)? {
             Datum::Array { raw, .. } => raw,
@@ -419,7 +436,9 @@ pub(super) fn table_func_def<'a>(
     let is_each = is_json_each_name(tref.table);
     let is_rstt = tref.table.eq_ignore_ascii_case("regexp_split_to_table");
     let is_gsub = tref.table.eq_ignore_ascii_case("generate_subscripts");
-    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems && !is_each && !is_rstt && !is_gsub {
+    let is_stt = tref.table.eq_ignore_ascii_case("string_to_table");
+    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems && !is_each && !is_rstt && !is_gsub && !is_stt
+    {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
@@ -430,7 +449,7 @@ pub(super) fn table_func_def<'a>(
         "generate_series"
     } else if is_re {
         "regexp_matches"
-    } else if is_keys || is_elems || is_each || is_rstt || is_gsub {
+    } else if is_keys || is_elems || is_each || is_rstt || is_gsub || is_stt {
         tref.table
     } else {
         "unnest"
@@ -477,7 +496,7 @@ pub(super) fn table_func_def<'a>(
             ColType::Int4
         } else if is_re {
             ColType::Array(crate::sql::types::ArrElem::Text)
-        } else if is_keys || is_rstt {
+        } else if is_keys || is_rstt || is_stt {
             ColType::Text
         } else if is_elems {
             if tref.table.eq_ignore_ascii_case("json_array_elements") {
@@ -575,6 +594,54 @@ pub(super) fn table_func_rows<'a>(
         let rows = arena.alloc_slice_with(pairs.len(), |_| EMPTY).map_err(|_| arena_full())?;
         for (slot, (key, value)) in rows.iter_mut().zip(pairs.iter()) {
             *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key), *value], arena)?;
+        }
+        return Ok(&*rows);
+    }
+    // string_to_table(string, delimiter [, null_string]): one text row per
+    // piece. A NULL delimiter splits into characters and a piece equal to
+    // null_string is NULL, both as `string_to_array` has it — the split rule
+    // itself is shared, so the two cannot drift apart.
+    if tref.table.eq_ignore_ascii_case("string_to_table") {
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function string_to_table(...) with {} arguments does not exist",
+                args.len()
+            ));
+        }
+        let evaluate = |i: usize| {
+            crate::sql::eval::eval(args[i], arena, params, &crate::sql::eval::NoColumns)
+        };
+        let source = match evaluate(0)? {
+            Datum::Text(s) => s,
+            Datum::Null => return Ok(&[]),
+            a => return Err(crate::sql::eval::type_mismatch_pub("string_to_table", &a)),
+        };
+        let delimiter = match evaluate(1)? {
+            Datum::Text(d) => Some(d),
+            Datum::Null => None,
+            a => return Err(crate::sql::eval::type_mismatch_pub("string_to_table", &a)),
+        };
+        let null_string = if args.len() == 3 {
+            match evaluate(2)? {
+                Datum::Text(t) => Some(t),
+                Datum::Null => None,
+                a => return Err(crate::sql::eval::type_mismatch_pub("string_to_table", &a)),
+            }
+        } else {
+            None
+        };
+        let mut pieces: [&str; MAX_PIECES] = [""; MAX_PIECES];
+        let n = crate::sql::eval::split_pieces(source, delimiter, &mut pieces)?;
+        const EMPTY: &[u8] = &[];
+        let rows = arena.alloc_slice_with(n, |_| EMPTY).map_err(|_| arena_full())?;
+        for (slot, piece) in rows.iter_mut().zip(pieces[..n].iter()) {
+            let value = if null_string == Some(*piece) {
+                Datum::Null
+            } else {
+                Datum::Text(piece)
+            };
+            *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
         }
         return Ok(&*rows);
     }

@@ -307,7 +307,7 @@ pub const RECORD_FIELD_NAMES: [&str; 64] = [
 
 /// The value type of `json_each`-family output's `value` column, for callers
 /// outside this module (scope-based record-star expansion).
-pub fn json_each_value_type_pub(name: &str) -> Option<ColType> {
+pub(crate) fn json_each_value_type_pub(name: &str) -> Option<ColType> {
     json_each_value_type(name)
 }
 
@@ -568,6 +568,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
         Expr::Unary { operator, operand } => match operator {
             crate::sql::ast::UnaryOp::Not => of(ColType::Bool),
             crate::sql::ast::UnaryOp::Neg | crate::sql::ast::UnaryOp::BitNot => infer_type_res(operand, columns)?,
+            crate::sql::ast::UnaryOp::SquareRoot | crate::sql::ast::UnaryOp::CubeRoot => {
+                of(ColType::Float8)
+            }
+            crate::sql::ast::UnaryOp::AbsoluteValue => infer_type_res(operand, columns)?,
         },
         Expr::Binary { operator, left, right } => {
             use crate::sql::ast::BinaryOp::*;
@@ -1126,7 +1130,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             // regexp_matches returns each match's capture groups as text[].
             "regexp_matches" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
-            "regexp_split_to_table" => of(ColType::Text),
+            "regexp_split_to_table" | "string_to_table" => of(ColType::Text),
             "generate_subscripts" => of(ColType::Int4),
             "jsonb_object_keys" | "json_object_keys" | "jsonb_array_elements_text"
             | "json_array_elements_text" => of(ColType::Text),

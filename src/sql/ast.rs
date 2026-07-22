@@ -595,6 +595,7 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("json_each_text")
                 || name.eq_ignore_ascii_case("jsonb_each_text")
                 || name.eq_ignore_ascii_case("regexp_split_to_table")
+                || name.eq_ignore_ascii_case("string_to_table")
                 || name.eq_ignore_ascii_case("generate_subscripts")
         }
         match self {
@@ -644,6 +645,25 @@ pub enum UnaryOp {
     Not,
     /// `~` bitwise NOT (integers).
     BitNot,
+    /// PostgreSQL's prefix arithmetic operators `|/`, `||/` and `@`. They are
+    /// operators rather than the functions they compute — a column they produce
+    /// is `?column?`, not `sqrt` — so they are their own nodes and delegate to
+    /// those functions when evaluated.
+    SquareRoot,
+    CubeRoot,
+    AbsoluteValue,
+}
+
+impl UnaryOp {
+    /// The scalar function a prefix arithmetic operator computes.
+    pub fn arithmetic_function(self) -> Option<&'static str> {
+        match self {
+            UnaryOp::SquareRoot => Some("sqrt"),
+            UnaryOp::CubeRoot => Some("cbrt"),
+            UnaryOp::AbsoluteValue => Some("abs"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

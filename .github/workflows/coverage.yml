@@ -1,0 +1,33 @@
+# Line coverage over both test layers. The in-process tests alone report 59%
+# and put the wire protocol at 6%, which measures what is instrumented rather
+# than what is tested: the corpora, the sqllogictest blocks and the psql golden
+# suite all drive the server binary as a subprocess. tools/coverage.sh
+# instruments that binary too, which is what takes the figure to ~78%.
+name: coverage
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install PostgreSQL 18 (the differential oracle)
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update && sudo apt-get install -y postgresql-18
+      - name: Python venv for the sqllogictest replay
+        run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary
+      - name: Measure
+        env:
+          POS3QL_VENV: ${{ github.workspace }}/venv
+          POS3QL_PGBIN: /usr/lib/postgresql/18/bin
+        run: sh tools/coverage.sh

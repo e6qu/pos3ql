@@ -1,5 +1,5 @@
 {
-  "//": "Copy-paste gate (jscpd v5, Rabin-Karp). CI fails if duplication exceeds `threshold` (percent of lines). Ratchet: lower it as clones are removed; never raise it without a reason. Current debt — three ~25-47 line clones, all fidelity-critical hot paths not worth a risky extract yet: src/sql/exec.rs 1891 (INSERT/UPDATE row-fill loop), src/sql/query.rs 9889 (grouping-set scan closure), src/sql/to_char.rs 967 (shared sign/currency/bracket match arms). ~0.2% today; 0.3 leaves headroom for churn while catching a large new copy-paste.",
+  "//": "Copy-paste gate (jscpd v5, Rabin-Karp). CI fails if duplication exceeds `threshold` (percent of lines). Ratchet: lower it as clones are removed; never raise it without a reason. Current debt \u2014 three clones, all fidelity-critical hot paths not worth a risky extract yet: src/sql/exec/mod.rs 1012 vs 1086 (48 lines, INSERT/UPDATE row-fill loop), src/sql/query/materialize.rs 260 vs 313 (35 lines, projected-row build with and without postponement), src/sql/to_char.rs 821 vs 967 (27 lines, shared sign/currency/bracket match arms). ~0.18% today; 0.3 leaves headroom for churn while catching a large new copy-paste. Note minLines 25 is a deliberate floor: below it, repetitive match arms dominate the report.",
   "path": ["src"],
   "pattern": "**/*.rs",
   "minLines": 25,

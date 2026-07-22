@@ -19,7 +19,7 @@ const ENTRY_LEN: usize = 8 + 8 + 4 + 4 + 8; // view, operation, client, request,
 
 /// Largest possible encoded message (a DoViewChange/StartView with a full
 /// log), used to size transport buffers.
-pub const MAX_ENCODED: usize = 4 + 1 + 2 + 8 * 4 + 2 + MAX_LOG * ENTRY_LEN;
+pub(crate) const MAX_ENCODED: usize = 4 + 1 + 2 + 8 * 4 + 2 + MAX_LOG * ENTRY_LEN;
 
 struct Writer<'a> {
     buffer: &'a mut [u8],
@@ -57,7 +57,7 @@ impl<'a> Writer<'a> {
 
 /// Encodes `msg` into `buffer`, returning the number of bytes written, or
 /// `None` if the buffer is too small. `from`/`to` are carried in the frame.
-pub fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
+pub(crate) fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
     if buffer.len() < MAX_ENCODED {
         // Encoders always get a MAX_ENCODED-sized buffer; refuse otherwise
         // rather than risk a partial frame.
@@ -176,7 +176,7 @@ impl<'a> Reader<'a> {
 /// `(message, bytes_consumed)`. Returns `Ok(None)` when more bytes are
 /// needed, and `Err(())` on a malformed frame (the caller drops the peer).
 #[allow(clippy::result_unit_err)]
-pub fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
+pub(crate) fn decode(buffer: &[u8]) -> Result<Option<(Message, usize)>, ()> {
     if buffer.len() < 4 {
         return Ok(None);
     }

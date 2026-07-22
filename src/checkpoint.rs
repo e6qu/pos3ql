@@ -27,7 +27,7 @@ use crate::storage::{ColumnMeta, OwnedDatum, RowLoc, SqlName, Storage, TableDef,
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
 
-pub const MANIFEST_KEY: &str = "manifest";
+pub(crate) const MANIFEST_KEY: &str = "manifest";
 const MANIFEST_HEADER: &str = "pos3ql-manifest-v2";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const SST_MAGIC: u64 = 0x3154_5353_4c51_3350; // "P3QLSST1" little-endian
@@ -48,7 +48,7 @@ struct PrevSst {
     crc: u32,
 }
 
-pub struct Checkpointer {
+pub(crate) struct Checkpointer {
     client: S3Client,
     manifest_buf: FixedBuf,
     manifest_etag: Option<StackStr<80>>,
@@ -74,13 +74,13 @@ const MAX_CKPT_TABLES: usize = 1024;
 const MAX_SWEEP_KEYS: usize = 4096;
 
 impl Checkpointer {
-    pub fn budget_bytes(config: &Config) -> usize {
+    pub(crate) fn budget_bytes(config: &Config) -> usize {
         S3Client::budget_bytes(config) + MANIFEST_BUF_BYTES
     }
 
     /// Fails when S3 is enabled but credentials are missing — explicitly,
     /// at startup.
-    pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
         let mut config = config.clone();
         if config.s3_access_key.is_empty() {
             config.s3_access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
@@ -107,14 +107,10 @@ impl Checkpointer {
         })
     }
 
-    pub fn manifest_lsn(&self) -> u64 {
-        self.manifest_lsn
-    }
-
     /// Uploads a committed WAL batch as a segment keyed by its first LSN,
     /// so a lost-disk cold start can replay everything past the manifest.
     /// Called with the raw journal bytes of one commit.
-    pub fn upload_wal_segment(&mut self, first_lsn: u64, bytes: &[u8]) -> Result<(), SqlError> {
+    pub(crate) fn upload_wal_segment(&mut self, first_lsn: u64, bytes: &[u8]) -> Result<(), SqlError> {
         let key = stack_format!(48, "wal/{:020}.seg", first_lsn);
         self.client
             .put(key.as_str(), bytes, Precondition::None)
@@ -125,7 +121,7 @@ impl Checkpointer {
     /// Downloads and replays WAL segments with a first-LSN strictly greater
     /// than `floor`, in ascending order, feeding each record to `apply`.
     /// Startup only (allocates while listing/parsing).
-    pub fn replay_wal_segments(
+    pub(crate) fn replay_wal_segments(
         &mut self,
         floor: u64,
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
@@ -161,7 +157,7 @@ impl Checkpointer {
 
     /// Deletes uploaded WAL segments whose records are entirely covered by
     /// the current manifest LSN. Called after a checkpoint.
-    pub fn prune_wal_segments(&mut self, up_to_lsn: u64) -> Result<(), SqlError> {
+    pub(crate) fn prune_wal_segments(&mut self, up_to_lsn: u64) -> Result<(), SqlError> {
         // Two passes because list borrows the client: collect keys into
         // pre-reserved scratch (no allocation post-freeze — this runs inside a
         // checkpoint). Keep the highest-keyed doomed segment so one straddling
@@ -205,7 +201,7 @@ impl Checkpointer {
     /// Cold start: loads the manifest (if any) and rehydrates every SST
     /// into storage. Returns the manifest LSN — the WAL replay floor.
     /// Startup only (allocates freely while parsing).
-    pub fn load_into(&mut self, storage: &mut Storage) -> Result<u64, CheckpointSetupError> {
+    pub(crate) fn load_into(&mut self, storage: &mut Storage) -> Result<u64, CheckpointSetupError> {
         match self.client.get(MANIFEST_KEY, None) {
             Ok(r) => {
                 self.manifest_etag = Some(r.etag);
@@ -611,7 +607,7 @@ impl Checkpointer {
 
     /// Uploads a full snapshot and publishes it. The caller resets the WAL
     /// and compacts the heap afterwards. No-op when nothing changed.
-    pub fn checkpoint(
+    pub(crate) fn checkpoint(
         &mut self,
         storage: &Storage,
         sort_scratch: &mut FixedVec<(u64, RowLoc)>,

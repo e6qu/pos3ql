@@ -4,13 +4,13 @@ use super::message::{LogEntry, Message, MessageBody, MAX_LOG};
 use super::{primary_of, quorum, ReplicaId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
+pub(crate) enum Status {
     Normal,
     ViewChange,
 }
 
 /// Bounded outbox filled during a step; the driver flushes it.
-pub struct Outbox {
+pub(crate) struct Outbox {
     msgs: [Message; OUTBOX_CAP],
     len: usize,
 }
@@ -38,7 +38,7 @@ impl Outbox {
         }
     }
 
-    pub fn drain(&mut self) -> impl Iterator<Item = Message> + '_ {
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = Message> + '_ {
         let n = self.len;
         self.len = 0;
         self.msgs[..n].iter().copied()
@@ -47,14 +47,14 @@ impl Outbox {
 
 /// A committed operation delivered to the application, in commit order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Committed {
+pub(crate) struct Committed {
     pub operation: u64,
     pub client: u32,
     pub request: u32,
     pub value: u64,
 }
 
-pub struct Replica {
+pub(crate) struct Replica {
     pub id: ReplicaId,
     pub n: usize,
     pub view: u64,
@@ -92,7 +92,7 @@ pub struct Replica {
     delivered_len: usize,
 }
 
-pub const MAX_REPLICAS: usize = 7;
+pub(crate) const MAX_REPLICAS: usize = 7;
 
 #[derive(Debug, Clone, Copy)]
 struct DvcRecord {
@@ -104,7 +104,7 @@ struct DvcRecord {
 }
 
 impl Replica {
-    pub fn new(id: ReplicaId, n: usize, view_change_timeout: u32) -> Self {
+    pub(crate) fn new(id: ReplicaId, n: usize, view_change_timeout: u32) -> Self {
         assert!((1..=MAX_REPLICAS).contains(&n), "cluster size out of range");
         Self {
             id,
@@ -140,7 +140,7 @@ impl Replica {
     /// log to disk). Only volatile protocol state is lost: quorum votes,
     /// timers, and any un-flushed outbox. The committed prefix and the log
     /// survive, which is exactly the fault model VSR tolerates.
-    pub fn recover(&mut self) {
+    pub(crate) fn recover(&mut self) {
         self.prepare_ok_from = [false; MAX_REPLICAS];
         self.prepare_ok_op = 0;
         self.start_view_change_from = [false; MAX_REPLICAS];
@@ -156,7 +156,7 @@ impl Replica {
         }
     }
 
-    pub fn is_primary(&self) -> bool {
+    pub(crate) fn is_primary(&self) -> bool {
         primary_of(self.view, self.n) == self.id
     }
 
@@ -169,16 +169,16 @@ impl Replica {
         self.view_change_timeout + rank * (self.view_change_timeout / 2 + 1)
     }
 
-    pub fn primary(&self) -> ReplicaId {
+    pub(crate) fn primary(&self) -> ReplicaId {
         primary_of(self.view, self.n)
     }
 
-    pub fn outbox(&mut self) -> &mut Outbox {
+    pub(crate) fn outbox(&mut self) -> &mut Outbox {
         &mut self.outbox
     }
 
     /// Committed ops delivered during the last step, in order.
-    pub fn take_delivered(&mut self) -> impl Iterator<Item = Committed> + '_ {
+    pub(crate) fn take_delivered(&mut self) -> impl Iterator<Item = Committed> + '_ {
         let n = self.delivered_len;
         self.delivered_len = 0;
         self.delivered[..n].iter().copied()
@@ -186,7 +186,7 @@ impl Replica {
 
     /// A client request submitted at the primary. Returns whether it was
     /// accepted (only the Normal-status primary accepts).
-    pub fn on_request(&mut self, client: u32, request: u32, value: u64) -> bool {
+    pub(crate) fn on_request(&mut self, client: u32, request: u32, value: u64) -> bool {
         if self.status != Status::Normal || !self.is_primary() {
             return false;
         }
@@ -229,7 +229,7 @@ impl Replica {
 
     /// A logical clock tick. Backups start a view change if the primary has
     /// gone silent; the primary sends periodic commits as heartbeats.
-    pub fn on_tick(&mut self) {
+    pub(crate) fn on_tick(&mut self) {
         self.idle_ticks += 1;
         if self.is_primary() && self.status == Status::Normal {
             // Heartbeat so backups do not time out.
@@ -277,7 +277,7 @@ impl Replica {
         }
     }
 
-    pub fn on_message(&mut self, m: Message) {
+    pub(crate) fn on_message(&mut self, m: Message) {
         match m.body {
             MessageBody::Prepare {
                 view,

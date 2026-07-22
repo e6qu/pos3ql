@@ -6,11 +6,11 @@ use super::ReplicaId;
 /// Maximum log entries a single DoViewChange/StartView can carry. Bounds
 /// how far a lagging replica may be behind before it needs state transfer
 /// (not modeled here); the simulator keeps within this.
-pub const MAX_LOG: usize = 64;
+pub(crate) const MAX_LOG: usize = 64;
 
 /// One replicated operation: a client request identified for dedup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogEntry {
+pub(crate) struct LogEntry {
     /// The view in which this operation was first prepared (used to pick the most
     /// up-to-date log during view change).
     pub view: u64,
@@ -22,7 +22,7 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    pub const EMPTY: LogEntry = LogEntry {
+    pub(crate) const EMPTY: LogEntry = LogEntry {
         view: 0,
         operation: 0,
         client: 0,
@@ -32,14 +32,14 @@ impl LogEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Message {
+pub(crate) struct Message {
     pub from: ReplicaId,
     pub to: ReplicaId,
     pub body: MessageBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageBody {
+pub(crate) enum MessageBody {
     /// Primary → backups: replicate one operation.
     Prepare {
         view: u64,

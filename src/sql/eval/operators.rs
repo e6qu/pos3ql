@@ -938,6 +938,11 @@ pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Re
             _ => Ok(Datum::Null),
         },
         (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
+        // The prefix arithmetic operators are evaluated through the functions
+        // they compute, so a datum never reaches here wearing one.
+        (UnaryOp::SquareRoot | UnaryOp::CubeRoot | UnaryOp::AbsoluteValue, _) => {
+            unreachable!("prefix arithmetic operators evaluate through their function")
+        }
     }
 }
 

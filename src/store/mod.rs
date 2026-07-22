@@ -25,6 +25,9 @@
 // here would be unfulfilled in the test build and fail it.
 #![allow(dead_code)]
 
+mod memory;
+mod object;
+
 use crate::wal::crc32c::crc32c;
 
 /// Bytes in a block, header included. Large enough that an object-storage GET
@@ -73,7 +76,7 @@ impl BlockType {
 /// A block's name: the SHA-256 of its payload. Two blocks with the same
 /// contents have the same identity by construction, which is what makes a write
 /// idempotent and a retry harmless.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct BlockId(pub(crate) [u8; 32]);
 
 impl BlockId {

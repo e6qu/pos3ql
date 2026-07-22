@@ -170,9 +170,26 @@ are kept — the CRC catches damage cheaply on every read, the hash is what stop
 bucket returning a *different* valid block from being believed, which the tests
 demonstrate by re-checksumming a substituted payload. Encoding writes into a
 caller's buffer and decoding borrows from one, so a block lives in the pool its
-owner reserved. Remaining for Stage A: the local and object-storage backends
-behind the trait, the free set / ref-map, and re-expressing the current SST
-writer/reader in terms of blocks.
+owner reserved.
+
+Both backends now sit behind the trait. `store/object.rs` keeps one object per
+block under a key prefix and writes with no precondition — the key *is* the
+content, so a conditional create would turn a harmless retry into an error a
+caller would have to interpret. It verifies a read against the name it was
+fetched under rather than only against the block's own header, which is the case
+a checksum cannot cover: being handed a different, intact block. `contains`
+fetches the header alone, so asking whether a block exists does not cost what
+reading it would. `store/memory.rs` is the RAM tier and the test double: a
+reserved slab plus a `FixedMap` from identity to extent, where a full store
+raises and keeps everything it holds rather than reclaiming space by dropping a
+block — that distinction between a store and a cache is what tells a caller
+whether it still owes the bucket an upload, and reclaiming belongs to Stage B in
+front of this.
+
+Remaining for Stage A: the free set / ref-map for the local grid, and
+re-expressing the current SST writer/reader in terms of blocks — the half that
+touches working durability code, with the cold-start and durability scenarios in
+`tests/external/run.sh` as the guardrail.
 
 ### Stage B — the tiered read cache (RAM block cache + local disk cache)
 

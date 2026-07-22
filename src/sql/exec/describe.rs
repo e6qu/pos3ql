@@ -222,9 +222,11 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
         Expr::Column { name, .. } => Some(name),
-        // `SIMILAR TO` is an operator in PostgreSQL (an anonymous `?column?`),
-        // though we desugar it to a `similar_to(...)` call internally.
-        Expr::Call { name: "similar_to", .. } => None,
+        // The desugarings of syntax-only constructs must not be labelled with
+        // the internal name they carry: `SIMILAR TO` is an operator, so its
+        // column is anonymous, while PostgreSQL does label OVERLAPS.
+        Expr::Call { name: crate::sql::parser::SIMILAR_TO, .. } => None,
+        Expr::Call { name: crate::sql::parser::OVERLAPS_PERIODS, .. } => Some("overlaps"),
         Expr::Call { name, .. } => Some(name),
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
@@ -1153,7 +1155,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 of(ColType::Text)
             }
             "get_byte" | "get_bit" => of(ColType::Int4),
-            "overlaps" => of(ColType::Bool),
+            crate::sql::parser::OVERLAPS_PERIODS => of(ColType::Bool),
             "bit_count" => of(ColType::Int8),
             "parse_ident" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             // date_bin returns the type of its source timestamp (arg 1).

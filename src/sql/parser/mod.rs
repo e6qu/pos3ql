@@ -10,6 +10,14 @@ use crate::util::StackStr;
 use super::ast::*;
 use super::lexer::{LexError, Lexer, Tok};
 
+/// Names for the calls a desugaring produces, for syntax PostgreSQL does not
+/// also expose as a function. A space cannot appear in an identifier, so a
+/// query cannot reach these by writing them, and the function router will not
+/// answer to `similar_to(...)` or `overlaps(...)` — which PostgreSQL refuses.
+/// Any future desugaring of syntax-only constructs belongs here too.
+pub(crate) const SIMILAR_TO: &str = "similar to";
+pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
+
 pub const MAX_LIST: usize = 64;
 pub const MAX_CTES: usize = 16;
 /// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.

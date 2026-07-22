@@ -92,7 +92,7 @@ pub(crate) fn dispatch<'a>(
             | "justify_hours"
             | "justify_days"
             | "justify_interval"
-            | "overlaps"
+            | crate::sql::parser::OVERLAPS_PERIODS
             | "extract"
             | "date_part"
             | "date_trunc"
@@ -407,7 +407,7 @@ pub(crate) fn dispatch<'a>(
             // overlap, comparing in microseconds. The end of each pair may be an
             // interval (the period's length); pairs are normalized so start <= end.
             // Any NULL endpoint → NULL.
-            "overlaps" => {
+            crate::sql::parser::OVERLAPS_PERIODS => {
                 arity(4)?;
                 let s1 = eval_full(args[0], arena, params, row, hooks)?;
                 let e1 = eval_full(args[1], arena, params, row, hooks)?;

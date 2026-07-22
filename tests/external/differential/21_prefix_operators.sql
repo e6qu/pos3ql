@@ -5,8 +5,12 @@
 
 SELECT |/ 4;
 SELECT |/ 2;
-SELECT ||/ 27;
+-- Cube roots are taken of exact powers of two only. `cbrt(27)` is 3 on macOS
+-- and 3.0000000000000004 on the Linux CI runner -- a difference in
+-- PostgreSQL's own libm, not in either engine, and cbrt (unlike sqrt) is not
+-- required to be correctly rounded.
 SELECT ||/ 8;
+SELECT ||/ 64;
 SELECT @ -3;
 SELECT @ 3.5;
 SELECT @ '-3'::numeric;
@@ -14,7 +18,7 @@ SELECT |/ -1;
 
 -- they agree with the functions they name
 SELECT sqrt(4), |/ 4;
-SELECT cbrt(27), ||/ 27;
+SELECT cbrt(8), ||/ 8;
 SELECT abs(-3), @ -3;
 
 -- precedence: the operand swallows + - * / but not a comparison

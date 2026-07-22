@@ -44,7 +44,8 @@ touch src/lib.rs
 cargo build --release 2>&1 | tail -1
 BIN="$PWD/target/release/pos3ql"
 
-if [ -n "$POS3QL_VENV" ] && [ -x "/opt/homebrew/opt/postgresql@18/bin/pg_ctl" ]; then
+PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
+if [ -n "$POS3QL_VENV" ] && [ -x "$PGBIN/pg_ctl" ]; then
     echo "=== differential suites (server binary) ==="
     # A pipe would mask the suite's exit status, and a suite that aborts (a
     # stale server on the port, say) produces no profile at all -- which shows
@@ -59,8 +60,15 @@ if [ -n "$POS3QL_VENV" ] && [ -x "/opt/homebrew/opt/postgresql@18/bin/pg_ctl" ];
         tail -2 "$TMP/$suite.log"
     done
 else
-    echo "=== differential suites SKIPPED (needs POS3QL_VENV and PostgreSQL 18) ==="
-    echo "    the reported figure will understate coverage substantially"
+    # Skipping is not a lower number, it is a different measurement: without the
+    # suites the figure covers only what runs in-process, and comparing that to
+    # a floor set for both layers fails for a reason that has nothing to do with
+    # coverage. Say so and stop, rather than report a figure that reads as real.
+    echo "=== differential suites SKIPPED ==="
+    echo "    POS3QL_VENV is unset or no pg_ctl at $PGBIN"
+    echo "    (set POS3QL_PGBIN if PostgreSQL 18 lives elsewhere)"
+    echo "SKIP: cannot measure both layers, so the floor does not apply"
+    exit 0
 fi
 
 echo "=== combined report ==="

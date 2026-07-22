@@ -24,7 +24,7 @@ psql:tests/external/sql/errors.sql:15: ERROR:  42704: type "nosuchtype" does not
 SELECT 9223372036854775807 + 1;
 psql:tests/external/sql/errors.sql:16: ERROR:  22003: bigint out of range
 SELECT nosuchfunc(1);
-psql:tests/external/sql/errors.sql:17: ERROR:  42883: function nosuchfunc() does not exist
+psql:tests/external/sql/errors.sql:17: ERROR:  42883: function nosuchfunc(integer) does not exist
 SELECT 1 +;
 psql:tests/external/sql/errors.sql:18: ERROR:  42601: syntax error: expected an expression
 SELECT count(*), id FROM t_err;

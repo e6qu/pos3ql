@@ -191,6 +191,15 @@ pub(crate) fn sql_regex_substring<'a>(
             match chars.next() {
                 Some('"') => {
                     // Group boundary: first opens the capture, second closes it.
+                    // PostgreSQL allows exactly zero or two, and says so rather
+                    // than letting a third reach the regex engine as an
+                    // unbalanced parenthesis.
+                    if captures == 2 {
+                        return Err(sql_err!(
+                            "2200C",
+                            "SQL regular expression may not contain more than two escape-double-quote separators"
+                        ));
+                    }
                     let _ = posix.write_char(if captures == 0 { '(' } else { ')' });
                     captures += 1;
                 }

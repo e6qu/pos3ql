@@ -447,35 +447,8 @@ pub(crate) fn dispatch<'a>(
                     None
                 };
                 let mut items: [Datum; 1024] = [Datum::Null; 1024];
-                let mut n = 0usize;
-                // Collect the split pieces (slices of `s`, so they share its
-                // lifetime); a piece equal to null_string becomes NULL.
                 let mut pieces: [&str; 1024] = [""; 1024];
-                match delim {
-                    Some("") => {
-                        pieces[0] = s;
-                        n = 1;
-                    }
-                    Some(d) if !s.is_empty() => {
-                        for piece in s.split(d) {
-                            if n >= pieces.len() {
-                                return Err(sql_err!("54000", "string_to_array result too large"));
-                            }
-                            pieces[n] = piece;
-                            n += 1;
-                        }
-                    }
-                    Some(_) => {} // empty input yields an empty array
-                    None => {
-                        for (i, c) in s.char_indices() {
-                            if n >= pieces.len() {
-                                return Err(sql_err!("54000", "string_to_array result too large"));
-                            }
-                            pieces[n] = &s[i..i + c.len_utf8()];
-                            n += 1;
-                        }
-                    }
-                }
+                let n = super::super::split_pieces(s, delim, &mut pieces)?;
                 for (k, &piece) in pieces[..n].iter().enumerate() {
                     items[k] = if null_str == Some(piece) {
                         Datum::Null

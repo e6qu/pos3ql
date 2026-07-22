@@ -497,6 +497,11 @@ pub fn eval_full<'a>(
                 n
             )),
         Expr::Unary { operator, operand } => {
+            // The prefix arithmetic operators compute exactly what their
+            // functions do, so they run the same code rather than a second copy.
+            if let Some(function) = operator.arithmetic_function() {
+                return call(function, &[operand], false, arena, params, row, hooks);
+            }
             let v = eval_full(operand, arena, params, row, hooks)?;
             unary(operator, v, arena)
         }
@@ -1222,6 +1227,34 @@ fn call<'a>(
                 .srf_index
                 .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
             Ok(pieces.get(k - 1).copied().unwrap_or(Datum::Null))
+        }
+        // Set-returning `string_to_table(string, delimiter [, null_string])`:
+        // the k-th piece for the current expansion index. The split rule is
+        // shared with `string_to_array`, so the two cannot disagree.
+        "string_to_table" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
+            let Some(source) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            // A NULL delimiter splits into characters rather than yielding NULL.
+            let delimiter = text_arg(name, args, 1, arena, params, row, hooks)?;
+            let null_string = if args.len() == 3 {
+                text_arg(name, args, 2, arena, params, row, hooks)?
+            } else {
+                None
+            };
+            let mut pieces = [""; crate::sql::parser::MAX_LIST * 16];
+            let n = split_pieces(source, delimiter, &mut pieces)?;
+            let k = hooks
+                .srf_index
+                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+            Ok(match pieces[..n].get(k - 1) {
+                Some(piece) if null_string == Some(*piece) => Datum::Null,
+                Some(piece) => Datum::Text(arena.alloc_str(piece).map_err(|_| arena_full())?),
+                None => Datum::Null,
+            })
         }
         // Set-returning `generate_subscripts(array, dim)`: the k-th 1-based index
         // of the array along `dim` (only dimension 1 exists here).
@@ -2352,6 +2385,7 @@ pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
 
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
+        Datum::Array { element, .. } => element.array_name(),
         Datum::Null => "unknown",
         Datum::Bool(_) => "boolean",
         Datum::Int4(_) => "integer",
@@ -2367,7 +2401,6 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Interval(_) => "interval",
         Datum::Json { jsonb: false, .. } => "json",
         Datum::Json { jsonb: true, .. } => "jsonb",
-        Datum::Array { .. } => "array",
         Datum::Uuid(_) => "uuid",
         Datum::Bytea(_) => "bytea",
         Datum::Range { kind, .. } => kind.name(),

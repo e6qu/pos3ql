@@ -233,7 +233,7 @@ impl ColType {
             Self::Interval => "interval",
             Self::Json => "json",
             Self::Jsonb => "jsonb",
-            Self::Array(_) => "array",
+            Self::Array(element) => element.array_name(),
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
             Self::Numeric => "numeric",
@@ -360,6 +360,23 @@ pub enum ArrElem {
 }
 
 impl ArrElem {
+    /// The array type's own name, as PostgreSQL reports it in a message:
+    /// `integer[]`, not `array`. The element's name with `[]` appended, but as
+    /// a static string, since that is what a type name is here.
+    pub fn array_name(self) -> &'static str {
+        match self {
+            ArrElem::Bool => "boolean[]",
+            ArrElem::Int4 => "integer[]",
+            ArrElem::Int8 => "bigint[]",
+            ArrElem::Float8 => "double precision[]",
+            ArrElem::Text => "text[]",
+            ArrElem::Numeric => "numeric[]",
+            ArrElem::Date => "date[]",
+            ArrElem::Timestamp => "timestamp[]",
+            ArrElem::Timestamptz => "timestamp with time zone[]",
+        }
+    }
+
     /// The array element type matching a scalar datum's runtime type.
     pub fn from_datum(d: &Datum) -> Option<ArrElem> {
         Some(match d {

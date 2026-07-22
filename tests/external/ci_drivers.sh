@@ -39,7 +39,7 @@ max_tables = 64
 table_rows = 65536
 memtable_bytes = 256MiB
 EOF
-./target/release/pos3ql --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 for _ in $(seq 1 100); do
   psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break

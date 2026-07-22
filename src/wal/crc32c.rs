@@ -24,7 +24,7 @@ const fn build_table() -> [u32; 256] {
 
 static TABLE: [u32; 256] = build_table();
 
-pub fn crc32c(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in bytes {
         crc = (crc >> 8) ^ TABLE[((crc ^ u32::from(b)) & 0xff) as usize];
@@ -33,20 +33,20 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 }
 
 /// Incremental form for checksumming a record in pieces.
-pub struct Crc32c(u32);
+pub(crate) struct Crc32c(u32);
 
 impl Crc32c {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(!0)
     }
 
-    pub fn update(&mut self, bytes: &[u8]) {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.0 = (self.0 >> 8) ^ TABLE[((self.0 ^ u32::from(b)) & 0xff) as usize];
         }
     }
 
-    pub fn finish(&self) -> u32 {
+    pub(crate) fn finish(&self) -> u32 {
         !self.0
     }
 }

@@ -23,7 +23,7 @@ struct Peer {
     rx: Vec<u8>,
 }
 
-pub struct ClusterNode {
+pub(crate) struct ClusterNode {
     replica: Replica,
     listener: TcpListener,
     peers: Vec<Peer>,
@@ -35,7 +35,7 @@ pub struct ClusterNode {
 impl ClusterNode {
     /// Binds `addrs[id]` and prepares links to the other replicas. Peer
     /// dialing happens lazily in [`Self::poll`].
-    pub fn bind(id: ReplicaId, addrs: &[String], view_change_timeout: u32) -> std::io::Result<Self> {
+    pub(crate) fn bind(id: ReplicaId, addrs: &[String], view_change_timeout: u32) -> std::io::Result<Self> {
         let n = addrs.len();
         let listener = TcpListener::bind(&addrs[id as usize])?;
         listener.set_nonblocking(true)?;
@@ -57,17 +57,17 @@ impl ClusterNode {
         })
     }
 
-    pub fn replica(&mut self) -> &mut Replica {
+    pub(crate) fn replica(&mut self) -> &mut Replica {
         &mut self.replica
     }
 
-    pub fn id(&self) -> ReplicaId {
+    pub(crate) fn id(&self) -> ReplicaId {
         self.replica.id
     }
 
     /// Submits a client write at this node. Returns false if this node is
     /// not the primary (the caller should redirect to `self.replica.primary()`).
-    pub fn submit(&mut self, client: u32, request: u32, value: u64) -> bool {
+    pub(crate) fn submit(&mut self, client: u32, request: u32, value: u64) -> bool {
         let accepted = self.replica.on_request(client, request, value);
         if accepted {
             self.flush_outbox();
@@ -78,7 +78,7 @@ impl ClusterNode {
 
     /// One event-loop step: accept new peer links, dial missing ones, read
     /// and dispatch incoming messages, tick the replica, and flush output.
-    pub fn poll(&mut self) {
+    pub(crate) fn poll(&mut self) {
         self.accept_incoming();
         self.dial_missing();
         self.read_peers();

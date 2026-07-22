@@ -511,3 +511,40 @@ pub(crate) fn alloc_text<'a>(arena: &'a Arena, parts: &[&str], total: usize) -> 
     }
     Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
 }
+
+/// The pieces `string_to_array` and `string_to_table` split a string into.
+/// PostgreSQL gives both the same rule, so it is written once: a NULL delimiter
+/// splits into individual characters, an empty delimiter does not split at all,
+/// an empty input yields nothing, and the caller decides separately what a
+/// piece equal to its `null_string` becomes. Returns how many pieces landed in
+/// `out`, which borrow from `s`.
+pub(crate) fn split_pieces<'a>(
+    s: &'a str,
+    delimiter: Option<&str>,
+    out: &mut [&'a str],
+) -> Result<usize, SqlError> {
+    let mut n = 0usize;
+    let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
+        if *n >= out.len() {
+            return Err(sql_err!("54000", "too many pieces in a split string"));
+        }
+        out[*n] = piece;
+        *n += 1;
+        Ok(())
+    };
+    match delimiter {
+        Some("") => push(s, &mut n)?,
+        Some(d) if !s.is_empty() => {
+            for piece in s.split(d) {
+                push(piece, &mut n)?;
+            }
+        }
+        Some(_) => {} // empty input yields nothing
+        None => {
+            for (i, c) in s.char_indices() {
+                push(&s[i..i + c.len_utf8()], &mut n)?;
+            }
+        }
+    }
+    Ok(n)
+}

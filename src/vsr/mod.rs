@@ -13,24 +13,31 @@
 //! opaque `u64` payloads carrying a client request; the replicated log is
 //! the abstraction the storage engine's WAL sits on in a full deployment.
 
-pub mod cluster;
-pub mod codec;
-pub mod message;
-pub mod replica;
+#![expect(
+    dead_code,
+    reason = "built and unit-tested ahead of the phase that wires it into the \
+              running server; `expect` rather than `allow` so this marker fails \
+              once the code is actually reached"
+)]
 
-pub use message::{Message, MessageBody};
-pub use replica::{Replica, Status};
+pub(crate) mod cluster;
+pub(crate) mod codec;
+pub(crate) mod message;
+pub(crate) mod replica;
+
+pub(crate) use message::Message;
+pub(crate) use replica::{Replica, Status};
 
 /// Replicas in a cluster, 0-indexed.
-pub type ReplicaId = u8;
+pub(crate) type ReplicaId = u8;
 
 /// A cluster of `n` replicas tolerates `f` failures where `n = 2f + 1`.
 /// The commit/view-change quorum is `f + 1`.
-pub fn quorum(n: usize) -> usize {
+pub(crate) fn quorum(n: usize) -> usize {
     n / 2 + 1
 }
 
 /// The primary for a view is `view mod n` (VSR's round-robin rule).
-pub fn primary_of(view: u64, n: usize) -> ReplicaId {
+pub(crate) fn primary_of(view: u64, n: usize) -> ReplicaId {
     (view % n as u64) as ReplicaId
 }

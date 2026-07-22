@@ -136,7 +136,7 @@ pub fn describe_set_query<'a>(
 /// Expands WITH CTEs and view references across a whole set-operation tree
 /// (schema-only: a self-referencing recursive CTE binds its non-recursive
 /// term's shape, as in [`expand_ctes`]).
-pub fn expand_set_tree<'a>(
+pub(super) fn expand_set_tree<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
     storage: &'a Storage,
@@ -153,7 +153,7 @@ pub fn expand_set_tree<'a>(
 
 /// Like [`expand_set_tree`], but for execution: recursive CTEs materialize to
 /// their fixpoint (see [`expand_ctes_exec`]).
-pub fn expand_set_tree_exec<'a>(
+pub(super) fn expand_set_tree_exec<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
     storage: &'a Storage,

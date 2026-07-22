@@ -5,7 +5,7 @@
 //! bytes are reclaimed when the memtable flushes to object storage (later
 //! phase). All capacities are fixed at startup.
 
-pub mod rowenc;
+pub(crate) mod rowenc;
 
 use core::hash::{Hash, Hasher};
 
@@ -18,7 +18,7 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::util::StackStr;
 
-pub use rowenc::MAX_COLUMNS;
+pub(crate) use rowenc::MAX_COLUMNS;
 
 /// An SQL identifier, owned inline. PostgreSQL caps names at 63 bytes
 /// (NAMEDATALEN - 1); so does this.
@@ -81,7 +81,7 @@ pub enum OwnedDatum {
     Numeric { sign: u8, weight: i16, dscale: u16, nbytes: u8, digits: [u8; MAX_DEFAULT_TEXT] },
 }
 
-pub const MAX_DEFAULT_TEXT: usize = 48;
+pub(crate) const MAX_DEFAULT_TEXT: usize = 48;
 
 impl OwnedDatum {
     pub fn from_datum(d: &crate::sql::types::Datum) -> Result<Self, SqlError> {
@@ -208,13 +208,13 @@ impl ColumnMeta {
 }
 
 /// Maximum number of multi-column UNIQUE/PRIMARY KEY constraints per table.
-pub const MAX_UNIQUES: usize = 8;
+pub(crate) const MAX_UNIQUES: usize = 8;
 /// Maximum number of CHECK constraints per table.
-pub const MAX_CHECKS: usize = 8;
+pub(crate) const MAX_CHECKS: usize = 8;
 /// Maximum stored length of a CHECK predicate's source text.
-pub const CHECK_SQL_MAX: usize = 512;
+pub(crate) const CHECK_SQL_MAX: usize = 512;
 /// Maximum number of FOREIGN KEY constraints per table.
-pub const MAX_FKEYS: usize = 8;
+pub(crate) const MAX_FKEYS: usize = 8;
 
 /// A referential action for ON DELETE / ON UPDATE. Mirrors the parser's
 /// `FkAction` so the storage/WAL/checkpoint layers do not depend on the AST.
@@ -529,12 +529,12 @@ impl Table {
 }
 
 /// Maximum length of a stored view definition (the SELECT text).
-pub const VIEW_SQL_MAX: usize = 2048;
+pub(crate) const VIEW_SQL_MAX: usize = 2048;
 
 /// A named view: its output is its stored SELECT text, expanded as a derived
 /// table at query time.
 #[derive(Clone)]
-pub struct ViewDef {
+pub(crate) struct ViewDef {
     pub name: SqlName,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub live: bool,
@@ -546,7 +546,7 @@ pub struct ViewDef {
 
 impl ViewDef {
     /// Whether `txid` sees this view exist.
-    pub fn visible_to(&self, txid: u32) -> bool {
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
         match self.pending {
             Some(p) if p.txid == txid => p.creating,
             _ => self.live,
@@ -555,7 +555,7 @@ impl ViewDef {
 }
 
 /// Maximum columns in an index key.
-pub const MAX_INDEX_COLS: usize = 8;
+pub(crate) const MAX_INDEX_COLS: usize = 8;
 
 /// A named index over a table's columns. Our engine does full scans, so an
 /// index never accelerates a query; it exists as a durable catalog object and,

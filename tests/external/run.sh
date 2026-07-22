@@ -73,7 +73,7 @@ s3_access_key = minioadmin
 s3_secret_key = minioadmin
 wal_upload = on
 EOF
-./target/release/pos3ql --config "$WORK/server.conf" > "$WORK/server.log" 2>&1 &
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
@@ -143,7 +143,7 @@ step "durability: kill -9, restart, data intact"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
-./target/release/pos3ql --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
@@ -174,7 +174,7 @@ step "async WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WA
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-./target/release/pos3ql --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
@@ -187,7 +187,7 @@ step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-./target/release/pos3ql --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break

@@ -17,7 +17,7 @@ use crate::util::StackStr;
 
 use super::super::{
     arena_full, arity_err, byte_to_char_1based, char_index_to_byte, expand_replacement, int_arg,
-    regex_split, regexp_flags, similar_to_posix, sqlstate, text_arg, ColumnLookup, EvalHooks,
+    eval_full, regex_split, regexp_flags, similar_to_posix, sqlstate, text_arg, ColumnLookup, EvalHooks,
     SqlError,
 };
 
@@ -45,8 +45,10 @@ pub(crate) fn dispatch<'a>(
     ) {
         return None;
     }
-    let arity = |n: usize| -> Result<(), SqlError> {
-        if args.len() != n || star {
+    // `f(*)` is not one of these functions whatever its arity, and the arities
+    // that vary do so over a contiguous range.
+    let arity_between = |lo: usize, hi: usize| -> Result<(), SqlError> {
+        if args.len() < lo || args.len() > hi || star {
             Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "function {}(...) with {} arguments does not exist",
@@ -233,15 +235,24 @@ pub(crate) fn dispatch<'a>(
                 // `x SIMILAR TO p`: the SQL regular-expression pattern is translated
                 // to a POSIX regex anchored to the whole string, then matched by the
                 // shared regex engine.
-                arity(2)?;
+                arity_between(2, 3)?;
                 let (Some(text), Some(pattern)) = (
                     text_arg(name, args, 0, arena, params, row, hooks)?,
                     text_arg(name, args, 1, arena, params, row, hooks)?,
                 ) else {
                     return Ok(Datum::Null);
                 };
+                // `ESCAPE c` arrives as a third argument; without it the escape
+                // character is a backslash, as PostgreSQL's default is.
+                let escape = match args.get(2) {
+                    Some(e) => match eval_full(e, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        d => super::super::escape_char(d)?,
+                    },
+                    None => Some('\\'),
+                };
                 let mut posix = StackStr::<256>::new();
-                similar_to_posix(pattern, &mut posix)?;
+                similar_to_posix(pattern, &mut posix, escape)?;
                 Ok(Datum::Bool(regex::regex_search(posix.as_str(), text, false)?))
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),

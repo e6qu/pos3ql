@@ -13,6 +13,14 @@ use super::{is_base_prefixed, is_reserved_keyword, ParseError, Parser, MAX_LIST}
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 
 impl<'a> Parser<'a> {
+    /// The optional `ESCAPE c` trailing a LIKE or SIMILAR TO pattern.
+    fn escape_clause(&mut self) -> Result<Option<&'a Expr<'a>>, ParseError> {
+        if self.eat_ident("escape")? {
+            return Ok(Some(self.expression(5)?));
+        }
+        Ok(None)
+    }
+
     /// Pratt expression parser.
     pub(super) fn expression(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
         let mut left = self.prefix()?;
@@ -227,11 +235,13 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     let pattern = self.expression(5)?;
+                    let escape = self.escape_clause()?;
                     left = self.arena_expr(Expr::Like {
                         operand: left,
                         pattern,
                         negated,
                         case_insensitive: ilike,
+                        escape,
                     })?;
                     continue;
                 }
@@ -241,9 +251,14 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     self.expect_ident("to")?;
                     let pattern = self.expression(5)?;
+                    // The escape character rides along as a third argument.
+                    let args = match self.escape_clause()? {
+                        Some(escape) => self.arena_slice(&[left, pattern, escape])?,
+                        None => self.arena_slice(&[left, pattern])?,
+                    };
                     let call = self.arena_expr(Expr::Call {
                         name: "similar_to",
-                        args: self.arena_slice(&[left, pattern])?,
+                        args,
                         star: false,
                         distinct: false,
                         order_by: &[],

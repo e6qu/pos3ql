@@ -817,11 +817,15 @@ fn rewrite_grouped_expr<'a>(
             high: rewrite(high)?,
             negated: *negated,
         }),
-        Expr::Like { operand, pattern, negated, case_insensitive } => alloc(Expr::Like {
+        Expr::Like { operand, pattern, negated, case_insensitive, escape } => alloc(Expr::Like {
             operand: rewrite(operand)?,
             pattern: rewrite(pattern)?,
             negated: *negated,
             case_insensitive: *case_insensitive,
+            escape: match escape {
+                Some(e) => Some(rewrite(e)?),
+                None => None,
+            },
         }),
         Expr::Match { operand, pattern, negated, case_insensitive } => alloc(Expr::Match {
             operand: rewrite(operand)?,

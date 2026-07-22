@@ -499,6 +499,10 @@ pub enum Expr<'a> {
         pattern: &'a Expr<'a>,
         negated: bool,
         case_insensitive: bool,
+        /// `ESCAPE c`: the character that quotes a literal `%` or `_` in the
+        /// pattern. `None` is PostgreSQL's default of a backslash; an empty
+        /// string disables escaping entirely.
+        escape: Option<&'a Expr<'a>>,
     },
     /// POSIX regex match: `operand ~ pattern` (`!~`, `~*`, `!~*`).
     Match {

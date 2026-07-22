@@ -888,11 +888,12 @@ fn subst_expr<'a>(
             high: subst_expr(high, context, arena)?,
             negated: *negated,
         },
-        Expr::Like { operand, pattern, negated, case_insensitive } => Expr::Like {
+        Expr::Like { operand, pattern, negated, case_insensitive, escape } => Expr::Like {
             operand: subst_expr(operand, context, arena)?,
             pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
             case_insensitive: *case_insensitive,
+            escape: opt_subst(*escape, context, arena)?,
         },
         Expr::Match { operand, pattern, negated, case_insensitive } => Expr::Match {
             operand: subst_expr(operand, context, arena)?,

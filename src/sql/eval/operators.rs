@@ -1081,7 +1081,7 @@ pub(crate) fn binary<'a>(
             }
             let text = cast_to_text(l, arena)?;
             let pattern = cast_to_text(r, arena)?;
-            Ok(Datum::Bool(like_match(text, pattern, operator == ILike)))
+            Ok(Datum::Bool(like_match(text, pattern, operator == ILike, Some('\\'))))
         }
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none

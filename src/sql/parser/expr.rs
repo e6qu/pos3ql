@@ -744,7 +744,10 @@ impl<'a> Parser<'a> {
         // `trim([both|leading|trailing] [chars] FROM str)` desugar to the plain
         // function forms.
         if name.eq_ignore_ascii_case("substring") {
-            let target = self.expression(0)?;
+            // Above the precedence `SIMILAR TO` binds at, so that the SIMILAR
+            // in `substring(x SIMILAR p ESCAPE e)` is this form's keyword
+            // rather than an infix operator applied to the target.
+            let target = self.expression(5)?;
             if self.eat_ident("from")? {
                 let start = self.expression(0)?;
                 let mut cargs = [target, start, target];
@@ -755,6 +758,17 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(")")?;
                 return self.plain_call("substring", &cargs[..cn]);
+            }
+            // `substring(str SIMILAR pattern ESCAPE e)`: SQL:2003's spelling of
+            // the SQL-regular-expression form that `FROM pattern FOR e` already
+            // spells, so it is the same call — the extraction semantics live in
+            // one place rather than being written twice for two syntaxes.
+            if self.eat_ident("similar")? {
+                let pattern = self.expression(0)?;
+                self.expect_ident("escape")?;
+                let escape = self.expression(0)?;
+                self.expect_op(")")?;
+                return self.plain_call("substring", &[target, pattern, escape]);
             }
             // `substring(str FOR len)` — no FROM; PostgreSQL implies FROM 1.
             if self.eat_ident("for")? {

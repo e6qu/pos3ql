@@ -983,6 +983,45 @@ fn unify_arr_elem(a: super::types::ArrElem, b: super::types::ArrElem) -> super::
     }
 }
 
+/// PostgreSQL names the argument types a call was made with, so that the
+/// message says which function was looked for rather than only that one was:
+/// `nosuchfunc(integer)`, not `nosuchfunc()`. The types are the static ones —
+/// an argument is never evaluated to build an error about a function that will
+/// not run — so an untyped literal is `unknown`, exactly as PostgreSQL has it.
+fn undefined_function<'a>(
+    name: &str,
+    args: &[&Expr<'a>],
+    row: &impl ColumnLookup<'a>,
+) -> SqlError {
+    use core::fmt::Write as _;
+    let mut list = StackStr::<256>::new();
+    for (i, argument) in args.iter().enumerate() {
+        if i > 0 {
+            let _ = list.write_str(", ");
+        }
+        // An untyped literal is `unknown` to PostgreSQL however it would later
+        // coerce, and an array constructor names its element type.
+        let named = if is_unknown_literal(argument) {
+            None
+        } else if let Expr::Array(items) = argument {
+            items
+                .first()
+                .and_then(|first| static_type(first, row))
+                .and_then(crate::sql::types::ArrElem::from_coltype)
+                .map(|element| element.array_name())
+        } else {
+            static_type(argument, row).map(ColType::name)
+        };
+        let _ = list.write_str(named.unwrap_or("unknown"));
+    }
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "function {}({}) does not exist",
+        name,
+        list.as_str()
+    )
+}
+
 fn call<'a>(
     name: &str,
     args: &[&Expr<'a>],
@@ -1405,11 +1444,7 @@ fn call<'a>(
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
         }
-        _ => Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "function {}() does not exist",
-            name
-        )),
+        _ => Err(undefined_function(name, args, row)),
     }
 }
 

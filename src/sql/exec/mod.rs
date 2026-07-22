@@ -1119,6 +1119,12 @@ fn fill_auto_increment(
 }
 
 
+/// PostgreSQL names the kind of object a DROP could not find — `table "x" does
+/// not exist`, not `relation` — while every other lookup says relation.
+fn undefined_kind(kind: &str, name: &str) -> SqlError {
+    sql_err!(sqlstate::UNDEFINED_TABLE, "{} \"{}\" does not exist", kind, name)
+}
+
 pub fn drop_table(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -1155,7 +1161,7 @@ pub fn drop_table(
                 stack_format!(128, "table \"{}\" does not exist, skipping", statement.name).as_str(),
             )?;
         }
-        None => return sql_fail(undefined_table(statement.name)),
+        None => return sql_fail(undefined_kind("table", statement.name)),
     }
     responder.command_complete("DROP TABLE")?;
     sql_ok()
@@ -1387,7 +1393,9 @@ pub fn drop_index(
             stack_format!(128, "index \"{}\" does not exist, skipping", name).as_str(),
         )?;
     } else {
-        return sql_fail(sql_err!("42P01", "index \"{}\" does not exist", name));
+        // An index is an object, not a relation, to PostgreSQL's error codes:
+        // a missing one is 42704, where a missing table is 42P01.
+        return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "index \"{}\" does not exist", name));
     }
     responder.command_complete("DROP INDEX")?;
     sql_ok()

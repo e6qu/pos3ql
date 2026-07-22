@@ -933,7 +933,10 @@ pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Re
         (UnaryOp::BitNot, Datum::Int4(x)) => Ok(Datum::Int4(!x)),
         (UnaryOp::BitNot, Datum::Int8(x)) => Ok(Datum::Int8(!x)),
         (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
-        (UnaryOp::Not, other) => Err(type_mismatch("NOT", &other)),
+        (UnaryOp::Not, other) => match super::boolean_argument(other, "NOT")? {
+            Datum::Bool(b) => Ok(Datum::Bool(!b)),
+            _ => Ok(Datum::Null),
+        },
         (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
     }
 }
@@ -1105,7 +1108,10 @@ pub(crate) fn logic<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Resul
         match d {
             Datum::Null => Ok(None),
             Datum::Bool(b) => Ok(Some(*b)),
-            other => Err(type_mismatch("boolean operator", other)),
+            other => match super::boolean_argument(*other, "AND/OR")? {
+                Datum::Bool(b) => Ok(Some(b)),
+                _ => Ok(None),
+            },
         }
     };
     let (a, b) = (as_bool(&l)?, as_bool(&r)?);

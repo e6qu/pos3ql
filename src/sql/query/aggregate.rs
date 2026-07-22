@@ -17,6 +17,8 @@ use crate::storage::Storage;
 
 use super::{arena_full, scan_source, Chained, QueryScope, MAX_AGGS};
 
+/// Streams the source once, folding every aggregate node's state.
+/// Returns per-node result datums in the arena.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_aggregates<'a>(
     storage: &'a Storage,

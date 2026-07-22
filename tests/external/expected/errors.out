@@ -30,7 +30,7 @@ psql:tests/external/sql/errors.sql:18: ERROR:  42601: syntax error: expected an 
 SELECT count(*), id FROM t_err;
 psql:tests/external/sql/errors.sql:19: ERROR:  42803: column must appear in the GROUP BY clause or be used in an aggregate function
 DROP TABLE missing_table;
-psql:tests/external/sql/errors.sql:20: ERROR:  42P01: relation "missing_table" does not exist
+psql:tests/external/sql/errors.sql:20: ERROR:  42P01: table "missing_table" does not exist
 -- psql sends each ;-separated statement as its own Query message and
 -- (with ON_ERROR_STOP off) continues after errors; the wire_probe covers
 -- true multi-statement strings in one message.

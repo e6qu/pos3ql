@@ -20,7 +20,7 @@ pub(crate) use cast::{cast_to_text, parse_bytea, parse_int_literal, parse_uuid, 
 mod operators;
 pub use operators::compare_datums;
 pub(crate) use operators::arithmetic;
-use operators::{binary, coerce_unknown, logic, range_mismatch, unary};
+use operators::{binary, coerce_unknown, logic, membership_eq, range_mismatch, unary};
 
 #[derive(Debug)]
 pub struct SqlError {
@@ -620,8 +620,10 @@ pub fn eval_full<'a>(
                 }
                 let l = coerce_unknown(v, &member)?;
                 let r = coerce_unknown(member, &l)?;
-                if compare_datums(&l, &r)?.is_eq() {
-                    return Ok(Datum::Bool(!negated));
+                match membership_eq(&l, &r)? {
+                    Some(true) => return Ok(Datum::Bool(!negated)),
+                    Some(false) => {}
+                    None => saw_null = true,
                 }
             }
             Ok(if saw_null {
@@ -749,7 +751,7 @@ pub fn eval_full<'a>(
                     break;
                 }
             }
-            let Some((list, saw_null, witness)) = found else {
+            let Some((list, mut saw_null, witness)) = found else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "subqueries are not allowed in this context (or are correlated)"
@@ -786,8 +788,10 @@ pub fn eval_full<'a>(
                 }
                 let l = coerce_unknown(v, member)?;
                 let r = coerce_unknown(*member, &l)?;
-                if compare_datums(&l, &r)?.is_eq() {
-                    return Ok(Datum::Bool(!negated));
+                match membership_eq(&l, &r)? {
+                    Some(true) => return Ok(Datum::Bool(!negated)),
+                    Some(false) => {}
+                    None => saw_null = true,
                 }
             }
             Ok(if saw_null { Datum::Null } else { Datum::Bool(negated) })

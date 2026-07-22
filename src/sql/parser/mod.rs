@@ -628,8 +628,6 @@ impl<'a> Parser<'a> {
         Ok((order_by, limit, offset))
     }
 
-    /// A full SELECT (core + its own ORDER BY / LIMIT / OFFSET) — used for
-    /// subquery bodies, which carry their own trailing clauses.
     /// A subquery body: a set-operation tree of SELECTs, then the trailing
     /// ORDER BY / LIMIT / OFFSET applying to the whole result. A lone SELECT
     /// (no set operator) folds those clauses back into itself; a genuine

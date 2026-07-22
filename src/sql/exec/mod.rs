@@ -3544,9 +3544,6 @@ fn coerce<'a>(v: Datum<'a>, col: &ColumnMeta, arena: &'a Arena) -> Result<Datum<
     apply_typmod(v, col.ctype, col.type_mod, arena)
 }
 
-/// Enforces a PostgreSQL atttypmod on an already-cast value: varchar(n) length
-/// (22001) and numeric(p,s) rounding to scale + precision (22003). Values with
-/// no modifier, and NULLs, pass through unchanged.
 /// Applies a type modifier to an explicit cast result. Differs from column
 /// assignment ([`apply_typmod`]) in one way that matches PostgreSQL: an
 /// over-length `varchar(n)`/`char(n)` cast TRUNCATES rather than erroring.
@@ -3611,6 +3608,9 @@ fn bpchar_fit<'a>(
     Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buffer) }))
 }
 
+/// Enforces a PostgreSQL atttypmod on an already-cast value: varchar(n) length
+/// (22001) and numeric(p,s) rounding to scale + precision (22003). Values with
+/// no modifier, and NULLs, pass through unchanged.
 pub fn apply_typmod<'a>(
     v: Datum<'a>,
     ctype: ColType,

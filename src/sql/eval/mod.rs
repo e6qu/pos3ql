@@ -702,7 +702,10 @@ pub fn eval_full<'a>(
                             }
                         }
                         None => matches!(
-                            eval_full(cond, arena, params, row, hooks)?,
+                            boolean_argument(
+                                eval_full(cond, arena, params, row, hooks)?,
+                                "CASE/WHEN"
+                            )?,
                             Datum::Bool(true)
                         ),
                     };
@@ -2756,23 +2759,30 @@ fn eval_logic_short_circuit<'a>(
     let absorbing = matches!(operator, BinaryOp::Or);
     // Left first: a statically-determined left settles the result (absorbing) or
     // hands offset to the right (non-absorbing), matching plan-time folding order.
+    let context = if absorbing { "OR" } else { "AND" };
+    check_boolean_operand(left, row, context)?;
+    check_boolean_operand(right, row, context)?;
     match fold_check(left, arena)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
-        Some(_) => return eval_full(right, arena, params, row, hooks),
+        Some(_) => {
+            return boolean_argument(eval_full(right, arena, params, row, hooks)?, context)
+        }
         None => {}
     }
     // Left is runtime; if the right statically folds to the absorbing value it
     // settles the result and drops the (possibly-erroring) left.
     match fold_check(right, arena)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
-        Some(_) => return eval_full(left, arena, params, row, hooks),
+        Some(_) => {
+            return boolean_argument(eval_full(left, arena, params, row, hooks)?, context)
+        }
         None => {}
     }
-    let l = eval_full(left, arena, params, row, hooks)?;
+    let l = boolean_argument(eval_full(left, arena, params, row, hooks)?, context)?;
     if matches!(l, Datum::Bool(b) if b == absorbing) {
         return Ok(Datum::Bool(absorbing));
     }
-    let r = eval_full(right, arena, params, row, hooks)?;
+    let r = boolean_argument(eval_full(right, arena, params, row, hooks)?, context)?;
     logic(operator, l, r)
 }
 
@@ -2910,6 +2920,53 @@ fn num_factor(d: &Datum) -> Option<f64> {
         Datum::Float8(x) => Some(*x),
         Datum::Numeric(n) => Some(n.to_f64()),
         _ => None,
+    }
+}
+
+/// The static counterpart of [`boolean_argument`], for an operand a
+/// short-circuit is about to drop. PostgreSQL type-checks both arguments of
+/// AND/OR during parse analysis, so `true OR 1` is refused even though nothing
+/// would evaluate the `1`; only a *runtime* error is what short-circuiting
+/// spares an operand from. An operand whose type is not statically known is
+/// left to the runtime check.
+fn check_boolean_operand<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    context: &str,
+) -> Result<(), SqlError> {
+    match static_type(expression, row) {
+        Some(ColType::Bool) | None => Ok(()),
+        // An unknown-type literal is read as a boolean rather than refused for
+        // its type — and reading it is what reports one that is not a boolean
+        // at all, which PostgreSQL also does before any short-circuit.
+        Some(_) if is_unknown_literal(expression) => match expression {
+            Expr::Str(text) => parse_bool(text).map(|_| ()),
+            _ => Ok(()),
+        },
+        Some(other) => Err(sql_err!(
+            "42804",
+            "argument of {} must be type boolean, not type {}",
+            context,
+            other.name()
+        )),
+    }
+}
+
+/// A value used where SQL requires a boolean — an AND/OR operand, a NOT
+/// operand, a `CASE WHEN` condition. PostgreSQL accepts a boolean, a NULL, and
+/// an unknown-type literal it can read as one (`'yes'`), and refuses every
+/// other type by name rather than treating it as truthy. `context` names the
+/// construct, as PostgreSQL's message does.
+pub(crate) fn boolean_argument<'a>(v: Datum<'a>, context: &str) -> Result<Datum<'a>, SqlError> {
+    match v {
+        Datum::Null | Datum::Bool(_) => Ok(v),
+        Datum::Text(s) => Ok(Datum::Bool(parse_bool(s)?)),
+        other => Err(sql_err!(
+            "42804",
+            "argument of {} must be type boolean, not type {}",
+            context,
+            type_name_of(&other)
+        )),
     }
 }
 

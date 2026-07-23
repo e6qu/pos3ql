@@ -355,16 +355,23 @@ pub(crate) fn scan_source<'a>(
             let mut src = table.rows.iter();
             let ordered = arena
                 .alloc_slice_with(count, |_| loop {
-                    let (_, state) = src.next().expect("visible count is stable");
-                    if let Some(loc) = state.visible_to(txid) {
-                        break loc;
+                    let (&rowid, state) = src.next().expect("visible count is stable");
+                    if let Some(home) = state.visible_to(txid) {
+                        break (rowid, home);
                     }
                 })
                 .map_err(|_| arena_full())?;
-            ordered.sort_unstable_by_key(|l| l.offset);
-            for (this, &loc) in ordered.iter().enumerate() {
+            // Spilled rows sort by rowid (their SST order — the physical order
+            // they were written in); heap rows keep heap-offset order after
+            // them, matching insertion order within each group.
+            ordered.sort_unstable_by_key(|(rowid, home)| match home {
+                crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
+                crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
+            });
+            for (this, &(rowid, home)) in ordered.iter().enumerate() {
                 check_timeout()?;
-                bound[order[depth]] = Some(storage.heap.get(loc));
+                bound[order[depth]] =
+                    Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
                     continue;
                 }
@@ -382,12 +389,13 @@ pub(crate) fn scan_source<'a>(
         } else {
             let table = storage.table(scope.slots[order[depth]]);
             let mut index = 0usize;
-            for (_, state) in table.rows.iter() {
+            for (&rowid, state) in table.rows.iter() {
                 check_timeout()?;
-                let Some(loc) = state.visible_to(txid) else {
+                let Some(home) = state.visible_to(txid) else {
                     continue;
                 };
-                bound[order[depth]] = Some(storage.heap.get(loc));
+                bound[order[depth]] =
+                    Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
                 let this = index;
                 index += 1;
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
@@ -556,13 +564,18 @@ pub(crate) fn scan_source<'a>(
         } else {
             let table = storage.table(scope.slots[d]);
             let mut index = 0usize;
-            for (_, state) in table.rows.iter() {
-                let Some(loc) = state.visible_to(txid) else {
+            for (&rowid, state) in table.rows.iter() {
+                let Some(home) = state.visible_to(txid) else {
                     continue;
                 };
                 let this = index;
                 index += 1;
-                if !m[this].get() && !emit_unmatched(storage.heap.get(loc), f)? {
+                if !m[this].get()
+                    && !emit_unmatched(
+                        storage.row_bytes(scope.slots[d], rowid, home, arena)?,
+                        f,
+                    )?
+                {
                     return Ok(());
                 }
             }

@@ -168,6 +168,12 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
             .filter_map(|slot| slot.as_ref().map(|(k, v)| (k, v)))
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.slots
+            .iter_mut()
+            .filter_map(|slot| slot.as_mut().map(|(k, v)| (&*k, v)))
+    }
+
     pub fn clear(&mut self) {
         self.slots.fill_with(|| None);
         self.len = 0;

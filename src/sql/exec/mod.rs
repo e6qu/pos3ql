@@ -11,7 +11,7 @@ use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
-    ColumnMeta, RowLoc, SqlName, Storage, TableDef, MAX_COLUMNS,
+    ColumnMeta, RowHome, SqlName, Storage, TableDef, MAX_COLUMNS,
 };
 use super::txn::TxnState;
 use crate::storage::rowenc;
@@ -456,30 +456,38 @@ fn find_conflict(
     let table = storage.table(table_index);
     let table_name = def.name.as_str();
     for (&rowid, state) in table.rows.iter() {
-        let Some(loc) = state.visible_to(txid) else {
+        let Some(home) = state.visible_to(txid) else {
             continue;
         };
-        let mut other = [Datum::Null; MAX_COLUMNS];
-        if rowenc::decode(storage.heap.get(loc), schema, &mut other).is_err() {
-            continue;
-        }
-        let eq = |a: &Datum, b: &Datum| {
-            !a.is_null()
-                && !b.is_null()
-                && compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false)
-        };
-        for (i, c) in def.columns().iter().enumerate() {
-            if c.unique && eq(&values[i], &other[i]) {
-                return Some(rowid);
-            }
-        }
-        for index in storage.unique_indexes_for(table_name, txid) {
-            let icols = &index.columns[..index.n_cols];
-            if !icols.iter().any(|&c| values[c as usize].is_null())
-                && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
-            {
-                return Some(rowid);
-            }
+        let hit = storage
+            .with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                if rowenc::decode(bytes, schema, &mut other).is_err() {
+                    return Ok(false);
+                }
+                let eq = |a: &Datum, b: &Datum| {
+                    !a.is_null()
+                        && !b.is_null()
+                        && compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false)
+                };
+                for (i, c) in def.columns().iter().enumerate() {
+                    if c.unique && eq(&values[i], &other[i]) {
+                        return Ok(true);
+                    }
+                }
+                for index in storage.unique_indexes_for(table_name, txid) {
+                    let icols = &index.columns[..index.n_cols];
+                    if !icols.iter().any(|&c| values[c as usize].is_null())
+                        && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .unwrap_or(false);
+        if hit {
+            return Some(rowid);
         }
     }
     None
@@ -549,13 +557,14 @@ fn handle_conflict(
     // DO UPDATE: recompute the conflicting row, `excluded` = the proposed row.
     let new_bytes = {
         let mut existing = [Datum::Null; MAX_COLUMNS];
-        let loc = storage
+        let home = storage
             .table(table_index)
             .rows
             .get(&rowid)
             .and_then(|s| s.visible_to(txn.txid))
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
-        rowenc::decode(storage.heap.get(loc), schema, &mut existing)?;
+        let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
+        rowenc::decode(bytes, schema, &mut existing)?;
         let context = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
         if let Some(cond) = oc.update_where
             && !matches!(eval(cond, arena, params, &context)?, Datum::Bool(true))
@@ -827,25 +836,25 @@ pub fn create_index(
         // rollback drop_index (a mutable borrow) runs after the scan.
         let mut conflict: Option<SqlError> = None;
         for (&rowid, state) in storage.table(table_index).rows.iter() {
-            let Some(loc) = state.committed else { continue };
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) =
-                rowenc::decode(storage.heap.get(loc), &schema[..tdef.n_columns], &mut values)
-            {
-                conflict = Some(e);
-                break;
-            }
-            if let Err(e) = check_unique_indexes(
-                storage,
-                table_index,
-                &tdef,
-                &schema[..tdef.n_columns],
-                &values[..tdef.n_columns],
-                Some(rowid),
-                // The just-registered index is an uncommitted CREATE owned by
-                // this transaction; validation must see it.
-                txn.txid,
-            ) {
+            let Some(home) = state.committed else { continue };
+            // The whole check runs inside the fetch: the decoded values borrow
+            // the fetched bytes, and the re-scan's own fetches nest into the
+            // spill reader's second scratch.
+            if let Err(e) = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
+                check_unique_indexes(
+                    storage,
+                    table_index,
+                    &tdef,
+                    &schema[..tdef.n_columns],
+                    &values[..tdef.n_columns],
+                    Some(rowid),
+                    // The just-registered index is an uncommitted CREATE owned
+                    // by this transaction; validation must see it.
+                    txn.txid,
+                )
+            }) {
                 conflict = Some(e);
                 break;
             }
@@ -1196,7 +1205,7 @@ fn emit_projected(
 pub fn update(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowLoc)>,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     statement: &Update,
     arena: &Arena,
     params: &[Datum],
@@ -1258,12 +1267,16 @@ pub fn update(
 
     let mut updated = 0u64;
     for i in 0..scratch.len() {
-        let (rowid, loc) = scratch[i];
+        let (rowid, home) = scratch[i];
         // Build the new row image in the statement arena so the heap
         // borrow ends before the heap is appended to.
         // An arena-owned copy of the old row bytes: the referential-action
         // pass below needs the old values after storage mutates.
-        let row_bytes = match arena.alloc_slice_copy(storage.heap.get(loc)) {
+        let fetched = match storage.row_bytes(table_index, rowid, home, arena) {
+            Ok(b) => b,
+            Err(e) => return sql_fail(e),
+        };
+        let row_bytes = match arena.alloc_slice_copy(fetched) {
             Ok(b) => &*b,
             Err(_) => {
                 return sql_fail(sql_err!(
@@ -1418,7 +1431,7 @@ pub fn update(
 pub fn delete(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowLoc)>,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     statement: &Delete,
     arena: &Arena,
     params: &[Datum],
@@ -1460,11 +1473,15 @@ pub fn delete(
     }
     let referenced = table_is_referenced(storage, statement.table, txn.txid);
     for i in 0..scratch.len() {
-        let (rowid, old_loc) = scratch[i];
+        let (rowid, old_home) = scratch[i];
         if !statement.returning.is_empty() || referenced {
             // The cascade below mutates storage, so the row image is decoded
             // from an arena-owned copy.
-            let old_copy = match arena.alloc_slice_copy(storage.heap.get(old_loc)) {
+            let fetched = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                Ok(b) => b,
+                Err(e) => return sql_fail(e),
+            };
+            let old_copy = match arena.alloc_slice_copy(fetched) {
                 Ok(c) => c,
                 Err(_) => {
                     return sql_fail(sql_err!(
@@ -1672,7 +1689,7 @@ const MAX_TRUNCATE_TABLES: usize = 16;
 pub fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
-    scratch: &mut FixedVec<(u64, RowLoc)>,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     statement: &AlterTable,
     arena: &Arena,
     responder: &mut Responder,
@@ -1814,15 +1831,17 @@ pub fn alter_table(
     }
     let _ = row_count;
     for i in 0..scratch.len() {
-        let (rowid, old_loc) = scratch[i];
+        let (rowid, old_home) = scratch[i];
         let new_loc = if rewrite {
             // Build the new image in the statement arena so the heap
             // borrow (decoded text refs) ends before the heap append.
             let new_bytes: &[u8] = {
+                let old_bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                    Ok(b) => b,
+                    Err(e) => return sql_fail(e),
+                };
                 let mut values = [Datum::Null; MAX_COLUMNS];
-                if let Err(e) =
-                    rowenc::decode(storage.heap.get(old_loc), old_schema, &mut values)
-                {
+                if let Err(e) = rowenc::decode(old_bytes, old_schema, &mut values) {
                     return sql_fail(e);
                 }
                 let mut out = [Datum::Null; MAX_COLUMNS];
@@ -1859,7 +1878,33 @@ pub fn alter_table(
             slice.copy_from_slice(new_bytes);
             loc
         } else {
-            old_loc
+            match old_home {
+                RowHome::Heap(loc) => loc,
+                RowHome::Spilled { .. } => {
+                    // The ALTER journals a full re-upsert of every row, so a
+                    // spilled row's bytes come back into the heap here; the
+                    // next checkpoint spills them again.
+                    let bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                        Ok(b) => b,
+                        Err(e) => return sql_fail(e),
+                    };
+                    let copied = match arena.alloc_slice_copy(bytes) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return sql_fail(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "ALTER rewrite exceeds the statement arena"
+                            ))
+                        }
+                    };
+                    let (loc, slice) = match storage.heap.append(copied.len()) {
+                        Ok(x) => x,
+                        Err(e) => return sql_fail(e),
+                    };
+                    slice.copy_from_slice(copied);
+                    loc
+                }
+            }
         };
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
@@ -1872,22 +1917,23 @@ pub fn alter_table(
         ) {
             return sql_fail(e);
         }
-        scratch[i] = (rowid, new_loc);
+        scratch[i] = (rowid, RowHome::Heap(new_loc));
     }
 
-    // Phase 2: swap in memory. Nothing below can fail.
+    // Phase 2: swap in memory. Nothing below can fail. Every row now has a
+    // heap image (the rewrite or the spilled-row copy above), so the old
+    // spill SST no longer serves this table.
     storage.set_table_def(table_index, new_def);
-    if rewrite {
-        for i in 0..scratch.len() {
-            let (rowid, new_loc) = scratch[i];
-            let state = storage
-                .table_mut(table_index)
-                .rows
-                .get_mut(&rowid)
-                .expect("row existed in phase 1");
-            state.committed = Some(new_loc);
-        }
+    for i in 0..scratch.len() {
+        let (rowid, new_home) = scratch[i];
+        let state = storage
+            .table_mut(table_index)
+            .rows
+            .get_mut(&rowid)
+            .expect("row existed in phase 1");
+        state.committed = Some(new_home);
     }
+    storage.set_spill_sst(table_index, None);
     responder.command_complete("ALTER TABLE")?;
     sql_ok()
 }
@@ -1986,9 +2032,11 @@ pub fn eval_limit_pub(limit: Option<&Expr>, arena: &Arena, params: &[Datum]) -> 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 fn row_matches<'a>(
     storage: &Storage,
+    table_index: usize,
+    rowid: u64,
     def: &TableDef,
     schema: &[ColType],
-    loc: RowLoc,
+    home: RowHome,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -1998,7 +2046,7 @@ fn row_matches<'a>(
         return Ok(true);
     };
     let mut values = [Datum::Null; MAX_COLUMNS];
-    rowenc::decode(storage.heap.get(loc), schema, &mut values)?;
+    rowenc::decode(storage.row_bytes(table_index, rowid, home, arena)?, schema, &mut values)?;
     let context = RowCtx { def, values: &values[..def.n_columns] };
     match super::eval::eval_full(w, arena, params, &context, hooks)? {
         Datum::Bool(true) => Ok(true),
@@ -2020,7 +2068,7 @@ fn collect_matches<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
-    scratch: &mut FixedVec<(u64, RowLoc)>,
+    scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<(), SqlError> {
     scratch.clear();
     let table = storage.table(table_index);
@@ -2028,7 +2076,7 @@ fn collect_matches<'a>(
         let Some(loc) = state.visible_to(txid) else {
             continue;
         };
-        if row_matches(storage, &table.def, schema, loc, where_clause, arena, params, hooks)? {
+        if row_matches(storage, table_index, rowid, &table.def, schema, loc, where_clause, arena, params, hooks)? {
             scratch.push((rowid, loc)).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2055,7 +2103,7 @@ fn collect_join_matches<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     txid: u32,
-    scratch: &mut FixedVec<(u64, RowLoc)>,
+    scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<(), SqlError> {
     scratch.clear();
     let table = storage.table(table_index);
@@ -2064,7 +2112,7 @@ fn collect_join_matches<'a>(
             continue;
         };
         let mut tv = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(storage.heap.get(loc), schema, &mut tv)?;
+        rowenc::decode(storage.row_bytes(table_index, rowid, loc, arena)?, schema, &mut tv)?;
         let context = RowCtx { def, values: &tv[..def.n_columns] };
         let found = super::query::first_from_match(
             storage, from, txid, where_clause, arena, params, &context, &mut |_| Ok(()),

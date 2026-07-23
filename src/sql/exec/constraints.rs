@@ -40,40 +40,50 @@ pub fn check_unique(
         }
         // Check both the committed image and any pending image: a commit
         // of either would collide.
-        for (loc, pending_of) in [
+        for (home, pending_of) in [
             (state.committed, None),
             (
-                state.pending.and_then(|p| p.loc),
+                state.pending.and_then(|p| p.loc).map(crate::storage::RowHome::Heap),
                 state.pending.map(|p| p.txid),
             ),
         ] {
-            let Some(loc) = loc else { continue };
-            let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(storage.heap.get(loc), schema, &mut other)?;
-            for (i, c) in def.columns().iter().enumerate() {
-                if !c.unique || values[i].is_null() || other[i].is_null() {
-                    continue;
+            let Some(home) = home else { continue };
+            // The decoded datums borrow the fetched bytes, so the comparison
+            // runs inside the fetch; only the colliding column index escapes.
+            let collision = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut other)?;
+                for (i, c) in def.columns().iter().enumerate() {
+                    if !c.unique || values[i].is_null() || other[i].is_null() {
+                        continue;
+                    }
+                    if compare_datums(&values[i], &other[i])
+                        .map(|o| o.is_eq())
+                        .unwrap_or(false)
+                    {
+                        return Ok(Some(i));
+                    }
                 }
-                if compare_datums(&values[i], &other[i])
-                    .map(|o| o.is_eq())
-                    .unwrap_or(false)
+                Ok(None)
+            })?;
+            if let Some(i) = collision {
+                if let Some(owner) = pending_of
+                    && owner != txid
                 {
-                    if let Some(owner) = pending_of
-                        && owner != txid {
-                            return Err(sql_err!(
-                                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                                "could not serialize access due to concurrent update"
-                            ));
-                        }
-                    let kind = if c.primary { "pkey" } else { "key" };
                     return Err(sql_err!(
-                        crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
-                        "duplicate key value violates unique constraint \"{}_{}_{}\"",
-                        def.name.as_str(),
-                        c.name.as_str(),
-                        kind
+                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent update"
                     ));
                 }
+                let c = &def.columns()[i];
+                let kind = if c.primary { "pkey" } else { "key" };
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
+                    "duplicate key value violates unique constraint \"{}_{}_{}\"",
+                    def.name.as_str(),
+                    c.name.as_str(),
+                    kind
+                ));
             }
         }
     }
@@ -164,20 +174,25 @@ fn tuple_uniqueness(
         if Some(rowid) == self_rowid {
             continue;
         }
-        for (loc, pending_of) in [
+        for (home, pending_of) in [
             (state.committed, None),
-            (state.pending.and_then(|p| p.loc), state.pending.map(|p| p.txid)),
+            (
+                state.pending.and_then(|p| p.loc).map(crate::storage::RowHome::Heap),
+                state.pending.map(|p| p.txid),
+            ),
         ] {
-            let Some(loc) = loc else { continue };
-            let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(storage.heap.get(loc), schema, &mut other)?;
-            let all_eq = columns.iter().all(|&c| {
-                let column_index = c as usize;
-                !other[column_index].is_null()
-                    && compare_datums(&values[column_index], &other[column_index])
-                        .map(|o| o.is_eq())
-                        .unwrap_or(false)
-            });
+            let Some(home) = home else { continue };
+            let all_eq = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut other)?;
+                Ok(columns.iter().all(|&c| {
+                    let column_index = c as usize;
+                    !other[column_index].is_null()
+                        && compare_datums(&values[column_index], &other[column_index])
+                            .map(|o| o.is_eq())
+                            .unwrap_or(false)
+                }))
+            })?;
             if all_eq {
                 if let Some(owner) = pending_of
                     && owner != txid
@@ -312,16 +327,18 @@ fn parent_has_key(
     txid: u32,
 ) -> Result<bool, SqlError> {
     let table = storage.table(parent_index);
-    for (_, state) in table.rows.iter() {
-        let Some(loc) = state.visible_to(txid) else { continue };
-        let mut prow = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(storage.heap.get(loc), parent_schema, &mut prow)?;
-        let all_eq = parent_cols.iter().zip(child_cols).all(|(&pc, &cc)| {
-            let pv = &prow[pc as usize];
-            let cv = &child_values[cc as usize];
-            !pv.is_null()
-                && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
-        });
+    for (&rowid, state) in table.rows.iter() {
+        let Some(home) = state.visible_to(txid) else { continue };
+        let all_eq = storage.with_row_bytes(parent_index, rowid, home, |bytes| {
+            let mut prow = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, parent_schema, &mut prow)?;
+            Ok(parent_cols.iter().zip(child_cols).all(|(&pc, &cc)| {
+                let pv = &prow[pc as usize];
+                let cv = &child_values[cc as usize];
+                !pv.is_null()
+                    && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
+            }))
+        })?;
         if all_eq {
             return Ok(true);
         }
@@ -403,11 +420,15 @@ pub(crate) fn apply_fk_parent_actions(
             let mut n_match = 0usize;
             {
                 let table = storage.table(child_index);
-                for (_, state) in table.rows.iter() {
-                    let Some(loc) = state.visible_to(txn.txid) else { continue };
-                    let mut crow = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(storage.heap.get(loc), cschema, &mut crow)?;
-                    if refers(&crow[..cdef.n_columns]) {
+                for (&rowid, state) in table.rows.iter() {
+                    let Some(home) = state.visible_to(txn.txid) else { continue };
+                    let is_match =
+                        storage.with_row_bytes(child_index, rowid, home, |bytes| {
+                            let mut crow = [Datum::Null; MAX_COLUMNS];
+                            rowenc::decode(bytes, cschema, &mut crow)?;
+                            Ok(refers(&crow[..cdef.n_columns]))
+                        })?;
+                    if is_match {
                         n_match += 1;
                     }
                 }
@@ -441,13 +462,13 @@ pub(crate) fn apply_fk_parent_actions(
                 let mut at = 0usize;
                 let table = storage.table(child_index);
                 for (rowid, state) in table.rows.iter() {
-                    let Some(loc) = state.visible_to(txn.txid) else { continue };
-                    let bytes = storage.heap.get(loc);
+                    let Some(home) = state.visible_to(txn.txid) else { continue };
+                    // The cascade mutates storage below, so a matching row is
+                    // copied into the arena wherever its bytes live.
+                    let bytes = storage.row_bytes(child_index, *rowid, home, arena)?;
                     let mut crow = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, cschema, &mut crow)?;
                     if refers(&crow[..cdef.n_columns]) {
-                        // Copy the row bytes out of the heap so the decoded
-                        // values survive the mutations below.
                         let copy = arena.alloc_slice_copy(bytes).map_err(|_| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,

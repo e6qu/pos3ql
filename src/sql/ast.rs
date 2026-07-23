@@ -516,6 +516,11 @@ pub enum Expr<'a> {
         operand: Option<&'a Expr<'a>>,
         whens: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
         otherwise: Option<&'a Expr<'a>>,
+        /// True when this `CASE` is the desugaring of a syntactic construct that
+        /// is not itself a `CASE` — `IS TRUE`, `IS DISTINCT FROM`. PostgreSQL
+        /// labels those output columns `?column?`, not `case`, so the flag lets
+        /// naming tell them from a `CASE` the query actually wrote.
+        synthetic: bool,
     },
     /// The DEFAULT keyword inside INSERT VALUES.
     DefaultMarker,
@@ -618,7 +623,7 @@ impl Expr<'_> {
             Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
                 operand.is_constant() && pattern.is_constant()
             }
-            Expr::Case { operand, whens, otherwise } => {
+            Expr::Case { operand, whens, otherwise, .. } => {
                 operand.map(|o| o.is_constant()).unwrap_or(true)
                     && whens.iter().all(|(c, r)| c.is_constant() && r.is_constant())
                     && otherwise.map(|e| e.is_constant()).unwrap_or(true)

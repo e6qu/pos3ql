@@ -56,7 +56,7 @@ impl<'a> Parser<'a> {
                     let then_v = self.arena_expr(Expr::Bool(!negated))?;
                     let else_v = self.arena_expr(Expr::Bool(negated))?;
                     let whens = self.arena_slice(&[(cond, then_v)])?;
-                    left = self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(else_v) })?;
+                    left = self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(else_v), synthetic: true })?;
                     continue;
                 }
                 if self.eat_ident("distinct")? {
@@ -566,6 +566,7 @@ impl<'a> Parser<'a> {
                     operand,
                     whens: self.arena_slice(&whens[..n])?,
                     otherwise,
+                    synthetic: false,
                 })
             }
             Tok::Ident("true") => {
@@ -1039,16 +1040,30 @@ impl<'a> Parser<'a> {
         };
         self.advance()?;
         if self.eat_ident("to")? {
-            // The only range form handled so far is YEAR TO MONTH, whose
-            // hyphenated `Y-M` value has a self-contained format. The clock
-            // ranges (DAY/HOUR/MINUTE TO ...) carry a per-pair format and
-            // field truncation, and are refused rather than mis-parsed.
-            if word == "year" && self.eat_ident("month")? {
-                return self.year_to_month(lit);
+            // YEAR TO MONTH carries a self-contained `Y-M` format; the clock
+            // ranges (DAY/HOUR/MINUTE TO ...) carry a `D H:M:S` value truncated
+            // to the trailing field. Each field pair is a valid ordering only
+            // from a coarser field to a finer one.
+            if word == "year" {
+                if self.eat_ident("month")? {
+                    return self.year_to_month(lit);
+                }
+                return Err(self.err_here("expected MONTH after YEAR TO"));
             }
-            return Err(self.err_here(
-                "INTERVAL with a TO range qualifier is not supported yet",
-            ));
+            let Some(start) = clock_field_ordinal(word) else {
+                return Err(self.err_here("INTERVAL range must run from a coarser field to a finer"));
+            };
+            let Some((end_word, _)) = self.peek_interval_field() else {
+                return Err(self.err_here("expected an interval field after TO"));
+            };
+            let Some(end) = clock_field_ordinal(end_word) else {
+                return Err(self.err_here("INTERVAL range must run from a coarser field to a finer"));
+            };
+            if end <= start {
+                return Err(self.err_here("INTERVAL range must run from a coarser field to a finer"));
+            }
+            self.advance()?;
+            return self.clock_range(lit, start, end);
         }
         let value = lit.trim();
         let numeric = value.strip_prefix(['-', '+']).unwrap_or(value);
@@ -1120,6 +1135,155 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.err_here("interval literal too large for SQL arena"))
     }
 
+    /// A clock `TO`-range qualifier — `INTERVAL '1 2:03:04' DAY TO SECOND` and
+    /// its kin. The value is a day count (only when the range starts at DAY)
+    /// followed by an `H:M:S` clock, truncated to the trailing field. Rather
+    /// than teach the interval parser the colon rules — a two-part clock is
+    /// `H:M` or `M:S` depending on the leading field, a three-part clock is
+    /// always `H:M:S`, and a bare number takes the trailing field — the value
+    /// is decoded here into components and re-emitted as the unambiguous
+    /// `N day N hour N minute N second` form the parser already sums. Day and
+    /// clock carry independent signs, as PostgreSQL keeps them.
+    fn clock_range(&mut self, lit: &'a str, start: u8, end: u8) -> Result<&'a str, ParseError> {
+        let bad = || ParseError {
+            at: self.peek_at,
+            message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
+            sqlstate: "22007",
+        };
+        let value = lit.trim();
+
+        // A single scalar with no day separator and no clock takes the trailing
+        // field: `'5' DAY TO HOUR` is five hours, `'100' MINUTE TO SECOND` a
+        // hundred seconds.
+        if !value.contains([' ', ':']) {
+            return self.scalar_in_field(lit, value, end);
+        }
+
+        // Components in the order the parser will read them back.
+        let mut days = 0i64;
+        let mut hours = 0i64;
+        let mut minutes = 0i64;
+        let mut sec_whole = 0i64;
+        let mut sec_frac: &str = "";
+
+        // The clock, and the day count when the range starts at DAY.
+        let clock = if start == FIELD_DAY {
+            let (day_str, clock) = value.split_once(' ').ok_or_else(bad)?;
+            days = parse_signed_int(day_str.trim()).ok_or_else(bad)?;
+            clock.trim()
+        } else {
+            value
+        };
+
+        // The clock's own sign, independent of the day's.
+        let (clock_neg, clock) = match clock.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, clock.strip_prefix('+').unwrap_or(clock)),
+        };
+        // The field a two-part clock begins at: HOUR after a day or when the
+        // range starts at DAY/HOUR, MINUTE when the range starts at MINUTE.
+        let clock_start = if start == FIELD_MINUTE { FIELD_MINUTE } else { FIELD_HOUR };
+        let mut parts = clock.split(':');
+        let a = parts.next().unwrap_or("");
+        let b = parts.next();
+        let c = parts.next();
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        match (b, c) {
+            // Three parts are always hours:minutes:seconds.
+            (Some(bb), Some(cc)) => {
+                hours = parse_uint(a).ok_or_else(bad)?;
+                minutes = parse_uint(bb).ok_or_else(bad)?;
+                let (w, f) = split_seconds(cc).ok_or_else(bad)?;
+                sec_whole = w;
+                sec_frac = f;
+            }
+            // Two parts start at the clock's leading field.
+            (Some(bb), None) => {
+                if clock_start == FIELD_HOUR {
+                    hours = parse_uint(a).ok_or_else(bad)?;
+                    minutes = parse_uint(bb).ok_or_else(bad)?;
+                } else {
+                    minutes = parse_uint(a).ok_or_else(bad)?;
+                    let (w, f) = split_seconds(bb).ok_or_else(bad)?;
+                    sec_whole = w;
+                    sec_frac = f;
+                }
+            }
+            // One part after a day is the field just below DAY, i.e. hours.
+            (None, None) => {
+                hours = parse_uint(a).ok_or_else(bad)?;
+            }
+            (None, Some(_)) => unreachable!("split yields no third part without a second"),
+        }
+        if clock_neg {
+            hours = -hours;
+            minutes = -minutes;
+        }
+
+        // Truncate to the trailing field by zeroing everything finer.
+        if end < FIELD_HOUR {
+            hours = 0;
+        }
+        if end < FIELD_MINUTE {
+            minutes = 0;
+        }
+        if end < FIELD_SECOND {
+            sec_whole = 0;
+            sec_frac = "";
+        }
+
+        // Seconds carry the clock's sign on the whole `S.f` value together, so a
+        // fractional-only negative second (`-0.5`) keeps its sign.
+        let sec_sign = if clock_neg { "-" } else { "" };
+        let combined = crate::stack_format!(
+            96,
+            "{} day {} hour {} minute {}{}.{} second",
+            days,
+            hours,
+            minutes,
+            sec_sign,
+            sec_whole,
+            if sec_frac.is_empty() { "0" } else { sec_frac }
+        );
+        self.arena
+            .alloc_str(combined.as_str())
+            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+    }
+
+    /// A bare number interpreted in a single field for a range qualifier — the
+    /// trailing field of a `TO` range. Truncates toward zero for every field
+    /// but SECOND, as the single-field qualifier does.
+    fn scalar_in_field(
+        &mut self,
+        lit: &'a str,
+        value: &str,
+        field: u8,
+    ) -> Result<&'a str, ParseError> {
+        let numeric = value.strip_prefix(['-', '+']).unwrap_or(value);
+        let is_number = !numeric.is_empty()
+            && numeric.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            && numeric.bytes().filter(|&b| b == b'.').count() <= 1;
+        if !is_number {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
+                sqlstate: "22007",
+            });
+        }
+        let (word, keep_fraction) = clock_field_word(field);
+        let magnitude = if keep_fraction {
+            value
+        } else {
+            value.split_once('.').map_or(value, |(head, _)| head)
+        };
+        let combined = crate::stack_format!(64, "{} {}", magnitude, word);
+        self.arena
+            .alloc_str(combined.as_str())
+            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+    }
+
     /// The interval field keyword under the cursor, as `(unit word, keeps a
     /// fractional part)`. SECOND keeps its fraction; the coarser fields do not.
     fn peek_interval_field(&self) -> Option<(&'static str, bool)> {
@@ -1152,7 +1316,7 @@ impl<'a> Parser<'a> {
         let both_val = self.arena_expr(Expr::Bool(negated))?;
         let either_val = self.arena_expr(Expr::Bool(!negated))?;
         let whens = self.arena_slice(&[(both, both_val), (either, either_val)])?;
-        self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(cmp) })
+        self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(cmp), synthetic: true })
     }
 
     pub(super) fn peek_binary_op(&self) -> Option<BinaryOp> {
@@ -1193,5 +1357,66 @@ impl<'a> Parser<'a> {
             Tok::Ident("or") => Some(BinaryOp::Or),
             _ => None,
         }
+    }
+}
+
+/// Ordinals for the clock interval fields, coarse to fine. YEAR and MONTH are
+/// not here — their range form is handled separately.
+const FIELD_DAY: u8 = 0;
+const FIELD_HOUR: u8 = 1;
+const FIELD_MINUTE: u8 = 2;
+const FIELD_SECOND: u8 = 3;
+
+/// The clock field an interval keyword names, or `None` for YEAR/MONTH and
+/// anything that is not a field.
+fn clock_field_ordinal(word: &str) -> Option<u8> {
+    Some(match word {
+        "day" => FIELD_DAY,
+        "hour" => FIELD_HOUR,
+        "minute" => FIELD_MINUTE,
+        "second" => FIELD_SECOND,
+        _ => return None,
+    })
+}
+
+/// The unit word for a clock field ordinal, and whether it keeps a fraction.
+fn clock_field_word(field: u8) -> (&'static str, bool) {
+    match field {
+        FIELD_DAY => ("day", false),
+        FIELD_HOUR => ("hour", false),
+        FIELD_MINUTE => ("minute", false),
+        _ => ("second", true),
+    }
+}
+
+/// A non-negative integer, or `None` for anything else.
+fn parse_uint(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// A signed integer (optional leading `+`/`-`), or `None`.
+fn parse_signed_int(s: &str) -> Option<i64> {
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let v: i64 = parse_uint(rest)?;
+    Some(if neg { -v } else { v })
+}
+
+/// Splits a seconds field into `(whole, fraction-digits)`; the fraction is the
+/// text after the decimal point, empty when there is none.
+fn split_seconds(s: &str) -> Option<(i64, &str)> {
+    match s.split_once('.') {
+        Some((w, f)) => {
+            if !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((parse_uint(w)?, f))
+        }
+        None => Some((parse_uint(s)?, "")),
     }
 }

@@ -190,7 +190,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError
             validate_check_refs(operand, def)?;
             validate_check_refs(pattern, def)?;
         }
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, .. } => {
             if let Some(o) = operand {
                 validate_check_refs(o, def)?;
             }

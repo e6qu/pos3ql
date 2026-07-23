@@ -696,7 +696,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             }
             c
         }
-        Case { operand, whens, otherwise } => {
+        Case { operand, whens, otherwise, .. } => {
             let mut c = operand.map_or(0, |o| postpone_cost(o, scope, arena));
             // Non-constant branch results whose type differs from the CASE's
             // unified result type carry an implicit cast, which PostgreSQL

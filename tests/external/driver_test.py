@@ -88,6 +88,19 @@ assert bcur.fetchone()[0] == "hi   ", "bpchar binary format"
 bcur.close()
 print("bpchar wire ok")
 
+# smallint: OID 21, 2-byte binary payload, values intact in both formats.
+cur.execute("DROP TABLE IF EXISTS drv_int2")
+cur.execute("CREATE TABLE drv_int2(s smallint)")
+cur.execute("INSERT INTO drv_int2 VALUES (32767), (-32768)")
+cur.execute("SELECT s FROM drv_int2 ORDER BY s")
+assert cur.description[0].type_code == 21, f"smallint oid: {cur.description[0].type_code}"
+assert [r[0] for r in cur.fetchall()] == [-32768, 32767]
+bcur = conn.cursor(binary=True)
+bcur.execute("SELECT s FROM drv_int2 ORDER BY s")
+assert [r[0] for r in bcur.fetchall()] == [-32768, 32767], "smallint binary format"
+bcur.close()
+print("smallint wire ok")
+
 conn.close()
 
 print("ALL DRIVER TESTS PASSED")

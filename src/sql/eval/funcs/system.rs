@@ -250,6 +250,7 @@ pub(crate) fn dispatch<'a>(
                 Ok(Datum::Text(match v {
                     Datum::Null => "unknown",
                     Datum::Bool(_) => "boolean",
+                    Datum::Int2(_) => "smallint",
                     Datum::Int4(_) => "integer",
                     Datum::Int8(_) => "bigint",
                     Datum::Float8(_) => "double precision",
@@ -263,20 +264,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Interval(_) => "interval",
                     Datum::Json { jsonb: false, .. } => "json",
                     Datum::Json { jsonb: true, .. } => "jsonb",
-                    Datum::Array { element, .. } => {
-                        use ArrElem::*;
-                        match element {
-                            Bool => "boolean[]",
-                            Int4 => "integer[]",
-                            Int8 => "bigint[]",
-                            Float8 => "double precision[]",
-                            Text => "text[]",
-                            Numeric => "numeric[]",
-                            Date => "date[]",
-                            Timestamp => "timestamp without time zone[]",
-                            Timestamptz => "timestamp with time zone[]",
-                        }
-                    }
+                    Datum::Array { element, .. } => element.typeof_name(),
                     Datum::Uuid(_) => "uuid",
                     Datum::Bytea(_) => "bytea",
                     Datum::Numeric(_) => "numeric",

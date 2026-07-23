@@ -476,7 +476,12 @@ impl<'a> Parser<'a> {
                 // literals negate through the normal Neg path (numeric).
                 if let Tok::Num(text) = self.peeked {
                     let integral = is_base_prefixed(text) || !text.contains(['.', 'e', 'E']);
+                    // A following `::` binds tighter than the minus, so
+                    // `-32768::int2` is `-(32768::int2)` — PostgreSQL raises
+                    // "smallint out of range" there, and folding would hide it.
+                    let cast_follows = self.next_is_cast()?;
                     if integral
+                        && !cast_follows
                         && let Some(v) = crate::sql::eval::parse_int_literal(text) {
                             self.advance()?;
                             return self.arena_expr(Expr::Int(-v));

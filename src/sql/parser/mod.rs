@@ -1945,6 +1945,14 @@ impl<'a> Parser<'a> {
     /// With `(` peeked at grouping-term position, reports whether it opens a
     /// multi-column grouping list — `()` or `(a, b, ...)` — as opposed to a
     /// scalar parenthesized expression like `(a + b)` or `(x + 1) * 2`. It
+    /// Whether the token after the peeked one is `::` — a cloned-lexer
+    /// lookahead, used to keep a unary minus from folding into a literal the
+    /// cast binds tighter to.
+    pub(super) fn next_is_cast(&self) -> Result<bool, ParseError> {
+        let mut lexer = self.lexer.clone();
+        Ok(matches!(lexer.next_token()?, Tok::Op("::")))
+    }
+
     /// scans a cloned lexer to the matching close paren: a top-level comma is
     /// never valid inside a scalar `( ... )`, so seeing one (or an immediate
     /// close, the empty grand-total level) unambiguously marks a grouping list.

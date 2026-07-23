@@ -84,6 +84,7 @@ pub(crate) fn int_arg<'a>(
 ) -> Result<Option<i64>, SqlError> {
     match eval_full(args[i], arena, params, row, hooks)? {
         Datum::Null => Ok(None),
+        Datum::Int2(v) => Ok(Some(v as i64)),
         Datum::Int4(v) => Ok(Some(v as i64)),
         Datum::Int8(v) => Ok(Some(v)),
         other => Err(type_mismatch(name, &other)),
@@ -103,6 +104,7 @@ pub(crate) fn num_f64<'a>(
 ) -> Result<Option<f64>, SqlError> {
     match eval_full(args[i], arena, params, row, hooks)? {
         Datum::Null => Ok(None),
+        Datum::Int2(v) => Ok(Some(v as f64)),
         Datum::Int4(v) => Ok(Some(v as f64)),
         Datum::Int8(v) => Ok(Some(v as f64)),
         Datum::Float8(v) => Ok(Some(v)),
@@ -114,6 +116,7 @@ pub(crate) fn num_f64<'a>(
 /// f64 view of an already-evaluated numeric-category datum.
 pub(crate) fn datum_f64(name: &str, d: Datum<'_>) -> Result<f64, SqlError> {
     match d {
+        Datum::Int2(v) => Ok(v as f64),
         Datum::Int4(v) => Ok(v as f64),
         Datum::Int8(v) => Ok(v as f64),
         Datum::Float8(v) => Ok(v),
@@ -330,6 +333,7 @@ pub(crate) fn log_domain_check(n: &Numeric) -> Result<(), SqlError> {
 pub(crate) fn datum_numeric<'a>(name: &str, d: Datum<'a>, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
     match d {
         Datum::Numeric(n) => Ok(n),
+        Datum::Int2(v) => Numeric::from_i64(v as i64, arena),
         Datum::Int4(v) => Numeric::from_i64(v as i64, arena),
         Datum::Int8(v) => Numeric::from_i64(v, arena),
         Datum::Float8(v) => Numeric::parse(stack_format!(64, "{}", v).as_str(), arena),

@@ -99,6 +99,7 @@ pub mod sqlstate {
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
     pub const AMBIGUOUS_COLUMN: &str = "42702";
+    pub const AMBIGUOUS_FUNCTION: &str = "42725";
     pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
     pub const CHECK_VIOLATION: &str = "23514";
@@ -676,7 +677,8 @@ pub fn eval_full<'a>(
                     _ => 1,
                 };
                 let value = match v {
-                    Datum::Int4(x) => x as u32 as u64,
+                    Datum::Int2(x) => x as u16 as u64,
+                Datum::Int4(x) => x as u32 as u64,
                     Datum::Int8(x) => x as u64,
                     _ => unreachable!(),
                 };
@@ -991,6 +993,7 @@ pub fn eval_full<'a>(
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
             let index = match i {
+                Datum::Int2(x) => x as i64,
                 Datum::Int4(x) => x as i64,
                 Datum::Int8(x) => x,
                 Datum::Null => return Ok(Datum::Null),
@@ -1415,6 +1418,7 @@ fn call<'a>(
                 other => return Err(type_mismatch("generate_subscripts requires an array", &other)),
             };
             let dim = match eval_full(args[1], arena, params, row, hooks)? {
+                Datum::Int2(v) => v as i64,
                 Datum::Int4(v) => v as i64,
                 Datum::Int8(v) => v,
                 Datum::Null => return Ok(Datum::Null),
@@ -1616,6 +1620,10 @@ fn unify_types(a: ColType, b: ColType) -> Option<ColType> {
 }
 
 /// Best-effort static type of an expression for CASE unification.
+pub(crate) fn static_type_pub<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType> {
+    static_type(e, row)
+}
+
 fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType> {
     match e {
         Expr::Null | Expr::Param(_) => None,
@@ -1755,6 +1763,7 @@ fn json_get<'a>(
     let tree = super::json::parse(text, arena)?;
     let child = match r {
         Datum::Text(k) => tree.get_field(k),
+        Datum::Int2(i) => tree.get_index(i as i64),
         Datum::Int4(i) => tree.get_index(i as i64),
         Datum::Int8(i) => tree.get_index(i),
         other => return Err(type_mismatch("-> key must be text or integer", &other)),
@@ -2011,6 +2020,7 @@ fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
     let result = match r {
         Datum::Null => return Ok(Datum::Null),
         Datum::Text(key) => super::json::delete_key(root, key, arena)?,
+        Datum::Int2(i) => super::json::delete_index(root, i as i64, arena)?,
         Datum::Int4(i) => super::json::delete_index(root, i as i64, arena)?,
         Datum::Int8(i) => super::json::delete_index(root, i, arena)?,
         Datum::Array { element, raw } => {
@@ -2341,6 +2351,7 @@ fn timestamp_micros(name: &str, d: Datum) -> Result<i64, SqlError> {
 /// double, or numeric). Text and other types are not factors.
 fn num_factor(d: &Datum) -> Option<f64> {
     match d {
+        Datum::Int2(x) => Some(f64::from(*x)),
         Datum::Int4(x) => Some(f64::from(*x)),
         Datum::Int8(x) => Some(*x as f64),
         Datum::Float8(x) => Some(*x),
@@ -2418,6 +2429,7 @@ fn to_numeric<'a>(d: &Datum, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> 
             // Re-alloc digit bytes into this arena scope.
             digits: arena.alloc_slice_copy(n.digits).map_err(|_| overflow("numeric"))?,
         }),
+        Datum::Int2(x) => Numeric::from_i64(*x as i64, arena),
         Datum::Int4(x) => Numeric::from_i64(*x as i64, arena),
         Datum::Int8(x) => Numeric::from_i64(*x, arena),
         other => Err(sql_err!(
@@ -2639,6 +2651,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Array { element, .. } => element.array_name(),
         Datum::Null => "unknown",
         Datum::Bool(_) => "boolean",
+        Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",
         Datum::Int8(_) => "bigint",
         Datum::Float8(_) => "double precision",
@@ -2665,6 +2678,7 @@ fn type_name_of(d: &Datum) -> &'static str {
 
 fn as_i64(d: &Datum) -> Option<i64> {
     match d {
+        Datum::Int2(x) => Some(i64::from(*x)),
         Datum::Int4(x) => Some(i64::from(*x)),
         Datum::Int8(x) => Some(*x),
         _ => None,
@@ -2676,6 +2690,7 @@ fn as_f64(d: &Datum) -> Option<f64> {
         return Some(n.to_f64());
     }
     match d {
+        Datum::Int2(x) => Some(f64::from(*x)),
         Datum::Int4(x) => Some(f64::from(*x)),
         Datum::Int8(x) => Some(*x as f64),
         Datum::Float8(x) => Some(*x),

@@ -294,6 +294,7 @@ pub(crate) fn dispatch<'a>(
                 }
                 let total = array::len(raw);
                 let trim = match count {
+                    Datum::Int2(v) => v as i64,
                     Datum::Int4(v) => v as i64,
                     Datum::Int8(v) => v,
                     _ => return Err(type_mismatch("trim_array count must be an integer", &count)),

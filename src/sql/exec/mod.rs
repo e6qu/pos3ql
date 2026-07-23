@@ -436,6 +436,7 @@ fn next_auto_value<'x>(
             continue;
         }
         let v = match row.get(col) {
+            Some(Datum::Int2(x)) => i64::from(*x),
             Some(Datum::Int4(x)) => i64::from(*x),
             Some(Datum::Int8(x)) => *x,
             _ => continue,
@@ -443,10 +444,10 @@ fn next_auto_value<'x>(
         max = max.max(v);
     }
     let next = max + 1;
-    if ctype == ColType::Int8 {
-        Datum::Int8(next)
-    } else {
-        Datum::Int4(next as i32)
+    match ctype {
+        ColType::Int8 => Datum::Int8(next),
+        ColType::Int2 => Datum::Int2(next as i16),
+        _ => Datum::Int4(next as i32),
     }
 }
 
@@ -1762,9 +1763,10 @@ pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -
     };
     match eval(expression, arena, params, &NoColumns)? {
         Datum::Null => Ok(0),
+        Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
-        Datum::Int4(_) | Datum::Int8(_) => {
+        Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) => {
             Err(sql_err!(sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET, "OFFSET must not be negative"))
         }
         _ => Err(sql_err!(
@@ -1824,9 +1826,10 @@ pub fn eval_limit_pub(limit: Option<&Expr>, arena: &Arena, params: &[Datum]) -> 
     };
     match eval(expression, arena, params, &NoColumns)? {
         Datum::Null => Ok(u64::MAX),
+        Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
-        Datum::Int4(_) | Datum::Int8(_) => Err(sql_err!(
+        Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) => Err(sql_err!(
             crate::sql::eval::sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
             "LIMIT must not be negative"
         )),

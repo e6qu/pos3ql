@@ -173,11 +173,25 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::NAME => ColType::Name,
         // Array OIDs (catalog columns like indkey/conkey/indoption are arrays).
         1000 => ColType::Array(crate::sql::types::ArrElem::Bool),
-        1005 | 1007 => ColType::Array(crate::sql::types::ArrElem::Int4),
+        1005 => ColType::Array(crate::sql::types::ArrElem::Int2),
+        1007 => ColType::Array(crate::sql::types::ArrElem::Int4),
         1016 => ColType::Array(crate::sql::types::ArrElem::Int8),
         1021 | 1022 => ColType::Array(crate::sql::types::ArrElem::Float8),
-        1009 | 1015 | 1002 | 1014 => ColType::Array(crate::sql::types::ArrElem::Text),
+        1009 | 1002 => ColType::Array(crate::sql::types::ArrElem::Text),
+        1015 => ColType::Array(crate::sql::types::ArrElem::Varchar),
+        1014 => ColType::Array(crate::sql::types::ArrElem::Bpchar),
+        1003 => ColType::Array(crate::sql::types::ArrElem::Name),
         1231 => ColType::Array(crate::sql::types::ArrElem::Numeric),
+        1182 => ColType::Array(crate::sql::types::ArrElem::Date),
+        1115 => ColType::Array(crate::sql::types::ArrElem::Timestamp),
+        1185 => ColType::Array(crate::sql::types::ArrElem::Timestamptz),
+        1183 => ColType::Array(crate::sql::types::ArrElem::Time),
+        1270 => ColType::Array(crate::sql::types::ArrElem::Timetz),
+        1187 => ColType::Array(crate::sql::types::ArrElem::Interval),
+        2951 => ColType::Array(crate::sql::types::ArrElem::Uuid),
+        1001 => ColType::Array(crate::sql::types::ArrElem::Bytea),
+        199 => ColType::Array(crate::sql::types::ArrElem::Json),
+        3807 => ColType::Array(crate::sql::types::ArrElem::Jsonb),
         3904 => ColType::Range(crate::sql::types::RangeKind::Int4),
         3926 => ColType::Range(crate::sql::types::RangeKind::Int8),
         3906 => ColType::Range(crate::sql::types::RangeKind::Num),
@@ -211,7 +225,7 @@ fn array_promoted(array_oid: Option<i32>, elem_oid: Option<i32>) -> (i32, i16) {
 pub(crate) fn unify_numeric_tower(a: ColType, b: ColType) -> ColType {
     use ColType::*;
     let rank = |t: ColType| match t {
-        Int4 => 1, Int8 => 2, Numeric => 3, Float8 => 4, _ => 0,
+        Int2 => 1, Int4 => 2, Int8 => 3, Numeric => 4, Float8 => 5, _ => 0,
     };
     let (ra, rb) = (rank(a), rank(b));
     if ra > 0 && rb > 0 {
@@ -261,6 +275,12 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             _ if type_name.eq_ignore_ascii_case("regtype") => Some("regtype"),
             _ if type_name.eq_ignore_ascii_case("regclass") => Some("regclass"),
             _ if type_name.eq_ignore_ascii_case("oid") => Some("oid"),
+            // A cast to an array type titles as the *element*'s internal name
+            // (`'{1}'::int2[]` is an `int2` column), as PostgreSQL has it.
+            _ if type_name.ends_with("[]") => {
+                ColType::from_sql_name(type_name.trim_end_matches("[]"))
+                    .map(ColType::internal_name)
+            }
             _ => ColType::from_sql_name(type_name).map(ColType::internal_name),
         },
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
@@ -500,20 +520,9 @@ pub fn typeof_static<'a>(
     expression: &Expr,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
 ) -> Option<&'static str> {
-    use crate::sql::types::ArrElem;
     let (type_oid, _) = infer_type_res(expression, &RowCols(row)).ok()?;
     Some(match coltype_of_oid(type_oid)? {
-        ColType::Array(elem) => match elem {
-            ArrElem::Bool => "boolean[]",
-            ArrElem::Int4 => "integer[]",
-            ArrElem::Int8 => "bigint[]",
-            ArrElem::Float8 => "double precision[]",
-            ArrElem::Text => "text[]",
-            ArrElem::Numeric => "numeric[]",
-            ArrElem::Date => "date[]",
-            ArrElem::Timestamp => "timestamp without time zone[]",
-            ArrElem::Timestamptz => "timestamp with time zone[]",
-        },
+        ColType::Array(elem) => elem.typeof_name(),
         other => other.name(),
     })
 }
@@ -540,7 +549,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     if a == b {
         return true;
     }
-    let numeric = |t: ColType| matches!(t, Int4 | Int8 | Numeric | Float8);
+    let numeric = |t: ColType| matches!(t, Int2 | Int4 | Int8 | Numeric | Float8 | Float4);
     let datetime = |t: ColType| matches!(t, Date | Timestamp | Timestamptz);
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
@@ -690,17 +699,26 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 BitAnd | BitOr | BitXor | Shl | Shr => {
                     if is_bit(lo) || is_bit(ro) {
                         (if lo == oid::VARBIT || ro == oid::VARBIT { oid::VARBIT } else { oid::BIT }, -1)
+                    } else if matches!(operator, Shl | Shr) {
+                        // A shift keeps its left operand's type.
+                        match lo {
+                            oid::INT2 => of(ColType::Int2),
+                            oid::INT8 => of(ColType::Int8),
+                            _ => of(ColType::Int4),
+                        }
                     } else if lo == oid::INT8 || ro == oid::INT8 {
                         of(ColType::Int8)
+                    } else if lo == oid::INT2 && ro == oid::INT2 {
+                        of(ColType::Int2)
                     } else {
                         of(ColType::Int4)
                     }
                 }
                 Add | Sub | Mul | Div | Mod => {
                     let numeric = |o: i32| {
-                        matches!(o, oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT8)
+                        matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT8)
                     };
-                    let int_like = |o: i32| matches!(o, oid::INT4 | oid::INT8 | oid::UNKNOWN);
+                    let int_like = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
                     // Date arithmetic: date - date -> int4; date +/- int -> date;
                     // int + date -> date.
                     if lo == oid::DATE && ro == oid::DATE && matches!(operator, Sub) {
@@ -772,6 +790,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                         (ro, coltype_of_oid(ro).map(|t| t.typlen()).unwrap_or(-1))
                     } else if ro == oid::UNKNOWN {
                         (lo, coltype_of_oid(lo).map(|t| t.typlen()).unwrap_or(-1))
+                    } else if lo == oid::INT2 && ro == oid::INT2 {
+                        // smallint op smallint stays smallint.
+                        of(ColType::Int2)
                     } else {
                         of(ColType::Int4)
                     }
@@ -927,8 +948,8 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "sum" | "avg" => {
                 let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
                 match a {
-                    Some(oid::INT4) if *name == "sum" => of(ColType::Int8),
-                    Some(oid::INT4) | Some(oid::INT8) | Some(oid::NUMERIC) => of(ColType::Numeric),
+                    Some(oid::INT2 | oid::INT4) if *name == "sum" => of(ColType::Int8),
+                    Some(oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC) => of(ColType::Numeric),
                     Some(oid::FLOAT8) => of(ColType::Float8),
                     Some(oid::UNKNOWN) | None => of(ColType::Numeric),
                     Some(other) => return Err(agg_undefined(name, other)),

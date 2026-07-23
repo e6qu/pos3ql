@@ -101,6 +101,10 @@ pub(crate) struct AggState<'a> {
     // in `finish`. `ordered` is only set for string_agg (ORDER BY cannot change
     // a commutative aggregate's result).
     ordered: bool,
+    // array_agg: the argument's static element type, captured on first input —
+    // a varchar value arrives as a text datum, and only the static type can
+    // say the result is character varying[].
+    elem_hint: Option<crate::sql::types::ArrElem>,
     ord_spec: &'a [crate::sql::ast::OrderBy<'a>],
     ord: *mut &'a [u8],
     ord_len: usize,
@@ -225,6 +229,7 @@ impl Default for AggState<'_> {
             str_len: 0,
             str_cap: 0,
             ordered: false,
+            elem_hint: None,
             ord_spec: &[],
             ord: core::ptr::null_mut(),
             ord_len: 0,
@@ -380,6 +385,10 @@ impl<'a> AggState<'a> {
             }
             // array_agg/json_agg keep NULL elements, unlike string_agg.
             let value = eval_full(args[0], arena, params, row, hooks)?;
+            if matches!(self.kind, AggKind::ArrayAgg) && self.elem_hint.is_none() {
+                self.elem_hint = crate::sql::eval::static_type_pub(args[0], row)
+                    .and_then(crate::sql::types::ArrElem::from_coltype);
+            }
             if self.ordered {
                 let mut tuple = [Datum::Null; 1 + MAX_PROJ];
                 tuple[0] = value;
@@ -418,6 +427,7 @@ impl<'a> AggState<'a> {
                 self.sum_float = match eval_full(fraction, arena, params, row, hooks)? {
                     Datum::Float8(f) => f,
                     Datum::Numeric(n) => n.to_f64(),
+                    Datum::Int2(v) => f64::from(v),
                     Datum::Int4(v) => f64::from(v),
                     Datum::Int8(v) => v as f64,
                     _ => return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "percentile value must be numeric")),
@@ -471,6 +481,12 @@ impl<'a> AggState<'a> {
         match self.kind {
             AggKind::Count => {}
             AggKind::Sum | AggKind::Avg => match v {
+                // sum(smallint) is bigint in PostgreSQL — the int2 input rides
+                // the integer accumulator like int4 does.
+                Datum::Int2(x) => {
+                    self.arg_kind = self.arg_kind.max(ArgKind::Int4);
+                    self.sum_int += i128::from(x);
+                }
                 Datum::Int4(x) => {
                     self.arg_kind = self.arg_kind.max(ArgKind::Int4);
                     self.sum_int += i128::from(x);
@@ -552,6 +568,10 @@ impl<'a> AggState<'a> {
             AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
                 use crate::sql::numeric::{self as num, Numeric};
                 let as_numeric = match v {
+                    Datum::Int2(x) => {
+                        self.arg_kind = self.arg_kind.max(ArgKind::Int4);
+                        Some(Numeric::from_i64(i64::from(x), arena)?)
+                    }
                     Datum::Int4(x) => {
                         self.arg_kind = self.arg_kind.max(ArgKind::Int4);
                         Some(Numeric::from_i64(i64::from(x), arena)?)
@@ -791,6 +811,7 @@ impl<'a> AggState<'a> {
                 let weight = position - low as f64;
                 let to_f64 = |d: &Datum<'a>| -> f64 {
                     match d {
+                        Datum::Int2(v) => f64::from(*v),
                         Datum::Int4(v) => f64::from(*v),
                         Datum::Int8(v) => *v as f64,
                         Datum::Float8(v) => *v,
@@ -1083,7 +1104,8 @@ impl<'a> AggState<'a> {
         // No default here. Falling back to int4 for an element type arrays
         // cannot yet carry relabelled the values rather than failing, so
         // `array_agg` over a time or a uuid came back as meaningless integers.
-        let Some(element) = values.iter().find_map(crate::sql::types::ArrElem::from_datum) else {
+        let from_values = values.iter().find_map(crate::sql::types::ArrElem::from_datum);
+        let Some(element) = self.elem_hint.or(from_values) else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "array_agg over {} is not supported yet",

@@ -137,6 +137,13 @@ pub(crate) fn dispatch<'a>(
                 arity(2)?;
                 let a = eval_full(args[0], arena, params, row, hooks)?;
                 let b = eval_full(args[1], arena, params, row, hooks)?;
+                let (a, b) = if a.is_null() || b.is_null() {
+                    (a, b)
+                } else {
+                    let a2 = crate::sql::eval::coerce_unknown_pub(a, &b)?;
+                    let b2 = crate::sql::eval::coerce_unknown_pub(b, &a2)?;
+                    (a2, b2)
+                };
                 if !a.is_null() && !b.is_null() && compare_datums(&a, &b)?.is_eq() {
                     Ok(Datum::Null)
                 } else {

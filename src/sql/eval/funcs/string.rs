@@ -16,6 +16,7 @@ use crate::sql::types::{ArrElem, Datum};
 use crate::sql_err;
 
 use super::super::{
+    text_view,
     alloc_text, arena_full, arity_err, datum_to_text, eval_full, ident_needs_quotes, int_arg,
     overflow, parse_qualified_ident, quote_ident_str, quote_literal_str, regex_substring,
     sql_regex_substring, sqlstate, text_arg, type_mismatch, ColumnLookup, EvalHooks, SqlError,
@@ -92,6 +93,10 @@ pub(crate) fn dispatch<'a>(
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
                     Datum::Text(s) => Ok(Datum::Int4(s.chars().count() as i32)),
+                    // char(n) length ignores the blank padding.
+                    Datum::Bpchar(s) => {
+                        Ok(Datum::Int4(s.trim_end_matches(' ').chars().count() as i32))
+                    }
                     // length of a bit string is its number of bits.
                     Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len() as i32)),
                     // length of a bytea is its number of bytes.
@@ -101,7 +106,7 @@ pub(crate) fn dispatch<'a>(
             }
             "upper" | "lower" => {
                 arity(1)?;
-                match eval_full(args[0], arena, params, row, hooks)? {
+                match text_view(eval_full(args[0], arena, params, row, hooks)?) {
                     Datum::Null => Ok(Datum::Null),
                     // On a range, lower/upper return the corresponding bound.
                     Datum::Range { text, kind } => {
@@ -214,12 +219,12 @@ pub(crate) fn dispatch<'a>(
                 // A text second argument selects the regular-expression forms:
                 // `substring(str FROM posix_pattern)` and, with a third text arg,
                 // `substring(str FROM sql_pattern FOR escape)`.
-                let from_val = eval_full(args[1], arena, params, row, hooks)?;
+                let from_val = text_view(eval_full(args[1], arena, params, row, hooks)?);
                 if let Datum::Text(pattern) = from_val {
                     if args.len() == 2 {
                         return regex_substring(s, pattern);
                     }
-                    let escape = match eval_full(args[2], arena, params, row, hooks)? {
+                    let escape = match text_view(eval_full(args[2], arena, params, row, hooks)?) {
                         Datum::Text(e) => e,
                         Datum::Null => return Ok(Datum::Null),
                         other => return Err(type_mismatch("substring escape must be text", &other)),
@@ -475,6 +480,9 @@ pub(crate) fn dispatch<'a>(
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
                     Datum::Text(s) => Ok(Datum::Int4(s.len() as i32)),
+                    // octet_length(bpchar) counts the padding — one of the few
+                    // functions PostgreSQL gives the raw padded value.
+                    Datum::Bpchar(s) => Ok(Datum::Int4(s.len() as i32)),
                     Datum::Bytea(b) => Ok(Datum::Int4(b.len() as i32)),
                     // octets needed to hold the bits.
                     Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len().div_ceil(8) as i32)),
@@ -596,6 +604,9 @@ pub(crate) fn dispatch<'a>(
                     // A bit string's bit_length is its bit count.
                     Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len() as i32)),
                     Datum::Text(s) => Ok(Datum::Int4((s.len() as i64 * 8) as i32)),
+                    Datum::Bpchar(s) => {
+                        Ok(Datum::Int4((s.trim_end_matches(' ').len() as i64 * 8) as i32))
+                    }
                     Datum::Bytea(b) => Ok(Datum::Int4((b.len() as i64 * 8) as i32)),
                     other => Err(type_mismatch("bit_length", &other)),
                 }
@@ -635,7 +646,10 @@ pub(crate) fn dispatch<'a>(
                         Datum::Null
                     });
                 }
-                Ok(Datum::Text(quote_literal_str(datum_to_text(v, arena)?, arena)?))
+                Ok(Datum::Text(quote_literal_str(
+                    datum_to_text(text_view(v), arena)?,
+                    arena,
+                )?))
             }
             // `parse_ident(text)`: split a qualified name into its parts as text[].
             "parse_ident" => {

@@ -114,7 +114,7 @@ pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeri
 mod projected;
 pub use projected::{
     decode_projected_pub, decode_projected_value, encode_projected_pub, projected_prefix_len,
-    projected_value_len,
+    projected_value_len, sort_dedup_projected,
 };
 
 mod ddl;
@@ -2003,7 +2003,16 @@ pub fn apply_cast_typmod<'a>(
             }
             Ok(v)
         }
-        (ColType::Bpchar, TypeMod::Length(n), Datum::Text(s)) => bpchar_fit(s, n, true, arena),
+        (ColType::Bpchar, TypeMod::Length(n), Datum::Text(s) | Datum::Bpchar(s)) => {
+            // The padded result is a *bpchar* value: the padding is part of it
+            // (output functions and LIKE see it), while comparisons and text
+            // casts strip it — which is what the variant encodes. A bpchar
+            // source re-fits from its stripped text (`c::char(3)`).
+            match bpchar_fit(s.trim_end_matches(' '), n, true, arena)? {
+                Datum::Text(padded) => Ok(Datum::Bpchar(padded)),
+                other => Ok(other),
+            }
+        }
         (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
             super::eval::fit_bits(bits, n, varying, arena)
         }
@@ -2058,6 +2067,12 @@ pub fn apply_typmod<'a>(
     match (ctype, modifier, v) {
         (ColType::Text | ColType::Varchar, TypeMod::Length(max), Datum::Text(s)) => {
             if s.chars().count() > max {
+                // Excess that is entirely spaces truncates silently, the same
+                // allowance PostgreSQL gives both varchar and char columns.
+                let end = s.char_indices().nth(max).map_or(s.len(), |(i, _)| i);
+                if s[end..].chars().all(|c| c == ' ') {
+                    return Ok(Datum::Text(&s[..end]));
+                }
                 return Err(sql_err!(
                     sqlstate::STRING_DATA_RIGHT_TRUNCATION,
                     "value too long for type character varying({})",
@@ -2066,7 +2081,12 @@ pub fn apply_typmod<'a>(
             }
             Ok(v)
         }
-        (_, TypeMod::Length(n), Datum::Text(s)) => bpchar_fit(s, n, false, arena),
+        (_, TypeMod::Length(n), Datum::Text(s) | Datum::Bpchar(s)) => {
+            match bpchar_fit(s.trim_end_matches(' '), n, false, arena)? {
+                Datum::Text(padded) => Ok(Datum::Bpchar(padded)),
+                other => Ok(other),
+            }
+        }
         (_, TypeMod::NumericPS { precision, scale }, Datum::Numeric(n)) => {
             apply_numeric_typmod(&n, precision as usize, scale as usize, arena)
                 .map(Datum::Numeric)

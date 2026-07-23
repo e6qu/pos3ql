@@ -248,6 +248,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(_) => "bigint",
                     Datum::Float8(_) => "double precision",
                     Datum::Text(_) => "text",
+                    Datum::Bpchar(_) => "character",
                     Datum::Date(_) => "date",
                     Datum::Timestamp(_) => "timestamp without time zone",
                     Datum::Timestamptz(_) => "timestamp with time zone",

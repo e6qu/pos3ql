@@ -19,7 +19,6 @@ use crate::stack_format;
 use crate::sql::exec::MAX_PROJ;
 
 use super::aggregate::AggState;
-use super::materialize::visible_prefix;
 use super::plan::where_passes;
 use super::subquery::merge_correlated;
 use super::{
@@ -164,6 +163,10 @@ pub(super) fn groups_for_mask<'a>(
                     if mask & (1u64 << k) != 0 {
                         key_vals[k] = eval_full(g, arena, params, row, row_hooks)?;
                     }
+                }
+                for v in key_vals[..n_keys].iter_mut() {
+                    // bpchar keys group by their stripped text.
+                    *v = crate::sql::eval::text_view(*v);
                 }
                 keys[at].0 = crate::sql::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
                 keys[at].1 = at as u32;
@@ -486,17 +489,7 @@ pub(super) fn grouped_rows<'a>(
                 ));
             }
         }
-        out_rows.sort_unstable();
-        let mut unique = 0usize;
-        for i in 0..out_rows.len() {
-            let same = i > 0
-                && visible_prefix(out_rows[i], width) == visible_prefix(out_rows[i - 1], width);
-            if !same {
-                out_rows[unique] = out_rows[i];
-                unique += 1;
-            }
-        }
-        live = unique;
+        live = crate::sql::exec::sort_dedup_projected(out_rows, width);
     }
     let out_rows = &mut out_rows[..live];
 

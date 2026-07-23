@@ -74,6 +74,20 @@ assert got == [
 ], f"typmod on the wire: {got}"
 print("row description typmod ok")
 
+# char(n): the blank padding is part of the value on the wire — in both text
+# and binary result formats (PostgreSQL's bpchar binary send is the padded
+# text bytes) — while length() and equality ignore it.
+cur.execute("DROP TABLE IF EXISTS drv_bpchar")
+cur.execute("CREATE TABLE drv_bpchar(c char(5))")
+cur.execute("INSERT INTO drv_bpchar VALUES ('hi')")
+cur.execute("SELECT c, length(c), c = 'hi' FROM drv_bpchar")
+assert cur.fetchone() == ("hi   ", 2, True), "bpchar text format"
+bcur = conn.cursor(binary=True)
+bcur.execute("SELECT c FROM drv_bpchar")
+assert bcur.fetchone()[0] == "hi   ", "bpchar binary format"
+bcur.close()
+print("bpchar wire ok")
+
 conn.close()
 
 print("ALL DRIVER TESTS PASSED")

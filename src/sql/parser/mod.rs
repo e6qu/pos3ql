@@ -1451,6 +1451,10 @@ impl<'a> Parser<'a> {
         if name == "bit" && self.eat_ident("varying")? {
             name = "varbit";
         }
+        // `character varying` / `char varying` is `varchar`.
+        if (name == "character" || name == "char") && self.eat_ident("varying")? {
+            name = "varchar";
+        }
         if name == "timestamp" || name == "time" {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
@@ -1465,6 +1469,10 @@ impl<'a> Parser<'a> {
         }
         let type_mod = if self.peeked == Tok::Op("(") {
             self.type_modifier(name)?
+        } else if name == "char" || name == "character" {
+            // Bare `char`/`character` is char(1) in PostgreSQL (`'ab'::char`
+            // is 'a'); only the internal name `bpchar` means unlimited.
+            TypeMod::Length(1).encode()
         } else {
             -1
         };

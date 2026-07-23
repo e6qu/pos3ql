@@ -45,6 +45,7 @@ pub(crate) fn text_arg<'a>(
     match eval_full(args[i], arena, params, row, hooks)? {
         Datum::Null => Ok(None),
         Datum::Text(s) => Ok(Some(s)),
+        Datum::Bpchar(s) => Ok(Some(s.trim_end_matches(' '))),
         other => Err(type_mismatch(name, &other)),
     }
 }
@@ -65,6 +66,7 @@ pub(crate) fn bytea_arg<'a>(
         Datum::Null => Ok(None),
         Datum::Bytea(b) => Ok(Some(b)),
         Datum::Text(s) => Ok(Some(parse_bytea(s, arena)?)),
+        Datum::Bpchar(s) => Ok(Some(parse_bytea(s.trim_end_matches(' '), arena)?)),
         other => Err(type_mismatch(name, &other)),
     }
 }
@@ -497,6 +499,7 @@ pub(crate) fn parse_qualified_ident<'a>(
 pub(crate) fn datum_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
         Datum::Text(s) => Ok(s),
+        Datum::Bpchar(s) => Ok(s),
         other => arena.alloc_str_display(other).map_err(|_| arena_full()),
     }
 }

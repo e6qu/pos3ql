@@ -556,12 +556,21 @@ fn smallint_varchar_char_type_fidelity() {
     assert!(run("INSERT INTO ty(s) VALUES (40000)").contains("smallint out of range"));
     assert!(run("INSERT INTO ty(s) VALUES (32767)").contains("INSERT"));
     assert!(run("SELECT s FROM ty WHERE s = 32767").contains("32767"), "round-trips");
-    // varchar length errors; char(n) blank-pads to n.
+    // varchar length errors; char(n) padding is *not* part of the value —
+    // PostgreSQL strips it through operators, so concatenation sees "hi".
     assert!(run("INSERT INTO ty(v) VALUES ('toolong')").contains("22001"));
     assert!(
         run("INSERT INTO ty(c) VALUES ('hi'); SELECT '[' || c || ']' FROM ty WHERE c IS NOT NULL")
-            .contains("[hi   ]"),
-        "char(5) pads to 5"
+            .contains("[hi]"),
+        "char(5) padding strips through concatenation"
+    );
+    assert!(
+        run("SELECT length(c) FROM ty WHERE c IS NOT NULL").contains('2'),
+        "length ignores char(n) padding"
+    );
+    assert!(
+        run("SELECT count(*) FROM ty WHERE c = 'hi'").contains('1'),
+        "char(n) compares equal to its stripped text"
     );
 }
 

@@ -17,6 +17,7 @@ use crate::sql::{datetime, guc, to_char};
 use crate::{sql_err, stack_format};
 
 use super::super::{
+    text_view,
     cast_to, datum_numeric, eval_full, int_arg, interval_extract, num_f64, num_factor,
     overlaps_end_micros, overlaps_micros, sqlstate, text_arg, timestamp_micros, type_mismatch,
     ColumnLookup, EvalHooks, SqlError,
@@ -206,6 +207,7 @@ pub(crate) fn dispatch<'a>(
                 if v.is_null() || f.is_null() {
                     return Ok(Datum::Null);
                 }
+                let f = text_view(f);
                 let Datum::Text(fmt) = f else {
                     return Err(type_mismatch(name, &f));
                 };

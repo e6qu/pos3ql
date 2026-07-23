@@ -535,6 +535,7 @@ impl<'a> AggState<'a> {
             // Only reached through the DISTINCT fold; the streaming path handles
             // string_agg directly (it needs the per-row delimiter).
             AggKind::StringAgg => {
+                let v = crate::sql::eval::text_view(v);
                 let Datum::Text(s) = v else {
                     return Err(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
@@ -624,7 +625,7 @@ impl<'a> AggState<'a> {
                 "string_agg requires exactly two arguments"
             ));
         }
-        let value = eval_full(args[0], arena, params, row, hooks)?;
+        let value = crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?);
         if value.is_null() {
             return Ok(());
         }
@@ -635,7 +636,7 @@ impl<'a> AggState<'a> {
             ));
         };
         let sep = eval_full(args[1], arena, params, row, hooks)?;
-        let sep_str = match sep {
+        let sep_str = match crate::sql::eval::text_view(sep) {
             Datum::Text(s) => s,
             Datum::Null => "",
             _ => {
@@ -907,7 +908,9 @@ impl<'a> AggState<'a> {
         }
         let sep = self.sep.unwrap_or("");
         for &row in rows.iter() {
-            let Datum::Text(s) = crate::sql::exec::decode_projected_pub(row, 0) else {
+            let Datum::Text(s) =
+                crate::sql::eval::text_view(crate::sql::exec::decode_projected_pub(row, 0))
+            else {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "string_agg value must be text"

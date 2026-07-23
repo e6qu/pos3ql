@@ -15,6 +15,7 @@ use crate::sql::types::Datum;
 use crate::sql_err;
 
 use super::super::{
+    text_view,
     arena_full, arity_err, eval_full, json_path_parts, json_to_text, json_tree_arg, sqlstate,
     type_mismatch, ColumnLookup, EvalHooks, SqlError,
 };
@@ -92,7 +93,7 @@ pub(crate) fn dispatch<'a>(
             }
             "jsonb_array_length" | "json_array_length" => {
                 arity(1)?;
-                let s = match eval_full(args[0], arena, params, row, hooks)? {
+                let s = match text_view(eval_full(args[0], arena, params, row, hooks)?) {
                     Datum::Json { text, .. } => text,
                     Datum::Text(s) => s,
                     Datum::Null => return Ok(Datum::Null),
@@ -106,7 +107,7 @@ pub(crate) fn dispatch<'a>(
             // The JSON type name of the value, as PostgreSQL's json_typeof.
             "jsonb_typeof" | "json_typeof" => {
                 arity(1)?;
-                let s = match eval_full(args[0], arena, params, row, hooks)? {
+                let s = match text_view(eval_full(args[0], arena, params, row, hooks)?) {
                     Datum::Json { text, .. } => text,
                     Datum::Text(s) => s,
                     Datum::Null => return Ok(Datum::Null),
@@ -127,7 +128,7 @@ pub(crate) fn dispatch<'a>(
                 if star || args.is_empty() {
                     return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}(...) does not exist", name));
                 }
-                let (text, jsonb) = match eval_full(args[0], arena, params, row, hooks)? {
+                let (text, jsonb) = match text_view(eval_full(args[0], arena, params, row, hooks)?) {
                     Datum::Json { text, jsonb } => (text, jsonb),
                     Datum::Text(s) => (s, name.starts_with("jsonb")),
                     Datum::Null => return Ok(Datum::Null),
@@ -136,7 +137,7 @@ pub(crate) fn dispatch<'a>(
                 let as_text = name.ends_with("_text");
                 let mut node = json::parse(text, arena)?;
                 for key_arg in &args[1..] {
-                    let step = eval_full(key_arg, arena, params, row, hooks)?;
+                    let step = text_view(eval_full(key_arg, arena, params, row, hooks)?);
                     let Datum::Text(key) = step else {
                         return Ok(Datum::Null);
                     };
@@ -206,7 +207,7 @@ pub(crate) fn dispatch<'a>(
                 // handled per the fifth argument instead of nulling the result.
                 if lax && raw_value.is_null() {
                     let treatment = if args.len() == 5 {
-                        match eval_full(args[4], arena, params, row, hooks)? {
+                        match text_view(eval_full(args[4], arena, params, row, hooks)?) {
                             Datum::Text(t) => t,
                             Datum::Null => return Ok(Datum::Null),
                             other => {

@@ -28,7 +28,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Timetz(..) => 12,
             Datum::Interval(_) => 16,
             Datum::Uuid(_) => 16,
-            Datum::Text(s) => 4 + s.len(),
+            Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
             Datum::Json { text, .. } | Datum::Range { text, .. } | Datum::Multirange { text, .. } => 4 + text.len(),
             // 4-byte payload length, 1 flag byte (varying), then the bit chars.
             Datum::Bit { bits, .. } => 5 + bits.len(),
@@ -73,7 +73,7 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[..8].copy_from_slice(&x.to_le_bytes());
                 take = 8;
             }
-            Datum::Text(s) => {
+            Datum::Text(s) | Datum::Bpchar(s) => {
                 rest[..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
                 rest[4..4 + s.len()].copy_from_slice(s.as_bytes());
                 take = 4 + s.len();
@@ -199,7 +199,15 @@ pub(crate) fn decode<'a>(
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
                 at += len;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
-                out[i] = Datum::Text(s);
+                // A char(n) value is stored blank-padded, and in PostgreSQL the
+                // padding is part of the value — `max(c)` returns it padded
+                // even under typmod -1 — so it decodes into the variant that
+                // knows it: comparisons and text casts strip, output does not.
+                out[i] = if matches!(schema[i], ColType::Bpchar) {
+                    Datum::Bpchar(s)
+                } else {
+                    Datum::Text(s)
+                };
             }
             ColType::Date => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;

@@ -528,10 +528,12 @@ fn comparable(a: ColType, b: ColType) -> bool {
     let datetime = |t: ColType| matches!(t, Date | Timestamp | Timestamptz);
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
+    let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar);
     (numeric(a) && numeric(b))
         || (datetime(a) && datetime(b))
         || (timeofday(a) && timeofday(b))
         || (bit(a) && bit(b))
+        || (stringy(a) && stringy(b))
 }
 
 fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {

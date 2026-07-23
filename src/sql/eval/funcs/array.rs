@@ -14,6 +14,7 @@ use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
+    text_view,
     arena_full, arity_err, cast_to, compare_datums, eval_full, load_array, sqlstate, text_arg,
     type_mismatch, unify_arr_elem, ColumnLookup, EvalHooks, SqlError,
 };
@@ -341,7 +342,7 @@ pub(crate) fn dispatch<'a>(
                 // Third argument is the string substituted for NULL elements; when
                 // absent (or itself NULL) NULL elements are omitted entirely.
                 let nullrep = if args.len() == 3 {
-                    match eval_full(args[2], arena, params, row, hooks)? {
+                    match text_view(eval_full(args[2], arena, params, row, hooks)?) {
                         Datum::Null => None,
                         Datum::Text(s) => Some(s),
                         other => return Err(type_mismatch("array_to_string null string", &other)),
@@ -354,7 +355,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Array { element, raw } => (element, raw),
                     other => return Err(type_mismatch("array_to_string", &other)),
                 };
-                let delim = match delim {
+                let delim = match text_view(delim) {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Text(s) => s,
                     other => return Err(type_mismatch("array_to_string delimiter", &other)),

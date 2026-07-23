@@ -343,6 +343,11 @@ pub(crate) fn compare_datums_as(
     let ord = match (l, r) {
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
         (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
+        (Datum::Bpchar(a), Datum::Bpchar(b)) => {
+            a.trim_end_matches(' ').cmp(b.trim_end_matches(' '))
+        }
+        (Datum::Bpchar(a), Datum::Text(b)) => a.trim_end_matches(' ').cmp(*b),
+        (Datum::Text(a), Datum::Bpchar(b)) => (*a).cmp(b.trim_end_matches(' ')),
         (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
         (Datum::Timestamp(a), Datum::Timestamp(b))
         | (Datum::Timestamptz(a), Datum::Timestamptz(b))
@@ -504,6 +509,7 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
             Datum::Timestamptz(datetime::parse_timestamp(s, true)?)
         }
         Datum::Uuid(_) => Datum::Uuid(parse_uuid(s)?),
+        Datum::Bpchar(_) => Datum::Bpchar(s),
         Datum::Time(_) => Datum::Time(datetime::parse_time(s)?),
         Datum::Timetz(..) => {
             let (t, zone) = datetime::parse_timetz(s)?;

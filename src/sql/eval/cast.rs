@@ -35,6 +35,11 @@ pub fn cast_to<'a>(
     if v.is_null() {
         return Ok(Datum::Null);
     }
+    let v = match v {
+        Datum::Bpchar(_) if target == ColType::Bpchar => return Ok(v),
+        Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),
+        other => other,
+    };
     let out = match target {
         ColType::Bool => match v {
             Datum::Bool(_) => v,
@@ -377,6 +382,8 @@ pub(crate) fn parse_bytea<'a>(s: &str, arena: &'a Arena) -> Result<&'a [u8], Sql
 pub(crate) fn cast_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
         Datum::Text(s) => Ok(s),
+        // bpchar-to-text strips the padding (`c || 'x'` sees "hi", not "hi   ").
+        Datum::Bpchar(s) => Ok(s.trim_end_matches(' ')),
         Datum::Bool(b) => Ok(if b { "true" } else { "false" }),
         Datum::Bytea(b) => {
             // 2 + 2 bytes per input byte, straight into the arena.

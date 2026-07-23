@@ -385,17 +385,7 @@ pub(crate) fn materialized_rows<'a>(
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
     if statement.distinct && n_on == 0 {
-        rows.sort_unstable();
-        let mut unique = 0usize;
-        for i in 0..rows.len() {
-            let same = i > 0
-                && visible_prefix(rows[i], width) == visible_prefix(rows[i - 1], width);
-            if !same {
-                rows[unique] = rows[i];
-                unique += 1;
-            }
-        }
-        live = unique;
+        live = crate::sql::exec::sort_dedup_projected(rows, width);
     }
     let rows = &mut rows[..live];
 
@@ -528,11 +518,3 @@ pub(crate) fn materialized_select<'a>(
     sql_ok()
 }
 
-/// Byte span of the first `width` encoded columns.
-pub(crate) fn visible_prefix(bytes: &[u8], width: usize) -> &[u8] {
-    // Sizes come from the decoder itself. This used to carry its own tag table
-    // covering only the first eleven, so `SELECT DISTINCT` over a time, an
-    // interval, a json, a range — anything encoded with a later tag — reached
-    // its `unreachable!()` and took the server down with it.
-    &bytes[..crate::sql::exec::projected_prefix_len(bytes, width)]
-}

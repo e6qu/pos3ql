@@ -46,7 +46,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Timetz(..) => 12,
         Datum::Interval(_) => 16,
         Datum::Uuid(_) => 16,
-        Datum::Text(s) => 4 + s.len(),
+        Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::Array { raw, .. } => 6 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
@@ -104,6 +104,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 4;
             out[1..9].copy_from_slice(&x.to_bits().to_le_bytes());
             9
+        }
+        Datum::Bpchar(str_value) => {
+            out[0] = 21;
+            out[1..5].copy_from_slice(&(str_value.len() as u32).to_le_bytes());
+            out[5..5 + str_value.len()].copy_from_slice(str_value.as_bytes());
+            5 + str_value.len()
         }
         Datum::Text(str_value) => {
             out[0] = 5;
@@ -347,6 +353,17 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 7 + ndigits * 2,
             )
         }
+        21 => {
+            let len =
+                u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (
+                Datum::Bpchar(
+                    core::str::from_utf8(&bytes[at + 4..at + 4 + len])
+                        .expect("encoded from valid UTF-8"),
+                ),
+                4 + len,
+            )
+        }
         20 => (
             Datum::Timetz(
                 i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
@@ -384,4 +401,46 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
         at += size;
         current += 1;
     }
+}
+/// Compares two encoded rows' first `width` columns under SQL equality:
+/// column bytes compare directly except bpchar values, which compare by their
+/// stripped text — cross-width padding must not split a DISTINCT group.
+fn cmp_projected_prefix(a: &[u8], b: &[u8], width: usize) -> core::cmp::Ordering {
+    let (mut ia, mut ib) = (1usize, 1usize);
+    for _ in 0..width {
+        let (ta, tb) = (a[ia], b[ib]);
+        ia += 1;
+        ib += 1;
+        let (da, sa) = decode_projected_value(a, ta, ia);
+        let (db, sb) = decode_projected_value(b, tb, ib);
+        let ord = match (da, db) {
+            (Datum::Bpchar(x), Datum::Bpchar(y)) => {
+                x.trim_end_matches(' ').cmp(y.trim_end_matches(' '))
+            }
+            _ => a[ia - 1..ia + sa].cmp(&b[ib - 1..ib + sb]),
+        };
+        if !ord.is_eq() {
+            return ord;
+        }
+        ia += sa;
+        ib += sb;
+    }
+    core::cmp::Ordering::Equal
+}
+
+/// DISTINCT over encoded rows: sorts (grouping SQL-equal rows adjacently,
+/// byte order as the tiebreak so the surviving representative is
+/// deterministic) and keeps the first of each run. Returns the live count.
+pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
+    rows.sort_unstable_by(|a, b| cmp_projected_prefix(a, b, width).then_with(|| a.cmp(b)));
+    let mut unique = 0usize;
+    for i in 0..rows.len() {
+        let same =
+            i > 0 && cmp_projected_prefix(rows[i], rows[unique - 1], width).is_eq();
+        if !same {
+            rows[unique] = rows[i];
+            unique += 1;
+        }
+    }
+    unique
 }

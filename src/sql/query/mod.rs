@@ -33,7 +33,7 @@ use setops::materialize_set_body;
 
 mod materialize;
 use materialize::{
-    finalize_projected_row, materialized_rows, materialized_select, visible_prefix, ScopeSchema,
+    finalize_projected_row, materialized_rows, materialized_select, ScopeSchema,
 };
 
 mod scan;
@@ -1655,17 +1655,7 @@ pub fn constant_select<'a>(
 
     let mut live = out_rows.len();
     if statement.distinct {
-        out_rows.sort_unstable();
-        let mut unique = 0usize;
-        for i in 0..out_rows.len() {
-            let same = i > 0
-                && visible_prefix(out_rows[i], width) == visible_prefix(out_rows[i - 1], width);
-            if !same {
-                out_rows[unique] = out_rows[i];
-                unique += 1;
-            }
-        }
-        live = unique;
+        live = super::exec::sort_dedup_projected(out_rows, width);
     }
     let out_rows = &mut out_rows[..live];
     if n_order > 0 {

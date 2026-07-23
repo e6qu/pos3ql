@@ -1254,7 +1254,16 @@ pub(crate) fn dedup_window_rows<'a>(
     let empty: &[u8] = &[];
     let encoded = arena.alloc_slice_with(n, |_| empty).map_err(|_| arena_full())?;
     for i in 0..n {
-        encoded[i] = crate::sql::exec::encode_projected_pub(proj_rows[i], arena)?;
+        if proj_rows[i].iter().any(|d| matches!(d, Datum::Bpchar(_))) {
+            let key = arena
+                .alloc_slice_with(proj_rows[i].len(), |j| {
+                    crate::sql::eval::text_view(proj_rows[i][j])
+                })
+                .map_err(|_| arena_full())?;
+            encoded[i] = crate::sql::exec::encode_projected_pub(key, arena)?;
+        } else {
+            encoded[i] = crate::sql::exec::encode_projected_pub(proj_rows[i], arena)?;
+        }
     }
     index.sort_unstable_by(|&a, &b| encoded[a].cmp(encoded[b]));
     let mut unique = 0usize;

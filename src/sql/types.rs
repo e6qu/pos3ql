@@ -384,7 +384,7 @@ impl ArrElem {
             Datum::Int4(_) => ArrElem::Int4,
             Datum::Int8(_) => ArrElem::Int8,
             Datum::Float8(_) => ArrElem::Float8,
-            Datum::Text(_) => ArrElem::Text,
+            Datum::Text(_) | Datum::Bpchar(_) => ArrElem::Text,
             Datum::Numeric(_) => ArrElem::Numeric,
             Datum::Date(_) => ArrElem::Date,
             Datum::Timestamp(_) => ArrElem::Timestamp,
@@ -706,6 +706,13 @@ pub enum Datum<'a> {
     Int8(i64),
     Float8(f64),
     Text(&'a str),
+    /// A `char(n)` value, blank-padded to its declared width. The padding is
+    /// part of the value (PostgreSQL emits `max(c)` padded even when the
+    /// result typmod is -1), but it is *semantically* insignificant: casts to
+    /// other string types, comparisons, and functions taking `text` all see
+    /// the stripped form, while output functions, `LIKE`/regex matching, and
+    /// `octet_length` see the raw padded form.
+    Bpchar(&'a str),
     /// Days since 2000-01-01.
     Date(i32),
     /// Microseconds since 2000-01-01 (naive).
@@ -768,6 +775,7 @@ impl<'a> Datum<'a> {
             Datum::Int8(_) => oid::INT8,
             Datum::Float8(_) => oid::FLOAT8,
             Datum::Text(_) => oid::TEXT,
+            Datum::Bpchar(_) => oid::BPCHAR,
             Datum::Date(_) => oid::DATE,
             Datum::Timestamp(_) => oid::TIMESTAMP,
             Datum::Timestamptz(_) => oid::TIMESTAMPTZ,
@@ -807,7 +815,8 @@ impl fmt::Display for Datum<'_> {
                     write!(f, "{v}")
                 }
             }
-            Datum::Text(s) => f.write_str(s),
+            // The output function emits the padding — psql shows `hi   `.
+            Datum::Text(s) | Datum::Bpchar(s) => f.write_str(s),
             Datum::Date(d) => f.write_str(super::datetime::format_date(*d).as_str()),
             Datum::Timestamp(t) => {
                 f.write_str(super::datetime::format_timestamp(*t, false).as_str())

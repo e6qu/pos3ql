@@ -28,6 +28,7 @@ pub(crate) use pattern::regex_split;
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
 pub use operators::compare_datums;
+pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
 pub(crate) use operators::arithmetic;
 use operators::{binary, coerce_unknown, logic, membership_eq, range_mismatch, unary};
 
@@ -431,6 +432,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
 /// character, or the empty string to mean no escaping at all, and refuses
 /// anything longer.
 pub(crate) fn escape_char(d: Datum<'_>) -> Result<Option<char>, SqlError> {
+    let d = text_view(d);
     let Datum::Text(s) = d else {
         return Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -587,7 +589,8 @@ pub fn eval_full<'a>(
                     // `'relname'::regclass` resolves to the relation's OID, so a
                     // catalog query's `attrelid = 'tbl'::regclass` compares OIDs
                     // (pgx and most tools introspect this way).
-                    Datum::Text(name) => {
+                    Datum::Text(name) | Datum::Bpchar(name) => {
+                        let name = name.trim_end_matches(' ');
                         if let Some(oid) = cat.reloid(name) {
                             return Ok(Datum::Int4(oid));
                         }
@@ -723,7 +726,10 @@ pub fn eval_full<'a>(
             };
             match (v, p) {
                 (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
-                (Datum::Text(s), Datum::Text(pat)) => {
+                (
+                    Datum::Text(s) | Datum::Bpchar(s),
+                    Datum::Text(pat) | Datum::Bpchar(pat),
+                ) => {
                     let matched = like_match(s, pat, case_insensitive, escape.unwrap_or(Some('\\')));
                     Ok(Datum::Bool(matched != negated))
                 }
@@ -740,7 +746,10 @@ pub fn eval_full<'a>(
             let p = eval_full(pattern, arena, params, row, hooks)?;
             match (v, p) {
                 (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
-                (Datum::Text(s), Datum::Text(pat)) => {
+                (
+                    Datum::Text(s) | Datum::Bpchar(s),
+                    Datum::Text(pat) | Datum::Bpchar(pat),
+                ) => {
                     let matched = super::regex::regex_search(pat, s, case_insensitive)?;
                     Ok(Datum::Bool(matched != negated))
                 }
@@ -907,7 +916,12 @@ pub fn eval_full<'a>(
             let ct = element.to_coltype();
             for v in vals.iter_mut().take(items.len()) {
                 if !v.is_null() {
-                    *v = cast_to(*v, ct, arena)?;
+                    *v = match *v {
+                        // A bpchar element keeps its padding in the array
+                        // value, as PostgreSQL's array_out shows it.
+                        Datum::Bpchar(s) => Datum::Text(s),
+                        other => cast_to(other, ct, arena)?,
+                    };
                 }
             }
             Ok(Datum::Array { element, raw: super::array::build(&vals[..items.len()], arena)? })
@@ -2459,6 +2473,17 @@ fn session_zone_at(utc_micros: i64) -> i32 {
     super::timezone::session().resolve(utc_micros).0
 }
 
+/// The text a bpchar value presents to any text-typed context: PostgreSQL's
+/// bpchar-to-text cast strips the blank padding, and every function or
+/// operator without a bpchar-specific form receives the value through that
+/// cast. Other datums pass through untouched.
+pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
+    match d {
+        Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),
+        other => other,
+    }
+}
+
 pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
     type_name_of(d)
 }
@@ -2473,6 +2498,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Float8(_) => "double precision",
         Datum::Numeric(_) => "numeric",
         Datum::Text(_) => "text",
+        Datum::Bpchar(_) => "character",
         Datum::Date(_) => "date",
         Datum::Timestamp(_) => "timestamp without time zone",
         Datum::Timestamptz(_) => "timestamp with time zone",

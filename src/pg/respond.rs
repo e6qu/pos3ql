@@ -302,7 +302,7 @@ impl<'b> Responder<'b> {
                 Datum::Null => {
                     m.i32(-1);
                 }
-                Datum::Text(s) => {
+                Datum::Text(s) | Datum::Bpchar(s) => {
                     m.i32(s.len() as i32);
                     m.bytes(s.as_bytes());
                 }
@@ -467,7 +467,7 @@ impl<'b> Responder<'b> {
                     m.i32(8);
                     m.bytes(&x.to_bits().to_be_bytes());
                 }
-                Datum::Text(s) => {
+                Datum::Text(s) | Datum::Bpchar(s) => {
                     m.i32(s.len() as i32);
                     m.bytes(s.as_bytes());
                 }

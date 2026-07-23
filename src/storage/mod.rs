@@ -134,7 +134,7 @@ impl OwnedDatum {
                     digits,
                 }
             }
-            Datum::Text(s) => {
+            Datum::Text(s) | Datum::Bpchar(s) => {
                 if s.len() > MAX_DEFAULT_TEXT {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,

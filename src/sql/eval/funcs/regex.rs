@@ -236,10 +236,16 @@ pub(crate) fn dispatch<'a>(
                 // to a POSIX regex anchored to the whole string, then matched by the
                 // shared regex engine.
                 arity_between(2, 3)?;
-                let (Some(text), Some(pattern)) = (
-                    text_arg(name, args, 0, arena, params, row, hooks)?,
-                    text_arg(name, args, 1, arena, params, row, hooks)?,
-                ) else {
+                // The matched string and pattern keep bpchar padding: SIMILAR TO
+                // is pattern matching, which PostgreSQL runs on the raw value.
+                let raw_text = |i: usize| -> Result<Option<&'a str>, SqlError> {
+                    match eval_full(args[i], arena, params, row, hooks)? {
+                        Datum::Null => Ok(None),
+                        Datum::Text(s) | Datum::Bpchar(s) => Ok(Some(s)),
+                        other => Err(super::super::type_mismatch_pub(name, &other)),
+                    }
+                };
+                let (Some(text), Some(pattern)) = (raw_text(0)?, raw_text(1)?) else {
                     return Ok(Datum::Null);
                 };
                 // `ESCAPE c` arrives as a third argument; without it the escape

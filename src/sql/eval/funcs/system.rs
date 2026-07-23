@@ -211,19 +211,20 @@ pub(crate) fn dispatch<'a>(
                         stack_format!(64, "{}({},{})", name, (packed >> 16) & 0xffff, packed & 0xffff)
                     }
                     ColType::Time | ColType::Timetz | ColType::Timestamp | ColType::Timestamptz => {
-                        // The precision sits inside the name, before the time
-                        // zone tail — `timestamp(3) without time zone`. The
-                        // split finds it for both spellings, since "without"
-                        // begins with "with". The stored modifier carries the
-                        // 4-byte header here, which PostgreSQL's does not for
-                        // these types (B-140); rendering subtracts it so the
-                        // text is right while the encoding is not yet.
+                        // The precision is the bare modifier, and it sits inside
+                        // the name before the time-zone tail —
+                        // `timestamp(3) without time zone`. The split finds the
+                        // tail for both spellings, since "without" begins "with".
                         match name.split_once(" with") {
                             Some((head, tail)) => {
-                                stack_format!(64, "{}({}) with{}", head, type_mod - 4, tail)
+                                stack_format!(64, "{}({}) with{}", head, type_mod, tail)
                             }
-                            None => stack_format!(64, "{}({})", name, type_mod - 4),
+                            None => stack_format!(64, "{}({})", name, type_mod),
                         }
+                    }
+                    ColType::Interval => {
+                        // The precision is the low half of the packed modifier.
+                        stack_format!(64, "interval({})", type_mod & 0xffff)
                     }
                     // Every other type ignores a modifier, as PostgreSQL does.
                     _ => return Ok(Datum::Text(name)),

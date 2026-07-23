@@ -1986,7 +1986,9 @@ pub fn apply_cast_typmod<'a>(
     type_mod: i32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    if type_mod < 4 || v.is_null() {
+    // -1 means no modifier for every type; temporal precisions are a bare
+    // 0..6 (no 4-byte header), so the guard is `< 0`, not `< 4`.
+    if type_mod < 0 || v.is_null() {
         return Ok(v);
     }
     match (ctype, v) {
@@ -2049,7 +2051,9 @@ pub fn apply_typmod<'a>(
     type_mod: i32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    if type_mod < 4 || v.is_null() {
+    // -1 means no modifier for every type; temporal precisions are a bare
+    // 0..6 (no 4-byte header), so the guard is `< 0`, not `< 4`.
+    if type_mod < 0 || v.is_null() {
         return Ok(v);
     }
     match (ctype, v) {
@@ -2077,20 +2081,20 @@ pub fn apply_typmod<'a>(
         // Fractional-second precision: micros round half-away-from-zero in
         // integer arithmetic, as PostgreSQL's AdjustTimestampForTypmod.
         (ColType::Timestamp, Datum::Timestamp(t)) => {
-            Ok(Datum::Timestamp(round_micros(t, type_mod - 4)))
+            Ok(Datum::Timestamp(round_micros(t, type_mod)))
         }
         (ColType::Timestamptz, Datum::Timestamptz(t)) => {
-            Ok(Datum::Timestamptz(round_micros(t, type_mod - 4)))
+            Ok(Datum::Timestamptz(round_micros(t, type_mod)))
         }
-        (ColType::Time, Datum::Time(t)) => Ok(Datum::Time(round_micros(t, type_mod - 4))),
+        (ColType::Time, Datum::Time(t)) => Ok(Datum::Time(round_micros(t, type_mod))),
         (ColType::Timetz, Datum::Timetz(t, zone)) => {
-            Ok(Datum::Timetz(round_micros(t, type_mod - 4), zone))
+            Ok(Datum::Timetz(round_micros(t, type_mod), zone))
         }
         (ColType::Interval, Datum::Interval(iv)) => Ok(Datum::Interval(
             crate::sql::types::Interval {
                 months: iv.months,
                 days: iv.days,
-                micros: round_micros(iv.micros, type_mod - 4),
+                micros: round_micros(iv.micros, type_mod & 0xFFFF),
             },
         )),
         _ => Ok(v),

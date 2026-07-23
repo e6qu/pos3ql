@@ -19,6 +19,10 @@ pub(crate) const SIMILAR_TO: &str = "similar to";
 pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
 
 pub const MAX_LIST: usize = 64;
+
+/// PostgreSQL's INTERVAL_FULL_RANGE: the field-range mask a plain `interval(p)`
+/// carries in the high half of its atttypmod.
+pub(crate) const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
 pub const MAX_CTES: usize = 16;
 /// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
 pub const MAX_WINDOW_DEFS: usize = 16;
@@ -1578,7 +1582,17 @@ impl<'a> Parser<'a> {
                         if zoned { " WITH TIME ZONE" } else { "" }
                     ));
                 }
-                Ok(nums[0].min(6) as i32 + 4)
+                let precision = nums[0].min(6) as i32;
+                // PostgreSQL's atttypmod for these is the bare precision — no
+                // 4-byte header, unlike varchar(n)/numeric(p,s) — except
+                // interval, which packs the field-range mask into the high half
+                // and the precision into the low half. A plain `interval(p)`
+                // has the full field range.
+                if base == "interval" {
+                    Ok((INTERVAL_FULL_RANGE << 16) | precision)
+                } else {
+                    Ok(precision)
+                }
             }
             _ => Err(self.unexpected("type modifier is not supported for this type yet")),
         }

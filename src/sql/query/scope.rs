@@ -202,10 +202,13 @@ impl<'d> QueryScope<'d> {
             return self.add_table_func(tref, arena, params, true);
         }
         let Some(sub) = tref.subquery else {
-            if crate::sql::catalog::is_catalog_relation(tref.schema, tref.table) {
+            if matches!(
+                storage.resolve_relation(tref.schema, tref.table, txid),
+                Some(crate::storage::ResolvedRelation::Catalog)
+            ) {
                 return self.add_catalog(storage, tref, arena, true);
             }
-            return self.add(storage, tref.table, tref.alias, txid);
+            return self.add(storage, tref.schema, tref.table, tref.alias, txid);
         };
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
@@ -289,10 +292,13 @@ impl<'d> QueryScope<'d> {
             return self.add_table_func(tref, arena, &[], false);
         }
         let Some(sub) = tref.subquery else {
-            if crate::sql::catalog::is_catalog_relation(tref.schema, tref.table) {
+            if matches!(
+                storage.resolve_relation(tref.schema, tref.table, txid),
+                Some(crate::storage::ResolvedRelation::Catalog)
+            ) {
                 return self.add_catalog(storage, tref, arena, false);
             }
-            return self.add(storage, tref.table, tref.alias, txid);
+            return self.add(storage, tref.schema, tref.table, tref.alias, txid);
         };
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
@@ -407,18 +413,29 @@ impl<'d> QueryScope<'d> {
     pub(crate) fn add(
         &mut self,
         storage: &'d Storage,
+        schema: Option<&str>,
         table: &str,
         alias: Option<&'d str>,
         txid: u32,
     ) -> Result<(), SqlError> {
         // `txid == 0` (schema-only / Describe) resolves against the committed
         // catalog; a real transaction sees its own uncommitted CREATE/DROP.
-        let Some(slot) = storage.find_visible(table, txid) else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "relation \"{}\" does not exist",
-                table
-            ));
+        let Some(crate::storage::ResolvedRelation::Table(slot)) =
+            storage.resolve_relation(schema, table, txid)
+        else {
+            return Err(match schema {
+                Some(s) => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}.{}\" does not exist",
+                    s,
+                    table
+                ),
+                None => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    table
+                ),
+            });
         };
         let def = &storage.table(slot).def;
         let exposed = alias.unwrap_or(def.name.as_str());

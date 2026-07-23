@@ -112,6 +112,9 @@ pub struct GucState {
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
     search_path: StackStr<128>,
+    /// The startup packet's user, for `current_user` and `"$user"` in the
+    /// search path. Trust auth: the client's claim is the identity.
+    session_user: StackStr<64>,
     client_min_messages: MessageLevel,
     extra_float_digits: StackStr<8>,
     lock_timeout: StackStr<24>,
@@ -138,6 +141,7 @@ impl GucState {
             client_encoding: StackStr::new(),
             application_name: StackStr::new(),
             search_path: StackStr::new(),
+            session_user: StackStr::new(),
             client_min_messages: MessageLevel::Notice,
             extra_float_digits: StackStr::new(),
             lock_timeout: StackStr::new(),
@@ -149,6 +153,7 @@ impl GucState {
         let _ = write!(g.timezone, "UTC");
         let _ = write!(g.client_encoding, "UTF8");
         let _ = write!(g.search_path, "\"$user\", public");
+        let _ = write!(g.session_user, "postgres");
         let _ = write!(g.extra_float_digits, "1");
         let _ = write!(g.lock_timeout, "0");
         let _ = write!(g.statement_timeout, "0");
@@ -157,6 +162,19 @@ impl GucState {
     }
 
     /// The current statement_timeout in milliseconds (0 = disabled).
+    pub fn search_path(&self) -> &str {
+        self.search_path.as_str()
+    }
+
+    pub fn session_user(&self) -> &str {
+        self.session_user.as_str()
+    }
+
+    pub fn set_session_user(&mut self, user: &str) {
+        self.session_user = StackStr::new();
+        let _ = core::fmt::Write::write_str(&mut self.session_user, user);
+    }
+
     pub fn statement_timeout_ms(&self) -> u64 {
         parse_timeout_ms(self.statement_timeout.as_str()).unwrap_or(0)
     }
@@ -243,15 +261,15 @@ impl GucState {
             return store(&mut self.application_name, if is_default { "" } else { v });
         }
         if name.eq_ignore_ascii_case("search_path") {
-            // Name resolution searches pg_catalog + public; a search_path that
-            // still reaches public is honored, anything else is not yet.
-            if is_default || mentions_public(v) {
-                return store(&mut self.search_path, if is_default { "\"$user\", public" } else { v });
+            if is_default {
+                return store(&mut self.search_path, "\"$user\", public");
             }
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "search_path without \"public\" is not supported yet"
-            ));
+            let mut canonical = StackStr::<128>::new();
+            // The raw text, not the pre-unquoted value: quoting decides how
+            // elements split, and a single-quoted string is one element
+            // however many commas it holds.
+            canonicalize_search_path(raw, &mut canonical)?;
+            return store(&mut self.search_path, canonical.as_str());
         }
         if name.eq_ignore_ascii_case("extra_float_digits") {
             // Floats already render at their shortest exact round-trip form —
@@ -602,8 +620,94 @@ fn is_utf8(v: &str) -> bool {
     v.eq_ignore_ascii_case("utf8") || v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("unicode")
 }
 
-fn mentions_public(v: &str) -> bool {
-    v.split(',').any(|p| p.trim().eq_ignore_ascii_case("public"))
+/// Renders a `SET search_path` value the way PostgreSQL stores it for SHOW:
+/// elements comma-space separated, bare identifiers case-folded to lower, and
+/// an element quoted on output when it needs quoting (`"$user"`, mixed case,
+/// spaces). Elements split on commas *outside* quotes: a single-quoted
+/// string is one element however many commas it contains.
+fn canonicalize_search_path(v: &str, out: &mut StackStr<128>) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let mut first = true;
+    let mut rest = v.trim();
+    while !rest.is_empty() {
+        // Take one element: up to a comma not inside '...' or "...".
+        let mut depth_single = false;
+        let mut depth_double = false;
+        let mut split = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '\'' if !depth_double => depth_single = !depth_single,
+                '"' if !depth_single => depth_double = !depth_double,
+                ',' if !depth_single && !depth_double => {
+                    split = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let element = rest[..split].trim();
+        rest = rest.get(split + 1..).unwrap_or("").trim_start();
+        if element.is_empty() {
+            continue;
+        }
+        let mut name = StackStr::<64>::new();
+        if element.starts_with('"') {
+            let raw = element.trim_matches('"');
+            let mut chars = raw.chars().peekable();
+            while let Some(c) = chars.next() {
+                let _ = write!(name, "{c}");
+                if c == '"' {
+                    chars.next();
+                }
+            }
+        } else if element.starts_with('\'') {
+            let raw = element.trim_matches('\'');
+            let mut chars = raw.chars().peekable();
+            while let Some(c) = chars.next() {
+                let _ = write!(name, "{c}");
+                if c == '\'' {
+                    chars.next();
+                }
+            }
+        } else {
+            for c in element.chars() {
+                let _ = write!(name, "{}", c.to_ascii_lowercase());
+            }
+        }
+        let plain = name
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && name
+                .as_str()
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b == b'_');
+        if !first {
+            let _ = write!(out, ", ");
+        }
+        first = false;
+        if plain {
+            let _ = write!(out, "{}", name.as_str());
+        } else {
+            let _ = write!(out, "\"");
+            for c in name.as_str().chars() {
+                if c == '"' {
+                    let _ = write!(out, "\"\"");
+                } else {
+                    let _ = write!(out, "{c}");
+                }
+            }
+            let _ = write!(out, "\"");
+        }
+        if out.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "search_path is too long (limit 128 bytes)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_read_only(name: &str) -> bool {

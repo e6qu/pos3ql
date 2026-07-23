@@ -437,7 +437,22 @@ pub fn record_field_type(
     field: &str,
     columns: &dyn ColTypeResolver,
 ) -> Result<ColType, SqlError> {
-    check_row_field_types(base, columns)?;
+    // A bare unknown literal cannot be coerced out of a ROW(...) — but only
+    // selecting *that* field (star expansion checks every field elsewhere)
+    // hits the failure; a typed sibling selects fine.
+    if let Expr::Call { name, args, .. } = base
+        && name.eq_ignore_ascii_case("row")
+        && let Some(position) = RECORD_FIELD_NAMES
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(field))
+        && let Some(arg) = args.get(position)
+        && infer_type_res(arg, columns)?.0 == oid::UNKNOWN
+    {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "failed to find conversion function from unknown to text"
+        ));
+    }
     let mut found = None;
     let shape = record_shape(base, columns, |name, ctype| {
         if found.is_none() && name.eq_ignore_ascii_case(field) {
@@ -445,19 +460,49 @@ pub fn record_field_type(
         }
     });
     if shape.is_none() {
-        return Err(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "field selection is not supported on this expression"
-        ));
+        // Not a record at all: PostgreSQL names the non-composite type.
+        let type_name = infer_type_res(base, columns)
+            .ok()
+            .and_then(|(oid, _)| coltype_of_oid(oid))
+            .map(|t| t.name())
+            .unwrap_or("record");
+        if type_name == "record" {
+            return Err(could_not_identify(field));
+        }
+        return Err(not_composite(field, type_name));
     }
-    found.ok_or_else(|| {
-        sql_err!(
+    found.ok_or_else(|| match base {
+        // A whole-row reference names the missing column with its table.
+        Expr::WholeRow(table) | Expr::Column { qualifier: None, name: table } => sql_err!(
             sqlstate::UNDEFINED_COLUMN,
-            "could not identify column \"{}\" in record data type",
+            "column {}.{} does not exist",
+            table,
             field
-        )
+        ),
+        _ => could_not_identify(field),
     })
 }
+
+/// PostgreSQL's 42703 for a field of an anonymous record.
+pub fn could_not_identify(field: &str) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_COLUMN,
+        "could not identify column \"{}\" in record data type",
+        field
+    )
+}
+
+/// PostgreSQL's 42809 for column notation on a non-composite value.
+pub fn not_composite(field: &str, type_name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::WRONG_OBJECT_TYPE,
+        "column notation .{} applied to type {}, which is not a composite type",
+        field,
+        type_name
+    )
+}
+
+
 
 /// No FROM clause: any column reference is an error.
 pub struct NoCols;

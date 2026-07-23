@@ -2,6 +2,22 @@
 //! references, so an entire statement tree lives exactly as long as the
 //! per-statement arena and costs nothing to drop.
 
+/// A possibly schema-qualified relation name, as written. `schema: None`
+/// means the statement spelled a bare name that resolves through the session
+/// search path; carrying the pair everywhere makes losing a qualifier
+/// impossible by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualName<'a> {
+    pub schema: Option<&'a str>,
+    pub name: &'a str,
+}
+
+impl<'a> QualName<'a> {
+    pub fn bare(name: &'a str) -> Self {
+        QualName { schema: None, name }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stmt<'a> {
     Select(Select<'a>),
@@ -21,21 +37,21 @@ pub enum Stmt<'a> {
     DropTable(DropTable<'a>),
     /// TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
     /// [CASCADE | RESTRICT].
-    Truncate { tables: &'a [&'a str], restart_identity: bool, cascade: bool },
+    Truncate { tables: &'a [QualName<'a>], restart_identity: bool, cascade: bool },
     /// CREATE [OR REPLACE] VIEW name AS <select>. `sql` is the raw SELECT text,
     /// stored and re-expanded as a derived table at query time.
-    CreateView { name: &'a str, or_replace: bool, sql: &'a str },
+    CreateView { name: QualName<'a>, or_replace: bool, sql: &'a str },
     /// DROP VIEW [IF EXISTS] name.
-    DropView { name: &'a str, if_exists: bool },
+    DropView { names: &'a [QualName<'a>], if_exists: bool },
     /// CREATE [UNIQUE] INDEX name ON table (col, ...).
     CreateIndex {
         name: &'a str,
-        table: &'a str,
+        table: QualName<'a>,
         columns: &'a [&'a str],
         unique: bool,
     },
     /// DROP INDEX [IF EXISTS] name.
-    DropIndex { name: &'a str, if_exists: bool },
+    DropIndex { names: &'a [QualName<'a>], if_exists: bool },
     /// SET name {=|TO} value. `value` is the raw source text of the value
     /// (quotes included); the session GUC store validates and applies it.
     Set { name: &'a str, value: &'a str },
@@ -59,6 +75,16 @@ pub enum Stmt<'a> {
     /// A set-operation query (UNION / INTERSECT / EXCEPT). A lone SELECT stays
     /// `Select` above; this variant appears only when a set operator is present.
     SetQuery(SetQuery<'a>),
+    /// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role] [element ...].
+    /// Elements are the embedded CREATE statements, executed with the new
+    /// schema as their creation target.
+    CreateSchema {
+        name: &'a str,
+        if_not_exists: bool,
+        elements: &'a [&'a Stmt<'a>],
+    },
+    /// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT].
+    DropSchema { names: &'a [&'a str], if_exists: bool, cascade: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +301,7 @@ pub struct OrderBy<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CreateTable<'a> {
-    pub name: &'a str,
+    pub name: QualName<'a>,
     pub columns: &'a [ColumnDef<'a>],
     /// Table-level constraints (multi-column PK/UNIQUE, CHECK, FOREIGN KEY),
     /// plus column-level CHECK/REFERENCES desugared into this list.
@@ -294,7 +320,7 @@ pub struct LikeClause<'a> {
     /// How many of `CreateTable::columns` precede this element, so
     /// `(z int, LIKE src, w text)` keeps PostgreSQL's column order.
     pub at: usize,
-    pub source: &'a str,
+    pub source: QualName<'a>,
     /// `INCLUDING DEFAULTS`.
     pub defaults: bool,
     /// `INCLUDING CONSTRAINTS` — CHECK constraints. NOT NULL is not part of
@@ -328,7 +354,7 @@ pub enum TableConstraint<'a> {
     ForeignKey {
         name: Option<&'a str>,
         columns: &'a [&'a str],
-        parent: &'a str,
+        parent: QualName<'a>,
         /// Referenced columns; empty means "the parent's primary key".
         parent_cols: &'a [&'a str],
         on_delete: FkAction,
@@ -350,7 +376,7 @@ pub enum FkAction {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DropTable<'a> {
-    pub name: &'a str,
+    pub names: &'a [QualName<'a>],
     pub if_exists: bool,
 }
 
@@ -370,7 +396,7 @@ pub struct ColumnDef<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Insert<'a> {
-    pub table: &'a str,
+    pub table: QualName<'a>,
     /// Empty means "all columns in table order".
     pub columns: &'a [&'a str],
     /// `VALUES` rows. Empty when the source is a `SELECT` (`select` is set).
@@ -398,7 +424,7 @@ pub struct OnConflict<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Update<'a> {
-    pub table: &'a str,
+    pub table: QualName<'a>,
     pub assignments: &'a [(&'a str, &'a Expr<'a>)],
     /// Extra tables joined for the assignment/WHERE (`UPDATE t SET ... FROM e`).
     pub from: Option<&'a FromClause<'a>>,
@@ -408,7 +434,7 @@ pub struct Update<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Delete<'a> {
-    pub table: &'a str,
+    pub table: QualName<'a>,
     /// Extra tables joined for the WHERE (`DELETE FROM t USING e`).
     pub using: Option<&'a FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
@@ -417,13 +443,15 @@ pub struct Delete<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AlterTable<'a> {
-    pub table: &'a str,
+    pub table: QualName<'a>,
     pub action: AlterAction<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterAction<'a> {
     RenameTable(&'a str),
+    /// ALTER TABLE ... SET SCHEMA new_schema.
+    SetSchema(&'a str),
     RenameColumn { from: &'a str, to: &'a str },
     AddColumn(ColumnDef<'a>),
     DropColumn(&'a str),

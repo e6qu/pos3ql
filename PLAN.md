@@ -403,7 +403,20 @@ suite's radar until the torture sorted 20k. All five now run on
 the statement arena, original position as the tiebreak, applied by cycles),
 property-tested against the standard sort across the threshold. The guard
 itself now prints an alloc-free backtrace (`backtrace_symbols_fd`) when it
-fires, so the next violation names its call site. The full IANA time-zone database follows (the larger half of B-071's remainder): TZif files parsed per RFC 8536 into fixed thread-local pools — a zone-name catalog walked at startup before the allocator freezes, zones loaded on demand (64-slot cache, loud when full), transition history binary-searched, the POSIX TZ footer rule (its own parser) covering the far future — with the embedded rule set kept as the no-zoneinfo fallback. Corpus 36 pins Moscow's +04 era, Caracas's -04:30, Lord Howe's half-hour DST, 1968 US rules, Chatham's +12:45, case-insensitive names, zone names in timestamp literals (resolved at the literal's instant), and session-zone interpretation of bare timestamptz literals — the last two being fidelity bugs the work surfaced and fixed. B-071's remaining item is schemas.
+fires, so the next violation names its call site. The full IANA time-zone database follows (the larger half of B-071's remainder): TZif files parsed per RFC 8536 into fixed thread-local pools — a zone-name catalog walked at startup before the allocator freezes, zones loaded on demand (64-slot cache, loud when full), transition history binary-searched, the POSIX TZ footer rule (its own parser) covering the far future — with the embedded rule set kept as the no-zoneinfo fallback. Corpus 36 pins Moscow's +04 era, Caracas's -04:30, Lord Howe's half-hour DST, 1968 US rules, Chatham's +12:45, case-insensitive names, zone names in timestamp literals (resolved at the literal's instant), and session-zone interpretation of bare timestamptz literals — the last two being fidelity bugs the work surfaced and fixed. B-071's remaining item was schemas, closed next (B-150): table identity
+becomes `(schema, name)` end to end — a `QualName` through the AST, a schema
+registry with catalog MVCC in storage, and every lookup routed through the
+per-statement search-path context — with `CREATE`/`DROP SCHEMA` (CASCADE
+severing inbound foreign keys via a definition-only WAL record, RESTRICT
+reporting dependents with PostgreSQL's DETAIL/HINT), a real `search_path` GUC
+(quote-aware list, `"$user"` from the startup packet's user, which now also
+backs `current_user`), `ALTER TABLE ... SET SCHEMA`, multi-name DROP, views
+bound to their creation path, schema-aware catalogs, and additive WAL/manifest
+persistence proven across kill -9 replay and wiped-disk cold starts. The
+record-access half of B-071 turned out mostly stale; its real divergences from
+PostgreSQL's static-type binding closed as B-151, leaving record-typed
+derived-table columns (B-152) and three-part column references (B-153) as the
+recorded remainder.
 
 ### Stage E — leveled compaction (background, paced, allocation-free)
 

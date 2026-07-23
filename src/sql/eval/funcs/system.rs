@@ -17,6 +17,63 @@ use crate::stack_format;
 
 use super::super::{arena_full, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
 
+std::thread_local! {
+    /// The session's startup user, published per statement (like the session
+    /// time zone) so `current_user` and friends reflect the connection.
+    static SESSION_USER: core::cell::RefCell<crate::util::StackStr<64>> =
+        core::cell::RefCell::new({
+            let mut s = crate::util::StackStr::new();
+            let _ = core::fmt::Write::write_str(&mut s, "postgres");
+            s
+        });
+}
+
+/// The effective search path's schema names, published per statement for
+/// `current_schema`/`current_schemas`. `catalog_pos` is where the implicit or
+/// explicit `pg_catalog` sits among them.
+#[derive(Clone, Copy)]
+pub struct SessionSchemas {
+    pub names: [crate::util::StackStr<64>; 17],
+    pub n: usize,
+    pub catalog_pos: usize,
+}
+
+std::thread_local! {
+    static SESSION_SCHEMAS: core::cell::RefCell<SessionSchemas> =
+        const {
+            core::cell::RefCell::new(SessionSchemas {
+                names: [crate::util::StackStr::new(); 17],
+                n: 0,
+                catalog_pos: 0,
+            })
+        };
+}
+
+pub fn set_session_schemas(schemas: SessionSchemas) {
+    SESSION_SCHEMAS.with(|s| *s.borrow_mut() = schemas);
+}
+
+fn session_schemas() -> SessionSchemas {
+    SESSION_SCHEMAS.with(|s| *s.borrow())
+}
+
+pub fn set_session_user(user: &str) {
+    SESSION_USER.with(|u| {
+        let mut u = u.borrow_mut();
+        *u = crate::util::StackStr::new();
+        let _ = core::fmt::Write::write_str(&mut *u, user);
+    });
+}
+
+pub fn session_user_owned() -> crate::util::StackStr<64> {
+    SESSION_USER.with(|u| *u.borrow())
+}
+
+fn session_user_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> {
+    let user = session_user_owned();
+    arena.alloc_str(user.as_str()).map_err(|_| arena_full())
+}
+
 /// Handles the system/introspection family. Returns `None` if `name` is not one
 /// of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -93,27 +150,48 @@ pub(crate) fn dispatch<'a>(
             }
             "current_schema" => {
                 arity(0)?;
-                Ok(Datum::Text("public"))
+                let schemas = session_schemas();
+                if schemas.n == 0 {
+                    return Ok(Datum::Null);
+                }
+                Ok(Datum::Text(
+                    arena.alloc_str(schemas.names[0].as_str()).map_err(|_| arena_full())?,
+                ))
             }
             // `current_schemas(bool)` returns the search-path schemas as a text[];
-            // with `true` it prepends the implicit pg_catalog.
+            // with `true` it includes pg_catalog at its (implicit or explicit)
+            // position.
             "current_schemas" => {
                 arity(1)?;
                 let include_implicit =
                     matches!(eval_full(args[0], arena, params, row, hooks)?, Datum::Bool(true));
-                let elems: &[Datum] = if include_implicit {
-                    &[Datum::Text("pg_catalog"), Datum::Text("public")]
-                } else {
-                    &[Datum::Text("public")]
-                };
+                let schemas = session_schemas();
+                let mut elems = [Datum::Null; 18];
+                let mut n = 0;
+                for (i, name) in schemas.names[..schemas.n].iter().enumerate() {
+                    if include_implicit && i == schemas.catalog_pos {
+                        elems[n] = Datum::Text("pg_catalog");
+                        n += 1;
+                    }
+                    elems[n] =
+                        Datum::Text(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?);
+                    n += 1;
+                }
+                if include_implicit
+                    && schemas.catalog_pos != usize::MAX
+                    && schemas.catalog_pos >= schemas.n
+                {
+                    elems[n] = Datum::Text("pg_catalog");
+                    n += 1;
+                }
                 Ok(Datum::Array {
                     element: ArrElem::Text,
-                    raw: array::build(elems, arena)?,
+                    raw: array::build(&elems[..n], arena)?,
                 })
             }
             "current_user" | "session_user" | "user" => {
                 arity(0)?;
-                Ok(Datum::Text("pos3ql"))
+                Ok(Datum::Text(session_user_str(arena)?))
             }
             // Catalog helpers for psql introspection. Every user object lives in the
             // single visible schema owned by the connection role.

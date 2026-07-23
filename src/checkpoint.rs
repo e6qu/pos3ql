@@ -373,6 +373,9 @@ impl Checkpointer {
                     }
                     let name = rest_of(line, 3)?;
                     let def = TableDef {
+                        // `tsch` (written right after) overrides; a manifest
+                        // from before schemas existed has none.
+                        schema: sql_name("public")?,
                         name: sql_name(name)?,
                         columns: [empty_column(); MAX_COLUMNS],
                         n_columns: n_cols,
@@ -406,6 +409,30 @@ impl Checkpointer {
                         default_value: default_from_hex(default_hex)?,
                     };
                     *seen += 1;
+                }
+                Some("tsch") => {
+                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("tsch outside table"));
+                    };
+                    let hex = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("tsch name missing"))?;
+                    def.schema = sql_name(&decode_hex_name(hex)?)?;
+                }
+                Some("nsp") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let hex = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("nsp name missing"))?;
+                    let name = sql_name(&decode_hex_name(hex)?)?;
+                    if storage.find_schema(name.as_str()).is_none() {
+                        storage.create_schema(name).map_err(|e| {
+                            CheckpointSetupError::S3(format!(
+                                "manifest schema rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
+                    }
                 }
                 Some("seq") => {
                     let Some((_, _, _, serials)) = pending_def.as_mut() else {
@@ -507,6 +534,10 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("fkey parent missing"))?;
                     fk.name = sql_name(&decode_hex_name(hex_name)?)?;
                     fk.parent = sql_name(&decode_hex_name(hparent)?)?;
+                    fk.parent_schema = match words.next() {
+                        Some(hex) => sql_name(&decode_hex_name(hex)?)?,
+                        None => sql_name("public")?,
+                    };
                     let i = def.n_fkeys;
                     def.fkeys[i] = fk;
                     def.n_fkeys += 1;
@@ -585,9 +616,46 @@ impl Checkpointer {
                     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
                     use core::fmt::Write;
                     let _ = write!(buffer, "{sql}");
+                    let mut path = StackStr::<128>::new();
+                    let _ = write!(path, "\"$user\", public");
                     // Checkpoint load reconstructs committed state.
                     let (new_slot, old_slot) = storage
-                        .create_view(sql_name(name)?, buffer, true, 0)
+                        .create_view(sql_name("public")?, sql_name(name)?, buffer, path, true, 0)
+                        .map_err(|e| {
+                            CheckpointSetupError::S3(format!(
+                                "manifest view rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_view_create(new_slot);
+                    if let Some(old) = old_slot {
+                        storage.commit_view_drop(old);
+                    }
+                }
+                Some("vw2") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let read_hex = |w: Option<&str>, what: &'static str| {
+                        w.ok_or(CheckpointSetupError::Corrupt(what))
+                            .and_then(decode_hex_name)
+                    };
+                    let sql = read_hex(words.next(), "vw2 sql missing")?;
+                    let schema = read_hex(words.next(), "vw2 schema missing")?;
+                    let path = read_hex(words.next(), "vw2 path missing")?;
+                    let name = read_hex(words.next(), "vw2 name missing")?;
+                    use core::fmt::Write;
+                    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+                    let _ = write!(buffer, "{sql}");
+                    let mut path_buffer = StackStr::<128>::new();
+                    let _ = write!(path_buffer, "{path}");
+                    let (new_slot, old_slot) = storage
+                        .create_view(
+                            sql_name(&schema)?,
+                            sql_name(&name)?,
+                            buffer,
+                            path_buffer,
+                            true,
+                            0,
+                        )
                         .map_err(|e| {
                             CheckpointSetupError::S3(format!(
                                 "manifest view rejected: {}",
@@ -618,9 +686,14 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("idx table missing"))?;
                     let name = decode_hex_name(hex_name)?;
                     let table = decode_hex_name(htable)?;
+                    let schema = match words.next() {
+                        Some(hex) => decode_hex_name(hex)?,
+                        None => "public".to_string(),
+                    };
                     let slot = storage
                         .create_index(
                             crate::storage::IndexDef {
+                                schema: sql_name(&schema)?,
                                 name: sql_name(&name)?,
                                 table: sql_name(&table)?,
                                 columns,
@@ -889,6 +962,18 @@ impl Checkpointer {
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
 
+        // Schemas: `nsp <hex-name>` (public is implicit and never written).
+        for (_, schema) in storage.live_schemas() {
+            if schema.name.as_str() == "public" {
+                continue;
+            }
+            use core::fmt::Write;
+            let mut hex = StackStr::<130>::new();
+            for b in schema.name.as_str().as_bytes() {
+                let _ = write!(hex, "{b:02x}");
+            }
+            write_manifest(&mut self.manifest_buf, format_args!("nsp {}", hex.as_str()))?;
+        }
         for slot in 0..storage.table_count() {
             let table = storage.table(slot);
             if !table.live {
@@ -903,6 +988,17 @@ impl Checkpointer {
                     table.def.name.as_str()
                 ),
             )?;
+            if table.def.schema.as_str() != "public" {
+                use core::fmt::Write;
+                let mut hex = StackStr::<130>::new();
+                for b in table.def.schema.as_str().as_bytes() {
+                    let _ = write!(hex, "{b:02x}");
+                }
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!("tsch {}", hex.as_str()),
+                )?;
+            }
             for c in table.def.columns() {
                 let default_hex = default_to_hex(&c.default_value);
                 let flags = u8::from(c.not_null)
@@ -987,10 +1083,14 @@ impl Checkpointer {
                 for b in fk.parent.as_str().as_bytes() {
                     let _ = write!(hparent, "{b:02x}");
                 }
+                let mut hparent_schema = StackStr::<130>::new();
+                for b in fk.parent_schema.as_str().as_bytes() {
+                    let _ = write!(hparent_schema, "{b:02x}");
+                }
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "fkey {} {}{} {}{} {} {} {}",
+                        "fkey {} {}{} {}{} {} {} {} {}",
                         fk.n_cols,
                         columns.as_str(),
                         fk.n_parent_cols,
@@ -998,7 +1098,8 @@ impl Checkpointer {
                         fk.on_delete.code(),
                         fk.on_update.code(),
                         hex_name.as_str(),
-                        hparent.as_str()
+                        hparent.as_str(),
+                        hparent_schema.as_str()
                     ),
                 )?;
             }
@@ -1148,17 +1249,36 @@ impl Checkpointer {
                 self.prev_scratch[slot] = new_list;
             }
         }
-        // Views: `view <hex-of-SELECT-text> <name>` (name is rest-of-line, so
-        // it may contain spaces; the SELECT is hex so it survives the format).
-        for (name, sql) in storage.live_views() {
-            let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
+        // Views: `vw2 <hex-SELECT> <hex-schema> <hex-creation-path> <hex-name>`
+        // (all hex, so every field survives the space-separated format; the
+        // loader still reads the older `view` line for old manifests).
+        for view in storage.live_views() {
             use core::fmt::Write;
-            for b in sql.as_bytes() {
+            let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
+            for b in view.sql.as_str().as_bytes() {
                 let _ = write!(hex, "{b:02x}");
+            }
+            let mut hschema = StackStr::<130>::new();
+            for b in view.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{b:02x}");
+            }
+            let mut hpath = StackStr::<260>::new();
+            for b in view.creation_path.as_str().as_bytes() {
+                let _ = write!(hpath, "{b:02x}");
+            }
+            let mut hname = StackStr::<130>::new();
+            for b in view.name.as_str().as_bytes() {
+                let _ = write!(hname, "{b:02x}");
             }
             write_manifest(
                 &mut self.manifest_buf,
-                format_args!("view {} {name}", hex.as_str()),
+                format_args!(
+                    "vw2 {} {} {} {}",
+                    hex.as_str(),
+                    hschema.as_str(),
+                    hpath.as_str(),
+                    hname.as_str()
+                ),
             )?;
         }
         // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
@@ -1176,15 +1296,20 @@ impl Checkpointer {
             for b in index.table.as_str().as_bytes() {
                 let _ = write!(htable, "{b:02x}");
             }
+            let mut hschema = StackStr::<130>::new();
+            for b in index.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{b:02x}");
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {}{} {}",
+                    "idx {} {} {}{} {} {}",
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
                     hex_name.as_str(),
-                    htable.as_str()
+                    htable.as_str(),
+                    hschema.as_str()
                 ),
             )?;
         }

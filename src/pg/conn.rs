@@ -312,7 +312,10 @@ impl Conn {
                 return Step::Close;
             };
             match key {
-                "user" => user_seen = !value.is_empty(),
+                "user" => {
+                    user_seen = !value.is_empty();
+                    self.guc.set_session_user(value);
+                }
                 "database" | "options" | "replication" => {}
                 _ if key.starts_with("_pq_.") => {
                     if n_unknown < unknown_protocol_options.len() {

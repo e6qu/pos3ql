@@ -81,7 +81,7 @@ pub fn synthesize<'a>(
         (false, "pg_attrdef") => pg_attrdef(arena),
         (false, "pg_collation") => pg_collation(arena),
         (false, "pg_type") => pg_type(arena),
-        (false, "pg_namespace") => pg_namespace(arena),
+        (false, "pg_namespace") => pg_namespace(storage, arena),
         (false, "pg_tables") => pg_tables(storage, arena),
         (false, "pg_am") => finish(
             def_of(
@@ -312,7 +312,7 @@ pub fn synthesize<'a>(
         }
         (true, "tables") => info_tables(storage, arena),
         (true, "columns") => info_columns(storage, arena),
-        (true, "schemata") => info_schemata(arena),
+        (true, "schemata") => info_schemata(storage, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -325,6 +325,20 @@ pub fn synthesize<'a>(
 /// range (stable for a running process).
 fn table_oid(_storage: &Storage, slot: usize) -> i32 {
     FIRST_USER_OID + slot as i32
+}
+
+/// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
+/// schema's OID is derived from its registry slot, above the table range.
+const FIRST_SCHEMA_OID: i32 = 80_000;
+fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
+    match schema {
+        "public" => PUBLIC_NS_OID,
+        "pg_catalog" => PG_CATALOG_NS_OID,
+        _ => storage
+            .find_schema(schema)
+            .map(|slot| FIRST_SCHEMA_OID + slot as i32)
+            .unwrap_or(0),
+    }
 }
 
 /// Index relations get OIDs from a separate range so they never collide with
@@ -480,7 +494,9 @@ fn collect_fkeys(storage: &Storage, out: &mut [Option<FkInfo>; MAX_SYNTH_INDEXES
     for (slot, table) in storage.live_tables() {
         let conrelid = table_oid(storage, slot);
         for (i, fk) in table.def.fkeys().iter().enumerate() {
-            let Some(pslot) = storage.find_table(fk.parent.as_str()) else {
+            let Some(pslot) =
+                storage.find_table(fk.parent_schema.as_str(), fk.parent.as_str())
+            else {
                 continue;
             };
             if n == MAX_SYNTH_INDEXES {
@@ -515,7 +531,9 @@ pub fn constraint_def_text<'a>(
         }
         let child = &storage.table(info.child_slot).def;
         let fk = &child.fkeys()[info.fk_index];
-        let Some(pslot) = storage.find_table(fk.parent.as_str()) else {
+        let Some(pslot) =
+            storage.find_table(fk.parent_schema.as_str(), fk.parent.as_str())
+        else {
             return Ok(None);
         };
         let parent = &storage.table(pslot).def;
@@ -683,7 +701,7 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             &[
                 Datum::Int4(toid),
                 text(table.def.name.as_str(), arena)?,
-                Datum::Int4(PUBLIC_NS_OID),
+                Datum::Int4(namespace_oid(storage, table.def.schema.as_str())),
                 text("r", arena)?, // relkind: ordinary table
                 Datum::Int4(table.def.n_columns as i32),
                 Datum::Float8(table.rows.len() as f64),
@@ -717,7 +735,10 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             &[
                 Datum::Int4(info.oid),
                 text(info.name.as_str(), arena)?,
-                Datum::Int4(PUBLIC_NS_OID),
+                Datum::Int4(namespace_oid(
+                    storage,
+                    storage.table(info.table_slot).def.schema.as_str(),
+                )),
                 text("i", arena)?, // relkind: index
                 Datum::Int4(info.n_cols as i32),
                 Datum::Float8(0.0),
@@ -1098,16 +1119,26 @@ fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     finish(def, &out[..types.len()], arena)
 }
 
-fn pg_namespace<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_namespace",
         &[("oid", ColType::Int4), ("nspname", ColType::Text)],
     );
-    let rows = [
-        row(&[Datum::Int4(PG_CATALOG_NS_OID), text("pg_catalog", arena)?], arena)?,
-        row(&[Datum::Int4(PUBLIC_NS_OID), text("public", arena)?], arena)?,
-    ];
-    finish(def, &rows, arena)
+    let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
+        [&[]; 2 + crate::storage::MAX_SCHEMAS];
+    out[0] = row(&[Datum::Int4(PG_CATALOG_NS_OID), text("pg_catalog", arena)?], arena)?;
+    let mut n = 1;
+    for (_, schema) in storage.live_schemas() {
+        out[n] = row(
+            &[
+                Datum::Int4(namespace_oid(storage, schema.name.as_str())),
+                text(arena.alloc_str(schema.name.as_str()).map_err(|_| crate::sql::eval::arena_full())?, arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &out[..n], arena)
 }
 
 fn pg_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -1127,9 +1158,20 @@ fn pg_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, 
         }
         out[n] = row(
             &[
-                text("public", arena)?,
+                text(
+                    arena
+                        .alloc_str(table.def.schema.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
                 text(table.def.name.as_str(), arena)?,
-                text("pos3ql", arena)?,
+                text(
+                    arena.alloc_str(
+                        crate::sql::eval::funcs::system::session_user_owned().as_str(),
+                    )
+                    .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
             ],
             arena,
         )?;
@@ -1157,9 +1199,39 @@ fn info_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
         out[n] = row(
             &[
                 text("postgres", arena)?,
-                text("public", arena)?,
+                text(
+                    arena
+                        .alloc_str(table.def.schema.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
                 text(table.def.name.as_str(), arena)?,
                 text("BASE TABLE", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for view in storage.live_views() {
+        if n == out.len() {
+            break;
+        }
+        out[n] = row(
+            &[
+                text("postgres", arena)?,
+                text(
+                    arena
+                        .alloc_str(view.schema.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                text(
+                    arena
+                        .alloc_str(view.name.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                text("VIEW", arena)?,
             ],
             arena,
         )?;
@@ -1191,7 +1263,12 @@ fn info_columns<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
             out[n] = row(
                 &[
                     text("postgres", arena)?,
-                    text("public", arena)?,
+                    text(
+                        arena
+                            .alloc_str(table.def.schema.as_str())
+                            .map_err(|_| crate::sql::eval::arena_full())?,
+                        arena,
+                    )?,
                     text(table.def.name.as_str(), arena)?,
                     text(c.name.as_str(), arena)?,
                     Datum::Int4(i as i32 + 1),
@@ -1206,7 +1283,7 @@ fn info_columns<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
     finish(def, &out[..n], arena)
 }
 
-fn info_schemata<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn info_schemata<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "schemata",
         &[
@@ -1214,15 +1291,32 @@ fn info_schemata<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("schema_name", ColType::Text),
         ],
     );
-    let rows = [
-        row(&[text("postgres", arena)?, text("public", arena)?], arena)?,
-        row(&[text("postgres", arena)?, text("pg_catalog", arena)?], arena)?,
-        row(
-            &[text("postgres", arena)?, text("information_schema", arena)?],
+    let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
+        [&[]; 2 + crate::storage::MAX_SCHEMAS];
+    let mut n = 0;
+    for (_, schema) in storage.live_schemas() {
+        out[n] = row(
+            &[
+                text("postgres", arena)?,
+                text(
+                    arena
+                        .alloc_str(schema.name.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+            ],
             arena,
-        )?,
-    ];
-    finish(def, &rows, arena)
+        )?;
+        n += 1;
+    }
+    out[n] = row(&[text("postgres", arena)?, text("pg_catalog", arena)?], arena)?;
+    n += 1;
+    out[n] = row(
+        &[text("postgres", arena)?, text("information_schema", arena)?],
+        arena,
+    )?;
+    n += 1;
+    finish(def, &out[..n], arena)
 }
 
 fn empty_like<'a>(

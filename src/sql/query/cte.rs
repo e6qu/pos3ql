@@ -43,7 +43,7 @@ pub fn expand_ctes<'a>(
         if resolved[..n].iter().any(|(name, _, _)| *name == cte.name) {
             return Err(sql_err!(sqlstate::DUPLICATE_ALIAS, "WITH query name \"{}\" specified more than once", cte.name));
         }
-        let context = Subst { ctes: &resolved[..n], materialized: &[], storage, txid, depth: 0 };
+        let context = Subst { ctes: &resolved[..n], materialized: &[], storage, txid, depth: 0, path: None };
         // A self-referencing recursive CTE cannot be inlined; this schema-only
         // path (Describe / view validation) binds its non-recursive term,
         // which carries the CTE's column shape. Execution goes through
@@ -60,7 +60,7 @@ pub fn expand_ctes<'a>(
     }
     // Substitute the body against all CTEs (the WITH list is dropped by
     // subst_select, which never copies it) and expand any view references.
-    let context = Subst { ctes: &resolved[..n], materialized: &[], storage, txid, depth: 0 };
+    let context = Subst { ctes: &resolved[..n], materialized: &[], storage, txid, depth: 0, path: None };
     subst_select(sel, context, arena)
 }
 
@@ -99,6 +99,7 @@ pub fn expand_ctes_exec<'a>(
             storage,
             txid,
             depth: 0,
+            path: None,
         };
         if cte.recursive && select_references(cte.query, cte.name) > 0 {
             let m = materialize_recursive(cte, context, storage, txid, arena, params)?;
@@ -116,6 +117,7 @@ pub fn expand_ctes_exec<'a>(
         storage,
         txid,
         depth: 0,
+        path: None,
     };
     subst_select(sel, context, arena)
 }
@@ -213,6 +215,10 @@ struct Subst<'c, 'a> {
     /// transaction created but has not committed is invisible here).
     txid: u32,
     depth: u32,
+    /// Inside a view body: the view creator's search path. Table references
+    /// are rewritten fully qualified under it, so the surrounding statement's
+    /// path cannot re-bind them. `None` at the statement level.
+    path: Option<crate::storage::PathContext>,
 }
 
 const MAX_VIEW_DEPTH: u32 = 12;
@@ -488,7 +494,7 @@ fn materialize_recursive<'a>(
             .alloc(MaterializedCte { column_names, column_types, rows: working })
             .map_err(|_| arena_full())?;
         let binding = [(cte.name, &*working_cte)];
-        let context = Subst { ctes: &[], materialized: &binding, storage, txid: outer.txid, depth: 0 };
+        let context = Subst { ctes: &[], materialized: &binding, storage, txid: outer.txid, depth: 0, path: None };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
         // The recursive term's column types must agree with the non-recursive
         // term's (PostgreSQL unifies them; a mismatch is a loud error).
@@ -702,12 +708,17 @@ fn subst_tableref<'a>(
             with_ordinality: false,
         });
     }
-    // A name matching a view (and not shadowed by a CTE or table) expands to a
-    // derived table over the view's stored SELECT, recursively expanded.
-    if t.schema.is_none()
-        && context.storage.find_table(t.table).is_none()
-        && let Some(view_sql) = context.storage.find_view(t.table, context.txid)
-    {
+    // A name resolving to a view (not shadowed by a CTE, and not out-resolved
+    // by a table earlier in the path) expands to a derived table over the
+    // view's stored SELECT, recursively expanded under the view creator's
+    // search path.
+    let resolved = match context.path {
+        Some(p) => context
+            .storage
+            .resolve_relation_under(&p, t.schema, t.table, context.txid),
+        None => context.storage.resolve_relation(t.schema, t.table, context.txid),
+    };
+    if let Some(crate::storage::ResolvedRelation::View(slot)) = resolved {
         if context.depth >= MAX_VIEW_DEPTH {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -715,14 +726,25 @@ fn subst_tableref<'a>(
                 t.table
             ));
         }
+        let view = context.storage.view(slot);
+        let view_sql =
+            arena.alloc_str(view.sql.as_str()).map_err(|_| arena_full())?;
+        let user = crate::sql::eval::funcs::system::session_user_owned();
+        let view_path = context.storage.compute_path(
+            view.creation_path.as_str(),
+            user.as_str(),
+            context.txid,
+        );
         let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
-        // The view body has its own scope: no outer CTEs, deeper view depth.
+        // The view body has its own scope: no outer CTEs, deeper view depth,
+        // and the creator's path for its own references.
         let inner = Subst {
             ctes: &[],
             materialized: &[],
             storage: context.storage,
             txid: context.txid,
             depth: context.depth + 1,
+            path: Some(view_path),
         };
         let expanded = subst_select(vsel, inner, arena)?;
         return Ok(TableRef {
@@ -735,6 +757,18 @@ fn subst_tableref<'a>(
             cte: None,
             with_ordinality: false,
         });
+    }
+    // Inside a view body, pin a table reference to the schema it resolved to
+    // under the creator's path, so the reader's session path cannot re-bind
+    // it.
+    if let (Some(_), Some(crate::storage::ResolvedRelation::Table(slot))) =
+        (context.path, resolved)
+        && t.schema.is_none()
+    {
+        let def = &context.storage.table(slot).def;
+        let schema =
+            arena.alloc_str(def.schema.as_str()).map_err(|_| arena_full())?;
+        return Ok(TableRef { schema: Some(schema), ..*t });
     }
     Ok(*t)
 }

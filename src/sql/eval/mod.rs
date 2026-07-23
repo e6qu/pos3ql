@@ -11,7 +11,7 @@ use super::ast::{BinaryOp, Expr, UnaryOp};
 use super::numeric::Numeric;
 use super::types::{ColType, Datum};
 
-mod funcs;
+pub mod funcs;
 mod cast;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
@@ -31,6 +31,31 @@ pub use operators::compare_datums;
 pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
 pub(crate) use operators::arithmetic;
 use operators::{binary, coerce_unknown, logic, membership_eq, range_mismatch, unary};
+
+/// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
+/// constructed at ~60 sites and stays two fields; the rare errors that carry
+/// PostgreSQL DETAIL/HINT (DROP ... CASCADE dependency reports) stash them
+/// here, and the wire responder consumes them with the next diagnostic it
+/// writes. The engine is single-threaded per process; the responder clears
+/// the slot on every emission, so a stale detail cannot outlive its error.
+#[derive(Clone, Copy)]
+pub struct Diagnostic {
+    pub detail: StackStr<512>,
+    pub hint: Option<StackStr<128>>,
+}
+
+std::thread_local! {
+    static PENDING_DIAGNOSTIC: core::cell::RefCell<Option<Diagnostic>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+pub fn stash_diagnostic(detail: StackStr<512>, hint: Option<StackStr<128>>) {
+    PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(Diagnostic { detail, hint }));
+}
+
+pub fn take_diagnostic() -> Option<Diagnostic> {
+    PENDING_DIAGNOSTIC.with(|d| d.borrow_mut().take())
+}
 
 #[derive(Debug)]
 pub struct SqlError {
@@ -54,6 +79,12 @@ pub mod sqlstate {
     pub const UNDEFINED_COLUMN: &str = "42703";
     pub const UNDEFINED_TABLE: &str = "42P01";
     pub const DUPLICATE_TABLE: &str = "42P07";
+    pub const DUPLICATE_SCHEMA: &str = "42P06";
+    pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
+    pub const RESERVED_NAME: &str = "42939";
+    pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
+    pub const INVALID_SCHEMA_NAME: &str = "3F000";
+    pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
     pub const UNDEFINED_OBJECT: &str = "42704";
     pub const DATATYPE_MISMATCH: &str = "42804";
     pub const DIVISION_BY_ZERO: &str = "22012";
@@ -1012,18 +1043,61 @@ pub fn eval_full<'a>(
             }
         }
         Expr::Field { base, field } => {
+            // A `.*` that survived to a value position was not a top-level
+            // select item — PostgreSQL refuses it there.
+            if *field == *"*" {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "row expansion via \"*\" is not supported here"
+                ));
+            }
+            // A direct ROW(...) resolves its f1..fn — unless the selected
+            // field is a bare unknown literal, which PostgreSQL cannot
+            // coerce (XX000). A typed sibling of an unknown field is fine.
+            if let Expr::Call { name, args, .. } = base
+                && name.eq_ignore_ascii_case("row")
+                && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(field))
+                && matches!(args.get(position), Some(Expr::Str(_)))
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "failed to find conversion function from unknown to text"
+                ));
+            }
             let b = eval_full(base, arena, params, row, hooks)?;
+            // A record arriving indirectly — CASE, a scalar subquery, an
+            // aggregate, a field of a field — is anonymous to PostgreSQL: no
+            // field name resolves in it, however it was built.
+            let anonymous_source = match base {
+                Expr::Call { name, .. } => !(name.eq_ignore_ascii_case("row")
+                    || name.eq_ignore_ascii_case("json_each")
+                    || name.eq_ignore_ascii_case("jsonb_each")
+                    || name.eq_ignore_ascii_case("json_each_text")
+                    || name.eq_ignore_ascii_case("jsonb_each_text")),
+                Expr::Case { .. } | Expr::Subquery(_) | Expr::Field { .. } => true,
+                _ => false,
+            };
             match b {
+                Datum::Record(_) if anonymous_source => {
+                    Err(crate::sql::exec::could_not_identify(field))
+                }
                 Datum::Null => Ok(Datum::Null),
                 // A record: select the field by name (records carry lowercase
                 // field names — `f1,f2,…` for ROW(), column names for a row).
                 Datum::Record(fields) => match fields.iter().find(|f| f.name.eq_ignore_ascii_case(field)) {
                     Some(f) => Ok(f.value),
-                    None => Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "could not identify column \"{}\" in record data type",
-                        field
-                    )),
+                    None => Err(match base {
+                        Expr::WholeRow(table)
+                        | Expr::Column { qualifier: None, name: table } => sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column {}.{} does not exist",
+                            table,
+                            field
+                        ),
+                        _ => crate::sql::exec::could_not_identify(field),
+                    }),
                 },
                 // The `_pg_expandarray` result is encoded as the 2-element array
                 // `[x, n]`; `.x`/`.f1` is the element and `.n`/`.f2` the ordinal.
@@ -1042,7 +1116,7 @@ pub fn eval_full<'a>(
                     };
                     Ok(super::array::get(raw, element, index).unwrap_or(Datum::Null))
                 }
-                _ => Err(type_mismatch("field access on a non-composite value", &b)),
+                _ => Err(crate::sql::exec::not_composite(field, type_name_of(&b))),
             }
         }
         Expr::AnyAll { operand, operator, array, all } => {

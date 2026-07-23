@@ -297,6 +297,7 @@ pub struct ForeignKey {
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
+    pub parent_schema: SqlName,
     pub parent: SqlName,
     pub parent_cols: [u16; MAX_INDEX_COLS],
     pub n_parent_cols: usize,
@@ -307,6 +308,7 @@ pub struct ForeignKey {
 impl ForeignKey {
     pub const EMPTY: Self = ForeignKey {
         name: SqlName::EMPTY,
+        parent_schema: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],
         n_cols: 0,
         parent: SqlName::EMPTY,
@@ -327,6 +329,9 @@ impl ForeignKey {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TableDef {
+    /// The schema the table lives in ("public" unless created qualified or
+    /// under a search_path naming another schema).
+    pub schema: SqlName,
     pub name: SqlName,
     pub columns: [ColumnMeta; MAX_COLUMNS],
     pub n_columns: usize,
@@ -343,6 +348,7 @@ impl TableDef {
     /// the constraint arrays at construction sites.
     pub const fn empty() -> Self {
         TableDef {
+            schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
@@ -507,6 +513,9 @@ impl RowHeap {
 
 pub struct Table {
     pub def: TableDef,
+    /// Monotonic creation stamp (catalog sequence), giving dependency
+    /// reports PostgreSQL's OID ordering.
+    pub created_at: u64,
     pub rows: FixedMap<u64, RowState>,
     /// Committed existence: whether the table is part of the last-committed
     /// catalog image. `pending_ddl` overlays an uncommitted CREATE/DROP.
@@ -591,9 +600,16 @@ pub(crate) const VIEW_SQL_MAX: usize = 2048;
 /// A named view: its output is its stored SELECT text, expanded as a derived
 /// table at query time.
 #[derive(Clone)]
-pub(crate) struct ViewDef {
+pub struct ViewDef {
+    /// Monotonic creation stamp, shared with tables (see `Table::created_at`).
+    pub created_at: u64,
+    pub schema: SqlName,
     pub name: SqlName,
     pub sql: StackStr<VIEW_SQL_MAX>,
+    /// The session search_path when the view was created. PostgreSQL binds a
+    /// view body by OID at creation; this engine re-resolves the stored text,
+    /// so it must re-resolve under the creator's path, not the reader's.
+    pub creation_path: StackStr<128>,
     pub live: bool,
     /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
     /// mirroring `Table::pending_ddl`): other transactions see `live`; the
@@ -619,6 +635,9 @@ pub(crate) const MAX_INDEX_COLS: usize = 8;
 /// when `unique`, enforces a uniqueness constraint on its column tuple.
 #[derive(Clone, Copy)]
 pub struct IndexDef {
+    /// The schema of both the index and its table (an index always lives in
+    /// its table's schema).
+    pub schema: SqlName,
     pub name: SqlName,
     pub table: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
@@ -640,11 +659,101 @@ impl IndexDef {
     }
 }
 
+/// How many schemas may exist at once, including the built-in "public".
+pub(crate) const MAX_SCHEMAS: usize = 32;
+
+/// A named schema (namespace for tables, views and indexes). Catalog MVCC
+/// mirrors `Table`: `live` is the committed image, `pending` an uncommitted
+/// CREATE/DROP owned by one transaction.
+#[derive(Clone, Copy)]
+pub struct SchemaDef {
+    pub name: SqlName,
+    pub live: bool,
+    pub pending: Option<PendingDdl>,
+}
+
+impl SchemaDef {
+    /// Whether `txid` sees this schema exist.
+    pub fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(p) if p.txid == txid => p.creating,
+            _ => self.live,
+        }
+    }
+}
+
+/// One element of the effective search path: a live schema slot, or the
+/// implicit/explicit `pg_catalog` position.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PathEntry {
+    Schema(u16),
+    Catalog,
+}
+
+/// How many schemas a search_path may name.
+pub(crate) const MAX_PATH_ENTRIES: usize = 16;
+
+/// The effective search path of the running statement: the visible schemas
+/// the session's `search_path` names, in order, with `pg_catalog` interleaved
+/// at its explicit position or implicitly first. Set by the engine before each
+/// statement (and swapped while a view body — which resolves under its
+/// creator's path — expands); every name resolution reads it.
+#[derive(Clone, Copy)]
+pub struct PathContext {
+    entries: [PathEntry; MAX_PATH_ENTRIES],
+    n: usize,
+    /// Whether the path names pg_catalog explicitly. An explicit first
+    /// pg_catalog is the creation target (which then fails with permission
+    /// denied, as PostgreSQL); the implicit one never is.
+    explicit_catalog: bool,
+}
+
+impl PathContext {
+    /// A path of exactly `public` (slot 0) with implicit pg_catalog, the
+    /// state before any session context is computed (journal replay, tests).
+    pub const fn public_only() -> Self {
+        let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
+        entries[0] = PathEntry::Catalog;
+        entries[1] = PathEntry::Schema(0);
+        PathContext { entries, n: 2, explicit_catalog: false }
+    }
+
+    pub fn entries(&self) -> &[PathEntry] {
+        &self.entries[..self.n]
+    }
+
+    pub fn explicit_catalog(&self) -> bool {
+        self.explicit_catalog
+    }
+
+    /// The first schema entry: creation target and `current_schema()`.
+    pub fn first_schema(&self) -> Option<u16> {
+        self.entries().iter().find_map(|e| match e {
+            PathEntry::Schema(slot) => Some(*slot),
+            PathEntry::Catalog => None,
+        })
+    }
+}
+
+/// What a relation name resolved to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedRelation {
+    Table(usize),
+    View(usize),
+    /// A `pg_catalog` / `information_schema` relation (synthesized rows).
+    Catalog,
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
     views: FixedVec<ViewDef>,
     indexes: FixedVec<IndexDef>,
+    schemas: FixedVec<SchemaDef>,
+    /// The running statement's effective search path (see [`PathContext`]).
+    path: PathContext,
+    /// Monotonic stamp for `created_at` fields.
+    catalog_seq: u64,
     next_rowid: u64,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
@@ -701,6 +810,7 @@ impl Storage {
                 + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                 + size_of::<ViewDef>()
                 + size_of::<IndexDef>())
+            + MAX_SCHEMAS * size_of::<SchemaDef>()
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -725,6 +835,7 @@ impl Storage {
                         ..TableDef::empty()
                     },
                     rows: FixedMap::new(budget, "table_rows", config.table_rows)?,
+                    created_at: 0,
                     live: false,
                     pending_ddl: None,
                     dirty: false,
@@ -742,17 +853,35 @@ impl Storage {
         for _ in 0..config.max_tables {
             views
                 .push(ViewDef {
+                    created_at: 0,
+                    schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
+                    creation_path: StackStr::new(),
                     live: false,
                     pending: None,
                 })
                 .expect("sized to max_tables");
         }
+        let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
+        for i in 0..MAX_SCHEMAS {
+            schemas
+                .push(SchemaDef {
+                    name: if i == 0 {
+                        SqlName::parse("public").expect("fits")
+                    } else {
+                        SqlName::EMPTY
+                    },
+                    live: i == 0,
+                    pending: None,
+                })
+                .expect("sized to MAX_SCHEMAS");
+        }
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
         for _ in 0..config.max_tables {
             indexes
                 .push(IndexDef {
+                    schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
                     table: SqlName::parse("").expect("empty name fits"),
                     columns: [0; MAX_INDEX_COLS],
@@ -768,10 +897,334 @@ impl Storage {
             tables,
             views,
             indexes,
+            schemas,
+            path: PathContext::public_only(),
+            catalog_seq: 0,
             next_rowid: 1,
             lsn: 0,
             spill: None,
         })
+    }
+
+    /// Committed-catalog schema lookup (ignores uncommitted DDL): journal
+    /// replay and the durable image.
+    pub fn find_schema(&self, name: &str) -> Option<usize> {
+        self.schemas
+            .iter()
+            .position(|n| n.live && n.name.as_str() == name)
+    }
+
+    /// Transaction-scoped schema lookup: `txid` sees its own uncommitted
+    /// CREATE/DROP and every committed schema.
+    pub fn find_schema_visible(&self, name: &str, txid: u32) -> Option<usize> {
+        self.schemas
+            .iter()
+            .position(|n| n.visible_to(txid) && n.name.as_str() == name)
+    }
+
+    pub fn schema_def(&self, slot: usize) -> &SchemaDef {
+        &self.schemas[slot]
+    }
+
+    /// Committed schemas with their slot indices, for checkpoint and catalog
+    /// output.
+    pub fn live_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
+        self.schemas
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.live)
+    }
+
+    /// Schemas visible to `txid`, for catalog output inside a transaction.
+    pub fn visible_schemas(&self, txid: u32) -> impl Iterator<Item = (usize, &SchemaDef)> {
+        self.schemas
+            .iter()
+            .enumerate()
+            .filter(move |(_, n)| n.visible_to(txid))
+    }
+
+    /// Committed create (journal replay): the schema is immediately part of
+    /// the durable image.
+    pub fn create_schema(&mut self, name: SqlName) -> Result<usize, SqlError> {
+        if self.find_schema(name.as_str()).is_some() {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_SCHEMA,
+                "schema \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        self.alloc_schema(name, None)
+    }
+
+    /// Transactional create: the schema exists only for `txid` until commit.
+    pub fn create_schema_in(&mut self, name: SqlName, txid: u32) -> Result<usize, SqlError> {
+        if self.find_schema_visible(name.as_str(), txid).is_some() {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_SCHEMA,
+                "schema \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if self.schemas.iter().any(|n| {
+            n.name.as_str() == name.as_str() && matches!(n.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access due to concurrent DDL on schema \"{}\"",
+                name.as_str()
+            ));
+        }
+        self.alloc_schema(name, Some(PendingDdl { txid, creating: true }))
+    }
+
+    fn alloc_schema(&mut self, name: SqlName, pending: Option<PendingDdl>) -> Result<usize, SqlError> {
+        let Some(slot) = self
+            .schemas
+            .iter()
+            .position(|n| !n.live && n.pending.is_none())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many schemas (limit {})",
+                self.schemas.len()
+            ));
+        };
+        self.schemas[slot] = SchemaDef { name, live: pending.is_none(), pending };
+        Ok(slot)
+    }
+
+    /// Committed drop (journal replay).
+    pub fn drop_schema(&mut self, slot: usize) {
+        self.schemas[slot].live = false;
+        self.schemas[slot].pending = None;
+    }
+
+    /// Transactional drop: the schema stays visible to other transactions
+    /// until `txid` commits. The owner's own pending-create evaporates.
+    pub fn drop_schema_in(&mut self, slot: usize, txid: u32) {
+        let n = &mut self.schemas[slot];
+        if matches!(n.pending, Some(p) if p.txid == txid && p.creating) {
+            n.live = false;
+            n.pending = None;
+        } else {
+            n.pending = Some(PendingDdl { txid, creating: false });
+        }
+    }
+
+    /// Promotes an uncommitted CREATE SCHEMA into the committed catalog.
+    pub fn commit_schema_create(&mut self, slot: usize) {
+        self.schemas[slot].live = true;
+        self.schemas[slot].pending = None;
+    }
+
+    /// Applies a committed DROP SCHEMA.
+    pub fn commit_schema_drop(&mut self, slot: usize) {
+        self.schemas[slot].live = false;
+        self.schemas[slot].pending = None;
+    }
+
+    /// Rolls back an uncommitted CREATE SCHEMA, freeing the slot.
+    pub fn rollback_schema_create(&mut self, slot: usize) {
+        self.schemas[slot].live = false;
+        self.schemas[slot].pending = None;
+    }
+
+    /// Rolls back an uncommitted DROP SCHEMA: it returns to the committed
+    /// image unchanged.
+    pub fn rollback_schema_drop(&mut self, slot: usize) {
+        self.schemas[slot].pending = None;
+    }
+
+    /// Computes the effective path a raw `search_path` value denotes for this
+    /// session: `"$user"` becomes the session user, missing schemas are
+    /// skipped (PostgreSQL validates lazily, not at SET), and `pg_catalog` is
+    /// implicit first unless the path places it explicitly.
+    pub fn compute_path(&self, raw: &str, user: &str, txid: u32) -> PathContext {
+        let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
+        let mut n = 0;
+        let mut explicit_catalog = false;
+        let mut name_buf = [0u8; 63];
+        // Elements split on commas outside double quotes (the stored form is
+        // canonical: only double-quoted elements may embed commas).
+        let mut rest = raw.trim();
+        while !rest.is_empty() {
+            let mut in_quotes = false;
+            let mut split = rest.len();
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '"' => in_quotes = !in_quotes,
+                    ',' if !in_quotes => {
+                        split = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let element = rest[..split].trim();
+            rest = rest.get(split + 1..).unwrap_or("").trim_start();
+            if element.is_empty() || n == MAX_PATH_ENTRIES {
+                continue;
+            }
+            // Unquote a `"quoted name"` element ("" is an embedded quote).
+            let name: &str = if element.starts_with('"') {
+                let inner = element.trim_matches('"');
+                let mut len = 0;
+                let mut bytes = inner.bytes().peekable();
+                while let Some(b) = bytes.next() {
+                    if len == name_buf.len() {
+                        break;
+                    }
+                    name_buf[len] = b;
+                    len += 1;
+                    if b == b'"' {
+                        // "" collapses to one quote.
+                        bytes.next();
+                    }
+                }
+                core::str::from_utf8(&name_buf[..len]).unwrap_or(inner)
+            } else {
+                element
+            };
+            let name = if name == "$user" { user } else { name };
+            if name == "pg_catalog" {
+                if !explicit_catalog {
+                    entries[n] = PathEntry::Catalog;
+                    n += 1;
+                    explicit_catalog = true;
+                }
+                continue;
+            }
+            if let Some(slot) = self.find_schema_visible(name, txid) {
+                let entry = PathEntry::Schema(slot as u16);
+                if !entries[..n].contains(&entry) {
+                    entries[n] = entry;
+                    n += 1;
+                }
+            }
+        }
+        if !explicit_catalog {
+            // Implicit pg_catalog precedes everything, as PostgreSQL has it.
+            let mut shifted = [PathEntry::Catalog; MAX_PATH_ENTRIES];
+            shifted[1..=n.min(MAX_PATH_ENTRIES - 1)]
+                .copy_from_slice(&entries[..n.min(MAX_PATH_ENTRIES - 1)]);
+            return PathContext { entries: shifted, n: n + 1, explicit_catalog: false };
+        }
+        PathContext { entries, n, explicit_catalog: true }
+    }
+
+    pub fn path(&self) -> &PathContext {
+        &self.path
+    }
+
+    /// Installs the running statement's path, returning the previous one so a
+    /// nested resolution context (a view body under its creator's path) can
+    /// restore it.
+    pub fn swap_path(&mut self, path: PathContext) -> PathContext {
+        core::mem::replace(&mut self.path, path)
+    }
+
+    /// Resolves a possibly-qualified relation name under the current path.
+    /// `None` means no visible relation matches (the caller owns the 42P01
+    /// wording, which differs between qualified and bare spellings).
+    pub fn resolve_relation(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<ResolvedRelation> {
+        self.resolve_relation_under(&self.path, qualifier, name, txid)
+    }
+
+    /// [`Self::resolve_relation`] under an explicit path — a view body
+    /// resolves under its creator's path, not the running statement's.
+    pub fn resolve_relation_under(
+        &self,
+        path: &PathContext,
+        qualifier: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<ResolvedRelation> {
+        if crate::sql::catalog::is_catalog_relation(qualifier, name) {
+            return Some(ResolvedRelation::Catalog);
+        }
+        if let Some(schema) = qualifier {
+            return self.relation_in(schema, name, txid);
+        }
+        for entry in path.entries() {
+            match entry {
+                PathEntry::Catalog => {
+                    if crate::sql::catalog::is_catalog_relation(None, name) {
+                        return Some(ResolvedRelation::Catalog);
+                    }
+                }
+                PathEntry::Schema(slot) => {
+                    let schema_name = self.schemas[*slot as usize].name;
+                    if let Some(found) = self.relation_in(schema_name.as_str(), name, txid) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn relation_in(&self, schema: &str, name: &str, txid: u32) -> Option<ResolvedRelation> {
+        if let Some(t) = self.find_visible(schema, name, txid) {
+            return Some(ResolvedRelation::Table(t));
+        }
+        self.views
+            .iter()
+            .position(|v| {
+                v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
+            })
+            .map(ResolvedRelation::View)
+    }
+
+    /// The schema a new relation lands in: the qualifier if it names a
+    /// visible schema, else the first schema of the path. `relation` is only
+    /// for the error message.
+    pub fn creation_schema(
+        &self,
+        qualifier: Option<&str>,
+        relation: &str,
+        txid: u32,
+    ) -> Result<SqlName, SqlError> {
+        if let Some(schema) = qualifier {
+            if schema == "pg_catalog" || schema == "information_schema" {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to create \"{}.{}\"",
+                    schema,
+                    relation
+                ));
+            }
+            if self.find_schema_visible(schema, txid).is_none() {
+                return Err(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            }
+            return SqlName::parse(schema);
+        }
+        // An explicit pg_catalog at the head of the path is the creation
+        // target, which PostgreSQL then refuses.
+        if self.path.explicit_catalog
+            && self.path.entries().first() == Some(&PathEntry::Catalog)
+        {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to create \"pg_catalog.{}\"",
+                relation
+            ));
+        }
+        let Some(slot) = self.path.first_schema() else {
+            return Err(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "no schema has been selected to create in"
+            ));
+        };
+        Ok(self.schemas[slot as usize].name)
     }
 
     /// Live tables with their slot indices.
@@ -1273,19 +1726,21 @@ impl Storage {
 
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
     /// replay and any context that operates on the durable image.
-    pub fn find_table(&self, name: &str) -> Option<usize> {
-        self.tables
-            .iter()
-            .position(|t| t.live && t.def.name.as_str() == name)
+    pub fn find_table(&self, schema: &str, name: &str) -> Option<usize> {
+        self.tables.iter().position(|t| {
+            t.live && t.def.schema.as_str() == schema && t.def.name.as_str() == name
+        })
     }
 
     /// Transaction-scoped lookup: `txid` sees its own uncommitted CREATE/DROP
     /// and every committed table, but not another transaction's uncommitted
     /// DDL.
-    pub fn find_visible(&self, name: &str, txid: u32) -> Option<usize> {
-        self.tables
-            .iter()
-            .position(|t| t.visible_to(txid) && t.def.name.as_str() == name)
+    pub fn find_visible(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.tables.iter().position(|t| {
+            t.visible_to(txid)
+                && t.def.schema.as_str() == schema
+                && t.def.name.as_str() == name
+        })
     }
 
     pub fn table(&self, index: usize) -> &Table {
@@ -1307,8 +1762,11 @@ impl Storage {
                 self.tables.len()
             ));
         };
+        self.catalog_seq += 1;
+        let stamp = self.catalog_seq;
         let table = &mut self.tables[slot];
         table.def = def;
+        table.created_at = stamp;
         table.rows.clear();
         table.live = pending.is_none();
         table.pending_ddl = pending;
@@ -1327,7 +1785,7 @@ impl Storage {
     /// Committed create (journal replay): the table is immediately part of the
     /// durable image.
     pub fn create_table(&mut self, def: TableDef) -> Result<usize, SqlError> {
-        if self.find_table(def.name.as_str()).is_some() {
+        if self.find_table(def.schema.as_str(), def.name.as_str()).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -1341,14 +1799,16 @@ impl Storage {
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL is a conflict (40001).
     pub fn create_table_in(&mut self, def: TableDef, txid: u32) -> Result<usize, SqlError> {
-        if self.find_visible(def.name.as_str(), txid).is_some() {
+        if self.find_visible(def.schema.as_str(), def.name.as_str(), txid).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
                 def.name.as_str()
             ));
         }
-        if let Some(other) = self.ddl_name_locked_by_other(def.name.as_str(), txid) {
+        if let Some(other) =
+            self.ddl_name_locked_by_other(def.schema.as_str(), def.name.as_str(), txid)
+        {
             let _ = other;
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
@@ -1360,10 +1820,10 @@ impl Storage {
     }
 
     /// The txid of another transaction holding uncommitted DDL for `name`.
-    fn ddl_name_locked_by_other(&self, name: &str, txid: u32) -> Option<u32> {
+    fn ddl_name_locked_by_other(&self, schema: &str, name: &str, txid: u32) -> Option<u32> {
         self.tables
             .iter()
-            .filter(|t| t.def.name.as_str() == name)
+            .filter(|t| t.def.schema.as_str() == schema && t.def.name.as_str() == name)
             .find_map(|t| t.ddl_locked_by_other(txid))
     }
 
@@ -1416,20 +1876,24 @@ impl Storage {
     }
 
     /// Committed views as (name, SELECT text), for checkpoint serialization.
-    pub fn live_views(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.views
-            .iter()
-            .filter(|v| v.live)
-            .map(|v| (v.name.as_str(), v.sql.as_str()))
+    pub fn live_views(&self) -> impl Iterator<Item = &ViewDef> {
+        self.views.iter().filter(|v| v.live)
+    }
+
+    pub(crate) fn view(&self, slot: usize) -> &ViewDef {
+        &self.views[slot]
+    }
+
+    pub(crate) fn view_count(&self) -> usize {
+        self.views.len()
     }
 
     /// The stored SELECT text of a view visible to `txid`, if `name` names one
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
-    pub fn find_view(&self, name: &str, txid: u32) -> Option<&str> {
-        self.views
-            .iter()
-            .find(|v| v.visible_to(txid) && v.name.as_str() == name)
-            .map(|v| v.sql.as_str())
+    pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<&ViewDef> {
+        self.views.iter().find(|v| {
+            v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
+        })
     }
 
     /// Registers a view as an uncommitted CREATE owned by `txid` (other
@@ -1440,12 +1904,14 @@ impl Storage {
     /// another transaction's uncommitted view DDL.
     pub fn create_view(
         &mut self,
+        schema: SqlName,
         name: SqlName,
         sql: StackStr<VIEW_SQL_MAX>,
+        creation_path: StackStr<128>,
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<usize>), SqlError> {
-        if self.find_table(name.as_str()).is_some() {
+        if self.find_table(schema.as_str(), name.as_str()).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -1455,7 +1921,8 @@ impl Storage {
         // Another transaction's uncommitted CREATE/DROP holds the name; a
         // fail-fast conflict replaces PostgreSQL's lock wait.
         if self.views.iter().any(|v| {
-            v.name.as_str() == name.as_str()
+            v.schema.as_str() == schema.as_str()
+                && v.name.as_str() == name.as_str()
                 && matches!(v.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
@@ -1464,10 +1931,11 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let existing = self
-            .views
-            .iter()
-            .position(|v| v.visible_to(txid) && v.name.as_str() == name.as_str());
+        let existing = self.views.iter().position(|v| {
+            v.visible_to(txid)
+                && v.schema.as_str() == schema.as_str()
+                && v.name.as_str() == name.as_str()
+        });
         if existing.is_some() && !or_replace {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
@@ -1489,9 +1957,13 @@ impl Storage {
         if let Some(old) = existing {
             self.pending_drop_view(old, txid);
         }
+        self.catalog_seq += 1;
         self.views[new] = ViewDef {
+            created_at: self.catalog_seq,
+            schema,
             name,
             sql,
+            creation_path,
             live: false,
             pending: Some(PendingDdl { txid, creating: true }),
         };
@@ -1501,9 +1973,11 @@ impl Storage {
     /// Marks the view visible to `txid` pending-dropped; returns its slot (for
     /// undo). None if absent. Errors if another transaction's uncommitted DDL
     /// holds the name.
-    pub fn drop_view(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+    pub fn drop_view(&mut self, schema: &str, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
         if self.views.iter().any(|v| {
-            v.name.as_str() == name && matches!(v.pending, Some(p) if p.txid != txid)
+            v.schema.as_str() == schema
+                && v.name.as_str() == name
+                && matches!(v.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
@@ -1511,11 +1985,9 @@ impl Storage {
                 name
             ));
         }
-        let Some(i) = self
-            .views
-            .iter()
-            .position(|v| v.visible_to(txid) && v.name.as_str() == name)
-        else {
+        let Some(i) = self.views.iter().position(|v| {
+            v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
+        }) else {
             return Ok(None);
         };
         self.pending_drop_view(i, txid);
@@ -1564,10 +2036,10 @@ impl Storage {
         }
     }
 
-    pub fn index_exists(&self, name: &str, txid: u32) -> bool {
-        self.indexes
-            .iter()
-            .any(|x| x.visible_to(txid) && x.name.as_str() == name)
+    pub fn index_exists(&self, schema: &str, name: &str, txid: u32) -> bool {
+        self.indexes.iter().any(|x| {
+            x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name
+        })
     }
 
     /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
@@ -1575,7 +2047,8 @@ impl Storage {
     /// another transaction's uncommitted DDL on the name.
     pub fn create_index(&mut self, def: IndexDef, txid: u32) -> Result<usize, SqlError> {
         if self.indexes.iter().any(|x| {
-            x.name.as_str() == def.name.as_str()
+            x.schema.as_str() == def.schema.as_str()
+                && x.name.as_str() == def.name.as_str()
                 && matches!(x.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
@@ -1584,7 +2057,7 @@ impl Storage {
                 def.name.as_str()
             ));
         }
-        if self.index_exists(def.name.as_str(), txid) {
+        if self.index_exists(def.schema.as_str(), def.name.as_str(), txid) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -1614,9 +2087,12 @@ impl Storage {
     /// (PostgreSQL drops a table's indexes when the table itself is dropped).
     /// Commit finalizes via [`Self::commit_indexes_for`]; rollback reverts via
     /// [`Self::rollback_indexes_for`].
-    pub fn drop_indexes_for(&mut self, table: &str, txid: u32) {
+    pub fn drop_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for i in 0..self.indexes.len() {
-            if self.indexes[i].visible_to(txid) && self.indexes[i].table.as_str() == table {
+            if self.indexes[i].visible_to(txid)
+                && self.indexes[i].schema.as_str() == schema
+                && self.indexes[i].table.as_str() == table
+            {
                 self.pending_drop_index(i, txid);
             }
         }
@@ -1624,9 +2100,10 @@ impl Storage {
 
     /// Promotes this transaction's pending index drops on a table (cascaded
     /// from its DROP TABLE) into the committed catalog.
-    pub fn commit_indexes_for(&mut self, table: &str, txid: u32) {
+    pub fn commit_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for x in self.indexes.iter_mut() {
-            if x.table.as_str() == table
+            if x.schema.as_str() == schema
+                && x.table.as_str() == table
                 && matches!(x.pending, Some(p) if p.txid == txid && !p.creating)
             {
                 x.live = false;
@@ -1637,9 +2114,10 @@ impl Storage {
 
     /// Discards this transaction's pending index drops on a table (a rolled
     /// back DROP TABLE): committed indexes become visible again.
-    pub fn rollback_indexes_for(&mut self, table: &str, txid: u32) {
+    pub fn rollback_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for x in self.indexes.iter_mut() {
-            if x.table.as_str() == table
+            if x.schema.as_str() == schema
+                && x.table.as_str() == table
                 && matches!(x.pending, Some(p) if p.txid == txid && !p.creating)
             {
                 x.pending = None;
@@ -1650,9 +2128,11 @@ impl Storage {
     /// Marks the index visible to `txid` pending-dropped; returns its slot
     /// (for undo). None if absent. Errors if another transaction's uncommitted
     /// DDL holds the name.
-    pub fn drop_index(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+    pub fn drop_index(&mut self, schema: &str, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
         if self.indexes.iter().any(|x| {
-            x.name.as_str() == name && matches!(x.pending, Some(p) if p.txid != txid)
+            x.schema.as_str() == schema
+                && x.name.as_str() == name
+                && matches!(x.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
@@ -1660,11 +2140,9 @@ impl Storage {
                 name
             ));
         }
-        let Some(i) = self
-            .indexes
-            .iter()
-            .position(|x| x.visible_to(txid) && x.name.as_str() == name)
-        else {
+        let Some(i) = self.indexes.iter().position(|x| {
+            x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name
+        }) else {
             return Ok(None);
         };
         self.pending_drop_index(i, txid);
@@ -1716,17 +2194,90 @@ impl Storage {
     /// enforcement — an uncommitted CREATE UNIQUE INDEX binds its owner).
     /// Every index on `table` that `txid` can see, including one it created in
     /// its own still-open transaction.
-    pub fn indexes_for(&self, table: &str, txid: u32) -> impl Iterator<Item = &IndexDef> {
-        self.indexes.iter().filter(move |x| x.visible_to(txid) && x.table.as_str() == table)
+    pub fn indexes_for<'a>(
+        &'a self,
+        schema: &'a str,
+        table: &'a str,
+        txid: u32,
+    ) -> impl Iterator<Item = &'a IndexDef> {
+        self.indexes.iter().filter(move |x| {
+            x.visible_to(txid) && x.schema.as_str() == schema && x.table.as_str() == table
+        })
     }
 
-    pub fn unique_indexes_for(&self, table: &str, txid: u32) -> impl Iterator<Item = &IndexDef> {
-        self.indexes_for(table, txid).filter(|x| x.unique)
+    pub fn unique_indexes_for<'a>(
+        &'a self,
+        schema: &'a str,
+        table: &'a str,
+        txid: u32,
+    ) -> impl Iterator<Item = &'a IndexDef> {
+        self.indexes_for(schema, table, txid).filter(|x| x.unique)
     }
 
     /// All committed indexes, for checkpoint serialization.
     pub fn live_indexes(&self) -> impl Iterator<Item = &IndexDef> {
         self.indexes.iter().filter(|x| x.live)
+    }
+
+    /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
+    /// and its indexes change schema, and every inbound foreign key follows —
+    /// deterministically, so WAL replay reproduces it from the names alone.
+    pub fn move_table_schema(&mut self, index: usize, new_schema: SqlName) {
+        let old_schema = self.tables[index].def.schema;
+        let name = self.tables[index].def.name;
+        self.tables[index].def.schema = new_schema;
+        self.tables[index].dirty = true;
+        for x in self.indexes.iter_mut() {
+            if x.live
+                && x.schema.as_str() == old_schema.as_str()
+                && x.table.as_str() == name.as_str()
+            {
+                x.schema = new_schema;
+            }
+        }
+        for t in self.tables.iter_mut() {
+            if !t.live {
+                continue;
+            }
+            let mut changed = false;
+            for f in 0..t.def.n_fkeys {
+                let fk = &mut t.def.fkeys[f];
+                if fk.parent_schema.as_str() == old_schema.as_str()
+                    && fk.parent.as_str() == name.as_str()
+                {
+                    fk.parent_schema = new_schema;
+                    changed = true;
+                }
+            }
+            if changed {
+                t.dirty = true;
+            }
+        }
+    }
+
+    /// Removes one foreign key from a table's definition by constraint name
+    /// (DROP SCHEMA CASCADE severing an inbound reference), returning it for
+    /// transactional undo.
+    pub fn drop_fk(&mut self, index: usize, fk_name: &str) -> Option<ForeignKey> {
+        let def = &mut self.tables[index].def;
+        let at = (0..def.n_fkeys).find(|&f| def.fkeys[f].name.as_str() == fk_name)?;
+        let removed = def.fkeys[at];
+        for f in at..def.n_fkeys - 1 {
+            def.fkeys[f] = def.fkeys[f + 1];
+        }
+        def.n_fkeys -= 1;
+        self.tables[index].dirty = true;
+        Some(removed)
+    }
+
+    /// Restores a foreign key removed by [`Self::drop_fk`] (rollback).
+    pub fn restore_fk(&mut self, index: usize, fk: ForeignKey) {
+        let def = &mut self.tables[index].def;
+        if def.n_fkeys < MAX_FKEYS {
+            def.fkeys[def.n_fkeys] = fk;
+            def.n_fkeys += 1;
+            self.tables[index].dirty = true;
+        }
     }
 
     /// Replaces a table's definition in place (ALTER TABLE).
@@ -1779,6 +2330,7 @@ mod tests {
 
     fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {
         let mut def = TableDef {
+            schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse(name).unwrap(),
             columns: [ColumnMeta {
                 name: SqlName::parse("").unwrap(),
@@ -1815,13 +2367,13 @@ mod tests {
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let def = make_def("t1", &[("id", ColType::Int4, true)]);
         let index = s.create_table(def).unwrap();
-        assert_eq!(s.find_table("t1"), Some(index));
+        assert_eq!(s.find_table("public", "t1"), Some(index));
         assert_eq!(
             s.create_table(def).unwrap_err().sqlstate,
             sqlstate::DUPLICATE_TABLE
         );
         s.drop_table(index);
-        assert_eq!(s.find_table("t1"), None);
+        assert_eq!(s.find_table("public", "t1"), None);
         // Slot is reusable; capacity is enforced.
         for i in 0..4u32 {
             let name = crate::stack_format!(8, "x{}", i);

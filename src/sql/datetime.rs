@@ -263,20 +263,31 @@ pub fn make_timestamp(
 /// microseconds since 2000-01-01 UTC. `require_tz_shift` applies the zone
 /// offset (timestamptz); plain timestamp ignores any suffix.
 pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
-    let bad = || {
-        sql_err!(
-            "22007",
-            "invalid input syntax for type timestamp: \"{}\"",
-            s
-        )
+    // The type this input is for names the error, so `timestamptz` reports
+    // `timestamp with time zone`, as PostgreSQL does.
+    let type_name = if apply_timezone {
+        "timestamp with time zone"
+    } else {
+        "timestamp"
     };
+    let bad = || sql_err!("22007", "invalid input syntax for type {}: \"{}\"", type_name, s);
     let t = s.trim();
     // Split date and time parts.
     let (date_part, rest) = match t.find([' ', 'T']) {
         Some(i) => (&t[..i], &t[i + 1..]),
         None => (t, ""),
     };
-    let date_days = parse_date(date_part)? as i64;
+    // A syntactically bad date part is this timestamp's malformed input, not a
+    // `date` error surfaced verbatim — so a 22007 from `parse_date` is remapped
+    // to the timestamp type, while its 22008 out-of-range error is kept, since
+    // an impossible date is an impossible timestamp too.
+    let date_days = parse_date(date_part).map_err(|e| {
+        if e.sqlstate == "22007" {
+            bad()
+        } else {
+            e
+        }
+    })? as i64;
 
     if rest.is_empty() {
         return Ok(date_days * 86_400 * 1_000_000);

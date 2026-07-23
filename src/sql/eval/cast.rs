@@ -12,7 +12,7 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::{
-    arena_full, bad_text, cast_unsupported, load_array, overflow, parse_bool, session_zone_at,
+    arena_full, bad_text, cast_unsupported, load_array, out_of_range, overflow, parse_bool, session_zone_at,
     sqlstate, SqlError,
 };
 
@@ -47,6 +47,10 @@ pub fn cast_to<'a>(
                 // bit -> integer: the bits are the low bits of the result
                 // (two's complement), so a full 32-bit string round-trips.
                 Datum::Int4(bits_to_uint(bits, 32, "integer")? as u32 as i32)
+            } else if let Datum::Text(s) = v {
+                // Text input names the offending value on overflow, where a
+                // value-to-value cast does not.
+                Datum::Int4(parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer")? as i32)
             } else {
                 let x = to_i64_for_cast(&v, "integer")?;
                 Datum::Int4(i32::try_from(x).map_err(|_| overflow("integer"))?)
@@ -55,6 +59,8 @@ pub fn cast_to<'a>(
         ColType::Int8 => {
             if let Datum::Bit { bits, .. } = v {
                 Datum::Int8(bits_to_uint(bits, 64, "bigint")? as i64)
+            } else if let Datum::Text(s) = v {
+                Datum::Int8(parse_int_bounded(s, i64::MIN, i64::MAX, "bigint")?)
             } else {
                 Datum::Int8(to_i64_for_cast(&v, "bigint")?)
             }
@@ -72,10 +78,15 @@ pub fn cast_to<'a>(
         },
         ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
         ColType::Int2 => {
-            let x = to_i64_for_cast(&v, "smallint")?;
-            if !(-32768..=32767).contains(&x) {
-                return Err(overflow("smallint"));
-            }
+            let x = if let Datum::Text(s) = v {
+                parse_int_bounded(s, -32768, 32767, "smallint")?
+            } else {
+                let x = to_i64_for_cast(&v, "smallint")?;
+                if !(-32768..=32767).contains(&x) {
+                    return Err(overflow("smallint"));
+                }
+                x
+            };
             Datum::Int4(x as i32)
         }
         ColType::Date => match v {
@@ -411,12 +422,47 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
 /// Parses an integer the way PostgreSQL's integer input does: optional sign, an
 /// optional `0x`/`0o`/`0b` base prefix, and `_` digit separators (only between
 /// digits). Returns None for anything malformed or out of `i64` range.
+/// How an integer literal parsed: a value, a well-formed literal that exceeds
+/// `i64`, or something not shaped like an integer at all. The last two are the
+/// same `None` to [`parse_int_literal`] but different errors to a cast —
+/// `22003` out-of-range versus `22P02` invalid-syntax, as PostgreSQL has them.
+pub(crate) enum IntLiteral {
+    Value(i64),
+    Overflow,
+    Malformed,
+}
+
 pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
+    match classify_int_literal(s) {
+        IntLiteral::Value(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Parses `s` as an integer for a cast into `[lo, hi]`, giving PostgreSQL's two
+/// distinct errors: a value outside the range (or beyond `i64`) is out-of-range
+/// naming the value, and text not shaped like an integer is an invalid-syntax
+/// error naming the type.
+pub(crate) fn parse_int_bounded(
+    s: &str,
+    lo: i64,
+    hi: i64,
+    target: &'static str,
+) -> Result<i64, SqlError> {
+    match classify_int_literal(s) {
+        IntLiteral::Value(v) if (lo..=hi).contains(&v) => Ok(v),
+        IntLiteral::Value(_) | IntLiteral::Overflow => Err(out_of_range(s.trim(), target)),
+        IntLiteral::Malformed => Err(bad_text(s, target)),
+    }
+}
+
+fn classify_int_literal(s: &str) -> IntLiteral {
     let t = s.trim();
     let (neg, rest) = match t.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
+    use IntLiteral::{Malformed, Overflow, Value};
     let (radix, digits) = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
         (16, r)
     } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
@@ -428,7 +474,7 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
     };
     let db = digits.as_bytes();
     if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
-        return None;
+        return Malformed;
     }
     let mut buffer = [0u8; 80];
     let mut n = 0;
@@ -436,19 +482,78 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
     for &c in db {
         if c == b'_' {
             if prev_underscore {
-                return None; // `__` is not allowed
+                return Malformed; // `__` is not allowed
             }
             prev_underscore = true;
             continue;
         }
         prev_underscore = false;
+        // A character that is not a digit for this radix is malformed input,
+        // not an overflow — the distinction the two error kinds rest on.
+        if !(c as char).is_digit(radix) {
+            return Malformed;
+        }
         if n >= buffer.len() {
-            return None;
+            // More digits than any i64 could hold: well-formed but out of range.
+            return Overflow;
         }
         buffer[n] = c;
         n += 1;
     }
-    let cleaned = core::str::from_utf8(&buffer[..n]).ok()?;
-    let v = i64::from_str_radix(cleaned, radix).ok()?;
-    Some(if neg { -v } else { v })
+    let Ok(cleaned) = core::str::from_utf8(&buffer[..n]) else {
+        return Malformed;
+    };
+    // The digits are already validated for the radix, so a parse failure here is
+    // an overflow, not a malformation.
+    match i64::from_str_radix(cleaned, radix) {
+        Ok(v) => Value(if neg { -v } else { v }),
+        Err(_) => Overflow,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(s: &str, lo: i64, hi: i64, ty: &'static str) -> (String, String) {
+        let e = parse_int_bounded(s, lo, hi, ty).unwrap_err();
+        (e.sqlstate.to_string(), e.message.as_str().to_string())
+    }
+
+    #[test]
+    fn overflow_names_the_value_and_type() {
+        // A value beyond the target range, or beyond i64 entirely, is an
+        // out-of-range error that names both — as PostgreSQL has it.
+        let (state, msg) = err("3000000000", i32::MIN as i64, i32::MAX as i64, "integer");
+        assert_eq!(state, "22003");
+        assert_eq!(msg, "value \"3000000000\" is out of range for type integer");
+        let (state, msg) = err("99999999999999999999", i64::MIN, i64::MAX, "bigint");
+        assert_eq!(state, "22003");
+        assert_eq!(msg, "value \"99999999999999999999\" is out of range for type bigint");
+        let (_, msg) = err("40000", -32768, 32767, "smallint");
+        assert_eq!(msg, "value \"40000\" is out of range for type smallint");
+    }
+
+    #[test]
+    fn malformed_is_a_syntax_error() {
+        // Text not shaped like an integer is a syntax error naming the type —
+        // distinct from an overflow, and the reason a bad char must not be
+        // mistaken for too many digits.
+        for bad in ["abc", "12abc", "", "  ", "0xGG", "1__0", "_5", "5_"] {
+            let (state, msg) = err(bad, i32::MIN as i64, i32::MAX as i64, "integer");
+            assert_eq!(state, "22P02", "{bad:?} should be a syntax error");
+            assert_eq!(msg, format!("invalid input syntax for type integer: \"{bad}\""));
+        }
+    }
+
+    #[test]
+    fn valid_literals_in_range_parse() {
+        let ok = |s: &str| parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer").unwrap();
+        assert_eq!(ok("42"), 42);
+        assert_eq!(ok("-2147483648"), -2147483648);
+        assert_eq!(ok("2147483647"), 2147483647);
+        assert_eq!(ok("0x1F"), 31);
+        assert_eq!(ok("1_000"), 1000);
+        assert_eq!(ok("+7"), 7);
+    }
 }

@@ -59,7 +59,7 @@ pub fn set_query<'a>(
     };
 
     // ORDER BY (by output column position or name), then LIMIT/OFFSET.
-    if let Err(e) = sort_set_rows(rows, q.order_by, &columns[..n_cols]) {
+    if let Err(e) = sort_set_rows(arena, rows, q.order_by, &columns[..n_cols]) {
         return sql_fail(e);
     }
     let limit = match exec::eval_limit_pub(q.limit, arena, params) {
@@ -420,6 +420,7 @@ fn combine_sets<'a>(
 /// reference an output column by 1-based position or by name (from the first
 /// leaf). Other ORDER BY expressions over a set operation are unsupported.
 fn sort_set_rows(
+    arena: &Arena,
     rows: &mut [&[u8]],
     order_by: &[OrderBy],
     columns: &[ColDesc],
@@ -457,7 +458,7 @@ fn sort_set_rows(
     }
     let keys = &keys[..nk];
     let mut err: Option<SqlError> = None;
-    rows.sort_by(|a, b| {
+    crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
         if err.is_some() {
             return core::cmp::Ordering::Equal;
         }
@@ -481,7 +482,8 @@ fn sort_set_rows(
             }
         }
         core::cmp::Ordering::Equal
-    });
+    })
+    .map_err(|_| arena_full())?;
     match err {
         Some(e) => Err(e),
         None => Ok(()),

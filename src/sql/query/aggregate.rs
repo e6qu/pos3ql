@@ -1178,7 +1178,7 @@ impl<'a> AggState<'a> {
             let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
             let spec = self.ord_spec;
             let mut cmp_err: Option<SqlError> = None;
-            rows.sort_by(|a, b| {
+            crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
                 use core::cmp::Ordering;
                 for (k, o) in spec.iter().enumerate() {
                     let ka = crate::sql::exec::decode_projected_pub(a, 1 + k);
@@ -1200,7 +1200,8 @@ impl<'a> AggState<'a> {
                     }
                 }
                 Ordering::Equal
-            });
+            })
+            .map_err(|_| arena_full())?;
             if let Some(e) = cmp_err {
                 return Err(e);
             }
@@ -1212,13 +1213,16 @@ impl<'a> AggState<'a> {
         } else if self.distinct {
             let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
             let mut cmp_err: Option<SqlError> = None;
-            vals.sort_by(|a, b| match compare_datums(a, b) {
-                Ok(o) => o,
-                Err(e) => {
-                    if cmp_err.is_none() { cmp_err = Some(e); }
-                    core::cmp::Ordering::Equal
+            crate::mem::arena::stable_sort_via(arena, vals, |a, b| {
+                match compare_datums(a, b) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        if cmp_err.is_none() { cmp_err = Some(e); }
+                        core::cmp::Ordering::Equal
+                    }
                 }
-            });
+            })
+            .map_err(|_| arena_full())?;
             if let Some(e) = cmp_err {
                 return Err(e);
             }

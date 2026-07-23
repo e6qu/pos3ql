@@ -387,6 +387,24 @@ merge currently rides a checkpoint) and flush-rate-driven manifest logging.
 **Crux invariant** (kept): an SST is referenced by the published manifest
 before the WAL resets — the checkpoint orders it so.
 
+**Stage H's spirit arrives early as a crash-torture differential**
+(`tests/external/torture_diff.py`, a run.sh step): seeded random DML against
+pos3ql *and* a hermetic real PostgreSQL, with random kill -9 restarts and
+wiped-disk cold starts between acknowledged batches — the reference database
+is the model, so the spill / delta / tombstone / WAL / manifest machinery is
+checked against PostgreSQL itself after every recovery. Deterministic from its
+seed. Its first run caught a real bug class: the standard library's *stable*
+`sort_by` draws merge scratch from the heap above a size threshold, so five
+query-path sorts (ORDER BY materialization, set operations, ordered/DISTINCT
+aggregates, jsonb key canonicalization) violated the post-startup allocation
+guard only once a sort exceeded ~tens of thousands of rows — below every
+suite's radar until the torture sorted 20k. All five now run on
+`arena::stable_sort_via`, an allocation-free stable sort (index permutation in
+the statement arena, original position as the tiebreak, applied by cycles),
+property-tested against the standard sort across the threshold. The guard
+itself now prints an alloc-free backtrace (`backtrace_symbols_fd`) when it
+fires, so the next violation names its call site.
+
 ### Stage E — leveled compaction (background, paced, allocation-free)
 
 Keep read amplification and object count bounded under sustained update/delete load

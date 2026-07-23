@@ -206,8 +206,70 @@ impl Drop for Arena {
     }
 }
 
+/// A stable sort that never touches the allocator: the standard library's
+/// stable `sort_by` draws merge scratch from the heap for large slices, which
+/// the post-startup allocation guard forbids. This stages a permutation in
+/// `arena` instead — an unstable sort over indices with the original position
+/// as the tiebreak reproduces stability exactly — then applies it in place by
+/// following cycles.
+pub fn stable_sort_via<T>(
+    arena: &Arena,
+    items: &mut [T],
+    mut cmp: impl FnMut(&T, &T) -> core::cmp::Ordering,
+) -> Result<(), ArenaFull> {
+    let n = items.len();
+    if n < 2 {
+        return Ok(());
+    }
+    let perm = arena.alloc_slice_with(n, |i| i as u32)?;
+    perm.sort_unstable_by(|&a, &b| {
+        cmp(&items[a as usize], &items[b as usize]).then_with(|| a.cmp(&b))
+    });
+    // Apply the permutation by cycles: each element moves at most once.
+    let visited = arena.alloc_slice_with(n, |_| false)?;
+    for start in 0..n {
+        if visited[start] || perm[start] as usize == start {
+            visited[start] = true;
+            continue;
+        }
+        let mut at = start;
+        loop {
+            visited[at] = true;
+            let from = perm[at] as usize;
+            if from == start {
+                break;
+            }
+            items.swap(at, from);
+            at = from;
+            if visited[at] {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stable_sort_via_matches_the_standard_stable_sort() {
+        // Duplicate keys in scrambled order: the arena-staged sort must keep
+        // their original relative order exactly as the (allocating) standard
+        // stable sort does, across sizes on both sides of driftsort's
+        // stack-scratch threshold.
+        let mut budget = crate::mem::budget::Budget::new(64 << 20);
+        let mut arena = super::Arena::new(&mut budget, "sort", 16 << 20).unwrap();
+        for n in [0usize, 1, 2, 7, 33, 1000, 30_000] {
+            let mut a: Vec<(u32, u32)> =
+                (0..n as u32).map(|i| (i.wrapping_mul(2_654_435_761) % 17, i)).collect();
+            let mut b = a.clone();
+            a.sort_by_key(|x| x.0);
+            super::stable_sort_via(&arena, &mut b, |x, y| x.0.cmp(&y.0)).unwrap();
+            assert_eq!(a, b, "n = {n}");
+            arena.reset();
+        }
+    }
+
     use super::*;
 
     #[test]

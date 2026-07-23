@@ -401,7 +401,7 @@ pub(crate) fn materialized_rows<'a>(
     // (as PostgreSQL requires), but it groups equal keys when ORDER BY is
     // absent so the run dedup below works.
     if n_order > 0 || n_on > 0 {
-        rows.sort_by(|a, b| {
+        crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
             for (k, ob) in statement.order_by.iter().enumerate() {
                 let ka = crate::sql::exec::decode_projected_pub(a, width + k);
                 let kb = crate::sql::exec::decode_projected_pub(b, width + k);
@@ -441,7 +441,8 @@ pub(crate) fn materialized_rows<'a>(
                 }
             }
             core::cmp::Ordering::Equal
-        });
+        })
+        .map_err(|_| arena_full())?;
     }
 
     // DISTINCT ON: keep the first row of each run of equal ON keys.

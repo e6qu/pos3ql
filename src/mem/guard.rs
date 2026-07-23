@@ -74,6 +74,12 @@ fn fault() {
     let msg: &[u8] = b"pos3ql: heap allocation after freeze or inside forbid_alloc scope; aborting\n";
     unsafe {
         libc::write(2, msg.as_ptr().cast(), msg.len());
+        // An alloc-free backtrace: `backtrace_symbols_fd` writes straight to
+        // the fd without malloc, so the guard can say *where* without
+        // recursing into itself.
+        let mut frames = [core::ptr::null_mut::<libc::c_void>(); 64];
+        let n = libc::backtrace(frames.as_mut_ptr(), 64);
+        libc::backtrace_symbols_fd(frames.as_ptr(), n, 2);
     }
     std::process::abort();
 }

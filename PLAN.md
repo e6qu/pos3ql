@@ -403,7 +403,7 @@ suite's radar until the torture sorted 20k. All five now run on
 the statement arena, original position as the tiebreak, applied by cycles),
 property-tested against the standard sort across the threshold. The guard
 itself now prints an alloc-free backtrace (`backtrace_symbols_fd`) when it
-fires, so the next violation names its call site.
+fires, so the next violation names its call site. The full IANA time-zone database follows (the larger half of B-071's remainder): TZif files parsed per RFC 8536 into fixed thread-local pools — a zone-name catalog walked at startup before the allocator freezes, zones loaded on demand (64-slot cache, loud when full), transition history binary-searched, the POSIX TZ footer rule (its own parser) covering the far future — with the embedded rule set kept as the no-zoneinfo fallback. Corpus 36 pins Moscow's +04 era, Caracas's -04:30, Lord Howe's half-hour DST, 1968 US rules, Chatham's +12:45, case-insensitive names, zone names in timestamp literals (resolved at the literal's instant), and session-zone interpretation of bare timestamptz literals — the last two being fidelity bugs the work surfaced and fixed. B-071's remaining item is schemas.
 
 ### Stage E — leveled compaction (background, paced, allocation-free)
 

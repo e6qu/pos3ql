@@ -23,6 +23,7 @@ pub mod types;
 pub mod range;
 pub mod to_char;
 pub mod timezone;
+pub mod tzif;
 
 use crate::checkpoint::{Checkpointer, CheckpointSetupError};
 use crate::config::Config;
@@ -1362,7 +1363,18 @@ impl Engine {
                 }))
             }
         };
-        responder.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
+        // The column titles as PostgreSQL canonicalizes them: most parameters
+        // are lowercase, but a few keep their registered mixed case.
+        let title = if name.eq_ignore_ascii_case("timezone") {
+            "TimeZone"
+        } else if name.eq_ignore_ascii_case("datestyle") {
+            "DateStyle"
+        } else if name.eq_ignore_ascii_case("intervalstyle") {
+            "IntervalStyle"
+        } else {
+            name
+        };
+        responder.row_description(&[ColDesc::new(title, types::oid::TEXT, -1)])?;
         responder.data_row(&[Datum::Text(value)])?;
         responder.command_complete("SHOW")?;
         Ok(Ok(()))

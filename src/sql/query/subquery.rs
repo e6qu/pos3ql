@@ -86,7 +86,7 @@ pub(super) fn walk_children<'a>(
             f(operand)?;
             f(pattern)
         }
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, .. } => {
             if let Some(o) = operand {
                 f(o)?;
             }

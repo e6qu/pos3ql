@@ -333,7 +333,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             fold_check(pattern, arena)?;
             Ok(None)
         }
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, .. } => {
             if let Some(o) = operand {
                 // Operand form (`CASE x WHEN v ...`): the WHENs are compared to
                 // x, not boolean conditions, so no arm is dropped by folding.
@@ -719,7 +719,7 @@ pub fn eval_full<'a>(
                 )),
             }
         }
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, .. } => {
             let scrutinee = match operand {
                 Some(operator) => Some(eval_full(operator, arena, params, row, hooks)?),
                 None => None,

@@ -241,6 +241,9 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             }
             _ => ColType::from_sql_name(type_name).map(ColType::internal_name),
         },
+        // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
+        // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
+        Expr::Case { synthetic: true, .. } => None,
         Expr::Case { otherwise: Some(e), .. } => name_of(e),
         Expr::Array(_) | Expr::ArraySubquery(_) => Some("array"),
         // An array subscript keeps the base column's name (`m[1]` → `m`).
@@ -258,7 +261,7 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
         return n;
     }
     match expression {
-        Expr::Case { .. } => "case",
+        Expr::Case { synthetic: false, .. } => "case",
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
         Expr::ArraySubquery(_) | Expr::Array(_) => "array",

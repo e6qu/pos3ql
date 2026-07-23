@@ -880,7 +880,7 @@ fn rewrite_grouped_expr<'a>(
             negated: *negated,
             case_insensitive: *case_insensitive,
         }),
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, synthetic } => {
             let operand = match operand {
                 Some(o) => Some(rewrite(o)?),
                 None => None,
@@ -895,7 +895,7 @@ fn rewrite_grouped_expr<'a>(
                 Some(o) => Some(rewrite(o)?),
                 None => None,
             };
-            alloc(Expr::Case { operand, whens, otherwise })
+            alloc(Expr::Case { operand, whens, otherwise, synthetic: *synthetic })
         }
         Expr::Call { name, args, star, distinct, order_by, over, filter } => {
             let mut rewritten = [&Expr::Null as &'a Expr<'a>; super::parser::MAX_LIST];

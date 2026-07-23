@@ -632,7 +632,7 @@ fn ungrouped_column<'e, 'a>(
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
             first(&[operand, pattern])
         }
-        Expr::Case { operand, whens, otherwise } => operand
+        Expr::Case { operand, whens, otherwise, .. } => operand
             .and_then(|o| ungrouped_column(o, group_by))
             .or_else(|| {
                 whens.iter().find_map(|(c, r)| first(&[c, r]))

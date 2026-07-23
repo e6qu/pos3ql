@@ -293,7 +293,7 @@ fn expr_references(e: &Expr, name: &str) -> usize {
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
             expr_references(operand, name) + expr_references(pattern, name)
         }
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, .. } => {
             operand.map_or(0, |o| expr_references(o, name))
                 + whens
                     .iter()
@@ -791,7 +791,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
             expr_has_subquery(operand) || expr_has_subquery(pattern)
         }
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, .. } => {
             operand.is_some_and(expr_has_subquery)
                 || whens.iter().any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
                 || otherwise.is_some_and(expr_has_subquery)
@@ -901,7 +901,7 @@ fn subst_expr<'a>(
             negated: *negated,
             case_insensitive: *case_insensitive,
         },
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case { operand, whens, otherwise, synthetic } => {
             let operand = opt_subst(*operand, context, arena)?;
             let mut ws = [(&Expr::Null, &Expr::Null); crate::sql::parser::MAX_LIST];
             if whens.len() > ws.len() {
@@ -915,6 +915,7 @@ fn subst_expr<'a>(
                 operand,
                 whens,
                 otherwise: opt_subst(*otherwise, context, arena)?,
+                synthetic: *synthetic,
             }
         }
         // Leaves never reach here (guarded by expr_has_subquery above).

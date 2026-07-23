@@ -534,25 +534,36 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
     let years = interval.months / 12;
     let mons = interval.months % 12;
     let mut first = true;
+    // PostgreSQL gives a positive field an explicit `+` only when the field
+    // printed just before it was negative — `-1 mons +5 days`, but a run of
+    // all-positive fields stays bare. `prev_neg` tracks that immediately
+    // preceding sign.
+    let mut prev_neg = false;
     let sep = |out: &mut StackStr<48>, first: &mut bool| {
         if !*first {
             let _ = write!(out, " ");
         }
         *first = false;
     };
-    let unit = |out: &mut StackStr<48>, first: &mut bool, n: i32, singular: &str| {
+    let unit = |out: &mut StackStr<48>, first: &mut bool, prev_neg: &mut bool, n: i32, singular: &str| {
         if n != 0 {
             sep(out, first);
+            if n > 0 && *prev_neg {
+                let _ = write!(out, "+");
+            }
             let _ = write!(out, "{n} {singular}");
             if n != 1 {
                 let _ = write!(out, "s");
             }
+            *prev_neg = n < 0;
         }
     };
-    unit(&mut out, &mut first, years, "year");
-    unit(&mut out, &mut first, mons, "mon");
-    unit(&mut out, &mut first, interval.days, "day");
+    unit(&mut out, &mut first, &mut prev_neg, years, "year");
+    unit(&mut out, &mut first, &mut prev_neg, mons, "mon");
+    unit(&mut out, &mut first, &mut prev_neg, interval.days, "day");
     if interval.micros != 0 || (interval.months == 0 && interval.days == 0) {
+        // The clock takes the same rule: `+` when it is positive and the field
+        // before it was negative, `-` when it is itself negative.
         sep(&mut out, &mut first);
         let neg = interval.micros < 0;
         let a = interval.micros.unsigned_abs() as i64;
@@ -561,6 +572,8 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
         let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
         if neg {
             let _ = write!(out, "-");
+        } else if prev_neg {
+            let _ = write!(out, "+");
         }
         let _ = write!(out, "{h:02}:{m:02}:{s:02}");
         if frac != 0 {

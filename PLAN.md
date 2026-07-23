@@ -280,8 +280,28 @@ index plus only the data blocks it covers, not the whole SST, which a test holds
 to by reading a narrow window near the end of a three-thousand-row SST in four
 block reads. The `get` lookup was refactored onto the same index-navigation
 helpers and a shared data-block iterator in the process, so the point and range
-paths cannot drift apart. What is left of Stage C is the bloom filter block and
-the multi-block index.
+paths cannot drift apart. The bloom filter is now built too. `store/bloom.rs` is a one-block filter over
+the row identities, filled as the writer appends and written as an `SstFilter`
+block; `finish` returns an `SstHandle` naming both the index and the filter. A
+reader checks the filter first — a key it rejects returns without the index or a
+data block being read, which is the whole point of a filter (skipping an SST
+that cannot hold a key), and a test shows an absent key costing one block read
+where a present one costs three. The filter has no false negatives, the one
+property correctness needs: an inserted key is never reported absent, and an
+empty or all-zero filter admits everything rather than claiming absence.
+Membership is double-hashing over a splitmix64 finalizer, seven bits per key.
+The filter is a fixed 128 KiB block — good to about a hundred thousand keys
+under one percent false positives, degrading gracefully beyond, never to a false
+negative — so a sized or per-block filter and the multi-block index (still
+bounding an SST at ~6.5k data blocks) are what remain of Stage C, both
+refinements rather than correctness gaps.
+
+With that, Stage C's read path is complete: a point lookup is filter → index →
+one data block, a range scan streams the covering blocks, and both are proven to
+touch only the blocks they must. What remains before the SST is load-bearing is
+routing the checkpoint and cold-start paths through `store::sst` instead of the
+whole-object reader they use today — the step where storage stops being additive
+and touches durability.
 
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 

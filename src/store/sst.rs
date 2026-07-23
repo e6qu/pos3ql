@@ -23,7 +23,17 @@
 
 use crate::mem::arena::Arena;
 
+use super::bloom::{self, FILTER_BYTES};
 use super::{BlockId, BlockStore, BlockType, StoreError, MAX_PAYLOAD};
+
+/// What a finished SST is named by: the index block a reader searches, and the
+/// filter block it checks first to skip an SST that cannot hold a key. The
+/// filter is `None` only for an SST with no rows, which has neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SstHandle {
+    pub(crate) index: BlockId,
+    pub(crate) filter: BlockId,
+}
 
 /// `rowid` u64 | `len` u32, then the row bytes — one row inside a data block.
 const ENTRY_HEADER: usize = 12;
@@ -77,6 +87,9 @@ pub(crate) struct SstWriter<'a> {
     /// The last key written, so out-of-order rows are caught rather than
     /// producing an SST whose binary search silently misses them.
     last_key: Option<u64>,
+    /// The filter's bit array, one key set into it per append. It becomes the
+    /// filter block at finish.
+    filter: &'a mut [u8],
 }
 
 impl<'a> SstWriter<'a> {
@@ -87,6 +100,9 @@ impl<'a> SstWriter<'a> {
         let index = arena
             .alloc_slice_with(MAX_DATA_BLOCKS, |_| (0u64, BlockId([0u8; 32])))
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
+        let filter = arena
+            .alloc_slice_with(FILTER_BYTES, |_| 0u8)
+            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
         Ok(Self {
             pending,
             pending_len: 0,
@@ -94,6 +110,7 @@ impl<'a> SstWriter<'a> {
             index,
             index_len: 0,
             last_key: None,
+            filter,
         })
     }
 
@@ -127,6 +144,7 @@ impl<'a> SstWriter<'a> {
             self.pending_first = Some(rowid);
         }
         self.last_key = Some(rowid);
+        bloom::insert(self.filter, rowid);
         Ok(())
     }
 
@@ -152,11 +170,13 @@ impl<'a> SstWriter<'a> {
     pub(crate) fn finish(
         mut self,
         store: &mut dyn BlockStore,
-    ) -> Result<Option<BlockId>, SstError> {
+    ) -> Result<Option<SstHandle>, SstError> {
         self.flush_data(store)?;
         if self.index_len == 0 {
             return Ok(None);
         }
+        // The filter block, so a reader can skip this SST without the index.
+        let filter = store.put(self.filter, BlockType::SstFilter, 0)?;
         // The index block: count, then (first_rowid, block_id) per data block.
         let bytes = 4 + self.index_len * INDEX_ENTRY;
         let buffer = &mut *self.pending; // reuse the data scratch; it is done with
@@ -166,8 +186,8 @@ impl<'a> SstWriter<'a> {
             buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
             buffer[at + 8..at + INDEX_ENTRY].copy_from_slice(&id.0);
         }
-        let root = store.put(&buffer[..bytes], BlockType::SstIndex, 0)?;
-        Ok(Some(root))
+        let index = store.put(&buffer[..bytes], BlockType::SstIndex, 0)?;
+        Ok(Some(SstHandle { index, filter }))
     }
 }
 
@@ -191,16 +211,24 @@ impl<'a> SstReader<'a> {
     }
 
     /// Finds `rowid`, copying its row into `into` and returning the length, or
-    /// `None` when the SST does not hold it. Reads two blocks: the index, then
-    /// the one data block the key would be in.
+    /// `None` when the SST does not hold it. Checks the filter first: a key the
+    /// filter rejects returns without the index or a data block being read at
+    /// all. A key it admits reads the index and the one data block the key
+    /// would be in — two blocks, as before, plus the filter.
     pub(crate) fn get(
         &mut self,
         store: &mut dyn BlockStore,
-        root: &BlockId,
+        handle: &SstHandle,
         rowid: u64,
         into: &mut [u8],
     ) -> Result<Option<usize>, SstError> {
-        let count = self.load_index(store, root)?;
+        // The filter reuses the index buffer: it is consulted and done with
+        // before the index is read, so the two never coexist.
+        let filter_len = store.get(&handle.filter, self.index_scratch)?;
+        if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
+            return Ok(None);
+        }
+        let count = self.load_index(store, &handle.index)?;
         let Some(entry) = block_containing(self.index_scratch, count, rowid) else {
             return Ok(None);
         };
@@ -234,7 +262,7 @@ impl<'a> SstReader<'a> {
     pub(crate) fn scan(
         &mut self,
         store: &mut dyn BlockStore,
-        root: &BlockId,
+        handle: &SstHandle,
         lo: u64,
         hi: u64,
         emit: &mut dyn FnMut(u64, &[u8]),
@@ -242,7 +270,9 @@ impl<'a> SstReader<'a> {
         if lo > hi {
             return Ok(());
         }
-        let count = self.load_index(store, root)?;
+        // A range is not a point-membership question, so the filter does not
+        // help here; the index locates the covering blocks directly.
+        let count = self.load_index(store, &handle.index)?;
         // The block `lo` falls in, or — when `lo` precedes every key — the
         // first block, since the range may still cover it from the left.
         let start = block_containing(self.index_scratch, count, lo).unwrap_or(0);
@@ -352,7 +382,7 @@ mod tests {
     }
 
     /// Builds an SST from `(rowid, row)` pairs, returns its root.
-    fn build(store: &mut MemoryBlockStore, arena: &Arena, rows: &[(u64, Vec<u8>)]) -> Option<BlockId> {
+    fn build(store: &mut MemoryBlockStore, arena: &Arena, rows: &[(u64, Vec<u8>)]) -> Option<SstHandle> {
         let mut w = SstWriter::new(arena).unwrap();
         for (rowid, row) in rows {
             w.append(store, *rowid, row).unwrap();
@@ -363,11 +393,11 @@ mod tests {
     fn get(
         reader: &mut SstReader,
         store: &mut MemoryBlockStore,
-        root: &BlockId,
+        handle: &SstHandle,
         rowid: u64,
     ) -> Option<Vec<u8>> {
         let mut out = vec![0u8; MAX_PAYLOAD];
-        reader.get(store, root, rowid, &mut out).unwrap().map(|n| {
+        reader.get(store, handle, rowid, &mut out).unwrap().map(|n| {
             out.truncate(n);
             out
         })
@@ -411,9 +441,9 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_reads_exactly_two_blocks() {
-        // The sparse index's guarantee: whatever the SST's size, a hit costs the
-        // index block plus one data block, no more.
+    fn a_present_key_reads_the_filter_the_index_and_one_data_block() {
+        // The sparse index's guarantee, now with the filter in front: whatever
+        // the SST's size, a hit costs the filter, the index, and one data block.
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (0..3000u64).map(|i| (i + 1, vec![7u8; 500])).collect();
@@ -421,7 +451,31 @@ mod tests {
         let mut r = SstReader::new(&a).unwrap();
         let before = s.reads();
         let _ = get(&mut r, &mut s, &root, 2500);
-        assert_eq!(s.reads() - before, 2, "a lookup should read the index and one data block");
+        assert_eq!(s.reads() - before, 3, "filter, index, and one data block");
+    }
+
+    #[test]
+    fn a_filtered_out_key_reads_only_the_filter() {
+        // The filter's payoff: a key it rejects returns without the index or a
+        // data block being touched at all — one read, not three.
+        let (_b, mut s) = store();
+        let a = arena();
+        // Only even keys are stored, so the odd probe is genuinely absent; with
+        // 3000 keys in a 128 KiB filter a false positive is very unlikely, and
+        // a rare one would read more, so the test probes several odd keys and
+        // requires that most cost a single read.
+        let rows: Vec<_> = (0..3000u64).map(|i| (i * 2, vec![7u8; 500])).collect();
+        let root = build(&mut s, &a, &rows).expect("has a root");
+        let mut r = SstReader::new(&a).unwrap();
+        let mut single_read = 0;
+        for probe in (1..200u64).step_by(2) {
+            let before = s.reads();
+            assert_eq!(get(&mut r, &mut s, &root, probe), None, "odd key {probe} is absent");
+            if s.reads() - before == 1 {
+                single_read += 1;
+            }
+        }
+        assert!(single_read >= 95, "the filter skipped the index on {single_read} of 100 absent keys");
     }
 
     #[test]
@@ -459,13 +513,13 @@ mod tests {
     fn scan(
         reader: &mut SstReader,
         store: &mut MemoryBlockStore,
-        root: &BlockId,
+        handle: &SstHandle,
         lo: u64,
         hi: u64,
     ) -> Vec<(u64, Vec<u8>)> {
         let mut out = Vec::new();
         reader
-            .scan(store, root, lo, hi, &mut |key, row| out.push((key, row.to_vec())))
+            .scan(store, handle, lo, hi, &mut |key, row| out.push((key, row.to_vec())))
             .unwrap();
         out
     }

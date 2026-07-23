@@ -144,7 +144,11 @@ step "durability: kill -9, restart, data intact"
   -c "INSERT INTO crashy_types VALUES ('{1,2}','{t,f}','{x}','{[2020-01-01,2020-02-01)}','[1,5)')" \
   -c "CREATE TABLE crashy_seq (id serial, v int)" \
   -c "INSERT INTO crashy_seq(v) VALUES (1),(2),(3)" \
-  -c "TRUNCATE crashy_seq"
+  -c "TRUNCATE crashy_seq" \
+  -c "CREATE SCHEMA crashy_ns" \
+  -c "CREATE TABLE crashy_ns.t (a int)" \
+  -c "INSERT INTO crashy_ns.t VALUES (7)" \
+  -c "CREATE VIEW crashy_ns.v AS SELECT a FROM crashy_ns.t"
 # With asynchronous wal_upload, a commit is durable on local disk immediately
 # but its S3 upload drains just after; a trailing query plus a short pause lets
 # that drain reach MinIO before the abrupt kill, so the later disk-wipe steps
@@ -170,6 +174,13 @@ seq_id=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -q \
   -c "INSERT INTO crashy_seq(v) VALUES (9) RETURNING id" 2>&1 | head -1)
 [[ "$seq_id" == "4" ]] && ok "serial sequence survives restart" \
   || bad "serial sequence survives restart (got: $seq_id)"
+# Schemas, their tables and their views survive the crash: the journal
+# replays CREATE SCHEMA and the qualified objects, and the view still
+# resolves under its stored creation path.
+ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
+  -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v), (SELECT count(*) FROM pg_namespace WHERE nspname = 'crashy_ns')" 2>&1)
+[[ "$ns" == "1|7|1" ]] && ok "schema objects survive restart" \
+  || bad "schema objects after restart: '$ns'"
 [[ "$types" == "$want" ]] && ok "column types survive restart" \
   || bad "column types after restart: got '$types' want '$want'"
 vals=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT a,b,c FROM crashy_types" 2>&1)
@@ -211,6 +222,11 @@ for i in {1..50}; do
 done
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT v FROM crashy ORDER BY id LIMIT 1" 2>&1)
 [[ "$out" == "pre-crash" ]] && ok "cold start from bucket" || bad "cold start from bucket: '$out'"
+# Schemas and their contents rebuild from the manifest alone (wiped disk).
+ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
+  -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v)" 2>&1)
+[[ "$ns" == "1|7" ]] && ok "schema objects survive a cold start" \
+  || bad "schema objects after cold start: '$ns'"
 
 step "ingest beyond memtable_bytes: rows spill to the bucket and read back"
 # The Stage D milestone: sustained inserts well past the heap's capacity,

@@ -42,6 +42,10 @@ const KIND_DROP_VIEW: u8 = 6;
 const KIND_CREATE_INDEX: u8 = 7;
 const KIND_DROP_INDEX: u8 = 8;
 const KIND_SEQUENCE_SET: u8 = 9;
+const KIND_CREATE_SCHEMA: u8 = 10;
+const KIND_DROP_SCHEMA: u8 = 11;
+const KIND_SET_TABLE_SCHEMA: u8 = 12;
+const KIND_DROP_FK: u8 = 13;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -53,36 +57,69 @@ const JOURNAL_FULL: &str = "53100";
 )]
 pub enum WalOp<'a> {
     CreateTable(TableDef),
-    DropTable(&'a str),
+    DropTable {
+        schema: &'a str,
+        name: &'a str,
+    },
     Upsert {
+        schema: &'a str,
         table: &'a str,
         rowid: u64,
         row: &'a [u8],
     },
     Delete {
+        schema: &'a str,
         table: &'a str,
         rowid: u64,
     },
     CreateView {
+        schema: &'a str,
         name: &'a str,
         sql: &'a str,
+        /// The creator's search_path, under which the body re-resolves.
+        path: &'a str,
     },
-    DropView(&'a str),
+    DropView {
+        schema: &'a str,
+        name: &'a str,
+    },
     CreateIndex {
+        schema: &'a str,
         name: &'a str,
         table: &'a str,
         columns: [u16; MAX_INDEX_COLS],
         n_cols: usize,
         unique: bool,
     },
-    DropIndex(&'a str),
+    DropIndex {
+        schema: &'a str,
+        name: &'a str,
+    },
     /// A serial/identity column's sequence position: the last value handed
     /// out. Absolute, so replay is idempotent and order-tolerant within a
     /// table's records.
     SequenceSet {
+        schema: &'a str,
         table: &'a str,
         column: u16,
         last: i64,
+    },
+    CreateSchema(&'a str),
+    DropSchema(&'a str),
+    /// ALTER TABLE ... SET SCHEMA: a definition-only move. Replay moves the
+    /// table and its indexes and repoints every inbound foreign key, all
+    /// deterministically, so no row images are journaled.
+    SetTableSchema {
+        schema: &'a str,
+        name: &'a str,
+        new_schema: &'a str,
+    },
+    /// DROP SCHEMA CASCADE severing an inbound foreign key on a table that
+    /// survives: a definition-only removal, replayed by constraint name.
+    DropTableFk {
+        schema: &'a str,
+        table: &'a str,
+        fk_name: &'a str,
     },
 }
 
@@ -228,7 +265,7 @@ impl Wal {
                     u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_SEQUENCE_SET).contains(&kind)
+                if !(KIND_CREATE..=KIND_DROP_FK).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -412,14 +449,18 @@ fn die(msg: &str) -> ! {
 fn op_kind(operation: &WalOp) -> u8 {
     match operation {
         WalOp::CreateTable(_) => KIND_CREATE,
-        WalOp::DropTable(_) => KIND_DROP,
+        WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
         WalOp::Delete { .. } => KIND_DELETE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
-        WalOp::DropView(_) => KIND_DROP_VIEW,
+        WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
-        WalOp::DropIndex(_) => KIND_DROP_INDEX,
+        WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
+        WalOp::CreateSchema(_) => KIND_CREATE_SCHEMA,
+        WalOp::DropSchema(_) => KIND_DROP_SCHEMA,
+        WalOp::SetTableSchema { .. } => KIND_SET_TABLE_SCHEMA,
+        WalOp::DropTableFk { .. } => KIND_DROP_FK,
     }
 }
 
@@ -449,18 +490,37 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     + 1 + fk.n_parent_cols * 2
                     + 2;
             }
+            // Trailing schema block (absent in journals from before schemas
+            // existed; replay defaults those to public).
+            n += 1 + def.schema.as_str().len();
+            for fk in def.fkeys() {
+                n += 1 + fk.parent_schema.as_str().len();
+            }
             n
         }
-        WalOp::DropTable(name) => 1 + name.len(),
-        WalOp::Upsert { table, row, .. } => 1 + table.len() + 8 + 4 + row.len(),
-        WalOp::Delete { table, .. } => 1 + table.len() + 8,
-        WalOp::CreateView { name, sql } => 1 + name.len() + 2 + sql.len(),
-        WalOp::DropView(name) => 1 + name.len(),
-        WalOp::CreateIndex { name, table, n_cols, .. } => {
-            1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2
+        WalOp::DropTable { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::Upsert { schema, table, row, .. } => {
+            1 + table.len() + 8 + 4 + row.len() + 1 + schema.len()
         }
-        WalOp::DropIndex(name) => 1 + name.len(),
-        WalOp::SequenceSet { table, .. } => 1 + table.len() + 2 + 8,
+        WalOp::Delete { schema, table, .. } => 1 + table.len() + 8 + 1 + schema.len(),
+        WalOp::CreateView { schema, name, sql, path } => {
+            1 + name.len() + 2 + sql.len() + 1 + schema.len() + 2 + path.len()
+        }
+        WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::CreateIndex { schema, name, table, n_cols, .. } => {
+            1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2 + 1 + schema.len()
+        }
+        WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::SequenceSet { schema, table, .. } => {
+            1 + table.len() + 2 + 8 + 1 + schema.len()
+        }
+        WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
+        WalOp::SetTableSchema { schema, name, new_schema } => {
+            1 + schema.len() + 1 + name.len() + 1 + new_schema.len()
+        }
+        WalOp::DropTableFk { schema, table, fk_name } => {
+            1 + schema.len() + 1 + table.len() + 1 + fk_name.len()
+        }
     }
 }
 
@@ -514,39 +574,68 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 }
                 ok &= buffer.append(&[fk.on_delete.code(), fk.on_update.code()]);
             }
+            ok &= name_bytes(buffer, def.schema.as_str());
+            for fk in def.fkeys() {
+                ok &= name_bytes(buffer, fk.parent_schema.as_str());
+            }
             ok
         }
-        WalOp::DropTable(name) => name_bytes(buffer, name),
-        WalOp::Upsert { table, rowid, row } => {
+        WalOp::DropTable { schema, name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        }
+        WalOp::Upsert { schema, table, rowid, row } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
                 && buffer.append(&(row.len() as u32).to_le_bytes())
                 && buffer.append(row)
+                && name_bytes(buffer, schema)
         }
-        WalOp::Delete { table, rowid } => {
-            name_bytes(buffer, table) && buffer.append(&rowid.to_le_bytes())
+        WalOp::Delete { schema, table, rowid } => {
+            name_bytes(buffer, table)
+                && buffer.append(&rowid.to_le_bytes())
+                && name_bytes(buffer, schema)
         }
-        WalOp::CreateView { name, sql } => {
+        WalOp::CreateView { schema, name, sql, path } => {
             name_bytes(buffer, name)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
+                && name_bytes(buffer, schema)
+                && buffer.append(&(path.len() as u16).to_le_bytes())
+                && buffer.append(path.as_bytes())
         }
-        WalOp::DropView(name) => name_bytes(buffer, name),
-        WalOp::CreateIndex { name, table, columns, n_cols, unique } => {
+        WalOp::DropView { schema, name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        }
+        WalOp::CreateIndex { schema, name, table, columns, n_cols, unique } => {
             let mut ok = name_bytes(buffer, name)
                 && name_bytes(buffer, table)
                 && buffer.append(&[u8::from(*unique), *n_cols as u8]);
             for c in &columns[..*n_cols] {
                 ok &= buffer.append(&c.to_le_bytes());
             }
+            ok &= name_bytes(buffer, schema);
             ok
         }
-        WalOp::DropIndex(name) => name_bytes(buffer, name),
-        WalOp::SequenceSet { table, column, last } => {
+        WalOp::DropIndex { schema, name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        }
+        WalOp::SequenceSet { schema, table, column, last } => {
             let mut ok = name_bytes(buffer, table);
             ok &= buffer.append(&column.to_le_bytes());
             ok &= buffer.append(&last.to_le_bytes());
+            ok &= name_bytes(buffer, schema);
             ok
+        }
+        WalOp::CreateSchema(name) | WalOp::DropSchema(name) => name_bytes(buffer, name),
+        WalOp::SetTableSchema { schema, name, new_schema } => {
+            name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, new_schema)
+        }
+        WalOp::DropTableFk { schema, table, fk_name } => {
+            name_bytes(buffer, schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, fk_name)
         }
     }
 }
@@ -700,11 +789,26 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 fk.on_update = FkAction::from_code(acts[1])?;
                 def.fkeys[f] = fk;
             }
+            // Trailing schema block; a journal from before schemas existed
+            // ends here, and everything defaults to public.
+            if at < payload.len() {
+                def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
+                for f in 0..def.n_fkeys {
+                    def.fkeys[f].parent_schema =
+                        SqlName::parse(take_name(&mut at)?).ok()?;
+                }
+            } else {
+                def.schema = SqlName::parse("public").ok()?;
+                for f in 0..def.n_fkeys {
+                    def.fkeys[f].parent_schema = SqlName::parse("public").ok()?;
+                }
+            }
             (at == payload.len()).then_some(WalOp::CreateTable(def))
         }
         KIND_DROP => {
             let name = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropTable(name))
+            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            (at == payload.len()).then_some(WalOp::DropTable { schema, name })
         }
         KIND_UPSERT => {
             let table = take_name(&mut at)?;
@@ -715,13 +819,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 4;
             let row = payload.get(at..at + row_len)?;
             at += row_len;
-            (at == payload.len()).then_some(WalOp::Upsert { table, rowid, row })
+            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            (at == payload.len()).then_some(WalOp::Upsert { schema, table, rowid, row })
         }
         KIND_DELETE => {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            (at == payload.len()).then_some(WalOp::Delete { table, rowid })
+            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            (at == payload.len()).then_some(WalOp::Delete { schema, table, rowid })
         }
         KIND_CREATE_VIEW => {
             let name = take_name(&mut at)?;
@@ -731,11 +837,23 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let raw = payload.get(at..at + sql_len)?;
             at += sql_len;
             let sql = core::str::from_utf8(raw).ok()?;
-            (at == payload.len()).then_some(WalOp::CreateView { name, sql })
+            let (schema, path) = if at < payload.len() {
+                let schema = take_name(&mut at)?;
+                let path_len =
+                    u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+                at += 2;
+                let raw = payload.get(at..at + path_len)?;
+                at += path_len;
+                (schema, core::str::from_utf8(raw).ok()?)
+            } else {
+                ("public", "\"$user\", public")
+            };
+            (at == payload.len()).then_some(WalOp::CreateView { schema, name, sql, path })
         }
         KIND_DROP_VIEW => {
             let name = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropView(name))
+            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            (at == payload.len()).then_some(WalOp::DropView { schema, name })
         }
         KIND_CREATE_INDEX => {
             let name = take_name(&mut at)?;
@@ -752,7 +870,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                 at += 2;
             }
+            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
             (at == payload.len()).then_some(WalOp::CreateIndex {
+                schema,
                 name,
                 table,
                 columns,
@@ -762,7 +882,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_DROP_INDEX => {
             let name = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropIndex(name))
+            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            (at == payload.len()).then_some(WalOp::DropIndex { schema, name })
         }
         KIND_SEQUENCE_SET => {
             let table = take_name(&mut at)?;
@@ -770,7 +891,29 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 2;
             let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            (at == payload.len()).then_some(WalOp::SequenceSet { table, column, last })
+            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            (at == payload.len()).then_some(WalOp::SequenceSet { schema, table, column, last })
+        }
+        KIND_CREATE_SCHEMA => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::CreateSchema(name))
+        }
+        KIND_DROP_SCHEMA => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropSchema(name))
+        }
+        KIND_SET_TABLE_SCHEMA => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let new_schema = take_name(&mut at)?;
+            (at == payload.len())
+                .then_some(WalOp::SetTableSchema { schema, name, new_schema })
+        }
+        KIND_DROP_FK => {
+            let schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let fk_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropTableFk { schema, table, fk_name })
         }
         _ => None,
     }
@@ -1016,14 +1159,15 @@ mod tests {
             wal.append(
                 2,
                 &WalOp::Upsert {
+                    schema: "public",
                     table: "t",
                     rowid: 1,
                     row: b"ROWBYTES",
                 },
             )
             .unwrap();
-            wal.append(3, &WalOp::Delete { table: "t", rowid: 1 }).unwrap();
-            wal.append(4, &WalOp::DropTable("t")).unwrap();
+            wal.append(3, &WalOp::Delete { schema: "public", table: "t", rowid: 1 }).unwrap();
+            wal.append(4, &WalOp::DropTable { schema: "public", name: "t" }).unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
@@ -1039,7 +1183,7 @@ mod tests {
         assert!(seen[3].starts_with("4:DropTable"));
         assert_eq!(wal.last_lsn(), 4);
         // Appending continues after the replayed tail.
-        wal.append(5, &WalOp::DropTable("u")).unwrap();
+        wal.append(5, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
         wal.commit();
     }
 
@@ -1051,7 +1195,7 @@ mod tests {
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
             for lsn in 1..=3 {
-                wal.append(lsn, &WalOp::Delete { table: "t", rowid: lsn })
+                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn })
                     .unwrap();
             }
             wal.commit();
@@ -1059,7 +1203,7 @@ mod tests {
         // Flip one byte in the second record's payload.
         let path = format!("{dir}/journal.wal");
         let mut bytes = std::fs::read(&path).unwrap();
-        let record_len = HEADER_LEN + encoded_payload_len(&WalOp::Delete { table: "t", rowid: 1 });
+        let record_len = HEADER_LEN + encoded_payload_len(&WalOp::Delete { schema: "public", table: "t", rowid: 1 });
         bytes[record_len + HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
@@ -1077,7 +1221,7 @@ mod tests {
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
             for lsn in 1..=5 {
-                wal.append(lsn, &WalOp::Delete { table: "t", rowid: lsn }).unwrap();
+                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn }).unwrap();
             }
             wal.commit();
         }
@@ -1097,13 +1241,13 @@ mod tests {
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
             for lsn in 1..=10 {
-                wal.append(lsn, &WalOp::Delete { table: "t", rowid: lsn }).unwrap();
+                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn }).unwrap();
             }
             wal.commit();
             // Checkpoint at lsn 10; journal restarts with two tail records.
             wal.reset_after_checkpoint();
-            wal.append(11, &WalOp::Delete { table: "t", rowid: 11 }).unwrap();
-            wal.append(12, &WalOp::Delete { table: "t", rowid: 12 }).unwrap();
+            wal.append(11, &WalOp::Delete { schema: "public", table: "t", rowid: 11 }).unwrap();
+            wal.append(12, &WalOp::Delete { schema: "public", table: "t", rowid: 12 }).unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
@@ -1129,6 +1273,7 @@ mod tests {
             match wal.append(
                 lsn,
                 &WalOp::Upsert {
+                    schema: "public",
                     table: "t",
                     rowid: lsn,
                     row: &[0u8; 32],
@@ -1151,7 +1296,7 @@ mod tests {
         let mut wal = Wal::open(&config, &mut budget).unwrap();
         let big = [0u8; 256];
         let err = wal
-            .append(1, &WalOp::Upsert { table: "t", rowid: 1, row: &big })
+            .append(1, &WalOp::Upsert { schema: "public", table: "t", rowid: 1, row: &big })
             .unwrap_err();
         assert_eq!(err.sqlstate, "54000");
     }
@@ -1164,7 +1309,7 @@ mod tests {
         let mut wal = Wal::open(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for lsn in 1..=16 {
-                wal.append(lsn, &WalOp::Delete { table: "t", rowid: lsn })
+                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn })
                     .unwrap();
             }
         });

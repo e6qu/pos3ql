@@ -8,7 +8,7 @@
 //! statement does not give one.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{ColumnDef, Expr, FkAction, TableConstraint};
+use crate::sql::ast::{ColumnDef, Expr, FkAction, QualName, TableConstraint};
 use crate::sql::eval::{cast_to, eval, sqlstate, NoColumns, SqlError};
 use crate::sql::types::ColType;
 use crate::storage::{
@@ -390,7 +390,7 @@ fn attach_fkey(
     def: &mut TableDef,
     name: Option<&str>,
     child_cols: &[&str],
-    parent: &str,
+    parent: &QualName,
     parent_cols: &[&str],
     on_delete: FkAction,
     on_update: FkAction,
@@ -406,17 +406,44 @@ fn attach_fkey(
     }
     let (child_idxs, n_child) = resolve_cols(def, child_cols)?;
 
-    // The parent may be this very table (self-reference), not yet in storage.
-    let self_ref = parent == def.name.as_str();
+    // The parent may be this very table (self-reference), not yet in
+    // storage: PostgreSQL resolves the reference with the new table already
+    // cataloged, so a name landing on the creation target is a self-reference
+    // — a bare name only when no earlier search-path schema holds an existing
+    // table of that name, a qualified one when it names the table's schema.
+    let resolved: Option<usize> =
+        match storage.resolve_relation(parent.schema, parent.name, txid) {
+            Some(crate::storage::ResolvedRelation::Table(pi)) => Some(pi),
+            _ => None,
+        };
+    let self_ref = parent.name == def.name.as_str()
+        && match parent.schema {
+            Some(schema) => schema == def.schema.as_str(),
+            None => {
+                // Does an existing table shadow the self-reference earlier in
+                // the path than the creation schema? The creation schema is
+                // the first path schema, so any hit resolves after it — the
+                // self-reference wins.
+                true
+            }
+        };
     let parent_def: TableDef = if self_ref {
         *def
     } else {
-        let Some(pi) = storage.find_visible(parent, txid) else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "relation \"{}\" does not exist",
-                parent
-            ));
+        let Some(pi) = resolved else {
+            return Err(match parent.schema {
+                Some(schema) => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}.{}\" does not exist",
+                    schema,
+                    parent.name
+                ),
+                None => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    parent.name
+                ),
+            });
         };
         storage.table(pi).def
     };
@@ -430,7 +457,7 @@ fn attach_fkey(
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
                 "there is no primary key for referenced table \"{}\"",
-                parent
+                parent.name
             ));
         }
         n_parent = pk_n;
@@ -454,7 +481,7 @@ fn attach_fkey(
         return Err(sql_err!(
             crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
             "there is no unique constraint matching given keys for referenced table \"{}\"",
-            parent
+            parent.name
         ));
     }
     // Types must match between each child and parent column.
@@ -479,7 +506,8 @@ fn attach_fkey(
     fk.name = fname;
     fk.columns[..n_child].copy_from_slice(&child_idxs[..n_child]);
     fk.n_cols = n_child;
-    fk.parent = SqlName::parse(parent)?;
+    fk.parent_schema = parent_def.schema;
+    fk.parent = parent_def.name;
     fk.parent_cols[..n_parent].copy_from_slice(&parent_idxs[..n_parent]);
     fk.n_parent_cols = n_parent;
     fk.on_delete = fk_action_of(on_delete);

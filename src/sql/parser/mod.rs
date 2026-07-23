@@ -270,17 +270,28 @@ impl<'a> Parser<'a> {
     /// TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
     /// [CASCADE | RESTRICT]. ONLY and `*` are accepted and meaningless here
     /// (no inheritance).
+    /// `[schema.]name` — a possibly-qualified relation name in a statement
+    /// position (DDL targets, DML tables).
+    fn qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        let first = self.col_ident(what)?;
+        if self.eat_op(".")? {
+            Ok(QualName { schema: Some(first), name: self.col_ident(what)? })
+        } else {
+            Ok(QualName::bare(first))
+        }
+    }
+
     fn truncate(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // truncate
         let _ = self.eat_ident("table")?;
-        let mut names: [&'a str; 16] = [""; 16];
+        let mut names: [QualName<'a>; 16] = [QualName::bare(""); 16];
         let mut n = 0usize;
         loop {
             let _ = self.eat_ident("only")?;
             if n == names.len() {
                 return Err(self.err_here("too many tables in TRUNCATE"));
             }
-            names[n] = self.col_ident("table name")?;
+            names[n] = self.qual_name("table name")?;
             n += 1;
             if self.peeked == Tok::Op("*") {
                 self.advance()?;
@@ -1178,8 +1189,11 @@ impl<'a> Parser<'a> {
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         self.expect_ident("table")?;
-        let table = self.col_ident("table name")?;
-        let action = if self.eat_ident("rename")? {
+        let table = self.qual_name("table name")?;
+        let action = if self.eat_ident("set")? {
+            self.expect_ident("schema")?;
+            AlterAction::SetSchema(self.col_ident("schema name")?)
+        } else if self.eat_ident("rename")? {
             if self.eat_ident("to")? {
                 AlterAction::RenameTable(self.col_ident("new table name")?)
             } else {
@@ -1286,7 +1300,7 @@ impl<'a> Parser<'a> {
     fn insert(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
-        let table = self.col_ident("table name")?;
+        let table = self.qual_name("table name")?;
         let mut column_names: [&'a str; MAX_LIST] = [""; MAX_LIST];
         let mut n_cols = 0;
         if self.peeked == Tok::Op("(") {
@@ -1420,7 +1434,7 @@ impl<'a> Parser<'a> {
 
     fn update(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("update")?;
-        let table = self.col_ident("table name")?;
+        let table = self.qual_name("table name")?;
         self.expect_ident("set")?;
         let dummy: (&'a str, &'a Expr<'a>) = ("", &Expr::Null);
         let mut assignments = [dummy; MAX_LIST];
@@ -1458,7 +1472,7 @@ impl<'a> Parser<'a> {
     fn delete(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("delete")?;
         self.expect_ident("from")?;
-        let table = self.col_ident("table name")?;
+        let table = self.qual_name("table name")?;
         let using = if self.eat_ident("using")? {
             let fc = self.from_clause()?;
             Some(&*self.arena.alloc(fc).map_err(|_| self.err_here("USING too large for SQL arena"))?)
@@ -2195,7 +2209,7 @@ mod tests {
              DROP TABLE IF EXISTS t",
             |p| {
                 let Stmt::CreateTable(c) = p.next_stmt().unwrap().unwrap() else { panic!() };
-                assert_eq!(c.name, "t");
+                assert_eq!(c.name, QualName::bare("t"));
                 assert_eq!(c.columns.len(), 3);
                 assert!(c.columns[0].not_null);
                 assert_eq!(c.columns[2].type_name, "float8");

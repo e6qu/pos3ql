@@ -121,8 +121,7 @@ pub fn check_unique_indexes(
     self_rowid: Option<u64>,
     txid: u32,
 ) -> Result<(), SqlError> {
-    let table_name = def.name.as_str();
-    for index in storage.unique_indexes_for(table_name, txid) {
+    for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         let icols = &index.columns[..index.n_cols];
         tuple_uniqueness(
             storage, table_index, schema, icols, values, self_rowid, txid, index.name.as_str(),
@@ -283,7 +282,7 @@ fn check_fk_child(
         if fk.columns().iter().any(|&c| values[c as usize].is_null()) {
             continue;
         }
-        let Some(pi) = storage.find_visible(fk.parent.as_str(), txid) else {
+        let Some(pi) = storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid) else {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::FOREIGN_KEY_VIOLATION,
                 "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
@@ -362,6 +361,7 @@ pub(crate) const MAX_FK_CASCADE_DEPTH: u32 = 32;
 pub(crate) fn apply_fk_parent_actions(
     storage: &mut Storage,
     txn: &mut TxnState,
+    parent_schema: &str,
     parent_name: &str,
     old_parent: &[Datum],
     new_parent: Option<&[Datum]>,
@@ -386,7 +386,9 @@ pub(crate) fn apply_fk_parent_actions(
         let cschema = &cschema[..cdef.n_columns];
         for fk_index in 0..cdef.n_fkeys {
             let fk = cdef.fkeys[fk_index];
-            if fk.parent.as_str() != parent_name {
+            if fk.parent_schema.as_str() != parent_schema
+                || fk.parent.as_str() != parent_name
+            {
                 continue;
             }
             // An update triggers this key's action only when the key changed.
@@ -481,6 +483,7 @@ pub(crate) fn apply_fk_parent_actions(
                 }
             }
 
+            let child_schema = cdef.schema.as_str();
             let child_name = cdef.name.as_str();
             for &(rowid, old_bytes) in matches.iter() {
                 let mut crow = [Datum::Null; MAX_COLUMNS];
@@ -489,7 +492,8 @@ pub(crate) fn apply_fk_parent_actions(
                 if new_parent.is_none() && action == StorageFkAction::Cascade {
                     // Cascade the delete: grandchildren first, then this row.
                     apply_fk_parent_actions(
-                        storage, txn, child_name, crow, None, arena, params, depth - 1,
+                        storage, txn, child_schema, child_name, crow, None, arena, params,
+                        depth - 1,
                     )?;
                     let prior = storage.write_pending(child_index, rowid, txn.txid, None)?;
                     if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
@@ -536,6 +540,7 @@ pub(crate) fn apply_fk_parent_actions(
                 apply_fk_parent_actions(
                     storage,
                     txn,
+                    child_schema,
                     child_name,
                     crow,
                     Some(new_child),
@@ -565,7 +570,12 @@ pub(crate) fn apply_fk_parent_actions(
 }
 
 /// Whether any visible table has a foreign key referencing `name`.
-pub(crate) fn table_is_referenced(storage: &Storage, name: &str, txid: u32) -> bool {
+pub(crate) fn table_is_referenced(
+    storage: &Storage,
+    schema: &str,
+    name: &str,
+    txid: u32,
+) -> bool {
     for column_index in 0..storage.table_count() {
         if !storage.table(column_index).visible_to(txid) {
             continue;
@@ -575,7 +585,7 @@ pub(crate) fn table_is_referenced(storage: &Storage, name: &str, txid: u32) -> b
             .def
             .fkeys()
             .iter()
-            .any(|fk| fk.parent.as_str() == name)
+            .any(|fk| fk.parent_schema.as_str() == schema && fk.parent.as_str() == name)
         {
             return true;
         }
@@ -587,6 +597,7 @@ pub(crate) fn table_is_referenced(storage: &Storage, name: &str, txid: u32) -> b
 /// child foreign key (so referential integrity must be re-checked).
 pub(crate) fn referenced_key_changed(
     storage: &Storage,
+    parent_schema: &str,
     parent_name: &str,
     old: &[Datum],
     new: &[Datum],
@@ -598,7 +609,9 @@ pub(crate) fn referenced_key_changed(
         }
         let cdef = storage.table(column_index).def;
         for fk in cdef.fkeys() {
-            if fk.parent.as_str() != parent_name {
+            if fk.parent_schema.as_str() != parent_schema
+                || fk.parent.as_str() != parent_name
+            {
                 continue;
             }
             for &pc in fk.parent_cols() {

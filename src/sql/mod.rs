@@ -237,11 +237,13 @@ impl Engine {
                 continue;
             }
             let name = t.def.name;
+            let schema = t.def.schema;
             let lsn = self.storage.lsn() + 1;
             let appended = match p.loc {
                 Some(loc) => self.wal.append(
                     lsn,
                     &WalOp::Upsert {
+                        schema: schema.as_str(),
                         table: name.as_str(),
                         rowid,
                         row: self.storage.heap.get(loc),
@@ -250,6 +252,7 @@ impl Engine {
                 None => self.wal.append(
                     lsn,
                     &WalOp::Delete {
+                        schema: schema.as_str(),
                         table: name.as_str(),
                         rowid,
                     },
@@ -269,6 +272,7 @@ impl Engine {
                 continue;
             }
             let name = self.storage.table(i).def.name;
+            let schema = self.storage.table(i).def.schema;
             for c in 0..self.storage.table(i).def.n_columns {
                 if !self.storage.table(i).def.columns()[c].auto_increment {
                     continue;
@@ -277,7 +281,12 @@ impl Engine {
                 let lsn = self.storage.lsn() + 1;
                 if let Err(e) = self.wal.append(
                     lsn,
-                    &WalOp::SequenceSet { table: name.as_str(), column: c as u16, last },
+                    &WalOp::SequenceSet {
+                        schema: schema.as_str(),
+                        table: name.as_str(),
+                        column: c as u16,
+                        last,
+                    },
                 ) {
                     self.rollback_txn(txn);
                     return Err(e);
@@ -307,9 +316,11 @@ impl Engine {
                 DdlUndo::Created(slot) => self.storage.commit_create(*slot as usize),
                 DdlUndo::Dropped(slot) => {
                     let name = self.storage.table(*slot as usize).def.name;
+                    let schema = self.storage.table(*slot as usize).def.schema;
                     self.storage.commit_drop(*slot as usize);
                     // The table's indexes were pending-dropped with it.
-                    self.storage.commit_indexes_for(name.as_str(), txn.txid);
+                    self.storage
+                        .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
                 DdlUndo::ViewCreated(slot) => self.storage.commit_view_create(*slot as usize),
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
@@ -317,6 +328,14 @@ impl Engine {
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } => {}
+                DdlUndo::SchemaCreated(slot) => {
+                    self.storage.commit_schema_create(*slot as usize)
+                }
+                DdlUndo::SchemaDropped(slot) => {
+                    self.storage.commit_schema_drop(*slot as usize)
+                }
+                // The removal already happened in place; committing keeps it.
+                DdlUndo::FkDropped { .. } => {}
             }
         }
         txn.clear();
@@ -340,7 +359,9 @@ impl Engine {
                     self.storage.rollback_drop(slot as usize);
                     // The table's indexes were pending-dropped with it; revert.
                     let name = self.storage.table(slot as usize).def.name;
-                    self.storage.rollback_indexes_for(name.as_str(), txn.txid);
+                    let schema = self.storage.table(slot as usize).def.schema;
+                    self.storage
+                        .rollback_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
                 DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
                 DdlUndo::ViewDropped(slot) => {
@@ -354,6 +375,15 @@ impl Engine {
                     let t = self.storage.table_mut(table as usize);
                     t.serial_last[column as usize] = prior;
                     t.serial_dirty = true;
+                }
+                DdlUndo::SchemaCreated(slot) => {
+                    self.storage.rollback_schema_create(slot as usize)
+                }
+                DdlUndo::SchemaDropped(slot) => {
+                    self.storage.rollback_schema_drop(slot as usize)
+                }
+                DdlUndo::FkDropped { table, fk } => {
+                    self.storage.restore_fk(table as usize, fk)
                 }
             }
         }
@@ -377,7 +407,9 @@ impl Engine {
                 DdlUndo::Dropped(slot) => {
                     self.storage.rollback_drop(slot as usize);
                     let name = self.storage.table(slot as usize).def.name;
-                    self.storage.rollback_indexes_for(name.as_str(), txn.txid);
+                    let schema = self.storage.table(slot as usize).def.schema;
+                    self.storage
+                        .rollback_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
                 DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
                 DdlUndo::ViewDropped(slot) => {
@@ -391,6 +423,15 @@ impl Engine {
                     let t = self.storage.table_mut(table as usize);
                     t.serial_last[column as usize] = prior;
                     t.serial_dirty = true;
+                }
+                DdlUndo::SchemaCreated(slot) => {
+                    self.storage.rollback_schema_create(slot as usize)
+                }
+                DdlUndo::SchemaDropped(slot) => {
+                    self.storage.rollback_schema_drop(slot as usize)
+                }
+                DdlUndo::FkDropped { table, fk } => {
+                    self.storage.restore_fk(table as usize, fk)
                 }
             }
         }
@@ -687,8 +728,11 @@ impl Engine {
     }
 
     /// The OID of a named column of a visible table, if resolvable.
-    fn column_oid(&self, table: &str, col: &str, txid: u32) -> Option<i32> {
-        let slot = self.storage.find_visible(table, txid)?;
+    fn column_oid(&self, table: &ast::QualName, col: &str, txid: u32) -> Option<i32> {
+        let slot = match self.storage.resolve_relation(table.schema, table.name, txid) {
+            Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
+            _ => return None,
+        };
         let def = &self.storage.table(slot).def;
         let index = def.column_index(col)?;
         Some(def.columns()[index].ctype.oid())
@@ -703,7 +747,11 @@ impl Engine {
         };
         match statement {
             Stmt::Insert(ins) => {
-                let slot = self.storage.find_visible(ins.table, txid);
+                let slot = match self.storage.resolve_relation(ins.table.schema, ins.table.name, txid)
+                {
+                    Some(crate::storage::ResolvedRelation::Table(slot)) => Some(slot),
+                    _ => None,
+                };
                 let def = slot.map(|s| &self.storage.table(s).def);
                 for row in ins.rows {
                     for (i, value) in row.iter().enumerate() {
@@ -723,17 +771,17 @@ impl Engine {
             }
             Stmt::Update(u) => {
                 for (col, value) in u.assignments {
-                    if let Some(ty) = self.column_oid(u.table, col, txid) {
+                    if let Some(ty) = self.column_oid(&u.table, col, txid) {
                         set(oids, value, ty);
                     }
                 }
                 if let Some(w) = u.where_clause {
-                    self.infer_where_params(u.table, w, txid, oids);
+                    self.infer_where_params(&u.table, w, txid, oids);
                 }
             }
             Stmt::Delete(d) => {
                 if let Some(w) = d.where_clause {
-                    self.infer_where_params(d.table, w, txid, oids);
+                    self.infer_where_params(&d.table, w, txid, oids);
                 }
             }
             Stmt::Select(s) => {
@@ -741,7 +789,9 @@ impl Engine {
                 // resolution; those params stay text).
                 if let (Some(from), Some(w)) = (&s.from, s.where_clause)
                     && from.joins.is_empty() && from.base.subquery.is_none() {
-                        self.infer_where_params(from.base.table, w, txid, oids);
+                        let table =
+                            ast::QualName { schema: from.base.schema, name: from.base.table };
+                        self.infer_where_params(&table, w, txid, oids);
                     }
             }
             _ => {}
@@ -752,7 +802,7 @@ impl Engine {
     /// parameter from the column's type.
     fn infer_where_params(
         &self,
-        table: &str,
+        table: &ast::QualName,
         expression: &Expr,
         txid: u32,
         oids: &mut [i32; MAX_BIND_PARAMS],
@@ -882,6 +932,47 @@ impl Engine {
         // Reclaim the shared execution arena from the previous statement: its
         // materialized rows have already been paged to the wire.
         self.work.reset();
+        // Drop any diagnostic detail a swallowed error left behind, and
+        // install this session's effective search path for the statement:
+        // every name resolution below reads it from storage.
+        let _ = eval::take_diagnostic();
+        eval::funcs::system::set_session_user(guc.session_user());
+        let path =
+            self.storage.compute_path(guc.search_path(), guc.session_user(), txn.txid);
+        self.storage.swap_path(path);
+        // Publish the path's schema names for current_schema/current_schemas.
+        {
+            use core::fmt::Write as _;
+            let mut published = eval::funcs::system::SessionSchemas {
+                names: [crate::util::StackStr::new(); 17],
+                n: 0,
+                catalog_pos: usize::MAX,
+            };
+            for entry in path.entries() {
+                match entry {
+                    crate::storage::PathEntry::Catalog => {
+                        // An *explicit* pg_catalog is a real path element
+                        // (current_schema can be pg_catalog); the implicit
+                        // one only surfaces in current_schemas(true).
+                        if path.explicit_catalog() {
+                            let _ = write!(published.names[published.n], "pg_catalog");
+                            published.n += 1;
+                        } else if published.catalog_pos == usize::MAX {
+                            published.catalog_pos = published.n;
+                        }
+                    }
+                    crate::storage::PathEntry::Schema(slot) => {
+                        let _ = write!(
+                            published.names[published.n],
+                            "{}",
+                            self.storage.schema_def(*slot as usize).name.as_str()
+                        );
+                        published.n += 1;
+                    }
+                }
+            }
+            eval::funcs::system::set_session_schemas(published);
+        }
         // Arm this statement's `statement_timeout` deadline (0 clears it); each
         // statement re-arms, so no explicit disarm is needed.
         query::arm_timeout(guc.statement_timeout_ms());
@@ -953,11 +1044,12 @@ impl Engine {
                 name,
                 *or_replace,
                 sql,
+                guc.search_path(),
                 arena,
                 responder,
             ),
-            Stmt::DropView { name, if_exists } => {
-                exec::drop_view(&mut self.storage, &mut self.wal, txn, name, *if_exists, responder)
+            Stmt::DropView { names, if_exists } => {
+                exec::drop_view(&mut self.storage, &mut self.wal, txn, names, *if_exists, responder)
             }
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
                 &mut self.storage,
@@ -969,8 +1061,8 @@ impl Engine {
                 *unique,
                 responder,
             ),
-            Stmt::DropIndex { name, if_exists } => {
-                exec::drop_index(&mut self.storage, &mut self.wal, txn, name, *if_exists, responder)
+            Stmt::DropIndex { names, if_exists } => {
+                exec::drop_index(&mut self.storage, &mut self.wal, txn, names, *if_exists, responder)
             }
             Stmt::Insert(i) => {
                 // DML on an auto-updatable view rewrites to its base table.
@@ -1046,6 +1138,43 @@ impl Engine {
             Stmt::Truncate { tables, restart_identity, cascade } => {
                 exec::truncate(&mut self.storage, txn, tables, *restart_identity, *cascade, responder)
             }
+            Stmt::CreateSchema { name, if_not_exists, elements } => {
+                let out = exec::create_schema(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    name,
+                    *if_not_exists,
+                    responder,
+                )?;
+                if let Err(e) = out {
+                    return Ok(Err(e));
+                }
+                // Schema elements run with the new schema as their creation
+                // target; an element naming a different schema is refused, as
+                // PostgreSQL has it (42P15).
+                for element in *elements {
+                    let requalified = match requalify_schema_element(element, name, arena) {
+                        Ok(r) => r,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    if let Err(e) = self
+                        .execute_stmt(requalified, arena, params, txn, sqlprep, guc, responder)?
+                    {
+                        return Ok(Err(e));
+                    }
+                }
+                Ok(Ok(()))
+            }
+            Stmt::DropSchema { names, if_exists, cascade } => exec::drop_schema(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::Begin => {
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
@@ -1452,14 +1581,66 @@ fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), W
     responder.error(e.sqlstate, e.message.as_str())
 }
 
+/// Rewrites a CREATE SCHEMA element to create inside the new schema. An
+/// element that already names that schema passes through; one naming another
+/// schema is PostgreSQL's 42P15.
+fn requalify_schema_element<'a>(
+    element: &'a Stmt<'a>,
+    schema: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let requalify = |name: ast::QualName<'a>| -> Result<ast::QualName<'a>, SqlError> {
+        match name.schema {
+            None => Ok(ast::QualName { schema: Some(schema), name: name.name }),
+            Some(s) if s == schema => Ok(name),
+            Some(s) => Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_SCHEMA_DEFINITION,
+                "CREATE specifies a schema ({}) different from the one being created ({})",
+                s,
+                schema
+            )),
+        }
+    };
+    let rewritten = match element {
+        Stmt::CreateTable(c) => {
+            Stmt::CreateTable(ast::CreateTable { name: requalify(c.name)?, ..*c })
+        }
+        Stmt::CreateView { name, or_replace, sql } => Stmt::CreateView {
+            name: requalify(*name)?,
+            or_replace: *or_replace,
+            sql,
+        },
+        Stmt::CreateIndex { name, table, columns, unique } => Stmt::CreateIndex {
+            name,
+            table: requalify(*table)?,
+            columns,
+            unique: *unique,
+        },
+        other => {
+            let _ = other;
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "unsupported CREATE SCHEMA element"
+            ));
+        }
+    };
+    arena
+        .alloc(rewritten)
+        .map(|r| &*r)
+        .map_err(|_| query::arena_full_pub())
+}
+
 /// Reapplies one journal record to storage during recovery.
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
         WalOp::CreateTable(def) => {
+            // A journal written before its schema existed cannot occur going
+            // forward (CreateSchema precedes in LSN order), but a pre-schema
+            // journal names only public, which always exists.
             storage.create_table(def)?;
         }
-        WalOp::SequenceSet { table, column, last } => {
-            let Some(index) = storage.find_table(table) else {
+        WalOp::SequenceSet { schema, table, column, last } => {
+            let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
                     message: stack_format!(192, "journal sets a sequence of unknown table \"{}\"", table),
@@ -1470,19 +1651,19 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 t.serial_last[column as usize] = last;
             }
         }
-        WalOp::DropTable(name) => {
-            let Some(index) = storage.find_table(name) else {
+        WalOp::DropTable { schema, name } => {
+            let Some(index) = storage.find_table(schema, name) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
                     message: stack_format!(192, "journal drops unknown table \"{}\"", name),
                 });
             };
             storage.drop_table(index);
-            storage.drop_indexes_for(name, 0);
-            storage.commit_indexes_for(name, 0);
+            storage.drop_indexes_for(schema, name, 0);
+            storage.commit_indexes_for(schema, name, 0);
         }
-        WalOp::Upsert { table, rowid, row } => {
-            let Some(index) = storage.find_table(table) else {
+        WalOp::Upsert { schema, table, rowid, row } => {
+            let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
                     message: stack_format!(192, "journal writes to unknown table \"{}\"", table),
@@ -1500,8 +1681,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     message: stack_format!(192, "journal replay overflows {}", e.what),
                 })?;
         }
-        WalOp::Delete { table, rowid } => {
-            let Some(index) = storage.find_table(table) else {
+        WalOp::Delete { schema, table, rowid } => {
+            let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
@@ -1509,26 +1690,35 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             storage.remove_committed(index, rowid);
         }
-        WalOp::CreateView { name, sql } => {
+        WalOp::CreateView { schema, name, sql, path } => {
             // Replay reconstructs committed state: create then promote.
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             use core::fmt::Write;
             let _ = write!(buffer, "{sql}");
-            let (new_slot, old_slot) =
-                storage.create_view(crate::storage::SqlName::parse(name)?, buffer, true, 0)?;
+            let mut creation_path = crate::util::StackStr::<128>::new();
+            let _ = write!(creation_path, "{path}");
+            let (new_slot, old_slot) = storage.create_view(
+                crate::storage::SqlName::parse(schema)?,
+                crate::storage::SqlName::parse(name)?,
+                buffer,
+                creation_path,
+                true,
+                0,
+            )?;
             storage.commit_view_create(new_slot);
             if let Some(old) = old_slot {
                 storage.commit_view_drop(old);
             }
         }
-        WalOp::DropView(name) => {
-            if let Some(slot) = storage.drop_view(name, 0)? {
+        WalOp::DropView { schema, name } => {
+            if let Some(slot) = storage.drop_view(schema, name, 0)? {
                 storage.commit_view_drop(slot);
             }
         }
-        WalOp::CreateIndex { name, table, columns, n_cols, unique } => {
+        WalOp::CreateIndex { schema, name, table, columns, n_cols, unique } => {
             let slot = storage.create_index(
                 crate::storage::IndexDef {
+                    schema: crate::storage::SqlName::parse(schema)?,
                     name: crate::storage::SqlName::parse(name)?,
                     table: crate::storage::SqlName::parse(table)?,
                     columns,
@@ -1541,10 +1731,36 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             )?;
             storage.commit_index_create(slot);
         }
-        WalOp::DropIndex(name) => {
-            if let Some(slot) = storage.drop_index(name, 0)? {
+        WalOp::DropIndex { schema, name } => {
+            if let Some(slot) = storage.drop_index(schema, name, 0)? {
                 storage.commit_index_drop(slot);
             }
+        }
+        WalOp::CreateSchema(name) => {
+            storage.create_schema(crate::storage::SqlName::parse(name)?)?;
+        }
+        WalOp::DropSchema(name) => {
+            if let Some(slot) = storage.find_schema(name) {
+                storage.drop_schema(slot);
+            }
+        }
+        WalOp::SetTableSchema { schema, name, new_schema } => {
+            let Some(index) = storage.find_table(schema, name) else {
+                return Err(SqlError {
+                    sqlstate: sqlstate::UNDEFINED_TABLE,
+                    message: stack_format!(192, "journal moves unknown table \"{}\"", name),
+                });
+            };
+            storage.move_table_schema(index, crate::storage::SqlName::parse(new_schema)?);
+        }
+        WalOp::DropTableFk { schema, table, fk_name } => {
+            let Some(index) = storage.find_table(schema, table) else {
+                return Err(SqlError {
+                    sqlstate: sqlstate::UNDEFINED_TABLE,
+                    message: stack_format!(192, "journal severs a key of unknown table \"{}\"", table),
+                });
+            };
+            let _ = storage.drop_fk(index, fk_name);
         }
     }
     storage.set_lsn(lsn);

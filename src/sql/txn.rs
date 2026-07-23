@@ -63,6 +63,10 @@ pub struct TxnState {
 
 /// How to undo one DDL statement.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "FkDropped carries the removed ForeignKey inline (no heap after startup); the undo list is a small fixed pool"
+)]
 pub enum DdlUndo {
     /// CREATE TABLE at this slot — undo by dropping it.
     Created(u32),
@@ -82,9 +86,18 @@ pub enum DdlUndo {
     /// restoring the prior counter. (A plain advance is *not* undone: a
     /// rolled-back insert still consumes its number, as PostgreSQL has it.)
     SequenceReset { table: u32, column: u16, prior: i64 },
+    /// CREATE SCHEMA at this slot — undo by dropping it.
+    SchemaCreated(u32),
+    /// DROP SCHEMA at this slot — undo by reviving it.
+    SchemaDropped(u32),
+    /// DROP SCHEMA CASCADE severed an inbound foreign key on a surviving
+    /// table — undo by restoring it.
+    FkDropped { table: u32, fk: crate::storage::ForeignKey },
 }
 
-pub const MAX_TXN_DDL: usize = 16;
+/// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and
+/// severed inbound foreign key takes one undo entry.
+pub const MAX_TXN_DDL: usize = 64;
 
 impl TxnState {
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {

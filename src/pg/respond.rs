@@ -595,6 +595,9 @@ impl<'b> Responder<'b> {
         sqlstate: &str,
         message: &str,
     ) -> Result<(), WireFull> {
+        // The stashed detail belongs to this diagnostic even when the level
+        // filter drops it — take it either way so it cannot leak forward.
+        let diagnostic = crate::sql::eval::take_diagnostic();
         if !self.render.min_message_level.allows(level) {
             return Ok(());
         }
@@ -607,6 +610,14 @@ impl<'b> Responder<'b> {
         m.cstr(sqlstate);
         m.u8(b'M');
         m.cstr(message);
+        if let Some(d) = &diagnostic {
+            m.u8(b'D');
+            m.cstr(d.detail.as_str());
+            if let Some(h) = &d.hint {
+                m.u8(b'H');
+                m.cstr(h.as_str());
+            }
+        }
         m.u8(0);
         m.finish()
     }
@@ -614,6 +625,7 @@ impl<'b> Responder<'b> {
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
     pub fn error(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+        let diagnostic = crate::sql::eval::take_diagnostic();
         let mut m = MsgOut::begin(self.buffer, wire::MSG_ERROR_RESPONSE);
         m.u8(b'S');
         m.cstr("ERROR");
@@ -623,6 +635,14 @@ impl<'b> Responder<'b> {
         m.cstr(sqlstate);
         m.u8(b'M');
         m.cstr(message);
+        if let Some(d) = &diagnostic {
+            m.u8(b'D');
+            m.cstr(d.detail.as_str());
+            if let Some(h) = &d.hint {
+                m.u8(b'H');
+                m.cstr(h.as_str());
+            }
+        }
         m.u8(0);
         m.finish()
     }

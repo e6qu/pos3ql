@@ -18,8 +18,8 @@ use crate::storage::rowenc;
 use crate::wal::{Wal, WalOp};
 
 use super::ast::{
-    AlterAction, AlterTable, CreateTable, Delete, DropTable, Expr, Insert, LikeClause, SelectItem,
-    Update,
+    AlterAction, AlterTable, CreateTable, Delete, DropTable, Expr, Insert, LikeClause, QualName,
+    SelectItem, Update,
 };
 use super::eval::{cast_to, compare_datums, eval, sqlstate, ColumnLookup, NoColumns, SqlError};
 use super::types::{ColDesc, ColType, Datum, TypeMod};
@@ -104,7 +104,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod describe;
-pub use describe::{
+pub use describe::{could_not_identify, not_composite,
     check_row_field_types, derived_name, describe_items, infer_type_pub, infer_type_res,
     record_field_type, record_shape, typeof_static, typeof_static_coltype, ColTypeResolver, DefCols, NoCols,
     RECORD_FIELD_NAMES,
@@ -139,6 +139,14 @@ pub fn create_table(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    def.schema = match storage.creation_schema(
+        statement.name.schema,
+        statement.name.name,
+        txn.txid,
+    ) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
     // A copied constraint lands before the explicitly written ones, so a
     // duplicate primary key is caught with PostgreSQL's own message.
     if let Err(e) = copy_like_constraints(storage, &mut def, statement, txn.txid) {
@@ -166,7 +174,7 @@ pub fn create_table(
         Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
             responder.notice(
                 crate::sql::eval::sqlstate::DUPLICATE_TABLE,
-                stack_format!(128, "relation \"{}\" already exists, skipping", statement.name).as_str(),
+                stack_format!(128, "relation \"{}\" already exists, skipping", statement.name.name).as_str(),
             )?;
         }
         Err(e) => return sql_fail(e),
@@ -201,9 +209,9 @@ fn like_source<'s>(
     like: &LikeClause,
     txid: u32,
 ) -> Result<&'s TableDef, SqlError> {
-    match storage.find_visible(like.source, txid) {
-        Some(i) => Ok(&storage.table(i).def),
-        None => Err(undefined_table(like.source)),
+    match resolve_dml_table(storage, &like.source, txid) {
+        Ok(i) => Ok(&storage.table(i).def),
+        Err(e) => Err(e),
     }
 }
 
@@ -217,9 +225,9 @@ fn build_def_with_likes(
     arena: &Arena,
 ) -> Result<TableDef, SqlError> {
     if statement.likes.is_empty() {
-        return build_def(statement.name, statement.columns, arena);
+        return build_def(statement.name.name, statement.columns, arena);
     }
-    let mut def = TableDef { name: SqlName::parse(statement.name)?, ..TableDef::empty() };
+    let mut def = TableDef { name: SqlName::parse(statement.name.name)?, ..TableDef::empty() };
     let mut n = 0usize;
     for position in 0..=statement.columns.len() {
         for like in statement.likes.iter().filter(|l| l.at == position) {
@@ -359,7 +367,12 @@ fn copy_like_indexes(
         let mut copied = [CopiedIndex { columns: [0; crate::storage::MAX_INDEX_COLS], n_cols: 0, unique: false };
             MAX_LIKE_INDEXES];
         let mut n_copied = 0;
-        for index in storage.indexes_for(like.source, txn.txid) {
+        let source_def = storage.table(resolve_dml_table(storage, &like.source, txn.txid)?).def;
+        for index in storage.indexes_for(
+            source_def.schema.as_str(),
+            source_def.name.as_str(),
+            txn.txid,
+        ) {
             if n_copied == MAX_LIKE_INDEXES {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -371,15 +384,13 @@ fn copy_like_indexes(
                 CopiedIndex { columns: index.columns, n_cols: index.n_cols, unique: index.unique };
             n_copied += 1;
         }
-        let source = match storage.find_visible(like.source, txn.txid) {
-            Some(i) => storage.table(i).def,
-            None => return Err(undefined_table(like.source)),
-        };
+        let source = source_def;
         for index in &copied[..n_copied] {
             let columns = remap_columns(def, &source, &index.columns[..index.n_cols])?;
             let name = auto_key_name(def, &columns[..index.n_cols], "idx", true)?;
             let slot = storage.create_index(
                 IndexDef {
+                    schema: def.schema,
                     name,
                     table: def.name,
                     columns,
@@ -394,6 +405,7 @@ fn copy_like_indexes(
             if let Err(e) = wal.append(
                 lsn,
                 &WalOp::CreateIndex {
+                    schema: def.schema.as_str(),
                     name: name.as_str(),
                     table: def.name.as_str(),
                     columns,
@@ -454,7 +466,7 @@ fn find_conflict(
     txid: u32,
 ) -> Option<u64> {
     let table = storage.table(table_index);
-    let table_name = def.name.as_str();
+
     for (&rowid, state) in table.rows.iter() {
         let Some(home) = state.visible_to(txid) else {
             continue;
@@ -475,7 +487,9 @@ fn find_conflict(
                         return Ok(true);
                     }
                 }
-                for index in storage.unique_indexes_for(table_name, txid) {
+                for index in
+                    storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+                {
                     let icols = &index.columns[..index.n_cols];
                     if !icols.iter().any(|&c| values[c as usize].is_null())
                         && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
@@ -644,38 +658,471 @@ pub fn drop_table(
     statement: &DropTable,
     responder: &mut Responder,
 ) -> Outcome {
-    match storage.find_visible(statement.name, txn.txid) {
-        Some(index) => {
-            if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
-                let _ = other;
-                return sql_fail(sql_err!(
-                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                    "could not serialize access due to concurrent DDL on \"{}\"",
-                    statement.name
-                ));
-            }
-            let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::DropTable(statement.name)) {
-                return sql_fail(e);
-            }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(index as u32)) {
-                return sql_fail(e);
-            }
-            storage.drop_table_in(index, txn.txid);
-            // A table's indexes are dropped with it (no separate journal record;
-            // DropTable replay re-applies this).
-            storage.drop_indexes_for(statement.name, txn.txid);
+    for name in statement.names {
+        // A DROP whose qualifier names no schema is PostgreSQL's 3F000 (a
+        // SELECT of the same spelling is 42P01 — the codes really differ).
+        if let Some(schema) = name.schema
+            && storage.find_schema_visible(schema, txn.txid).is_none()
+            && !statement.if_exists
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                schema
+            ));
         }
-        None if statement.if_exists => {
-            // PostgreSQL's skip notice carries SQLSTATE 00000.
-            responder.notice(
-                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(128, "table \"{}\" does not exist, skipping", statement.name).as_str(),
-            )?;
+        match storage.resolve_relation(name.schema, name.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::Table(index)) => {
+                if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
+                    let _ = other;
+                    return sql_fail(sql_err!(
+                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent DDL on \"{}\"",
+                        name.name
+                    ));
+                }
+                let def = storage.table(index).def;
+                let lsn = storage.bump_lsn();
+                if let Err(e) = wal.append(
+                    lsn,
+                    &WalOp::DropTable {
+                        schema: def.schema.as_str(),
+                        name: def.name.as_str(),
+                    },
+                ) {
+                    return sql_fail(e);
+                }
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(index as u32)) {
+                    return sql_fail(e);
+                }
+                storage.drop_table_in(index, txn.txid);
+                // A table's indexes are dropped with it (no separate journal
+                // record; DropTable replay re-applies this).
+                storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+            }
+            _ if statement.if_exists => {
+                // PostgreSQL's skip notice carries SQLSTATE 00000.
+                responder.notice(
+                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "table \"{}\" does not exist, skipping", name.name)
+                        .as_str(),
+                )?;
+            }
+            _ => return sql_fail(undefined_kind("table", name.name)),
         }
-        None => return sql_fail(undefined_kind("table", statement.name)),
     }
     responder.command_complete("DROP TABLE")?;
+    sql_ok()
+}
+
+/// CREATE SCHEMA [IF NOT EXISTS]: registers a schema in the catalog,
+/// journaled and transactional like table DDL.
+pub fn create_schema(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    if_not_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    if name.starts_with("pg_") {
+        let mut detail = crate::util::StackStr::<512>::new();
+        let _ = core::fmt::Write::write_str(
+            &mut detail,
+            "The prefix \"pg_\" is reserved for system schemas.",
+        );
+        crate::sql::eval::stash_diagnostic(detail, None);
+        return sql_fail(sql_err!(
+            crate::sql::eval::sqlstate::RESERVED_NAME,
+            "unacceptable schema name \"{}\"",
+            name
+        ));
+    }
+    let taken_by_system = name == "information_schema";
+    let created = if taken_by_system {
+        Err(sql_err!(
+            crate::sql::eval::sqlstate::DUPLICATE_SCHEMA,
+            "schema \"{}\" already exists",
+            name
+        ))
+    } else {
+        let sqlname = match SqlName::parse(name) {
+            Ok(n) => n,
+            Err(e) => return sql_fail(e),
+        };
+        storage.create_schema_in(sqlname, txn.txid)
+    };
+    match created {
+        Ok(slot) => {
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(lsn, &WalOp::CreateSchema(name)) {
+                storage.rollback_schema_create(slot);
+                return sql_fail(e);
+            }
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SchemaCreated(slot as u32)) {
+                storage.rollback_schema_create(slot);
+                return sql_fail(e);
+            }
+        }
+        Err(e)
+            if e.sqlstate == crate::sql::eval::sqlstate::DUPLICATE_SCHEMA
+                && if_not_exists =>
+        {
+            responder.notice(
+                crate::sql::eval::sqlstate::DUPLICATE_SCHEMA,
+                stack_format!(128, "schema \"{}\" already exists, skipping", name).as_str(),
+            )?;
+        }
+        Err(e) => return sql_fail(e),
+    }
+    responder.command_complete("CREATE SCHEMA")?;
+    sql_ok()
+}
+
+/// One object a DROP SCHEMA sweeps up, for dependency reports and the
+/// cascaded drops.
+#[derive(Clone, Copy)]
+enum SchemaObject {
+    Table(usize),
+    View(usize),
+    /// An inbound foreign key on a table that itself survives.
+    InboundFk { table: usize, fk_index: usize },
+}
+
+/// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT]: RESTRICT (the
+/// default) refuses a non-empty schema with PostgreSQL's dependency report;
+/// CASCADE drops the contained tables and views and severs inbound foreign
+/// keys from surviving tables.
+pub fn drop_schema(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    use core::fmt::Write as _;
+    const MAX_DROP_SCHEMAS: usize = 16;
+    let mut slots: [usize; MAX_DROP_SCHEMAS] = [0; MAX_DROP_SCHEMAS];
+    let mut n_slots = 0usize;
+    for name in names {
+        if *name == "pg_catalog" || *name == "information_schema" {
+            return sql_fail(sql_err!(
+                crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop schema {} because it is required by the database system",
+                name
+            ));
+        }
+        match storage.find_schema_visible(name, txn.txid) {
+            Some(slot) => {
+                if !slots[..n_slots].contains(&slot) {
+                    if n_slots == MAX_DROP_SCHEMAS {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "too many schemas in one DROP SCHEMA"
+                        ));
+                    }
+                    slots[n_slots] = slot;
+                    n_slots += 1;
+                }
+            }
+            None if if_exists => {
+                responder.notice(
+                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "schema \"{}\" does not exist, skipping", name)
+                        .as_str(),
+                )?;
+            }
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    name
+                ))
+            }
+        }
+    }
+    // Everything the drop sweeps up, across all listed schemas.
+    let in_listed = |storage: &Storage, schema: &str| {
+        slots[..n_slots]
+            .iter()
+            .any(|&slot| storage.schema_def(slot).name.as_str() == schema)
+    };
+    let mut objects: [Option<SchemaObject>; 64] = [const { None }; 64];
+    let mut n_objects = 0usize;
+    let mut push = |o: SchemaObject, n_objects: &mut usize| -> Result<(), SqlError> {
+        if *n_objects == objects.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "DROP SCHEMA sweeps up more than {} objects",
+                64
+            ));
+        }
+        objects[*n_objects] = Some(o);
+        *n_objects += 1;
+        Ok(())
+    };
+    for t in 0..storage.table_count() {
+        if storage.table(t).visible_to(txn.txid)
+            && in_listed(storage, storage.table(t).def.schema.as_str())
+            && let Err(e) = push(SchemaObject::Table(t), &mut n_objects)
+        {
+            return sql_fail(e);
+        }
+    }
+    for v in 0..storage.view_count() {
+        if storage.view(v).visible_to(txn.txid)
+            && in_listed(storage, storage.view(v).schema.as_str())
+            && let Err(e) = push(SchemaObject::View(v), &mut n_objects)
+        {
+            return sql_fail(e);
+        }
+    }
+    // Inbound foreign keys: a surviving table referencing a dropped one loses
+    // the constraint (PostgreSQL drops the constraint, not the table).
+    for t in 0..storage.table_count() {
+        if !storage.table(t).visible_to(txn.txid)
+            || in_listed(storage, storage.table(t).def.schema.as_str())
+        {
+            continue;
+        }
+        for f in 0..storage.table(t).def.n_fkeys {
+            if in_listed(storage, storage.table(t).def.fkeys[f].parent_schema.as_str())
+                && let Err(e) = push(SchemaObject::InboundFk { table: t, fk_index: f }, &mut n_objects)
+            {
+                return sql_fail(e);
+            }
+        }
+    }
+    // PostgreSQL walks the listed schemas in reverse, and reports each
+    // schema's dependents in OID (creation) order; a severed constraint
+    // sorts with its child table, after it.
+    let schema_rank = |storage: &Storage, schema: &str| -> usize {
+        slots[..n_slots]
+            .iter()
+            .position(|&slot| storage.schema_def(slot).name.as_str() == schema)
+            .map(|p| n_slots - p)
+            .unwrap_or(0)
+    };
+    let sort_key = |storage: &Storage, o: &SchemaObject| -> (usize, u64, u8) {
+        match o {
+            SchemaObject::Table(t) => {
+                let table = storage.table(*t);
+                (
+                    schema_rank(storage, table.def.schema.as_str()),
+                    table.created_at,
+                    0,
+                )
+            }
+            SchemaObject::View(v) => {
+                let view = storage.view(*v);
+                (schema_rank(storage, view.schema.as_str()), view.created_at, 0)
+            }
+            SchemaObject::InboundFk { table, fk_index } => {
+                let child = storage.table(*table);
+                (
+                    schema_rank(
+                        storage,
+                        child.def.fkeys[*fk_index].parent_schema.as_str(),
+                    ),
+                    child.created_at,
+                    1,
+                )
+            }
+        }
+    };
+    {
+        let slice = &mut objects[..n_objects];
+        slice.sort_unstable_by_key(|o| sort_key(storage, o.as_ref().expect("filled")));
+    }
+    // Renders one swept object the way PostgreSQL's dependency report does:
+    // qualified only when its schema is not on the current search path.
+    let in_path = |storage: &Storage, schema: &str| {
+        storage.path().entries().iter().any(|e| match e {
+            crate::storage::PathEntry::Schema(slot) => {
+                storage.schema_def(*slot as usize).name.as_str() == schema
+            }
+            crate::storage::PathEntry::Catalog => schema == "pg_catalog",
+        })
+    };
+    let describe = |storage: &Storage, o: &SchemaObject, out: &mut crate::util::StackStr<192>| {
+        let write_rel = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
+            if in_path(storage, schema.as_str()) {
+                let _ = write!(out, "{}", name.as_str());
+            } else {
+                let _ = write!(out, "{}.{}", schema.as_str(), name.as_str());
+            }
+        };
+        match o {
+            SchemaObject::Table(t) => {
+                let def = &storage.table(*t).def;
+                let _ = write!(out, "table ");
+                write_rel(out, &def.schema, &def.name);
+            }
+            SchemaObject::View(v) => {
+                let view = storage.view(*v);
+                let _ = write!(out, "view ");
+                write_rel(out, &view.schema, &view.name);
+            }
+            SchemaObject::InboundFk { table, fk_index } => {
+                let def = &storage.table(*table).def;
+                let _ = write!(
+                    out,
+                    "constraint {} on table ",
+                    def.fkeys[*fk_index].name.as_str()
+                );
+                write_rel(out, &def.schema, &def.name);
+            }
+        }
+    };
+    if n_objects > 0 && !cascade {
+        let first = slots[0];
+        let mut detail = crate::util::StackStr::<512>::new();
+        for (i, o) in objects[..n_objects].iter().flatten().enumerate() {
+            let mut line = crate::util::StackStr::<192>::new();
+            describe(storage, o, &mut line);
+            let _ = write!(
+                detail,
+                "{}{} depends on schema {}",
+                if i > 0 { "\n" } else { "" },
+                line.as_str(),
+                // PostgreSQL's report names the schema each object hangs off;
+                // for a multi-schema drop each line names its own.
+                match o {
+                    SchemaObject::Table(t) => storage.table(*t).def.schema.as_str(),
+                    SchemaObject::View(v) => storage.view(*v).schema.as_str(),
+                    SchemaObject::InboundFk { table, fk_index } =>
+                        storage.table(*table).def.fkeys[*fk_index].parent_schema.as_str(),
+                }
+            );
+        }
+        let mut hint = crate::util::StackStr::<128>::new();
+        let _ = write!(hint, "Use DROP ... CASCADE to drop the dependent objects too.");
+        crate::sql::eval::stash_diagnostic(detail, Some(hint));
+        return sql_fail(sql_err!(
+            crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop schema {} because other objects depend on it",
+            storage.schema_def(first).name.as_str()
+        ));
+    }
+    if n_objects == 1 {
+        let mut line = crate::util::StackStr::<192>::new();
+        describe(storage, objects[0].as_ref().expect("counted"), &mut line);
+        responder.notice(
+            crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(224, "drop cascades to {}", line.as_str()).as_str(),
+        )?;
+    } else if n_objects > 1 {
+        let mut detail = crate::util::StackStr::<512>::new();
+        for (i, o) in objects[..n_objects].iter().flatten().enumerate() {
+            let mut line = crate::util::StackStr::<192>::new();
+            describe(storage, o, &mut line);
+            let _ = write!(
+                detail,
+                "{}drop cascades to {}",
+                if i > 0 { "\n" } else { "" },
+                line.as_str()
+            );
+        }
+        crate::sql::eval::stash_diagnostic(detail, None);
+        responder.notice(
+            crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(128, "drop cascades to {} other objects", n_objects).as_str(),
+        )?;
+    }
+    // Apply the cascade: severed constraints first, then views, then tables,
+    // then the schemas themselves — the order replay reproduces.
+    for o in objects[..n_objects].iter().flatten() {
+        match o {
+            SchemaObject::InboundFk { table, fk_index } => {
+                let def = &storage.table(*table).def;
+                let fk_name = def.fkeys[*fk_index].name;
+                let (schema, tname) = (def.schema, def.name);
+                let lsn = storage.bump_lsn();
+                if let Err(e) = wal.append(
+                    lsn,
+                    &WalOp::DropTableFk {
+                        schema: schema.as_str(),
+                        table: tname.as_str(),
+                        fk_name: fk_name.as_str(),
+                    },
+                ) {
+                    return sql_fail(e);
+                }
+                let Some(fk) = storage.drop_fk(*table, fk_name.as_str()) else {
+                    continue;
+                };
+                if let Err(e) =
+                    txn.record_ddl(super::txn::DdlUndo::FkDropped { table: *table as u32, fk })
+                {
+                    return sql_fail(e);
+                }
+            }
+            SchemaObject::View(v) => {
+                let (schema, vname) = {
+                    let view = storage.view(*v);
+                    (view.schema, view.name)
+                };
+                let lsn = storage.bump_lsn();
+                if let Err(e) = wal.append(
+                    lsn,
+                    &WalOp::DropView { schema: schema.as_str(), name: vname.as_str() },
+                ) {
+                    return sql_fail(e);
+                }
+                let dropped = match storage.drop_view(schema.as_str(), vname.as_str(), txn.txid)
+                {
+                    Ok(d) => d,
+                    Err(e) => return sql_fail(e),
+                };
+                if let Some(slot) = dropped
+                    && let Err(e) =
+                        txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
+                {
+                    return sql_fail(e);
+                }
+            }
+            SchemaObject::Table(t) => {
+                if let Some(other) = storage.table(*t).ddl_locked_by_other(txn.txid) {
+                    let _ = other;
+                    return sql_fail(sql_err!(
+                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent DDL on \"{}\"",
+                        storage.table(*t).def.name.as_str()
+                    ));
+                }
+                let def = storage.table(*t).def;
+                let lsn = storage.bump_lsn();
+                if let Err(e) = wal.append(
+                    lsn,
+                    &WalOp::DropTable {
+                        schema: def.schema.as_str(),
+                        name: def.name.as_str(),
+                    },
+                ) {
+                    return sql_fail(e);
+                }
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(*t as u32)) {
+                    return sql_fail(e);
+                }
+                storage.drop_table_in(*t, txn.txid);
+                storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+            }
+        }
+    }
+    for &slot in &slots[..n_slots] {
+        let name = storage.schema_def(slot).name;
+        let lsn = storage.bump_lsn();
+        if let Err(e) = wal.append(lsn, &WalOp::DropSchema(name.as_str())) {
+            return sql_fail(e);
+        }
+        if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SchemaDropped(slot as u32)) {
+            return sql_fail(e);
+        }
+        storage.drop_schema_in(slot, txn.txid);
+    }
+    responder.command_complete("DROP SCHEMA")?;
     sql_ok()
 }
 
@@ -687,9 +1134,10 @@ pub fn create_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    name: &str,
+    name: &QualName,
     or_replace: bool,
     sql: &str,
+    raw_path: &str,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
@@ -708,14 +1156,34 @@ pub fn create_view(
     if let Err(e) = super::query::validate_view(buffer.as_str(), storage, txn.txid, arena) {
         return sql_fail(e);
     }
-    let sqlname = match SqlName::parse(name) {
+    let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    match storage.create_view(sqlname, buffer, or_replace, txn.txid) {
+    let sqlname = match SqlName::parse(name.name) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    let mut creation_path = crate::util::StackStr::<128>::new();
+    let _ = core::fmt::Write::write_str(&mut creation_path, raw_path);
+    if creation_path.is_truncated() {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "search_path is too long to store with a view"
+        ));
+    }
+    match storage.create_view(schema, sqlname, buffer, creation_path, or_replace, txn.txid) {
         Ok((new_slot, old_slot)) => {
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::CreateView { name, sql }) {
+            if let Err(e) = wal.append(
+                lsn,
+                &WalOp::CreateView {
+                    schema: schema.as_str(),
+                    name: name.name,
+                    sql,
+                    path: raw_path,
+                },
+            ) {
                 // The journal rejected the record; undo the in-memory apply.
                 storage.rollback_view_create(new_slot);
                 if let Some(o) = old_slot {
@@ -744,31 +1212,59 @@ pub fn drop_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    name: &str,
+    names: &[QualName],
     if_exists: bool,
     responder: &mut Responder,
 ) -> Outcome {
-    if storage.find_view(name, txn.txid).is_some() {
-        let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(lsn, &WalOp::DropView(name)) {
-            return sql_fail(e);
-        }
-        let dropped = match storage.drop_view(name, txn.txid) {
-            Ok(d) => d,
-            Err(e) => return sql_fail(e),
-        };
-        if let Some(slot) = dropped
-            && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
+    for name in names {
+        if let Some(schema) = name.schema
+            && storage.find_schema_visible(schema, txn.txid).is_none()
+            && !if_exists
         {
-            return sql_fail(e);
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                schema
+            ));
         }
-    } else if if_exists {
-        responder.notice(
-            crate::sql::eval::sqlstate::UNDEFINED_TABLE,
-            stack_format!(128, "view \"{}\" does not exist, skipping", name).as_str(),
-        )?;
-    } else {
-        return sql_fail(sql_err!(sqlstate::UNDEFINED_TABLE, "view \"{}\" does not exist", name));
+        let found = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::View(slot)) => Some(slot),
+            _ => None,
+        };
+        if let Some(slot) = found {
+            let (schema, view_name) = {
+                let v = storage.view(slot);
+                (v.schema, v.name)
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(
+                lsn,
+                &WalOp::DropView { schema: schema.as_str(), name: view_name.as_str() },
+            ) {
+                return sql_fail(e);
+            }
+            let dropped = match storage.drop_view(schema.as_str(), view_name.as_str(), txn.txid)
+            {
+                Ok(d) => d,
+                Err(e) => return sql_fail(e),
+            };
+            if let Some(slot) = dropped
+                && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
+            {
+                return sql_fail(e);
+            }
+        } else if if_exists {
+            responder.notice(
+                crate::sql::eval::sqlstate::UNDEFINED_TABLE,
+                stack_format!(128, "view \"{}\" does not exist, skipping", name.name).as_str(),
+            )?;
+        } else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "view \"{}\" does not exist",
+                name.name
+            ));
+        }
     }
     responder.command_complete("DROP VIEW")?;
     sql_ok()
@@ -784,14 +1280,15 @@ pub fn create_index(
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
     name: &str,
-    table: &str,
+    table: &QualName,
     column_names: &[&str],
     unique: bool,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{IndexDef, MAX_INDEX_COLS};
-    let Some(table_index) = storage.find_visible(table, txn.txid) else {
-        return sql_fail(undefined_table(table));
+    let table_index = match resolve_dml_table(storage, table, txn.txid) {
+        Ok(i) => i,
+        Err(e) => return sql_fail(e),
     };
     let tdef = storage.table(table_index).def;
     if column_names.is_empty() || column_names.len() > MAX_INDEX_COLS {
@@ -817,11 +1314,16 @@ pub fn create_index(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let table_name = match SqlName::parse(table) {
-        Ok(n) => n,
-        Err(e) => return sql_fail(e),
+    let def = IndexDef {
+        schema: tdef.schema,
+        name: sqlname,
+        table: tdef.name,
+        columns,
+        n_cols,
+        unique,
+        live: true,
+        pending: None,
     };
-    let def = IndexDef { name: sqlname, table: table_name, columns, n_cols, unique, live: true, pending: None };
     // Register first so the UNIQUE validation below sees this index; on any
     // failure the registration is rolled back.
     let slot = match storage.create_index(def, txn.txid) {
@@ -865,7 +1367,17 @@ pub fn create_index(
         }
     }
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::CreateIndex { name, table, columns, n_cols, unique }) {
+    if let Err(e) = wal.append(
+        lsn,
+        &WalOp::CreateIndex {
+            schema: tdef.schema.as_str(),
+            name,
+            table: tdef.name.as_str(),
+            columns,
+            n_cols,
+            unique,
+        },
+    ) {
         storage.rollback_index_create(slot);
         return sql_fail(e);
     }
@@ -881,33 +1393,69 @@ pub fn drop_index(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    name: &str,
+    names: &[QualName],
     if_exists: bool,
     responder: &mut Responder,
 ) -> Outcome {
-    if storage.index_exists(name, txn.txid) {
-        let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(lsn, &WalOp::DropIndex(name)) {
-            return sql_fail(e);
-        }
-        let dropped = match storage.drop_index(name, txn.txid) {
-            Ok(d) => d,
-            Err(e) => return sql_fail(e),
-        };
-        if let Some(slot) = dropped
-            && let Err(e) = txn.record_ddl(super::txn::DdlUndo::IndexDropped(slot as u32))
+    for name in names {
+        if let Some(schema) = name.schema
+            && storage.find_schema_visible(schema, txn.txid).is_none()
+            && !if_exists
         {
-            return sql_fail(e);
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                schema
+            ));
         }
-    } else if if_exists {
-        responder.notice(
-            crate::sql::eval::sqlstate::UNDEFINED_TABLE,
-            stack_format!(128, "index \"{}\" does not exist, skipping", name).as_str(),
-        )?;
-    } else {
-        // An index is an object, not a relation, to PostgreSQL's error codes:
-        // a missing one is 42704, where a missing table is 42P01.
-        return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "index \"{}\" does not exist", name));
+        // A bare index name resolves through the search path; a qualified one
+        // looks only in its schema.
+        let found: Option<SqlName> = match name.schema {
+            Some(schema) => storage
+                .index_exists(schema, name.name, txn.txid)
+                .then(|| SqlName::parse(schema).ok())
+                .flatten(),
+            None => storage.path().entries().iter().find_map(|e| match e {
+                crate::storage::PathEntry::Schema(slot) => {
+                    let schema = storage.schema_def(*slot as usize).name;
+                    storage
+                        .index_exists(schema.as_str(), name.name, txn.txid)
+                        .then_some(schema)
+                }
+                crate::storage::PathEntry::Catalog => None,
+            }),
+        };
+        if let Some(schema) = found {
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(
+                lsn,
+                &WalOp::DropIndex { schema: schema.as_str(), name: name.name },
+            ) {
+                return sql_fail(e);
+            }
+            let dropped = match storage.drop_index(schema.as_str(), name.name, txn.txid) {
+                Ok(d) => d,
+                Err(e) => return sql_fail(e),
+            };
+            if let Some(slot) = dropped
+                && let Err(e) = txn.record_ddl(super::txn::DdlUndo::IndexDropped(slot as u32))
+            {
+                return sql_fail(e);
+            }
+        } else if if_exists {
+            responder.notice(
+                crate::sql::eval::sqlstate::UNDEFINED_TABLE,
+                stack_format!(128, "index \"{}\" does not exist, skipping", name.name).as_str(),
+            )?;
+        } else {
+            // An index is an object, not a relation, to PostgreSQL's error
+            // codes: a missing one is 42704, where a missing table is 42P01.
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "index \"{}\" does not exist",
+                name.name
+            ));
+        }
     }
     responder.command_complete("DROP INDEX")?;
     sql_ok()
@@ -921,8 +1469,9 @@ pub fn insert(
     params: &[Datum],
     responder: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
-        return sql_fail(undefined_table(statement.table));
+    let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
+        Ok(i) => i,
+        Err(e) => return sql_fail(e),
     };
     let def = storage.table(table_index).def;
     let checks = match parse_checks(&def, arena) {
@@ -944,7 +1493,7 @@ pub fn insert(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" of relation \"{}\" does not exist",
                     name,
-                    statement.table
+                    statement.table.name
                 ));
             };
             targets[i] = col;
@@ -1211,8 +1760,9 @@ pub fn update(
     params: &[Datum],
     responder: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
-        return sql_fail(undefined_table(statement.table));
+    let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
+        Ok(i) => i,
+        Err(e) => return sql_fail(e),
     };
     let def = storage.table(table_index).def;
     let checks = match parse_checks(&def, arena) {
@@ -1231,7 +1781,7 @@ pub fn update(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" of relation \"{}\" does not exist",
                 name,
-                statement.table
+                statement.table.name
             ));
         };
         targets[i] = col;
@@ -1388,14 +1938,16 @@ pub fn update(
             }
             if referenced_key_changed(
                 storage,
-                statement.table,
+                def.schema.as_str(),
+                def.name.as_str(),
                 &old_row[..def.n_columns],
                 &new_row[..def.n_columns],
                 txn.txid,
             ) && let Err(e) = apply_fk_parent_actions(
                 storage,
                 txn,
-                statement.table,
+                def.schema.as_str(),
+                def.name.as_str(),
                 &old_row[..def.n_columns],
                 Some(&new_row[..def.n_columns]),
                 arena,
@@ -1437,8 +1989,9 @@ pub fn delete(
     params: &[Datum],
     responder: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_visible(statement.table, txn.txid) else {
-        return sql_fail(undefined_table(statement.table));
+    let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
+        Ok(i) => i,
+        Err(e) => return sql_fail(e),
     };
     let def = storage.table(table_index).def;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -1471,7 +2024,7 @@ pub fn delete(
             Err(e) => return sql_fail(e),
         }
     }
-    let referenced = table_is_referenced(storage, statement.table, txn.txid);
+    let referenced = table_is_referenced(storage, def.schema.as_str(), def.name.as_str(), txn.txid);
     for i in 0..scratch.len() {
         let (rowid, old_home) = scratch[i];
         if !statement.returning.is_empty() || referenced {
@@ -1501,7 +2054,8 @@ pub fn delete(
                 && let Err(e) = apply_fk_parent_actions(
                     storage,
                     txn,
-                    statement.table,
+                    def.schema.as_str(),
+                    def.name.as_str(),
                     &old_values[..def.n_columns],
                     None,
                     arena,
@@ -1549,7 +2103,7 @@ pub fn delete(
 pub fn truncate(
     storage: &mut Storage,
     txn: &mut TxnState,
-    tables: &[&str],
+    tables: &[QualName],
     restart_identity: bool,
     cascade: bool,
     responder: &mut Responder,
@@ -1558,19 +2112,16 @@ pub fn truncate(
     let mut list: [usize; MAX_TRUNCATE_TABLES] = [0; MAX_TRUNCATE_TABLES];
     let mut n = 0usize;
     for name in tables {
-        if storage.find_view(name, txn.txid).is_some() {
-            return sql_fail(sql_err!(
-                crate::sql::eval::sqlstate::WRONG_OBJECT_TYPE,
-                "\"{}\" is not a table",
-                name
-            ));
-        }
-        let Some(index) = storage.find_visible(name, txn.txid) else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "relation \"{}\" does not exist",
-                name
-            ));
+        let index = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::View(_)) => {
+                return sql_fail(sql_err!(
+                    crate::sql::eval::sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a table",
+                    name.name
+                ));
+            }
+            Some(crate::storage::ResolvedRelation::Table(index)) => index,
+            _ => return sql_fail(undefined_qual(name)),
         };
         if !list[..n].contains(&index) {
             if n == MAX_TRUNCATE_TABLES {
@@ -1592,9 +2143,11 @@ pub fn truncate(
                 continue;
             }
             let refs_listed = storage.table(other).def.fkeys().iter().any(|fk| {
-                list[..n]
-                    .iter()
-                    .any(|&t| storage.table(t).def.name.as_str() == fk.parent.as_str())
+                list[..n].iter().any(|&t| {
+                    let tdef = &storage.table(t).def;
+                    tdef.schema.as_str() == fk.parent_schema.as_str()
+                        && tdef.name.as_str() == fk.parent.as_str()
+                })
             });
             if !refs_listed {
                 continue;
@@ -1694,8 +2247,15 @@ pub fn alter_table(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let Some(table_index) = storage.find_table(statement.table) else {
-        return sql_fail(undefined_table(statement.table));
+    // ALTER runs autocommitted, so resolution sees only the committed
+    // catalog (no transaction owns pending DDL here).
+    let table_index = match storage.resolve_relation(
+        statement.table.schema,
+        statement.table.name,
+        u32::MAX,
+    ) {
+        Some(crate::storage::ResolvedRelation::Table(i)) => i,
+        _ => return sql_fail(undefined_qual(&statement.table)),
     };
     let def = storage.table(table_index).def;
 
@@ -1709,8 +2269,51 @@ pub fn alter_table(
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,
             "table \"{}\" has uncommitted changes; retry when idle",
-            statement.table
+            statement.table.name
         ));
+    }
+
+    // SET SCHEMA is a definition-only move with its own journal record — no
+    // row images change, and inbound foreign keys follow the table.
+    if let AlterAction::SetSchema(new_schema) = &statement.action {
+        let Some(_) = storage.find_schema(new_schema) else {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                new_schema
+            ));
+        };
+        if *new_schema == def.schema.as_str() {
+            // Already there: PostgreSQL treats this as a no-op success.
+            responder.command_complete("ALTER TABLE")?;
+            return sql_ok();
+        }
+        if storage.find_table(new_schema, def.name.as_str()).is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists in schema \"{}\"",
+                def.name.as_str(),
+                new_schema
+            ));
+        }
+        let new_name = match SqlName::parse(new_schema) {
+            Ok(n) => n,
+            Err(e) => return sql_fail(e),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(e) = wal.append(
+            lsn,
+            &WalOp::SetTableSchema {
+                schema: def.schema.as_str(),
+                name: def.name.as_str(),
+                new_schema,
+            },
+        ) {
+            return sql_fail(e);
+        }
+        storage.move_table_schema(table_index, new_name);
+        responder.command_complete("ALTER TABLE")?;
+        return sql_ok();
     }
 
     // Build the new definition and the per-row transform.
@@ -1718,8 +2321,9 @@ pub fn alter_table(
     let mut added: Option<(usize, Datum)> = None; // (index, fill value)
     let mut dropped: Option<usize> = None;
     match &statement.action {
+        AlterAction::SetSchema(_) => unreachable!("handled above"),
         AlterAction::RenameTable(new_name) => {
-            if storage.find_table(new_name).is_some() {
+            if storage.find_table(def.schema.as_str(), new_name).is_some() {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_TABLE,
                     "relation \"{}\" already exists",
@@ -1773,7 +2377,7 @@ pub fn alter_table(
                         sqlstate::NOT_NULL_VIOLATION,
                         "column \"{}\" of relation \"{}\" contains null values",
                         c.name,
-                        statement.table
+                        statement.table.name
                     ))
                 }
                 None => Datum::Null,
@@ -1804,7 +2408,10 @@ pub fn alter_table(
 
     // Phase 1: journal the shape change and prepare every rewritten row.
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::DropTable(def.name.as_str())) {
+    if let Err(e) = wal.append(
+        lsn,
+        &WalOp::DropTable { schema: def.schema.as_str(), name: def.name.as_str() },
+    ) {
         return sql_fail(e);
     }
     let lsn = storage.bump_lsn();
@@ -1910,6 +2517,7 @@ pub fn alter_table(
         if let Err(e) = wal.append(
             lsn,
             &WalOp::Upsert {
+                schema: new_def.schema.as_str(),
                 table: new_def.name.as_str(),
                 rowid,
                 row: storage.heap.get(new_loc),
@@ -2455,6 +3063,32 @@ fn undefined_table(name: &str) -> SqlError {
         "relation \"{}\" does not exist",
         name
     )
+}
+
+/// PostgreSQL's 42P01 echoes the spelling used: a qualified reference names
+/// its qualifier, a bare one does not.
+fn undefined_qual(name: &QualName) -> SqlError {
+    match name.schema {
+        Some(schema) => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}.{}\" does not exist",
+            schema,
+            name.name
+        ),
+        None => undefined_table(name.name),
+    }
+}
+
+/// Resolves a DML/DDL target through the search path to a table slot.
+fn resolve_dml_table(
+    storage: &Storage,
+    name: &QualName,
+    txid: u32,
+) -> Result<usize, SqlError> {
+    match storage.resolve_relation(name.schema, name.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => Ok(slot),
+        _ => Err(undefined_qual(name)),
+    }
 }
 
 

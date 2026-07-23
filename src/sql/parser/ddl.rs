@@ -7,14 +7,15 @@
 
 use crate::sql::eval::sqlstate;
 use super::{
-    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, Stmt,
-    TableConstraint, Tok, MAX_LIST,
+    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, QualName,
+    Stmt, TableConstraint, Tok, MAX_LIST,
 };
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
 
 impl<'a> Parser<'a> {
-    /// Dispatches CREATE: `[OR REPLACE] VIEW` or `TABLE` ("create" consumed here).
+    /// Dispatches CREATE: `[OR REPLACE] VIEW`, `TABLE`, `INDEX` or `SCHEMA`
+    /// ("create" consumed here).
     pub(super) fn create(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("create")?;
         let or_replace = if self.eat_ident("or")? {
@@ -37,7 +38,73 @@ impl<'a> Parser<'a> {
         if self.eat_ident("index")? {
             return self.create_index(false);
         }
+        if self.eat_ident("schema")? {
+            return self.create_schema();
+        }
         self.create_table()
+    }
+
+    /// CREATE SCHEMA [IF NOT EXISTS] { name [AUTHORIZATION role] |
+    /// AUTHORIZATION role } [schema_element ...] ("create schema" consumed).
+    /// The only role this engine has is the session's bootstrap user; naming
+    /// any other errors as PostgreSQL does. Schema elements are the embedded
+    /// CREATE statements, run with the new schema as their creation target.
+    fn create_schema(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = if self.peeked == Tok::Ident("authorization") {
+            None
+        } else {
+            Some(self.col_ident("schema name")?)
+        };
+        let name = if self.eat_ident("authorization")? {
+            let role = self.col_ident("role name")?;
+            if role != "postgres" {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "role \"{}\" does not exist", role),
+                    sqlstate: sqlstate::UNDEFINED_OBJECT,
+                });
+            }
+            // An omitted name defaults to the role's name, as PostgreSQL.
+            name.unwrap_or(role)
+        } else {
+            let Some(n) = name else {
+                return Err(self.err_here("expected schema name or AUTHORIZATION"));
+            };
+            n
+        };
+        let mut elements: [&'a Stmt<'a>; 16] = [&Stmt::Begin; 16];
+        let mut n = 0usize;
+        while self.peeked == Tok::Ident("create") {
+            if n == elements.len() {
+                return Err(self.limit("schema elements", elements.len()));
+            }
+            let element = self.create()?;
+            if !matches!(
+                element,
+                Stmt::CreateTable(_) | Stmt::CreateView { .. } | Stmt::CreateIndex { .. }
+            ) {
+                return Err(self.err_here(
+                    "CREATE SCHEMA elements may be CREATE TABLE, VIEW, or INDEX",
+                ));
+            }
+            elements[n] = self
+                .arena
+                .alloc(element)
+                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+            n += 1;
+        }
+        Ok(Stmt::CreateSchema {
+            name,
+            if_not_exists,
+            elements: self.arena_slice(&elements[..n])?,
+        })
     }
 
     /// CREATE [UNIQUE] INDEX name ON table (col, ...) ("create [unique] index"
@@ -45,7 +112,7 @@ impl<'a> Parser<'a> {
     fn create_index(&mut self, unique: bool) -> Result<Stmt<'a>, ParseError> {
         let name = self.col_ident("index name")?;
         self.expect_ident("on")?;
-        let table = self.col_ident("table name")?;
+        let table = self.qual_name("table name")?;
         self.expect_op("(")?;
         let mut columns = [""; MAX_LIST];
         let mut n = 0;
@@ -66,7 +133,7 @@ impl<'a> Parser<'a> {
 
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
     fn create_view(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
-        let name = self.col_ident("view name")?;
+        let name = self.qual_name("view name")?;
         self.expect_ident("as")?;
         // Capture the raw SELECT text (re-parsed at query time).
         let start = self.peek_at;
@@ -81,25 +148,78 @@ impl<'a> Parser<'a> {
     pub(super) fn drop_stmt(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("drop")?;
         if self.eat_ident("view")? {
-            let (name, if_exists) = self.drop_target("view name")?;
-            return Ok(Stmt::DropView { name, if_exists });
+            let (names, if_exists) = self.drop_targets("view name")?;
+            return Ok(Stmt::DropView { names, if_exists });
         }
         if self.eat_ident("index")? {
-            let (name, if_exists) = self.drop_target("index name")?;
-            return Ok(Stmt::DropIndex { name, if_exists });
+            let (names, if_exists) = self.drop_targets("index name")?;
+            return Ok(Stmt::DropIndex { names, if_exists });
+        }
+        if self.eat_ident("schema")? {
+            return self.drop_schema();
         }
         self.drop_table()
     }
 
-    /// `[IF EXISTS] name` after a DROP keyword.
-    fn drop_target(&mut self, what: &str) -> Result<(&'a str, bool), ParseError> {
+    /// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
+    /// ("drop schema" consumed).
+    fn drop_schema(&mut self) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
             true
         } else {
             false
         };
-        Ok((self.any_ident(what)?, if_exists))
+        let mut names: [&'a str; 16] = [""; 16];
+        let mut n = 0usize;
+        loop {
+            if n == names.len() {
+                return Err(self.limit("schemas", names.len()));
+            }
+            names[n] = self.col_ident("schema name")?;
+            n += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropSchema { names: self.arena_slice(&names[..n])?, if_exists, cascade })
+    }
+
+    /// `[IF EXISTS] name [, ...]` after a DROP keyword.
+    fn drop_targets(
+        &mut self,
+        what: &str,
+    ) -> Result<(&'a [QualName<'a>], bool), ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let mut names: [QualName<'a>; 16] = [QualName::bare(""); 16];
+        let mut n = 0usize;
+        loop {
+            if n == names.len() {
+                return Err(self.limit("relations", names.len()));
+            }
+            let first = self.any_ident(what)?;
+            names[n] = if self.eat_op(".")? {
+                QualName { schema: Some(first), name: self.any_ident(what)? }
+            } else {
+                QualName::bare(first)
+            };
+            n += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok((self.arena_slice(&names[..n])?, if_exists))
     }
 
     fn create_table(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -111,14 +231,14 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.col_ident("table name")?;
+        let name = self.qual_name("table name")?;
         self.expect_op("(")?;
         let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None }; MAX_LIST];
         let mut n = 0;
         let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
         let mut n_cons = 0;
         let mut likes =
-            [LikeClause { at: 0, source: "", defaults: false, constraints: false, indexes: false, identity: false };
+            [LikeClause { at: 0, source: QualName::bare(""), defaults: false, constraints: false, indexes: false, identity: false };
                 MAX_LIST];
         let mut n_likes = 0;
         loop {
@@ -240,7 +360,7 @@ impl<'a> Parser<'a> {
     /// The rest of a `LIKE source [ { INCLUDING | EXCLUDING } option ]...`
     /// element, `LIKE` already consumed. `at` is how many columns precede it.
     fn like_clause(&mut self, at: usize) -> Result<LikeClause<'a>, ParseError> {
-        let source = self.col_ident("source table name")?;
+        let source = self.qual_name("source table name")?;
         let mut clause =
             LikeClause { at, source, defaults: false, constraints: false, indexes: false, identity: false };
         loop {
@@ -340,7 +460,7 @@ impl<'a> Parser<'a> {
         name: Option<&'a str>,
         columns: &'a [&'a str],
     ) -> Result<TableConstraint<'a>, ParseError> {
-        let parent = self.col_ident("referenced table")?;
+        let parent = self.qual_name("referenced table")?;
         let parent_cols = if self.peeked == Tok::Op("(") {
             self.column_name_list()?
         } else {
@@ -394,12 +514,6 @@ impl<'a> Parser<'a> {
 
     fn drop_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("table")?;
-        let if_exists = if self.eat_ident("if")? {
-            self.expect_ident("exists")?;
-            true
-        } else {
-            false
-        };
-        let name = self.col_ident("table name")?;
-        Ok(Stmt::DropTable(DropTable { name, if_exists }))
+        let (names, if_exists) = self.drop_targets("table name")?;
+        Ok(Stmt::DropTable(DropTable { names, if_exists }))
     }}

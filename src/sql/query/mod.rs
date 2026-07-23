@@ -18,7 +18,7 @@ use crate::stack_format;
 use crate::storage::{ColumnMeta, Storage};
 
 use super::ast::{
-    Expr, FrameBound, FromClause, OrderBy, Select, SelectItem, TableRef,
+    Expr, FrameBound, FromClause, OrderBy, QualName, Select, SelectItem, TableRef,
     WindowFrame,
 };
 use super::eval::{
@@ -532,7 +532,9 @@ fn common_using_type(a: ColType, b: ColType) -> Option<ColType> {
 /// plain (un-aliased) base column. `where_clause` is the view's own filter, to
 /// be AND-ed into any DML on the view; `columns` are the exposed base columns.
 pub struct UpdatableView<'a> {
-    pub base: &'a str,
+    /// The base table, fully qualified from the view's own resolution so the
+    /// rewritten DML binds the same table regardless of the session's path.
+    pub base: QualName<'a>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub columns: &'a [&'a str],
 }
@@ -542,16 +544,22 @@ pub struct UpdatableView<'a> {
 /// is not a view at all (the DML then targets a table normally).
 pub fn resolve_view_for_dml<'a>(
     storage: &Storage,
-    name: &str,
+    name: QualName,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<UpdatableView<'a>>, SqlError> {
-    let Some(sql) = storage.find_view(name, txid) else {
-        return Ok(None);
+    let view_slot = match storage.resolve_relation(name.schema, name.name, txid) {
+        Some(crate::storage::ResolvedRelation::View(slot)) => slot,
+        _ => return Ok(None),
     };
+    let view = storage.view(view_slot);
+    // The body re-resolves under the view creator's search path.
+    let user = crate::sql::eval::funcs::system::session_user_owned();
+    let view_path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
     // Copy the definition into the arena so the parsed AST no longer borrows
     // storage (the caller then takes a mutable storage borrow to run the DML).
-    let sql = arena.alloc_str(sql).map_err(|_| arena_full())?;
+    let sql = arena.alloc_str(view.sql.as_str()).map_err(|_| arena_full())?;
+    let name = name.name;
     let not_updatable = || {
         sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -571,18 +579,27 @@ pub fn resolve_view_for_dml<'a>(
     let Some(from) = &sel.from else {
         return Err(not_updatable());
     };
-    if !from.joins.is_empty() || from.base.subquery.is_some() || from.base.schema.is_some() {
+    if !from.joins.is_empty() || from.base.subquery.is_some() {
         return Err(not_updatable());
     }
-    let base = from.base.table;
+    let Some(crate::storage::ResolvedRelation::Table(ti)) = storage.resolve_relation_under(
+        &view_path,
+        from.base.schema,
+        from.base.table,
+        txid,
+    ) else {
+        return Err(not_updatable());
+    };
+    let base_def = &storage.table(ti).def;
+    let base = QualName {
+        schema: Some(arena.alloc_str(base_def.schema.as_str()).map_err(|_| arena_full())?),
+        name: arena.alloc_str(base_def.name.as_str()).map_err(|_| arena_full())?,
+    };
     let mut columns = [""; MAX_PROJ];
     let mut n = 0;
     for it in sel.items {
         match it {
             SelectItem::Wildcard => {
-                let Some(ti) = storage.find_table(base) else {
-                    return Err(not_updatable());
-                };
                 for c in storage.table(ti).def.columns() {
                     if n == MAX_PROJ {
                         return Err(not_updatable());

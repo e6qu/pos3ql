@@ -294,9 +294,48 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
         return Ok(date_days * 86_400 * 1_000_000);
     }
 
-    // Trailing zone: Z, +HH, +HH:MM, -HH, -HH:MM.
-    let (time_part, timezone_seconds) = if let Some(stripped) = rest.strip_suffix('Z') {
-        (stripped, 0i64)
+    // Trailing *named* zone (`... Europe/Moscow`, `... EST`, `... UTC`): the
+    // name resolves at the timestamp's own instant, so a historical rule
+    // applies to a historical timestamp. Detected before the numeric-offset
+    // split, since a name never contains the digits an offset must.
+    let mut named_zone: Option<super::timezone::Timezone> = None;
+    let rest = if let Some((head, name)) = rest.rsplit_once(' ') {
+        let name = name.trim();
+        let name_like = !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphabetic() || c == '/' || c == '_')
+            && name.chars().any(|c| c.is_ascii_alphabetic());
+        if name_like {
+            if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
+                named_zone = Some(super::timezone::Timezone::utc());
+            } else {
+                named_zone = Some(super::timezone::lookup(name).ok_or_else(|| {
+                    // PostgreSQL reports the name case-folded.
+                    let mut folded = crate::util::StackStr::<64>::new();
+                    use core::fmt::Write as _;
+                    for c in name.chars() {
+                        let _ = folded.write_char(c.to_ascii_lowercase());
+                    }
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "time zone \"{}\" not recognized",
+                        folded.as_str()
+                    )
+                })?);
+            }
+            head.trim_end()
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+    // Trailing zone: Z, +HH, +HH:MM, -HH, -HH:MM. Whether an offset was
+    // written matters: a bare timestamptz literal is interpreted in the
+    // *session* zone, as PostgreSQL reads it.
+    let (time_part, timezone_seconds, explicit_offset) = if let Some(stripped) =
+        rest.strip_suffix('Z')
+    {
+        (stripped, 0i64, true)
     } else if let Some(pos) = rest.rfind(['+', '-']) {
         if pos > 0 {
             let (tp, zone) = rest.split_at(pos);
@@ -309,12 +348,12 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
                 ),
                 None => (z.parse::<i64>().map_err(|_| bad())?, 0),
             };
-            (tp, sign * (h * 3600 + m * 60))
+            (tp, sign * (h * 3600 + m * 60), true)
         } else {
-            (rest, 0)
+            (rest, 0, false)
         }
     } else {
-        (rest, 0)
+        (rest, 0, false)
     };
 
     let mut it = time_part.splitn(3, ':');
@@ -347,7 +386,19 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     let mut total =
         date_days * 86_400_000_000 + (h * 3600 + m * 60 + sec) * 1_000_000 + micros;
     if apply_timezone {
-        total -= timezone_seconds * 1_000_000;
+        if let Some(zone) = named_zone {
+            // The offset in effect at the given wall time (resolved with the
+            // wall instant standing in for UTC — exact away from the sub-hour
+            // transition windows, as the AT TIME ZONE conversion has it).
+            let (offset_seconds, _) = zone.resolve(total);
+            total -= i64::from(offset_seconds) * 1_000_000;
+        } else if explicit_offset {
+            total -= timezone_seconds * 1_000_000;
+        } else {
+            // No zone written: the wall time reads in the session zone.
+            let (offset_seconds, _) = super::timezone::session().resolve(total);
+            total -= i64::from(offset_seconds) * 1_000_000;
+        }
     }
     Ok(total)
 }

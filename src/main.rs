@@ -35,6 +35,11 @@ fn run() -> Result<(), String> {
     let mut server =
         Server::new(&config, &mut budget).map_err(|e| format!("startup failed: {e}"))?;
 
+    // The IANA zone-name catalog walks /usr/share/zoneinfo, which allocates —
+    // it must happen on this side of the freeze. Zone files themselves load
+    // on demand into fixed pools.
+    pos3ql::sql::tzif::init_catalog();
+
     mem::guard::freeze();
     println!(
         "startup complete: memory frozen ({} of {} budget drawn); accepting connections",

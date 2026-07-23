@@ -33,14 +33,23 @@ pub struct Dst {
     end: Trans,
 }
 
-/// A resolved time zone.
+/// A rule-based zone: fixed offsets with an optional POSIX DST rule. The
+/// embedded fallback set and TZif footer rules both take this form.
 #[derive(Debug, Clone, Copy)]
-pub struct Timezone {
+pub struct PosixZone {
     std_off: i32,
     dst_off: i32,
     std_abbrev: StackStr<8>,
     dst_abbrev: StackStr<8>,
     dst: Option<Dst>,
+}
+
+/// A resolved time zone: a rule-based zone, or a slot in the TZif cache — the
+/// full IANA database with its historical transitions.
+#[derive(Debug, Clone, Copy)]
+pub enum Timezone {
+    Posix(PosixZone),
+    Tzif(u16),
 }
 
 use core::cell::Cell;
@@ -67,13 +76,30 @@ impl Timezone {
     pub fn fixed(off_secs: i32, abbrev: &str) -> Timezone {
         let mut a = StackStr::new();
         let _ = write!(a, "{abbrev}");
-        Timezone { std_off: off_secs, dst_off: off_secs, std_abbrev: a, dst_abbrev: a, dst: None }
+        Timezone::Posix(PosixZone {
+            std_off: off_secs,
+            dst_off: off_secs,
+            std_abbrev: a,
+            dst_abbrev: a,
+            dst: None,
+        })
     }
 
     pub fn utc() -> Timezone {
         Timezone::fixed(0, "UTC")
     }
 
+    /// The offset (seconds east of UTC) and abbreviation in effect at `utc`
+    /// microseconds-since-2000.
+    pub fn resolve(&self, utc: i64) -> (i32, StackStr<8>) {
+        match self {
+            Timezone::Posix(z) => z.resolve(utc),
+            Timezone::Tzif(slot) => super::tzif::resolve(*slot, utc),
+        }
+    }
+}
+
+impl PosixZone {
     /// The offset (seconds east of UTC) and abbreviation in effect at `utc`
     /// microseconds-since-2000.
     pub fn resolve(&self, utc: i64) -> (i32, StackStr<8>) {
@@ -132,7 +158,7 @@ fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst
     let _ = write!(s, "{std_ab}");
     let mut d = StackStr::new();
     let _ = write!(d, "{dst_ab}");
-    Timezone { std_off, dst_off, std_abbrev: s, dst_abbrev: d, dst }
+    Timezone::Posix(PosixZone { std_off, dst_off, std_abbrev: s, dst_abbrev: d, dst })
 }
 
 /// US rule (2007+): spring 2nd Sunday March 02:00 std, fall 1st Sunday
@@ -172,9 +198,17 @@ fn nz() -> Dst {
     }
 }
 
-/// Looks up an IANA zone name (case-insensitive). Returns the resolved zone, or
-/// `None` if it is not in the embedded set.
+/// Looks up an IANA zone name (case-insensitive): the system's TZif database
+/// first (full history), then the embedded rule set for hosts without one.
 pub fn lookup(name: &str) -> Option<Timezone> {
+    if let Some(slot) = super::tzif::load(name) {
+        return Some(Timezone::Tzif(slot));
+    }
+    lookup_embedded(name)
+}
+
+/// The embedded present-rule set: exact for current rules, no history.
+fn lookup_embedded(name: &str) -> Option<Timezone> {
     let n = name;
     let eq = |a: &str| n.eq_ignore_ascii_case(a);
     // North America
@@ -267,6 +301,141 @@ pub fn lookup(name: &str) -> Option<Timezone> {
         return Some(build(12 * H, 13 * H, "NZST", "NZDT", Some(nz())));
     }
     None
+}
+
+/// Parses a POSIX `TZ` string (the TZif footer form): `std offset [dst
+/// [offset] [,Mm.w.d[/time],Mm.w.d[/time]]]`, names either alphabetic or
+/// `<quoted>`, the offset sign *inverted* (west positive, so `EST5` is
+/// UTC-5), transition times defaulting to 02:00:00 and allowed outside
+/// 0..24h (tzdata's extension — Ireland's `M10.5.0/-1`). Rule forms other
+/// than `M` (the `Jn`/`n` day numbers, present in exactly one Antarctic
+/// zone's footer) are refused with `None`, which freezes that zone at its
+/// last recorded transition rather than approximating.
+pub fn parse_posix_tz(s: &str) -> Option<PosixZone> {
+    let b = s.as_bytes();
+    let mut at = 0usize;
+    let name = |at: &mut usize| -> Option<StackStr<8>> {
+        let mut out = StackStr::new();
+        if *at < b.len() && b[*at] == b'<' {
+            *at += 1;
+            while *at < b.len() && b[*at] != b'>' {
+                let _ = out.write_char(b[*at] as char);
+                *at += 1;
+            }
+            if *at == b.len() {
+                return None;
+            }
+            *at += 1; // consume '>'
+        } else {
+            while *at < b.len() && (b[*at].is_ascii_alphabetic()) {
+                let _ = out.write_char(b[*at] as char);
+                *at += 1;
+            }
+        }
+        if out.as_str().is_empty() { None } else { Some(out) }
+    };
+    // `[+-]h[h][:mm[:ss]]`, seconds west of UTC as written.
+    let offset = |at: &mut usize| -> Option<i64> {
+        let mut sign = 1i64;
+        if *at < b.len() && (b[*at] == b'+' || b[*at] == b'-') {
+            if b[*at] == b'-' {
+                sign = -1;
+            }
+            *at += 1;
+        }
+        let mut parts = [0i64; 3];
+        let mut np = 0usize;
+        loop {
+            let start = *at;
+            while *at < b.len() && b[*at].is_ascii_digit() {
+                parts[np] = parts[np] * 10 + i64::from(b[*at] - b'0');
+                *at += 1;
+            }
+            if *at == start {
+                return None;
+            }
+            np += 1;
+            if np == 3 || *at >= b.len() || b[*at] != b':' {
+                break;
+            }
+            *at += 1;
+        }
+        Some(sign * (parts[0] * 3600 + parts[1] * 60 + parts[2]))
+    };
+    let rule = |at: &mut usize| -> Option<Trans> {
+        if *at >= b.len() || b[*at] != b'M' {
+            return None;
+        }
+        *at += 1;
+        let num = |at: &mut usize| -> Option<u32> {
+            let start = *at;
+            let mut v = 0u32;
+            while *at < b.len() && b[*at].is_ascii_digit() {
+                v = v * 10 + u32::from(b[*at] - b'0');
+                *at += 1;
+            }
+            (*at > start).then_some(v)
+        };
+        let month = num(at)?;
+        if *at >= b.len() || b[*at] != b'.' {
+            return None;
+        }
+        *at += 1;
+        let week = num(at)?;
+        if *at >= b.len() || b[*at] != b'.' {
+            return None;
+        }
+        *at += 1;
+        let dow = num(at)? as usize;
+        let seconds = if *at < b.len() && b[*at] == b'/' {
+            *at += 1;
+            offset(at)?
+        } else {
+            2 * 3600
+        };
+        if !(1..=12).contains(&month) || !(1..=5).contains(&week) || dow > 6 {
+            return None;
+        }
+        Some(Trans { month, week, dow, seconds })
+    };
+
+    let std_abbrev = name(&mut at)?;
+    let std_off = -(offset(&mut at)? as i32); // POSIX west-positive, inverted
+    if at == b.len() {
+        return Some(PosixZone {
+            std_off,
+            dst_off: std_off,
+            std_abbrev,
+            dst_abbrev: std_abbrev,
+            dst: None,
+        });
+    }
+    let dst_abbrev = name(&mut at)?;
+    let dst_off = if at < b.len() && b[at] != b',' {
+        -(offset(&mut at)? as i32)
+    } else {
+        std_off + 3600
+    };
+    if at >= b.len() || b[at] != b',' {
+        return None; // a DST name without rules is not a form real footers use
+    }
+    at += 1;
+    let start = rule(&mut at)?;
+    if at >= b.len() || b[at] != b',' {
+        return None;
+    }
+    at += 1;
+    let end = rule(&mut at)?;
+    if at != b.len() {
+        return None;
+    }
+    Some(PosixZone {
+        std_off,
+        dst_off,
+        std_abbrev,
+        dst_abbrev,
+        dst: Some(Dst { start, end }),
+    })
 }
 
 #[cfg(test)]

@@ -186,7 +186,13 @@ impl GucState {
             let timezone = if is_default {
                 super::timezone::Timezone::utc()
             } else {
-                parse_timezone(v).ok_or_else(|| unsupported_value("TimeZone", v))?
+                parse_timezone(v).ok_or_else(|| {
+                    sql_err!(
+                        crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
+                        "invalid value for parameter \"TimeZone\": \"{}\"",
+                        v
+                    )
+                })?
             };
             store(&mut self.timezone, if is_default { "UTC" } else { v })?;
             self.parsed_timezone = timezone;

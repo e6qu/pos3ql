@@ -2475,7 +2475,7 @@ fn timezone_offset_affects_timestamptz() {
     let summer = "timestamptz '2024-07-15 14:30:00+00'";
     assert_eq!(go(&mut e, &mut b, format!("SET timezone='America/New_York'; SELECT {summer}")), ["2024-07-15 10:30:00-04"]);
     // An unknown zone name is still rejected loudly.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone='Mars/Olympus'")).contains("0A000"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone='Mars/Olympus'")).contains("22023"));
 }
 
 #[test]
@@ -2515,7 +2515,7 @@ fn set_and_show_session_gucs() {
     // A named IANA time zone is now accepted.
     assert_eq!(message_types(&run_with(&mut e, &mut b, "SET timezone = 'America/New_York'")), [b'C']);
     // An unknown zone name is still rejected loudly.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone = 'Mars/Olympus'")).contains("0A000"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone = 'Mars/Olympus'")).contains("22023"));
     // DateStyle values are now honored (see datestyle_affects_date_output).
     assert_eq!(message_types(&run_with(&mut e, &mut b, "SET DateStyle = 'German'")), [b'C']);
     // SET TIME ZONE spelling maps to timezone; UTC is accepted.

@@ -351,9 +351,18 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 let zone = guc::parse_timezone(zone_name).ok_or_else(|| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "time zone \"{}\" not recognized", zone_name))?;
-                match eval_full(args[1], arena, params, row, hooks)? {
+                match text_view(eval_full(args[1], arena, params, row, hooks)?) {
                     Datum::Null => Ok(Datum::Null),
                     Datum::Timestamptz(utc) => {
+                        let (offset_seconds, _) = zone.resolve(utc);
+                        Ok(Datum::Timestamp(utc + i64::from(offset_seconds) * 1_000_000))
+                    }
+                    // An untyped literal coerces to timestamp *with* time
+                    // zone (session-zone interpreted), and the operator then
+                    // converts it into the named zone — PostgreSQL's
+                    // resolution of `'2021-07-04 12:00' AT TIME ZONE z`.
+                    Datum::Text(s) => {
+                        let utc = datetime::parse_timestamp(s, true)?;
                         let (offset_seconds, _) = zone.resolve(utc);
                         Ok(Datum::Timestamp(utc + i64::from(offset_seconds) * 1_000_000))
                     }

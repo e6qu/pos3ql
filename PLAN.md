@@ -260,6 +260,20 @@ Stage-B cache; range scan streams the covering blocks. **Milestone:** cold start
 longer rehydrates whole tables into RAM; a point lookup touches O(1) blocks
 (verified by fetch counters).
 
+**Started: the sorted data blocks and the sparse index.** `store/sst.rs` writes a
+table's rows, in key order, into `SstData` blocks packed until each is full, then a
+single `SstIndex` block recording the first key and identity of each data block.
+That index block is the SST's root: given its identity a reader finds any key. The
+lookup is the O(1) one the milestone names — binary-search the sparse index for the
+one block a key could be in, read that block, scan it — and a test proves it
+touches exactly two blocks (index + data) whatever the row count, using the memory
+store's read counter. Keys are row identities, so this re-expresses the current
+checkpoint SST's format in blocks (Stage A's other half) rather than a new key
+space, and the writer refuses out-of-order keys and rows too large for a block. The
+bloom filter block and a multi-block index (the single index block currently bounds
+an SST at ~6.5k data blocks, a bound that is checked and raised, not overrun) are
+what remain of Stage C, along with a range-scan reader over the covering blocks.
+
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 
 Kill the "flush not implemented" wall: ingest becomes bounded by flush *rate*, not

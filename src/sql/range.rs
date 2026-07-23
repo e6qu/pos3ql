@@ -28,37 +28,59 @@ pub struct Parsed<'a> {
     pub upper_inc: bool,
 }
 
-fn bad(kind: RangeKind, s: &str) -> SqlError {
-    sql_err!("22P02", "malformed range literal for {}: \"{}\"", kind.name(), s)
+/// A range literal that does not have the shape of a range — missing a bracket,
+/// the wrong number of comma-separated parts. PostgreSQL names neither the range
+/// type nor the element here, only that the literal is malformed.
+fn bad_literal(input: &str) -> SqlError {
+    sql_err!("22P02", "malformed range literal: \"{}\"", input)
+}
+
+/// A bound that is well-placed but is not a value of the element type. This is
+/// the element type's own input error, not a range error — `[a,5)::int4range`
+/// fails the way `'a'::integer` does — so it names the element type and value.
+/// Only the integer and numeric elements reach here; the temporal elements
+/// raise their own equivalent from `parse_date` / `parse_timestamp`.
+fn bad_element(kind: RangeKind, value: &str) -> SqlError {
+    sql_err!(
+        "22P02",
+        "invalid input syntax for type {}: \"{}\"",
+        kind.elem_type().name(),
+        value
+    )
 }
 
 /// Parses a range literal (`[1,5)` / `(,5]` / `empty`) into its components.
-pub fn parse<'a>(input: &'a str, kind: RangeKind) -> Result<Parsed<'a>, SqlError> {
+pub fn parse<'a>(input: &'a str) -> Result<Parsed<'a>, SqlError> {
     let t = input.trim();
     if t.eq_ignore_ascii_case("empty") {
         return Ok(Parsed { empty: true, lower: None, upper: None, lower_inc: false, upper_inc: false });
     }
     let b = t.as_bytes();
     if b.len() < 2 {
-        return Err(bad(kind, input));
+        return Err(bad_literal(input));
     }
     let lower_inc = match b[0] {
         b'[' => true,
         b'(' => false,
-        _ => return Err(bad(kind, input)),
+        _ => return Err(bad_literal(input)),
     };
     let upper_inc = match b[b.len() - 1] {
         b']' => true,
         b')' => false,
-        _ => return Err(bad(kind, input)),
+        _ => return Err(bad_literal(input)),
     };
     let inner = &t[1..t.len() - 1];
     // The separator is the first comma outside quotes: a bound may be quoted to
     // carry a character that would otherwise be structural, exactly as
     // PostgreSQL writes a timestamp bound, so the split must respect the quotes.
-    let (lower_text, upper_text) = split_bounds(inner).ok_or_else(|| bad(kind, input))?;
+    let (lower_text, upper_raw) = split_bounds(inner).ok_or_else(|| bad_literal(input))?;
+    // A third part — another comma outside quotes in the remainder — is a
+    // malformed literal, not a bad element value in the second part.
+    if split_bounds(upper_raw).is_some() {
+        return Err(bad_literal(input));
+    }
     let lower_text = unquote_bound(lower_text.trim());
-    let upper_text = unquote_bound(upper_text.trim());
+    let upper_text = unquote_bound(upper_raw.trim());
     Ok(Parsed {
         empty: false,
         lower: if lower_text.is_empty() { None } else { Some(lower_text) },
@@ -264,7 +286,7 @@ fn incr_into(v: &str, kind: RangeKind, buffer: &mut StackStr<48>) -> Result<(), 
     buffer.clear();
     match kind {
         RangeKind::Int4 | RangeKind::Int8 => {
-            let n: i64 = v.trim().parse().map_err(|_| bad(kind, v))?;
+            let n: i64 = v.trim().parse().map_err(|_| bad_element(kind, v))?;
             let _ = write!(buffer, "{}", n + 1);
         }
         RangeKind::Date => {
@@ -282,8 +304,8 @@ fn incr_into(v: &str, kind: RangeKind, buffer: &mut StackStr<48>) -> Result<(), 
 fn cmp_elem(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
     Ok(match kind {
         RangeKind::Int4 | RangeKind::Int8 => {
-            let x: i64 = a.trim().parse().map_err(|_| bad(kind, a))?;
-            let y: i64 = b.trim().parse().map_err(|_| bad(kind, b))?;
+            let x: i64 = a.trim().parse().map_err(|_| bad_element(kind, a))?;
+            let y: i64 = b.trim().parse().map_err(|_| bad_element(kind, b))?;
             x.cmp(&y)
         }
         RangeKind::Date => super::datetime::parse_date(a.trim())?
@@ -292,10 +314,17 @@ fn cmp_elem(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
             .cmp(&super::datetime::parse_timestamp(b.trim(), false)?),
         RangeKind::Tstz => super::datetime::parse_timestamp(a.trim(), true)?
             .cmp(&super::datetime::parse_timestamp(b.trim(), true)?),
-        RangeKind::Num => match numeric::cmp_decimal_str(a.trim(), b.trim()) {
-            Some(o) => o,
-            None => return Err(bad(kind, a)),
-        },
+        RangeKind::Num => {
+            // cmp fails without saying which side was malformed, so each is
+            // checked to name the offending one as PostgreSQL does.
+            if !numeric::valid_decimal(a.trim()) {
+                return Err(bad_element(kind, a));
+            }
+            if !numeric::valid_decimal(b.trim()) {
+                return Err(bad_element(kind, b));
+            }
+            numeric::cmp_decimal_str(a.trim(), b.trim()).ok_or_else(|| bad_element(kind, a))?
+        }
     })
 }
 
@@ -312,7 +341,7 @@ fn bound_datum<'a>(
     lower: bool,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let p = parse(text, kind)?;
+    let p = parse(text)?;
     let raw = if lower { p.lower } else { p.upper };
     match raw {
         None => Ok(Datum::Null),
@@ -322,8 +351,8 @@ fn bound_datum<'a>(
 
 fn elem_datum<'a>(s: &str, kind: RangeKind, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     Ok(match kind {
-        RangeKind::Int4 => Datum::Int4(s.trim().parse().map_err(|_| bad(kind, s))?),
-        RangeKind::Int8 => Datum::Int8(s.trim().parse().map_err(|_| bad(kind, s))?),
+        RangeKind::Int4 => Datum::Int4(s.trim().parse().map_err(|_| bad_element(kind, s))?),
+        RangeKind::Int8 => Datum::Int8(s.trim().parse().map_err(|_| bad_element(kind, s))?),
         RangeKind::Date => Datum::Date(super::datetime::parse_date(s.trim())?),
         RangeKind::Ts => Datum::Timestamp(super::datetime::parse_timestamp(s.trim(), false)?),
         RangeKind::Tstz => Datum::Timestamptz(super::datetime::parse_timestamp(s.trim(), true)?),
@@ -335,8 +364,8 @@ pub fn is_empty(text: &str) -> bool {
     text.trim().eq_ignore_ascii_case("empty")
 }
 
-pub fn bound_inc(text: &str, kind: RangeKind, lower: bool) -> Result<bool, SqlError> {
-    let p = parse(text, kind)?;
+pub fn bound_inc(text: &str, lower: bool) -> Result<bool, SqlError> {
+    let p = parse(text)?;
     if p.empty {
         return Ok(false);
     }
@@ -345,7 +374,7 @@ pub fn bound_inc(text: &str, kind: RangeKind, lower: bool) -> Result<bool, SqlEr
 
 /// `range @> element`.
 pub fn contains_elem(text: &str, kind: RangeKind, element: &str) -> Result<bool, SqlError> {
-    let p = parse(text, kind)?;
+    let p = parse(text)?;
     if p.empty {
         return Ok(false);
     }
@@ -368,7 +397,7 @@ pub fn contains_elem(text: &str, kind: RangeKind, element: &str) -> Result<bool,
 
 /// `outer @> inner` (range contains range).
 pub fn contains_range(outer: &str, inner: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (parsed_outer, parsed_inner) = (parse(outer, kind)?, parse(inner, kind)?);
+    let (parsed_outer, parsed_inner) = (parse(outer)?, parse(inner)?);
     if parsed_inner.empty {
         return Ok(true);
     }
@@ -380,7 +409,7 @@ pub fn contains_range(outer: &str, inner: &str, kind: RangeKind) -> Result<bool,
 
 /// `a && b` (ranges overlap).
 pub fn overlaps(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
@@ -424,7 +453,7 @@ fn upper_ge(outer: &Parsed, inner: &Parsed, kind: RangeKind) -> Result<bool, Sql
 /// Comparison is on bound *values* (not canonical text), so `numrange(1.0,5.0)`
 /// and `numrange(1.00,5.0)` compare equal.
 pub fn cmp_ranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     match (parsed_a.empty, parsed_b.empty) {
         (true, true) => return Ok(Ordering::Equal),
         (true, false) => return Ok(Ordering::Less),
@@ -477,21 +506,21 @@ fn cmp_bound(
 }
 
 /// `lower_inf(r)`: the range is non-empty and has no lower bound.
-pub fn lower_inf(text: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let p = parse(text, kind)?;
+pub fn lower_inf(text: &str) -> Result<bool, SqlError> {
+    let p = parse(text)?;
     Ok(!p.empty && p.lower.is_none())
 }
 
 /// `upper_inf(r)`: the range is non-empty and has no upper bound.
-pub fn upper_inf(text: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let p = parse(text, kind)?;
+pub fn upper_inf(text: &str) -> Result<bool, SqlError> {
+    let p = parse(text)?;
     Ok(!p.empty && p.upper.is_none())
 }
 
 /// `a << b`: `a` lies strictly to the left of `b` (no overlap, `a` entirely
 /// below `b`). Empty ranges are never strictly left of anything.
 pub fn strictly_before(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
@@ -505,7 +534,7 @@ pub fn strictly_after(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlErro
 
 /// `a &< b`: `a` does not extend to the right of `b` (`upper(a) <= upper(b)`).
 pub fn not_right_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
@@ -514,7 +543,7 @@ pub fn not_right_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError>
 
 /// `a &> b`: `a` does not extend to the left of `b` (`lower(a) >= lower(b)`).
 pub fn not_left_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
@@ -523,7 +552,7 @@ pub fn not_left_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> 
 
 /// `a -|- b`: the ranges are adjacent (disjoint with no gap between them).
 pub fn adjacent(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
@@ -548,7 +577,7 @@ fn bound_adjacent(
 
 /// `a * b`: the intersection of two ranges (empty when they do not overlap).
 pub fn intersect<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty || !overlaps(a, b, kind)? {
         return alloc(arena, "empty");
     }
@@ -561,7 +590,7 @@ pub fn intersect<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Res
 /// `a + b`: the union of two ranges. PostgreSQL requires the result to be
 /// contiguous (the inputs overlap or are adjacent), else it errors.
 pub fn union<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty {
         return canonical(&parsed_b, kind, arena);
     }
@@ -579,7 +608,7 @@ pub fn union<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<
 /// `range_merge(a, b)`: the smallest range containing both, with no contiguity
 /// requirement (unlike `+`).
 pub fn merge<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty {
         return canonical(&parsed_b, kind, arena);
     }
@@ -594,7 +623,7 @@ pub fn merge<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<
 /// `a - b`: `a` with the portion overlapping `b` removed. Errors when the
 /// result would not be contiguous (`b` strictly inside `a`).
 pub fn difference<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let (parsed_a, parsed_b) = (parse(a, kind)?, parse(b, kind)?);
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty || !overlaps(a, b, kind)? {
         return canonical(&parsed_a, kind, arena);
     }
@@ -757,7 +786,7 @@ pub fn parse_multirange<'a>(
     let mut canon: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
     let mut m = 0usize;
     for &c in &raw[..n] {
-        let p = parse(c, kind)?;
+        let p = parse(c)?;
         let cx = canonical(&p, kind, arena)?;
         if cx != "empty" {
             canon[m] = cx;
@@ -878,7 +907,7 @@ pub fn multirange_difference<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena:
     let mut np = na;
     pieces[..na].copy_from_slice(&ca[..na]);
     for &bj in &cb[..nb] {
-        let parsed_b = parse(bj, kind)?;
+        let parsed_b = parse(bj)?;
         let mut next: [&str; MAX_MULTIRANGE * 2] = [""; MAX_MULTIRANGE * 2];
         let mut nn = 0usize;
         let mut push = |s: &'a str, nn: &mut usize| -> Result<(), SqlError> {
@@ -892,7 +921,7 @@ pub fn multirange_difference<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena:
         for &piece in &pieces[..np] {
             if overlaps(piece, bj, kind)? {
                 let mut rem: [&str; 2] = [""; 2];
-                let k = range_minus(&parse(piece, kind)?, &parsed_b, kind, arena, &mut rem)?;
+                let k = range_minus(&parse(piece)?, &parsed_b, kind, arena, &mut rem)?;
                 for &r in &rem[..k] {
                     push(r, &mut nn)?;
                 }
@@ -964,6 +993,44 @@ pub fn cmp_multiranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, Sq
 mod tests {
     use super::*;
     use RangeKind::{Int4, Num};
+
+    fn error_of(literal: &str, kind: RangeKind) -> String {
+        let arena = mini_arena();
+        // The message a cast to this range kind would raise. `canonical` is
+        // where both structural and element errors surface.
+        let p = match parse(literal) {
+            Err(e) => return e.message.as_str().to_string(),
+            Ok(p) => p,
+        };
+        match canonical(&p, kind, &arena) {
+            Err(e) => e.message.as_str().to_string(),
+            Ok(_) => String::from("<no error>"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_literal_names_neither_type_nor_element() {
+        // Structural errors carry only "malformed range literal", as PostgreSQL
+        // does — not the range type name it once wrongly included.
+        assert_eq!(error_of("garbage", Int4), "malformed range literal: \"garbage\"");
+        assert_eq!(error_of("1,5)", Int4), "malformed range literal: \"1,5)\"");
+        assert_eq!(error_of("[1,5", Int4), "malformed range literal: \"[1,5\"");
+        // A third comma-separated part is structural, not a bad second bound.
+        assert_eq!(error_of("[1,2,3]", Int4), "malformed range literal: \"[1,2,3]\"");
+    }
+
+    #[test]
+    fn a_bad_bound_is_the_element_types_own_input_error() {
+        // A well-placed but invalid bound raises the element type's error,
+        // naming the type and the offending value — the way `\'a\'::integer`
+        // does — rather than a range error.
+        assert_eq!(error_of("[a,5)", Int4), "invalid input syntax for type integer: \"a\"");
+        assert_eq!(error_of("[5,z)", RangeKind::Int8), "invalid input syntax for type bigint: \"z\"");
+        assert_eq!(error_of("[1.5,x)", Num), "invalid input syntax for type numeric: \"x\"");
+        // Whichever side is bad is the one named.
+        assert_eq!(error_of("[x,5)", Num), "invalid input syntax for type numeric: \"x\"");
+        assert_eq!(error_of("[1,bad)", Int4), "invalid input syntax for type integer: \"bad\"");
+    }
 
     #[test]
     fn cmp_ranges_orders_by_bounds() {
@@ -1043,9 +1110,9 @@ mod tests {
         assert!(not_left_of("[5,20)", "[1,10)", Int4).unwrap());
         assert!(adjacent("[1,10)", "[10,20)", Int4).unwrap());
         assert!(!adjacent("[1,10)", "[11,20)", Int4).unwrap());
-        assert!(lower_inf("(,5)", Int4).unwrap());
-        assert!(upper_inf("[1,)", Int4).unwrap());
-        assert!(!lower_inf("[1,5)", Int4).unwrap());
+        assert!(lower_inf("(,5)").unwrap());
+        assert!(upper_inf("[1,)").unwrap());
+        assert!(!lower_inf("[1,5)").unwrap());
     }
 
     #[test]

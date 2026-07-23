@@ -658,6 +658,15 @@ impl<'a> Parser<'a> {
                 if let Tok::Str(lit) = self.peeked
                     && crate::sql::types::ColType::from_sql_name(name).is_some() {
                         self.advance()?;
+                        // `INTERVAL '1' DAY`: the SQL-standard trailing unit
+                        // qualifier interprets an otherwise-unitless value in
+                        // that field, so it is folded into the literal before
+                        // the cast rather than left dangling.
+                        let lit = if name.eq_ignore_ascii_case("interval") {
+                            self.interval_with_qualifier(lit)?
+                        } else {
+                            lit
+                        };
                         let operand = self.arena_expr(Expr::Str(lit))?;
                         return self.arena_expr(Expr::Cast { operand, type_name: name, type_mod: -1 });
                     }
@@ -1014,6 +1023,65 @@ impl<'a> Parser<'a> {
 
     /// Desugars `left IS [NOT] DISTINCT FROM right` into a null-safe `CASE`:
     /// both null → equal, one null → distinct, else the plain comparison.
+    /// Applies an SQL-standard interval unit qualifier (`INTERVAL '1' DAY`) to
+    /// the literal, folding the trailing field into the string. Returns the
+    /// literal unchanged when no qualifier follows.
+    ///
+    /// A single field interprets a bare numeric value in that unit and, for
+    /// every field but SECOND, truncates it toward zero to that field's
+    /// resolution — `'2.5' HOUR` is two hours, not two and a half. The
+    /// hyphenated `YEAR TO MONTH` range form and a qualifier on an already
+    /// unit-bearing string are not yet handled and are refused rather than
+    /// quietly mis-parsed.
+    fn interval_with_qualifier(&mut self, lit: &'a str) -> Result<&'a str, ParseError> {
+        let Some((word, keep_fraction)) = self.peek_interval_field() else {
+            return Ok(lit);
+        };
+        self.advance()?;
+        if self.eat_ident("to")? {
+            return Err(self.err_here(
+                "INTERVAL with a TO range qualifier is not supported yet",
+            ));
+        }
+        let value = lit.trim();
+        let numeric = value.strip_prefix(['-', '+']).unwrap_or(value);
+        let is_number = !numeric.is_empty()
+            && numeric.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            && numeric.bytes().filter(|&b| b == b'.').count() <= 1;
+        if !is_number {
+            return Err(self.err_here(
+                "INTERVAL unit qualifier on a non-numeric literal is not supported yet",
+            ));
+        }
+        // Truncate toward zero for the coarser fields by dropping any fraction.
+        let magnitude = if keep_fraction {
+            value
+        } else {
+            value.split_once('.').map_or(value, |(head, _)| head)
+        };
+        let combined = crate::stack_format!(64, "{} {}", magnitude, word);
+        self.arena
+            .alloc_str(combined.as_str())
+            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+    }
+
+    /// The interval field keyword under the cursor, as `(unit word, keeps a
+    /// fractional part)`. SECOND keeps its fraction; the coarser fields do not.
+    fn peek_interval_field(&self) -> Option<(&'static str, bool)> {
+        let Tok::Ident(word) = self.peeked else {
+            return None;
+        };
+        Some(match word {
+            "year" => ("year", false),
+            "month" => ("month", false),
+            "day" => ("day", false),
+            "hour" => ("hour", false),
+            "minute" => ("minute", false),
+            "second" => ("second", true),
+            _ => return None,
+        })
+    }
+
     pub(super) fn build_distinct_from(
         &self,
         left: &'a Expr<'a>,

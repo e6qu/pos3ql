@@ -491,9 +491,14 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
             saw = true;
             continue;
         }
-        // A signed number followed by a unit word.
+        // A signed number, optionally followed by a unit word. A number with
+        // no unit is seconds, as PostgreSQL reads a bare `INTERVAL '90'`.
         let n: f64 = tok.parse().map_err(|_| bad())?;
-        let unit = it.next().ok_or_else(bad)?;
+        let Some(unit) = it.next() else {
+            micros += (n * 1_000_000.0) as i64;
+            saw = true;
+            continue;
+        };
         let u = unit.trim_end_matches('s'); // singular/plural
         match u {
             "year" | "yr" => months += (n * 12.0) as i64,

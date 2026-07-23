@@ -41,6 +41,7 @@ const KIND_CREATE_VIEW: u8 = 5;
 const KIND_DROP_VIEW: u8 = 6;
 const KIND_CREATE_INDEX: u8 = 7;
 const KIND_DROP_INDEX: u8 = 8;
+const KIND_SEQUENCE_SET: u8 = 9;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -75,6 +76,14 @@ pub enum WalOp<'a> {
         unique: bool,
     },
     DropIndex(&'a str),
+    /// A serial/identity column's sequence position: the last value handed
+    /// out. Absolute, so replay is idempotent and order-tolerant within a
+    /// table's records.
+    SequenceSet {
+        table: &'a str,
+        column: u16,
+        last: i64,
+    },
 }
 
 pub struct Wal {
@@ -219,7 +228,7 @@ impl Wal {
                     u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_DROP_INDEX).contains(&kind)
+                if !(KIND_CREATE..=KIND_SEQUENCE_SET).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -410,6 +419,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropView(_) => KIND_DROP_VIEW,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::DropIndex(_) => KIND_DROP_INDEX,
+        WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
     }
 }
 
@@ -450,6 +460,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2
         }
         WalOp::DropIndex(name) => 1 + name.len(),
+        WalOp::SequenceSet { table, .. } => 1 + table.len() + 2 + 8,
     }
 }
 
@@ -531,6 +542,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::DropIndex(name) => name_bytes(buffer, name),
+        WalOp::SequenceSet { table, column, last } => {
+            let mut ok = name_bytes(buffer, table);
+            ok &= buffer.append(&column.to_le_bytes());
+            ok &= buffer.append(&last.to_le_bytes());
+            ok
+        }
     }
 }
 
@@ -746,6 +763,14 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_DROP_INDEX => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropIndex(name))
+        }
+        KIND_SEQUENCE_SET => {
+            let table = take_name(&mut at)?;
+            let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
+            at += 2;
+            let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
+            at += 8;
+            (at == payload.len()).then_some(WalOp::SequenceSet { table, column, last })
         }
         _ => None,
     }

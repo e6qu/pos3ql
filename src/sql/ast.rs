@@ -19,6 +19,9 @@ pub enum Stmt<'a> {
     /// ROLLBACK TO [SAVEPOINT] name.
     RollbackToSavepoint(&'a str),
     DropTable(DropTable<'a>),
+    /// TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
+    /// [CASCADE | RESTRICT].
+    Truncate { tables: &'a [&'a str], restart_identity: bool, cascade: bool },
     /// CREATE [OR REPLACE] VIEW name AS <select>. `sql` is the raw SELECT text,
     /// stored and re-expanded as a derived table at query time.
     CreateView { name: &'a str, or_replace: bool, sql: &'a str },

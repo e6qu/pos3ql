@@ -143,6 +143,7 @@ impl Engine {
         };
         let mut wal = Wal::open(config, budget)?;
         wal.replay(floor, |lsn, operator| apply_wal_op(&mut storage, lsn, operator))?;
+        storage.reconcile_serials();
         // RPO=0: replay any WAL segments in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
         if let Some(c) = ckpt.as_mut() {
@@ -249,6 +250,31 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        // Journal any sequence advances (this transaction's or ones a
+        // rolled-back transaction left dirty): absolute positions, so replay
+        // is idempotent.
+        for i in 0..self.storage.table_count() {
+            if !self.storage.table(i).serial_dirty || !self.storage.table(i).live {
+                continue;
+            }
+            let name = self.storage.table(i).def.name;
+            for c in 0..self.storage.table(i).def.n_columns {
+                if !self.storage.table(i).def.columns()[c].auto_increment {
+                    continue;
+                }
+                let last = self.storage.table(i).serial_last[c];
+                let lsn = self.storage.lsn() + 1;
+                if let Err(e) = self.wal.append(
+                    lsn,
+                    &WalOp::SequenceSet { table: name.as_str(), column: c as u16, last },
+                ) {
+                    self.rollback_txn(txn);
+                    return Err(e);
+                }
+                self.storage.set_lsn(lsn);
+            }
+            self.storage.table_mut(i).serial_dirty = false;
+        }
         // One fsync per transaction, before any promotion: this is the
         // durability point. In synchronous mode the batch is also uploaded to
         // the bucket before acking (RPO=0 to S3); otherwise the upload is left
@@ -278,6 +304,8 @@ impl Engine {
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
                 DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
+                // The reset already happened in place; committing keeps it.
+                DdlUndo::SequenceReset { .. } => {}
             }
         }
         txn.clear();
@@ -311,6 +339,11 @@ impl Engine {
                 DdlUndo::IndexDropped(slot) => {
                     self.storage.rollback_index_drop(slot as usize, txn.txid)
                 }
+                DdlUndo::SequenceReset { table, column, prior } => {
+                    let t = self.storage.table_mut(table as usize);
+                    t.serial_last[column as usize] = prior;
+                    t.serial_dirty = true;
+                }
             }
         }
         self.wal.truncate_to_mark(txn.wal_mark);
@@ -342,6 +375,11 @@ impl Engine {
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
                     self.storage.rollback_index_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::SequenceReset { table, column, prior } => {
+                    let t = self.storage.table_mut(table as usize);
+                    t.serial_last[column as usize] = prior;
+                    t.serial_dirty = true;
                 }
             }
         }
@@ -982,6 +1020,9 @@ impl Engine {
                 };
                 exec::delete(&mut self.storage, txn, &mut self.scratch, d, arena, params, responder)
             }
+            Stmt::Truncate { tables, restart_identity, cascade } => {
+                exec::truncate(&mut self.storage, txn, tables, *restart_identity, *cascade, responder)
+            }
             Stmt::Begin => {
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
@@ -1382,6 +1423,18 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
     match operator {
         WalOp::CreateTable(def) => {
             storage.create_table(def)?;
+        }
+        WalOp::SequenceSet { table, column, last } => {
+            let Some(index) = storage.find_table(table) else {
+                return Err(SqlError {
+                    sqlstate: sqlstate::UNDEFINED_TABLE,
+                    message: stack_format!(192, "journal sets a sequence of unknown table \"{}\"", table),
+                });
+            };
+            let t = storage.table_mut(index);
+            if (column as usize) < crate::storage::MAX_COLUMNS {
+                t.serial_last[column as usize] = last;
+            }
         }
         WalOp::DropTable(name) => {
             let Some(index) = storage.find_table(name) else {

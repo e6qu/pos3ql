@@ -600,10 +600,16 @@ fn serial_auto_increment() {
     // A multi-row insert assigns increasing ids.
     let out = run("INSERT INTO u(name) VALUES ('b'),('c') RETURNING id");
     assert!(out.contains('2') && out.contains('3'), "sequential: {out}");
-    // An explicit value is accounted for by the next auto value.
+    // An explicit value does NOT advance the sequence (PostgreSQL: the
+    // sequence is independent of the column's stored values).
     run("INSERT INTO u VALUES (100, 'd')");
-    assert!(run("INSERT INTO u(name) VALUES ('e') RETURNING id").contains("101"));
+    assert!(run("INSERT INTO u(name) VALUES ('e') RETURNING id").contains('4'));
     assert!(run("SELECT count(*) FROM u").contains('5'));
+    // TRUNCATE keeps the sequence; RESTART IDENTITY resets it.
+    assert!(run("TRUNCATE u").contains("TRUNCATE TABLE"));
+    assert!(run("INSERT INTO u(name) VALUES ('f') RETURNING id").contains('5'));
+    assert!(run("TRUNCATE u RESTART IDENTITY").contains("TRUNCATE TABLE"));
+    assert!(run("INSERT INTO u(name) VALUES ('g') RETURNING id").contains('1'));
 }
 
 #[test]

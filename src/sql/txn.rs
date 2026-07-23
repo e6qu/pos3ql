@@ -78,6 +78,10 @@ pub enum DdlUndo {
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.
     IndexDropped(u32),
+    /// TRUNCATE ... RESTART IDENTITY reset one column's sequence — undo by
+    /// restoring the prior counter. (A plain advance is *not* undone: a
+    /// rolled-back insert still consumes its number, as PostgreSQL has it.)
+    SequenceReset { table: u32, column: u16, prior: i64 },
 }
 
 pub const MAX_TXN_DDL: usize = 16;

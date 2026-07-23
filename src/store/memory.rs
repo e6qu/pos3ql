@@ -26,6 +26,8 @@ struct Extent {
 
 pub(crate) struct MemoryBlockStore {
     slab: Box<[u8]>,
+    /// Successful reads, so a caller can prove how many blocks a lookup touched.
+    reads: u64,
     /// Bytes handed out so far. Blocks are immutable and never removed, so the
     /// slab only ever grows towards its end.
     used: usize,
@@ -42,11 +44,16 @@ impl MemoryBlockStore {
         budget.draw_array(bytes, 1, what)?;
         let index = FixedMap::new(budget, what, max_blocks)?;
         let slab = vec![0u8; bytes];
-        Ok(Self { slab: slab.into_boxed_slice(), used: 0, index })
+        Ok(Self { slab: slab.into_boxed_slice(), reads: 0, used: 0, index })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.index.len()
+    }
+
+    /// Blocks read back so far.
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads
     }
 
     /// Bytes still available for new blocks.
@@ -90,6 +97,7 @@ impl BlockStore for MemoryBlockStore {
             return Err(StoreError::BufferTooSmall);
         }
         into[..block.payload.len()].copy_from_slice(block.payload);
+        self.reads += 1;
         Ok(block.payload.len())
     }
 

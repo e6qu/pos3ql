@@ -29,6 +29,7 @@ mod cache;
 mod disk;
 mod memory;
 mod object;
+mod sst;
 mod tiered;
 
 use crate::wal::crc32c::crc32c;

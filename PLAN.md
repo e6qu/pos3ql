@@ -227,9 +227,27 @@ checksum. A previous run's file is discarded on open rather than trusted.
 Corrupt-slot reads are counted apart from misses, because a rising count is a
 sick disk rather than a cold one.
 
-Remaining for Stage B: reading `block_cache_bytes` / `disk_cache_bytes` from
-config to size the two tiers and stacking them (RAM over disk over store), at
-which point those knobs stop being declared-and-ignored.
+The two tiers now stack. `store/tiered.rs` assembles RAM frames over the disk
+file over a base store, sizing each tier from `block_cache_bytes` and
+`disk_cache_bytes` — a `StackPlan::resolve` turns each byte budget into whole
+units first, so a budget too small to hold one block is reported as undersized
+(a likely typo the caller can refuse) rather than built as a cache that misses
+on everything, and a budget of zero drops the tier entirely. Both tiers dropped
+leaves the base store answering directly, which is exactly the RAM-only database
+the earlier phases were, reached through the same seam. The base store is a type
+parameter, so the identical stack sits over the object backend in the server and
+over the memory backend under test; the assembled whole is still a `BlockStore`,
+so a caller never learns how many tiers answered. The layering is an enum, not a
+boxed trait, so no allocation or dynamic dispatch enters the read path.
+
+This closes Stage B's structure: the knobs size real tiers and the read path is
+RAM → disk → store. What remains before the stack is load-bearing is Stage A's
+other half — re-expressing the SST writer/reader in terms of blocks — and then
+routing the checkpoint/cold-start paths through `store::build` instead of the
+whole-object SST reader/writer they use today. That last step is where storage
+stops being additive and touches durability, and wants a session that can hold
+the checkpoint path, the cold-start path and `tests/external/run.sh`'s
+durability scenarios in view together.
 
 ### Stage C — a real SST: sorted data blocks + sparse index + bloom filter
 

@@ -214,9 +214,22 @@ store decides first and the cache only remembers what the store accepted, so a
 block the store rejected is never served. Frames hold payloads rather than framed
 blocks, since the block was verified on the way in. `hits`/`misses`/`evictions`/
 `insertions` are counted and readable, because a cache whose hit ratio cannot be
-seen is one nobody can size. Remaining for Stage B: the local disk tier beneath
-this, and reading `block_cache_bytes` / `disk_cache_bytes` from config to size
-both.
+seen is one nobody can size. The disk tier is now built too. `store/disk.rs` is a preallocated cache file of
+fixed slots with an in-RAM identity-to-slot index and the same CLOCK eviction,
+one tier down — the RAM cache in front of it, the store or bucket behind. It is
+sized once at startup like the WAL journal, so a slot write is only ever an
+overwrite. Being pure cache is what lets it skip fsync: a slot torn by a crash
+or rotted on the platter reads back as something other than the block the index
+named, and that is a *miss* — the slot is dropped and the block re-fetched from
+the store, so the caller never sees the damage. Identity, not the checksum,
+catches a stale block a torn write left behind, since that block passes its own
+checksum. A previous run's file is discarded on open rather than trusted.
+Corrupt-slot reads are counted apart from misses, because a rising count is a
+sick disk rather than a cold one.
+
+Remaining for Stage B: reading `block_cache_bytes` / `disk_cache_bytes` from
+config to size the two tiers and stacking them (RAM over disk over store), at
+which point those knobs stop being declared-and-ignored.
 
 ### Stage C — a real SST: sorted data blocks + sparse index + bloom filter
 

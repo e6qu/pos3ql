@@ -467,6 +467,109 @@ impl ArrElem {
     }
 }
 
+/// The decoded view of a PostgreSQL `atttypmod`.
+///
+/// On the wire and in the catalog a type modifier is one `i32`, but that
+/// integer is three different encodings wearing one type: varchar(n) and
+/// numeric(p,s) carry a 4-byte header, the temporal precisions are bare, and
+/// interval packs a field-range mask beside its precision. Reading one with the
+/// wrong rule was a recurring bug class (a `timestamp(3)` reported as 7, an
+/// interval precision read with a header it does not have), because every
+/// consumer had to remember which rule applied.
+///
+/// This enum is the fix: `decode` and `encode` are the only places the integer
+/// forms exist, they are adjacent and round-trip-tested, and every consumer
+/// pattern-matches on the decoded meaning instead. A site can no longer
+/// subtract a header the value does not carry, because there is no integer to
+/// subtract from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeMod {
+    /// No modifier: `-1` on the wire, or a value meaningless for the type.
+    None,
+    /// `varchar(n)` / `char(n)` / `bit(n)`: a length in characters or bits.
+    Length(usize),
+    /// `numeric(p, s)`.
+    NumericPS { precision: u16, scale: u16 },
+    /// `timestamp(p)` / `timestamptz(p)` / `time(p)` / `timetz(p)`:
+    /// fractional-second digits, 0..=6.
+    TemporalPrecision(u8),
+    /// `interval` with a field-range mask and an optional precision. A plain
+    /// `interval(p)` carries [`INTERVAL_FULL_RANGE`]; a range form like
+    /// `interval hour to minute` carries its field mask with *no* precision —
+    /// which is why the precision is an `Option`: the encoding's `0xFFFF`
+    /// low half means "unspecified", and treating it as a number to clamp
+    /// would silently round to 6 digits.
+    IntervalMod { range: u16, precision: Option<u8> },
+}
+
+/// PostgreSQL's INTERVAL_FULL_RANGE: the field-range mask a plain `interval`
+/// or `interval(p)` carries in the high half of its modifier.
+pub const INTERVAL_FULL_RANGE: u16 = 0x7FFF;
+
+impl TypeMod {
+    /// Reads an `atttypmod` under the encoding `ctype` uses. Anything that is
+    /// not a valid modifier for the type — negative, or below the header a
+    /// headered kind requires — is `None`, never a garbage value.
+    pub fn decode(ctype: ColType, atttypmod: i32) -> TypeMod {
+        if atttypmod < 0 {
+            return TypeMod::None;
+        }
+        match ctype {
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Bit { .. } => {
+                if atttypmod >= 4 {
+                    TypeMod::Length((atttypmod - 4) as usize)
+                } else {
+                    TypeMod::None
+                }
+            }
+            ColType::Numeric => {
+                if atttypmod >= 4 {
+                    let packed = atttypmod - 4;
+                    TypeMod::NumericPS {
+                        precision: ((packed >> 16) & 0xFFFF) as u16,
+                        scale: (packed & 0xFFFF) as u16,
+                    }
+                } else {
+                    TypeMod::None
+                }
+            }
+            ColType::Time | ColType::Timetz | ColType::Timestamp | ColType::Timestamptz => {
+                if atttypmod <= 6 {
+                    TypeMod::TemporalPrecision(atttypmod as u8)
+                } else {
+                    TypeMod::None
+                }
+            }
+            ColType::Interval => {
+                let precision_raw = atttypmod & 0xFFFF;
+                TypeMod::IntervalMod {
+                    range: ((atttypmod as u32) >> 16) as u16,
+                    // 0xFFFF is "no precision given", not a precision.
+                    precision: if precision_raw <= 6 { Some(precision_raw as u8) } else { None },
+                }
+            }
+            _ => TypeMod::None,
+        }
+    }
+
+    /// The `atttypmod` integer this modifier is written as — the exact value
+    /// PostgreSQL stores, byte for byte.
+    pub fn encode(&self) -> i32 {
+        match *self {
+            TypeMod::None => -1,
+            TypeMod::Length(n) => n as i32 + 4,
+            TypeMod::NumericPS { precision, scale } => {
+                (((precision as i32) << 16) | (scale as i32)) + 4
+            }
+            TypeMod::TemporalPrecision(p) => i32::from(p),
+            TypeMod::IntervalMod { range, precision } => {
+                ((range as i32) << 16) | precision.map_or(0xFFFF, i32::from)
+            }
+        }
+    }
+}
+
+
 /// A PostgreSQL `interval`: three independent fields (months, days, and
 /// microseconds) that add to a date/timestamp separately — a month is a
 /// calendar month, a day is 24 hours only in the absence of a DST shift.
@@ -870,6 +973,77 @@ impl<'a> ColDesc<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typemod_encodes_postgres_exact_values() {
+        // The values PostgreSQL 18.4 stores in pg_attribute, byte for byte.
+        assert_eq!(TypeMod::Length(5).encode(), 9); // varchar(5)
+        assert_eq!(TypeMod::Length(3).encode(), 7); // char(3)
+        assert_eq!(TypeMod::NumericPS { precision: 6, scale: 2 }.encode(), 393222);
+        assert_eq!(TypeMod::TemporalPrecision(3).encode(), 3); // timestamp(3)
+        assert_eq!(TypeMod::TemporalPrecision(0).encode(), 0); // timestamp(0)
+        assert_eq!(
+            TypeMod::IntervalMod { range: INTERVAL_FULL_RANGE, precision: Some(1) }.encode(),
+            2147418113 // interval(1)
+        );
+        assert_eq!(
+            TypeMod::IntervalMod { range: 0x0C00, precision: None }.encode(),
+            201392127 // interval hour to minute — precision unspecified
+        );
+        assert_eq!(TypeMod::None.encode(), -1);
+    }
+
+    #[test]
+    fn typemod_round_trips_through_every_encoding() {
+        let cases: &[(ColType, TypeMod)] = &[
+            (ColType::Varchar, TypeMod::Length(5)),
+            (ColType::Bpchar, TypeMod::Length(3)),
+            (ColType::Bit { varying: false }, TypeMod::Length(8)),
+            (ColType::Numeric, TypeMod::NumericPS { precision: 6, scale: 2 }),
+            (ColType::Timestamp, TypeMod::TemporalPrecision(3)),
+            (ColType::Timestamptz, TypeMod::TemporalPrecision(0)),
+            (ColType::Time, TypeMod::TemporalPrecision(6)),
+            (ColType::Timetz, TypeMod::TemporalPrecision(2)),
+            (
+                ColType::Interval,
+                TypeMod::IntervalMod { range: INTERVAL_FULL_RANGE, precision: Some(4) },
+            ),
+            (ColType::Interval, TypeMod::IntervalMod { range: 0x0C00, precision: None }),
+        ];
+        for &(ctype, modifier) in cases {
+            assert_eq!(
+                TypeMod::decode(ctype, modifier.encode()),
+                modifier,
+                "{ctype:?} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn typemod_decode_rejects_what_is_not_a_modifier() {
+        // -1 is "none" for every type; a headered kind refuses a value below
+        // its header; a bare precision refuses one past 6. Garbage decodes to
+        // None, never to a wrong number.
+        for ctype in [
+            ColType::Varchar,
+            ColType::Numeric,
+            ColType::Timestamp,
+            ColType::Interval,
+            ColType::Int4,
+        ] {
+            assert_eq!(TypeMod::decode(ctype, -1), TypeMod::None, "{ctype:?}");
+        }
+        assert_eq!(TypeMod::decode(ColType::Varchar, 3), TypeMod::None);
+        assert_eq!(TypeMod::decode(ColType::Numeric, 2), TypeMod::None);
+        assert_eq!(TypeMod::decode(ColType::Timestamp, 7), TypeMod::None);
+        // A type with no modifier concept ignores any value.
+        assert_eq!(TypeMod::decode(ColType::Int4, 9), TypeMod::None);
+        // The interval 0xFFFF low half is "no precision", not precision 65535.
+        assert_eq!(
+            TypeMod::decode(ColType::Interval, 201392127),
+            TypeMod::IntervalMod { range: 0x0C00, precision: None }
+        );
+    }
 
     #[test]
     fn text_rendering_matches_postgres_conventions() {

@@ -22,7 +22,7 @@ use super::ast::{
     Update,
 };
 use super::eval::{cast_to, compare_datums, eval, sqlstate, ColumnLookup, NoColumns, SqlError};
-use super::types::{ColDesc, ColType, Datum};
+use super::types::{ColDesc, ColType, Datum, TypeMod};
 
 /// Wildcard expansion can double the select list.
 pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
@@ -1986,12 +1986,14 @@ pub fn apply_cast_typmod<'a>(
     type_mod: i32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    if type_mod < 4 || v.is_null() {
+    // Decoded once; the arms below match on meaning, so no site here can read
+    // the modifier under the wrong encoding.
+    let modifier = TypeMod::decode(ctype, type_mod);
+    if modifier == TypeMod::None || v.is_null() {
         return Ok(v);
     }
-    match (ctype, v) {
-        (ColType::Text | ColType::Varchar, Datum::Text(s)) => {
-            let max = (type_mod - 4) as usize;
+    match (ctype, modifier, v) {
+        (ColType::Text | ColType::Varchar, TypeMod::Length(max), Datum::Text(s)) => {
             if s.chars().count() > max {
                 let end = s.char_indices().nth(max).map_or(s.len(), |(i, _)| i);
                 let t = arena.alloc_str(&s[..end]).map_err(|_| {
@@ -2001,9 +2003,9 @@ pub fn apply_cast_typmod<'a>(
             }
             Ok(v)
         }
-        (ColType::Bpchar, Datum::Text(s)) => bpchar_fit(s, (type_mod - 4) as usize, true, arena),
-        (ColType::Bit { varying }, Datum::Bit { bits, .. }) => {
-            super::eval::fit_bits(bits, (type_mod - 4) as usize, varying, arena)
+        (ColType::Bpchar, TypeMod::Length(n), Datum::Text(s)) => bpchar_fit(s, n, true, arena),
+        (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
+            super::eval::fit_bits(bits, n, varying, arena)
         }
         _ => apply_typmod(v, ctype, type_mod, arena),
     }
@@ -2049,12 +2051,12 @@ pub fn apply_typmod<'a>(
     type_mod: i32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    if type_mod < 4 || v.is_null() {
+    let modifier = TypeMod::decode(ctype, type_mod);
+    if modifier == TypeMod::None || v.is_null() {
         return Ok(v);
     }
-    match (ctype, v) {
-        (ColType::Text | ColType::Varchar, Datum::Text(s)) => {
-            let max = (type_mod - 4) as usize;
+    match (ctype, modifier, v) {
+        (ColType::Text | ColType::Varchar, TypeMod::Length(max), Datum::Text(s)) => {
             if s.chars().count() > max {
                 return Err(sql_err!(
                     "22001",
@@ -2064,35 +2066,36 @@ pub fn apply_typmod<'a>(
             }
             Ok(v)
         }
-        (ColType::Bpchar, Datum::Text(s)) => bpchar_fit(s, (type_mod - 4) as usize, false, arena),
-        (ColType::Numeric, Datum::Numeric(n)) => {
-            let t = type_mod - 4;
-            let precision = ((t >> 16) & 0xFFFF) as usize;
-            let scale = (t & 0xFFFF) as usize;
-            apply_numeric_typmod(&n, precision, scale, arena).map(Datum::Numeric)
+        (_, TypeMod::Length(n), Datum::Text(s)) => bpchar_fit(s, n, false, arena),
+        (_, TypeMod::NumericPS { precision, scale }, Datum::Numeric(n)) => {
+            apply_numeric_typmod(&n, precision as usize, scale as usize, arena)
+                .map(Datum::Numeric)
         }
-        (ColType::Bit { varying }, Datum::Bit { bits, .. }) => {
-            super::eval::fit_bits(bits, (type_mod - 4) as usize, varying, arena)
+        (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
+            super::eval::fit_bits(bits, n, varying, arena)
         }
         // Fractional-second precision: micros round half-away-from-zero in
         // integer arithmetic, as PostgreSQL's AdjustTimestampForTypmod.
-        (ColType::Timestamp, Datum::Timestamp(t)) => {
-            Ok(Datum::Timestamp(round_micros(t, type_mod - 4)))
+        (_, TypeMod::TemporalPrecision(p), Datum::Timestamp(t)) => {
+            Ok(Datum::Timestamp(round_micros(t, p)))
         }
-        (ColType::Timestamptz, Datum::Timestamptz(t)) => {
-            Ok(Datum::Timestamptz(round_micros(t, type_mod - 4)))
+        (_, TypeMod::TemporalPrecision(p), Datum::Timestamptz(t)) => {
+            Ok(Datum::Timestamptz(round_micros(t, p)))
         }
-        (ColType::Time, Datum::Time(t)) => Ok(Datum::Time(round_micros(t, type_mod - 4))),
-        (ColType::Timetz, Datum::Timetz(t, zone)) => {
-            Ok(Datum::Timetz(round_micros(t, type_mod - 4), zone))
+        (_, TypeMod::TemporalPrecision(p), Datum::Time(t)) => Ok(Datum::Time(round_micros(t, p))),
+        (_, TypeMod::TemporalPrecision(p), Datum::Timetz(t, zone)) => {
+            Ok(Datum::Timetz(round_micros(t, p), zone))
         }
-        (ColType::Interval, Datum::Interval(iv)) => Ok(Datum::Interval(
-            crate::sql::types::Interval {
+        // An interval range form with no precision (`interval hour to minute`)
+        // rounds nothing — its `precision: None` cannot be mistaken for a
+        // number, where the packed 0xFFFF once could.
+        (_, TypeMod::IntervalMod { precision: Some(p), .. }, Datum::Interval(iv)) => {
+            Ok(Datum::Interval(crate::sql::types::Interval {
                 months: iv.months,
                 days: iv.days,
-                micros: round_micros(iv.micros, type_mod - 4),
-            },
-        )),
+                micros: round_micros(iv.micros, p),
+            }))
+        }
         _ => Ok(v),
     }
 }
@@ -2100,8 +2103,8 @@ pub fn apply_typmod<'a>(
 /// Rounds microseconds to `p` (0..=6) fractional-second digits,
 /// half-away-from-zero in integer arithmetic (PostgreSQL's
 /// `AdjustTimestampForTypmod`).
-fn round_micros(micros: i64, p: i32) -> i64 {
-    let p = p.clamp(0, 6) as u32;
+fn round_micros(micros: i64, p: u8) -> i64 {
+    let p = u32::from(p.min(6));
     let scale = 10i64.pow(6 - p);
     if scale == 1 {
         return micros;

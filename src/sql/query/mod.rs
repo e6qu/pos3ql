@@ -348,10 +348,29 @@ fn check_key_types<'a>(
 /// 1+0` is a constant expression in PostgreSQL too, and errors as one.
 fn resolve_group_ordinals<'a>(
     statement: &'a Select<'a>,
-    scope: &QueryScope<'a>,
+    scope: Option<&QueryScope<'a>>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
+    // An aggregate cannot be a grouping key, however it got there — written
+    // directly, nested in an expression, or named by a position. Checked after
+    // resolution so `GROUP BY 1` naming an aggregate item is caught too.
+    let refuse_aggregates = |keys: &[&'a Expr<'a>]| -> Result<(), SqlError> {
+        for key in keys {
+            let mut nodes: [(*const Expr, &Expr); MAX_AGGS] =
+                [(core::ptr::null(), &Expr::Null); MAX_AGGS];
+            let mut n = 0;
+            collect_aggs(key, &mut nodes, &mut n)?;
+            if n > 0 {
+                return Err(sql_err!(
+                    "42803",
+                    "aggregate functions are not allowed in GROUP BY"
+                ));
+            }
+        }
+        Ok(())
+    };
     if !statement.group_by.iter().any(|g| matches!(g, Expr::Int(_))) {
+        refuse_aggregates(statement.group_by)?;
         return Ok(statement);
     }
     // The parser bounds a GROUP BY list by the same limit it bounds any
@@ -363,6 +382,7 @@ fn resolve_group_ordinals<'a>(
             _ => g,
         };
     }
+    refuse_aggregates(&resolved[..statement.group_by.len()])?;
     let group_by = arena
         .alloc_slice_copy(&resolved[..statement.group_by.len()])
         .map_err(|_| arena_full())?;
@@ -381,7 +401,7 @@ fn resolve_order_target<'a>(
     scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    resolve_position_target(expression, items, scope, arena, "ORDER BY")
+    resolve_position_target(expression, items, Some(scope), arena, "ORDER BY")
 }
 
 /// An `ORDER BY` / `GROUP BY` target: a bare integer is a 1-based position in
@@ -390,7 +410,7 @@ fn resolve_order_target<'a>(
 fn resolve_position_target<'a>(
     expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
-    scope: &QueryScope<'a>,
+    scope: Option<&QueryScope<'a>>,
     arena: &'a Arena,
     clause: &str,
 ) -> Result<&'a Expr<'a>, SqlError> {
@@ -416,6 +436,11 @@ fn resolve_position_target<'a>(
                 remaining -= 1;
             }
             SelectItem::Wildcard => {
+                // A star without a FROM is invalid before any position could
+                // resolve into it, so a missing scope reports the position.
+                let Some(scope) = scope else {
+                    return Err(position_error());
+                };
                 let width = scope.star_columns();
                 if remaining < width {
                     return match scope.star_entry(remaining) {
@@ -430,6 +455,9 @@ fn resolve_position_target<'a>(
                 remaining -= width;
             }
             SelectItem::TableWildcard(q) => {
+                let Some(scope) = scope else {
+                    return Err(position_error());
+                };
                 let t = scope.table_index(q)?;
                 let def = scope.defs[t].expect("resolved");
                 if remaining < def.n_columns {
@@ -441,6 +469,9 @@ fn resolve_position_target<'a>(
                 remaining -= def.n_columns;
             }
             SelectItem::RecordStar(base) => {
+                let Some(scope) = scope else {
+                    return Err(position_error());
+                };
                 let width = record_star_width(base, scope);
                 if remaining < width {
                     // A positional (ORDER BY/GROUP BY ordinal) reference into a
@@ -1064,7 +1095,7 @@ pub fn select_query<'a>(
     };
     // A GROUP BY position names a select-list column; resolve it before
     // anything reads the grouping keys.
-    let statement = match resolve_group_ordinals(statement, &scope, arena) {
+    let statement = match resolve_group_ordinals(statement, Some(&scope), arena) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -1415,6 +1446,12 @@ pub fn constant_select<'a>(
             Err(e) => sql_fail(e),
         };
     }
+    // A GROUP BY position names a select-list column here too — a FROM-less
+    // select has no scope, but its positions resolve against the items alone.
+    let statement = match resolve_group_ordinals(statement, None, arena) {
+        Ok(s) => s,
+        Err(e) => return sql_fail(e),
+    };
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n = match describe_items(statement.items, None, &mut columns) {
         Ok(n) => n,
@@ -1778,7 +1815,7 @@ pub fn select_into_rows<'a>(
             return Ok(());
         };
         let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
-        let statement = resolve_group_ordinals(statement, &scope, arena)?;
+        let statement = resolve_group_ordinals(statement, Some(&scope), arena)?;
         check_key_types(statement, &scope, arena)?;
         let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ] = [None; 2 + MAX_PROJ];
         sub_exprs[0] = statement.where_clause;

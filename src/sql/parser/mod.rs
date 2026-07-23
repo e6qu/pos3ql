@@ -9,6 +9,7 @@ use crate::util::StackStr;
 
 use super::ast::*;
 use super::lexer::{LexError, Lexer, Tok};
+use super::types::{TypeMod, INTERVAL_FULL_RANGE};
 
 /// Names for the calls a desugaring produces, for syntax PostgreSQL does not
 /// also expose as a function. A space cannot appear in an identifier, so a
@@ -19,6 +20,7 @@ pub(crate) const SIMILAR_TO: &str = "similar to";
 pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
 
 pub const MAX_LIST: usize = 64;
+
 pub const MAX_CTES: usize = 16;
 /// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
 pub const MAX_WINDOW_DEFS: usize = 16;
@@ -1526,7 +1528,7 @@ impl<'a> Parser<'a> {
                 if !(1..=10_485_760).contains(&nums[0]) {
                     return Err(self.unexpected("length for character type must be 1..10485760"));
                 }
-                Ok(nums[0] as i32 + 4)
+                Ok(TypeMod::Length(nums[0] as usize).encode())
             }
             "numeric" | "decimal" | "dec" => {
                 if n < 1 {
@@ -1540,7 +1542,7 @@ impl<'a> Parser<'a> {
                 if !(0..=p).contains(&s) {
                     return Err(self.unexpected("numeric scale must be between 0 and precision"));
                 }
-                Ok((((p as i32) << 16) | (s as i32)) + 4)
+                Ok(TypeMod::NumericPS { precision: p as u16, scale: s as u16 }.encode())
             }
             "bit" | "varbit" => {
                 if n != 1 {
@@ -1549,7 +1551,7 @@ impl<'a> Parser<'a> {
                 if nums[0] < 1 {
                     return Err(self.unexpected("length for bit type must be at least 1"));
                 }
-                Ok(nums[0] as i32 + 4)
+                Ok(TypeMod::Length(nums[0] as usize).encode())
             }
             // Fractional-second precision, 0..=6. A larger value is clamped to
             // 6, and PostgreSQL warns when it does so.
@@ -1578,7 +1580,18 @@ impl<'a> Parser<'a> {
                         if zoned { " WITH TIME ZONE" } else { "" }
                     ));
                 }
-                Ok(nums[0].min(6) as i32 + 4)
+                let precision = nums[0].min(6) as u8;
+                // A plain `interval(p)` carries the full field range beside its
+                // precision; the other temporal types carry the precision bare.
+                if base == "interval" {
+                    Ok(TypeMod::IntervalMod {
+                        range: INTERVAL_FULL_RANGE,
+                        precision: Some(precision),
+                    }
+                    .encode())
+                } else {
+                    Ok(TypeMod::TemporalPrecision(precision).encode())
+                }
             }
             _ => Err(self.unexpected("type modifier is not supported for this type yet")),
         }

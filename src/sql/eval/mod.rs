@@ -576,8 +576,10 @@ pub fn eval_full<'a>(
             if let Some(ct @ ColType::Bit { varying }) = ColType::from_sql_name(type_name)
                 && matches!(v, Datum::Int4(_) | Datum::Int8(_))
             {
-                let _ = ct;
-                let n = if type_mod >= 4 { (type_mod - 4) as usize } else { 1 };
+                let n = match crate::sql::types::TypeMod::decode(ct, type_mod) {
+                    crate::sql::types::TypeMod::Length(n) => n,
+                    _ => 1,
+                };
                 let value = match v {
                     Datum::Int4(x) => x as u32 as u64,
                     Datum::Int8(x) => x as u64,

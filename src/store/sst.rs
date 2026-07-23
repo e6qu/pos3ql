@@ -200,55 +200,137 @@ impl<'a> SstReader<'a> {
         rowid: u64,
         into: &mut [u8],
     ) -> Result<Option<usize>, SstError> {
-        let index_len = store.get(root, self.index_scratch)?;
-        let index = &self.index_scratch[..index_len];
-        let count = u32::from_le_bytes(index[0..4].try_into().unwrap()) as usize;
-
-        // Binary search the sparse index for the last block whose first key does
-        // not exceed the target: that is the only block the key can be in.
-        let first_key = |i: usize| {
-            let at = 4 + i * INDEX_ENTRY;
-            u64::from_le_bytes(index[at..at + 8].try_into().unwrap())
-        };
-        if count == 0 || rowid < first_key(0) {
+        let count = self.load_index(store, root)?;
+        let Some(entry) = block_containing(self.index_scratch, count, rowid) else {
             return Ok(None);
-        }
-        let (mut lo, mut hi) = (0usize, count - 1);
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if first_key(mid) <= rowid {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        let mut block_id = [0u8; 32];
-        block_id.copy_from_slice(&index[4 + lo * INDEX_ENTRY + 8..4 + lo * INDEX_ENTRY + INDEX_ENTRY]);
-        let block_id = BlockId(block_id);
+        };
+        let block_id = block_id_at(self.index_scratch, entry);
 
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
         let data_len = store.get(&block_id, self.data_scratch)?;
-        let data = &self.data_scratch[..data_len];
-        let mut at = 0usize;
-        while at + ENTRY_HEADER <= data.len() {
-            let key = u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
-            let len = u32::from_le_bytes(data[at + 8..at + 12].try_into().unwrap()) as usize;
-            if key == rowid {
-                if into.len() < len {
+        for entry in DataBlock(&self.data_scratch[..data_len]) {
+            if entry.key == rowid {
+                if into.len() < entry.row.len() {
                     return Err(SstError::Store(StoreError::BufferTooSmall));
                 }
-                into[..len].copy_from_slice(&data[at + ENTRY_HEADER..at + ENTRY_HEADER + len]);
-                return Ok(Some(len));
+                into[..entry.row.len()].copy_from_slice(entry.row);
+                return Ok(Some(entry.row.len()));
             }
             // Rows are ascending, so once past the target it is not here.
-            if key > rowid {
+            if entry.key > rowid {
                 break;
             }
-            at += ENTRY_HEADER + len;
         }
         Ok(None)
+    }
+
+    /// Streams every row whose key is in `[lo, hi]`, in key order, to `emit`.
+    /// Locates the first covering data block through the sparse index, then
+    /// reads consecutive data blocks and emits their in-range rows until one
+    /// runs past `hi`. So a range scan fetches the index plus only the data
+    /// blocks the range actually covers, not the whole SST.
+    pub(crate) fn scan(
+        &mut self,
+        store: &mut dyn BlockStore,
+        root: &BlockId,
+        lo: u64,
+        hi: u64,
+        emit: &mut dyn FnMut(u64, &[u8]),
+    ) -> Result<(), SstError> {
+        if lo > hi {
+            return Ok(());
+        }
+        let count = self.load_index(store, root)?;
+        // The block `lo` falls in, or — when `lo` precedes every key — the
+        // first block, since the range may still cover it from the left.
+        let start = block_containing(self.index_scratch, count, lo).unwrap_or(0);
+        for entry_index in start..count {
+            let block_id = block_id_at(self.index_scratch, entry_index);
+            let data_len = store.get(&block_id, self.data_scratch)?;
+            let mut ran_past = false;
+            for entry in DataBlock(&self.data_scratch[..data_len]) {
+                if entry.key > hi {
+                    ran_past = true;
+                    break;
+                }
+                if entry.key >= lo {
+                    emit(entry.key, entry.row);
+                }
+            }
+            // A block ending past `hi` bounds the scan: later blocks hold only
+            // larger keys, so none of them can be in range.
+            if ran_past {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads and validates the index block, returning its data-block count.
+    fn load_index(&mut self, store: &mut dyn BlockStore, root: &BlockId) -> Result<usize, SstError> {
+        store.get(root, self.index_scratch)?;
+        Ok(u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize)
+    }
+}
+
+/// Binary-searches the sparse index for the last block whose first key does not
+/// exceed `key` — the only data block `key` can be in. `None` when the index is
+/// empty or `key` precedes every block's first key.
+fn block_containing(index: &[u8], count: usize, key: u64) -> Option<usize> {
+    let first_key = |i: usize| {
+        let at = 4 + i * INDEX_ENTRY;
+        u64::from_le_bytes(index[at..at + 8].try_into().unwrap())
+    };
+    if count == 0 || key < first_key(0) {
+        return None;
+    }
+    let (mut lo, mut hi) = (0usize, count - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if first_key(mid) <= key {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
+}
+
+/// The block identity stored in index entry `i`.
+fn block_id_at(index: &[u8], i: usize) -> BlockId {
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&index[4 + i * INDEX_ENTRY + 8..4 + i * INDEX_ENTRY + INDEX_ENTRY]);
+    BlockId(id)
+}
+
+/// One row read out of a data block.
+struct DataEntry<'a> {
+    key: u64,
+    row: &'a [u8],
+}
+
+/// Iterates the `(key, len, row)` entries packed in a data block, in the key
+/// order they were written. A short trailing fragment — never present in a
+/// well-formed block — ends iteration rather than reading past the payload.
+struct DataBlock<'a>(&'a [u8]);
+
+impl<'a> Iterator for DataBlock<'a> {
+    type Item = DataEntry<'a>;
+
+    fn next(&mut self) -> Option<DataEntry<'a>> {
+        let data = self.0;
+        if data.len() < ENTRY_HEADER {
+            return None;
+        }
+        let key = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        if data.len() < ENTRY_HEADER + len {
+            return None;
+        }
+        self.0 = &data[ENTRY_HEADER + len..];
+        Some(DataEntry { key, row: &data[ENTRY_HEADER..ENTRY_HEADER + len] })
     }
 }
 
@@ -372,6 +454,111 @@ mod tests {
             r.get(&mut s, &root, 1, &mut small).err(),
             Some(SstError::Store(StoreError::BufferTooSmall))
         );
+    }
+
+    fn scan(
+        reader: &mut SstReader,
+        store: &mut MemoryBlockStore,
+        root: &BlockId,
+        lo: u64,
+        hi: u64,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        reader
+            .scan(store, root, lo, hi, &mut |key, row| out.push((key, row.to_vec())))
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_range_scan_returns_the_covered_rows_in_order() {
+        let (_b, mut s) = store();
+        let a = arena();
+        let rows: Vec<_> = (1..=50u64).map(|i| (i, vec![i as u8; 20])).collect();
+        let root = build(&mut s, &a, &rows).expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        let got = scan(&mut r, &mut s, &root, 10, 20);
+        assert_eq!(got.len(), 11);
+        assert_eq!(got.first().unwrap().0, 10);
+        assert_eq!(got.last().unwrap().0, 20);
+        for (i, (key, row)) in got.iter().enumerate() {
+            assert_eq!(*key, 10 + i as u64);
+            assert_eq!(row, &vec![*key as u8; 20]);
+        }
+    }
+
+    #[test]
+    fn a_range_spanning_many_data_blocks_is_complete_and_ordered() {
+        // Rows big enough to span many blocks, so the scan must walk from the
+        // block `lo` lands in through the consecutive blocks the range covers.
+        let (_b, mut s) = store();
+        let a = arena();
+        let rows: Vec<_> = (0..4000u64).map(|i| (i, vec![(i % 251) as u8; 400])).collect();
+        let root = build(&mut s, &a, &rows).expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        let got = scan(&mut r, &mut s, &root, 1000, 2999);
+        assert_eq!(got.len(), 2000);
+        for (expected, (key, row)) in (1000u64..).zip(got.iter()) {
+            assert_eq!(*key, expected, "keys must be dense and ascending");
+            assert_eq!(row, &vec![(expected % 251) as u8; 400]);
+        }
+    }
+
+    #[test]
+    fn range_bounds_beyond_the_data_clamp_to_what_exists() {
+        let (_b, mut s) = store();
+        let a = arena();
+        let rows: Vec<_> = (10..=30u64).map(|i| (i, vec![i as u8; 8])).collect();
+        let root = build(&mut s, &a, &rows).expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        // Below, above, and straddling both ends.
+        assert_eq!(scan(&mut r, &mut s, &root, 0, 5).len(), 0, "before the first key");
+        assert_eq!(scan(&mut r, &mut s, &root, 40, 99).len(), 0, "after the last key");
+        assert_eq!(scan(&mut r, &mut s, &root, 0, 100).len(), 21, "covers everything");
+        let straddle_low = scan(&mut r, &mut s, &root, 5, 12);
+        assert_eq!(straddle_low.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![10, 11, 12]);
+        let straddle_high = scan(&mut r, &mut s, &root, 28, 50);
+        assert_eq!(straddle_high.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![28, 29, 30]);
+    }
+
+    #[test]
+    fn a_single_key_range_returns_just_that_row() {
+        let (_b, mut s) = store();
+        let a = arena();
+        let rows: Vec<_> = (1..=40u64).map(|i| (i * 3, vec![i as u8; 16])).collect();
+        let root = build(&mut s, &a, &rows).expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        assert_eq!(scan(&mut r, &mut s, &root, 30, 30), vec![(30, vec![10u8; 16])]);
+        // A key that falls in a gap between stored keys returns nothing.
+        assert_eq!(scan(&mut r, &mut s, &root, 31, 31), vec![]);
+    }
+
+    #[test]
+    fn an_inverted_range_is_empty() {
+        let (_b, mut s) = store();
+        let a = arena();
+        let rows: Vec<_> = (1..=10u64).map(|i| (i, vec![i as u8; 4])).collect();
+        let root = build(&mut s, &a, &rows).expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        assert_eq!(scan(&mut r, &mut s, &root, 8, 3), vec![], "hi below lo yields nothing");
+    }
+
+    #[test]
+    fn a_scan_over_a_range_reads_the_index_plus_only_its_blocks() {
+        // The point of streaming the covering blocks: a narrow range near the
+        // end of a large SST reads the index and a handful of data blocks, not
+        // the whole table.
+        let (_b, mut s) = store();
+        let a = arena();
+        let rows: Vec<_> = (0..3000u64).map(|i| (i, vec![9u8; 500])).collect();
+        let root = build(&mut s, &a, &rows).expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        let before = s.reads();
+        let got = scan(&mut r, &mut s, &root, 2500, 2510);
+        assert_eq!(got.len(), 11);
+        let read = s.reads() - before;
+        // Index + the one or two data blocks an eleven-key window touches.
+        assert!(read <= 4, "a narrow range read {read} blocks; expected the index and a few data blocks");
     }
 
     #[test]

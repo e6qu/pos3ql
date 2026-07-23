@@ -272,7 +272,16 @@ checkpoint SST's format in blocks (Stage A's other half) rather than a new key
 space, and the writer refuses out-of-order keys and rows too large for a block. The
 bloom filter block and a multi-block index (the single index block currently bounds
 an SST at ~6.5k data blocks, a bound that is checked and raised, not overrun) are
-what remain of Stage C, along with a range-scan reader over the covering blocks.
+what remain of Stage C. The range-scan reader is now built: `SstReader::scan`
+locates the block a range's low key falls in through the sparse index, then
+reads consecutive data blocks and emits their in-range rows in key order,
+stopping at the first block that runs past the high key — so a range fetches the
+index plus only the data blocks it covers, not the whole SST, which a test holds
+to by reading a narrow window near the end of a three-thousand-row SST in four
+block reads. The `get` lookup was refactored onto the same index-navigation
+helpers and a shared data-block iterator in the process, so the point and range
+paths cannot drift apart. What is left of Stage C is the bloom filter block and
+the multi-block index.
 
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 

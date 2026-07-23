@@ -333,7 +333,7 @@ impl GucState {
         // Read-only parameters cannot be assigned.
         if is_read_only(name) {
             return Err(sql_err!(
-                "55P02",
+                crate::sql::eval::sqlstate::CANT_CHANGE_RUNTIME_PARAM,
                 "parameter \"{}\" cannot be changed",
                 name
             ));

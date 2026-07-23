@@ -193,7 +193,7 @@ fn frame_offset_count<'a>(
     };
     if n < 0 {
         return Err(sql_err!(
-            "22013",
+            crate::sql::eval::sqlstate::INVALID_PRECEDING_OR_FOLLOWING_SIZE,
             "frame {} offset must not be negative",
             if starting { "starting" } else { "ending" }
         ));
@@ -288,7 +288,7 @@ fn frame_range<'a>(
         let off = eval_full(offset_expr, arena, params, &r, hooks)?;
         if range_offset_negative(&off) {
             return Err(sql_err!(
-                "22013",
+                crate::sql::eval::sqlstate::INVALID_PRECEDING_OR_FOLLOWING_SIZE,
                 "invalid preceding or following size in window function"
             ));
         }

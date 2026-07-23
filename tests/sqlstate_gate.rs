@@ -28,7 +28,16 @@ fn scan(dir: &Path, offenders: &mut Vec<String>) {
         for (number, line) in source.lines().enumerate() {
             let inline_err = line.contains("sql_err!(\"");
             let inline_field = line.contains("sqlstate: \"");
-            if inline_err || inline_field {
+            // A code alone on its line: rustfmt's multi-line sql_err! layout,
+            // which the two substring checks above cannot see.
+            let bare_code = {
+                let t = line.trim();
+                t.len() == 8
+                    && t.starts_with('"')
+                    && t.ends_with("\",")
+                    && t[1..6].bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+            };
+            if inline_err || inline_field || bare_code {
                 offenders.push(format!("{}:{}: {}", path.display(), number + 1, line.trim()));
             }
         }

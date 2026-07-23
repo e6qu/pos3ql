@@ -986,7 +986,7 @@ impl Engine {
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
                     responder.warning(
-                        "25001",
+                        crate::sql::eval::sqlstate::ACTIVE_SQL_TRANSACTION,
                         "there is already a transaction in progress",
                     )?;
                 }
@@ -1027,7 +1027,7 @@ impl Engine {
             Stmt::Savepoint(name) => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
-                        "25P01",
+                        crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                         "SAVEPOINT can only be used in transaction blocks"
                     )));
                 }
@@ -1041,7 +1041,7 @@ impl Engine {
             Stmt::ReleaseSavepoint(name) => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
-                        "25P01",
+                        crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                         "RELEASE SAVEPOINT can only be used in transaction blocks"
                     )));
                 }
@@ -1052,7 +1052,7 @@ impl Engine {
                         Ok(Ok(()))
                     }
                     None => Ok(Err(sql_err!(
-                        "3B001",
+                        crate::sql::eval::sqlstate::INVALID_SAVEPOINT_SPECIFICATION,
                         "savepoint \"{}\" does not exist",
                         name
                     ))),
@@ -1061,13 +1061,13 @@ impl Engine {
             Stmt::RollbackToSavepoint(name) => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
-                        "25P01",
+                        crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                         "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"
                     )));
                 }
                 let Some(index) = txn.savepoint_index(name) else {
                     return Ok(Err(sql_err!(
-                        "3B001",
+                        crate::sql::eval::sqlstate::INVALID_SAVEPOINT_SPECIFICATION,
                         "savepoint \"{}\" does not exist",
                         name
                     )));

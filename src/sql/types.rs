@@ -13,6 +13,7 @@ pub mod oid {
     pub const INT2: i32 = 21;
     pub const INT4: i32 = 23;
     pub const TEXT: i32 = 25;
+    pub const NAME: i32 = 19;
     pub const FLOAT4: i32 = 700;
     pub const FLOAT8: i32 = 701;
     pub const BPCHAR: i32 = 1042;
@@ -61,6 +62,9 @@ pub enum ColType {
     Float4,
     Float8,
     Text,
+    /// `name`: PostgreSQL's identifier type (OID 19, typlen 64). Text storage;
+    /// input truncates to 63 bytes.
+    Name,
     /// `varchar`/`character varying`: text storage, but reports OID 1043.
     Varchar,
     /// `char(n)`/`character`/`bpchar`: blank-padded to length, OID 1042.
@@ -135,8 +139,9 @@ impl ColType {
             "float4" | "real" => Self::Float4,
             // `name` and the `reg*` object-identifier types render as text for
             // catalog introspection.
-            "text" | "name" | "regtype" | "regclass" | "regproc" | "regprocedure"
+            "text" | "regtype" | "regclass" | "regproc" | "regprocedure"
             | "regrole" | "regnamespace" | "regoper" | "regoperator" => Self::Text,
+            "name" => Self::Name,
             "oid" => Self::Int4,
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
@@ -168,6 +173,7 @@ impl ColType {
             Self::Float4 => oid::FLOAT8,
             Self::Float8 => oid::FLOAT8,
             Self::Text => oid::TEXT,
+            Self::Name => oid::NAME,
             Self::Varchar => oid::VARCHAR,
             Self::Bpchar => oid::BPCHAR,
             Self::Date => oid::DATE,
@@ -197,6 +203,7 @@ impl ColType {
             Self::Timetz => 12,
             Self::Interval => 16,
             Self::Uuid => 16,
+            Self::Name => 64,
             Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
         }
@@ -208,7 +215,7 @@ impl ColType {
         match self {
             Self::Int2 => Self::Int4,
             Self::Float4 => Self::Float8,
-            Self::Varchar | Self::Bpchar => Self::Text,
+            Self::Varchar | Self::Bpchar | Self::Name => Self::Text,
             other => other,
         }
     }
@@ -223,6 +230,7 @@ impl ColType {
             Self::Float4 => "float4",
             Self::Float8 => "float8",
             Self::Text => "text",
+            Self::Name => "name",
             Self::Varchar => "varchar",
             Self::Bpchar => "bpchar",
             Self::Date => "date",
@@ -253,6 +261,7 @@ impl ColType {
             Self::Float4 => "real",
             Self::Float8 => "double precision",
             Self::Text => "text",
+            Self::Name => "name",
             Self::Varchar => "character varying",
             Self::Bpchar => "character",
             Self::Date => "date",
@@ -302,6 +311,7 @@ impl ColType {
             Self::Range(k) => RANGE_CODE_BASE + k.code(),
             Self::Bit { varying: false } => 26,
             Self::Bit { varying: true } => 27,
+            Self::Name => 42,
             Self::Multirange(k) => MULTIRANGE_CODE_BASE + k.code(),
             Self::Array(e) => ARRAY_CODE_BASE + e.code(),
         }
@@ -332,6 +342,7 @@ impl ColType {
             19 => Self::Jsonb,
             26 => Self::Bit { varying: false },
             27 => Self::Bit { varying: true },
+            42 => Self::Name,
             c if (RANGE_CODE_BASE..RANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
                 Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE))
             }

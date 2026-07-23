@@ -350,7 +350,7 @@ fn recursive_parts<'a>(
 ) -> Result<(&'a SetTree<'a>, &'a SetTree<'a>, bool), SqlError> {
     let Some(&SetTree::Op { operator: SetOp::Union, all, left, right }) = q.set_body else {
         return Err(sql_err!(
-            "42P19",
+            crate::sql::eval::sqlstate::INVALID_RECURSION,
             "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] recursive-term",
             name
         ));
@@ -363,7 +363,7 @@ fn recursive_parts<'a>(
     }
     if set_tree_references(left, name) > 0 {
         return Err(sql_err!(
-            "42P19",
+            crate::sql::eval::sqlstate::INVALID_RECURSION,
             "recursive reference to query \"{}\" must not appear within its non-recursive term",
             name
         ));
@@ -418,14 +418,14 @@ fn materialize_recursive<'a>(
     let direct = direct_references(recursive_tree, cte.name);
     if total > direct {
         return Err(sql_err!(
-            "42P19",
+            crate::sql::eval::sqlstate::INVALID_RECURSION,
             "recursive reference to query \"{}\" must not appear within a subquery",
             cte.name
         ));
     }
     if direct > 1 {
         return Err(sql_err!(
-            "42P19",
+            crate::sql::eval::sqlstate::INVALID_RECURSION,
             "recursive reference to query \"{}\" must not appear more than once",
             cte.name
         ));

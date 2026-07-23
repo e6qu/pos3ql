@@ -39,7 +39,7 @@ impl SqlName {
         if s.len() > 63 {
             // PostgreSQL truncates with a notice; failing loudly is safer.
             return Err(sql_err!(
-                "42622",
+                crate::sql::eval::sqlstate::NAME_TOO_LONG,
                 "name \"{}\" is longer than 63 bytes",
                 s
             ));
@@ -769,7 +769,7 @@ impl Storage {
             if let Some(other) = state.locked_by_other(txid) {
                 let _ = other;
                 return Err(sql_err!(
-                    "40001",
+                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                     "could not serialize access due to concurrent update"
                 ));
             }
@@ -921,7 +921,7 @@ impl Storage {
         if let Some(other) = self.ddl_name_locked_by_other(def.name.as_str(), txid) {
             let _ = other;
             return Err(sql_err!(
-                "40001",
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize access due to concurrent DDL on \"{}\"",
                 def.name.as_str()
             ));
@@ -1029,7 +1029,7 @@ impl Storage {
                 && matches!(v.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
-                "40001",
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
                 name.as_str()
             ));
@@ -1076,7 +1076,7 @@ impl Storage {
             v.name.as_str() == name && matches!(v.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
-                "40001",
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
                 name
             ));
@@ -1149,7 +1149,7 @@ impl Storage {
                 && matches!(x.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
-                "40001",
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
                 def.name.as_str()
             ));
@@ -1225,7 +1225,7 @@ impl Storage {
             x.name.as_str() == name && matches!(x.pending, Some(p) if p.txid != txid)
         }) {
             return Err(sql_err!(
-                "40001",
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
                 name
             ));

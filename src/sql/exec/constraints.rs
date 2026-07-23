@@ -61,13 +61,13 @@ pub fn check_unique(
                     if let Some(owner) = pending_of
                         && owner != txid {
                             return Err(sql_err!(
-                                "40001",
+                                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                                 "could not serialize access due to concurrent update"
                             ));
                         }
                     let kind = if c.primary { "pkey" } else { "key" };
                     return Err(sql_err!(
-                        "23505",
+                        crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
                         "duplicate key value violates unique constraint \"{}_{}_{}\"",
                         def.name.as_str(),
                         c.name.as_str(),
@@ -183,12 +183,12 @@ fn tuple_uniqueness(
                     && owner != txid
                 {
                     return Err(sql_err!(
-                        "40001",
+                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                         "could not serialize access due to concurrent update"
                     ));
                 }
                 return Err(sql_err!(
-                    "23505",
+                    crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
                     "duplicate key value violates unique constraint \"{}\"",
                     constraint_name
                 ));
@@ -245,7 +245,7 @@ fn check_row_checks(
         let Some(expression) = checks[i] else { continue };
         if matches!(eval(expression, arena, params, &context)?, Datum::Bool(false)) {
             return Err(sql_err!(
-                "23514",
+                crate::sql::eval::sqlstate::CHECK_VIOLATION,
                 "new row for relation \"{}\" violates check constraint \"{}\"",
                 def.name.as_str(),
                 c.name.as_str()
@@ -270,7 +270,7 @@ fn check_fk_child(
         }
         let Some(pi) = storage.find_visible(fk.parent.as_str(), txid) else {
             return Err(sql_err!(
-                "23503",
+                crate::sql::eval::sqlstate::FOREIGN_KEY_VIOLATION,
                 "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
                 def.name.as_str(),
                 fk.name.as_str()
@@ -289,7 +289,7 @@ fn check_fk_child(
             txid,
         )? {
             return Err(sql_err!(
-                "23503",
+                crate::sql::eval::sqlstate::FOREIGN_KEY_VIOLATION,
                 "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
                 def.name.as_str(),
                 fk.name.as_str()

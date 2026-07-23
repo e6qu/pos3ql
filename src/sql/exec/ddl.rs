@@ -249,7 +249,7 @@ pub(super) fn attach_constraints(
             TableConstraint::PrimaryKey { name, columns } => {
                 if has_primary {
                     return Err(sql_err!(
-                        "42P16",
+                        crate::sql::eval::sqlstate::INVALID_TABLE_DEFINITION,
                         "multiple primary keys for table \"{}\" are not allowed",
                         def.name.as_str()
                     ));
@@ -428,7 +428,7 @@ fn attach_fkey(
         let (pk, pk_n) = primary_key_cols(&parent_def);
         if pk_n == 0 {
             return Err(sql_err!(
-                "42830",
+                crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
                 "there is no primary key for referenced table \"{}\"",
                 parent
             ));
@@ -443,7 +443,7 @@ fn attach_fkey(
     }
     if n_parent != n_child {
         return Err(sql_err!(
-            "42830",
+            crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
             "number of referencing and referenced columns for foreign key disagree"
         ));
     }
@@ -452,7 +452,7 @@ fn attach_fkey(
     // The referenced columns must be a unique key of the parent (PG 42830).
     if !is_unique_key(&parent_def, &parent_idxs[..n_parent]) {
         return Err(sql_err!(
-            "42830",
+            crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
             "there is no unique constraint matching given keys for referenced table \"{}\"",
             parent
         ));
@@ -463,7 +463,7 @@ fn attach_fkey(
         let parent_type = parent_def.columns()[parent_idxs[i] as usize].ctype;
         if column_type.storage() != parent_type.storage() {
             return Err(sql_err!(
-                "42804",
+                crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
                 "foreign key constraint cannot be implemented: column types {} and {} are incompatible",
                 column_type.name(),
                 parent_type.name()

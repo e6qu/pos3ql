@@ -82,6 +82,16 @@ pub fn cast_to<'a>(
             _ => return Err(cast_unsupported(&v, "double precision")),
         },
         ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
+        ColType::Name => {
+            // PostgreSQL truncates name input to NAMEDATALEN-1 = 63 bytes,
+            // silently, on a character boundary.
+            let s = cast_to_text(v, arena)?;
+            let mut end = s.len().min(63);
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            Datum::Text(&s[..end])
+        }
         ColType::Int2 => {
             let x = if let Datum::Text(s) = v {
                 parse_int_bounded(s, -32768, 32767, "smallint")?

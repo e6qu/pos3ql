@@ -1243,6 +1243,11 @@ pub fn select_query<'a>(
         && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs) {
             return sql_fail(e);
         }
+    for ob in statement.order_by {
+        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs) {
+            return sql_fail(e);
+        }
+    }
     if n_aggs > 0 || !statement.group_by.is_empty() {
         return grouped_select(
             storage,
@@ -1489,6 +1494,11 @@ pub fn constant_select<'a>(
         && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs)
     {
         return sql_fail(e);
+    }
+    for ob in statement.order_by {
+        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs) {
+            return sql_fail(e);
+        }
     }
     if n_aggs > 0 || statement.having.is_some() || !statement.group_by.is_empty() {
         if find_srf(statement.items).is_some() {
@@ -1745,6 +1755,9 @@ pub fn select_into_rows<'a>(
     }
     if let Some(h) = statement.having {
         collect_aggs(h, &mut agg_nodes, &mut n_aggs)?;
+    }
+    for ob in statement.order_by {
+        collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs)?;
     }
     // GROUP BY or aggregates: run the grouped executor (which sorts by any
     // ORDER BY and dedups DISTINCT) and emit each output row, honoring

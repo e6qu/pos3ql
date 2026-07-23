@@ -192,7 +192,7 @@ pub(crate) fn decode<'a>(
                 out[i] = Datum::Float8(f64::from_le_bytes(b.try_into().unwrap()));
                 at += 8;
             }
-            ColType::Text | ColType::Varchar | ColType::Bpchar => {
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
                 at += 4;

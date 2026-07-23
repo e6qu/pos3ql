@@ -48,12 +48,44 @@ const SQLSTATE_IO: &str = "58030";
 /// serialization_failure — manifest CAS lost to another writer.
 const SQLSTATE_CAS: &str = "40001";
 
+/// A spill-list update awaiting the manifest publish.
+#[derive(Clone, Copy)]
+enum SlotInstall {
+    Append(SstHandle),
+    Collapse(SstHandle),
+}
+
 /// A prior checkpoint's SST reference for one table slot.
 #[derive(Clone, Copy)]
 struct PrevSst {
     handle: SstHandle,
     count: u64,
     crc: u32,
+}
+
+/// One table's published SST list — a fixed, `Copy` array so the post-freeze
+/// checkpoint path never touches the allocator.
+#[derive(Clone, Copy)]
+struct SlotList {
+    ssts: [Option<PrevSst>; crate::storage::MAX_SPILL_SSTS],
+    n: usize,
+}
+
+impl SlotList {
+    const EMPTY: SlotList = SlotList { ssts: [None; crate::storage::MAX_SPILL_SSTS], n: 0 };
+
+    fn push(&mut self, p: PrevSst) -> bool {
+        if self.n == crate::storage::MAX_SPILL_SSTS {
+            return false;
+        }
+        self.ssts[self.n] = Some(p);
+        self.n += 1;
+        true
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PrevSst> {
+        self.ssts[..self.n].iter().filter_map(|p| p.as_ref())
+    }
 }
 
 pub(crate) struct Checkpointer {
@@ -67,6 +99,11 @@ pub(crate) struct Checkpointer {
     blocks: std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>>,
     /// Scratch for SST writers and readers, reset per table.
     sst_arena: Arena,
+    /// Spill-list updates computed during a checkpoint, applied to storage
+    /// only after the manifest CAS lands.
+    pending_installs: Vec<(usize, SlotInstall)>,
+    /// Pre-reserved sort scratch for a delta's tombstones.
+    tomb_scratch: Vec<u64>,
     /// Rosters of the SSTs the current manifest references (GC keep-set
     /// source) and their sweep scratch.
     roster_scratch: Vec<BlockId>,
@@ -77,12 +114,12 @@ pub(crate) struct Checkpointer {
     /// Per-slot SST from the last published manifest; clean tables reuse
     /// these handles (delta checkpoints). Capacity is reserved at startup so
     /// the post-freeze checkpoint path never allocates.
-    prev_ssts: Vec<Option<PrevSst>>,
+    prev_ssts: Vec<SlotList>,
     /// Keys referenced by the manifest just published (GC keep-set).
     referenced: Vec<StackStr<64>>,
     /// Pre-reserved scratch built during a checkpoint, then swapped into the
     /// fields above; keeps the post-freeze path allocation-free.
-    prev_scratch: Vec<Option<PrevSst>>,
+    prev_scratch: Vec<SlotList>,
     ref_scratch: Vec<StackStr<64>>,
     /// Pre-reserved scratch for GC / WAL-segment sweeps.
     doomed_scratch: Vec<StackStr<64>>,
@@ -149,6 +186,8 @@ impl Checkpointer {
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
+            pending_installs: Vec::with_capacity(MAX_CKPT_TABLES),
+            tomb_scratch: Vec::with_capacity(crate::storage::MAX_TOMBSTONES),
             roster_scratch: Vec::with_capacity(MAX_KEEP_BLOCKS),
             doomed_blocks: Vec::with_capacity(MAX_SWEEP_KEYS),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", MANIFEST_BUF_BYTES)
@@ -170,11 +209,6 @@ impl Checkpointer {
         std::rc::Rc::clone(&self.blocks)
     }
 
-    /// The SST the last published manifest holds for `slot`, if any — the
-    /// eviction target for that table's committed rows.
-    pub(crate) fn table_handle(&self, slot: usize) -> Option<SstHandle> {
-        self.prev_ssts.get(slot).copied().flatten().map(|p| p.handle)
-    }
 
     /// Uploads a committed WAL batch as a segment keyed by its first LSN,
     /// so a lost-disk cold start can replay everything past the manifest.
@@ -294,8 +328,8 @@ impl Checkpointer {
         let mut pending_def: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])> =
             None;
         let mut ssts: Vec<(String, usize, u64, u64, u32)> = Vec::new();
-        // (mindex, count, crc, handle) — the block-grid form.
-        let mut bssts: Vec<(usize, u64, u32, Option<SstHandle>)> = Vec::new();
+        // (mindex, list index, count, crc, handle) — the block-grid form.
+        let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
         let mut saw_end = false;
 
         let finish_pending = |storage: &mut Storage,
@@ -490,6 +524,8 @@ impl Checkpointer {
                     ssts.push((key, mindex, count, bytes, crc));
                 }
                 Some("bsst") => {
+                    // The single-SST form from before delta flushes: list
+                    // index 0 by construction.
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let mindex: usize = parse_field(words.next(), "bsst table")?;
                     let count: u64 = parse_field(words.next(), "bsst count")?;
@@ -506,7 +542,27 @@ impl Checkpointer {
                             roster: parse_block_id(roster)?,
                         })
                     };
-                    bssts.push((mindex, count, crc, handle));
+                    bssts.push((mindex, 0, count, crc, handle));
+                }
+                Some("dsst") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let mindex: usize = parse_field(words.next(), "dsst table")?;
+                    let idx: usize = parse_field(words.next(), "dsst list index")?;
+                    let count: u64 = parse_field(words.next(), "dsst count")?;
+                    let crc: u32 = parse_field(words.next(), "dsst crc")?;
+                    let index = words.next().ok_or(CheckpointSetupError::Corrupt("dsst index"))?;
+                    let filter = words.next().ok_or(CheckpointSetupError::Corrupt("dsst filter"))?;
+                    let roster = words.next().ok_or(CheckpointSetupError::Corrupt("dsst roster"))?;
+                    let handle = if index == "-" {
+                        None
+                    } else {
+                        Some(SstHandle {
+                            index: parse_block_id(index)?,
+                            filter: parse_block_id(filter)?,
+                            roster: parse_block_id(roster)?,
+                        })
+                    };
+                    bssts.push((mindex, idx, count, crc, handle));
                 }
                 Some("view") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -611,26 +667,54 @@ impl Checkpointer {
             // next checkpoint rewrites the table as a block SST, after which
             // the object is unreferenced and swept.
             if self.prev_ssts.len() <= slot {
-                self.prev_ssts.resize(slot + 1, None);
+                self.prev_ssts.resize(slot + 1, SlotList::EMPTY);
             }
-            self.prev_ssts[slot] = None;
+            self.prev_ssts[slot] = SlotList::EMPTY;
             self.referenced.push(crate::stack_format!(64, "{}", key));
         }
 
-        for (mindex, count, crc, handle) in &bssts {
+        // Block SSTs apply in (slot, list index) order: rows install spilled,
+        // a later list member's rows overwrite an earlier one's, tombstones
+        // remove — the same shadowing the deltas were written under.
+        bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
+        for (mindex, idx, count, crc, handle) in &bssts {
             let slot = slot_of
                 .get(*mindex)
                 .copied()
                 .flatten()
-                .ok_or(CheckpointSetupError::Corrupt("bsst references unknown table"))?;
-            if let Some(handle) = handle {
-                self.rehydrate_block_sst(storage, slot, *count, handle)?;
-            }
+                .ok_or(CheckpointSetupError::Corrupt("dsst references unknown table"))?;
             if self.prev_ssts.len() <= slot {
-                self.prev_ssts.resize(slot + 1, None);
+                self.prev_ssts.resize(slot + 1, SlotList::EMPTY);
             }
-            self.prev_ssts[slot] =
-                handle.map(|handle| PrevSst { handle, count: *count, crc: *crc });
+            let expect = self.prev_ssts[slot].n;
+            if let Some(handle) = handle {
+                if *idx != expect {
+                    return Err(CheckpointSetupError::Corrupt("dsst list index out of order"));
+                }
+                self.rehydrate_block_sst(storage, slot, *idx as u8, *count, handle)?;
+                if !self.prev_ssts[slot].push(PrevSst {
+                    handle: *handle,
+                    count: *count,
+                    crc: *crc,
+                }) {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "dsst list longer than the engine supports",
+                    ));
+                }
+            }
+        }
+        for (slot, list) in self.prev_ssts.iter().enumerate() {
+            if list.n > 0 {
+                let mut handles = [None; crate::storage::MAX_SPILL_SSTS];
+                let mut n = 0usize;
+                for p in list.iter() {
+                    handles[n] = Some(p.handle);
+                    n += 1;
+                }
+                let handles: [SstHandle; crate::storage::MAX_SPILL_SSTS] =
+                    core::array::from_fn(|i| handles[i].unwrap_or(list.ssts[0].expect("non-empty").handle));
+                storage.set_spill_list(slot, &handles[..n]);
+            }
         }
 
         storage.set_lsn(lsn);
@@ -641,12 +725,16 @@ impl Checkpointer {
         Ok(lsn)
     }
 
-    /// Rehydrates one block-grid SST: a full-range scan through the cache
-    /// stack, each row appended to the heap and installed committed.
+    /// Rehydrates one block-grid SST in list order: rows install *spilled*
+    /// (the map gets rowid and length, the bytes stay in the SST — the scan
+    /// just warmed the cache tiers), a later SST's row overwrites an earlier
+    /// one's, and a tombstone removes the entry. Cold start no longer needs
+    /// the dataset to fit the heap.
     fn rehydrate_block_sst(
         &mut self,
         storage: &mut Storage,
         slot: usize,
+        sst_index: u8,
         count: u64,
         handle: &SstHandle,
     ) -> Result<(), CheckpointSetupError> {
@@ -656,22 +744,30 @@ impl Checkpointer {
         let mut seen = 0u64;
         let mut blocks = self.blocks.borrow_mut();
         let mut failed: Option<CheckpointSetupError> = None;
-        // Rows are installed *spilled*: the map gets each rowid and length,
-        // the bytes stay in the SST (this scan just warmed the cache tiers
-        // with them), and the table's spill store is this SST. Cold start no
-        // longer needs the dataset to fit the heap.
         reader
             .scan(&mut *blocks, handle, 0, u64::MAX, &mut |rowid, row| {
                 if failed.is_some() {
                     return;
                 }
                 storage.observe_rowid(rowid);
-                let installed = storage.table_mut(slot).rows.insert(
-                    rowid,
-                    crate::storage::RowState::committed_spilled(row.len() as u32),
-                );
-                if installed.is_err() {
-                    failed = Some(CheckpointSetupError::Corrupt("sst rows exceed table_rows"));
+                match row {
+                    Some(row) => {
+                        let installed = storage.table_mut(slot).rows.insert(
+                            rowid,
+                            crate::storage::RowState::committed_spilled(
+                                row.len() as u32,
+                                sst_index,
+                            ),
+                        );
+                        if installed.is_err() {
+                            failed = Some(CheckpointSetupError::Corrupt(
+                                "sst rows exceed table_rows",
+                            ));
+                        }
+                    }
+                    None => {
+                        let _ = storage.table_mut(slot).rows.remove(&rowid);
+                    }
                 }
                 seen += 1;
             })
@@ -683,7 +779,6 @@ impl Checkpointer {
         if seen != count {
             return Err(CheckpointSetupError::Corrupt("sst row count mismatch"));
         }
-        storage.set_spill_sst(slot, Some(*handle));
         Ok(())
     }
 
@@ -772,7 +867,7 @@ impl Checkpointer {
     /// and compacts the heap afterwards. No-op when nothing changed.
     pub(crate) fn checkpoint(
         &mut self,
-        storage: &Storage,
+        storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<bool, SqlError> {
         let lsn = storage.lsn();
@@ -785,6 +880,7 @@ impl Checkpointer {
         // scratch so this post-freeze path never allocates.
         self.prev_scratch.clear();
         self.ref_scratch.clear();
+        self.pending_installs.clear();
         self.manifest_buf.clear();
         write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
         write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
@@ -907,68 +1003,126 @@ impl Checkpointer {
                 )?;
             }
 
-            // Sort rows by rowid; snapshots contain committed images only.
-            sort_scratch.clear();
-            for (&rowid, state) in table.rows.iter() {
-                let Some(loc) = state.committed else {
-                    continue;
-                };
-                sort_scratch.push((rowid, loc)).map_err(|e| {
-                    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "checkpoint scratch: {}", e)
-                })?;
-            }
-            sort_scratch.as_mut_slice().sort_unstable_by_key(|(rowid, _)| *rowid);
+            // A clean table carries its whole SST list forward untouched.
+            let clean = !storage.table(slot).dirty
+                && self.prev_ssts.get(slot).is_some_and(|l| l.n > 0);
+            // A dirty table with spilled SSTs and room flushes a *delta*:
+            // its heap-resident committed rows plus the tombstones recorded
+            // since the last checkpoint. Otherwise it rewrites fully.
+            let delta = !clean && storage.delta_eligible(slot) && storage.table(slot).dirty;
 
-            // Content CRC over the sorted entries: the delta test that lets a
-            // clean table carry its SST forward by handle instead of
-            // rewriting every block.
-            let mut crc = Crc32c::new();
-            for &(rowid, home) in sort_scratch.iter() {
-                storage.with_row_bytes(slot, rowid, home, |row| {
-                    let mut header = [0u8; SST_ENTRY_HEADER];
-                    header[0..8].copy_from_slice(&rowid.to_le_bytes());
-                    header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
-                    crc.update(&header);
-                    crc.update(row);
-                    Ok(())
-                })?;
-            }
-            let crc = crc.finish();
-            let count = sort_scratch.len() as u64;
-
-            let prev = self.prev_ssts.get(slot).copied().flatten();
-            let reuse = !storage.table(slot).dirty
-                && prev.is_some_and(|p| p.count == count && p.crc == crc);
-            let handle = if reuse {
-                prev.map(|p| p.handle)
-            } else if count == 0 {
-                None
+            let new_list: SlotList = if clean {
+                self.prev_ssts[slot]
             } else {
-                // Rows into the block grid through the cache stack: sorted
-                // data blocks, sparse index, bloom filter, roster.
-                self.sst_arena.reset();
-                let mut writer = SstWriter::new(&self.sst_arena).map_err(sst_to_sql)?;
-                for &(rowid, home) in sort_scratch.iter() {
-                    // A spilled row's bytes come back through the cache (its
-                    // old SST) on the way into the new SST; the fetch ends its
-                    // block borrow before the append takes its own.
-                    storage.with_row_bytes(slot, rowid, home, |row| {
-                        writer
-                            .append(&mut *self.blocks.borrow_mut(), rowid, row)
-                            .map_err(sst_to_sql)
+                // Collect the rows this SST will hold.
+                sort_scratch.clear();
+                for (&rowid, state) in table.rows.iter() {
+                    let Some(home) = state.committed else {
+                        continue;
+                    };
+                    if delta && !matches!(home, RowHome::Heap(_)) {
+                        continue; // already durable in an earlier list member
+                    }
+                    sort_scratch.push((rowid, home)).map_err(|e| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "checkpoint scratch: {}", e)
                     })?;
                 }
-                writer.finish(&mut *self.blocks.borrow_mut()).map_err(sst_to_sql)?
+                sort_scratch.as_mut_slice().sort_unstable_by_key(|(rowid, _)| *rowid);
+                self.tomb_scratch.clear();
+                if delta {
+                    // Within the reserved capacity: MAX_TOMBSTONES entries.
+                    self.tomb_scratch.extend_from_slice(storage.tombstones(slot));
+                }
+                self.tomb_scratch.sort_unstable();
+                self.tomb_scratch.dedup();
+                let tomb_sorted = &self.tomb_scratch;
+
+                let count = (sort_scratch.len() + tomb_sorted.len()) as u64;
+                let mut crc = Crc32c::new();
+                for &(rowid, home) in sort_scratch.iter() {
+                    storage.with_row_bytes(slot, rowid, home, |row| {
+                        let mut header = [0u8; SST_ENTRY_HEADER];
+                        header[0..8].copy_from_slice(&rowid.to_le_bytes());
+                        header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
+                        crc.update(&header);
+                        crc.update(row);
+                        Ok(())
+                    })?;
+                }
+                for &t in tomb_sorted.iter() {
+                    crc.update(&t.to_le_bytes());
+                }
+                let crc = crc.finish();
+
+                let handle = if count == 0 {
+                    None
+                } else {
+                    // Rows and tombstones merge in rowid order into the block
+                    // grid: sorted data blocks, sparse index, bloom filter,
+                    // roster. A spilled row's bytes come back through the
+                    // cache on the way into a full rewrite.
+                    self.sst_arena.reset();
+                    let mut writer = SstWriter::new(&self.sst_arena).map_err(sst_to_sql)?;
+                    let mut ti = 0usize;
+                    for &(rowid, home) in sort_scratch.iter() {
+                        while ti < tomb_sorted.len() && tomb_sorted[ti] < rowid {
+                            writer
+                                .append_tombstone(&mut *self.blocks.borrow_mut(), tomb_sorted[ti])
+                                .map_err(sst_to_sql)?;
+                            ti += 1;
+                        }
+                        storage.with_row_bytes(slot, rowid, home, |row| {
+                            writer
+                                .append(&mut *self.blocks.borrow_mut(), rowid, row)
+                                .map_err(sst_to_sql)
+                        })?;
+                    }
+                    while ti < tomb_sorted.len() {
+                        writer
+                            .append_tombstone(&mut *self.blocks.borrow_mut(), tomb_sorted[ti])
+                            .map_err(sst_to_sql)?;
+                        ti += 1;
+                    }
+                    writer.finish(&mut *self.blocks.borrow_mut()).map_err(sst_to_sql)?
+                };
+
+                // Storage is not touched yet: the list installs (and the
+                // entry remap a collapse implies) apply only after the
+                // manifest CAS lands, so a failed publish leaves memory
+                // consistent with the still-current manifest.
+                match (delta, handle) {
+                    (true, Some(h)) => {
+                        let mut list =
+                            self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
+                        if !list.push(PrevSst { handle: h, count, crc }) {
+                            return Err(sql_err!(
+                                SQLSTATE_IO,
+                                "delta flush into a full spill list"
+                            ));
+                        }
+                        self.pending_installs.push((slot, SlotInstall::Append(h)));
+                        list
+                    }
+                    (true, None) => {
+                        // Dirty but nothing new to flush (e.g. the change was
+                        // rolled back): the list stands.
+                        self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY)
+                    }
+                    (false, Some(h)) => {
+                        self.pending_installs.push((slot, SlotInstall::Collapse(h)));
+                        let mut list = SlotList::EMPTY;
+                        let _ = list.push(PrevSst { handle: h, count, crc });
+                        list
+                    }
+                    (false, None) => SlotList::EMPTY,
+                }
             };
 
             if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
-                self.prev_scratch.resize(slot + 1, None);
+                self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
             }
-            if slot < self.prev_scratch.len() {
-                self.prev_scratch[slot] =
-                    handle.map(|handle| PrevSst { handle, count, crc });
-            }
-            if let Some(h) = handle {
+            for (idx, p) in new_list.iter().enumerate() {
+                let h = p.handle;
                 let (mut ih, mut fh, mut rh) = ([0u8; 64], [0u8; 64], [0u8; 64]);
                 h.index.write_key(&mut ih);
                 h.filter.write_key(&mut fh);
@@ -976,19 +1130,22 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "bsst {slot} {count} {crc} {} {} {}",
+                        "dsst {slot} {idx} {} {} {} {} {}",
+                        p.count,
+                        p.crc,
                         core::str::from_utf8(&ih).expect("hex"),
                         core::str::from_utf8(&fh).expect("hex"),
                         core::str::from_utf8(&rh).expect("hex"),
                     ),
                 )?;
-            } else {
+            }
+            if new_list.n == 0 {
                 // An empty table still records its (zero-row) state so the
                 // loader creates it.
-                write_manifest(
-                    &mut self.manifest_buf,
-                    format_args!("bsst {slot} 0 {crc} - - -"),
-                )?;
+                write_manifest(&mut self.manifest_buf, format_args!("dsst {slot} 0 0 0 - - -"))?;
+            }
+            if slot < self.prev_scratch.len() {
+                self.prev_scratch[slot] = new_list;
             }
         }
         // Views: `view <hex-of-SELECT-text> <name>` (name is rest-of-line, so
@@ -1055,6 +1212,19 @@ impl Checkpointer {
         self.manifest_lsn = lsn;
         std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
         std::mem::swap(&mut self.referenced, &mut self.ref_scratch);
+        // The manifest is durable: install the new spill lists (a collapse
+        // remaps the table's spilled entries to slot 0) and forget the
+        // flushed tombstones. A failed CAS above reaches none of this, so a
+        // retry recomputes against unchanged state and the orphaned blocks
+        // are swept as garbage.
+        for &(slot, install) in &self.pending_installs {
+            match install {
+                SlotInstall::Append(h) => storage.append_spill(slot, h),
+                SlotInstall::Collapse(h) => storage.collapse_spill(slot, h),
+            }
+            storage.clear_tombstones(slot);
+        }
+        self.pending_installs.clear();
 
         // GC: delete any SST under sst/ not referenced by the new manifest,
         // then any block not on a live SST's roster.
@@ -1076,7 +1246,7 @@ impl Checkpointer {
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "gc scratch"))?;
-        for prev in self.prev_ssts.iter().flatten() {
+        for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
             let h = prev.handle;
             if self.roster_scratch.len() + 1 > MAX_KEEP_BLOCKS {
                 eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");

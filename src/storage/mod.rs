@@ -408,7 +408,7 @@ pub struct RowState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowHome {
     Heap(RowLoc),
-    Spilled { len: u32 },
+    Spilled { len: u32, sst: u8 },
 }
 
 impl RowHome {
@@ -435,9 +435,9 @@ impl RowState {
         }
     }
 
-    pub fn committed_spilled(len: u32) -> Self {
+    pub fn committed_spilled(len: u32, sst: u8) -> Self {
         Self {
-            committed: Some(RowHome::Spilled { len }),
+            committed: Some(RowHome::Spilled { len, sst }),
             pending: None,
         }
     }
@@ -525,10 +525,29 @@ pub struct Table {
     pub serial_last: [i64; MAX_COLUMNS],
     /// Whether `serial_last` changed since it was last written to the WAL.
     pub serial_dirty: bool,
-    /// The SST holding this table's spilled rows (the last checkpoint's),
-    /// `None` while every committed row is heap-resident.
-    pub(crate) spill_sst: Option<crate::store::SstHandle>,
+    /// The SSTs holding this table's spilled rows, in flush order: a full
+    /// checkpoint writes one, each delta checkpoint appends one, and a merge
+    /// (list full) collapses back to one. A row's map entry names which list
+    /// slot its bytes live in.
+    pub(crate) spill_ssts: [Option<crate::store::SstHandle>; MAX_SPILL_SSTS],
+    pub(crate) n_spill_ssts: usize,
+    /// Rowids removed since the last checkpoint while this table had spilled
+    /// SSTs — each becomes a tombstone entry in the next delta, so a cold
+    /// start does not resurrect an older SST's version. Overflow forces the
+    /// next checkpoint to a full rewrite instead of a delta (never dropping a
+    /// tombstone).
+    pub(crate) tombstones: [u64; MAX_TOMBSTONES],
+    pub(crate) n_tombstones: usize,
+    pub(crate) tombstones_overflow: bool,
 }
+
+/// The most delta SSTs a table accumulates before a checkpoint merges them
+/// back into one — the write-amplification / read-fan-out tradeoff.
+pub(crate) const MAX_SPILL_SSTS: usize = 8;
+
+/// Deletes remembered between checkpoints; past this the next checkpoint
+/// rewrites the table fully rather than lose one.
+pub(crate) const MAX_TOMBSTONES: usize = 1024;
 
 /// An uncommitted catalog change to one table, owned by one transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,7 +730,11 @@ impl Storage {
                     dirty: false,
                     serial_last: [0; MAX_COLUMNS],
                     serial_dirty: false,
-                    spill_sst: None,
+                    spill_ssts: [None; MAX_SPILL_SSTS],
+                    n_spill_ssts: 0,
+                    tombstones: [0; MAX_TOMBSTONES],
+                    n_tombstones: 0,
+                    tombstones_overflow: false,
                 })
                 .expect("sized to max_tables");
         }
@@ -846,14 +869,20 @@ impl Storage {
     ) -> Result<&'a [u8], SqlError> {
         match home {
             RowHome::Heap(loc) => Ok(self.heap.get(loc)),
-            RowHome::Spilled { len } => {
+            RowHome::Spilled { len, sst } => {
                 let Some(spill) = &self.spill else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "row is spilled but no spill reader is attached"
                     ));
                 };
-                let Some(handle) = self.tables[table_slot].spill_sst else {
+                let Some(handle) = self
+                    .tables[table_slot]
+                    .spill_ssts
+                    .get(sst as usize)
+                    .copied()
+                    .flatten()
+                else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "row is spilled but its table has no spill SST"
@@ -905,14 +934,20 @@ impl Storage {
     ) -> Result<R, SqlError> {
         match home {
             RowHome::Heap(loc) => f(self.heap.get(loc)),
-            RowHome::Spilled { len } => {
+            RowHome::Spilled { len, sst } => {
                 let Some(spill) = &self.spill else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "row is spilled but no spill reader is attached"
                     ));
                 };
-                let Some(handle) = self.tables[table_slot].spill_sst else {
+                let Some(handle) = self
+                    .tables[table_slot]
+                    .spill_ssts
+                    .get(sst as usize)
+                    .copied()
+                    .flatten()
+                else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "row is spilled but its table has no spill SST"
@@ -954,21 +989,97 @@ impl Storage {
     /// installed on the tables; rows with no SST (empty tables) are left.
     pub fn evict_committed(&mut self) {
         for i in 0..self.tables.len() {
-            if !self.tables[i].live || self.tables[i].spill_sst.is_none() {
+            if !self.tables[i].live || self.tables[i].n_spill_ssts == 0 {
                 continue;
             }
             let table = &mut self.tables[i];
+            // The newest SST is the delta the checkpoint just wrote, and it
+            // holds every committed heap row of this table.
+            let newest = (table.n_spill_ssts - 1) as u8;
             for (_, state) in table.rows.iter_mut() {
                 if let Some(RowHome::Heap(loc)) = state.committed {
-                    state.committed = Some(RowHome::Spilled { len: loc.len });
+                    state.committed = Some(RowHome::Spilled { len: loc.len, sst: newest });
                 }
             }
         }
     }
 
-    /// Installs a table's checkpoint SST handle (the eviction target).
-    pub(crate) fn set_spill_sst(&mut self, slot: usize, handle: Option<crate::store::SstHandle>) {
-        self.tables[slot].spill_sst = handle;
+    /// A full rewrite: the new SST holds every committed row, so the list
+    /// collapses to it and every spilled map entry is remapped to slot 0.
+    /// Clears the tombstones the rewrite made moot.
+    pub(crate) fn collapse_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
+        let table = &mut self.tables[slot];
+        table.spill_ssts = [None; MAX_SPILL_SSTS];
+        table.spill_ssts[0] = Some(handle);
+        table.n_spill_ssts = 1;
+        for (_, state) in table.rows.iter_mut() {
+            if let Some(RowHome::Spilled { len, .. }) = state.committed {
+                state.committed = Some(RowHome::Spilled { len, sst: 0 });
+            }
+        }
+    }
+
+    /// A delta flush: the new SST (heap rows + tombstones) joins the list;
+    /// existing spilled entries keep their slots. Clears the flushed
+    /// tombstones. The caller guarantees the list has room.
+    pub(crate) fn append_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
+        let table = &mut self.tables[slot];
+        assert!(table.n_spill_ssts < MAX_SPILL_SSTS, "delta flush into a full list");
+        table.spill_ssts[table.n_spill_ssts] = Some(handle);
+        table.n_spill_ssts += 1;
+    }
+
+    /// Installs a cold-start spill list verbatim (entries were installed with
+    /// their slots by the manifest scan).
+    pub(crate) fn set_spill_list(&mut self, slot: usize, handles: &[crate::store::SstHandle]) {
+        let table = &mut self.tables[slot];
+        table.spill_ssts = [None; MAX_SPILL_SSTS];
+        for (i, h) in handles.iter().take(MAX_SPILL_SSTS).enumerate() {
+            table.spill_ssts[i] = Some(*h);
+        }
+        table.n_spill_ssts = handles.len().min(MAX_SPILL_SSTS);
+        table.n_tombstones = 0;
+        table.tombstones_overflow = false;
+    }
+
+    /// Clears a table's remembered tombstones — called only once the manifest
+    /// referencing the SST that carries them has *published*. A failed
+    /// publish keeps them, so the retry flushes them again rather than losing
+    /// a delete.
+    pub(crate) fn clear_tombstones(&mut self, slot: usize) {
+        let table = &mut self.tables[slot];
+        table.n_tombstones = 0;
+        table.tombstones_overflow = false;
+    }
+
+    /// What the next checkpoint should do for this table: a delta flush (the
+    /// spill list has room and every remembered tombstone fits), or a full
+    /// rewrite.
+    pub(crate) fn delta_eligible(&self, slot: usize) -> bool {
+        let t = &self.tables[slot];
+        t.n_spill_ssts > 0 && t.n_spill_ssts < MAX_SPILL_SSTS && !t.tombstones_overflow
+    }
+
+    pub(crate) fn tombstones(&self, slot: usize) -> &[u64] {
+        let t = &self.tables[slot];
+        &t.tombstones[..t.n_tombstones]
+    }
+
+    /// Records a committed-row removal for the next delta checkpoint, so a
+    /// cold start cannot resurrect an older SST's version of the row. Only
+    /// meaningful while the table has spilled SSTs.
+    fn record_tombstone(table: &mut Table, rowid: u64) {
+        if table.n_spill_ssts == 0 || table.tombstones_overflow {
+            return;
+        }
+        if table.n_tombstones == MAX_TOMBSTONES {
+            // Never drop one: the next checkpoint falls back to a full
+            // rewrite, which needs no tombstones at all.
+            table.tombstones_overflow = true;
+            return;
+        }
+        table.tombstones[table.n_tombstones] = rowid;
+        table.n_tombstones += 1;
     }
 
     pub fn table_count(&self) -> usize {
@@ -1128,6 +1239,16 @@ impl Storage {
 
     /// Promotes a row's pending change to committed. The WAL record must
     /// already be durable.
+    /// Removes a committed row outright (journal replay of a DELETE),
+    /// recording the tombstone a later delta checkpoint needs.
+    pub fn remove_committed(&mut self, table_index: usize, rowid: u64) {
+        let table = &mut self.tables[table_index];
+        if table.rows.remove(&rowid).is_some() {
+            Self::record_tombstone(table, rowid);
+            table.dirty = true;
+        }
+    }
+
     pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32) {
         let table = &mut self.tables[table_index];
         let Some(state) = table.rows.get_mut(&rowid) else {
@@ -1139,6 +1260,10 @@ impl Storage {
                 state.pending = None;
                 if state.committed.is_none() {
                     table.rows.remove(&rowid);
+                    // A rowid that ever reached an SST — even if its latest
+                    // version was heap-resident — must tombstone, or a cold
+                    // start resurrects the SST's version.
+                    Self::record_tombstone(table, rowid);
                 }
                 table.dirty = true;
             }
@@ -1192,7 +1317,10 @@ impl Storage {
         // spilled rows.
         table.serial_last = [0; MAX_COLUMNS];
         table.serial_dirty = false;
-        table.spill_sst = None;
+        table.spill_ssts = [None; MAX_SPILL_SSTS];
+        table.n_spill_ssts = 0;
+        table.n_tombstones = 0;
+        table.tombstones_overflow = false;
         Ok(slot)
     }
 

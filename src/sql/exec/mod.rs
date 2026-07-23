@@ -1933,7 +1933,7 @@ pub fn alter_table(
             .expect("row existed in phase 1");
         state.committed = Some(new_home);
     }
-    storage.set_spill_sst(table_index, None);
+    storage.set_spill_list(table_index, &[]);
     responder.command_complete("ALTER TABLE")?;
     sql_ok()
 }
@@ -2045,8 +2045,25 @@ fn row_matches<'a>(
     let Some(w) = where_clause else {
         return Ok(true);
     };
-    let mut values = [Datum::Null; MAX_COLUMNS];
-    rowenc::decode(storage.row_bytes(table_index, rowid, home, arena)?, schema, &mut values)?;
+    // Consume-in-place: the row's bytes live only for this predicate — a
+    // WHERE over thousands of spilled rows must not fill the arena with
+    // rows it rejects. (A WHERE subquery's own spilled reads take the
+    // arena path, not this scratch, so nesting holds.)
+    storage.with_row_bytes(table_index, rowid, home, |bytes| {
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, schema, &mut values)?;
+        row_matches_values(def, &values, w, arena, params, hooks)
+    })
+}
+
+fn row_matches_values<'a>(
+    def: &TableDef,
+    values: &[Datum<'_>],
+    w: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
     let context = RowCtx { def, values: &values[..def.n_columns] };
     match super::eval::eval_full(w, arena, params, &context, hooks)? {
         Datum::Bool(true) => Ok(true),
@@ -2111,12 +2128,16 @@ fn collect_join_matches<'a>(
         let Some(loc) = state.visible_to(txid) else {
             continue;
         };
-        let mut tv = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(storage.row_bytes(table_index, rowid, loc, arena)?, schema, &mut tv)?;
-        let context = RowCtx { def, values: &tv[..def.n_columns] };
-        let found = super::query::first_from_match(
-            storage, from, txid, where_clause, arena, params, &context, &mut |_| Ok(()),
-        )?;
+        // Consume-in-place, as in row_matches: the joined-row probe reads
+        // this row's values only while it runs.
+        let found = storage.with_row_bytes(table_index, rowid, loc, |bytes| {
+            let mut tv = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut tv)?;
+            let context = RowCtx { def, values: &tv[..def.n_columns] };
+            super::query::first_from_match(
+                storage, from, txid, where_clause, arena, params, &context, &mut |_| Ok(()),
+            )
+        })?;
         if found {
             scratch.push((rowid, loc)).map_err(|_| {
                 sql_err!(

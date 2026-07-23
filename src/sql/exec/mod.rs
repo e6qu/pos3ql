@@ -414,41 +414,32 @@ fn copy_like_indexes(
 const MAX_LIKE_INDEXES: usize = 8;
 
 
-/// One past the current maximum value of an auto-increment (serial) column in
-/// the rows visible to `txid`, or 1 when empty. Rows this transaction already
-/// inserted are visible, so a multi-row INSERT assigns increasing values.
+/// The next value of a serial/identity column: a real sequence, as PostgreSQL
+/// has it. Explicit inserts do not advance it, deletes and TRUNCATE do not
+/// rewind it, and the advance survives a rollback (a consumed number stays
+/// consumed). The counter is journaled at commit and floored against the
+/// stored rows at startup.
 fn next_auto_value<'x>(
-    storage: &Storage,
+    storage: &mut Storage,
     table_index: usize,
     col: usize,
     ctype: ColType,
-    schema: &[ColType],
-    txid: u32,
-) -> Datum<'x> {
-    let table = storage.table(table_index);
-    let mut max: i64 = 0;
-    for (_, state) in table.rows.iter() {
-        let Some(loc) = state.visible_to(txid) else {
-            continue;
-        };
-        let mut row = [Datum::Null; MAX_COLUMNS];
-        if rowenc::decode(storage.heap.get(loc), schema, &mut row).is_err() {
-            continue;
-        }
-        let v = match row.get(col) {
-            Some(Datum::Int2(x)) => i64::from(*x),
-            Some(Datum::Int4(x)) => i64::from(*x),
-            Some(Datum::Int8(x)) => *x,
-            _ => continue,
-        };
-        max = max.max(v);
-    }
-    let next = max + 1;
-    match ctype {
+) -> Result<Datum<'x>, SqlError> {
+    let table = storage.table_mut(table_index);
+    let next = table.serial_last[col] + 1;
+    let bound_error = |what: &'static str| {
+        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", what)
+    };
+    let out = match ctype {
         ColType::Int8 => Datum::Int8(next),
-        ColType::Int2 => Datum::Int2(next as i16),
-        _ => Datum::Int4(next as i32),
-    }
+        ColType::Int2 => {
+            Datum::Int2(i16::try_from(next).map_err(|_| bound_error("smallint"))?)
+        }
+        _ => Datum::Int4(i32::try_from(next).map_err(|_| bound_error("integer"))?),
+    };
+    table.serial_last[col] = next;
+    table.serial_dirty = true;
+    Ok(out)
 }
 
 /// Finds an existing visible row that conflicts with the candidate on a
@@ -607,25 +598,27 @@ fn handle_conflict(
     Ok(ConflictOutcome::Updated)
 }
 
-/// Assigns each omitted/defaulted auto-increment column its next value.
+/// Assigns each omitted/defaulted auto-increment column its next value. A
+/// column the statement set *explicitly* — even to NULL — is left alone, so
+/// an explicit NULL falls through to the not-null check exactly as PostgreSQL
+/// rejects it, and an explicit value never advances the sequence.
 fn fill_auto_increment(
-    storage: &Storage,
+    storage: &mut Storage,
     table_index: usize,
     def: &TableDef,
     values: &mut [Datum],
-    txid: u32,
-) {
+    explicit: &[bool; MAX_COLUMNS],
+) -> Result<(), SqlError> {
     if !def.columns().iter().any(|c| c.auto_increment) {
-        return;
+        return Ok(());
     }
-    let mut sch = [ColType::Bool; MAX_COLUMNS];
-    def.schema(&mut sch);
-    for (i, col) in def.columns().iter().enumerate() {
-        if col.auto_increment && values[i].is_null() {
-            values[i] =
-                next_auto_value(storage, table_index, i, col.ctype, &sch[..def.n_columns], txid);
+    for i in 0..def.n_columns {
+        let col = &def.columns()[i];
+        if col.auto_increment && !explicit[i] && values[i].is_null() {
+            values[i] = next_auto_value(storage, table_index, i, col.ctype)?;
         }
     }
+    Ok(())
 }
 
 
@@ -1009,6 +1002,7 @@ pub fn insert(
                     values[i] = d.as_datum();
                 }
             }
+            let mut explicit = [false; MAX_COLUMNS];
             for i in 0..n_src {
                 let v = decode_projected_pub(bytes, i);
                 let col = &def.columns()[targets[i]];
@@ -1016,8 +1010,11 @@ pub fn insert(
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
+                explicit[targets[i]] = true;
             }
-            fill_auto_increment(storage, table_index, &def, &mut values, txn.txid);
+            if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
+                return sql_fail(e);
+            }
             if let Err(e) = check_not_null(&def, &values) {
                 return sql_fail(e);
             }
@@ -1077,6 +1074,7 @@ pub fn insert(
                 values[i] = d.as_datum();
             }
         }
+        let mut explicit = [false; MAX_COLUMNS];
         for (i, expression) in row_exprs.iter().enumerate() {
             if matches!(expression, Expr::DefaultMarker) {
                 continue; // keep the default already in place
@@ -1090,8 +1088,11 @@ pub fn insert(
                 Ok(v) => values[targets[i]] = v,
                 Err(e) => return sql_fail(e),
             }
+            explicit[targets[i]] = true;
         }
-        fill_auto_increment(storage, table_index, &def, &mut values, txn.txid);
+        if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
+            return sql_fail(e);
+        }
         if let Err(e) = check_not_null(&def, &values) {
             return sql_fail(e);
         }
@@ -1520,6 +1521,148 @@ pub fn delete(
     responder.command_complete(tag.as_str())?;
     sql_ok()
 }
+
+/// TRUNCATE: removes every visible row of the listed tables through the
+/// transactional delete machinery (so a rolled-back TRUNCATE restores them),
+/// with PostgreSQL's structural foreign-key rule — a table referenced by a
+/// table outside the list cannot be truncated; CASCADE pulls the referencing
+/// tables in transitively, with a NOTICE per addition. RESTART IDENTITY
+/// resets each serial column's sequence, transactionally (an undo entry
+/// restores the prior position on rollback).
+pub fn truncate(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    tables: &[&str],
+    restart_identity: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    // Resolve the listed tables (views are not truncatable).
+    let mut list: [usize; MAX_TRUNCATE_TABLES] = [0; MAX_TRUNCATE_TABLES];
+    let mut n = 0usize;
+    for name in tables {
+        if storage.find_view(name, txn.txid).is_some() {
+            return sql_fail(sql_err!(
+                crate::sql::eval::sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a table",
+                name
+            ));
+        }
+        let Some(index) = storage.find_visible(name, txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "relation \"{}\" does not exist",
+                name
+            ));
+        };
+        if !list[..n].contains(&index) {
+            if n == MAX_TRUNCATE_TABLES {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many tables in TRUNCATE"
+                ));
+            }
+            list[n] = index;
+            n += 1;
+        }
+    }
+    // Foreign-key closure: a table outside the list referencing a listed one
+    // blocks the truncate — or joins it under CASCADE.
+    loop {
+        let mut grew = false;
+        for other in 0..storage.table_count() {
+            if !storage.table(other).live || list[..n].contains(&other) {
+                continue;
+            }
+            let refs_listed = storage.table(other).def.fkeys().iter().any(|fk| {
+                list[..n]
+                    .iter()
+                    .any(|&t| storage.table(t).def.name.as_str() == fk.parent.as_str())
+            });
+            if !refs_listed {
+                continue;
+            }
+            if !cascade {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot truncate a table referenced in a foreign key constraint"
+                ));
+            }
+            if n == MAX_TRUNCATE_TABLES {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many tables in TRUNCATE"
+                ));
+            }
+            let name = storage.table(other).def.name;
+            responder.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(160, "truncate cascades to table \"{}\"", name.as_str()).as_str(),
+            )?;
+            list[n] = other;
+            n += 1;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    // Remove every visible row, transactionally.
+    for &table_index in &list[..n] {
+        let mut rowids: [u64; 4096] = [0; 4096];
+        loop {
+            let mut count = 0usize;
+            for (rowid, state) in storage.table(table_index).rows.iter() {
+                if state.visible_to(txn.txid).is_none() {
+                    continue;
+                }
+                if count == rowids.len() {
+                    break;
+                }
+                rowids[count] = *rowid;
+                count += 1;
+            }
+            if count == 0 {
+                break;
+            }
+            for &rowid in &rowids[..count] {
+                match storage.write_pending(table_index, rowid, txn.txid, None) {
+                    Ok(prior) => {
+                        if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
+                            storage.restore_pending(table_index, rowid, txn.txid, prior);
+                            return sql_fail(e);
+                        }
+                    }
+                    Err(e) => return sql_fail(e),
+                }
+            }
+        }
+        if restart_identity {
+            let def = storage.table(table_index).def;
+            for c in 0..def.n_columns {
+                if !def.columns()[c].auto_increment {
+                    continue;
+                }
+                let prior = storage.table(table_index).serial_last[c];
+                if let Err(e) = txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
+                    table: table_index as u32,
+                    column: c as u16,
+                    prior,
+                }) {
+                    return sql_fail(e);
+                }
+                let t = storage.table_mut(table_index);
+                t.serial_last[c] = 0;
+                t.serial_dirty = true;
+            }
+        }
+    }
+    responder.command_complete("TRUNCATE TABLE")?;
+    sql_ok()
+}
+
+/// The most tables one TRUNCATE can name, its CASCADE closure included.
+const MAX_TRUNCATE_TABLES: usize = 16;
 
 /// ALTER TABLE, autocommit-only: rewrites are journaled as DROP, CREATE,
 /// full re-UPSERT within one WAL batch, so replay reproduces the new
@@ -2228,8 +2371,9 @@ fn check_not_null(def: &TableDef, values: &[Datum]) -> Result<(), SqlError> {
         if c.not_null && values[i].is_null() {
             return Err(sql_err!(
                 sqlstate::NOT_NULL_VIOLATION,
-                "null value in column \"{}\" violates not-null constraint",
-                c.name.as_str()
+                "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                c.name.as_str(),
+                def.name.as_str()
             ));
         }
     }

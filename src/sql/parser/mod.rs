@@ -267,6 +267,52 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
+    /// [CASCADE | RESTRICT]. ONLY and `*` are accepted and meaningless here
+    /// (no inheritance).
+    fn truncate(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.advance()?; // truncate
+        let _ = self.eat_ident("table")?;
+        let mut names: [&'a str; 16] = [""; 16];
+        let mut n = 0usize;
+        loop {
+            let _ = self.eat_ident("only")?;
+            if n == names.len() {
+                return Err(self.err_here("too many tables in TRUNCATE"));
+            }
+            names[n] = self.col_ident("table name")?;
+            n += 1;
+            if self.peeked == Tok::Op("*") {
+                self.advance()?;
+            }
+            if self.peeked == Tok::Op(",") {
+                self.advance()?;
+                continue;
+            }
+            break;
+        }
+        let restart_identity = if self.eat_ident("restart")? {
+            self.expect_ident("identity")?;
+            true
+        } else {
+            if self.eat_ident("continue")? {
+                self.expect_ident("identity")?;
+            }
+            false
+        };
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        let tables = self
+            .arena
+            .alloc_slice_copy(&names[..n])
+            .map_err(|_| self.err_here("statement too large"))?;
+        Ok(Stmt::Truncate { tables, restart_identity, cascade })
+    }
+
     fn statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         match self.peeked {
             Tok::Ident("select") | Tok::Op("(") => self.query(),
@@ -276,6 +322,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("insert") => self.insert(),
             Tok::Ident("update") => self.update(),
             Tok::Ident("delete") => self.delete(),
+            Tok::Ident("truncate") => self.truncate(),
             Tok::Ident("begin") => {
                 self.advance()?;
                 self.skip_transaction_modifiers()?;

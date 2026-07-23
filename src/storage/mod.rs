@@ -491,6 +491,14 @@ pub struct Table {
     pub pending_ddl: Option<PendingDdl>,
     /// Changed since the last checkpoint (drives delta checkpoints).
     pub dirty: bool,
+    /// Per-column sequence state for serial/identity columns: the last value
+    /// a *default* assignment handed out. PostgreSQL's sequence, not a max
+    /// scan — explicit inserts do not advance it, deletes and TRUNCATE
+    /// (without RESTART IDENTITY) do not rewind it, and a rolled-back insert
+    /// still consumes its number.
+    pub serial_last: [i64; MAX_COLUMNS],
+    /// Whether `serial_last` changed since it was last written to the WAL.
+    pub serial_dirty: bool,
 }
 
 /// An uncommitted catalog change to one table, owned by one transaction.
@@ -629,6 +637,8 @@ impl Storage {
                     live: false,
                     pending_ddl: None,
                     dirty: false,
+                    serial_last: [0; MAX_COLUMNS],
+                    serial_dirty: false,
                 })
                 .expect("sized to max_tables");
         }
@@ -673,6 +683,55 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(|(_, t)| t.live)
+    }
+
+    /// Floors every serial column's sequence at the maximum value stored in
+    /// its rows. Run once after recovery: a journal or checkpoint written
+    /// before sequences were journaled carries no positions, and handing out
+    /// a value at or below an existing row's would violate the key.
+    pub fn reconcile_serials(&mut self) {
+        for i in 0..self.tables.len() {
+            if !self.tables[i].live {
+                continue;
+            }
+            let n_columns = self.tables[i].def.n_columns;
+            let mut auto = [false; MAX_COLUMNS];
+            let mut any = false;
+            for (c, slot) in auto.iter_mut().enumerate().take(n_columns) {
+                *slot = self.tables[i].def.columns()[c].auto_increment;
+                any |= *slot;
+            }
+            if !any {
+                continue;
+            }
+            let mut schema = [crate::sql::types::ColType::Bool; MAX_COLUMNS];
+            self.tables[i].def.schema(&mut schema);
+            let mut max = [0i64; MAX_COLUMNS];
+            for (_, state) in self.tables[i].rows.iter() {
+                let Some(loc) = state.visible_to(0) else { continue };
+                let mut row = [crate::sql::types::Datum::Null; MAX_COLUMNS];
+                if rowenc::decode(self.heap.get(loc), &schema[..n_columns], &mut row).is_err() {
+                    continue;
+                }
+                for c in 0..n_columns {
+                    if !auto[c] {
+                        continue;
+                    }
+                    let v = match row[c] {
+                        crate::sql::types::Datum::Int2(x) => i64::from(x),
+                        crate::sql::types::Datum::Int4(x) => i64::from(x),
+                        crate::sql::types::Datum::Int8(x) => x,
+                        _ => continue,
+                    };
+                    max[c] = max[c].max(v);
+                }
+            }
+            for c in 0..n_columns {
+                if auto[c] {
+                    self.tables[i].serial_last[c] = self.tables[i].serial_last[c].max(max[c]);
+                }
+            }
+        }
     }
 
     pub fn table_count(&self) -> usize {
@@ -892,6 +951,9 @@ impl Storage {
         table.live = pending.is_none();
         table.pending_ddl = pending;
         table.dirty = true;
+        // A reused slot must not inherit the dropped table's sequences.
+        table.serial_last = [0; MAX_COLUMNS];
+        table.serial_dirty = false;
         Ok(slot)
     }
 

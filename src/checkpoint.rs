@@ -221,15 +221,17 @@ impl Checkpointer {
         let mut next_rowid = 1u64;
         // manifest table index → live slot index
         let mut slot_of: Vec<Option<usize>> = Vec::new();
-        let mut pending_def: Option<(usize, TableDef, usize)> = None; // (mindex, def, cols_seen)
+        // (mindex, def, cols_seen, per-column sequence positions)
+        let mut pending_def: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])> =
+            None;
         let mut ssts: Vec<(String, usize, u64, u64, u32)> = Vec::new();
         let mut saw_end = false;
 
         let finish_pending = |storage: &mut Storage,
                               slot_of: &mut Vec<Option<usize>>,
-                              pending: Option<(usize, TableDef, usize)>|
+                              pending: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])>|
          -> Result<(), CheckpointSetupError> {
-            if let Some((mindex, def, seen)) = pending {
+            if let Some((mindex, def, seen, serials)) = pending {
                 if seen != def.n_columns {
                     return Err(CheckpointSetupError::Corrupt("manifest column count mismatch"));
                 }
@@ -239,6 +241,7 @@ impl Checkpointer {
                         "manifest table rejected: {}",
                         e.message.as_str()
                     )))?;
+                storage.table_mut(slot).serial_last = serials;
                 if slot_of.len() <= mindex {
                     slot_of.resize(mindex + 1, None);
                 }
@@ -270,10 +273,10 @@ impl Checkpointer {
                         n_columns: n_cols,
                         ..TableDef::empty()
                     };
-                    pending_def = Some((mindex, def, 0));
+                    pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
                 }
                 Some("col") => {
-                    let Some((_, def, seen)) = pending_def.as_mut() else {
+                    let Some((_, def, seen, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
                     let type_code: u8 = parse_field(words.next(), "col type")?;
@@ -299,8 +302,19 @@ impl Checkpointer {
                     };
                     *seen += 1;
                 }
+                Some("seq") => {
+                    let Some((_, _, _, serials)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("seq outside table"));
+                    };
+                    let column: usize = parse_field(words.next(), "seq column")?;
+                    let last: i64 = parse_field(words.next(), "seq last")?;
+                    if column >= crate::storage::MAX_COLUMNS {
+                        return Err(CheckpointSetupError::Corrupt("seq column out of range"));
+                    }
+                    serials[column] = last;
+                }
                 Some("ukey") => {
-                    let Some((_, def, _)) = pending_def.as_mut() else {
+                    let Some((_, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("ukey outside table"));
                     };
                     if def.n_uniques >= crate::storage::MAX_UNIQUES {
@@ -326,7 +340,7 @@ impl Checkpointer {
                     def.n_uniques += 1;
                 }
                 Some("chk") => {
-                    let Some((_, def, _)) = pending_def.as_mut() else {
+                    let Some((_, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("chk outside table"));
                     };
                     if def.n_checks >= crate::storage::MAX_CHECKS {
@@ -351,7 +365,7 @@ impl Checkpointer {
                     def.n_checks += 1;
                 }
                 Some("fkey") => {
-                    let Some((_, def, _)) = pending_def.as_mut() else {
+                    let Some((_, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("fkey outside table"));
                     };
                     if def.n_fkeys >= crate::storage::MAX_FKEYS {
@@ -661,6 +675,14 @@ impl Checkpointer {
                         c.name.as_str()
                     ),
                 )?;
+            }
+            for (ci, c) in table.def.columns().iter().enumerate() {
+                if c.auto_increment {
+                    write_manifest(
+                        &mut self.manifest_buf,
+                        format_args!("seq {ci} {}", table.serial_last[ci]),
+                    )?;
+                }
             }
             // Constraint lines (hex-encoded names/text tolerate spaces):
             // `ukey <is_primary> <ncols> <c0..cN> <hex-name>`

@@ -319,10 +319,23 @@ refinements rather than correctness gaps.
 
 With that, Stage C's read path is complete: a point lookup is filter → index →
 one data block, a range scan streams the covering blocks, and both are proven to
-touch only the blocks they must. What remains before the SST is load-bearing is
-routing the checkpoint and cold-start paths through `store::sst` instead of the
-whole-object reader they use today — the step where storage stops being additive
-and touches durability.
+touch only the blocks they must. **The SST is now load-bearing.** The checkpoint
+writes every table through `SstWriter` into content-addressed blocks under
+`blocks/` — data, sparse index, bloom filter, and a *roster* block listing every
+identity the SST comprises, so the garbage sweeper enumerates an SST by one read
+instead of walking its data. Cold start scans each SST block-wise through the
+tiered stack (`block_cache_bytes` RAM frames over the `disk_cache_bytes` slot
+file over the bucket — the two config knobs finally wired, sized in `StackPlan`
+and refused when under one block), and the write path populates the tiers on the
+way out. Rows larger than one block's payload chain through overflow blocks
+(head entry carries the chain identities; bounded at ~4 MiB per row, loudly).
+The manifest names each SST by its root identities (`bsst` lines); manifests
+from before the block grid still load, their whole-object SSTs rewritten as
+block SSTs by the next checkpoint and swept. The full external harness — kill
+-9 recovery, async-WAL rebuild, checkpointed cold start from a wiped disk —
+passes over the block path, and the fidelity suites are untouched by
+construction. What remains of Stage C proper: the multi-block index and a sized
+filter, both refinements.
 
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 

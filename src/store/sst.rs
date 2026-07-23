@@ -33,10 +33,31 @@ use super::{BlockId, BlockStore, BlockType, StoreError, MAX_PAYLOAD};
 pub(crate) struct SstHandle {
     pub(crate) index: BlockId,
     pub(crate) filter: BlockId,
+    /// The SST's complete block roster: every identity it comprises (data,
+    /// chain, filter, index), so garbage collection can enumerate an SST by
+    /// reading one block instead of all of them.
+    pub(crate) roster: BlockId,
 }
 
 /// `rowid` u64 | `len` u32, then the row bytes — one row inside a data block.
+/// `len`'s high bit marks a *chained* entry: a row too large for one block,
+/// whose payload continues in overflow blocks. The masked low bits are the
+/// row's total length; the entry body is then `n_chunks` u16, the overflow
+/// blocks' identities, and the head chunk inline.
 const ENTRY_HEADER: usize = 12;
+
+/// High bit of the entry length: the row continues in overflow blocks.
+const CHAIN_FLAG: u32 = 1 << 31;
+
+/// The largest assembled row a reader's scan scratch admits: the chained
+/// head chunk plus every overflow block.
+pub(crate) const MAX_ASSEMBLED: usize =
+    (MAX_PAYLOAD - ENTRY_HEADER - 2 - MAX_CHAIN * 32) + MAX_CHAIN * MAX_PAYLOAD;
+
+/// The most overflow blocks one chained row may span. With ~256 KiB blocks
+/// this caps a single row at about 4 MiB — far above anything the engine's
+/// arenas admit — and exceeding it is a loud error, never truncation.
+const MAX_CHAIN: usize = 16;
 
 /// `first_rowid` u64 | `block_id` [u8; 32] — one data block's index entry.
 const INDEX_ENTRY: usize = 8 + 32;
@@ -46,12 +67,16 @@ const INDEX_ENTRY: usize = 8 + 32;
 /// rather than silently overrun.
 const MAX_DATA_BLOCKS: usize = MAX_PAYLOAD / INDEX_ENTRY;
 
+/// The most block identities one roster block can list — and so the most
+/// blocks one SST may comprise. Checked and raised, never overrun.
+const MAX_ROSTER: usize = MAX_PAYLOAD / 32;
+
 /// Building an SST failed. Distinct from [`StoreError`] because these are the
 /// writer's own limits (a row too big for a block, more blocks than the index
 /// can hold), not the store's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SstError {
-    /// A single row does not fit in a data block.
+    /// A single row exceeds even the chained-row bound (`MAX_CHAIN` blocks).
     RowTooLarge,
     /// More data blocks than one index block can point at.
     TooManyBlocks,
@@ -90,6 +115,10 @@ pub(crate) struct SstWriter<'a> {
     /// The filter's bit array, one key set into it per append. It becomes the
     /// filter block at finish.
     filter: &'a mut [u8],
+    /// Every block identity written so far (data and chain blocks), for the
+    /// roster.
+    roster: &'a mut [BlockId],
+    roster_len: usize,
 }
 
 impl<'a> SstWriter<'a> {
@@ -103,6 +132,9 @@ impl<'a> SstWriter<'a> {
         let filter = arena
             .alloc_slice_with(FILTER_BYTES, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
+        let roster = arena
+            .alloc_slice_with(MAX_ROSTER, |_| BlockId([0u8; 32]))
+            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
         Ok(Self {
             pending,
             pending_len: 0,
@@ -111,6 +143,8 @@ impl<'a> SstWriter<'a> {
             index_len: 0,
             last_key: None,
             filter,
+            roster,
+            roster_len: 0,
         })
     }
 
@@ -123,14 +157,14 @@ impl<'a> SstWriter<'a> {
         rowid: u64,
         row: &[u8],
     ) -> Result<(), SstError> {
-        let entry = ENTRY_HEADER + row.len();
-        if entry > MAX_PAYLOAD {
-            return Err(SstError::RowTooLarge);
-        }
         if let Some(last) = self.last_key
             && rowid <= last
         {
             return Err(SstError::KeyOutOfOrder);
+        }
+        let entry = ENTRY_HEADER + row.len();
+        if entry > MAX_PAYLOAD {
+            return self.append_chained(store, rowid, row);
         }
         if self.pending_len + entry > MAX_PAYLOAD {
             self.flush_data(store)?;
@@ -148,6 +182,59 @@ impl<'a> SstWriter<'a> {
         Ok(())
     }
 
+    /// A row too large for one block: its tail is written as overflow blocks
+    /// first (so their identities are known), then a head entry — alone in its
+    /// own data block — carries the chain's identities and the leading chunk.
+    fn append_chained(
+        &mut self,
+        store: &mut dyn BlockStore,
+        rowid: u64,
+        row: &[u8],
+    ) -> Result<(), SstError> {
+        // The head block holds the entry header, the chunk count, up to
+        // MAX_CHAIN identities, and the head chunk; overflow blocks are raw.
+        let head_room = MAX_PAYLOAD - ENTRY_HEADER - 2 - MAX_CHAIN * 32;
+        let tail = &row[head_room..];
+        let n_chunks = tail.len().div_ceil(MAX_PAYLOAD);
+        if n_chunks > MAX_CHAIN {
+            return Err(SstError::RowTooLarge);
+        }
+        // The head entry gets a block of its own so the chain bookkeeping
+        // never shares space with packed rows.
+        self.flush_data(store)?;
+        let mut ids = [BlockId([0u8; 32]); MAX_CHAIN];
+        for (i, chunk) in tail.chunks(MAX_PAYLOAD).enumerate() {
+            ids[i] = store.put(chunk, BlockType::SstData, 0)?;
+            self.record(ids[i])?;
+        }
+        let at = 0usize;
+        self.pending[at..at + 8].copy_from_slice(&rowid.to_le_bytes());
+        self.pending[at + 8..at + 12]
+            .copy_from_slice(&((row.len() as u32) | CHAIN_FLAG).to_le_bytes());
+        let mut cursor = ENTRY_HEADER;
+        self.pending[cursor..cursor + 2].copy_from_slice(&(n_chunks as u16).to_le_bytes());
+        cursor += 2;
+        for id in &ids[..n_chunks] {
+            self.pending[cursor..cursor + 32].copy_from_slice(&id.0);
+            cursor += 32;
+        }
+        self.pending[cursor..cursor + head_room].copy_from_slice(&row[..head_room]);
+        self.pending_len = cursor + head_room;
+        self.pending_first = Some(rowid);
+        self.last_key = Some(rowid);
+        bloom::insert(self.filter, rowid);
+        self.flush_data(store)
+    }
+
+    fn record(&mut self, id: BlockId) -> Result<(), SstError> {
+        if self.roster_len == MAX_ROSTER {
+            return Err(SstError::TooManyBlocks);
+        }
+        self.roster[self.roster_len] = id;
+        self.roster_len += 1;
+        Ok(())
+    }
+
     fn flush_data(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
         if self.pending_len == 0 {
             return Ok(());
@@ -157,6 +244,7 @@ impl<'a> SstWriter<'a> {
         }
         let first = self.pending_first.expect("a non-empty block has a first key");
         let id = store.put(&self.pending[..self.pending_len], BlockType::SstData, 0)?;
+        self.record(id)?;
         self.index[self.index_len] = (first, id);
         self.index_len += 1;
         self.pending_len = 0;
@@ -177,6 +265,7 @@ impl<'a> SstWriter<'a> {
         }
         // The filter block, so a reader can skip this SST without the index.
         let filter = store.put(self.filter, BlockType::SstFilter, 0)?;
+        self.record(filter)?;
         // The index block: count, then (first_rowid, block_id) per data block.
         let bytes = 4 + self.index_len * INDEX_ENTRY;
         let buffer = &mut *self.pending; // reuse the data scratch; it is done with
@@ -187,7 +276,21 @@ impl<'a> SstWriter<'a> {
             buffer[at + 8..at + INDEX_ENTRY].copy_from_slice(&id.0);
         }
         let index = store.put(&buffer[..bytes], BlockType::SstIndex, 0)?;
-        Ok(Some(SstHandle { index, filter }))
+        if self.roster_len == MAX_ROSTER {
+            return Err(SstError::TooManyBlocks);
+        }
+        self.roster[self.roster_len] = index;
+        self.roster_len += 1;
+        // The roster last: every identity this SST comprises, so a sweeper
+        // enumerates the SST by one read. It cannot list itself — its own
+        // identity is a hash of its contents — so the sweeper keeps the
+        // roster alive through the handle that names it.
+        let roster_bytes = self.roster_len * 32;
+        for (i, id) in self.roster[..self.roster_len].iter().enumerate() {
+            buffer[i * 32..i * 32 + 32].copy_from_slice(&id.0);
+        }
+        let roster = store.put(&buffer[..roster_bytes], BlockType::SstRoster, 0)?;
+        Ok(Some(SstHandle { index, filter, roster }))
     }
 }
 
@@ -197,6 +300,9 @@ impl<'a> SstWriter<'a> {
 pub(crate) struct SstReader<'a> {
     index_scratch: &'a mut [u8],
     data_scratch: &'a mut [u8],
+    /// Scratch a range scan assembles a chained row into (a point lookup
+    /// assembles straight into the caller's buffer instead).
+    assembly: &'a mut [u8],
 }
 
 impl<'a> SstReader<'a> {
@@ -207,7 +313,10 @@ impl<'a> SstReader<'a> {
         let data_scratch = arena
             .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        Ok(Self { index_scratch, data_scratch })
+        let assembly = arena
+            .alloc_slice_with(MAX_ASSEMBLED, |_| 0u8)
+            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
+        Ok(Self { index_scratch, data_scratch, assembly })
     }
 
     /// Finds `rowid`, copying its row into `into` and returning the length, or
@@ -238,20 +347,27 @@ impl<'a> SstReader<'a> {
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
         let data_len = store.get(&block_id, self.data_scratch)?;
+        let mut found: Option<(usize, bool)> = None;
         for entry in DataBlock(&self.data_scratch[..data_len]) {
             if entry.key == rowid {
-                if into.len() < entry.row.len() {
-                    return Err(SstError::Store(StoreError::BufferTooSmall));
+                if entry.is_chained() {
+                    assemble_chain(store, &entry, into)?;
+                    found = Some((entry.total_len, true));
+                } else {
+                    if into.len() < entry.total_len {
+                        return Err(SstError::Store(StoreError::BufferTooSmall));
+                    }
+                    into[..entry.total_len].copy_from_slice(entry.head);
+                    found = Some((entry.total_len, false));
                 }
-                into[..entry.row.len()].copy_from_slice(entry.row);
-                return Ok(Some(entry.row.len()));
+                break;
             }
             // Rows are ascending, so once past the target it is not here.
             if entry.key > rowid {
                 break;
             }
         }
-        Ok(None)
+        Ok(found.map(|(n, _)| n))
     }
 
     /// Streams every row whose key is in `[lo, hi]`, in key order, to `emit`.
@@ -280,14 +396,26 @@ impl<'a> SstReader<'a> {
             let block_id = block_id_at(self.index_scratch, entry_index);
             let data_len = store.get(&block_id, self.data_scratch)?;
             let mut ran_past = false;
+            // A chained entry owns its whole block, so at most one assembly
+            // happens per block and the borrow of `data_scratch` has ended by
+            // the time the chain's overflow blocks are read.
+            let mut chained: Option<(u64, usize)> = None;
             for entry in DataBlock(&self.data_scratch[..data_len]) {
                 if entry.key > hi {
                     ran_past = true;
                     break;
                 }
                 if entry.key >= lo {
-                    emit(entry.key, entry.row);
+                    if entry.is_chained() {
+                        assemble_chain(store, &entry, self.assembly)?;
+                        chained = Some((entry.key, entry.total_len));
+                        break;
+                    }
+                    emit(entry.key, entry.head);
                 }
+            }
+            if let Some((key, n)) = chained {
+                emit(key, &self.assembly[..n]);
             }
             // A block ending past `hi` bounds the scan: later blocks hold only
             // larger keys, so none of them can be in range.
@@ -335,10 +463,21 @@ fn block_id_at(index: &[u8], i: usize) -> BlockId {
     BlockId(id)
 }
 
-/// One row read out of a data block.
+/// One row read out of a data block. For an ordinary entry `head` is the
+/// whole row and `chain` is empty; a chained entry's `head` is the leading
+/// chunk and `chain` the overflow blocks' identities (32 bytes each), with
+/// `total_len` the assembled row's length.
 struct DataEntry<'a> {
     key: u64,
-    row: &'a [u8],
+    total_len: usize,
+    head: &'a [u8],
+    chain: &'a [u8],
+}
+
+impl DataEntry<'_> {
+    fn is_chained(&self) -> bool {
+        !self.chain.is_empty()
+    }
 }
 
 /// Iterates the `(key, len, row)` entries packed in a data block, in the key
@@ -355,13 +494,62 @@ impl<'a> Iterator for DataBlock<'a> {
             return None;
         }
         let key = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let raw_len = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        if raw_len & CHAIN_FLAG != 0 {
+            // A chained head fills the rest of its block: count, identities,
+            // then the leading chunk.
+            let total_len = (raw_len & !CHAIN_FLAG) as usize;
+            let body = &data[ENTRY_HEADER..];
+            if body.len() < 2 {
+                return None;
+            }
+            let n_chunks = u16::from_le_bytes(body[0..2].try_into().unwrap()) as usize;
+            if n_chunks > MAX_CHAIN || body.len() < 2 + n_chunks * 32 {
+                return None;
+            }
+            let chain = &body[2..2 + n_chunks * 32];
+            let head = &body[2 + n_chunks * 32..];
+            self.0 = &[];
+            return Some(DataEntry { key, total_len, head, chain });
+        }
+        let len = raw_len as usize;
         if data.len() < ENTRY_HEADER + len {
             return None;
         }
         self.0 = &data[ENTRY_HEADER + len..];
-        Some(DataEntry { key, row: &data[ENTRY_HEADER..ENTRY_HEADER + len] })
+        Some(DataEntry {
+            key,
+            total_len: len,
+            head: &data[ENTRY_HEADER..ENTRY_HEADER + len],
+            chain: &[],
+        })
     }
+}
+
+/// Copies a chained entry's row into `into`: the inline head chunk, then each
+/// overflow block in order. `into` must hold `total_len` bytes.
+fn assemble_chain(
+    store: &mut dyn BlockStore,
+    entry: &DataEntry<'_>,
+    into: &mut [u8],
+) -> Result<(), SstError> {
+    if into.len() < entry.total_len {
+        return Err(SstError::Store(StoreError::BufferTooSmall));
+    }
+    into[..entry.head.len()].copy_from_slice(entry.head);
+    let mut at = entry.head.len();
+    for id_bytes in entry.chain.chunks(32) {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(id_bytes);
+        let n = store.get(&BlockId(id), &mut into[at..])?;
+        at += n;
+    }
+    if at != entry.total_len {
+        return Err(SstError::Store(StoreError::Corrupt(
+            super::BlockError::Truncated,
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -489,11 +677,38 @@ mod tests {
     }
 
     #[test]
-    fn a_row_too_large_for_a_block_is_refused() {
+    fn a_row_larger_than_a_block_chains_and_round_trips() {
+        // A row past one block's payload spans overflow blocks and reads back
+        // byte-identical, by point lookup and by scan, with ordinary rows on
+        // both sides of it.
         let (_b, mut s) = store();
-        let a = arena();
+        let a = Arena::new(&mut Budget::new(64 << 20), "sst chain", 16 << 20).expect("arena");
         let mut w = SstWriter::new(&a).unwrap();
-        let huge = vec![0u8; MAX_PAYLOAD];
+        let huge: Vec<u8> = (0..MAX_PAYLOAD + 50_000).map(|i| (i * 31 % 251) as u8).collect();
+        w.append(&mut s, 1, &[7u8; 40]).unwrap();
+        w.append(&mut s, 2, &huge).unwrap();
+        w.append(&mut s, 3, &[8u8; 40]).unwrap();
+        let root = w.finish(&mut s).unwrap().expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        let mut out = vec![0u8; MAX_ASSEMBLED];
+        let n = r.get(&mut s, &root, 2, &mut out).unwrap().expect("found");
+        assert_eq!(&out[..n], &huge[..], "chained row round-trips by get");
+        let mut seen = Vec::new();
+        r.scan(&mut s, &root, 0, u64::MAX, &mut |k, row| seen.push((k, row.to_vec())))
+            .unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[1].0, 2);
+        assert_eq!(seen[1].1, huge, "chained row round-trips by scan");
+        assert_eq!(seen[0].1, vec![7u8; 40]);
+        assert_eq!(seen[2].1, vec![8u8; 40]);
+    }
+
+    #[test]
+    fn a_row_beyond_the_chain_bound_is_refused() {
+        let (_b, mut s) = store();
+        let a = Arena::new(&mut Budget::new(96 << 20), "sst chain", 64 << 20).expect("arena");
+        let mut w = SstWriter::new(&a).unwrap();
+        let huge = vec![0u8; MAX_ASSEMBLED + MAX_PAYLOAD];
         assert_eq!(w.append(&mut s, 1, &huge).err(), Some(SstError::RowTooLarge));
     }
 

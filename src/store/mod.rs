@@ -25,6 +25,7 @@
 // here would be unfulfilled in the test build and fail it.
 #![allow(dead_code)]
 
+mod bloom;
 mod cache;
 mod disk;
 mod memory;

@@ -87,17 +87,14 @@ struct Catalog {
 }
 
 std::thread_local! {
-    static CACHE: RefCell<Cache> = const {
-        RefCell::new(Cache {
-            names: [StackStr::new(); MAX_CACHED],
-            zones: [EMPTY_ZONE; MAX_CACHED],
-            n: 0,
-            file_buf: [0; 64 * 1024],
-        })
-    };
-    static CATALOG: RefCell<Catalog> = const {
-        RefCell::new(Catalog { names: [StackStr::new(); MAX_CATALOG], n: 0 })
-    };
+    // Boxed, not inline: glibc places static TLS inside each thread's stack
+    // allocation, and half a megabyte of inline pools overflowed a 2 MiB test
+    // thread. The boxes are allocated in `init_catalog`, before the allocator
+    // freezes; a thread that never initialized (no zoneinfo, or the catalog
+    // was skipped) resolves nothing and lookup falls back to the embedded
+    // rules.
+    static CACHE: RefCell<Option<Box<Cache>>> = const { RefCell::new(None) };
+    static CATALOG: RefCell<Option<Box<Catalog>>> = const { RefCell::new(None) };
 }
 
 /// Walks the system zoneinfo directory into the name catalog. Called once at
@@ -108,11 +105,25 @@ pub fn init_catalog() {
     let root = std::path::Path::new(zoneinfo_root());
     CATALOG.with(|c| {
         let mut c = c.borrow_mut();
-        if c.n > 0 {
+        if c.is_some() {
             return;
         }
+        let mut catalog =
+            Box::new(Catalog { names: [StackStr::new(); MAX_CATALOG], n: 0 });
         let mut prefix = String::new();
-        walk(&mut c, root, &mut prefix);
+        walk(&mut catalog, root, &mut prefix);
+        *c = Some(catalog);
+    });
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.is_none() {
+            *c = Some(Box::new(Cache {
+                names: [StackStr::new(); MAX_CACHED],
+                zones: [EMPTY_ZONE; MAX_CACHED],
+                n: 0,
+                file_buf: [0; 64 * 1024],
+            }));
+        }
     });
 }
 
@@ -159,6 +170,7 @@ fn walk(catalog: &mut Catalog, dir: &std::path::Path, prefix: &mut String) {
 fn canonical_name(name: &str) -> Option<StackStr<48>> {
     CATALOG.with(|c| {
         let c = c.borrow();
+        let c = c.as_ref()?;
         c.names[..c.n]
             .iter()
             .find(|n| n.as_str().eq_ignore_ascii_case(name))
@@ -172,6 +184,7 @@ pub fn load(name: &str) -> Option<u16> {
     let canonical = canonical_name(name)?;
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
+        let cache = cache.as_mut()?;
         for i in 0..cache.n {
             if cache.names[i].as_str() == canonical.as_str() {
                 return Some(i as u16);
@@ -201,7 +214,7 @@ pub fn load(name: &str) -> Option<u16> {
             total
         };
         let slot = cache.n;
-        let Cache { zones, file_buf, .. } = &mut *cache;
+        let Cache { zones, file_buf, .. } = &mut **cache;
         if !parse_tzif(&file_buf[..n_read], &mut zones[slot]) {
             return None;
         }
@@ -217,6 +230,9 @@ pub fn load(name: &str) -> Option<u16> {
 pub fn resolve(slot: u16, utc_micros: i64) -> (i32, StackStr<8>) {
     CACHE.with(|cache| {
         let cache = cache.borrow();
+        let Some(cache) = cache.as_ref() else {
+            return (0, utc_abbrev());
+        };
         let Some(zone) = cache.zones.get(slot as usize) else {
             return (0, utc_abbrev());
         };

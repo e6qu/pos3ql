@@ -28,6 +28,13 @@ pub struct Parsed<'a> {
     pub upper_inc: bool,
 }
 
+/// PostgreSQL's value-less overflow, raised when an internal computation — the
+/// discrete increment that makes an inclusive upper bound exclusive — exceeds
+/// the element type, as distinct from a bad input value.
+fn int_overflow(target: &str) -> SqlError {
+    sql_err!("22003", "{} out of range", target)
+}
+
 /// A range literal that does not have the shape of a range — missing a bracket,
 /// the wrong number of comma-separated parts. PostgreSQL names neither the range
 /// type nor the element here, only that the literal is malformed.
@@ -285,9 +292,19 @@ fn alloc<'a>(arena: &'a Arena, s: &str) -> Result<&'a str, SqlError> {
 fn incr_into(v: &str, kind: RangeKind, buffer: &mut StackStr<48>) -> Result<(), SqlError> {
     buffer.clear();
     match kind {
-        RangeKind::Int4 | RangeKind::Int8 => {
-            let n: i64 = v.trim().parse().map_err(|_| bad_element(kind, v))?;
-            let _ = write!(buffer, "{}", n + 1);
+        RangeKind::Int4 => {
+            // The bound is already a validated element here; incrementing an
+            // inclusive INT_MAX upper to make it exclusive overflows the type,
+            // which PostgreSQL reports value-lessly, as an internal computation
+            // rather than a bad input value.
+            let n = super::eval::parse_int_bounded(v, i32::MIN as i64, i32::MAX as i64, "integer")?;
+            let next = i32::try_from(n + 1).map_err(|_| int_overflow("integer"))?;
+            let _ = write!(buffer, "{}", next);
+        }
+        RangeKind::Int8 => {
+            let n = super::eval::parse_int_bounded(v, i64::MIN, i64::MAX, "bigint")?;
+            let next = n.checked_add(1).ok_or_else(|| int_overflow("bigint"))?;
+            let _ = write!(buffer, "{}", next);
         }
         RangeKind::Date => {
             let d = super::datetime::parse_date(v.trim())?;
@@ -303,9 +320,14 @@ fn incr_into(v: &str, kind: RangeKind, buffer: &mut StackStr<48>) -> Result<(), 
 /// Compares two bound element texts under `kind`'s subtype ordering.
 fn cmp_elem(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
     Ok(match kind {
-        RangeKind::Int4 | RangeKind::Int8 => {
-            let x: i64 = a.trim().parse().map_err(|_| bad_element(kind, a))?;
-            let y: i64 = b.trim().parse().map_err(|_| bad_element(kind, b))?;
+        RangeKind::Int4 => {
+            let x = super::eval::parse_int_bounded(a, i32::MIN as i64, i32::MAX as i64, "integer")?;
+            let y = super::eval::parse_int_bounded(b, i32::MIN as i64, i32::MAX as i64, "integer")?;
+            x.cmp(&y)
+        }
+        RangeKind::Int8 => {
+            let x = super::eval::parse_int_bounded(a, i64::MIN, i64::MAX, "bigint")?;
+            let y = super::eval::parse_int_bounded(b, i64::MIN, i64::MAX, "bigint")?;
             x.cmp(&y)
         }
         RangeKind::Date => super::datetime::parse_date(a.trim())?
@@ -351,8 +373,12 @@ fn bound_datum<'a>(
 
 fn elem_datum<'a>(s: &str, kind: RangeKind, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     Ok(match kind {
-        RangeKind::Int4 => Datum::Int4(s.trim().parse().map_err(|_| bad_element(kind, s))?),
-        RangeKind::Int8 => Datum::Int8(s.trim().parse().map_err(|_| bad_element(kind, s))?),
+        RangeKind::Int4 => {
+            Datum::Int4(super::eval::parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer")? as i32)
+        }
+        RangeKind::Int8 => {
+            Datum::Int8(super::eval::parse_int_bounded(s, i64::MIN, i64::MAX, "bigint")?)
+        }
         RangeKind::Date => Datum::Date(super::datetime::parse_date(s.trim())?),
         RangeKind::Ts => Datum::Timestamp(super::datetime::parse_timestamp(s.trim(), false)?),
         RangeKind::Tstz => Datum::Timestamptz(super::datetime::parse_timestamp(s.trim(), true)?),

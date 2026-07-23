@@ -14,7 +14,9 @@ use super::types::{ColType, Datum};
 mod funcs;
 mod cast;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
-pub(crate) use cast::{cast_to_text, parse_bytea, parse_int_literal, parse_uuid, validate_bits};
+pub(crate) use cast::{
+    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_uuid, validate_bits,
+};
 
 mod operators;
 mod args;
@@ -2468,6 +2470,19 @@ fn as_f64(d: &Datum) -> Option<f64> {
 
 fn overflow(what: &'static str) -> SqlError {
     sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", what)
+}
+
+/// PostgreSQL's out-of-range error for a *text* value that names the value and
+/// the type — distinct from [`overflow`], which a value-to-value cast raises
+/// without a value. `'3000000000'::int4` gets this; `(big::int8)::int4` gets
+/// the other.
+pub(crate) fn out_of_range(value: &str, target: &'static str) -> SqlError {
+    sql_err!(
+        sqlstate::NUMERIC_OUT_OF_RANGE,
+        "value \"{}\" is out of range for type {}",
+        value,
+        target
+    )
 }
 
 fn division_by_zero() -> SqlError {

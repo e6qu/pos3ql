@@ -117,6 +117,38 @@ for f in $EXT/differential/*.sql; do
   fi
 done
 
+# Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,
+# which let five message-fidelity fixes ship guarded only by unit tests. These
+# corpora compare the full ERROR line — SQLSTATE and message text — dropping
+# only PostgreSQL's positional decorations (LINE/caret/HINT/...), which pos3ql
+# does not emit and which say where, not what.
+normalize_exact() {
+  sed -E \
+    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
+    -e 's/^ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
+    -e '/^LINE [0-9]+:/d' \
+    -e '/^ *\^ *$/d' \
+    -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|NOTICE|WARNING):/d'
+}
+
+run_exact() { # port name file
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
+    -v VERBOSITY=verbose -f "$3" 2>&1 | normalize_exact > "$WORK/$2"
+}
+
+print -- "\n=== exact-error corpora (message wording must match) ==="
+for f in $EXT/differential_exact/*.sql; do
+  name=$(basename "$f" .sql)
+  run_exact $PG_PORT "$name.pg" "$f"
+  run_exact $P3_PORT "$name.p3" "$f"
+  if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
+    ok "exact errors: $name"
+  else
+    bad "exact errors: $name"
+    head -30 "$WORK/$name.diff"
+  fi
+done
+
 print -- "\n=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==="
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
 if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then

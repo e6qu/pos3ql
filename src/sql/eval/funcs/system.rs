@@ -11,7 +11,7 @@
 use crate::sql::array;
 use crate::sql::ast::Expr;
 use crate::sql::exec;
-use crate::sql::types::{ArrElem, ColType, Datum};
+use crate::sql::types::{ArrElem, Datum, TypeMod};
 use crate::sql_err;
 use crate::stack_format;
 
@@ -195,39 +195,34 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Text("???"));
                 };
                 let name = coltype.name();
-                if type_mod < 0 {
-                    return Ok(Datum::Text(name));
-                }
-                // atttypmod is the declared modifier plus the 4-byte header:
-                // varchar(n)/char(n) carry `n`, numeric(p,s) packs `p` and `s`
-                // into the high and low halves, and the temporal types carry a
-                // precision that goes before the `with(out) time zone` tail.
-                let text = match coltype {
-                    ColType::Varchar | ColType::Bpchar | ColType::Bit { .. } => {
-                        stack_format!(64, "{}({})", name, type_mod - 4)
+                // The modifier is decoded once under the type's own encoding;
+                // the arms render meanings, not integer arithmetic.
+                let text = match TypeMod::decode(coltype, type_mod) {
+                    TypeMod::None => return Ok(Datum::Text(name)),
+                    TypeMod::Length(n) => stack_format!(64, "{}({})", name, n),
+                    TypeMod::NumericPS { precision, scale } => {
+                        stack_format!(64, "{}({},{})", name, precision, scale)
                     }
-                    ColType::Numeric => {
-                        let packed = type_mod - 4;
-                        stack_format!(64, "{}({},{})", name, (packed >> 16) & 0xffff, packed & 0xffff)
-                    }
-                    ColType::Time | ColType::Timetz | ColType::Timestamp | ColType::Timestamptz => {
-                        // The precision is the bare modifier, and it sits inside
-                        // the name before the time-zone tail —
-                        // `timestamp(3) without time zone`. The split finds the
-                        // tail for both spellings, since "without" begins "with".
+                    TypeMod::TemporalPrecision(p) => {
+                        // The precision sits inside the name, before the
+                        // time-zone tail — `timestamp(3) without time zone`. The
+                        // split finds the tail for both spellings, since
+                        // "without" begins "with".
                         match name.split_once(" with") {
                             Some((head, tail)) => {
-                                stack_format!(64, "{}({}) with{}", head, type_mod, tail)
+                                stack_format!(64, "{}({}) with{}", head, p, tail)
                             }
-                            None => stack_format!(64, "{}({})", name, type_mod),
+                            None => stack_format!(64, "{}({})", name, p),
                         }
                     }
-                    ColType::Interval => {
-                        // The precision is the low half of the packed modifier.
-                        stack_format!(64, "interval({})", type_mod & 0xffff)
+                    TypeMod::IntervalMod { precision: Some(p), .. } => {
+                        stack_format!(64, "interval({})", p)
                     }
-                    // Every other type ignores a modifier, as PostgreSQL does.
-                    _ => return Ok(Datum::Text(name)),
+                    // A range form with no precision renders bare; naming the
+                    // field range (`interval hour to minute`) is not built yet.
+                    TypeMod::IntervalMod { precision: None, .. } => {
+                        return Ok(Datum::Text(name))
+                    }
                 };
                 Ok(Datum::Text(arena.alloc_str(text.as_str()).map_err(|_| arena_full())?))
             }

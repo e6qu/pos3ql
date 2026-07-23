@@ -9,6 +9,7 @@ use crate::util::StackStr;
 
 use super::ast::*;
 use super::lexer::{LexError, Lexer, Tok};
+use super::types::{TypeMod, INTERVAL_FULL_RANGE};
 
 /// Names for the calls a desugaring produces, for syntax PostgreSQL does not
 /// also expose as a function. A space cannot appear in an identifier, so a
@@ -20,9 +21,6 @@ pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
 
 pub const MAX_LIST: usize = 64;
 
-/// PostgreSQL's INTERVAL_FULL_RANGE: the field-range mask a plain `interval(p)`
-/// carries in the high half of its atttypmod.
-pub(crate) const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
 pub const MAX_CTES: usize = 16;
 /// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
 pub const MAX_WINDOW_DEFS: usize = 16;
@@ -1530,7 +1528,7 @@ impl<'a> Parser<'a> {
                 if !(1..=10_485_760).contains(&nums[0]) {
                     return Err(self.unexpected("length for character type must be 1..10485760"));
                 }
-                Ok(nums[0] as i32 + 4)
+                Ok(TypeMod::Length(nums[0] as usize).encode())
             }
             "numeric" | "decimal" | "dec" => {
                 if n < 1 {
@@ -1544,7 +1542,7 @@ impl<'a> Parser<'a> {
                 if !(0..=p).contains(&s) {
                     return Err(self.unexpected("numeric scale must be between 0 and precision"));
                 }
-                Ok((((p as i32) << 16) | (s as i32)) + 4)
+                Ok(TypeMod::NumericPS { precision: p as u16, scale: s as u16 }.encode())
             }
             "bit" | "varbit" => {
                 if n != 1 {
@@ -1553,7 +1551,7 @@ impl<'a> Parser<'a> {
                 if nums[0] < 1 {
                     return Err(self.unexpected("length for bit type must be at least 1"));
                 }
-                Ok(nums[0] as i32 + 4)
+                Ok(TypeMod::Length(nums[0] as usize).encode())
             }
             // Fractional-second precision, 0..=6. A larger value is clamped to
             // 6, and PostgreSQL warns when it does so.
@@ -1582,16 +1580,17 @@ impl<'a> Parser<'a> {
                         if zoned { " WITH TIME ZONE" } else { "" }
                     ));
                 }
-                let precision = nums[0].min(6) as i32;
-                // PostgreSQL's atttypmod for these is the bare precision — no
-                // 4-byte header, unlike varchar(n)/numeric(p,s) — except
-                // interval, which packs the field-range mask into the high half
-                // and the precision into the low half. A plain `interval(p)`
-                // has the full field range.
+                let precision = nums[0].min(6) as u8;
+                // A plain `interval(p)` carries the full field range beside its
+                // precision; the other temporal types carry the precision bare.
                 if base == "interval" {
-                    Ok((INTERVAL_FULL_RANGE << 16) | precision)
+                    Ok(TypeMod::IntervalMod {
+                        range: INTERVAL_FULL_RANGE,
+                        precision: Some(precision),
+                    }
+                    .encode())
                 } else {
-                    Ok(precision)
+                    Ok(TypeMod::TemporalPrecision(precision).encode())
                 }
             }
             _ => Err(self.unexpected("type modifier is not supported for this type yet")),

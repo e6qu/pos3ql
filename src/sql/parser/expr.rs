@@ -1039,6 +1039,13 @@ impl<'a> Parser<'a> {
         };
         self.advance()?;
         if self.eat_ident("to")? {
+            // The only range form handled so far is YEAR TO MONTH, whose
+            // hyphenated `Y-M` value has a self-contained format. The clock
+            // ranges (DAY/HOUR/MINUTE TO ...) carry a per-pair format and
+            // field truncation, and are refused rather than mis-parsed.
+            if word == "year" && self.eat_ident("month")? {
+                return self.year_to_month(lit);
+            }
             return Err(self.err_here(
                 "INTERVAL with a TO range qualifier is not supported yet",
             ));
@@ -1060,6 +1067,54 @@ impl<'a> Parser<'a> {
             value.split_once('.').map_or(value, |(head, _)| head)
         };
         let combined = crate::stack_format!(64, "{} {}", magnitude, word);
+        self.arena
+            .alloc_str(combined.as_str())
+            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+    }
+
+    /// `INTERVAL '1-2' YEAR TO MONTH`: the `Y-M` value is years and months, a
+    /// bare number is months (the trailing field), and the leading sign applies
+    /// to both. The month part must be 0..11, since twelve months is a year;
+    /// PostgreSQL rejects `1-13` as out of range. The value is rewritten to the
+    /// `N year M month` form the interval parser already understands.
+    fn year_to_month(&mut self, lit: &'a str) -> Result<&'a str, ParseError> {
+        let out_of_range = || ParseError {
+            at: self.peek_at,
+            message: crate::stack_format!(96, "interval field value out of range: \"{}\"", lit),
+            sqlstate: "22015",
+        };
+        // A part that is not a number at all is malformed input (22007); a
+        // number that is simply too large for its field is out of range (22015).
+        let bad_syntax = || ParseError {
+            at: self.peek_at,
+            message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
+            sqlstate: "22007",
+        };
+        let value = lit.trim();
+        let (sign, rest) = match value.strip_prefix('-') {
+            Some(r) => ("-", r),
+            None => ("", value.strip_prefix('+').unwrap_or(value)),
+        };
+        let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let combined = match rest.split_once('-') {
+            Some((years, months)) => {
+                if !all_digits(years) || !all_digits(months) {
+                    return Err(bad_syntax());
+                }
+                // Twelve or more months would carry into the year field, which
+                // the two-field form does not permit.
+                if months.parse::<u32>().map_err(|_| out_of_range())? > 11 {
+                    return Err(out_of_range());
+                }
+                crate::stack_format!(48, "{s}{y} year {s}{m} month", s = sign, y = years, m = months)
+            }
+            None => {
+                if !all_digits(rest) {
+                    return Err(bad_syntax());
+                }
+                crate::stack_format!(48, "{s}{m} month", s = sign, m = rest)
+            }
+        };
         self.arena
             .alloc_str(combined.as_str())
             .map_err(|_| self.err_here("interval literal too large for SQL arena"))

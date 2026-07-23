@@ -26,6 +26,7 @@
 #![allow(dead_code)]
 
 mod cache;
+mod disk;
 mod memory;
 mod object;
 

@@ -5,6 +5,7 @@
 //! the parser as a second `impl Parser` block: these share the cursor and the
 //! token helpers with every other statement, but nothing else refers to them.
 
+use crate::sql::eval::sqlstate;
 use super::{
     ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, Stmt,
     TableConstraint, Tok, MAX_LIST,
@@ -264,7 +265,7 @@ impl<'a> Parser<'a> {
                             "INCLUDING {} is not supported: this engine has no such column property",
                             other
                         ),
-                        sqlstate: "0A000",
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     })
                 }
                 _ => return Err(self.err_here("expected a LIKE option after INCLUDING/EXCLUDING")),

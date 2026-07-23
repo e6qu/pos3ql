@@ -89,7 +89,7 @@ impl OwnedDatum {
         Ok(match d {
             Datum::Record(_) => {
                 return Err(sql_err!(
-                    "0A000",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot store a composite (record) value in a column"
                 ))
             }
@@ -112,13 +112,13 @@ impl OwnedDatum {
             | Datum::Uuid(_)
             | Datum::Bytea(_) => {
                 return Err(sql_err!(
-                    "0A000",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "defaults of this type are not supported yet (store as text)"
                 ))
             }
             Datum::Numeric(n) => {
                 if n.digits.len() > MAX_DEFAULT_TEXT {
-                    return Err(sql_err!("54000", "numeric default too large"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "numeric default too large"));
                 }
                 let mut digits = [0u8; MAX_DEFAULT_TEXT];
                 digits[..n.digits.len()].copy_from_slice(n.digits);
@@ -137,7 +137,7 @@ impl OwnedDatum {
             Datum::Text(s) => {
                 if s.len() > MAX_DEFAULT_TEXT {
                     return Err(sql_err!(
-                        "54000",
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "text defaults are limited to {} bytes",
                         MAX_DEFAULT_TEXT
                     ));

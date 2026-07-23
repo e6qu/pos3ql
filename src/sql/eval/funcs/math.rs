@@ -201,10 +201,10 @@ pub(crate) fn dispatch<'a>(
                 }
                 if let Datum::Numeric(n) = d {
                     if name == "sqrt" && n.sign == numeric::Sign::Neg && !n.is_zero() {
-                        return Err(sql_err!("2201F", "cannot take square root of a negative number"));
+                        return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION, "cannot take square root of a negative number"));
                     }
                     if name == "ln" && (n.sign == numeric::Sign::Neg || n.is_zero()) {
-                        return Err(sql_err!("2201E", "cannot take logarithm of a non-positive number"));
+                        return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a non-positive number"));
                     }
                     return Ok(Datum::Numeric(match name {
                         "sqrt" => numeric::sqrt(&n, arena)?,
@@ -214,10 +214,10 @@ pub(crate) fn dispatch<'a>(
                 }
                 let x = datum_f64(name, d)?;
                 if name == "sqrt" && x < 0.0 {
-                    return Err(sql_err!("2201F", "cannot take square root of a negative number"));
+                    return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION, "cannot take square root of a negative number"));
                 }
                 if name == "ln" && x <= 0.0 {
-                    return Err(sql_err!("2201E", "cannot take logarithm of a non-positive number"));
+                    return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a non-positive number"));
                 }
                 Ok(Datum::Float8(match name {
                     "sqrt" => x.sqrt(),
@@ -238,15 +238,23 @@ pub(crate) fn dispatch<'a>(
                     if db.is_null() || dv.is_null() {
                         return Ok(Datum::Null);
                     }
-                    if matches!(db, Datum::Numeric(_)) || matches!(dv, Datum::Numeric(_)) {
-                        let b = datum_numeric(name, db, arena)?;
-                        let v = datum_numeric(name, dv, arena)?;
-                        log_domain_check(&v)?;
-                        log_domain_check(&b)?;
-                        return Ok(Datum::Numeric(numeric::logb(&b, &v, arena)?));
+                    // PostgreSQL's two-argument log exists only for numeric:
+                    // integers coerce implicitly, doubles do not, so a float
+                    // argument is an undefined function rather than a looser
+                    // float computation with a different result type.
+                    if matches!(db, Datum::Float8(_)) || matches!(dv, Datum::Float8(_)) {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function log({}, {}) does not exist",
+                            super::super::type_name_of_pub(&db),
+                            super::super::type_name_of_pub(&dv)
+                        ));
                     }
-                    let (b, v) = (datum_f64(name, db)?, datum_f64(name, dv)?);
-                    return Ok(Datum::Float8(v.log(b)));
+                    let b = datum_numeric(name, db, arena)?;
+                    let v = datum_numeric(name, dv, arena)?;
+                    log_domain_check(&v)?;
+                    log_domain_check(&b)?;
+                    return Ok(Datum::Numeric(numeric::logb(&b, &v, arena)?));
                 }
                 let d = eval_full(args[0], arena, params, row, hooks)?;
                 if d.is_null() {
@@ -279,12 +287,12 @@ pub(crate) fn dispatch<'a>(
                 // rather than returning NaN/Inf as libm's powf would.
                 if a < 0.0 && bb.fract() != 0.0 {
                     return Err(sql_err!(
-                        "2201F",
+                        sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
                         "a negative number raised to a non-integer power yields a complex result"
                     ));
                 }
                 if a == 0.0 && bb < 0.0 {
-                    return Err(sql_err!("2201F", "zero raised to a negative power is undefined"));
+                    return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION, "zero raised to a negative power is undefined"));
                 }
                 Ok(Datum::Float8(a.powf(bb)))
             }
@@ -310,7 +318,7 @@ pub(crate) fn dispatch<'a>(
                     (other, _) => return Err(type_mismatch(name, &other)),
                 };
                 if y == 0 {
-                    return Err(sql_err!("22012", "division by zero"));
+                    return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
                 }
                 let r = x % y;
                 Ok(if wide { Datum::Int8(r) } else { Datum::Int4(r as i32) })
@@ -329,7 +337,7 @@ pub(crate) fn dispatch<'a>(
                     (Datum::Int8(x), Datum::Int8(y)) => (x, y, true),
                     (other, _) => return Err(type_mismatch(name, &other)),
                 };
-                let range = || sql_err!("22003", "{} result is out of range", name);
+                let range = || sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} result is out of range", name);
                 let (gx, gy) = (x.unsigned_abs(), y.unsigned_abs());
                 let mut g = gx;
                 let mut h = gy;
@@ -398,7 +406,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 }
                 if cnt <= 0 {
-                    return Err(sql_err!("2201G", "count must be greater than zero"));
+                    return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_WIDTH_BUCKET, "count must be greater than zero"));
                 }
                 let any_float = matches!(operator, Datum::Float8(_))
                     || matches!(lo, Datum::Float8(_))
@@ -406,7 +414,7 @@ pub(crate) fn dispatch<'a>(
                 if any_float {
                     let (o, l, h) = (datum_f64(name, operator)?, datum_f64(name, lo)?, datum_f64(name, hi)?);
                     if l == h {
-                        return Err(sql_err!("22004", "lower and upper bounds cannot be equal"));
+                        return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "lower and upper bounds cannot be equal"));
                     }
                     let b = width_bucket_f64(o, l, h, cnt);
                     return Ok(Datum::Int4(b));
@@ -506,7 +514,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if n < 0 {
-                    return Err(sql_err!("22003", "factorial of a negative number is undefined"));
+                    return Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "factorial of a negative number is undefined"));
                 }
                 // n! as an exact numeric; a too-large product exhausts the arena and
                 // errors loudly, matching PostgreSQL's numeric overflow.

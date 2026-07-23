@@ -258,7 +258,7 @@ impl<'b> Responder<'b> {
                 m.i16(0);
                 m.i32(c.type_oid);
                 m.i16(c.typlen);
-                m.i32(-1);
+                m.i32(c.type_mod);
                 m.i16(if formats.is_binary(i) { 1 } else { 0 });
             }
             m.finish()

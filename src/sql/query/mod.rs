@@ -112,7 +112,7 @@ pub fn check_timeout() -> Result<(), SqlError> {
         return Ok(());
     }
     if super::datetime::now_micros() >= dl {
-        return Err(sql_err!("57014", "canceling statement due to statement timeout"));
+        return Err(sql_err!(sqlstate::QUERY_CANCELED, "canceling statement due to statement timeout"));
     }
     Ok(())
 }
@@ -362,7 +362,7 @@ fn resolve_group_ordinals<'a>(
             collect_aggs(key, &mut nodes, &mut n)?;
             if n > 0 {
                 return Err(sql_err!(
-                    "42803",
+                    sqlstate::GROUPING_ERROR,
                     "aggregate functions are not allowed in GROUP BY"
                 ));
             }
@@ -419,7 +419,7 @@ fn resolve_position_target<'a>(
     };
     let index = *n;
     let position_error =
-        || sql_err!("42P10", "{} position {} is not in select list", clause, index);
+        || sql_err!(sqlstate::INVALID_COLUMN_REFERENCE, "{} position {} is not in select list", clause, index);
     if index < 1 {
         return Err(position_error());
     }
@@ -477,7 +477,7 @@ fn resolve_position_target<'a>(
                     // A positional (ORDER BY/GROUP BY ordinal) reference into a
                     // `(record).*` expansion has no simple column to resolve to.
                     return Err(sql_err!(
-                        "0A000",
+                        sqlstate::FEATURE_NOT_SUPPORTED,
                         "ORDER BY/GROUP BY position into a record expansion is not supported"
                     ));
                 }
@@ -685,7 +685,7 @@ pub(super) fn collect_windows<'a>(
             return Ok(());
         }
         if *n == MAX_WINDOWS {
-            return Err(sql_err!("54023", "too many window functions in one query"));
+            return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many window functions in one query"));
         }
         out[*n] = expression;
         *n += 1;
@@ -829,7 +829,7 @@ fn rewrite_grouped_expr<'a>(
     };
     match e {
         Expr::WholeRow(t) => Err(sql_err!(
-            "42803",
+            sqlstate::GROUPING_ERROR,
             "column \"{}.*\" must appear in the GROUP BY clause or be used in an aggregate function",
             t
         )),
@@ -858,7 +858,7 @@ fn rewrite_grouped_expr<'a>(
                 ));
             }
             Err(sql_err!(
-                "42803",
+                sqlstate::GROUPING_ERROR,
                 "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
                 qualifier.unwrap_or(""),
                 if qualifier.is_some() { "." } else { "" },
@@ -1565,7 +1565,7 @@ pub fn constant_select<'a>(
         if let Expr::Int(pos) = ob.expression {
             if *pos < 1 || *pos as usize > width {
                 return sql_fail(sql_err!(
-                    "42P10",
+                    sqlstate::INVALID_COLUMN_REFERENCE,
                     "ORDER BY position {} is not in select list",
                     pos
                 ));
@@ -1583,7 +1583,7 @@ pub fn constant_select<'a>(
         }).map(|i| col_start[i]);
         if statement.distinct && order_item[j].is_none() {
             return sql_fail(sql_err!(
-                "42P10",
+                sqlstate::INVALID_COLUMN_REFERENCE,
                 "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
             ));
         }
@@ -2195,7 +2195,7 @@ pub fn describe_scope_items<'q>(
                     if n == out.len() {
                         return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "select list too wide"));
                     }
-                    out[n] = ColDesc::of_type(c.name.as_str(), c.ctype);
+                    out[n] = ColDesc::of_type(c.name.as_str(), c.ctype).with_type_mod(c.type_mod);
                     n += 1;
                 }
             }
@@ -2205,8 +2205,13 @@ pub fn describe_scope_items<'q>(
                         return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "select list too wide"));
                     }
                     let entry = scope.star_entry(k);
-                    out[n] =
-                        ColDesc::of_type(scope.output_name(entry), scope.output_type(entry));
+                    out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
+                        .with_type_mod(match entry {
+                            ResolvedColumn::Table(t, c) => {
+                                scope.defs[t].expect("resolved").columns()[c].type_mod
+                            }
+                            ResolvedColumn::Merged(_) => -1,
+                        });
                     n += 1;
                 }
             }
@@ -2220,7 +2225,22 @@ pub fn describe_scope_items<'q>(
                 // Multi-table type inference: columns resolve via scope.
                 let (oid, typlen) = infer_scope_type(expression, scope)?;
                 let name = alias.unwrap_or(super::exec::derived_name(expression));
-                out[n] = ColDesc::new(name, oid, typlen);
+                // A bare column carries its declared modifier and a cast its
+                // target's, as RowDescription reports them; anything computed
+                // is -1 — the rule PostgreSQL follows.
+                let type_mod = match expression {
+                    Expr::Column { qualifier, name } => {
+                        match scope.find_column(*qualifier, name) {
+                            Ok(ResolvedColumn::Table(t, c)) => {
+                                scope.defs[t].expect("resolved").columns()[c].type_mod
+                            }
+                            _ => -1,
+                        }
+                    }
+                    Expr::Cast { type_mod, .. } => *type_mod,
+                    _ => -1,
+                };
+                out[n] = ColDesc::new(name, oid, typlen).with_type_mod(type_mod);
                 n += 1;
             }
         }
@@ -2269,7 +2289,7 @@ fn describe_scope_record_star<'q>(
         }
         _ => {
             return Err(sql_err!(
-                "42809",
+                sqlstate::WRONG_OBJECT_TYPE,
                 "row expansion is not supported on this expression"
             ));
         }

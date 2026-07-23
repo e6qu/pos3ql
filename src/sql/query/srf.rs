@@ -360,7 +360,7 @@ pub(super) fn synth_derived_def<'a>(
     };
     if n_cols > MAX_COLUMNS {
         return Err(sql_err!(
-            "54011",
+            sqlstate::TOO_MANY_COLUMNS,
             "derived table \"{}\" has too many columns",
             exposed
         ));
@@ -370,7 +370,7 @@ pub(super) fn synth_derived_def<'a>(
     if let Some(aliases) = col_alias {
         if aliases.len() > n_cols {
             return Err(sql_err!(
-                "42P10",
+                sqlstate::INVALID_COLUMN_REFERENCE,
                 "table \"{}\" has {} columns available but {} columns specified",
                 exposed,
                 n_cols,
@@ -528,7 +528,7 @@ pub(super) fn table_func_def<'a>(
         && aliases.len() > n_out
     {
         return Err(sql_err!(
-            "42P10",
+            sqlstate::INVALID_COLUMN_REFERENCE,
             "table \"{}\" has {} columns available but {} columns specified",
             name,
             n_out,

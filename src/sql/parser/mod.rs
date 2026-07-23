@@ -3,6 +3,7 @@
 //! Fixed limits, checked loudly: at most [`MAX_LIST`] items per select
 //! list / column list / VALUES row, and [`MAX_ROWS`] rows per INSERT.
 
+use crate::sql::eval::sqlstate;
 use crate::mem::arena::Arena;
 use crate::stack_format;
 use crate::util::StackStr;
@@ -149,7 +150,7 @@ impl ParseError {
         Self {
             at,
             message: stack_format!(96, "{}", text),
-            sqlstate: "42601",
+            sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
 }
@@ -1651,7 +1652,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "expected '{}'", operator),
-                sqlstate: "42601",
+                sqlstate: sqlstate::SYNTAX_ERROR,
             });
         }
         Ok(())
@@ -1670,7 +1671,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "expected '{}'", word),
-                sqlstate: "42601",
+                sqlstate: sqlstate::SYNTAX_ERROR,
             });
         }
         Ok(())
@@ -1686,7 +1687,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "syntax error at or near \"{}\"", word),
-                sqlstate: "42601",
+                sqlstate: sqlstate::SYNTAX_ERROR,
             });
         }
         self.any_ident(what)
@@ -1719,7 +1720,7 @@ impl<'a> Parser<'a> {
             _ => Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "expected {}", what),
-                sqlstate: "42601",
+                sqlstate: sqlstate::SYNTAX_ERROR,
             }),
         }
     }
@@ -1981,7 +1982,7 @@ impl<'a> Parser<'a> {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "syntax error: {}", expected),
-            sqlstate: "42601",
+            sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
 
@@ -1993,7 +1994,7 @@ impl<'a> Parser<'a> {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "{} exceeds fixed limit of {}", what, max),
-            sqlstate: "42601",
+            sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
 }

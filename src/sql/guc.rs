@@ -6,6 +6,7 @@
 //! false success. As behavior lands (DateStyle formatting, non-UTC time zones)
 //! the accepted set widens here.
 
+use crate::sql::eval::sqlstate;
 use core::fmt::Write;
 
 use crate::sql_err;
@@ -202,7 +203,7 @@ impl GucState {
                 return store(&mut self.client_encoding, "SQL_ASCII");
             }
             return Err(sql_err!(
-                "0A000",
+                sqlstate::FEATURE_NOT_SUPPORTED,
                 "conversion between {} and UTF8 is not supported",
                 v
             ));
@@ -212,7 +213,7 @@ impl GucState {
                 return Ok(());
             }
             return Err(sql_err!(
-                "0A000",
+                sqlstate::FEATURE_NOT_SUPPORTED,
                 "standard_conforming_strings can only be on (strings always conform)"
             ));
         }
@@ -224,7 +225,7 @@ impl GucState {
             } else {
                 MessageLevel::parse(v).ok_or_else(|| {
                     sql_err!(
-                        "22023",
+                        sqlstate::INVALID_PARAMETER_VALUE,
                         "invalid value for parameter \"client_min_messages\": \"{}\"",
                         v
                     )
@@ -242,7 +243,7 @@ impl GucState {
                 return store(&mut self.search_path, if is_default { "\"$user\", public" } else { v });
             }
             return Err(sql_err!(
-                "0A000",
+                sqlstate::FEATURE_NOT_SUPPORTED,
                 "search_path without \"public\" is not supported yet"
             ));
         }
@@ -255,7 +256,7 @@ impl GucState {
             } else {
                 v.parse().map_err(|_| {
                     sql_err!(
-                        "22023",
+                        sqlstate::INVALID_PARAMETER_VALUE,
                         "invalid value for parameter \"extra_float_digits\": \"{}\"",
                         v
                     )
@@ -263,7 +264,7 @@ impl GucState {
             };
             if !(-15..=3).contains(&n) {
                 return Err(sql_err!(
-                    "22023",
+                    sqlstate::INVALID_PARAMETER_VALUE,
                     "{} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)",
                     n
                 ));
@@ -285,7 +286,7 @@ impl GucState {
             }
             if parse_timeout_ms(v).is_none() {
                 return Err(sql_err!(
-                    "22023",
+                    sqlstate::INVALID_PARAMETER_VALUE,
                     "invalid value for parameter \"statement_timeout\": \"{}\"",
                     v
                 ));
@@ -299,7 +300,7 @@ impl GucState {
                 return Ok(());
             }
             return Err(sql_err!(
-                "0A000",
+                sqlstate::FEATURE_NOT_SUPPORTED,
                 "{} is not enforced yet; only 0 (disabled) is accepted",
                 name
             ));
@@ -314,7 +315,7 @@ impl GucState {
                 return Ok(());
             }
             return Err(sql_err!(
-                "22023",
+                sqlstate::INVALID_PARAMETER_VALUE,
                 "invalid value for parameter \"bytea_output\": \"{}\"",
                 v
             ));
@@ -338,7 +339,7 @@ impl GucState {
             ));
         }
         Err(sql_err!(
-            "42704",
+            sqlstate::UNDEFINED_OBJECT,
             "unrecognized configuration parameter \"{}\"",
             name
         ))
@@ -430,7 +431,7 @@ fn store<const N: usize>(dst: &mut StackStr<N>, v: &str) -> Result<(), SqlError>
     dst.clear();
     let _ = write!(dst, "{v}");
     if dst.is_truncated() {
-        return Err(sql_err!("22023", "configuration value is too long"));
+        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "configuration value is too long"));
     }
     Ok(())
 }
@@ -614,7 +615,7 @@ fn is_read_only(name: &str) -> bool {
 
 fn unsupported_value(param: &str, v: &str) -> SqlError {
     sql_err!(
-        "0A000",
+        sqlstate::FEATURE_NOT_SUPPORTED,
         "{} \"{}\" is not supported yet (only the default is implemented)",
         param,
         v

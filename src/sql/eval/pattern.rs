@@ -9,7 +9,7 @@ use crate::mem::arena::Arena;
 use crate::sql::types::Datum;
 use crate::sql_err;
 
-use super::{arena_full, SqlError};
+use super::{arena_full, sqlstate, SqlError};
 
 /// Translates a SQL `SIMILAR TO` pattern into a POSIX regular expression
 /// anchored to the whole string. `%`/`_` become `.*`/`.`; the SIMILAR TO
@@ -64,7 +64,7 @@ pub(crate) fn similar_to_posix(
     }
     let _ = buffer.write_char('$');
     if buffer.is_truncated() {
-        return Err(sql_err!("22026", "SIMILAR TO pattern is too long"));
+        return Err(sql_err!(sqlstate::STRING_DATA_LENGTH_MISMATCH, "SIMILAR TO pattern is too long"));
     }
     Ok(())
 }
@@ -210,7 +210,7 @@ pub(crate) fn sql_regex_substring<'a>(
                     }
                     let _ = posix.write_char(other);
                 }
-                None => return Err(sql_err!("22025", "invalid escape string")),
+                None => return Err(sql_err!(sqlstate::INVALID_ESCAPE_SEQUENCE, "invalid escape string")),
             }
             continue;
         }
@@ -246,7 +246,7 @@ pub(crate) fn sql_regex_substring<'a>(
     }
     let _ = posix.write_char('$');
     if posix.is_truncated() {
-        return Err(sql_err!("54000", "substring pattern too long"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "substring pattern too long"));
     }
     let mut spans = [(-1i64, -1i64); crate::sql::regex::MAX_GROUPS];
     match crate::sql::regex::find_captures(posix.as_str(), s, 0, false, &mut spans)? {
@@ -286,7 +286,7 @@ pub(crate) fn regex_split<'a>(
     let mut n = 0usize;
     let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
         if *n == out.len() {
-            return Err(sql_err!("54000", "too many split pieces"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many split pieces"));
         }
         out[*n] = Datum::Text(piece);
         *n += 1;
@@ -331,7 +331,7 @@ pub fn regexp_flags(flags: &str) -> Result<(bool, bool), SqlError> {
             'g' => global = true,
             'i' => case_insensitive = true,
             'c' => case_insensitive = false,
-            _ => return Err(sql_err!("22023", "invalid regular expression option: \"{}\"", f)),
+            _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid regular expression option: \"{}\"", f)),
         }
     }
     Ok((global, case_insensitive))

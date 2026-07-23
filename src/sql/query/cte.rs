@@ -33,7 +33,7 @@ pub fn expand_ctes<'a>(
         return Ok(sel);
     }
     if sel.with.len() > crate::sql::parser::MAX_CTES {
-        return Err(sql_err!("54023", "too many WITH entries"));
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many WITH entries"));
     }
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
     let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
@@ -41,7 +41,7 @@ pub fn expand_ctes<'a>(
     let mut n = 0;
     for cte in sel.with {
         if resolved[..n].iter().any(|(name, _, _)| *name == cte.name) {
-            return Err(sql_err!("42712", "WITH query name \"{}\" specified more than once", cte.name));
+            return Err(sql_err!(sqlstate::DUPLICATE_ALIAS, "WITH query name \"{}\" specified more than once", cte.name));
         }
         let context = Subst { ctes: &resolved[..n], materialized: &[], storage, txid, depth: 0 };
         // A self-referencing recursive CTE cannot be inlined; this schema-only
@@ -79,7 +79,7 @@ pub fn expand_ctes_exec<'a>(
         return Ok(sel);
     }
     if sel.with.len() > crate::sql::parser::MAX_CTES {
-        return Err(sql_err!("54023", "too many WITH entries"));
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many WITH entries"));
     }
     let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
         [("", sel, &[]); crate::sql::parser::MAX_CTES];
@@ -91,7 +91,7 @@ pub fn expand_ctes_exec<'a>(
         if resolved[..n].iter().any(|(name, _, _)| *name == cte.name)
             || materialized[..nm].iter().any(|(name, _)| *name == cte.name)
         {
-            return Err(sql_err!("42712", "WITH query name \"{}\" specified more than once", cte.name));
+            return Err(sql_err!(sqlstate::DUPLICATE_ALIAS, "WITH query name \"{}\" specified more than once", cte.name));
         }
         let context = Subst {
             ctes: &resolved[..n],
@@ -436,7 +436,7 @@ fn materialize_recursive<'a>(
     let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena)?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
-            "42P10",
+            sqlstate::INVALID_COLUMN_REFERENCE,
             "WITH query \"{}\" has {} columns available but {} columns specified",
             cte.name,
             ncols,
@@ -558,7 +558,7 @@ fn subst_select<'a>(
     };
     let mut items = [SelectItem::Wildcard; MAX_PROJ];
     if s.items.len() > MAX_PROJ {
-        return Err(sql_err!("54011", "select list too wide"));
+        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"));
     }
     for (i, it) in s.items.iter().enumerate() {
         items[i] = match it {
@@ -581,7 +581,7 @@ fn subst_select<'a>(
     let mut order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
         crate::sql::parser::MAX_LIST];
     if s.order_by.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!("54023", "ORDER BY list too long"));
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "ORDER BY list too long"));
     }
     for (i, ob) in s.order_by.iter().enumerate() {
         order[i] = OrderBy { expression: subst_expr(ob.expression, context, arena)?, ..*ob };
@@ -638,7 +638,7 @@ fn subst_from<'a>(
         Join { table: f.base, kind: JoinKind::Inner, on: None, using_columns: None, natural: false };
     let mut joins = [dummy; MAX_JOIN_TABLES - 1];
     if f.joins.len() > joins.len() {
-        return Err(sql_err!("54023", "too many joins"));
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many joins"));
     }
     for (i, j) in f.joins.iter().enumerate() {
         joins[i] = Join {
@@ -760,7 +760,7 @@ fn subst_expr_slice<'a>(
     }
     let mut tmp = [&Expr::Null; crate::sql::parser::MAX_LIST];
     if xs.len() > tmp.len() {
-        return Err(sql_err!("54023", "expression list too long"));
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "expression list too long"));
     }
     for (i, x) in xs.iter().enumerate() {
         tmp[i] = subst_expr(x, context, arena)?;
@@ -839,7 +839,7 @@ fn subst_expr<'a>(
             let mut ob = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
                 crate::sql::parser::MAX_LIST];
             if order_by.len() > ob.len() {
-                return Err(sql_err!("54023", "aggregate ORDER BY list too long"));
+                return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "aggregate ORDER BY list too long"));
             }
             for (i, o) in order_by.iter().enumerate() {
                 ob[i] = OrderBy { expression: subst_expr(o.expression, context, arena)?, ..*o };
@@ -905,7 +905,7 @@ fn subst_expr<'a>(
             let operand = opt_subst(*operand, context, arena)?;
             let mut ws = [(&Expr::Null, &Expr::Null); crate::sql::parser::MAX_LIST];
             if whens.len() > ws.len() {
-                return Err(sql_err!("54023", "CASE has too many WHEN branches"));
+                return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "CASE has too many WHEN branches"));
             }
             for (i, (c, r)) in whens.iter().enumerate() {
                 ws[i] = (subst_expr(c, context, arena)?, subst_expr(r, context, arena)?);

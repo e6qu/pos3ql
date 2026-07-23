@@ -17,6 +17,18 @@ use crate::storage::{ColumnMeta, TableDef};
 /// Result-column names and types, statically inferred. Names borrow the
 /// statement (aliases) or the catalog (wildcard columns); `'q` is whichever
 /// is shorter at the call site.
+/// The atttypmod RowDescription reports for an output expression: a bare table
+/// column carries its declared modifier, a cast its target's, and every other
+/// expression `-1` — matching what PostgreSQL sends (`upper(v)` has none even
+/// when `v` does).
+fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i32 {
+    match expression {
+        Expr::Column { name, .. } => column_mod(name),
+        Expr::Cast { type_mod, .. } => *type_mod,
+        _ => -1,
+    }
+}
+
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
     def: Option<&'q TableDef>,
@@ -45,20 +57,20 @@ pub fn describe_items<'q>(
                     ));
                 };
                 for c in def.columns() {
-                    push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
+                    push(ColDesc::of_type(c.name.as_str(), c.ctype).with_type_mod(c.type_mod))?;
                 }
             }
             SelectItem::TableWildcard(q) => {
                 let matches = def.is_some_and(|d| d.name.as_str() == *q);
                 if !matches {
                     return Err(sql_err!(
-                        "42P01",
+                        sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",
                         q
                     ));
                 }
                 for c in def.expect("matched").columns() {
-                    push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
+                    push(ColDesc::of_type(c.name.as_str(), c.ctype).with_type_mod(c.type_mod))?;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -73,7 +85,11 @@ pub fn describe_items<'q>(
                     typlen = -1;
                 }
                 let name = alias.unwrap_or(derived_name(expression));
-                push(ColDesc::new(name, type_oid, typlen))?;
+                let type_mod = output_type_mod(expression, |column| {
+                    def.and_then(|d| d.columns().iter().find(|c| c.name.as_str() == column))
+                        .map_or(-1, |c| c.type_mod)
+                });
+                push(ColDesc::new(name, type_oid, typlen).with_type_mod(type_mod))?;
             }
         }
     }
@@ -114,7 +130,7 @@ fn describe_record_star<'q>(
             Ok(())
         }
         _ => Err(sql_err!(
-            "42809",
+            sqlstate::WRONG_OBJECT_TYPE,
             "row expansion is not supported on this expression"
         )),
     }
@@ -379,7 +395,7 @@ pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Resu
         for arg in *args {
             if infer_type_res(arg, columns)?.0 == oid::UNKNOWN {
                 return Err(sql_err!(
-                    "XX000",
+                    sqlstate::INTERNAL_ERROR,
                     "failed to find conversion function from unknown to text"
                 ));
             }
@@ -404,7 +420,7 @@ pub fn record_field_type(
     });
     if shape.is_none() {
         return Err(sql_err!(
-            "42809",
+            sqlstate::WRONG_OBJECT_TYPE,
             "field selection is not supported on this expression"
         ));
     }
@@ -431,7 +447,7 @@ impl ColTypeResolver for DefCols<'_> {
     fn resolve(&self, q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(q) = q
             && q != self.0.name.as_str() {
-                return Err(sql_err!("42P01", "missing FROM-clause entry for table \"{}\"", q));
+                return Err(sql_err!(sqlstate::UNDEFINED_TABLE, "missing FROM-clause entry for table \"{}\"", q));
             }
         match self.0.column_index(name) {
             Some(i) => Ok(self.0.columns()[i].ctype),

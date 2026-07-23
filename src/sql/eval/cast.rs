@@ -164,7 +164,7 @@ pub fn cast_to<'a>(
                 let mut buffer = crate::util::StackStr::<8192>::new();
                 let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", crate::sql::json::JsonWrite(&tree)));
                 if buffer.is_truncated() {
-                    return Err(sql_err!("54000", "jsonb value exceeds the supported size"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "jsonb value exceeds the supported size"));
                 }
                 Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb: true }
             }
@@ -241,7 +241,7 @@ pub(crate) fn validate_bits(s: &str) -> Result<&str, SqlError> {
     for c in s.bytes() {
         if c != b'0' && c != b'1' {
             return Err(sql_err!(
-                "22P02",
+                sqlstate::INVALID_TEXT_REPRESENTATION,
                 "\"{}\" is not a valid binary digit",
                 (c as char)
             ));

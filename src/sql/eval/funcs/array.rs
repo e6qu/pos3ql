@@ -193,7 +193,7 @@ pub(crate) fn dispatch<'a>(
                 n = load_array(raw, source, element, &mut items, n, arena)?;
                 if name == "array_append" {
                     if n == items.len() {
-                        return Err(sql_err!("54000", "array value too large"));
+                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large"));
                     }
                     items[n] = coerced;
                     n += 1;
@@ -299,7 +299,7 @@ pub(crate) fn dispatch<'a>(
                 };
                 if trim < 0 || trim as usize > total {
                     return Err(sql_err!(
-                        "2202E",
+                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
                         "number of elements to trim must be between 0 and {}",
                         total
                     ));
@@ -405,7 +405,7 @@ pub(crate) fn dispatch<'a>(
                 let value = eval_full(args[0], arena, params, row, hooks)?;
                 let dims = eval_full(args[1], arena, params, row, hooks)?;
                 if dims.is_null() {
-                    return Err(sql_err!("22004", "dimension array or low bound array cannot be null"));
+                    return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "dimension array or low bound array cannot be null"));
                 }
                 let Datum::Array { element, raw } = dims else {
                     return Err(type_mismatch(name, &dims));
@@ -418,10 +418,10 @@ pub(crate) fn dispatch<'a>(
                 }
                 let count = match array::get(raw, element, 0) {
                     Some(Datum::Int4(n)) => n,
-                    _ => return Err(sql_err!("22004", "dimension values cannot be null")),
+                    _ => return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "dimension values cannot be null")),
                 };
                 if count < 0 {
-                    return Err(sql_err!("2202E", "array size exceeds the maximum allowed"));
+                    return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "array size exceeds the maximum allowed"));
                 }
                 let elem = ArrElem::from_datum(&value)
                     .unwrap_or(ArrElem::Int4);

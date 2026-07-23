@@ -86,7 +86,7 @@ pub(crate) fn dispatch<'a>(
                             'c' => case_insensitive = false,
                             _ => {
                                 return Err(sql_err!(
-                                    "22023",
+                                    sqlstate::INVALID_PARAMETER_VALUE,
                                     "invalid regular expression option: \"{}\"",
                                     f
                                 ))
@@ -101,7 +101,7 @@ pub(crate) fn dispatch<'a>(
                     regex::find_captures(pat, src, pos, case_insensitive, &mut spans)?
                 {
                     if out.write_str(&src[pos..s]).is_err() {
-                        return Err(sql_err!("54000", "regexp_replace result too large"));
+                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "regexp_replace result too large"));
                     }
                     expand_replacement(&mut out, rep, src, s, e, &spans[..ng])?;
                     if e == s {
@@ -125,7 +125,7 @@ pub(crate) fn dispatch<'a>(
                     }
                 }
                 if out.write_str(&src[pos..]).is_err() {
-                    return Err(sql_err!("54000", "regexp_replace result too large"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "regexp_replace result too large"));
                 }
                 Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
             }

@@ -71,7 +71,7 @@ pub fn parse_literal<'a>(
     element: ArrElem,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
-    let bad = || sql_err!("22P02", "malformed array literal: \"{}\"", text);
+    let bad = || sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "malformed array literal: \"{}\"", text);
     let t = text.trim();
     let inner = t
         .strip_prefix('{')
@@ -85,7 +85,7 @@ pub fn parse_literal<'a>(
         let mut i = 0;
         loop {
             if n == items.len() {
-                return Err(sql_err!("54000", "array literal too large"));
+                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array literal too large"));
             }
             // Skip leading whitespace.
             while i < b.len() && b[i].is_ascii_whitespace() {
@@ -144,7 +144,7 @@ fn read_field<'a>(
                 }
             }
         }
-        Err(sql_err!("22P02", "unterminated array element"))
+        Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "unterminated array element"))
     } else {
         // Unquoted: up to the next comma or closing brace.
         let start = i;

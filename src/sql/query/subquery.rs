@@ -286,7 +286,7 @@ fn subquery_exists<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
     if depth == 0 {
-        return Err(sql_err!("54001", "subqueries nested too deeply"));
+        return Err(sql_err!(sqlstate::STATEMENT_TOO_COMPLEX, "subqueries nested too deeply"));
     }
     if let Some(tree) = select.set_body {
         let (vals, _, _) = run_set_subquery(tree, select, storage, txid, arena, params, 1)?;
@@ -646,7 +646,7 @@ fn run_subquery<'a>(
     row_arity: usize,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     if depth == 0 {
-        return Err(sql_err!("54001", "subqueries nested too deeply"));
+        return Err(sql_err!(sqlstate::STATEMENT_TOO_COMPLEX, "subqueries nested too deeply"));
     }
     if let Some(tree) = select.set_body {
         return run_set_subquery(tree, select, storage, txid, arena, params, row_arity);

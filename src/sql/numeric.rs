@@ -1524,7 +1524,7 @@ pub fn pow<'a>(base: &Numeric, exp: &Numeric, arena: &'a Arena) -> Result<Numeri
     // Domain rules matching PostgreSQL numeric_power.
     if base.is_zero() {
         if exp.sign == Sign::Neg {
-            return Err(sql_err!("2201F", "zero raised to a negative power is undefined"));
+            return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION, "zero raised to a negative power is undefined"));
         }
         // The logarithm is undefined at zero, so the result weight is 0: both
         // `0^0 = 1` and `0^positive = 0` carry MIN_SIG_DIGITS fractional places.
@@ -1536,7 +1536,7 @@ pub fn pow<'a>(base: &Numeric, exp: &Numeric, arena: &'a Arena) -> Result<Numeri
     }
     if base.sign == Sign::Neg && !exp.is_integer() {
         return Err(sql_err!(
-            "2201F",
+            sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             "a negative number raised to a non-integer power yields a complex result"
         ));
     }

@@ -7,6 +7,7 @@
 //! committed image; a write conflict raises 40001 immediately instead of
 //! blocking (single-threaded execution cannot wait).
 
+use crate::sql::eval::sqlstate;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
 use crate::sql_err;
@@ -145,7 +146,7 @@ impl TxnState {
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
-            sql_err!("54000", "more than {} active savepoints", MAX_SAVEPOINTS)
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "more than {} active savepoints", MAX_SAVEPOINTS)
         })
     }
 

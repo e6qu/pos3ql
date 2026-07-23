@@ -958,15 +958,25 @@ pub struct ColDesc<'a> {
     pub name: &'a str,
     pub type_oid: i32,
     pub typlen: i16,
+    /// The column's atttypmod, as RowDescription reports it: a table column's
+    /// declared modifier, a cast's target modifier, `-1` for every computed
+    /// expression — matching what PostgreSQL sends.
+    pub type_mod: i32,
 }
 
 impl<'a> ColDesc<'a> {
     pub fn new(name: &'a str, type_oid: i32, typlen: i16) -> Self {
-        Self { name, type_oid, typlen }
+        Self { name, type_oid, typlen, type_mod: -1 }
     }
 
     pub fn of_type(name: &'a str, t: ColType) -> Self {
         Self::new(name, t.oid(), t.typlen())
+    }
+
+    /// The same description carrying the column's declared type modifier.
+    pub fn with_type_mod(mut self, type_mod: i32) -> Self {
+        self.type_mod = type_mod;
+        self
     }
 }
 

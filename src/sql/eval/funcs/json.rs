@@ -86,7 +86,7 @@ pub(crate) fn dispatch<'a>(
                 let mut buffer = crate::util::StackStr::<16384>::new();
                 let _ = json::write_datum_json(&array, false, &mut buffer);
                 if buffer.is_truncated() {
-                    return Err(sql_err!("54000", "array_to_json value exceeds the supported size"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array_to_json value exceeds the supported size"));
                 }
                 Ok(Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb: false })
             }
@@ -100,7 +100,7 @@ pub(crate) fn dispatch<'a>(
                 };
                 match json::parse(s, arena)? {
                     json::Json::Array(items) => Ok(Datum::Int4(items.len() as i32)),
-                    _ => Err(sql_err!("22023", "cannot get array length of a scalar")),
+                    _ => Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot get array length of a scalar")),
                 }
             }
             // The JSON type name of the value, as PostgreSQL's json_typeof.
@@ -181,7 +181,9 @@ pub(crate) fn dispatch<'a>(
             }
             // `jsonb_set(target, path, new_value [, create_if_missing])`.
             "jsonb_set" | "jsonb_set_lax" => {
-                if !(3..=4).contains(&args.len()) {
+                let lax = name == "jsonb_set_lax";
+                let max_args = if lax { 5 } else { 4 };
+                if !(3..=max_args).contains(&args.len()) {
                     return Err(arity_err(name, args.len()));
                 }
                 let target = eval_full(args[0], arena, params, row, hooks)?;
@@ -190,8 +192,8 @@ pub(crate) fn dispatch<'a>(
                 }
                 let root = json_tree_arg(target, arena)?;
                 let path = json_path_parts(eval_full(args[1], arena, params, row, hooks)?, arena)?;
-                let value = json_tree_arg(eval_full(args[2], arena, params, row, hooks)?, arena)?;
-                let create = if args.len() == 4 {
+                let raw_value = eval_full(args[2], arena, params, row, hooks)?;
+                let create = if args.len() >= 4 {
                     match eval_full(args[3], arena, params, row, hooks)? {
                         Datum::Bool(b) => b,
                         Datum::Null => return Ok(Datum::Null),
@@ -200,6 +202,40 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     true
                 };
+                // jsonb_set_lax's reason to exist: an SQL NULL new value is
+                // handled per the fifth argument instead of nulling the result.
+                if lax && raw_value.is_null() {
+                    let treatment = if args.len() == 5 {
+                        match eval_full(args[4], arena, params, row, hooks)? {
+                            Datum::Text(t) => t,
+                            Datum::Null => return Ok(Datum::Null),
+                            other => {
+                                return Err(type_mismatch("null_value_treatment must be text", &other))
+                            }
+                        }
+                    } else {
+                        "use_json_null"
+                    };
+                    let result = match treatment {
+                        "use_json_null" => json::set(root, path, json::Json::Null, create, arena)?,
+                        "delete_key" => json::delete_path(root, path, arena)?,
+                        "return_target" => root,
+                        "raise_exception" => {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "JSON value must not be null"
+                            ))
+                        }
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "null_value_treatment must be \"delete_key\", \"return_target\", \"use_json_null\", or \"raise_exception\""
+                            ))
+                        }
+                    };
+                    return Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true });
+                }
+                let value = json_tree_arg(raw_value, arena)?;
                 let result = json::set(root, path, value, create, arena)?;
                 Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
             }
@@ -236,7 +272,14 @@ pub(crate) fn dispatch<'a>(
                 }
                 let jsonb = matches!(d, Datum::Json { jsonb: true, .. }) || name.starts_with("jsonb");
                 let result = json::strip_nulls(json_tree_arg(d, arena)?, arena)?;
-                Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb })
+                // A json result re-serializes compactly, a jsonb one in the
+                // canonical spaced form — PostgreSQL's split exactly.
+                let text = if jsonb {
+                    json_to_text(&result, arena)?
+                } else {
+                    super::super::json_to_text_compact(&result, arena)?
+                };
+                Ok(Datum::Json { text, jsonb })
             }
             // `jsonb_pretty`: indented rendering of a jsonb value.
             "jsonb_pretty" => {
@@ -257,7 +300,7 @@ pub(crate) fn dispatch<'a>(
                 }
                 if !args.len().is_multiple_of(2) {
                     return Err(sql_err!(
-                        "22023",
+                        sqlstate::INVALID_PARAMETER_VALUE,
                         "argument list must have even number of elements"
                     ));
                 }
@@ -268,7 +311,7 @@ pub(crate) fn dispatch<'a>(
                 for pair in args.chunks(2) {
                     let key = eval_full(pair[0], arena, params, row, hooks)?;
                     if key.is_null() {
-                        return Err(sql_err!("22004", "argument {}: key must not be null", 1));
+                        return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "argument {}: key must not be null", 1));
                     }
                     let value = eval_full(pair[1], arena, params, row, hooks)?;
                     if !core::ptr::eq(pair.as_ptr(), args.as_ptr()) {

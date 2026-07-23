@@ -65,6 +65,37 @@ pub mod sqlstate {
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const UNDEFINED_FUNCTION: &str = "42883";
+    pub const DATA_EXCEPTION: &str = "22000";
+    pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
+    pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const INVALID_DATETIME_FORMAT: &str = "22007";
+    pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
+    pub const SUBSTRING_ERROR: &str = "22011";
+    pub const INTERVAL_FIELD_OVERFLOW: &str = "22015";
+    pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
+    pub const INVALID_ARGUMENT_FOR_LOG: &str = "2201E";
+    pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
+    pub const INVALID_ARGUMENT_FOR_WIDTH_BUCKET: &str = "2201G";
+    pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET: &str = "2201X";
+    pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+    pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
+    pub const STRING_DATA_LENGTH_MISMATCH: &str = "22026";
+    pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
+    pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+    pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
+    pub const DUPLICATE_COLUMN: &str = "42701";
+    pub const DUPLICATE_ALIAS: &str = "42712";
+    pub const GROUPING_ERROR: &str = "42803";
+    pub const WRONG_OBJECT_TYPE: &str = "42809";
+    pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
+    pub const WINDOWING_ERROR: &str = "42P20";
+    pub const OUT_OF_MEMORY: &str = "53200";
+    pub const STATEMENT_TOO_COMPLEX: &str = "54001";
+    pub const TOO_MANY_COLUMNS: &str = "54011";
+    pub const TOO_MANY_ARGUMENTS: &str = "54023";
+    pub const QUERY_CANCELED: &str = "57014";
+    pub const IO_ERROR: &str = "58030";
+    pub const INTERNAL_ERROR: &str = "XX000";
 }
 
 /// Resolves column references during evaluation. Statements without a FROM
@@ -81,7 +112,7 @@ pub trait ColumnLookup<'a> {
         _arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
         Err(sql_err!(
-            "0A000",
+            sqlstate::FEATURE_NOT_SUPPORTED,
             "whole-row reference to \"{}\" is not supported in this context",
             table
         ))
@@ -92,7 +123,7 @@ pub trait ColumnLookup<'a> {
     /// join rows reject it.
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         Err(sql_err!(
-            "0A000",
+            sqlstate::FEATURE_NOT_SUPPORTED,
             "whole-row reference to \"{}\" is not supported in this context",
             table
         ))
@@ -411,7 +442,7 @@ pub(crate) fn escape_char(d: Datum<'_>) -> Result<Option<char>, SqlError> {
     match (chars.next(), chars.next()) {
         (None, _) => Ok(None),
         (Some(c), None) => Ok(Some(c)),
-        _ => Err(sql_err!("22025", "invalid escape string")),
+        _ => Err(sql_err!(sqlstate::INVALID_ESCAPE_SEQUENCE, "invalid escape string")),
     }
 }
 
@@ -429,14 +460,14 @@ pub fn eval_full<'a>(
     {
         let Some((exprs, _, mask)) = hooks.group else {
             return Err(sql_err!(
-                "42803",
+                sqlstate::GROUPING_ERROR,
                 "GROUPING must be used with grouping sets or GROUP BY"
             ));
         };
         let mut result = 0i32;
         for arg in args.iter() {
             let idx = exprs.iter().position(|g| **g == **arg).ok_or_else(|| {
-                sql_err!("42803", "arguments to GROUPING must be grouping expressions of the associated query level")
+                sql_err!(sqlstate::GROUPING_ERROR, "arguments to GROUPING must be grouping expressions of the associated query level")
             })?;
             let grouped = mask & (1u64 << idx) != 0;
             result = (result << 1) | i32::from(!grouped);
@@ -561,7 +592,7 @@ pub fn eval_full<'a>(
                             return Ok(Datum::Int4(oid));
                         }
                         return Err(sql_err!(
-                            "42P01",
+                            sqlstate::UNDEFINED_TABLE,
                             "relation \"{}\" does not exist",
                             name
                         ));
@@ -861,7 +892,7 @@ pub fn eval_full<'a>(
             // Evaluate each element, unify to a common element type, build blob.
             let mut vals = [Datum::Null; 256];
             if items.len() > vals.len() {
-                return Err(sql_err!("54000", "array constructor too large"));
+                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array constructor too large"));
             }
             let mut element: Option<super::types::ArrElem> = None;
             for (i, e) in items.iter().enumerate() {
@@ -1083,7 +1114,7 @@ fn call<'a>(
     match name {
         "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every"
         | "string_agg" => Err(sql_err!(
-            "42803",
+            sqlstate::GROUPING_ERROR,
             "aggregate functions are not allowed here"
         )),
         // Set-returning functions: during expansion `hooks.srf_index` (1-based)
@@ -1098,7 +1129,7 @@ fn call<'a>(
             };
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
         }
         "generate_series" => {
@@ -1107,7 +1138,7 @@ fn call<'a>(
             }
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?
                 as i64;
             let start = eval_full(args[0], arena, params, row, hooks)?;
             let stop = eval_full(args[1], arena, params, row, hooks)?;
@@ -1172,7 +1203,7 @@ fn call<'a>(
             }
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             let (Some(string), Some(pattern)) = (
                 text_arg(name, args, 0, arena, params, row, hooks)?,
                 text_arg(name, args, 1, arena, params, row, hooks)?,
@@ -1268,7 +1299,7 @@ fn call<'a>(
             let pieces = regex_split_pub(src, pat, case_insensitive, arena)?;
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             Ok(pieces.get(k - 1).copied().unwrap_or(Datum::Null))
         }
         // Set-returning `string_to_table(string, delimiter [, null_string])`:
@@ -1292,7 +1323,7 @@ fn call<'a>(
             let n = split_pieces(source, delimiter, &mut pieces)?;
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             Ok(match pieces[..n].get(k - 1) {
                 Some(piece) if null_string == Some(*piece) => Datum::Null,
                 Some(piece) => Datum::Text(arena.alloc_str(piece).map_err(|_| arena_full())?),
@@ -1316,7 +1347,7 @@ fn call<'a>(
             };
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             if dim == 1 && k <= super::array::len(raw) {
                 Ok(Datum::Int4(k as i32))
             } else {
@@ -1334,7 +1365,7 @@ fn call<'a>(
             };
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             let kind = super::json::kind_of(text);
             if kind != super::json::Kind::Object {
                 return Err(super::json::object_keys_error(name, kind));
@@ -1365,7 +1396,7 @@ fn call<'a>(
             };
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             let kind = super::json::kind_of(text);
             if kind != super::json::Kind::Array {
                 return Err(super::json::array_elements_error(name, jsonb, kind));
@@ -1423,12 +1454,12 @@ fn call<'a>(
                 Datum::Json { text, .. } => text,
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(sql_err!("22023", "cannot deconstruct a scalar")),
+                _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct a scalar")),
             };
             let pairs = json_each_pairs(text, jsonb, as_text, arena)?;
             let k = hooks
                 .srf_index
-                .ok_or_else(|| sql_err!("0A000", "set-returning function called where not allowed"))?;
+                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
             let Some((key, value)) = pairs.get(k - 1) else {
                 return Ok(Datum::Null);
             };
@@ -1601,7 +1632,7 @@ pub fn timestamp_series_count(
     step: super::types::Interval,
 ) -> Result<usize, SqlError> {
     if step.months == 0 && step.days == 0 && step.micros == 0 {
-        return Err(sql_err!("22023", "step size cannot equal zero"));
+        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
     }
     let positive = interval_is_positive(step);
     let mut v = base;
@@ -1611,7 +1642,7 @@ pub fn timestamp_series_count(
         // A generous backstop against a pathologically large series; real limits
         // come from the row arena when the values are materialized.
         if n > 100_000_000 {
-            return Err(sql_err!("54000", "generate_series produces too many rows"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "generate_series produces too many rows"));
         }
         v = super::datetime::add_interval(v, step);
     }
@@ -1696,7 +1727,7 @@ fn load_array<'a>(
     let to_coltype = to.to_coltype();
     for i in 0..super::array::len(raw) {
         if n == items.len() {
-            return Err(sql_err!("54000", "array value too large"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large"));
         }
         let el = super::array::get(raw, from, i).unwrap_or(Datum::Null);
         items[n] = if el.is_null() || from == to { el } else { cast_to(el, to_coltype, arena)? };
@@ -1709,6 +1740,16 @@ fn json_to_text<'a>(v: &super::json::Json<'a>, arena: &'a Arena) -> Result<&'a s
     // Render straight into the arena at exact length — a jsonb value can be
     // larger than any fixed scratch buffer, and truncating it would corrupt it.
     arena.alloc_str_display(super::json::JsonWrite(v)).map_err(|_| arena_full())
+}
+
+/// [`json_to_text`] in the compact form a `json`-typed result carries.
+pub(crate) fn json_to_text_compact<'a>(
+    v: &super::json::Json<'a>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    arena
+        .alloc_str_display(super::json::JsonWriteCompact(v))
+        .map_err(|_| arena_full())
 }
 
 /// Expands a `(record).*` base to its fields for a projection. The runtime
@@ -1743,15 +1784,15 @@ pub fn json_each_pairs<'a>(
     match super::json::kind_of(text) {
         super::json::Kind::Object => {}
         super::json::Kind::Array => {
-            return Err(sql_err!("22023", "cannot deconstruct an array as an object"));
+            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct an array as an object"));
         }
         super::json::Kind::Scalar => {
-            return Err(sql_err!("22023", "cannot deconstruct a scalar"));
+            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct a scalar"));
         }
     }
     if jsonb {
         let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
-            return Err(sql_err!("22023", "cannot deconstruct an array as an object"));
+            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct an array as an object"));
         };
         let out = arena
             .alloc_slice_with(members.len(), |_| ("", Datum::Null))
@@ -1874,13 +1915,13 @@ fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], 
     };
     let n = super::array::len(raw);
     if n > 64 {
-        return Err(sql_err!("54000", "JSON path too long"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON path too long"));
     }
     let mut buffer = [""; 64];
     for (i, slot) in buffer[..n].iter_mut().enumerate() {
         *slot = match super::array::get(raw, element, i) {
             Some(Datum::Text(s)) => s,
-            _ => return Err(sql_err!("22023", "path element is not text")),
+            _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "path element is not text")),
         };
     }
     Ok(&*arena.alloc_slice_copy(&buffer[..n]).map_err(|_| arena_full())?)
@@ -2190,17 +2231,17 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             Datum::Array { raw, element: e } => {
                 for i in 0..super::array::len(raw) {
                     if n >= items.len() {
-                        return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
+                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array size exceeds the maximum allowed"));
                     }
                     items[n] = super::array::get(raw, e, i).ok_or_else(|| {
-                        sql_err!("XX000", "corrupt array element")
+                        sql_err!(sqlstate::INTERNAL_ERROR, "corrupt array element")
                     })?;
                     n += 1;
                 }
             }
             scalar => {
                 if n >= items.len() {
-                    return Err(sql_err!("54000", "array size exceeds the maximum allowed"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array size exceeds the maximum allowed"));
                 }
                 items[n] = scalar;
                 n += 1;

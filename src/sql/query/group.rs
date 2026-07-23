@@ -80,7 +80,7 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
             }
         }
         Err(sql_err!(
-            "42803",
+            sqlstate::GROUPING_ERROR,
             "subquery uses ungrouped column \"{}{}{}\" from outer query",
             qualifier.unwrap_or(""),
             if qualifier.is_some() { "." } else { "" },
@@ -385,7 +385,7 @@ pub(super) fn grouped_rows<'a>(
     for item in statement.items {
         let SelectItem::Expr { expression, .. } = item else {
             return Err(sql_err!(
-                "42803",
+                sqlstate::GROUPING_ERROR,
                 "SELECT * must appear in the GROUP BY clause or be used in an aggregate function"
             ));
         };
@@ -481,7 +481,7 @@ pub(super) fn grouped_rows<'a>(
             });
             if !in_list {
                 return Err(sql_err!(
-                    "42P10",
+                    sqlstate::INVALID_COLUMN_REFERENCE,
                     "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
                 ));
             }
@@ -588,13 +588,13 @@ fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
     };
     match table {
         Some(table) => sql_err!(
-            "42803",
+            sqlstate::GROUPING_ERROR,
             "column \"{}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",
             table,
             name
         ),
         None => sql_err!(
-            "42803",
+            sqlstate::GROUPING_ERROR,
             "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
             name
         ),

@@ -169,13 +169,13 @@ pub(crate) fn dispatch<'a>(
                 };
                 if stride.months != 0 {
                     return Err(sql_err!(
-                        "0A000",
+                        sqlstate::FEATURE_NOT_SUPPORTED,
                         "timestamps cannot be binned into intervals containing months or years"
                     ));
                 }
                 let stride_micros = (stride.days as i64) * 86_400_000_000 + stride.micros;
                 if stride_micros <= 0 {
-                    return Err(sql_err!("22008", "stride must be greater than zero"));
+                    return Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "stride must be greater than zero"));
                 }
                 let delta = source_micros - origin_micros;
                 // Floor-division so the bucket start is at or before the source.
@@ -325,7 +325,7 @@ pub(crate) fn dispatch<'a>(
                     .and_then(|w| w.checked_add(ints[3]))
                     .and_then(|d| i32::try_from(d).ok());
                 let (Some(months), Some(days)) = (months, days) else {
-                    return Err(sql_err!("22008", "interval field value out of range"));
+                    return Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval field value out of range"));
                 };
                 let sec_micros = (secs * 1_000_000.0).round();
                 let micros = ints[4]
@@ -334,7 +334,7 @@ pub(crate) fn dispatch<'a>(
                     .filter(|_| sec_micros.is_finite() && sec_micros.abs() < 9.2e18)
                     .and_then(|hm| hm.checked_add(sec_micros as i64));
                 let Some(micros) = micros else {
-                    return Err(sql_err!("22008", "interval field value out of range"));
+                    return Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval field value out of range"));
                 };
                 Ok(Datum::Interval(Interval { months, days, micros }))
             }
@@ -348,7 +348,7 @@ pub(crate) fn dispatch<'a>(
                 let Some(zone_name) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let zone = guc::parse_timezone(zone_name).ok_or_else(|| sql_err!("22023", "time zone \"{}\" not recognized", zone_name))?;
+                let zone = guc::parse_timezone(zone_name).ok_or_else(|| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "time zone \"{}\" not recognized", zone_name))?;
                 match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
                     Datum::Timestamptz(utc) => {
@@ -573,7 +573,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Timestamp(t) => (false, t),
                     Datum::Timestamptz(t) => (true, t),
-                    Datum::Date(d) => (false, d as i64 * 86_400_000_000),
+                    // A date promotes to timestamptz here, as PostgreSQL
+                    // resolves date_trunc(text, date) through that cast.
+                    Datum::Date(d) => (true, d as i64 * 86_400_000_000),
                     other => return Err(type_mismatch(name, &other)),
                 };
                 use datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};

@@ -248,6 +248,40 @@ after=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' \
   || bad "delta/tombstone cold start (got: $after)"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
 
+step "crash torture: random DML + kill -9 + cold starts vs real PostgreSQL"
+TORTURE_PGBIN="${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}"
+if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBIN/postgres" ]]; then
+  # A hermetic reference cluster, as the differential suite builds one.
+  TORTURE_PG_PORT=15497
+  "$TORTURE_PGBIN/initdb" -D "$WORK/torture-pgdata" -U postgres -A trust \
+    --encoding=UTF8 --lc-collate=C --lc-ctype=C >/dev/null 2>&1
+  TORTURE_SOCK=$(mktemp -d /tmp/pos3ql-torture-sock.XXXX)
+  "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" \
+    -o "-p $TORTURE_PG_PORT -k $TORTURE_SOCK -c listen_addresses=127.0.0.1 -c timezone=UTC" \
+    -l "$WORK/torture-pg.log" start >/dev/null
+  if P3_BIN="${POS3QL_BIN:-./target/release/pos3ql}" P3_CONF="$WORK/server.conf" \
+     P3_PORT=$PG_PORT P3_DATADIR="$WORK/data" P3_LOG="$WORK/server.log" \
+     PGHOST=127.0.0.1 PGPORT=$TORTURE_PG_PORT PGUSER=postgres PGDATABASE=postgres \
+     "$POS3QL_VENV/bin/python" tests/external/torture_diff.py --rounds 12 > "$WORK/torture.out" 2>&1; then
+    ok "crash torture ($(tail -1 "$WORK/torture.out"))"
+  else
+    bad "crash torture"; tail -40 "$WORK/torture.out"
+  fi
+  "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" stop -m immediate >/dev/null 2>&1
+  rm -rf "$TORTURE_SOCK"
+  # The torture script may have restarted the server under its own pid.
+  lsof -ti tcp:$PG_PORT -sTCP:LISTEN | xargs kill -9 2>/dev/null || true
+  sleep 0.3
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  for i in {1..50}; do
+    "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+else
+  print -- "SKIP: torture needs POS3QL_VENV and a reference PostgreSQL"
+fi
+
 step "differential vs real PostgreSQL 18 (when installed)"
 if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
   if tests/external/differential.sh > "$WORK/differential.out" 2>&1; then

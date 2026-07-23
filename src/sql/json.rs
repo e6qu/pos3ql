@@ -383,9 +383,12 @@ impl<'a> P<'a> {
         // jsonb orders object keys by length first, then bytewise — the same
         // order PostgreSQL stores and prints them in.
         let ms = &mut members[..n];
-        ms.sort_by(|a, b| {
+        crate::mem::arena::stable_sort_via(self.arena, ms, |a, b| {
             a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
-        });
+        })
+        .map_err(|_| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object exceeds the statement arena")
+        })?;
         let mut out: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
         let mut m = 0;
         for i in 0..n {
@@ -501,7 +504,12 @@ fn build_object<'a>(
     let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
     buffer[..members.len()].copy_from_slice(members);
     let ms = &mut buffer[..members.len()];
-    ms.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes())));
+    crate::mem::arena::stable_sort_via(arena, ms, |a, b| {
+        a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+    })
+    .map_err(|_| {
+        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object exceeds the statement arena")
+    })?;
     let mut out: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
     let mut m = 0;
     for i in 0..members.len() {

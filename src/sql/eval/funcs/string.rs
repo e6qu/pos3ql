@@ -232,6 +232,7 @@ pub(crate) fn dispatch<'a>(
                     return sql_regex_substring(s, pattern, escape, arena);
                 }
                 let from = match from_val {
+                    Datum::Int2(v) => v as i64,
                     Datum::Int4(v) => v as i64,
                     Datum::Int8(v) => v,
                     Datum::Null => return Ok(Datum::Null),

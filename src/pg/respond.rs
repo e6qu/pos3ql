@@ -418,6 +418,10 @@ impl<'b> Responder<'b> {
                     m.i32(4);
                     m.bytes(&x.to_be_bytes());
                 }
+                Datum::Int2(x) => {
+                    m.i32(2);
+                    m.bytes(&x.to_be_bytes());
+                }
                 Datum::Date(x) => {
                     m.i32(4);
                     m.bytes(&x.to_be_bytes());

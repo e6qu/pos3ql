@@ -82,7 +82,7 @@ pub(crate) fn dispatch<'a>(
                 // makes the result float8, as PostgreSQL does), falling back to the
                 // runtime value for expressions whose static type is unknown.
                 let rank = |d: &Datum| match d {
-                    Datum::Int4(_) => 1,
+                    Datum::Int2(_) | Datum::Int4(_) => 1,
                     Datum::Int8(_) => 2,
                     Datum::Numeric(_) => 3,
                     Datum::Float8(_) => 4,
@@ -118,6 +118,7 @@ pub(crate) fn dispatch<'a>(
                 let best = best.unwrap_or(Datum::Null);
                 Ok(match (widest, best) {
                     (4, d) => Datum::Float8(match d {
+                        Datum::Int2(x) => x as f64,
                         Datum::Int4(x) => x as f64,
                         Datum::Int8(x) => x as f64,
                         Datum::Numeric(n) => n.to_f64(),
@@ -125,10 +126,12 @@ pub(crate) fn dispatch<'a>(
                         other => return Ok(other),
                     }),
                     (3, d) => match d {
+                        Datum::Int2(x) => Datum::Numeric(Numeric::from_i64(x as i64, arena)?),
                         Datum::Int4(x) => Datum::Numeric(Numeric::from_i64(x as i64, arena)?),
                         Datum::Int8(x) => Datum::Numeric(Numeric::from_i64(x, arena)?),
                         other => other,
                     },
+                    (2, Datum::Int2(x)) => Datum::Int8(x as i64),
                     (2, Datum::Int4(x)) => Datum::Int8(x as i64),
                     (_, d) => d,
                 })

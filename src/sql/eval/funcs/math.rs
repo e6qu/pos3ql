@@ -95,6 +95,10 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
+                    Datum::Int2(v) => v
+                        .checked_abs()
+                        .map(Datum::Int2)
+                        .ok_or_else(|| overflow("smallint")),
                     Datum::Int4(v) => v
                         .checked_abs()
                         .map(Datum::Int4)
@@ -131,6 +135,7 @@ pub(crate) fn dispatch<'a>(
                     let v = match eval_full(args[0], arena, params, row, hooks)? {
                         Datum::Null => return Ok(Datum::Null),
                         Datum::Numeric(v) => v,
+                        Datum::Int2(x) => Numeric::from_i64(x as i64, arena)?,
                         Datum::Int4(x) => Numeric::from_i64(x as i64, arena)?,
                         Datum::Int8(x) => Numeric::from_i64(x, arena)?,
                         other => return Err(type_mismatch(name, &other)),
@@ -153,6 +158,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => Ok(Datum::Null),
                     // For an integer, floor/ceil/round/trunc are the identity; as in
                     // PostgreSQL the result type is double precision.
+                    Datum::Int2(v) => Ok(Datum::Float8(v as f64)),
                     Datum::Int4(v) => Ok(Datum::Float8(v as f64)),
                     Datum::Int8(v) => Ok(Datum::Float8(v as f64)),
                     Datum::Float8(v) => Ok(Datum::Float8(match mode {
@@ -169,6 +175,7 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
+                    Datum::Int2(v) => Ok(Datum::Float8(v.signum() as f64)),
                     Datum::Int4(v) => Ok(Datum::Float8(v.signum() as f64)),
                     Datum::Int8(v) => Ok(Datum::Float8(v.signum() as f64)),
                     Datum::Float8(v) => Ok(Datum::Float8(if v > 0.0 {
@@ -310,18 +317,24 @@ pub(crate) fn dispatch<'a>(
                     let y = datum_numeric(name, b, arena)?;
                     return Ok(Datum::Numeric(numeric::rem(&x, &y, arena)?));
                 }
-                let (x, y, wide) = match (a, b) {
-                    (Datum::Int4(x), Datum::Int4(y)) => (x as i64, y as i64, false),
-                    (Datum::Int4(x), Datum::Int8(y)) => (x as i64, y, true),
-                    (Datum::Int8(x), Datum::Int4(y)) => (x, y as i64, true),
-                    (Datum::Int8(x), Datum::Int8(y)) => (x, y, true),
-                    (other, _) => return Err(type_mismatch(name, &other)),
+                let int_of = |d: &Datum| match d {
+                    Datum::Int2(x) => Some((i64::from(*x), 2u8)),
+                    Datum::Int4(x) => Some((i64::from(*x), 4)),
+                    Datum::Int8(x) => Some((*x, 8)),
+                    _ => None,
+                };
+                let (Some((x, wl)), Some((y, wr))) = (int_of(&a), int_of(&b)) else {
+                    return Err(type_mismatch(name, &a));
                 };
                 if y == 0 {
                     return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
                 }
                 let r = x % y;
-                Ok(if wide { Datum::Int8(r) } else { Datum::Int4(r as i32) })
+                Ok(match wl.max(wr) {
+                    2 => Datum::Int2(r as i16),
+                    4 => Datum::Int4(r as i32),
+                    _ => Datum::Int8(r),
+                })
             }
             "gcd" | "lcm" => {
                 arity(2)?;
@@ -330,7 +343,17 @@ pub(crate) fn dispatch<'a>(
                 if a.is_null() || b.is_null() {
                     return Ok(Datum::Null);
                 }
-                let (x, y, wide) = match (a, b) {
+        let (x, y, wide) = match (a, b) {
+                    // PostgreSQL resolves gcd/lcm over int4 and int8 only; a
+                    // smallint argument matches both promotions equally and
+                    // the call is ambiguous.
+                    (Datum::Int2(_), _) | (_, Datum::Int2(_)) => {
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "function {}(smallint, smallint) is not unique",
+                            name
+                        ))
+                    }
                     (Datum::Int4(x), Datum::Int4(y)) => (x as i64, y as i64, false),
                     (Datum::Int4(x), Datum::Int8(y)) => (x as i64, y, true),
                     (Datum::Int8(x), Datum::Int4(y)) => (x, y as i64, true),

@@ -96,6 +96,7 @@ impl OwnedDatum {
             Datum::Null => Self::Null,
             Datum::Bool(b) => Self::Bool(*b),
             Datum::Int4(v) => Self::Int4(*v),
+            Datum::Int2(v) => Self::Int4(*v as i32),
             Datum::Int8(v) => Self::Int8(*v),
             Datum::Float8(v) => Self::Float8(*v),
             Datum::Date(_)

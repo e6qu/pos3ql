@@ -65,6 +65,13 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 let s = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => return Ok(Datum::Null),
+                    // to_hex has int4 and int8 forms only; int2 is ambiguous.
+                    Datum::Int2(_) => {
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "function to_hex(smallint) is not unique"
+                        ))
+                    }
                     Datum::Int4(v) => stack_format!(16, "{:x}", v as u32),
                     Datum::Int8(v) => stack_format!(16, "{:x}", v as u64),
                     other => return Err(type_mismatch(name, &other)),

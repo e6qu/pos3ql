@@ -165,9 +165,9 @@ impl ColType {
     pub fn oid(self) -> i32 {
         match self {
             Self::Bool => oid::BOOL,
-            // int2/float4 report int4/float8 OIDs so the binary payload width
-            // (4/8 bytes, from the i32/f64 storage) matches the declared type.
-            Self::Int2 => oid::INT4,
+            // float4 reports the float8 OID so the binary payload width
+            // matches the f64 storage; int2 has its own datum and real OID.
+            Self::Int2 => oid::INT2,
             Self::Int4 => oid::INT4,
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT8,
@@ -198,7 +198,8 @@ impl ColType {
     pub fn typlen(self) -> i16 {
         match self {
             Self::Bool => 1,
-            Self::Int2 | Self::Int4 | Self::Date => 4,
+            Self::Int2 => 2,
+            Self::Int4 | Self::Date => 4,
             Self::Int8 | Self::Float4 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
             Self::Timetz => 12,
             Self::Interval => 16,
@@ -213,7 +214,6 @@ impl ColType {
     /// float8, varchar/bpchar as text. Used where behavior is width-driven.
     pub fn storage(self) -> ColType {
         match self {
-            Self::Int2 => Self::Int4,
             Self::Float4 => Self::Float8,
             Self::Varchar | Self::Bpchar | Self::Name => Self::Text,
             other => other,
@@ -368,6 +368,17 @@ pub enum ArrElem {
     Date,
     Timestamp,
     Timestamptz,
+    Int2,
+    Time,
+    Timetz,
+    Interval,
+    Uuid,
+    Bytea,
+    Json,
+    Jsonb,
+    Varchar,
+    Bpchar,
+    Name,
 }
 
 impl ArrElem {
@@ -385,6 +396,26 @@ impl ArrElem {
             ArrElem::Date => "date[]",
             ArrElem::Timestamp => "timestamp[]",
             ArrElem::Timestamptz => "timestamp with time zone[]",
+            ArrElem::Int2 => "smallint[]",
+            ArrElem::Time => "time without time zone[]",
+            ArrElem::Timetz => "time with time zone[]",
+            ArrElem::Interval => "interval[]",
+            ArrElem::Uuid => "uuid[]",
+            ArrElem::Bytea => "bytea[]",
+            ArrElem::Json => "json[]",
+            ArrElem::Jsonb => "jsonb[]",
+            ArrElem::Varchar => "character varying[]",
+            ArrElem::Bpchar => "character[]",
+            ArrElem::Name => "name[]",
+        }
+    }
+
+    /// The array type's name as `pg_typeof` spells it — the temporal names
+    /// written out in full, unlike the message form [`ArrElem::array_name`].
+    pub fn typeof_name(self) -> &'static str {
+        match self {
+            ArrElem::Timestamp => "timestamp without time zone[]",
+            other => other.array_name(),
         }
     }
 
@@ -392,21 +423,40 @@ impl ArrElem {
     pub fn from_datum(d: &Datum) -> Option<ArrElem> {
         Some(match d {
             Datum::Bool(_) => ArrElem::Bool,
+            Datum::Int2(_) => ArrElem::Int2,
             Datum::Int4(_) => ArrElem::Int4,
             Datum::Int8(_) => ArrElem::Int8,
             Datum::Float8(_) => ArrElem::Float8,
-            Datum::Text(_) | Datum::Bpchar(_) => ArrElem::Text,
+            Datum::Text(_) => ArrElem::Text,
+            Datum::Bpchar(_) => ArrElem::Bpchar,
             Datum::Numeric(_) => ArrElem::Numeric,
             Datum::Date(_) => ArrElem::Date,
             Datum::Timestamp(_) => ArrElem::Timestamp,
             Datum::Timestamptz(_) => ArrElem::Timestamptz,
+            Datum::Time(_) => ArrElem::Time,
+            Datum::Timetz(..) => ArrElem::Timetz,
+            Datum::Interval(_) => ArrElem::Interval,
+            Datum::Uuid(_) => ArrElem::Uuid,
+            Datum::Bytea(_) => ArrElem::Bytea,
+            Datum::Json { jsonb: false, .. } => ArrElem::Json,
+            Datum::Json { jsonb: true, .. } => ArrElem::Jsonb,
             _ => return None,
         })
     }
 
     pub fn from_coltype(c: ColType) -> Option<ArrElem> {
+        // The string types keep their identity as elements (varchar[] and
+        // bpchar[] are their own array types), so match them before the
+        // storage fold collapses them into text.
+        match c {
+            ColType::Varchar => return Some(ArrElem::Varchar),
+            ColType::Bpchar => return Some(ArrElem::Bpchar),
+            ColType::Name => return Some(ArrElem::Name),
+            _ => {}
+        }
         Some(match c.storage() {
             ColType::Bool => ArrElem::Bool,
+            ColType::Int2 => ArrElem::Int2,
             ColType::Int4 => ArrElem::Int4,
             ColType::Int8 => ArrElem::Int8,
             ColType::Float8 => ArrElem::Float8,
@@ -415,6 +465,13 @@ impl ArrElem {
             ColType::Date => ArrElem::Date,
             ColType::Timestamp => ArrElem::Timestamp,
             ColType::Timestamptz => ArrElem::Timestamptz,
+            ColType::Time => ArrElem::Time,
+            ColType::Timetz => ArrElem::Timetz,
+            ColType::Interval => ArrElem::Interval,
+            ColType::Uuid => ArrElem::Uuid,
+            ColType::Bytea => ArrElem::Bytea,
+            ColType::Json => ArrElem::Json,
+            ColType::Jsonb => ArrElem::Jsonb,
             _ => return None,
         })
     }
@@ -430,6 +487,17 @@ impl ArrElem {
             ArrElem::Date => ColType::Date,
             ArrElem::Timestamp => ColType::Timestamp,
             ArrElem::Timestamptz => ColType::Timestamptz,
+            ArrElem::Int2 => ColType::Int2,
+            ArrElem::Time => ColType::Time,
+            ArrElem::Timetz => ColType::Timetz,
+            ArrElem::Interval => ColType::Interval,
+            ArrElem::Uuid => ColType::Uuid,
+            ArrElem::Bytea => ColType::Bytea,
+            ArrElem::Json => ColType::Json,
+            ArrElem::Jsonb => ColType::Jsonb,
+            ArrElem::Varchar => ColType::Varchar,
+            ArrElem::Bpchar => ColType::Bpchar,
+            ArrElem::Name => ColType::Name,
         }
     }
 
@@ -445,6 +513,17 @@ impl ArrElem {
             ArrElem::Date => 1182,
             ArrElem::Timestamp => 1115,
             ArrElem::Timestamptz => 1185,
+            ArrElem::Int2 => 1005,
+            ArrElem::Time => 1183,
+            ArrElem::Timetz => 1270,
+            ArrElem::Interval => 1187,
+            ArrElem::Uuid => 2951,
+            ArrElem::Bytea => 1001,
+            ArrElem::Json => 199,
+            ArrElem::Jsonb => 3807,
+            ArrElem::Varchar => 1015,
+            ArrElem::Bpchar => 1014,
+            ArrElem::Name => 1003,
         }
     }
 
@@ -459,6 +538,17 @@ impl ArrElem {
             ArrElem::Date => 6,
             ArrElem::Timestamp => 7,
             ArrElem::Timestamptz => 8,
+            ArrElem::Int2 => 9,
+            ArrElem::Time => 10,
+            ArrElem::Timetz => 11,
+            ArrElem::Interval => 12,
+            ArrElem::Uuid => 13,
+            ArrElem::Bytea => 14,
+            ArrElem::Json => 15,
+            ArrElem::Jsonb => 16,
+            ArrElem::Varchar => 17,
+            ArrElem::Bpchar => 18,
+            ArrElem::Name => 19,
         }
     }
 
@@ -473,6 +563,17 @@ impl ArrElem {
             6 => ArrElem::Date,
             7 => ArrElem::Timestamp,
             8 => ArrElem::Timestamptz,
+            9 => ArrElem::Int2,
+            10 => ArrElem::Time,
+            11 => ArrElem::Timetz,
+            12 => ArrElem::Interval,
+            13 => ArrElem::Uuid,
+            14 => ArrElem::Bytea,
+            15 => ArrElem::Json,
+            16 => ArrElem::Jsonb,
+            17 => ArrElem::Varchar,
+            18 => ArrElem::Bpchar,
+            19 => ArrElem::Name,
             _ => return None,
         })
     }
@@ -713,6 +814,10 @@ impl RangeKind {
 pub enum Datum<'a> {
     Null,
     Bool(bool),
+    /// `smallint`. The width is the type: an i16 cannot hold what PostgreSQL's
+    /// smallint cannot, so out-of-range states are unrepresentable. Stored
+    /// rows keep the historical 4-byte layout; decode narrows by schema.
+    Int2(i16),
     Int4(i32),
     Int8(i64),
     Float8(f64),
@@ -782,6 +887,7 @@ impl<'a> Datum<'a> {
             Datum::Record(_) => oid::RECORD,
             Datum::Null => oid::TEXT,
             Datum::Bool(_) => oid::BOOL,
+            Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
             Datum::Int8(_) => oid::INT8,
             Datum::Float8(_) => oid::FLOAT8,
@@ -815,6 +921,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Null => Ok(()), // never rendered; NULL is a column-length of -1
             Datum::Bool(true) => f.write_str("t"),
             Datum::Bool(false) => f.write_str("f"),
+            Datum::Int2(v) => write!(f, "{v}"),
             Datum::Int4(v) => write!(f, "{v}"),
             Datum::Int8(v) => write!(f, "{v}"),
             Datum::Float8(v) => {

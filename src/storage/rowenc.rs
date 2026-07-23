@@ -23,7 +23,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Record(_) => unreachable!("record cannot be a stored column value"),
             Datum::Null => 0,
             Datum::Bool(_) => 1,
-            Datum::Int4(_) | Datum::Date(_) => 4,
+            Datum::Int2(_) | Datum::Int4(_) | Datum::Date(_) => 4,
             Datum::Int8(_) | Datum::Float8(_) | Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Time(_) => 8,
             Datum::Timetz(..) => 12,
             Datum::Interval(_) => 16,
@@ -63,6 +63,10 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             }
             Datum::Int4(x) => {
                 rest[..4].copy_from_slice(&x.to_le_bytes());
+                take = 4;
+            }
+            Datum::Int2(x) => {
+                rest[..4].copy_from_slice(&(*x as i32).to_le_bytes());
                 take = 4;
             }
             Datum::Int8(x) => {
@@ -179,7 +183,14 @@ pub(crate) fn decode<'a>(
             }
             ColType::Int4 | ColType::Int2 => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                out[i] = Datum::Int4(i32::from_le_bytes(b.try_into().unwrap()));
+                let x = i32::from_le_bytes(b.try_into().unwrap());
+                // The 4-byte layout is historical; the schema narrows. A
+                // stored int2 is range-checked at write, so the cast holds.
+                out[i] = if matches!(schema[i], ColType::Int2) {
+                    Datum::Int2(x as i16)
+                } else {
+                    Datum::Int4(x)
+                };
                 at += 4;
             }
             ColType::Int8 => {

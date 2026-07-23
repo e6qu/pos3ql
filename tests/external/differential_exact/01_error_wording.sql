@@ -70,3 +70,11 @@ DROP VIEW nosuchview;
 SELECT count(*) GROUP BY 1;
 SELECT 1 GROUP BY 0;
 SELECT 1 GROUP BY 2;
+
+-- smallint arithmetic bounds and the ambiguous int2 overloads.
+SELECT 32767::int2 + 1::int2;
+SELECT '40000'::int2;
+SELECT -32768::int2;
+SELECT gcd(6::int2, 4::int2);
+SELECT to_hex(255::int2);
+SELECT 'serial'::regtype;

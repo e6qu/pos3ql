@@ -102,7 +102,7 @@ pub fn cast_to<'a>(
                 }
                 x
             };
-            Datum::Int4(x as i32)
+            Datum::Int2(x as i16)
         }
         ColType::Date => match v {
             Datum::Date(_) => v,
@@ -418,6 +418,7 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
         return n.to_i64().map_err(|_| overflow(target));
     }
     match v {
+        Datum::Int2(x) => Ok(i64::from(*x)),
         Datum::Int4(x) => Ok(i64::from(*x)),
         Datum::Int8(x) => Ok(*x),
         Datum::Bool(b) => Ok(i64::from(*b)),

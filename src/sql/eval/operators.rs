@@ -445,8 +445,8 @@ pub(crate) fn compare_datums_as(
             range::cmp_multiranges(a, b, *ka)?
         }
         // Numeric vs integer: compare exactly via numeric.
-        (Datum::Numeric(_), Datum::Int4(_) | Datum::Int8(_))
-        | (Datum::Int4(_) | Datum::Int8(_), Datum::Numeric(_)) => {
+        (Datum::Numeric(_), Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_))
+        | (Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_), Datum::Numeric(_)) => {
             // Fall through to the float comparison below only if exactness is
             // not required; integers convert to numeric exactly.
             return compare_numeric_int(l, r);
@@ -487,6 +487,11 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
         return Ok(v);
     };
     Ok(match other {
+        Datum::Int2(_) => {
+            let x: i64 =
+                s.trim().parse().map_err(|_| bad_text(s, "smallint"))?;
+            Datum::Int2(i16::try_from(x).map_err(|_| overflow("smallint"))?)
+        }
         Datum::Int4(_) => Datum::Int4(
             s.trim()
                 .parse()
@@ -802,14 +807,24 @@ fn date_shift<'a>(date: i32, days: i64, sub: bool) -> Result<Datum<'a>, SqlError
 
 /// int4 operator int4 yields int4 (with range check), as in PostgreSQL.
 fn narrow_int<'a>(v: i64, l: &Datum, r: &Datum) -> Result<Datum<'a>, SqlError> {
-    let both_int4 = matches!(l, Datum::Int4(_)) && matches!(r, Datum::Int4(_));
-    if both_int4 {
-        return match i32::try_from(v) {
+    // The result type is the wider operand's — smallint op smallint stays
+    // smallint and raises 22003 at ±32767, exactly PostgreSQL's rule.
+    let width = |d: &Datum| match d {
+        Datum::Int2(_) => 2u8,
+        Datum::Int4(_) => 4,
+        _ => 8,
+    };
+    match width(l).max(width(r)) {
+        2 => match i16::try_from(v) {
+            Ok(small) => Ok(Datum::Int2(small)),
+            Err(_) => Err(overflow("smallint")),
+        },
+        4 => match i32::try_from(v) {
             Ok(small) => Ok(Datum::Int4(small)),
             Err(_) => Err(overflow("integer")),
-        };
+        },
+        _ => Ok(Datum::Int8(v)),
     }
-    Ok(Datum::Int8(v))
 }
 
 fn as_multirange<'a>(d: &Datum<'a>) -> Result<(&'a str, RangeKind), SqlError> {
@@ -923,6 +938,7 @@ pub(crate) fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Res
     use BinaryOp::*;
     let int = |d: &Datum| -> Result<i64, SqlError> {
         match d {
+            Datum::Int2(v) => Ok(i64::from(*v)),
             Datum::Int4(v) => Ok(i64::from(*v)),
             Datum::Int8(v) => Ok(*v),
             other => Err(type_mismatch("bitwise operator requires integers", other)),
@@ -940,12 +956,23 @@ pub(crate) fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Res
         Shr => a >> (b & 63),
         _ => unreachable!("bitwise only"),
     };
-    // Result width follows the wider operand (int8 if either is int8).
-    if matches!(l, Datum::Int8(_)) || matches!(r, Datum::Int8(_)) {
-        Ok(Datum::Int8(v))
-    } else {
-        Ok(Datum::Int4(v as i32))
-    }
+    let width = |d: &Datum| match d {
+        Datum::Int2(_) => 2u8,
+        Datum::Int4(_) => 4,
+        _ => 8,
+    };
+    // A shift keeps its left operand's type (`1::int2 << 15` is smallint
+    // -32768, truncating silently); the pairwise operators follow the wider
+    // operand. Truncation, not overflow: PostgreSQL's C-level bit operators.
+    let out_width = match operator {
+        Shl | Shr => width(&l),
+        _ => width(&l).max(width(&r)),
+    };
+    Ok(match out_width {
+        2 => Datum::Int2(v as i16),
+        4 => Datum::Int4(v as i32),
+        _ => Datum::Int8(v),
+    })
 }
 
 pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
@@ -958,6 +985,10 @@ pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Re
                 .map_err(|_| arena_full())?;
             Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
         }
+        (UnaryOp::Neg, Datum::Int2(x)) => x
+            .checked_neg()
+            .map(Datum::Int2)
+            .ok_or_else(|| overflow("smallint")),
         (UnaryOp::Neg, Datum::Int4(x)) => x
             .checked_neg()
             .map(Datum::Int4)
@@ -981,6 +1012,7 @@ pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Re
             ..n
         })),
         (UnaryOp::Not, Datum::Bool(b)) => Ok(Datum::Bool(!b)),
+        (UnaryOp::BitNot, Datum::Int2(x)) => Ok(Datum::Int2(!x)),
         (UnaryOp::BitNot, Datum::Int4(x)) => Ok(Datum::Int4(!x)),
         (UnaryOp::BitNot, Datum::Int8(x)) => Ok(Datum::Int8(!x)),
         (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),

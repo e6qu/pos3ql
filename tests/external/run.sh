@@ -62,7 +62,7 @@ step "write config and start pos3ql"
 cat > "$WORK/server.conf" <<EOF
 listen_addr = 127.0.0.1:${PG_PORT}
 data_dir = ${WORK}/data
-max_connections = 16
+max_connections = 8
 memtable_bytes = 16MiB
 wal_bytes = 16MiB
 s3 = on
@@ -72,6 +72,13 @@ s3_prefix = run-$$/
 s3_access_key = minioadmin
 s3_secret_key = minioadmin
 wal_upload = on
+sql_arena_bytes = 4MiB
+wal_buffer_bytes = 4MiB
+max_tables = 64
+table_rows = 32768
+# A full scan of spilled rows stages them in the statement work arena (the
+# streaming read path is a later stage); size it for the spilled dataset.
+work_arena_bytes = 192MiB
 EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
@@ -204,6 +211,22 @@ for i in {1..50}; do
 done
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT v FROM crashy ORDER BY id LIMIT 1" 2>&1)
 [[ "$out" == "pre-crash" ]] && ok "cold start from bucket" || bad "cold start from bucket: '$out'"
+
+step "ingest beyond memtable_bytes: rows spill to the bucket and read back"
+# The Stage D milestone: sustained inserts well past the heap's capacity,
+# with checkpoints spilling committed bytes to block SSTs. Reads (point and
+# aggregate) then fetch spilled rows back through the cache tiers.
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CREATE TABLE spilly (id serial, pad text)"
+# ~24 MiB of row bytes against a 16 MiB memtable, in modest batches so the
+# auto-checkpoint between messages can drain the heap.
+for i in {1..24}; do
+  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q     -c "INSERT INTO spilly(pad) SELECT repeat('x', 1024) FROM generate_series(1, 1000)"     || { bad "spill ingest batch $i"; break; }
+done
+spill_count=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(*) FROM spilly" 2>&1)
+[[ "$spill_count" == "24000" ]] && ok "ingest 1.5x memtable_bytes (24000 rows)"   || bad "ingest beyond memtable (count: $spill_count)"
+spill_point=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT length(pad) FROM spilly WHERE id = 12345" 2>&1)
+[[ "$spill_point" == "1024" ]] && ok "point read of a spilled row"   || bad "point read of a spilled row (got: $spill_point)"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
 
 step "differential vs real PostgreSQL 18 (when installed)"
 if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then

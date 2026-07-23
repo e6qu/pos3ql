@@ -397,8 +397,27 @@ pub struct RowLoc {
 /// writer fails fast instead of blocking).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowState {
-    pub committed: Option<RowLoc>,
+    pub committed: Option<RowHome>,
     pub pending: Option<PendingChange>,
+}
+
+/// Where a committed row's bytes live: the RAM heap, or spilled to the
+/// table's checkpoint SST in the block store (fetched back through the cache
+/// tiers on read). The rows *map* stays in RAM either way — it is the
+/// authoritative index — so spilling moves bytes, never visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowHome {
+    Heap(RowLoc),
+    Spilled { len: u32 },
+}
+
+impl RowHome {
+    pub fn heap_loc(self) -> Option<RowLoc> {
+        match self {
+            RowHome::Heap(loc) => Some(loc),
+            RowHome::Spilled { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,16 +430,23 @@ pub struct PendingChange {
 impl RowState {
     pub fn committed_only(loc: RowLoc) -> Self {
         Self {
-            committed: Some(loc),
+            committed: Some(RowHome::Heap(loc)),
+            pending: None,
+        }
+    }
+
+    pub fn committed_spilled(len: u32) -> Self {
+        Self {
+            committed: Some(RowHome::Spilled { len }),
             pending: None,
         }
     }
 
     /// What transaction `txid` sees: its own pending change, else the
     /// committed image. `None` = row invisible.
-    pub fn visible_to(&self, txid: u32) -> Option<RowLoc> {
+    pub fn visible_to(&self, txid: u32) -> Option<RowHome> {
         match self.pending {
-            Some(p) if p.txid == txid => p.loc,
+            Some(p) if p.txid == txid => p.loc.map(RowHome::Heap),
             _ => self.committed,
         }
     }
@@ -453,7 +479,7 @@ impl RowHeap {
         if self.buffer.len() - self.used < len {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "memtable is full ({} bytes); flush to object storage is not implemented yet",
+                "memtable is full ({} bytes); with object storage on, rows spill at the next checkpoint — retry, raise memtable_bytes, or enable s3",
                 self.buffer.len()
             ));
         }
@@ -499,6 +525,9 @@ pub struct Table {
     pub serial_last: [i64; MAX_COLUMNS],
     /// Whether `serial_last` changed since it was last written to the WAL.
     pub serial_dirty: bool,
+    /// The SST holding this table's spilled rows (the last checkpoint's),
+    /// `None` while every committed row is heap-resident.
+    pub(crate) spill_sst: Option<crate::store::SstHandle>,
 }
 
 /// An uncommitted catalog change to one table, owned by one transaction.
@@ -600,6 +629,49 @@ pub struct Storage {
     next_rowid: u64,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
+    /// The read path for spilled rows: the tiered block stack shared with the
+    /// checkpointer, plus owned reader scratch. `None` without object storage
+    /// — then rows never spill and the heap-full error stands.
+    spill: Option<SpillReader>,
+}
+
+/// Fetches spilled rows back through the cache tiers. The buffers are owned
+/// and startup-reserved; the stack is shared with the checkpointer through a
+/// `RefCell` (single-threaded engine, short borrows).
+pub(crate) struct SpillReader {
+    blocks: std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
+    /// Two scratch sets so one consume-in-place fetch may nest inside another
+    /// (a validation scan holding one row while checking it against the
+    /// rest). Deeper nesting is a loud error, not a deadlock.
+    scratch: [std::cell::RefCell<SpillScratch>; 2],
+}
+
+/// The reader's owned block buffers (index, data, chain assembly).
+struct SpillScratch {
+    index_buf: Box<[u8]>,
+    data_buf: Box<[u8]>,
+    assembly_buf: Box<[u8]>,
+}
+
+impl SpillReader {
+    /// Startup-only: reserves the reader scratch from the budget.
+    pub(crate) fn new(
+        budget: &mut Budget,
+        blocks: std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
+    ) -> Result<Self, BudgetError> {
+        budget.draw(
+            2 * (2 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
+            "spill reader",
+        )?;
+        let fresh = || {
+            std::cell::RefCell::new(SpillScratch {
+                index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
+            })
+        };
+        Ok(Self { blocks, scratch: [fresh(), fresh()] })
+    }
 }
 
 impl Storage {
@@ -639,6 +711,7 @@ impl Storage {
                     dirty: false,
                     serial_last: [0; MAX_COLUMNS],
                     serial_dirty: false,
+                    spill_sst: None,
                 })
                 .expect("sized to max_tables");
         }
@@ -674,6 +747,7 @@ impl Storage {
             indexes,
             next_rowid: 1,
             lsn: 0,
+            spill: None,
         })
     }
 
@@ -707,23 +781,40 @@ impl Storage {
             let mut schema = [crate::sql::types::ColType::Bool; MAX_COLUMNS];
             self.tables[i].def.schema(&mut schema);
             let mut max = [0i64; MAX_COLUMNS];
-            for (_, state) in self.tables[i].rows.iter() {
-                let Some(loc) = state.visible_to(0) else { continue };
-                let mut row = [crate::sql::types::Datum::Null; MAX_COLUMNS];
-                if rowenc::decode(self.heap.get(loc), &schema[..n_columns], &mut row).is_err() {
-                    continue;
+            let mut rowids: Vec<(u64, RowHome)> = Vec::new();
+            for (&rowid, state) in self.tables[i].rows.iter() {
+                if let Some(home) = state.visible_to(0) {
+                    rowids.push((rowid, home));
                 }
-                for c in 0..n_columns {
-                    if !auto[c] {
-                        continue;
+            }
+            for (rowid, home) in rowids {
+                let mut vals = [0i64; MAX_COLUMNS];
+                let mut have = [false; MAX_COLUMNS];
+                self.with_row_bytes(i, rowid, home, |bytes| {
+                    let mut row = [crate::sql::types::Datum::Null; MAX_COLUMNS];
+                    if rowenc::decode(bytes, &schema[..n_columns], &mut row).is_err() {
+                        return Ok(());
                     }
-                    let v = match row[c] {
-                        crate::sql::types::Datum::Int2(x) => i64::from(x),
-                        crate::sql::types::Datum::Int4(x) => i64::from(x),
-                        crate::sql::types::Datum::Int8(x) => x,
-                        _ => continue,
-                    };
-                    max[c] = max[c].max(v);
+                    for c in 0..n_columns {
+                        if !auto[c] {
+                            continue;
+                        }
+                        let v = match row[c] {
+                            crate::sql::types::Datum::Int2(x) => i64::from(x),
+                            crate::sql::types::Datum::Int4(x) => i64::from(x),
+                            crate::sql::types::Datum::Int8(x) => x,
+                            _ => continue,
+                        };
+                        vals[c] = v;
+                        have[c] = true;
+                    }
+                    Ok(())
+                })
+                .unwrap_or(());
+                for c in 0..n_columns {
+                    if have[c] {
+                        max[c] = max[c].max(vals[c]);
+                    }
                 }
             }
             for c in 0..n_columns {
@@ -732,6 +823,152 @@ impl Storage {
                 }
             }
         }
+    }
+
+    /// Attaches the spilled-row read path (engine setup, object storage on).
+    pub(crate) fn attach_spill(&mut self, reader: SpillReader) {
+        self.spill = Some(reader);
+    }
+
+    pub fn spill_attached(&self) -> bool {
+        self.spill.is_some()
+    }
+
+    /// The bytes of a visible row, wherever they live: a heap row borrows the
+    /// heap directly; a spilled row is fetched through the cache tiers into
+    /// `arena`. The two lifetimes unify, so call sites keep their shapes.
+    pub fn row_bytes<'a>(
+        &'a self,
+        table_slot: usize,
+        rowid: u64,
+        home: RowHome,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [u8], SqlError> {
+        match home {
+            RowHome::Heap(loc) => Ok(self.heap.get(loc)),
+            RowHome::Spilled { len } => {
+                let Some(spill) = &self.spill else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "row is spilled but no spill reader is attached"
+                    ));
+                };
+                let Some(handle) = self.tables[table_slot].spill_sst else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "row is spilled but its table has no spill SST"
+                    ));
+                };
+                let out = arena
+                    .alloc_slice_with(len as usize, |_| 0u8)
+                    .map_err(|_| sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "spilled rows exceed the statement arena; raise work_arena_bytes"
+                    ))?;
+                // Both borrows are per-fetch; the copy into the arena ends
+                // them before returning.
+                let Some(mut scratch) =
+                    spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "spilled-row fetches nested deeper than the reader supports"
+                    ));
+                };
+                let mut blocks = spill.blocks.borrow_mut();
+                let SpillScratch { index_buf, data_buf, assembly_buf } = &mut *scratch;
+                let mut reader =
+                    crate::store::SstReader::over(index_buf, data_buf, assembly_buf);
+                let got = reader
+                    .get(&mut *blocks, &handle, rowid, out)
+                    .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+                match got {
+                    Some(n) if n == len as usize => Ok(&out[..n]),
+                    Some(_) => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row length mismatch")),
+                    None => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row missing from its SST")),
+                }
+            }
+        }
+    }
+
+    /// Hands a visible row's bytes to `f` without arena residency: a heap row
+    /// borrows the heap; a spilled row is fetched into the spill reader's own
+    /// scratch for the duration of the call. For consume-in-place readers
+    /// (constraint scans) whose decoded values do not outlive the closure.
+    /// `f` must not fetch another spilled row (the scratch is singular).
+    pub fn with_row_bytes<R>(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        home: RowHome,
+        f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        match home {
+            RowHome::Heap(loc) => f(self.heap.get(loc)),
+            RowHome::Spilled { len } => {
+                let Some(spill) = &self.spill else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "row is spilled but no spill reader is attached"
+                    ));
+                };
+                let Some(handle) = self.tables[table_slot].spill_sst else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "row is spilled but its table has no spill SST"
+                    ));
+                };
+                let Some(mut scratch) =
+                    spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "spilled-row fetches nested deeper than the reader supports"
+                    ));
+                };
+                let SpillScratch { index_buf, data_buf, assembly_buf } = &mut *scratch;
+                // The assembly buffer doubles as the row destination: `get`
+                // assembles a chained row into the caller buffer directly, so
+                // the two uses never overlap.
+                let row_buf = &mut assembly_buf[..len as usize];
+                let got = {
+                    let mut blocks = spill.blocks.borrow_mut();
+                    let mut reader =
+                        crate::store::SstReader::over(index_buf, data_buf, &mut []);
+                    reader
+                        .get(&mut *blocks, &handle, rowid, row_buf)
+                        .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?
+                };
+                match got {
+                    Some(n) if n == len as usize => f(&row_buf[..n]),
+                    Some(_) => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row length mismatch")),
+                    None => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row missing from its SST")),
+                }
+            }
+        }
+    }
+
+    /// Marks every committed heap row of every live table as spilled to its
+    /// just-checkpointed SST, so the following compaction drops the bytes
+    /// from RAM. Only called after a successful checkpoint whose handles are
+    /// installed on the tables; rows with no SST (empty tables) are left.
+    pub fn evict_committed(&mut self) {
+        for i in 0..self.tables.len() {
+            if !self.tables[i].live || self.tables[i].spill_sst.is_none() {
+                continue;
+            }
+            let table = &mut self.tables[i];
+            for (_, state) in table.rows.iter_mut() {
+                if let Some(RowHome::Heap(loc)) = state.committed {
+                    state.committed = Some(RowHome::Spilled { len: loc.len });
+                }
+            }
+        }
+    }
+
+    /// Installs a table's checkpoint SST handle (the eviction target).
+    pub(crate) fn set_spill_sst(&mut self, slot: usize, handle: Option<crate::store::SstHandle>) {
+        self.tables[slot].spill_sst = handle;
     }
 
     pub fn table_count(&self) -> usize {
@@ -766,7 +1003,7 @@ impl Storage {
                         e
                     )
                 };
-                if let Some(loc) = state.committed {
+                if let Some(RowHome::Heap(loc)) = state.committed {
                     scratch
                         .push((index as u32, rowid, false, loc))
                         .map_err(overflow)?;
@@ -805,7 +1042,7 @@ impl Storage {
                 let p = state.pending.as_mut().expect("pending image existed");
                 p.loc = Some(new_loc);
             } else {
-                state.committed = Some(new_loc);
+                state.committed = Some(RowHome::Heap(new_loc));
             }
             write_at += len;
         }
@@ -898,7 +1135,7 @@ impl Storage {
         };
         match state.pending {
             Some(p) if p.txid == txid => {
-                state.committed = p.loc;
+                state.committed = p.loc.map(RowHome::Heap);
                 state.pending = None;
                 if state.committed.is_none() {
                     table.rows.remove(&rowid);
@@ -951,9 +1188,11 @@ impl Storage {
         table.live = pending.is_none();
         table.pending_ddl = pending;
         table.dirty = true;
-        // A reused slot must not inherit the dropped table's sequences.
+        // A reused slot must not inherit the dropped table's sequences or
+        // spilled rows.
         table.serial_last = [0; MAX_COLUMNS];
         table.serial_dirty = false;
+        table.spill_sst = None;
         Ok(slot)
     }
 

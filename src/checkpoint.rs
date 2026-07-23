@@ -28,7 +28,7 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
 use crate::mem::arena::Arena;
-use crate::storage::{ColumnMeta, OwnedDatum, RowLoc, SqlName, Storage, TableDef, MAX_COLUMNS};
+use crate::storage::{ColumnMeta, OwnedDatum, RowHome, SqlName, Storage, TableDef, MAX_COLUMNS};
 use crate::store::{
     BlockId, BlockStore, OwnedObjectStore, SstHandle, SstReader, SstWriter, StackPlan,
     TieredStore,
@@ -62,8 +62,9 @@ pub(crate) struct Checkpointer {
     /// over content-addressed block objects — `block_cache_bytes` and
     /// `disk_cache_bytes` finally sized to something. SST reads and writes go
     /// through here; writes populate the tiers on the way out, so a cold
-    /// start warms what a later read wants.
-    blocks: TieredStore<OwnedObjectStore>,
+    /// start warms what a later read wants. Shared with the storage layer's
+    /// spilled-row reader (single-threaded engine, short borrows).
+    blocks: std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>>,
     /// Scratch for SST writers and readers, reset per table.
     sst_arena: Arena,
     /// Rosters of the SSTs the current manifest references (GC keep-set
@@ -138,8 +139,10 @@ impl Checkpointer {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| CheckpointSetupError::S3(format!("create data_dir: {e}")))?;
         let cache_dir = std::path::Path::new(&config.data_dir);
-        let blocks = crate::store::build_tiers(budget, base, plan, cache_dir)
-            .map_err(|e| CheckpointSetupError::S3(format!("block cache stack: {e:?}")))?;
+        let blocks = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::store::build_tiers(budget, base, plan, cache_dir)
+                .map_err(|e| CheckpointSetupError::S3(format!("block cache stack: {e:?}")))?,
+        ));
         Ok(Self {
             client: S3Client::new(&config, budget)
                 .map_err(|e| CheckpointSetupError::S3(e.to_string()))?,
@@ -158,6 +161,19 @@ impl Checkpointer {
             ref_scratch: Vec::with_capacity(MAX_CKPT_TABLES),
             doomed_scratch: Vec::with_capacity(MAX_SWEEP_KEYS),
         })
+    }
+
+    /// The shared block stack, for the storage layer's spilled-row reader.
+    pub(crate) fn block_stack(
+        &self,
+    ) -> std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>> {
+        std::rc::Rc::clone(&self.blocks)
+    }
+
+    /// The SST the last published manifest holds for `slot`, if any — the
+    /// eviction target for that table's committed rows.
+    pub(crate) fn table_handle(&self, slot: usize) -> Option<SstHandle> {
+        self.prev_ssts.get(slot).copied().flatten().map(|p| p.handle)
     }
 
     /// Uploads a committed WAL batch as a segment keyed by its first LSN,
@@ -638,37 +654,36 @@ impl Checkpointer {
         let mut reader = SstReader::new(&self.sst_arena)
             .map_err(|_| CheckpointSetupError::Corrupt("sst reader scratch"))?;
         let mut seen = 0u64;
-        let blocks = &mut self.blocks;
+        let mut blocks = self.blocks.borrow_mut();
         let mut failed: Option<CheckpointSetupError> = None;
+        // Rows are installed *spilled*: the map gets each rowid and length,
+        // the bytes stay in the SST (this scan just warmed the cache tiers
+        // with them), and the table's spill store is this SST. Cold start no
+        // longer needs the dataset to fit the heap.
         reader
-            .scan(blocks, handle, 0, u64::MAX, &mut |rowid, row| {
+            .scan(&mut *blocks, handle, 0, u64::MAX, &mut |rowid, row| {
                 if failed.is_some() {
                     return;
                 }
-                match storage.heap.append(row.len()) {
-                    Ok((loc, slice)) => {
-                        slice.copy_from_slice(row);
-                        storage.observe_rowid(rowid);
-                        let installed = storage
-                            .table_mut(slot)
-                            .rows
-                            .insert(rowid, crate::storage::RowState::committed_only(loc));
-                        if installed.is_err() {
-                            failed =
-                                Some(CheckpointSetupError::Corrupt("sst rows exceed table_rows"));
-                        }
-                        seen += 1;
-                    }
-                    Err(_) => failed = Some(CheckpointSetupError::Corrupt("heap full during rehydrate")),
+                storage.observe_rowid(rowid);
+                let installed = storage.table_mut(slot).rows.insert(
+                    rowid,
+                    crate::storage::RowState::committed_spilled(row.len() as u32),
+                );
+                if installed.is_err() {
+                    failed = Some(CheckpointSetupError::Corrupt("sst rows exceed table_rows"));
                 }
+                seen += 1;
             })
             .map_err(|_| CheckpointSetupError::Corrupt("sst scan failed"))?;
+        drop(blocks);
         if let Some(e) = failed {
             return Err(e);
         }
         if seen != count {
             return Err(CheckpointSetupError::Corrupt("sst row count mismatch"));
         }
+        storage.set_spill_sst(slot, Some(*handle));
         Ok(())
     }
 
@@ -758,7 +773,7 @@ impl Checkpointer {
     pub(crate) fn checkpoint(
         &mut self,
         storage: &Storage,
-        sort_scratch: &mut FixedVec<(u64, RowLoc)>,
+        sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<bool, SqlError> {
         let lsn = storage.lsn();
         if lsn == self.manifest_lsn && self.manifest_etag.is_some() {
@@ -908,13 +923,15 @@ impl Checkpointer {
             // clean table carry its SST forward by handle instead of
             // rewriting every block.
             let mut crc = Crc32c::new();
-            for &(rowid, loc) in sort_scratch.iter() {
-                let row = storage.heap.get(loc);
-                let mut header = [0u8; SST_ENTRY_HEADER];
-                header[0..8].copy_from_slice(&rowid.to_le_bytes());
-                header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
-                crc.update(&header);
-                crc.update(row);
+            for &(rowid, home) in sort_scratch.iter() {
+                storage.with_row_bytes(slot, rowid, home, |row| {
+                    let mut header = [0u8; SST_ENTRY_HEADER];
+                    header[0..8].copy_from_slice(&rowid.to_le_bytes());
+                    header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
+                    crc.update(&header);
+                    crc.update(row);
+                    Ok(())
+                })?;
             }
             let crc = crc.finish();
             let count = sort_scratch.len() as u64;
@@ -931,12 +948,17 @@ impl Checkpointer {
                 // data blocks, sparse index, bloom filter, roster.
                 self.sst_arena.reset();
                 let mut writer = SstWriter::new(&self.sst_arena).map_err(sst_to_sql)?;
-                for &(rowid, loc) in sort_scratch.iter() {
-                    writer
-                        .append(&mut self.blocks, rowid, storage.heap.get(loc))
-                        .map_err(sst_to_sql)?;
+                for &(rowid, home) in sort_scratch.iter() {
+                    // A spilled row's bytes come back through the cache (its
+                    // old SST) on the way into the new SST; the fetch ends its
+                    // block borrow before the append takes its own.
+                    storage.with_row_bytes(slot, rowid, home, |row| {
+                        writer
+                            .append(&mut *self.blocks.borrow_mut(), rowid, row)
+                            .map_err(sst_to_sql)
+                    })?;
                 }
-                writer.finish(&mut self.blocks).map_err(sst_to_sql)?
+                writer.finish(&mut *self.blocks.borrow_mut()).map_err(sst_to_sql)?
             };
 
             if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
@@ -1063,6 +1085,7 @@ impl Checkpointer {
             self.roster_scratch.push(h.roster);
             let n = self
                 .blocks
+                .borrow_mut()
                 .get(&h.roster, scratch)
                 .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
             for id_bytes in scratch[..n].chunks(32) {

@@ -319,6 +319,17 @@ impl<'a> SstReader<'a> {
         Ok(Self { index_scratch, data_scratch, assembly })
     }
 
+    /// A reader over caller-owned buffers — the long-lived spill path, whose
+    /// scratch persists across statements instead of living in an arena.
+    /// `index`/`data` must each hold a block payload; `assembly` a chained row.
+    pub(crate) fn over(
+        index: &'a mut [u8],
+        data: &'a mut [u8],
+        assembly: &'a mut [u8],
+    ) -> Self {
+        Self { index_scratch: index, data_scratch: data, assembly }
+    }
+
     /// Finds `rowid`, copying its row into `into` and returning the length, or
     /// `None` when the SST does not hold it. Checks the filter first: a key the
     /// filter rejects returns without the index or a data block being read at

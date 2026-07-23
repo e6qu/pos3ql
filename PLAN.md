@@ -340,17 +340,35 @@ filter, both refinements.
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 
 Kill the "flush not implemented" wall: ingest becomes bounded by flush *rate*, not
-RAM *size*. The Loki **ingester** pattern, disciplined à la TigerBeetle: at a
-high-water mark, freeze the memtable (a read-only second memtable), flush it to a
-level-0 SST (Stage C), drop it, and keep writing against a fresh one — the WAL
-already protects the un-flushed tail. Replace the monolithic manifest rewrite with a
-**manifest log** (TigerBeetle `manifest_log` / Loki index shipping): append
-SST-added/removed records, compact the log periodically, and let a small
-**superblock** root — the only CAS'd object — point at the log tail. **Milestone:**
-insert far more than `memtable_bytes` of live rows with zero "memtable full" errors;
-kill -9 mid-flush recovers exactly. **Risk (crux invariant):** a flushed SST must be
-referenced in the manifest log *before* its WAL range is reclaimed — model it in
-Stage H.
+RAM *size*. **The core is built: row bytes spill to the bucket and the wall is
+gone.** The shape this engine's architecture gave it: the rows *map* (rowid →
+state) stays in RAM as the authoritative index — visibility, MVCC and uniqueness
+never consult a block — while committed row *bytes* gain a second home
+(`RowHome::Heap | Spilled`). The auto-checkpoint at 65% heap already wrote every
+committed row into the table's block SST; under memory pressure (heap still past
+50% after compaction) the map entries flip to `Spilled`, a second compaction
+drops the bytes from RAM, and reads fetch them back through the cache tiers —
+`Storage::row_bytes` (into the statement arena, for values that outlive a row
+step) and `Storage::with_row_bytes` (consume-in-place, for the constraint scans
+that visit every row; two scratch sets so one fetch may nest inside another).
+Cold start now installs spilled entries directly — the manifest scan warms the
+cache tiers but the heap stays small, so a node restarts into a dataset larger
+than its RAM. The external harness proves the milestone: 1.5× `memtable_bytes`
+ingested through a 16 MiB heap with zero memtable-full errors, point reads and a
+full count(*) of spilled rows, and the kill -9 / async-WAL / cold-start checks
+all green over the spill machinery. Below the pressure threshold nothing spills
+and reads stay heap-fast — the fidelity suites are untouched by construction.
+
+**Deviations, stated:** (1) the monolithic text manifest remains (it is
+kilobytes at this scale; the append-only manifest log + superblock come with
+flush *frequency*, i.e. compaction pressure in Stage E). (2) A full scan of
+spilled rows stages each row in the statement work arena — bounded and loud
+(`work_arena_bytes`), never wrong; the streaming read path that lifts it is
+Stage I's object-storage-adaptive execution. (3) Row *count* stays bounded by
+`table_rows` (the RAM map); only row *bytes* spill. **Remaining for Stage E:**
+per-flush L0 deltas instead of full-table rewrites (write amplification), and
+compaction. **Crux invariant** (kept): an SST is referenced by the published
+manifest before the WAL resets — the checkpoint orders it so.
 
 ### Stage E — leveled compaction (background, paced, allocation-free)
 

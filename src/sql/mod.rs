@@ -33,7 +33,7 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{RowLoc, Storage};
+use crate::storage::{RowHome, RowLoc, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError};
 
 use ast::{Delete, Expr, Insert, Stmt, Update};
@@ -101,7 +101,7 @@ pub struct Engine {
     wal_seg_buf: Vec<u8>,
     /// Scratch for materializing scans (ORDER BY, UPDATE, DELETE) and for
     /// sorting SST entries at checkpoint.
-    scratch: FixedVec<(u64, RowLoc)>,
+    scratch: FixedVec<(u64, RowHome)>,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, bool, RowLoc)>,
     /// Shared execution arena: one query's materialized rows (ORDER BY /
@@ -117,12 +117,15 @@ impl Engine {
     /// Bytes drawn beyond the row heap, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
-            + config.table_rows * size_of::<(u64, RowLoc)>()
+            + config.table_rows * size_of::<(u64, RowHome)>()
             + 2 * config.max_tables * config.table_rows * size_of::<(u32, u64, bool, RowLoc)>()
             + config.work_arena_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + if config.s3_on {
+                // The checkpointer's fixed parts plus the spilled-row reader's
+                // two scratch sets.
                 Checkpointer::budget_bytes(config)
+                    + 2 * (2 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             } else {
                 0
             }
@@ -137,6 +140,13 @@ impl Engine {
         } else {
             None
         };
+        // The spilled-row read path shares the checkpointer's block stack;
+        // it must exist before the manifest load installs spilled rows.
+        if let Some(c) = &ckpt {
+            let reader = crate::storage::SpillReader::new(budget, c.block_stack())
+                .map_err(EngineSetupError::Budget)?;
+            storage.attach_spill(reader);
+        }
         let floor = match &mut ckpt {
             Some(c) => c.load_into(&mut storage)?,
             None => 0,
@@ -480,7 +490,26 @@ impl Engine {
                 let _ = ckpt.prune_wal_segments(lsn);
             }
             self.wal.reset_after_checkpoint();
+            // Every table's committed rows are now in its checkpoint SST, so
+            // that SST becomes the table's spill store.
+            if self.storage.spill_attached() {
+                for slot in 0..self.storage.table_count() {
+                    if self.storage.table(slot).live {
+                        self.storage.set_spill_sst(slot, ckpt.table_handle(slot));
+                    }
+                }
+            }
             self.storage.compact_heap(&mut self.compact_scratch)?;
+            // Under memory pressure, committed bytes leave the heap: the map
+            // entries flip to spilled and a second compaction drops the
+            // bytes. Reads fetch them back through the cache tiers. Below the
+            // threshold nothing spills and reads stay heap-fast.
+            if self.storage.spill_attached()
+                && self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
+            {
+                self.storage.evict_committed();
+                self.storage.compact_heap(&mut self.compact_scratch)?;
+            }
         }
         Ok(wrote)
     }

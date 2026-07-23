@@ -53,8 +53,12 @@ pub fn parse<'a>(input: &'a str, kind: RangeKind) -> Result<Parsed<'a>, SqlError
         _ => return Err(bad(kind, input)),
     };
     let inner = &t[1..t.len() - 1];
-    let (lower_text, upper_text) = inner.split_once(',').ok_or_else(|| bad(kind, input))?;
-    let (lower_text, upper_text) = (lower_text.trim(), upper_text.trim());
+    // The separator is the first comma outside quotes: a bound may be quoted to
+    // carry a character that would otherwise be structural, exactly as
+    // PostgreSQL writes a timestamp bound, so the split must respect the quotes.
+    let (lower_text, upper_text) = split_bounds(inner).ok_or_else(|| bad(kind, input))?;
+    let lower_text = unquote_bound(lower_text.trim());
+    let upper_text = unquote_bound(upper_text.trim());
     Ok(Parsed {
         empty: false,
         lower: if lower_text.is_empty() { None } else { Some(lower_text) },
@@ -63,6 +67,78 @@ pub fn parse<'a>(input: &'a str, kind: RangeKind) -> Result<Parsed<'a>, SqlError
         upper_inc,
     })
 }
+
+/// Splits a range's inner text at the separating comma — the first one not
+/// inside a quoted bound. A backslash inside quotes escapes the next character,
+/// so a quoted `\"` or `\,` does not end the bound.
+fn split_bounds(inner: &str) -> Option<(&str, &str)> {
+    let bytes = inner.as_bytes();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => quoted = !quoted,
+            b'\\' if quoted => i += 1,
+            b',' if !quoted => return Some((&inner[..i], &inner[i + 1..])),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strips the surrounding quotes PostgreSQL puts around a bound that needs
+/// them. The builtin range element types — integers, numerics, dates,
+/// timestamps — never contain a quote or backslash of their own, so a quoted
+/// bound's content is the text between the quotes with no escape to undo; a
+/// stray escape is left for the element parser to reject.
+fn unquote_bound(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// The canonical output text of a bound: its value parsed as the element type
+/// and rendered as that type prints it — so a `tsrange` bound `2020-01-01`
+/// becomes `2020-01-01 00:00:00`, which is what PostgreSQL stores and shows,
+/// rather than the raw text the range literal happened to carry.
+fn element_text<'a>(raw: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    super::eval::cast_to_text(elem_datum(raw, kind, arena)?, arena)
+}
+
+/// Whether a bound's rendered text needs quoting on output. PostgreSQL quotes a
+/// bound that is empty or carries a character that would otherwise be
+/// structural — whitespace, a quote, a backslash, a comma, or a bracket — which
+/// for the builtin element types means the timestamp bounds, whose space forces
+/// the quotes, and nothing else.
+fn bound_needs_quote(text: &str) -> bool {
+    text.is_empty()
+        || text
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\\' | b',' | b'(' | b')' | b'[' | b']'))
+}
+
+/// Renders a bound for output: its canonical element text, quoted (with any
+/// quote or backslash escaped) when that text needs it.
+fn bound_out<'a>(raw: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let text = element_text(raw, kind, arena)?;
+    if !bound_needs_quote(text) {
+        return Ok(text);
+    }
+    let mut quoted = StackStr::<80>::new();
+    let _ = quoted.write_char('"');
+    for c in text.chars() {
+        if c == '"' || c == '\\' {
+            let _ = quoted.write_char('\\');
+        }
+        let _ = quoted.write_char(c);
+    }
+    let _ = quoted.write_char('"');
+    alloc(arena, quoted.as_str())
+}
+
 
 /// Canonicalizes parsed bounds and renders the canonical range text into the
 /// arena. Discrete kinds become half-open `[lower, upper)`; an empty or
@@ -106,8 +182,19 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
             return alloc(arena, "empty");
         }
         // An unbounded lower bound uses `(`; a bounded one is inclusive `[`.
+        // Each bound is normalized to its element text and quoted if it needs
+        // it — a no-op for the discrete kinds (integers, dates), whose text is
+        // already canonical and carries no character that would force quotes.
         let lb = if lower_text.is_some() { '[' } else { '(' };
-        let text = stack_format!(128, "{}{},{})", lb, lower_text.unwrap_or(""), upper_text.unwrap_or(""));
+        let lower_out = match lower_text {
+            Some(v) => bound_out(v, kind, arena)?,
+            None => "",
+        };
+        let upper_out = match upper_text {
+            Some(v) => bound_out(v, kind, arena)?,
+            None => "",
+        };
+        let text = stack_format!(160, "{}{},{})", lb, lower_out, upper_out);
         return alloc(arena, text.as_str());
     }
     // Continuous: empty when bounds are equal and not both inclusive.
@@ -117,10 +204,21 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
     {
         return alloc(arena, "empty");
     }
-    // An unbounded bound is always exclusive-bracketed.
+    // An unbounded bound is always exclusive-bracketed. Each present bound is
+    // rendered as its element type prints it and quoted when that text needs it
+    // — which is where a timestamp bound gains both its time-of-day and its
+    // surrounding quotes, matching what PostgreSQL stores and shows.
     let lb = if p.lower.is_some() && p.lower_inc { '[' } else { '(' };
     let rb = if p.upper.is_some() && p.upper_inc { ']' } else { ')' };
-    let text = stack_format!(128, "{}{},{}{}", lb, p.lower.unwrap_or(""), p.upper.unwrap_or(""), rb);
+    let lower_out = match p.lower {
+        Some(v) => bound_out(v, kind, arena)?,
+        None => "",
+    };
+    let upper_out = match p.upper {
+        Some(v) => bound_out(v, kind, arena)?,
+        None => "",
+    };
+    let text = stack_format!(200, "{}{},{}{}", lb, lower_out, upper_out, rb);
     alloc(arena, text.as_str())
 }
 

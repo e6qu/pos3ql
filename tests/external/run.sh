@@ -226,6 +226,26 @@ spill_count=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(
 [[ "$spill_count" == "24000" ]] && ok "ingest 1.5x memtable_bytes (24000 rows)"   || bad "ingest beyond memtable (count: $spill_count)"
 spill_point=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT length(pad) FROM spilly WHERE id = 12345" 2>&1)
 [[ "$spill_point" == "1024" ]] && ok "point read of a spilled row"   || bad "point read of a spilled row (got: $spill_point)"
+# Deltas and tombstones across a cold start: delete a slice of spilled rows,
+# update one, checkpoint (a delta SST with tombstones joins the table's list),
+# wipe the disk, and rebuild from the bucket. The deleted rows must not
+# resurrect from older SSTs; the update must win over its old version.
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
+  -c "DELETE FROM spilly WHERE id BETWEEN 100 AND 599" \
+  -c "UPDATE spilly SET pad = 'updated' WHERE id = 700" \
+  -c "CHECKPOINT"
+kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
+rm -rf "$WORK/data"
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+for i in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+after=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' \
+  -c "SELECT count(*), count(*) FILTER (WHERE id BETWEEN 100 AND 599), max(CASE WHEN id = 700 THEN pad END) FROM spilly" 2>&1)
+[[ "$after" == "23500|0|updated" ]] && ok "delta SSTs + tombstones survive a cold start" \
+  || bad "delta/tombstone cold start (got: $after)"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
 
 step "differential vs real PostgreSQL 18 (when installed)"

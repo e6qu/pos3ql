@@ -483,22 +483,15 @@ impl Engine {
         // first, so an interrupted checkpoint never strands acked writes.
         self.wal.commit();
         let lsn = self.storage.lsn();
-        let wrote = ckpt.checkpoint(&self.storage, &mut self.scratch)?;
+        let wrote = ckpt.checkpoint(&mut self.storage, &mut self.scratch)?;
         if wrote {
             self.storage.clear_dirty();
             if self.wal_upload {
                 let _ = ckpt.prune_wal_segments(lsn);
             }
             self.wal.reset_after_checkpoint();
-            // Every table's committed rows are now in its checkpoint SST, so
-            // that SST becomes the table's spill store.
-            if self.storage.spill_attached() {
-                for slot in 0..self.storage.table_count() {
-                    if self.storage.table(slot).live {
-                        self.storage.set_spill_sst(slot, ckpt.table_handle(slot));
-                    }
-                }
-            }
+            // The checkpoint installed each table's spill-SST list as it
+            // wrote (full rewrites collapse a list, deltas append).
             self.storage.compact_heap(&mut self.compact_scratch)?;
             // Under memory pressure, committed bytes leave the heap: the map
             // entries flip to spilled and a second compaction drops the
@@ -1502,7 +1495,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
                 });
             };
-            storage.table_mut(index).rows.remove(&rowid);
+            storage.remove_committed(index, rowid);
         }
         WalOp::CreateView { name, sql } => {
             // Replay reconstructs committed state: create then promote.

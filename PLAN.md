@@ -365,10 +365,27 @@ flush *frequency*, i.e. compaction pressure in Stage E). (2) A full scan of
 spilled rows stages each row in the statement work arena — bounded and loud
 (`work_arena_bytes`), never wrong; the streaming read path that lifts it is
 Stage I's object-storage-adaptive execution. (3) Row *count* stays bounded by
-`table_rows` (the RAM map); only row *bytes* spill. **Remaining for Stage E:**
-per-flush L0 deltas instead of full-table rewrites (write amplification), and
-compaction. **Crux invariant** (kept): an SST is referenced by the published
-manifest before the WAL resets — the checkpoint orders it so.
+`table_rows` (the RAM map); only row *bytes* spill. **Stage E's first half is
+now in:** a dirty table with spilled SSTs flushes a *delta* — its heap-resident
+committed rows plus tombstones for every rowid removed since the last
+checkpoint (recorded at the committed-removal choke points, including the
+update-then-delete case where the latest version was heap-resident but an older
+SST still holds one) — appended to the table's SST list (`dsst` manifest lines,
+capped at eight members) instead of rewriting everything; a full rewrite runs
+only when the list is full or the tombstone buffer overflowed, collapsing the
+list to one and remapping the spilled entries. Cold start applies the list in
+order — later members' rows shadow earlier ones's, tombstones remove — and the
+external harness proves delete/update/cold-start end to end (rows deleted after
+spilling stay deleted; an update wins over its older SST version). Storage
+state (list installs, entry remaps, tombstone clearing) applies only after the
+manifest CAS lands, so a lost publish leaves memory consistent with the
+still-current manifest and the orphaned blocks sweep as garbage. DML WHERE
+scans consume spilled rows in place (the two-slot spill scratch), so a DELETE
+over thousands of spilled rows no longer stages every candidate in the
+statement arena. **Remaining for Stage E:** paced background compaction (the
+merge currently rides a checkpoint) and flush-rate-driven manifest logging.
+**Crux invariant** (kept): an SST is referenced by the published manifest
+before the WAL resets — the checkpoint orders it so.
 
 ### Stage E — leveled compaction (background, paced, allocation-free)
 

@@ -49,6 +49,11 @@ const ENTRY_HEADER: usize = 12;
 /// High bit of the entry length: the row continues in overflow blocks.
 const CHAIN_FLAG: u32 = 1 << 31;
 
+/// Tombstone bit: the entry records a deletion, not a row — a delta SST's
+/// way of saying an older SST's version of this key is gone. Carries no
+/// payload.
+const TOMB_FLAG: u32 = 1 << 30;
+
 /// The largest assembled row a reader's scan scratch admits: the chained
 /// head chunk plus every overflow block.
 pub(crate) const MAX_ASSEMBLED: usize =
@@ -226,6 +231,34 @@ impl<'a> SstWriter<'a> {
         self.flush_data(store)
     }
 
+    /// Appends a deletion marker for `rowid`. Ordered with the rows, sized
+    /// like an empty entry.
+    pub(crate) fn append_tombstone(
+        &mut self,
+        store: &mut dyn BlockStore,
+        rowid: u64,
+    ) -> Result<(), SstError> {
+        if let Some(last) = self.last_key
+            && rowid <= last
+        {
+            return Err(SstError::KeyOutOfOrder);
+        }
+        if self.pending_len + ENTRY_HEADER > MAX_PAYLOAD {
+            self.flush_data(store)?;
+        }
+        let at = self.pending_len;
+        self.pending[at..at + 8].copy_from_slice(&rowid.to_le_bytes());
+        self.pending[at + 8..at + 12].copy_from_slice(&TOMB_FLAG.to_le_bytes());
+        self.pending_len += ENTRY_HEADER;
+        if self.pending_first.is_none() {
+            self.pending_first = Some(rowid);
+        }
+        self.last_key = Some(rowid);
+        // Not in the bloom filter: the filter answers "is this row here", and
+        // a tombstone is exactly a row not being here.
+        Ok(())
+    }
+
     fn record(&mut self, id: BlockId) -> Result<(), SstError> {
         if self.roster_len == MAX_ROSTER {
             return Err(SstError::TooManyBlocks);
@@ -361,6 +394,9 @@ impl<'a> SstReader<'a> {
         let mut found: Option<(usize, bool)> = None;
         for entry in DataBlock(&self.data_scratch[..data_len]) {
             if entry.key == rowid {
+                if entry.tombstone {
+                    break;
+                }
                 if entry.is_chained() {
                     assemble_chain(store, &entry, into)?;
                     found = Some((entry.total_len, true));
@@ -392,7 +428,7 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         lo: u64,
         hi: u64,
-        emit: &mut dyn FnMut(u64, &[u8]),
+        emit: &mut dyn FnMut(u64, Option<&[u8]>),
     ) -> Result<(), SstError> {
         if lo > hi {
             return Ok(());
@@ -417,16 +453,19 @@ impl<'a> SstReader<'a> {
                     break;
                 }
                 if entry.key >= lo {
-                    if entry.is_chained() {
+                    if entry.tombstone {
+                        emit(entry.key, None);
+                    } else if entry.is_chained() {
                         assemble_chain(store, &entry, self.assembly)?;
                         chained = Some((entry.key, entry.total_len));
                         break;
+                    } else {
+                        emit(entry.key, Some(entry.head));
                     }
-                    emit(entry.key, entry.head);
                 }
             }
             if let Some((key, n)) = chained {
-                emit(key, &self.assembly[..n]);
+                emit(key, Some(&self.assembly[..n]));
             }
             // A block ending past `hi` bounds the scan: later blocks hold only
             // larger keys, so none of them can be in range.
@@ -483,6 +522,7 @@ struct DataEntry<'a> {
     total_len: usize,
     head: &'a [u8],
     chain: &'a [u8],
+    tombstone: bool,
 }
 
 impl DataEntry<'_> {
@@ -506,6 +546,10 @@ impl<'a> Iterator for DataBlock<'a> {
         }
         let key = u64::from_le_bytes(data[0..8].try_into().unwrap());
         let raw_len = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        if raw_len & TOMB_FLAG != 0 {
+            self.0 = &data[ENTRY_HEADER..];
+            return Some(DataEntry { key, total_len: 0, head: &[], chain: &[], tombstone: true });
+        }
         if raw_len & CHAIN_FLAG != 0 {
             // A chained head fills the rest of its block: count, identities,
             // then the leading chunk.
@@ -521,7 +565,7 @@ impl<'a> Iterator for DataBlock<'a> {
             let chain = &body[2..2 + n_chunks * 32];
             let head = &body[2 + n_chunks * 32..];
             self.0 = &[];
-            return Some(DataEntry { key, total_len, head, chain });
+            return Some(DataEntry { key, total_len, head, chain, tombstone: false });
         }
         let len = raw_len as usize;
         if data.len() < ENTRY_HEADER + len {
@@ -533,6 +577,7 @@ impl<'a> Iterator for DataBlock<'a> {
             total_len: len,
             head: &data[ENTRY_HEADER..ENTRY_HEADER + len],
             chain: &[],
+            tombstone: false,
         })
     }
 }
@@ -705,13 +750,37 @@ mod tests {
         let n = r.get(&mut s, &root, 2, &mut out).unwrap().expect("found");
         assert_eq!(&out[..n], &huge[..], "chained row round-trips by get");
         let mut seen = Vec::new();
-        r.scan(&mut s, &root, 0, u64::MAX, &mut |k, row| seen.push((k, row.to_vec())))
+        r.scan(&mut s, &root, 0, u64::MAX, &mut |k, row| {
+            seen.push((k, row.expect("data row").to_vec()))
+        })
             .unwrap();
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[1].0, 2);
         assert_eq!(seen[1].1, huge, "chained row round-trips by scan");
         assert_eq!(seen[0].1, vec![7u8; 40]);
         assert_eq!(seen[2].1, vec![8u8; 40]);
+    }
+
+    #[test]
+    fn a_tombstone_round_trips_and_hides_the_key() {
+        // A delta SST records deletions as tombstones: a scan reports them
+        // (None), a point lookup treats the key as absent, and ordering with
+        // ordinary rows holds.
+        let (_b, mut s) = store();
+        let a = arena();
+        let mut w = SstWriter::new(&a).unwrap();
+        w.append(&mut s, 1, &[7u8; 8]).unwrap();
+        w.append_tombstone(&mut s, 2).unwrap();
+        w.append(&mut s, 3, &[9u8; 8]).unwrap();
+        let root = w.finish(&mut s).unwrap().expect("root");
+        let mut r = SstReader::new(&a).unwrap();
+        let mut out = [0u8; 64];
+        assert_eq!(r.get(&mut s, &root, 2, &mut out).unwrap(), None, "tombstoned key is absent");
+        assert!(r.get(&mut s, &root, 1, &mut out).unwrap().is_some());
+        let mut seen = Vec::new();
+        r.scan(&mut s, &root, 0, u64::MAX, &mut |k, row| seen.push((k, row.is_none())))
+            .unwrap();
+        assert_eq!(seen, vec![(1, false), (2, true), (3, false)]);
     }
 
     #[test]
@@ -745,7 +814,9 @@ mod tests {
     ) -> Vec<(u64, Vec<u8>)> {
         let mut out = Vec::new();
         reader
-            .scan(store, handle, lo, hi, &mut |key, row| out.push((key, row.to_vec())))
+            .scan(store, handle, lo, hi, &mut |key, row| {
+                out.push((key, row.expect("data row").to_vec()))
+            })
             .unwrap();
         out
     }

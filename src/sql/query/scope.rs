@@ -501,7 +501,7 @@ impl<'d> QueryScope<'d> {
                     if self.output_name(*entry) == name {
                         if left_entry.is_some() {
                             return Err(sql_err!(
-                                "42702",
+                                crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
                                 "common column name \"{}\" appears more than once in left table",
                                 name
                             ));
@@ -634,6 +634,14 @@ impl<'d> QueryScope<'d> {
 
     /// An expression reading a join-tree output column: a qualified column
     /// reference, or (merged) a COALESCE across the contributors.
+    pub(super) fn star_expression(
+        &self,
+        entry: ResolvedColumn,
+        arena: &'d Arena,
+    ) -> Result<&'d Expr<'d>, SqlError> {
+        self.output_expression(entry, arena)
+    }
+
     fn output_expression(
         &self,
         entry: ResolvedColumn,
@@ -754,7 +762,7 @@ impl<'d> QueryScope<'d> {
                         if self.output_name(self.output[k]) == name {
                             if found.is_some() {
                                 return Err(sql_err!(
-                                    "42702",
+                                    crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
                                     "column reference \"{}\" is ambiguous",
                                     name
                                 ));
@@ -775,7 +783,7 @@ impl<'d> QueryScope<'d> {
                     if let Some(c) = self.defs[t].expect("resolved").column_index(name) {
                         if found.is_some() {
                             return Err(sql_err!(
-                                "42702",
+                                crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
                                 "column reference \"{}\" is ambiguous",
                                 name
                             ));

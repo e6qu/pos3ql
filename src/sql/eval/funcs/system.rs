@@ -233,13 +233,19 @@ pub(crate) fn dispatch<'a>(
             "pg_typeof" => {
                 arity(1)?;
                 let v = eval_full(args[0], arena, params, row, hooks)?;
-                // PostgreSQL's pg_typeof reports the argument's static type, so a
-                // NULL value still names its declared type. A concrete value carries
-                // its own type; only for NULL do we recover the type statically.
-                if v.is_null()
-                    && let Some(name) = exec::typeof_static(args[0], row)
-                {
-                    return Ok(Datum::Text(name));
+                // PostgreSQL's pg_typeof reports the argument's *static* type —
+                // `current_user` is `name` though the value is plain text. The
+                // static answer is used whenever it is consistent with the
+                // runtime value (same storage type, or NULL); an inconsistent
+                // one — a mis-inferred set-returning function, say — falls
+                // back to the type the value itself carries.
+                if let Some(name) = exec::typeof_static(args[0], row) {
+                    let consistent = v.is_null()
+                        || exec::typeof_static_coltype(args[0], row)
+                            .is_some_and(|ct| ct.storage().oid() == v.type_oid());
+                    if consistent {
+                        return Ok(Datum::Text(name));
+                    }
                 }
                 Ok(Datum::Text(match v {
                     Datum::Null => "unknown",

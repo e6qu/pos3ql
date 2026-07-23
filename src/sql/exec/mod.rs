@@ -106,7 +106,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 mod describe;
 pub use describe::{
     check_row_field_types, derived_name, describe_items, infer_type_pub, infer_type_res,
-    record_field_type, record_shape, typeof_static, ColTypeResolver, DefCols, NoCols,
+    record_field_type, record_shape, typeof_static, typeof_static_coltype, ColTypeResolver, DefCols, NoCols,
     RECORD_FIELD_NAMES,
 };
 pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeric_tower};
@@ -165,7 +165,7 @@ pub fn create_table(
         }
         Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
             responder.notice(
-                "42P07",
+                crate::sql::eval::sqlstate::DUPLICATE_TABLE,
                 stack_format!(128, "relation \"{}\" already exists, skipping", statement.name).as_str(),
             )?;
         }
@@ -187,7 +187,7 @@ fn reject_multiple_primary(def: &TableDef) -> Result<(), SqlError> {
         + def.uniques[..def.n_uniques].iter().filter(|k| k.is_primary).count();
     if declared > 1 {
         return Err(sql_err!(
-            "42P16",
+            crate::sql::eval::sqlstate::INVALID_TABLE_DEFINITION,
             "multiple primary keys for table \"{}\" are not allowed",
             def.name.as_str()
         ));
@@ -646,7 +646,7 @@ pub fn drop_table(
             if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
                 let _ = other;
                 return sql_fail(sql_err!(
-                    "40001",
+                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                     "could not serialize access due to concurrent DDL on \"{}\"",
                     statement.name
                 ));
@@ -666,7 +666,7 @@ pub fn drop_table(
         None if statement.if_exists => {
             // PostgreSQL's skip notice carries SQLSTATE 00000.
             responder.notice(
-                "00000",
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(128, "table \"{}\" does not exist, skipping", statement.name).as_str(),
             )?;
         }
@@ -761,7 +761,7 @@ pub fn drop_view(
         }
     } else if if_exists {
         responder.notice(
-            "42P01",
+            crate::sql::eval::sqlstate::UNDEFINED_TABLE,
             stack_format!(128, "view \"{}\" does not exist, skipping", name).as_str(),
         )?;
     } else {
@@ -898,7 +898,7 @@ pub fn drop_index(
         }
     } else if if_exists {
         responder.notice(
-            "42P01",
+            crate::sql::eval::sqlstate::UNDEFINED_TABLE,
             stack_format!(128, "index \"{}\" does not exist, skipping", name).as_str(),
         )?;
     } else {
@@ -1546,7 +1546,7 @@ pub fn alter_table(
         .any(|(_, state)| state.pending.is_some())
     {
         return sql_fail(sql_err!(
-            "55P03",
+            crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,
             "table \"{}\" has uncommitted changes; retry when idle",
             statement.table
         ));
@@ -1797,7 +1797,7 @@ pub fn resolve_order_expr_pub<'a>(
                         // not, both being the same column).
                         Some(f) if *f != **item_expr => {
                             return Err(sql_err!(
-                                "42702",
+                                crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
                                 "ORDER BY \"{}\" is ambiguous",
                                 name
                             ));
@@ -1827,7 +1827,7 @@ pub fn eval_limit_pub(limit: Option<&Expr>, arena: &Arena, params: &[Datum]) -> 
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(_) | Datum::Int8(_) => Err(sql_err!(
-            "2201W",
+            crate::sql::eval::sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
             "LIMIT must not be negative"
         )),
         _ => Err(sql_err!(
@@ -2241,3 +2241,9 @@ fn undefined_table(name: &str) -> SqlError {
     )
 }
 
+
+/// Public view of the OID-to-ColType mapping for value-level renderers
+/// (`oid::regtype`).
+pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
+    describe::coltype_of_oid(o)
+}

@@ -234,7 +234,7 @@ fn eval_subquery_nodes<'a>(
                     run_subquery(select, storage, txid, arena, params, depth, outer, 1)?;
                 if values.len() > 1 {
                     return Err(sql_err!(
-                        "21000",
+                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
                         "more than one row returned by a subquery used as an expression"
                     ));
                 }
@@ -553,7 +553,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     run_subquery(select, storage, txid, arena, params, SUBQUERY_DEPTH, Some(outer), 1)?;
                 if values.len() > 1 {
                     return Err(sql_err!(
-                        "21000",
+                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
                         "more than one row returned by a subquery used as an expression"
                     ));
                 }
@@ -606,7 +606,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Timestamp => Datum::Timestamp(0),
         ColType::Timestamptz => Datum::Timestamptz(0),
         ColType::Uuid => Datum::Uuid([0; 16]),
-        ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Bytea | ColType::Numeric => {
+        ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name | ColType::Bytea | ColType::Numeric => {
             Datum::Text("")
         }
         ColType::Range(kind) => Datum::Range { text: "empty", kind },

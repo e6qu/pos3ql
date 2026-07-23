@@ -52,7 +52,7 @@ impl SqlPreparedPool {
     pub fn store(&mut self, name: &str, sql: &str, param_types: &[ColType]) -> Result<(), SqlError> {
         if self.get(name).is_some() {
             return Err(sql_err!(
-                "42P05",
+                crate::sql::eval::sqlstate::DUPLICATE_PREPARED_STATEMENT,
                 "prepared statement \"{}\" already exists",
                 name
             ));

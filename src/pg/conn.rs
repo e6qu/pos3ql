@@ -634,7 +634,7 @@ impl Conn {
         };
         if n_params as usize > MAX_BIND_PARAMS {
             return ext_err(&mut self.send, &mut self.phase, 
-                "54000",
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many parameters (the limit is 32)",
             );
         }
@@ -649,7 +649,7 @@ impl Conn {
             .any(|p| p.active && p.name.as_str() == name)
         {
             return ext_err(&mut self.send, &mut self.phase, 
-                "42P05",
+                crate::sql::eval::sqlstate::DUPLICATE_PREPARED_STATEMENT,
                 "prepared statement already exists",
             );
         } else {
@@ -760,7 +760,7 @@ impl Conn {
                     return ext_err(
                         &mut self.send,
                         &mut self.phase,
-                        "54000",
+                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many result columns requested in binary format",
                     )
                 }
@@ -768,7 +768,7 @@ impl Conn {
                     return ext_err(
                         &mut self.send,
                         &mut self.phase,
-                        "54000",
+                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many parameters (the limit is 32)",
                     )
                 }

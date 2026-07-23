@@ -120,7 +120,7 @@ impl TxnState {
     ) -> Result<(), SqlError> {
         self.touched.push((table_slot, rowid, prior)).map_err(|_| {
             sql_err!(
-                "54000",
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction touches more than {} rows (txn_rows)",
                 self.touched.capacity()
             )
@@ -195,7 +195,7 @@ impl TxnState {
     pub fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
         self.ddl.push(undo).map_err(|_| {
             sql_err!(
-                "54000",
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "more than {} DDL statements in one transaction",
                 MAX_TXN_DDL
             )

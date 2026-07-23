@@ -196,7 +196,7 @@ pub(crate) fn sql_regex_substring<'a>(
                     // unbalanced parenthesis.
                     if captures == 2 {
                         return Err(sql_err!(
-                            "2200C",
+                            crate::sql::eval::sqlstate::INVALID_USE_OF_ESCAPE_CHARACTER,
                             "SQL regular expression may not contain more than two escape-double-quote separators"
                         ));
                     }

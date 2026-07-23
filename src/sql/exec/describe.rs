@@ -167,9 +167,10 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::TSTZMULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Tstz),
         oid::BIT => ColType::Bit { varying: false },
         oid::VARBIT => ColType::Bit { varying: true },
-        // `"char"` (internal single-byte) and `name` appear in catalog columns;
-        // treat them as text so catalog-derived tables describe.
-        18 | 19 => ColType::Text,
+        // `"char"` (internal single-byte) appears in catalog columns; treat it
+        // as text so catalog-derived tables describe.
+        18 => ColType::Text,
+        oid::NAME => ColType::Name,
         // Array OIDs (catalog columns like indkey/conkey/indoption are arrays).
         1000 => ColType::Array(crate::sql::types::ArrElem::Bool),
         1005 | 1007 => ColType::Array(crate::sql::types::ArrElem::Int4),
@@ -255,6 +256,11 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             Expr::Column { .. } | Expr::Call { .. } | Expr::Array(_) | Expr::ArraySubquery(_) => {
                 name_of(operand)
             }
+            // The object-identifier types parse to text storage but title
+            // as themselves (`'int4'::regtype` is a `regtype` column).
+            _ if type_name.eq_ignore_ascii_case("regtype") => Some("regtype"),
+            _ if type_name.eq_ignore_ascii_case("regclass") => Some("regclass"),
+            _ if type_name.eq_ignore_ascii_case("oid") => Some("oid"),
             _ => ColType::from_sql_name(type_name).map(ColType::internal_name),
         },
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
@@ -480,6 +486,16 @@ impl<'a> ColTypeResolver for RowCols<'_, 'a> {
 /// against `row`, resolved statically (so a NULL value still names its declared
 /// type, matching PostgreSQL). `None` when the static type can't be pinned down
 /// (the caller then falls back to the runtime datum's type).
+/// The static [`ColType`] behind [`typeof_static`], for callers that must
+/// check the resolution against a runtime value before trusting it.
+pub fn typeof_static_coltype<'a>(
+    expression: &Expr,
+    row: &dyn crate::sql::eval::ColumnLookup<'a>,
+) -> Option<ColType> {
+    let (type_oid, _) = infer_type_res(expression, &RowCols(row)).ok()?;
+    coltype_of_oid(type_oid)
+}
+
 pub fn typeof_static<'a>(
     expression: &Expr,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
@@ -528,7 +544,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     let datetime = |t: ColType| matches!(t, Date | Timestamp | Timestamptz);
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
-    let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar);
+    let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar | Name);
     (numeric(a) && numeric(b))
         || (datetime(a) && datetime(b))
         || (timeofday(a) && timeofday(b))
@@ -1227,6 +1243,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
             }
             "current_date" => of(ColType::Date),
+            // The identifier-returning functions are `name`-typed in PostgreSQL.
+            "current_user" | "session_user" | "user" | "current_role" | "current_schema"
+            | "current_database" | "current_catalog" => of(ColType::Name),
             "current_time" => of(ColType::Timetz),
             "localtime" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),

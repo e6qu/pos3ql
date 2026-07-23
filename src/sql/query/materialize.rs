@@ -77,6 +77,12 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         let entry = self.0.find_column(qualifier, name).ok()?;
         Some(self.0.output_type(entry))
     }
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        match self.0.find_column(qualifier, name).ok()? {
+            super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
+            super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
+        }
+    }
 }
 
 /// Which projection items an ORDER BY + LIMIT query defers until after the

@@ -165,7 +165,15 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
             }
             let col_name = self.col_ident("column name")?;
+            let warnings_before = self.n_warnings;
             let (type_name, type_mod) = self.type_name_mod()?;
+            // PostgreSQL resolves a column definition's type twice, so a
+            // precision-clamp warning is reported twice per column here where
+            // a cast reports it once. Faithfully duplicated.
+            for w in warnings_before..self.n_warnings.min(super::MAX_PARSE_WARNINGS) {
+                let again = self.warnings[w];
+                self.warn(again);
+            }
             let mut not_null = false;
             let mut unique = false;
             let mut primary = false;

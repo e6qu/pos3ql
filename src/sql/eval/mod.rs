@@ -97,12 +97,57 @@ pub mod sqlstate {
     pub const QUERY_CANCELED: &str = "57014";
     pub const IO_ERROR: &str = "58030";
     pub const INTERNAL_ERROR: &str = "XX000";
+    pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
+    pub const AMBIGUOUS_COLUMN: &str = "42702";
+    pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
+    pub const CARDINALITY_VIOLATION: &str = "21000";
+    pub const CHECK_VIOLATION: &str = "23514";
+    pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
+    pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+    pub const INVALID_FOREIGN_KEY: &str = "42830";
+    pub const INVALID_PRECEDING_OR_FOLLOWING_SIZE: &str = "22013";
+    pub const INVALID_RECURSION: &str = "42P19";
+    pub const INVALID_ROW_COUNT_IN_LIMIT_CLAUSE: &str = "2201W";
+    pub const INVALID_SAVEPOINT_SPECIFICATION: &str = "3B001";
+    pub const INVALID_TABLE_DEFINITION: &str = "42P16";
+    pub const INVALID_USE_OF_ESCAPE_CHARACTER: &str = "2200C";
+    pub const LOCK_NOT_AVAILABLE: &str = "55P03";
+    pub const NAME_TOO_LONG: &str = "42622";
+    pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
+    pub const SERIALIZATION_FAILURE: &str = "40001";
+    pub const SUCCESSFUL_COMPLETION: &str = "00000";
+    pub const UNIQUE_VIOLATION: &str = "23505";
 }
 
 /// Resolves column references during evaluation. Statements without a FROM
 /// clause use [`NoColumns`].
+/// Whether two column references resolve to the same scope column — the
+/// semantic equality PostgreSQL uses for grouping keys, where `a` and `t.a`
+/// are one key. False whenever either side is not a column or the lookup
+/// cannot resolve identities.
+fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> bool {
+    let (Expr::Column { qualifier: qa, name: na }, Expr::Column { qualifier: qb, name: nb }) =
+        (a, b)
+    else {
+        return false;
+    };
+    match (row.column_identity(*qa, na), row.column_identity(*qb, nb)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
+
+    /// The scope-resolved identity of a column reference, when this lookup can
+    /// name one — used to match a grouping key spelled `a` against a select
+    /// item spelled `t.a` (PostgreSQL matches grouping keys semantically, not
+    /// by spelling). The pair is (table index, column index), with a
+    /// USING/NATURAL-merged column encoded as (u32::MAX, merge index).
+    fn column_identity(&self, _qualifier: Option<&str>, _name: &str) -> Option<(u32, u32)> {
+        None
+    }
 
     /// The named table's row as record fields (name + type + value), or None
     /// for an outer-join null row. Used to build a `Datum::Record` for a
@@ -468,7 +513,10 @@ pub fn eval_full<'a>(
         };
         let mut result = 0i32;
         for arg in args.iter() {
-            let idx = exprs.iter().position(|g| **g == **arg).ok_or_else(|| {
+            let idx = exprs
+                .iter()
+                .position(|g| **g == **arg || same_resolved_column(row, g, arg))
+                .ok_or_else(|| {
                 sql_err!(sqlstate::GROUPING_ERROR, "arguments to GROUPING must be grouping expressions of the associated query level")
             })?;
             let grouped = mask & (1u64 << idx) != 0;
@@ -477,10 +525,11 @@ pub fn eval_full<'a>(
         return Ok(Datum::Int4(result));
     }
     // Group-key substitution: any expression equal to a GROUP BY key
-    // evaluates to the group's value.
+    // evaluates to the group's value. Column references match by resolved
+    // identity too, so `t.a` finds the key spelled `a`.
     if let Some((exprs, values, _mask)) = hooks.group {
         for (g, v) in exprs.iter().zip(values) {
-            if **g == *expression {
+            if **g == *expression || same_resolved_column(row, g, expression) {
                 return Ok(*v);
             }
         }
@@ -600,6 +649,18 @@ pub fn eval_full<'a>(
                             name
                         ));
                     }
+                    _ => {}
+                }
+            }
+            // `::regtype` resolves a type name to the type and renders its
+            // canonical SQL name (`'varchar(5)'::regtype` is `character
+            // varying`); an OID renders the type it names, an unknown OID
+            // renders as the number and OID 0 as `-`, as PostgreSQL has it.
+            if type_name.eq_ignore_ascii_case("regtype") {
+                match text_view(v) {
+                    Datum::Text(name) => return regtype_of_name(name),
+                    Datum::Int4(x) => return regtype_of_oid(x as i64, arena),
+                    Datum::Int8(x) => return regtype_of_oid(x, arena),
                     _ => {}
                 }
             }
@@ -2309,7 +2370,7 @@ fn check_boolean_operand<'a>(
             _ => Ok(()),
         },
         Some(other) => Err(sql_err!(
-            "42804",
+            crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
             "argument of {} must be type boolean, not type {}",
             context,
             other.name()
@@ -2327,7 +2388,7 @@ pub(crate) fn boolean_argument<'a>(v: Datum<'a>, context: &str) -> Result<Datum<
         Datum::Null | Datum::Bool(_) => Ok(v),
         Datum::Text(s) => Ok(Datum::Bool(parse_bool(s)?)),
         other => Err(sql_err!(
-            "42804",
+            crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
             "argument of {} must be type boolean, not type {}",
             context,
             type_name_of(&other)
@@ -2482,6 +2543,91 @@ pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
         Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),
         other => other,
     }
+}
+
+/// `oid::regtype`: the canonical SQL name of the type an OID names. An OID no
+/// type carries renders as the number itself, and 0 as `-` — PostgreSQL's own
+/// fallbacks.
+fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    if o == 0 {
+        return Ok(Datum::Text("-"));
+    }
+    if let Ok(small) = i32::try_from(o)
+        && let Some(ct) = crate::sql::exec::coltype_of_oid_pub(small)
+    {
+        return Ok(Datum::Text(ct.name()));
+    }
+    arena.alloc_str_display(o).map(Datum::Text).map_err(|_| arena_full())
+}
+
+/// `'typename'::regtype`: resolves a spelled type name — with any `(...)`
+/// modifier ignored, as PostgreSQL ignores it — to its canonical SQL name.
+/// The serial pseudo-names are not types and are refused (42704), matching
+/// PostgreSQL; `name`, `oid` and the `reg*` identifiers resolve to themselves.
+fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
+    let mut base = spelled.trim();
+    if let Some(open) = base.find('(') {
+        // `varchar(5)` names varchar; the modifier plays no part.
+        let close = base.rfind(')').unwrap_or(base.len());
+        let tail = base[close..].trim_start_matches(')').trim();
+        if tail.is_empty() {
+            base = base[..open].trim_end();
+        }
+    }
+    let mut lowered = crate::util::StackStr::<128>::new();
+    use core::fmt::Write as _;
+    for c in base.chars() {
+        let _ = lowered.write_char(c.to_ascii_lowercase());
+    }
+    let unknown = || {
+        sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", spelled.trim())
+    };
+    if lowered.is_truncated() {
+        return Err(unknown());
+    }
+    // Collapse interior whitespace runs so `timestamp   with time zone` reads.
+    let mut collapsed = crate::util::StackStr::<128>::new();
+    let mut last_space = false;
+    for c in lowered.as_str().chars() {
+        if c.is_whitespace() {
+            if !last_space {
+                let _ = collapsed.write_char(' ');
+            }
+            last_space = true;
+        } else {
+            let _ = collapsed.write_char(c);
+            last_space = false;
+        }
+    }
+    let canonical = match collapsed.as_str() {
+        // These spell types the engine models; render via the one name table.
+        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial" => {
+            return Err(unknown())
+        }
+        "timestamp without time zone" | "timestamp" => "timestamp without time zone",
+        "timestamp with time zone" | "timestamptz" => "timestamp with time zone",
+        "time without time zone" | "time" => "time without time zone",
+        "time with time zone" | "timetz" => "time with time zone",
+        // Identifier/object types render as themselves.
+        "oid" => "oid",
+        s @ ("regtype" | "regclass" | "regproc" | "regprocedure" | "regrole"
+        | "regnamespace" | "regoper" | "regoperator") => match s {
+            "regtype" => "regtype",
+            "regclass" => "regclass",
+            "regproc" => "regproc",
+            "regprocedure" => "regprocedure",
+            "regrole" => "regrole",
+            "regnamespace" => "regnamespace",
+            "regoper" => "regoper",
+            "regoperator" => "regoperator",
+            _ => unreachable!(),
+        },
+        other => match ColType::from_sql_name(other) {
+            Some(ct) => ct.name(),
+            None => return Err(unknown()),
+        },
+    };
+    Ok(Datum::Text(canonical))
 }
 
 pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {

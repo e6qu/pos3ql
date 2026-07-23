@@ -384,6 +384,10 @@ pub(super) fn grouped_rows<'a>(
     correlated: &'a [&'a Expr<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(&'a [&'a [u8]], usize), SqlError> {
+    // A star in a grouped select stands for its columns: expand it so each
+    // expanded column is validated (and projected) like a written one —
+    // PostgreSQL accepts `SELECT * FROM t GROUP BY a, b, c`.
+    let statement = expand_grouped_stars(statement, scope, arena)?;
     // Validate: non-aggregate select items must be GROUP BY expressions.
     for item in statement.items {
         let SelectItem::Expr { expression, .. } = item else {
@@ -392,9 +396,14 @@ pub(super) fn grouped_rows<'a>(
                 "SELECT * must appear in the GROUP BY clause or be used in an aggregate function"
             ));
         };
-        if let Some(column) = ungrouped_column(expression, statement.group_by) {
+        if let Some(column) = ungrouped_column(expression, statement.group_by, scope) {
             return Err(ungrouped_error(column, scope));
         }
+    }
+    if let Some(h) = statement.having
+        && let Some(column) = ungrouped_column(h, statement.group_by, scope)
+    {
+        return Err(ungrouped_error(column, scope));
     }
 
     // Pass 1: count rows, so group storage can be arena-allocated. WHERE
@@ -428,7 +437,13 @@ pub(super) fn grouped_rows<'a>(
     // under the group hooks (so aggregates work). Resolved once.
     let mut order_arr: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     for (k, ob) in statement.order_by.iter().enumerate() {
-        order_arr[k] = Some(resolve_order_target(ob.expression, statement.items, scope, arena)?);
+        let target = resolve_order_target(ob.expression, statement.items, scope, arena)?;
+        // The sort key evaluates against the group, so it faces the same
+        // grouping rule as a select item (42803, not a missing-column error).
+        if let Some(column) = ungrouped_column(target, statement.group_by, scope) {
+            return Err(ungrouped_error(column, scope));
+        }
+        order_arr[k] = Some(target);
     }
     let order_exprs = &order_arr[..n_order];
 
@@ -568,6 +583,75 @@ pub(super) fn grouped_select<'a>(
 
 /// Does this item expression consist only of grouped expressions,
 /// aggregates, and constants?
+/// Whether two expressions are column references resolving to the same scope
+/// column — PostgreSQL's semantic key match, where `a` and `t.a` are one
+/// grouping key.
+fn same_scope_column(scope: &QueryScope, a: &Expr, b: &Expr) -> bool {
+    let (Expr::Column { qualifier: qa, name: na }, Expr::Column { qualifier: qb, name: nb }) =
+        (a, b)
+    else {
+        return false;
+    };
+    match (scope.find_column(*qa, na), scope.find_column(*qb, nb)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Expands `*` and `t.*` select items of a grouped query into their column
+/// references (a merged join column expands to its COALESCE), leaving every
+/// other item as written. Returns the statement unchanged when no star is
+/// present.
+fn expand_grouped_stars<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    use crate::sql::ast::SelectItem;
+    if !statement
+        .items
+        .iter()
+        .any(|i| matches!(i, SelectItem::Wildcard | SelectItem::TableWildcard(_)))
+    {
+        return Ok(statement);
+    }
+    let mut expanded: [SelectItem<'a>; MAX_PROJ] = [SelectItem::Wildcard; MAX_PROJ];
+    let mut n = 0usize;
+    let mut push = |item: SelectItem<'a>, n: &mut usize| -> Result<(), SqlError> {
+        if *n == MAX_PROJ {
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many select columns"));
+        }
+        expanded[*n] = item;
+        *n += 1;
+        Ok(())
+    };
+    for item in statement.items {
+        match item {
+            SelectItem::Wildcard => {
+                for i in 0..scope.star_columns() {
+                    let expression = scope.star_expression(scope.star_entry(i), arena)?;
+                    push(SelectItem::Expr { expression, alias: None }, &mut n)?;
+                }
+            }
+            SelectItem::TableWildcard(q) => {
+                let t = scope.table_index(q)?;
+                let def = scope.defs[t].expect("resolved");
+                for c in 0..def.n_columns {
+                    let expression = scope
+                        .star_expression(super::scope::ResolvedColumn::Table(t, c), arena)?;
+                    push(SelectItem::Expr { expression, alias: None }, &mut n)?;
+                }
+            }
+            other => push(*other, &mut n)?,
+        }
+    }
+    let items = arena.alloc_slice_copy(&expanded[..n]).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc(Select { items, ..*statement })
+        .map_err(|_| arena_full())?;
+    Ok(&*out)
+}
+
 /// PostgreSQL's ungrouped-column error, naming the column as `table.column`
 /// however the query spelled it.
 fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
@@ -602,12 +686,15 @@ fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
 fn ungrouped_column<'e, 'a>(
     expression: &'e Expr<'a>,
     group_by: &[&Expr<'a>],
+    scope: &QueryScope<'a>,
 ) -> Option<&'e Expr<'a>> {
-    if group_by.iter().any(|g| **g == *expression) || expression.is_aggregate() {
+    if group_by.iter().any(|g| **g == *expression || same_scope_column(scope, g, expression))
+        || expression.is_aggregate()
+    {
         return None;
     }
     let first =
-        |parts: &[&'e Expr<'a>]| parts.iter().find_map(|e| ungrouped_column(e, group_by));
+        |parts: &[&'e Expr<'a>]| parts.iter().find_map(|e| ungrouped_column(e, group_by, scope));
     match expression {
         Expr::Column { .. } | Expr::WholeRow(_) => Some(expression),
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_) | Expr::Str(_)
@@ -616,24 +703,24 @@ fn ungrouped_column<'e, 'a>(
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::IsNull { operand, .. }
-        | Expr::InSubquery { operand, .. } => ungrouped_column(operand, group_by),
+        | Expr::InSubquery { operand, .. } => ungrouped_column(operand, group_by, scope),
         Expr::Binary { left, right, .. } => first(&[left, right]),
-        Expr::Call { args, .. } => args.iter().find_map(|a| ungrouped_column(a, group_by)),
-        Expr::InList { operand, list, .. } => ungrouped_column(operand, group_by)
-            .or_else(|| list.iter().find_map(|e| ungrouped_column(e, group_by))),
+        Expr::Call { args, .. } => args.iter().find_map(|a| ungrouped_column(a, group_by, scope)),
+        Expr::InList { operand, list, .. } => ungrouped_column(operand, group_by, scope)
+            .or_else(|| list.iter().find_map(|e| ungrouped_column(e, group_by, scope))),
         Expr::Between { operand, low, high, .. } => first(&[operand, low, high]),
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
             first(&[operand, pattern])
         }
         Expr::Case { operand, whens, otherwise, .. } => operand
-            .and_then(|o| ungrouped_column(o, group_by))
+            .and_then(|o| ungrouped_column(o, group_by, scope))
             .or_else(|| {
                 whens.iter().find_map(|(c, r)| first(&[c, r]))
             })
-            .or_else(|| otherwise.and_then(|o| ungrouped_column(o, group_by))),
-        Expr::Array(items) => items.iter().find_map(|e| ungrouped_column(e, group_by)),
+            .or_else(|| otherwise.and_then(|o| ungrouped_column(o, group_by, scope))),
+        Expr::Array(items) => items.iter().find_map(|e| ungrouped_column(e, group_by, scope)),
         Expr::Subscript { base, index } => first(&[base, index]),
-        Expr::Field { base, .. } => ungrouped_column(base, group_by),
+        Expr::Field { base, .. } => ungrouped_column(base, group_by, scope),
         Expr::AnyAll { operand, array, .. } => first(&[operand, array]),
     }
 }

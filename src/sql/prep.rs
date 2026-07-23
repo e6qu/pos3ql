@@ -2,6 +2,7 @@
 //! A separate namespace from protocol-level prepared statements, as in
 //! PostgreSQL. Fixed pool per connection.
 
+use crate::sql::eval::sqlstate;
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
@@ -58,21 +59,21 @@ impl SqlPreparedPool {
         }
         if param_types.len() > MAX_PREP_PARAMS {
             return Err(sql_err!(
-                "54000",
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many declared parameters (max {})",
                 MAX_PREP_PARAMS
             ));
         }
         let Some(slot) = self.slots.iter_mut().find(|s| !s.active) else {
             return Err(sql_err!(
-                "54000",
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many prepared statements (max_prepared)"
             ));
         };
         slot.text.clear();
         if !slot.text.append(sql.as_bytes()) {
             return Err(sql_err!(
-                "54000",
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "prepared statement exceeds prepared_bytes"
             ));
         }

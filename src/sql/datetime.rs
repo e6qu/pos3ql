@@ -6,6 +6,7 @@
 //! (<https://howardhinnant.github.io/date_algorithms.html>). The session
 //! time zone is fixed at UTC.
 
+use crate::sql::eval::sqlstate;
 use crate::sql_err;
 use crate::util::StackStr;
 
@@ -61,14 +62,14 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 pub fn parse_date(s: &str) -> Result<i32, SqlError> {
     let bad = || {
         sql_err!(
-            "22007",
+            sqlstate::INVALID_DATETIME_FORMAT,
             "invalid input syntax for type date: \"{}\"",
             s
         )
     };
     let out_of_range = || {
         sql_err!(
-            "22008",
+            sqlstate::DATETIME_FIELD_OVERFLOW,
             "date/time field value out of range: \"{}\"",
             s
         )
@@ -101,7 +102,7 @@ const MONTH_FULL: [&str; 12] = [
 /// `MON`/`MONTH`) with any non-code characters treated as skippable separators;
 /// unrecognized letter codes are rejected loudly.
 pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i64, i64), SqlError> {
-    let bad = || sql_err!("22007", "invalid value for input string");
+    let bad = || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid value for input string");
     let (mut y, mut month, mut d, mut h, mut minute, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
     let input_bytes = input.as_bytes();
     let format_bytes = fmt.as_bytes();
@@ -165,7 +166,7 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
             y = read_num(&mut input_position, 1).ok_or_else(bad)?;
             format_index += 1;
         } else if up.is_ascii_alphabetic() {
-            return Err(sql_err!("22007", "unsupported to_date/to_timestamp code"));
+            return Err(sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "unsupported to_date/to_timestamp code"));
         } else {
             // Separator: skip one non-alphanumeric input character if present.
             if input_position < input_bytes.len() && !input_bytes[input_position].is_ascii_alphanumeric() {
@@ -175,7 +176,7 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
         }
     }
     if !(1..=12).contains(&month) || d < 1 || d > days_in_month(y, month) {
-        return Err(sql_err!("22008", "date/time field value out of range"));
+        return Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date/time field value out of range"));
     }
     Ok((y, month, d, h, minute, s))
 }
@@ -223,7 +224,7 @@ pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
 /// the fields as PostgreSQL `make_date` does.
 pub fn make_date(year: i64, month: i64, day: i64) -> Result<i32, SqlError> {
-    let range = || sql_err!("22008", "date field value out of range");
+    let range = || sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date field value out of range");
     if !(1..=12).contains(&month) {
         return Err(range());
     }
@@ -238,7 +239,7 @@ pub fn make_date(year: i64, month: i64, day: i64) -> Result<i32, SqlError> {
 /// Constructs a time-of-day (microseconds since midnight) from hour/minute and
 /// a fractional second, validating fields as PostgreSQL `make_time` does.
 pub fn make_time(hour: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
-    let range = || sql_err!("22008", "time field value out of range");
+    let range = || sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "time field value out of range");
     if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0.0..60.0).contains(&sec) {
         return Err(range());
     }
@@ -270,7 +271,7 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     } else {
         "timestamp"
     };
-    let bad = || sql_err!("22007", "invalid input syntax for type {}: \"{}\"", type_name, s);
+    let bad = || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid input syntax for type {}: \"{}\"", type_name, s);
     let t = s.trim();
     // Split date and time parts.
     let (date_part, rest) = match t.find([' ', 'T']) {
@@ -338,7 +339,7 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     };
     if !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..61).contains(&sec) {
         return Err(sql_err!(
-            "22008",
+            sqlstate::DATETIME_FIELD_OVERFLOW,
             "date/time field value out of range: \"{}\"",
             s
         ));
@@ -366,7 +367,7 @@ pub fn parse_time(s: &str) -> Result<i64, SqlError> {
 
 fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlError> {
     let bad =
-        || sql_err!("22007", "invalid input syntax for type {}: \"{}\"", type_name, s);
+        || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid input syntax for type {}: \"{}\"", type_name, s);
     let t = s.trim();
     // Split off a trailing zone: `Z`, a named `UTC`, or `±HH[:MM[:SS]]`. The
     // sign has to be past the start so a lone offset is not read as a time.
@@ -416,7 +417,7 @@ fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlE
     // 24:00:00 is the one hour-24 time PostgreSQL accepts.
     let hour_ok = (0..24).contains(&h) || (h == 24 && m == 0 && sec == 0 && micros == 0);
     if !hour_ok || !(0..60).contains(&m) || !(0..61).contains(&sec) {
-        return Err(sql_err!("22008", "date/time field value out of range: \"{}\"", s));
+        return Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date/time field value out of range: \"{}\"", s));
     }
     Ok(((h * 3600 + m * 60 + sec) * 1_000_000 + micros, zone))
 }
@@ -476,7 +477,7 @@ pub fn format_time(micros: i64) -> StackStr<24> {
 /// `90 minutes`, `-5 days`, `1 day 03:04:05`). Returns (months, days, micros).
 pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
     use super::types::Interval;
-    let bad = || sql_err!("22007", "invalid input syntax for type interval: \"{}\"", s);
+    let bad = || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid input syntax for type interval: \"{}\"", s);
     let mut months = 0i64;
     let mut days = 0i64;
     let mut micros = 0i64;

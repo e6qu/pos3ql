@@ -236,7 +236,7 @@ pub(crate) fn dispatch<'a>(
                     match int_arg(name, args, 2, arena, params, row, hooks)? {
                         Some(c) => {
                             if c < 0 {
-                                return Err(sql_err!("22011", "negative substring length not allowed"));
+                                return Err(sql_err!(sqlstate::SUBSTRING_ERROR, "negative substring length not allowed"));
                             }
                             Some(c)
                         }
@@ -460,12 +460,12 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if n == 0 {
-                    return Err(sql_err!("54000", "null character not permitted"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "null character not permitted"));
                 }
                 let c = u32::try_from(n)
                     .ok()
                     .and_then(char::from_u32)
-                    .ok_or_else(|| sql_err!("22023", "requested character not valid for encoding"))?;
+                    .ok_or_else(|| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "requested character not valid for encoding"))?;
                 let out = arena.alloc_slice_with(c.len_utf8(), |_| 0u8).map_err(|_| arena_full())?;
                 c.encode_utf8(out);
                 Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
@@ -542,7 +542,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if n == 0 {
-                    return Err(sql_err!("22023", "field position must not be zero"));
+                    return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "field position must not be zero"));
                 }
                 if delim.is_empty() {
                     return Ok(Datum::Text(if n == 1 || n == -1 { s } else { "" }));

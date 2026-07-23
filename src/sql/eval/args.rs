@@ -154,7 +154,7 @@ pub(crate) fn width_bucket_numeric(
     use crate::sql::numeric::{compare, mul, sub, trunc_div};
     use core::cmp::Ordering;
     if compare(lo, hi) == Ordering::Equal {
-        return Err(sql_err!("22004", "lower and upper bounds cannot be equal"));
+        return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "lower and upper bounds cannot be equal"));
     }
     let cnt = Numeric::from_i64(count, arena)?;
     let ascending = compare(lo, hi) == Ordering::Less;
@@ -195,7 +195,7 @@ pub(crate) fn format_append_str<'a>(
 /// lowercase identifier.
 pub(crate) fn format_append_ident(out: &mut StackStr<4096>, v: Datum<'_>) -> Result<(), SqlError> {
     if v.is_null() {
-        return Err(sql_err!("22004", "null value cannot be formatted as SQL identifier"));
+        return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "null value cannot be formatted as SQL identifier"));
     }
     let s = match v {
         Datum::Text(s) => s,
@@ -316,10 +316,10 @@ pub(crate) fn expand_replacement(
 /// Rejects a non-positive logarithm argument the way PostgreSQL does.
 pub(crate) fn log_domain_check(n: &Numeric) -> Result<(), SqlError> {
     if n.is_zero() {
-        return Err(sql_err!("2201E", "cannot take logarithm of zero"));
+        return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of zero"));
     }
     if n.sign == crate::sql::numeric::Sign::Neg {
-        return Err(sql_err!("2201E", "cannot take logarithm of a negative number"));
+        return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a negative number"));
     }
     Ok(())
 }
@@ -386,7 +386,7 @@ pub(crate) fn quote_ident_str<'a>(s: &str, arena: &'a Arena) -> Result<&'a str, 
     }
     let _ = out.write_char('"');
     if out.is_truncated() {
-        return Err(sql_err!("54000", "identifier too long to quote"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "identifier too long to quote"));
     }
     arena.alloc_str(out.as_str()).map_err(|_| arena_full())
 }
@@ -415,7 +415,7 @@ pub(crate) fn quote_literal_str<'a>(text: &str, arena: &'a Arena) -> Result<&'a 
     }
     let _ = out.write_char('\'');
     if out.is_truncated() {
-        return Err(sql_err!("54000", "literal too long to quote"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "literal too long to quote"));
     }
     arena.alloc_str(out.as_str()).map_err(|_| arena_full())
 }
@@ -428,7 +428,7 @@ pub(crate) fn parse_qualified_ident<'a>(
     out: &mut [Datum<'a>],
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
-    let bad = || sql_err!("42601", "string is not a valid identifier: \"{}\"", input);
+    let bad = || sql_err!(sqlstate::SYNTAX_ERROR, "string is not a valid identifier: \"{}\"", input);
     let bytes = input.as_bytes();
     let mut i = 0usize;
     let mut n = 0usize;
@@ -440,7 +440,7 @@ pub(crate) fn parse_qualified_ident<'a>(
             return Err(bad());
         }
         if n == out.len() {
-            return Err(sql_err!("54000", "identifier has too many parts"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "identifier has too many parts"));
         }
         let part = if bytes[i] == b'"' {
             // Quoted part: read to the closing quote, collapsing `""` to `"`.
@@ -526,7 +526,7 @@ pub(crate) fn split_pieces<'a>(
     let mut n = 0usize;
     let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
         if *n >= out.len() {
-            return Err(sql_err!("54000", "too many pieces in a split string"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many pieces in a split string"));
         }
         out[*n] = piece;
         *n += 1;

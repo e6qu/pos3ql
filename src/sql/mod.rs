@@ -152,7 +152,7 @@ impl Engine {
                     match crate::wal::decode_record(record) {
                         Some(operator) => apply_wal_op(&mut storage, lsn, operator),
                         None => Err(SqlError {
-                            sqlstate: "XX000",
+                            sqlstate: sqlstate::INTERNAL_ERROR,
                             message: stack_format!(192, "corrupt uploaded WAL record"),
                         }),
                     }
@@ -383,7 +383,7 @@ impl Engine {
         self.wal_seg_buf.resize(len, 0);
         if self.wal.read_range(start, &mut self.wal_seg_buf).is_err() {
             return Err(SqlError {
-                sqlstate: "58030",
+                sqlstate: sqlstate::IO_ERROR,
                 message: stack_format!(192, "cannot read WAL batch for upload"),
             });
         }
@@ -836,7 +836,7 @@ impl Engine {
             && !matches!(statement, Stmt::Commit | Stmt::Rollback | Stmt::RollbackToSavepoint(_))
         {
             return Ok(Err(SqlError {
-                sqlstate: "25P02",
+                sqlstate: sqlstate::IN_FAILED_SQL_TRANSACTION,
                 message: stack_format!(
                     192,
                     "current transaction is aborted, commands ignored until end of transaction block"
@@ -1153,7 +1153,7 @@ impl Engine {
                         Some(ct) => types[i] = ct,
                         None => {
                             return Ok(Err(SqlError {
-                                sqlstate: "42704",
+                                sqlstate: sqlstate::UNDEFINED_OBJECT,
                                 message: stack_format!(192, "type \"{}\" does not exist", tn),
                             }))
                         }
@@ -1170,7 +1170,7 @@ impl Engine {
             Stmt::ExecutePrepared { name, args } => {
                 let Some(text) = sqlprep.get(name) else {
                     return Ok(Err(SqlError {
-                        sqlstate: "26000",
+                        sqlstate: sqlstate::INVALID_SQL_STATEMENT_NAME,
                         message: stack_format!(
                             192,
                             "prepared statement \"{}\" does not exist",
@@ -1203,7 +1203,7 @@ impl Engine {
                 // must match and each argument is coerced to its declared type.
                 if n_decl > 0 && args.len() != n_decl {
                     return Ok(Err(SqlError {
-                        sqlstate: "08P01",
+                        sqlstate: sqlstate::PROTOCOL_VIOLATION,
                         message: stack_format!(
                             192,
                             "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
@@ -1261,7 +1261,7 @@ impl Engine {
                     Some(n) => {
                         if !sqlprep.remove(n) {
                             return Ok(Err(SqlError {
-                                sqlstate: "26000",
+                                sqlstate: sqlstate::INVALID_SQL_STATEMENT_NAME,
                                 message: stack_format!(
                                     192,
                                     "prepared statement \"{}\" does not exist",

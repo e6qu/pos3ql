@@ -178,7 +178,7 @@ pub(crate) fn materialized_rows<'a>(
         // present); otherwise the "first" row per key is ill-defined.
         if n_order > 0 && (j >= n_order || *order_exprs[j].expect("resolved") != *resolved) {
             return Err(sql_err!(
-                "42P10",
+                sqlstate::INVALID_COLUMN_REFERENCE,
                 "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
             ));
         }
@@ -194,7 +194,7 @@ pub(crate) fn materialized_rows<'a>(
             });
             if !in_list {
                 return Err(sql_err!(
-                    "42P10",
+                    sqlstate::INVALID_COLUMN_REFERENCE,
                     "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
                 ));
             }

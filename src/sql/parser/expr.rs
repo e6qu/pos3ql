@@ -7,6 +7,7 @@
 //! column, a parenthesized expression or row, a CASE, a subquery, an array —
 //! and the postfix forms (subscripts, field access, casts) that bind to it.
 
+use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
 use super::{is_base_prefixed, is_reserved_keyword, ParseError, Parser, MAX_LIST};
@@ -1096,14 +1097,14 @@ impl<'a> Parser<'a> {
         let out_of_range = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(96, "interval field value out of range: \"{}\"", lit),
-            sqlstate: "22015",
+            sqlstate: sqlstate::INTERVAL_FIELD_OVERFLOW,
         };
         // A part that is not a number at all is malformed input (22007); a
         // number that is simply too large for its field is out of range (22015).
         let bad_syntax = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
-            sqlstate: "22007",
+            sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
         };
         let value = lit.trim();
         let (sign, rest) = match value.strip_prefix('-') {
@@ -1148,7 +1149,7 @@ impl<'a> Parser<'a> {
         let bad = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
-            sqlstate: "22007",
+            sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
         };
         let value = lit.trim();
 
@@ -1269,7 +1270,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
-                sqlstate: "22007",
+                sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             });
         }
         let (word, keep_fraction) = clock_field_word(field);

@@ -275,7 +275,7 @@ fn frame_range<'a>(
         };
         if ord.len() != 1 {
             return Err(sql_err!(
-                "42P20",
+                sqlstate::WINDOWING_ERROR,
                 "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"
             ));
         }
@@ -388,7 +388,7 @@ fn frame_range<'a>(
         }
         FrameUnits::Groups => {
             if ord.is_empty() {
-                return Err(sql_err!("42P20", "GROUPS mode requires an ORDER BY clause"));
+                return Err(sql_err!(sqlstate::WINDOWING_ERROR, "GROUPS mode requires an ORDER BY clause"));
             }
             // This row's peer-group index (groups counted from the front).
             let gj = {
@@ -472,7 +472,7 @@ fn frame_range<'a>(
             );
             if uses_offset && ord.is_empty() {
                 return Err(sql_err!(
-                    "42P20",
+                    sqlstate::WINDOWING_ERROR,
                     "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"
                 ));
             }
@@ -561,7 +561,7 @@ fn compute_window<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
     let Expr::Call { name, args, over: Some(spec), .. } = node else {
-        return Err(sql_err!("XX000", "not a window function"));
+        return Err(sql_err!(sqlstate::INTERNAL_ERROR, "not a window function"));
     };
     let n = rows.len();
     let out = arena.alloc_slice_with(n, |_| Datum::Null).map_err(|_| arena_full())?;
@@ -1078,7 +1078,7 @@ pub(crate) fn project_window_rows<'a>(
     let n_order = statement.order_by.len();
     let mut order_exprs: [Option<&Expr>; MAX_WIN_KEYS] = [None; MAX_WIN_KEYS];
     if n_order > MAX_WIN_KEYS {
-        return Err(sql_err!("54023", "ORDER BY list too long"));
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "ORDER BY list too long"));
     }
     for (k, ob) in statement.order_by.iter().enumerate() {
         order_exprs[k] = Some(resolve_order_target(ob.expression, statement.items, scope, arena)?);
@@ -1175,7 +1175,7 @@ pub(crate) fn window_select<'a>(
             });
             if !in_list {
                 return sql_fail(sql_err!(
-                    "42P10",
+                    sqlstate::INVALID_COLUMN_REFERENCE,
                     "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
                 ));
             }

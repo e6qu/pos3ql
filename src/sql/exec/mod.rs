@@ -40,7 +40,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         if let Some(q) = qualifier
             && q != self.def.name.as_str() {
                 return Err(sql_err!(
-                    "42P01",
+                    sqlstate::UNDEFINED_TABLE,
                     "missing FROM-clause entry for table \"{}\"",
                     q
                 ));
@@ -62,7 +62,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
     ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
         if table != self.def.name.as_str() {
             return Err(sql_err!(
-                "42P01",
+                sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
                 table
             ));
@@ -258,7 +258,7 @@ fn push_column(def: &mut TableDef, n: &mut usize, column: ColumnMeta) -> Result<
     }
     if def.columns[..*n].iter().any(|prev| prev.name == column.name) {
         return Err(sql_err!(
-            "42701",
+            sqlstate::DUPLICATE_COLUMN,
             "column \"{}\" specified more than once",
             column.name.as_str()
         ));
@@ -510,7 +510,7 @@ impl<'v> ColumnLookup<'v> for ExcludedCtx<'_, 'v, '_> {
             if let Some(q) = qualifier
                 && q != self.def.name.as_str()
             {
-                return Err(sql_err!("42P01", "missing FROM-clause entry for table \"{}\"", q));
+                return Err(sql_err!(sqlstate::UNDEFINED_TABLE, "missing FROM-clause entry for table \"{}\"", q));
             }
             self.existing
         };
@@ -562,7 +562,7 @@ fn handle_conflict(
             .rows
             .get(&rowid)
             .and_then(|s| s.visible_to(txn.txid))
-            .ok_or_else(|| sql_err!("XX000", "conflict row vanished"))?;
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         rowenc::decode(storage.heap.get(loc), schema, &mut existing)?;
         let context = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
         if let Some(cond) = oc.update_where
@@ -765,7 +765,7 @@ pub fn drop_view(
             stack_format!(128, "view \"{}\" does not exist, skipping", name).as_str(),
         )?;
     } else {
-        return sql_fail(sql_err!("42P01", "view \"{}\" does not exist", name));
+        return sql_fail(sql_err!(sqlstate::UNDEFINED_TABLE, "view \"{}\" does not exist", name));
     }
     responder.command_complete("DROP VIEW")?;
     sql_ok()
@@ -1157,7 +1157,7 @@ fn emit_projected(
             SelectItem::TableWildcard(q) => {
                 if *q != def.name.as_str() {
                     return Ok(Err(sql_err!(
-                        "42P01",
+                        sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",
                         q
                     )));
@@ -1575,7 +1575,7 @@ pub fn alter_table(
                 return sql_fail(undefined_column(from));
             };
             if def.column_index(to).is_some() {
-                return sql_fail(sql_err!("42701", "column \"{}\" already exists", to));
+                return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", to));
             }
             new_def.columns[i].name = match SqlName::parse(to) {
                 Ok(n) => n,
@@ -1584,7 +1584,7 @@ pub fn alter_table(
         }
         AlterAction::AddColumn(c) => {
             if def.column_index(c.name).is_some() {
-                return sql_fail(sql_err!("42701", "column \"{}\" already exists", c.name));
+                return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", c.name));
             }
             if def.n_columns == MAX_COLUMNS {
                 return sql_fail(sql_err!(
@@ -1625,7 +1625,7 @@ pub fn alter_table(
             };
             if def.n_columns == 1 {
                 return sql_fail(sql_err!(
-                    "0A000",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot drop the only column of a table"
                 ));
             }
@@ -1765,7 +1765,7 @@ pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(_) | Datum::Int8(_) => {
-            Err(sql_err!("2201X", "OFFSET must not be negative"))
+            Err(sql_err!(sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET, "OFFSET must not be negative"))
         }
         _ => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -2028,7 +2028,7 @@ fn bpchar_fit<'a>(
                 .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cast result too large"))?;
             return Ok(Datum::Text(t));
         }
-        return Err(sql_err!("22001", "value too long for type character({})", n));
+        return Err(sql_err!(sqlstate::STRING_DATA_RIGHT_TRUNCATION, "value too long for type character({})", n));
     }
     if clen == n {
         return Ok(Datum::Text(s));
@@ -2059,7 +2059,7 @@ pub fn apply_typmod<'a>(
         (ColType::Text | ColType::Varchar, TypeMod::Length(max), Datum::Text(s)) => {
             if s.chars().count() > max {
                 return Err(sql_err!(
-                    "22001",
+                    sqlstate::STRING_DATA_RIGHT_TRUNCATION,
                     "value too long for type character varying({})",
                     max
                 ));
@@ -2143,7 +2143,7 @@ fn apply_numeric_typmod<'a>(
     let (int_b, frac_b) = (int_part.as_bytes(), frac_part.as_bytes());
     let int_len = int_b.len();
     if int_len + scale + 2 >= DIG {
-        return Err(sql_err!("22003", "numeric field overflow"));
+        return Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "numeric field overflow"));
     }
 
     // Kept digits: every integer digit, then `scale` fractional digits (padded
@@ -2174,7 +2174,7 @@ fn apply_numeric_typmod<'a>(
         int_len - lead_zeros
     };
     if sig_int > precision - scale {
-        return Err(sql_err!("22003", "numeric field overflow"));
+        return Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "numeric field overflow"));
     }
 
     // Reassemble and re-parse (parse sets dscale = scale, matching PostgreSQL).

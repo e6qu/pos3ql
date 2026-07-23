@@ -354,7 +354,7 @@ pub(crate) fn apply_fk_parent_actions(
 ) -> Result<(), SqlError> {
     if depth == 0 {
         return Err(sql_err!(
-            "54001",
+            sqlstate::STATEMENT_TOO_COMPLEX,
             "foreign key cascade nested more than {} levels deep",
             MAX_FK_CASCADE_DEPTH
         ));

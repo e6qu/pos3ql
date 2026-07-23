@@ -39,7 +39,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             Some([]) => Ok(Datum::Null),
             Some(vals) => Ok(vals[c]),
             None => Err(sql_err!(
-                "42P10",
+                sqlstate::INVALID_COLUMN_REFERENCE,
                 "column \"{}\" referenced before its table is joined",
                 name
             )),
@@ -75,7 +75,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             Some([]) => Ok(false), // outer-join null row
             Some(_) => Ok(true),
             None => Err(sql_err!(
-                "42P10",
+                sqlstate::INVALID_COLUMN_REFERENCE,
                 "whole-row reference to \"{}\" before its table is joined",
                 table
             )),
@@ -94,7 +94,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             Some(vals) => vals,
             None => {
                 return Err(sql_err!(
-                    "42P10",
+                    sqlstate::INVALID_COLUMN_REFERENCE,
                     "whole-row reference to \"{}\" before its table is joined",
                     table
                 ))

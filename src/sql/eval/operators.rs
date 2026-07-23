@@ -240,7 +240,7 @@ pub(crate) fn bit_bitwise<'a>(
             BinaryOp::BitOr => "OR",
             _ => "XOR",
         };
-        return Err(sql_err!("22026", "cannot {} bit strings of different sizes", verb));
+        return Err(sql_err!(sqlstate::STRING_DATA_LENGTH_MISMATCH, "cannot {} bit strings of different sizes", verb));
     }
     let varying = bit_is_varying(&l) || bit_is_varying(&r);
     let out = arena
@@ -790,7 +790,7 @@ fn date_shift<'a>(date: i32, days: i64, sub: bool) -> Result<Datum<'a>, SqlError
         .and_then(|v| i32::try_from(v).ok());
     match shifted {
         Some(d) => Ok(Datum::Date(d)),
-        None => Err(sql_err!("22008", "date out of range")),
+        None => Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date out of range")),
     }
 }
 
@@ -1004,7 +1004,7 @@ fn row_compare<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
     if a.len() != b.len() {
-        return Err(sql_err!("42601", "unequal number of entries in row expressions"));
+        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "unequal number of entries in row expressions"));
     }
     match operator {
         Eq | NotEq => {

@@ -6,6 +6,7 @@
 //! `,`, numbers canonicalized through the NUMERIC type, and strings minimally
 //! escaped. The same tree drives the `->` / `->>` accessors.
 
+use crate::sql::eval::sqlstate;
 use crate::mem::arena::Arena;
 use crate::sql_err;
 
@@ -38,7 +39,7 @@ struct P<'a> {
 }
 
 fn bad() -> SqlError {
-    sql_err!("22P02", "invalid input syntax for type json")
+    sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid input syntax for type json")
 }
 
 /// Parses `input` into an arena tree (jsonb semantics: objects sorted/deduped).
@@ -88,7 +89,7 @@ pub fn object_keys_error(name: &str, kind: Kind) -> SqlError {
         Kind::Array => "an array",
         Kind::Object => "an object",
     };
-    sql_err!("22023", "cannot call {} on {}", name, what)
+    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot call {} on {}", name, what)
 }
 
 /// PostgreSQL's error for calling `*_array_elements` on a non-array. The `json`
@@ -101,13 +102,13 @@ pub fn array_elements_error(name: &str, jsonb: bool, kind: Kind) -> SqlError {
             Kind::Object => "an object",
             Kind::Array => "an array",
         };
-        sql_err!("22023", "cannot extract elements from {}", what)
+        sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot extract elements from {}", what)
     } else {
         let what = match kind {
             Kind::Scalar => "a scalar",
             Kind::Object | Kind::Array => "a non-array",
         };
-        sql_err!("22023", "cannot call {} on {}", name, what)
+        sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot call {} on {}", name, what)
     }
 }
 
@@ -122,7 +123,7 @@ pub fn object_members_source<'a>(
     let mut p = P { b: input.as_bytes(), at: 0, arena };
     p.ws();
     if p.b.get(p.at) != Some(&b'{') {
-        return Err(sql_err!("22023", "cannot call json_object_keys on a non-object"));
+        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot call json_object_keys on a non-object"));
     }
     p.at += 1;
     let mut members: [(&str, &str); MAX_ELEMS] = [("", ""); MAX_ELEMS];
@@ -133,7 +134,7 @@ pub fn object_members_source<'a>(
     }
     loop {
         if n == MAX_ELEMS {
-            return Err(sql_err!("54000", "JSON object too large"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
         }
         p.ws();
         if p.b.get(p.at) != Some(&b'"') {
@@ -178,7 +179,7 @@ pub fn array_elements_source<'a>(
     let mut p = P { b: input.as_bytes(), at: 0, arena };
     p.ws();
     if p.b.get(p.at) != Some(&b'[') {
-        return Err(sql_err!("22023", "cannot extract elements from a non-array"));
+        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot extract elements from a non-array"));
     }
     p.at += 1;
     let mut items: [&str; MAX_ELEMS] = [""; MAX_ELEMS];
@@ -189,7 +190,7 @@ pub fn array_elements_source<'a>(
     }
     loop {
         if n == MAX_ELEMS {
-            return Err(sql_err!("54000", "JSON array too large"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON array too large"));
         }
         p.ws();
         let start = p.at;
@@ -222,7 +223,7 @@ impl<'a> P<'a> {
 
     fn value(&mut self, depth: u32) -> Result<Json<'a>, SqlError> {
         if depth > MAX_DEPTH {
-            return Err(sql_err!("54001", "JSON nested too deeply"));
+            return Err(sql_err!(sqlstate::STATEMENT_TOO_COMPLEX, "JSON nested too deeply"));
         }
         self.ws();
         match self.b.get(self.at) {
@@ -321,7 +322,7 @@ impl<'a> P<'a> {
         }
         loop {
             if n == MAX_ELEMS {
-                return Err(sql_err!("54000", "JSON array too large"));
+                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON array too large"));
             }
             items[n] = self.value(depth + 1)?;
             n += 1;
@@ -351,7 +352,7 @@ impl<'a> P<'a> {
         }
         loop {
             if n == MAX_ELEMS {
-                return Err(sql_err!("54000", "JSON object too large"));
+                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
             }
             self.ws();
             if self.b.get(self.at) != Some(&b'"') {
@@ -434,6 +435,37 @@ impl<'a> Json<'a> {
         }
     }
 
+    /// Serializes with no separator spacing — the form `json` (as opposed to
+    /// `jsonb`) functions re-emit, PostgreSQL rendering `json_strip_nulls` of a
+    /// spaced object compactly.
+    pub fn write_compact(&self, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        match self {
+            Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_) => self.write(out),
+            Json::Array(items) => {
+                out.write_str("[")?;
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.write_str(",")?;
+                    }
+                    v.write_compact(out)?;
+                }
+                out.write_str("]")
+            }
+            Json::Object(members) => {
+                out.write_str("{")?;
+                for (i, (k, v)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.write_str(",")?;
+                    }
+                    write_json_string(k, out)?;
+                    out.write_str(":")?;
+                    v.write_compact(out)?;
+                }
+                out.write_str("}")
+            }
+        }
+    }
+
     /// `->` accessor: object field by key, or array element by (0-based) index.
     pub fn get_field(&self, key: &str) -> Option<Json<'a>> {
         match self {
@@ -464,7 +496,7 @@ fn build_object<'a>(
     arena: &'a Arena,
 ) -> Result<Json<'a>, SqlError> {
     if members.len() > MAX_ELEMS {
-        return Err(sql_err!("54000", "JSON object too large"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
     }
     let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
     buffer[..members.len()].copy_from_slice(members);
@@ -510,7 +542,7 @@ pub fn set<'a>(
                 buffer[i].1 = set(members[i].1, rest, value, create, arena)?;
             } else if rest.is_empty() && create {
                 if n == MAX_ELEMS {
-                    return Err(sql_err!("54000", "JSON object too large"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
                 }
                 buffer[n] = (*head, value);
                 return build_object(&buffer[..n + 1], arena);
@@ -552,13 +584,13 @@ pub fn insert<'a>(
             buffer[..n].copy_from_slice(members);
             if let Some(i) = members.iter().position(|(k, _)| k == head) {
                 if rest.is_empty() {
-                    return Err(sql_err!("22023", "cannot replace existing key"));
+                    return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot replace existing key"));
                 }
                 buffer[i].1 = insert(members[i].1, rest, value, after, arena)?;
                 build_object(&buffer[..n], arena)
             } else if rest.is_empty() {
                 if n == MAX_ELEMS {
-                    return Err(sql_err!("54000", "JSON object too large"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
                 }
                 buffer[n] = (*head, value);
                 build_object(&buffer[..n + 1], arena)
@@ -578,7 +610,7 @@ pub fn insert<'a>(
                 }
                 let at = at as usize;
                 if items.len() + 1 > MAX_ELEMS {
-                    return Err(sql_err!("54000", "JSON array too large"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON array too large"));
                 }
                 let mut buffer = [Json::Null; MAX_ELEMS];
                 buffer[..at].copy_from_slice(&items[..at]);
@@ -654,14 +686,14 @@ pub fn delete_key<'a>(root: Json<'a>, key: &str, arena: &'a Arena) -> Result<Jso
             }
             Ok(Json::Array(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
         }
-        _ => Err(sql_err!("22023", "cannot delete from scalar")),
+        _ => Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot delete from scalar")),
     }
 }
 
 /// `jsonb - integer`: removes the element at a signed array index.
 pub fn delete_index<'a>(root: Json<'a>, index: i64, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
     let Json::Array(items) = root else {
-        return Err(sql_err!("22023", "cannot delete from object using integer index"));
+        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot delete from object using integer index"));
     };
     let resolved = if index < 0 { items.len() as i64 + index } else { index };
     if resolved < 0 || resolved as usize >= items.len() {
@@ -799,6 +831,15 @@ pub fn pretty_to_arena<'a>(root: &Json, arena: &'a Arena) -> Result<&'a str, Sql
 
 /// A `Display` adapter that renders a `Json` value in canonical jsonb form.
 pub struct JsonWrite<'a, 'b>(pub &'b Json<'a>);
+
+/// [`JsonWrite`]'s compact sibling, for `json`-typed results.
+pub struct JsonWriteCompact<'a, 'b>(pub &'b Json<'a>);
+
+impl core::fmt::Display for JsonWriteCompact<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.write_compact(f)
+    }
+}
 
 impl core::fmt::Display for JsonWrite<'_, '_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

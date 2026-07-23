@@ -58,5 +58,22 @@ cur.execute("SELECT count(*) FROM drv")
 assert cur.fetchone()[0] == 3
 print("update/delete ok")
 
+# RowDescription atttypmod: a table column carries its declared modifier and a
+# cast its target's, while a computed expression carries none — psycopg derives
+# display_size/precision/scale from it, so a client sees varchar(5) as 5.
+cur.execute("DROP TABLE IF EXISTS drv_typmod")
+cur.execute("CREATE TABLE drv_typmod(v varchar(5), n numeric(6,2), t timestamp(3))")
+cur.execute("SELECT v, n, t, v::varchar(9), upper(v) FROM drv_typmod")
+got = [(d.precision, d.scale, d.display_size) for d in cur.description]
+assert got == [
+    (None, None, 5),
+    (6, 2, None),
+    (3, None, None),
+    (None, None, 9),
+    (None, None, None),
+], f"typmod on the wire: {got}"
+print("row description typmod ok")
+
 conn.close()
+
 print("ALL DRIVER TESTS PASSED")

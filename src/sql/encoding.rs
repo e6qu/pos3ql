@@ -2,6 +2,7 @@
 //! base64, hex, and PostgreSQL's `escape` format. All allocate their result in
 //! the statement arena so arbitrarily large values never truncate.
 
+use crate::sql::eval::sqlstate;
 use crate::mem::arena::Arena;
 use crate::sql_err;
 
@@ -10,11 +11,11 @@ use super::eval::{arena_full, SqlError};
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn bad_base64() -> SqlError {
-    sql_err!("22023", "invalid symbol found while decoding base64 sequence")
+    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid symbol found while decoding base64 sequence")
 }
 
 fn bad_hex() -> SqlError {
-    sql_err!("22023", "invalid hexadecimal digit")
+    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid hexadecimal digit")
 }
 
 /// Standard base64 with padding, into the arena.
@@ -114,7 +115,7 @@ pub fn hex_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError
         }
     }
     if high.is_some() {
-        return Err(sql_err!("22023", "invalid hexadecimal data: odd number of digits"));
+        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid hexadecimal data: odd number of digits"));
     }
     Ok(&out[..n])
 }
@@ -179,13 +180,13 @@ pub fn escape_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlEr
                 let (Some(d1 @ b'0'..=b'7'), Some(d2 @ b'0'..=b'7')) =
                     (bytes.get(i + 2), bytes.get(i + 3))
                 else {
-                    return Err(sql_err!("22021", "invalid input syntax for type bytea"));
+                    return Err(sql_err!(sqlstate::CHARACTER_NOT_IN_REPERTOIRE, "invalid input syntax for type bytea"));
                 };
                 out[n] = ((d0 - b'0') << 6) | ((d1 - b'0') << 3) | (d2 - b'0');
                 n += 1;
                 i += 4;
             }
-            _ => return Err(sql_err!("22021", "invalid input syntax for type bytea")),
+            _ => return Err(sql_err!(sqlstate::CHARACTER_NOT_IN_REPERTOIRE, "invalid input syntax for type bytea")),
         }
     }
     Ok(&out[..n])

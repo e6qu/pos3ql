@@ -96,7 +96,7 @@ pub(crate) fn dispatch<'a>(
                         Datum::Range { text, kind: k } if k == kind => {
                             if !range::is_empty(text) {
                                 if n == range::MAX_MULTIRANGE {
-                                    return Err(sql_err!("54000", "multirange has too many component ranges"));
+                                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
                                 }
                                 comps[n] = text;
                                 n += 1;

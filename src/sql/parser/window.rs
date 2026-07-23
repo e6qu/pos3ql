@@ -4,6 +4,7 @@
 //! after `OVER`, by name against a `WINDOW` clause, and as a named spec that
 //! another one extends — so all three resolve through one body parser here.
 
+use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 use crate::stack_format;
 
@@ -110,7 +111,7 @@ impl<'a> Parser<'a> {
         Err(ParseError {
             at: self.peek_at,
             message: stack_format!(96, "window \"{}\" does not exist", name),
-            sqlstate: "42704",
+            sqlstate: sqlstate::UNDEFINED_OBJECT,
         })
     }
 
@@ -131,7 +132,7 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(96, "window \"{}\" is already defined", name),
-                    sqlstate: "42P20",
+                    sqlstate: sqlstate::WINDOWING_ERROR,
                 });
             }
             if self.n_windows == MAX_WINDOW_DEFS {
@@ -215,21 +216,21 @@ impl<'a> Parser<'a> {
             };
             // PostgreSQL's frame-shape validation (42P20).
             if matches!(start, FrameBound::UnboundedFollowing) {
-                return Err(ParseError { sqlstate: "42P20", ..self.err_here("frame start cannot be UNBOUNDED FOLLOWING") });
+                return Err(ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame start cannot be UNBOUNDED FOLLOWING") });
             }
             if matches!(end, FrameBound::UnboundedPreceding) {
-                return Err(ParseError { sqlstate: "42P20", ..self.err_here("frame end cannot be UNBOUNDED PRECEDING") });
+                return Err(ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame end cannot be UNBOUNDED PRECEDING") });
             }
             if matches!(start, FrameBound::CurrentRow) && matches!(end, FrameBound::Preceding(_)) {
                 return Err(
-                    ParseError { sqlstate: "42P20", ..self.err_here("frame starting from current row cannot have preceding rows") }
+                    ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame starting from current row cannot have preceding rows") }
                 );
             }
             if matches!(start, FrameBound::Following(_))
                 && matches!(end, FrameBound::Preceding(_) | FrameBound::CurrentRow)
             {
                 return Err(
-                    ParseError { sqlstate: "42P20", ..self.err_here("frame starting from following row cannot have preceding rows") }
+                    ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame starting from following row cannot have preceding rows") }
                 );
             }
             let exclusion = if self.eat_ident("exclude")? {
@@ -265,21 +266,21 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "cannot override PARTITION BY clause of window \"{}\"", name),
-                sqlstate: "42P20",
+                sqlstate: sqlstate::WINDOWING_ERROR,
             });
         }
         if !base.order_by.is_empty() && !order_by.is_empty() {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "cannot override ORDER BY clause of window \"{}\"", name),
-                sqlstate: "42P20",
+                sqlstate: sqlstate::WINDOWING_ERROR,
             });
         }
         if base.frame.is_some() {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(96, "cannot copy window \"{}\" because it has a frame clause", name),
-                sqlstate: "42P20",
+                sqlstate: sqlstate::WINDOWING_ERROR,
             });
         }
         Ok(WindowSpec {

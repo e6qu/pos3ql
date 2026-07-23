@@ -8,6 +8,7 @@
 //! bound comparison (including numeric) works directly on the text with no
 //! post-startup heap, so the ordering/containment operators need no arena.
 
+use crate::sql::eval::sqlstate;
 use core::cmp::Ordering;
 use core::fmt::Write as _;
 
@@ -32,14 +33,14 @@ pub struct Parsed<'a> {
 /// discrete increment that makes an inclusive upper bound exclusive — exceeds
 /// the element type, as distinct from a bad input value.
 fn int_overflow(target: &str) -> SqlError {
-    sql_err!("22003", "{} out of range", target)
+    sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", target)
 }
 
 /// A range literal that does not have the shape of a range — missing a bracket,
 /// the wrong number of comma-separated parts. PostgreSQL names neither the range
 /// type nor the element here, only that the literal is malformed.
 fn bad_literal(input: &str) -> SqlError {
-    sql_err!("22P02", "malformed range literal: \"{}\"", input)
+    sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "malformed range literal: \"{}\"", input)
 }
 
 /// A bound that is well-placed but is not a value of the element type. This is
@@ -49,7 +50,7 @@ fn bad_literal(input: &str) -> SqlError {
 /// raise their own equivalent from `parse_date` / `parse_timestamp`.
 fn bad_element(kind: RangeKind, value: &str) -> SqlError {
     sql_err!(
-        "22P02",
+        sqlstate::INVALID_TEXT_REPRESENTATION,
         "invalid input syntax for type {}: \"{}\"",
         kind.elem_type().name(),
         value
@@ -180,7 +181,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
         && cmp_elem(lower_text, upper_text, kind)? == Ordering::Greater
     {
         return Err(sql_err!(
-            "22000",
+            sqlstate::DATA_EXCEPTION,
             "range lower bound must be less than or equal to range upper bound"
         ));
     }
@@ -262,7 +263,7 @@ pub fn construct<'a>(
     let f = flags.unwrap_or("[)");
     let fb = f.as_bytes();
     if fb.len() != 2 {
-        return Err(sql_err!("22P02", "invalid range bound flags: \"{}\"", f));
+        return Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid range bound flags: \"{}\"", f));
     }
     let lower_inc = fb[0] == b'[';
     let upper_inc = fb[1] == b']';
@@ -285,7 +286,7 @@ fn elem_text<'a>(d: Datum, kind: RangeKind, arena: &'a Arena) -> Result<Option<&
 }
 
 fn alloc<'a>(arena: &'a Arena, s: &str) -> Result<&'a str, SqlError> {
-    arena.alloc_str(s).map_err(|_| sql_err!("53200", "out of memory"))
+    arena.alloc_str(s).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// Increments a discrete bound value by one (int/date) into `buffer`.
@@ -624,7 +625,7 @@ pub fn union<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<
         return canonical(&parsed_a, kind, arena);
     }
     if !overlaps(a, b, kind)? && !adjacent(a, b, kind)? {
-        return Err(sql_err!("22000", "result of range union would not be contiguous"));
+        return Err(sql_err!(sqlstate::DATA_EXCEPTION, "result of range union would not be contiguous"));
     }
     let (lower_text, lo_inc) = pick_lower(&parsed_a, &parsed_b, kind, false)?;
     let (upper_text, hi_inc) = pick_upper(&parsed_a, &parsed_b, kind, false)?;
@@ -663,7 +664,7 @@ pub fn difference<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Re
         // `b` trims the right: keep `[a.lower, b.lower)` (inclusivity flipped).
         (false, true) => canonical(&mk(parsed_a.lower, parsed_a.lower_inc, parsed_b.lower, !parsed_b.lower_inc), kind, arena),
         (false, false) => {
-            Err(sql_err!("22000", "result of range difference would not be contiguous"))
+            Err(sql_err!(sqlstate::DATA_EXCEPTION, "result of range difference would not be contiguous"))
         }
     }
 }
@@ -709,7 +710,7 @@ pub const MAX_MULTIRANGE: usize = 64;
 /// texts (no canonicalization; input is assumed already canonical). Commas
 /// inside a component's brackets are not separators. Returns the count.
 fn split_components<'a>(text: &'a str, out: &mut [&'a str; MAX_MULTIRANGE]) -> Result<usize, SqlError> {
-    let bad = || sql_err!("22P02", "malformed multirange literal: \"{}\"", text);
+    let bad = || sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "malformed multirange literal: \"{}\"", text);
     let inner = text
         .trim()
         .strip_prefix('{')
@@ -725,7 +726,7 @@ fn split_components<'a>(text: &'a str, out: &mut [&'a str; MAX_MULTIRANGE]) -> R
     let mut n = 0usize;
     let mut push = |seg: &'a str, n: &mut usize| -> Result<(), SqlError> {
         if *n == MAX_MULTIRANGE {
-            return Err(sql_err!("54000", "multirange has too many component ranges"));
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
         }
         out[*n] = seg.trim();
         *n += 1;
@@ -794,7 +795,7 @@ fn render_multirange<'a>(ranges: &[&str], arena: &'a Arena) -> Result<&'a str, S
     }
     let _ = buf.write_char('}');
     if buf.is_truncated() {
-        return Err(sql_err!("54000", "multirange value too large"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange value too large"));
     }
     alloc(arena, buf.as_str())
 }
@@ -864,7 +865,7 @@ pub fn multirange_union<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: &'a 
     let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
     let nb = split_components(b, &mut cb)?;
     if na + nb > MAX_MULTIRANGE * 2 {
-        return Err(sql_err!("54000", "multirange has too many component ranges"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
     }
     comps[..na].copy_from_slice(&ca[..na]);
     comps[na..na + nb].copy_from_slice(&cb[..nb]);
@@ -884,7 +885,7 @@ pub fn multirange_intersect<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: 
             let x = intersect(ai, bj, kind, arena)?;
             if x != "empty" {
                 if n == MAX_MULTIRANGE {
-                    return Err(sql_err!("54000", "multirange has too many component ranges"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
                 }
                 out[n] = x;
                 n += 1;
@@ -938,7 +939,7 @@ pub fn multirange_difference<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena:
         let mut nn = 0usize;
         let mut push = |s: &'a str, nn: &mut usize| -> Result<(), SqlError> {
             if *nn == MAX_MULTIRANGE * 2 {
-                return Err(sql_err!("54000", "multirange has too many component ranges"));
+                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
             }
             next[*nn] = s;
             *nn += 1;

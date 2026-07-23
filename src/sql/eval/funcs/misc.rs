@@ -49,7 +49,7 @@ pub(crate) fn dispatch<'a>(
             // f1, f2, ... as PostgreSQL does for an anonymous record.
             "row" => {
                 if args.len() > parser::MAX_LIST {
-                    return Err(sql_err!("54000", "too many fields in ROW()"));
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many fields in ROW()"));
                 }
                 let mut fields = [RecordField {
                     name: "",
@@ -121,7 +121,7 @@ pub(crate) fn dispatch<'a>(
                     }
                     i += 1;
                     let Some(&spec) = bytes.get(i) else {
-                        return Err(sql_err!("22023", "unterminated format specifier"));
+                        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "unterminated format specifier"));
                     };
                     i += 1;
                     if spec == b'%' {
@@ -129,7 +129,7 @@ pub(crate) fn dispatch<'a>(
                         continue;
                     }
                     if argi >= args.len() {
-                        return Err(sql_err!("22023", "too few arguments for format()"));
+                        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "too few arguments for format()"));
                     }
                     let v = eval_full(args[argi], arena, params, row, hooks)?;
                     argi += 1;
@@ -139,7 +139,7 @@ pub(crate) fn dispatch<'a>(
                         b'L' => format_append_literal(&mut out, v, arena)?,
                         other => {
                             return Err(sql_err!(
-                                "22023",
+                                sqlstate::INVALID_PARAMETER_VALUE,
                                 "unrecognized format() type specifier \"{}\"",
                                 other as char
                             ))

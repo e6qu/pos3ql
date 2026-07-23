@@ -248,7 +248,7 @@ fn agg_f64(d: &Datum) -> Option<f64> {
 impl<'a> AggState<'a> {
     pub(crate) fn init(&mut self, node: &'a Expr<'a>) -> Result<(), SqlError> {
         let Expr::Call { name, star, distinct, order_by, args, .. } = node else {
-            return Err(sql_err!("42803", "not an aggregate"));
+            return Err(sql_err!(sqlstate::GROUPING_ERROR, "not an aggregate"));
         };
         self.kind = match *name {
             "count" => AggKind::Count,
@@ -317,7 +317,7 @@ impl<'a> AggState<'a> {
                     order_by.len() == 1 && args.first().is_some_and(|a| **a == *order_by[0].expression);
                 if !sorts_by_argument {
                     return Err(sql_err!(
-                        "42P10",
+                        sqlstate::INVALID_COLUMN_REFERENCE,
                         "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
                     ));
                 }
@@ -361,7 +361,7 @@ impl<'a> AggState<'a> {
             }
             let key = eval_full(args[0], arena, params, row, hooks)?;
             if key.is_null() {
-                return Err(sql_err!("22004", "field name must not be null"));
+                return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "field name must not be null"));
             }
             let value = eval_full(args[1], arena, params, row, hooks)?;
             let tuple = [key, value];
@@ -410,7 +410,7 @@ impl<'a> AggState<'a> {
                 unreachable!("validated in init");
             };
             let Some(item) = order_by.first() else {
-                return Err(sql_err!("42809", "an ordered-set aggregate requires WITHIN GROUP"));
+                return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "an ordered-set aggregate requires WITHIN GROUP"));
             };
             if matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc)
                 && let Some(fraction) = args.first()
@@ -420,7 +420,7 @@ impl<'a> AggState<'a> {
                     Datum::Numeric(n) => n.to_f64(),
                     Datum::Int4(v) => f64::from(v),
                     Datum::Int8(v) => v as f64,
-                    _ => return Err(sql_err!("2202E", "percentile value must be numeric")),
+                    _ => return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "percentile value must be numeric")),
                 };
             }
             let value = eval_full(item.expression, arena, params, row, hooks)?;
@@ -449,7 +449,7 @@ impl<'a> AggState<'a> {
             return Ok(());
         }
         let Some(arg) = args.first() else {
-            return Err(sql_err!("42803", "aggregate requires an argument"));
+            return Err(sql_err!(sqlstate::GROUPING_ERROR, "aggregate requires an argument"));
         };
         let v = eval_full(arg, arena, params, row, hooks)?;
         if v.is_null() {

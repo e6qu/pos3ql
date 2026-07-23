@@ -13,6 +13,7 @@
 
 pub(crate) mod crc32c;
 
+use crate::sql::eval::sqlstate;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -268,7 +269,7 @@ impl Wal {
         let total = HEADER_LEN + payload_len;
         if self.buffer.capacity() - self.buffer.len() < total {
             return Err(sql_err!(
-                "54000",
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction exceeds wal_buffer_bytes ({}); raise it or commit in smaller batches",
                 self.buffer.capacity()
             ));

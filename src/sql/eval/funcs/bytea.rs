@@ -116,7 +116,7 @@ pub(crate) fn dispatch<'a>(
                         "base64" => crate::sql::encoding::base64_encode(bytes, arena)?,
                         "hex" => crate::sql::encoding::hex_encode(bytes, arena)?,
                         "escape" => crate::sql::encoding::escape_encode(bytes, arena)?,
-                        _ => return Err(sql_err!("22023", "unrecognized encoding: \"{}\"", format)),
+                        _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "unrecognized encoding: \"{}\"", format)),
                     };
                     Ok(Datum::Text(text))
                 } else {
@@ -127,7 +127,7 @@ pub(crate) fn dispatch<'a>(
                         "base64" => crate::sql::encoding::base64_decode(text, arena)?,
                         "hex" => crate::sql::encoding::hex_decode(text, arena)?,
                         "escape" => crate::sql::encoding::escape_decode(text, arena)?,
-                        _ => return Err(sql_err!("22023", "unrecognized encoding: \"{}\"", format)),
+                        _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "unrecognized encoding: \"{}\"", format)),
                     };
                     Ok(Datum::Bytea(bytes))
                 }
@@ -157,7 +157,7 @@ pub(crate) fn dispatch<'a>(
                         return Ok(Datum::Null);
                     };
                     let s = core::str::from_utf8(bytes)
-                        .map_err(|_| sql_err!("22021", "invalid byte sequence for encoding UTF8"))?;
+                        .map_err(|_| sql_err!(sqlstate::CHARACTER_NOT_IN_REPERTOIRE, "invalid byte sequence for encoding UTF8"))?;
                     Ok(Datum::Text(s))
                 }
             }
@@ -171,7 +171,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if index < 0 || index as usize >= bytes.len() {
-                    return Err(sql_err!("2202E", "index {} out of valid range, 0..{}", index, bytes.len()));
+                    return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "index {} out of valid range, 0..{}", index, bytes.len()));
                 }
                 if name == "get_byte" {
                     return Ok(Datum::Int4(bytes[index as usize] as i32));
@@ -194,7 +194,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if bit < 0 || (bit as usize) >= bytes.len() * 8 {
-                    return Err(sql_err!("2202E", "index {} out of valid range, 0..{}", bit, bytes.len() * 8 - 1));
+                    return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "index {} out of valid range, 0..{}", bit, bytes.len() * 8 - 1));
                 }
                 let byte_index = bit as usize / 8;
                 let bit_index = bit as usize % 8;

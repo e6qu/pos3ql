@@ -36,7 +36,7 @@ pub(super) fn build_def(name: &str, columns: &[ColumnDef], arena: &Arena) -> Res
     for (i, c) in columns.iter().enumerate() {
         if columns[..i].iter().any(|prev| prev.name == c.name) {
             return Err(sql_err!(
-                "42701",
+                sqlstate::DUPLICATE_COLUMN,
                 "column \"{}\" specified more than once",
                 c.name
             ));
@@ -142,7 +142,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError
     match expression {
         Expr::WholeRow(t) => {
             return Err(sql_err!(
-                "0A000",
+                sqlstate::FEATURE_NOT_SUPPORTED,
                 "whole-row reference to \"{}\" is not supported in CHECK",
                 t
             ))

@@ -138,20 +138,20 @@ impl<'d> QueryScope<'d> {
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
-                "42712",
+                sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
                 exposed
             ));
         }
         let ncols = m.column_names.len();
         if ncols > MAX_COLUMNS {
-            return Err(sql_err!("54011", "too many columns"));
+            return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
         }
         if let Some(aliases) = tref.col_alias
             && aliases.len() > ncols
         {
             return Err(sql_err!(
-                "42P10",
+                sqlstate::INVALID_COLUMN_REFERENCE,
                 "table \"{}\" has {} columns available but {} columns specified",
                 exposed,
                 ncols,
@@ -210,7 +210,7 @@ impl<'d> QueryScope<'d> {
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
-                "42712",
+                sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
                 exposed
             ));
@@ -297,7 +297,7 @@ impl<'d> QueryScope<'d> {
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
-                "42712",
+                sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
                 exposed
             ));
@@ -331,7 +331,7 @@ impl<'d> QueryScope<'d> {
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
-                "42712",
+                sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
                 exposed
             ));
@@ -373,7 +373,7 @@ impl<'d> QueryScope<'d> {
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
-                "42712",
+                sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
                 exposed
             ));
@@ -424,7 +424,7 @@ impl<'d> QueryScope<'d> {
         let exposed = alias.unwrap_or(def.name.as_str());
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
-                "42712",
+                sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
                 exposed
             ));

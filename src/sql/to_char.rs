@@ -9,6 +9,7 @@
 //! `src/backend/utils/adt/formatting.c`), and every rendering rule here was
 //! pinned empirically against PostgreSQL 18.4.
 
+use crate::sql::eval::sqlstate;
 use super::eval::SqlError;
 use super::numeric::{Numeric, RoundMode};
 use crate::mem::arena::Arena;
@@ -100,7 +101,7 @@ pub fn number<'a>(
     let mut i = 0usize;
     let push = |toks: &mut [Tok; MAX_TOKS], ntok: &mut usize, t: Tok| -> Result<(), SqlError> {
         if *ntok >= MAX_TOKS {
-            return Err(sql_err!("22023", "to_char format too long"));
+            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char format too long"));
         }
         toks[*ntok] = t;
         *ntok += 1;
@@ -120,7 +121,7 @@ pub fn number<'a>(
         let is_action = matches!(up, b'9' | b'0' | b'.' | b'D' | b',' | b'G' | b'L' | b'$' | b'S' | b'V')
             || matches!(&two, b"MI" | b"PL" | b"SG" | b"PR" | b"TH" | b"RN" | b"FM" | b"EE");
         if eeee && is_action {
-            return Err(sql_err!("42601", "\"EEEE\" must be the last pattern used"));
+            return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"EEEE\" must be the last pattern used"));
         }
         match &two {
             b"FM" => {
@@ -130,7 +131,7 @@ pub fn number<'a>(
             }
             b"MI" => {
                 if sign_seen {
-                    return Err(sql_err!("42601", "cannot use \"S\" and \"MI\" together"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" and \"MI\" together"));
                 }
                 minus = true;
                 push(&mut toks, &mut ntok, Tok::SignMinus)?;
@@ -139,7 +140,7 @@ pub fn number<'a>(
             }
             b"PL" => {
                 if sign_seen {
-                    return Err(sql_err!("42601", "cannot use \"S\" and \"PL\" together"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" and \"PL\" together"));
                 }
                 plus = true;
                 push(&mut toks, &mut ntok, Tok::SignPlus)?;
@@ -148,7 +149,7 @@ pub fn number<'a>(
             }
             b"SG" => {
                 if sign_seen {
-                    return Err(sql_err!("42601", "cannot use \"S\" and \"SG\" together"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" and \"SG\" together"));
                 }
                 minus = true;
                 plus = true;
@@ -159,7 +160,7 @@ pub fn number<'a>(
             b"PR" => {
                 if sign_seen || plus || minus {
                     return Err(sql_err!(
-                        "42601",
+                        sqlstate::SYNTAX_ERROR,
                         "cannot use \"PR\" and \"S\"/\"PL\"/\"MI\"/\"SG\" together"
                     ));
                 }
@@ -175,7 +176,7 @@ pub fn number<'a>(
             }
             b"RN" => {
                 if roman {
-                    return Err(sql_err!("42601", "cannot use \"RN\" twice"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"RN\" twice"));
                 }
                 roman = true;
                 roman_upper = bytes[i] == b'R';
@@ -188,15 +189,15 @@ pub fn number<'a>(
                     && bytes[i + 3].eq_ignore_ascii_case(&b'E');
                 if !four {
                     return Err(sql_err!(
-                        "0A000",
+                        sqlstate::FEATURE_NOT_SUPPORTED,
                         "to_char format code not supported: \"E\""
                     ));
                 }
                 if eeee {
-                    return Err(sql_err!("42601", "cannot use \"EEEE\" twice"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"EEEE\" twice"));
                 }
                 if fm || sign_seen || bracket || minus || plus || roman || multi > 0 || in_multi {
-                    return Err(sql_err!("42601", "\"EEEE\" is incompatible with other formats"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"EEEE\" is incompatible with other formats"));
                 }
                 eeee = true;
                 i += 4;
@@ -207,7 +208,7 @@ pub fn number<'a>(
         match up {
             b'9' => {
                 if bracket {
-                    return Err(sql_err!("42601", "\"9\" must be ahead of \"PR\""));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"9\" must be ahead of \"PR\""));
                 }
                 push(&mut toks, &mut ntok, Tok::Nine)?;
                 if in_multi {
@@ -222,7 +223,7 @@ pub fn number<'a>(
             }
             b'0' => {
                 if bracket {
-                    return Err(sql_err!("42601", "\"0\" must be ahead of \"PR\""));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"0\" must be ahead of \"PR\""));
                 }
                 push(&mut toks, &mut ntok, Tok::Zero)?;
                 if has_point && !in_multi {
@@ -236,11 +237,11 @@ pub fn number<'a>(
             }
             b'.' | b'D' => {
                 if has_point {
-                    return Err(sql_err!("42601", "multiple decimal points"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "multiple decimal points"));
                 }
                 if in_multi {
                     return Err(sql_err!(
-                        "42601",
+                        sqlstate::SYNTAX_ERROR,
                         "cannot use \"V\" and decimal point together"
                     ));
                 }
@@ -251,11 +252,11 @@ pub fn number<'a>(
             b'L' | b'$' => push(&mut toks, &mut ntok, Tok::Currency)?,
             b'S' => {
                 if sign_seen {
-                    return Err(sql_err!("42601", "cannot use \"S\" twice"));
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" twice"));
                 }
                 if plus || minus || bracket {
                     return Err(sql_err!(
-                        "42601",
+                        sqlstate::SYNTAX_ERROR,
                         "cannot use \"S\" and \"PL\"/\"MI\"/\"SG\"/\"PR\" together"
                     ));
                 }
@@ -266,7 +267,7 @@ pub fn number<'a>(
             b'V' => {
                 if has_point {
                     return Err(sql_err!(
-                        "42601",
+                        sqlstate::SYNTAX_ERROR,
                         "cannot use \"V\" and decimal point together"
                     ));
                 }
@@ -278,7 +279,7 @@ pub fn number<'a>(
             _ => {
                 if c.is_ascii_alphabetic() {
                     return Err(sql_err!(
-                        "0A000",
+                        sqlstate::FEATURE_NOT_SUPPORTED,
                         "to_char format code not supported: \"{}\"",
                         c as char
                     ));
@@ -292,7 +293,7 @@ pub fn number<'a>(
     // RN combines only with FM (plain digit positions carry no flag and are
     // ignored); anything else is an error, as in PostgreSQL.
     if roman && (sign_seen || plus || minus || bracket || multi > 0 || in_multi || eeee) {
-        return Err(sql_err!("42601", "\"RN\" is incompatible with other formats"));
+        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"RN\" is incompatible with other formats"));
     }
     if roman {
         return render_roman(value, float_source, roman_upper, fm, arena);
@@ -374,7 +375,7 @@ fn render_roman<'a>(
     let mut olen = 0usize;
     if !(1..=3999).contains(&n) {
         let filled = "###############";
-        return arena.alloc_str(filled).map_err(|_| sql_err!("53200", "out of memory"));
+        return arena.alloc_str(filled).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
     }
     const ONES: [&str; 10] = ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"];
     const TENS: [&str; 10] = ["", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"];
@@ -397,10 +398,10 @@ fn render_roman<'a>(
     }
     let roman = core::str::from_utf8(&body[..olen]).expect("ascii");
     if fm {
-        return arena.alloc_str(roman).map_err(|_| sql_err!("53200", "out of memory"));
+        return arena.alloc_str(roman).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
     }
     let padded = stack_format!(24, "{:>15}", roman);
-    arena.alloc_str(padded.as_str()).map_err(|_| sql_err!("53200", "out of memory"))
+    arena.alloc_str(padded.as_str()).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// `EEEE`: scientific notation `[sign]d.<frac>e±XX`. A float8 source rounds
@@ -428,7 +429,7 @@ fn render_eeee<'a>(
             out[dot] = b'.';
         }
         let text = core::str::from_utf8(&out[..n]).expect("ascii");
-        return arena.alloc_str(text).map_err(|_| sql_err!("53200", "out of memory"));
+        return arena.alloc_str(text).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
     }
     // Mantissa digits (1 + frac) and a base-10 exponent.
     let (neg, mantissa, exponent) = match float_source {
@@ -532,7 +533,7 @@ fn render_eeee<'a>(
         let _ = write!(out, "0");
     }
     let _ = write!(out, "{}", e);
-    arena.alloc_str(out.as_str()).map_err(|_| sql_err!("53200", "out of memory"))
+    arena.alloc_str(out.as_str()).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -732,7 +733,7 @@ fn render<'a>(
     let mut olen = 0usize;
     let emit = |out: &mut [u8; MAX_OUT], olen: &mut usize, ch: u8| -> Result<(), SqlError> {
         if *olen >= MAX_OUT {
-            return Err(sql_err!("22023", "to_char output too long"));
+            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char output too long"));
         }
         out[*olen] = ch;
         *olen += 1;
@@ -742,7 +743,7 @@ fn render<'a>(
         |out: &mut [u8; MAX_OUT], olen: &mut usize, s: &str| -> Result<(), SqlError> {
             for &b in s.as_bytes() {
                 if *olen >= MAX_OUT {
-                    return Err(sql_err!("22023", "to_char output too long"));
+                    return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char output too long"));
                 }
                 out[*olen] = b;
                 *olen += 1;
@@ -874,7 +875,7 @@ fn render<'a>(
     }
 
     let text = core::str::from_utf8(&out[..olen]).expect("ascii output");
-    arena.alloc_str(text).map_err(|_| sql_err!("53200", "out of memory"))
+    arena.alloc_str(text).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// Position (token index) of the decimal point, or `usize::MAX` if none.
@@ -927,7 +928,7 @@ fn render_nonfinite<'a>(
     let mut olen = 0usize;
     let emit = |out: &mut [u8; MAX_OUT], olen: &mut usize, ch: u8| -> Result<(), SqlError> {
         if *olen >= MAX_OUT {
-            return Err(sql_err!("22023", "to_char output too long"));
+            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char output too long"));
         }
         out[*olen] = ch;
         *olen += 1;
@@ -998,7 +999,7 @@ fn render_nonfinite<'a>(
         emit(&mut out, &mut olen, sc)?;
     }
     let text = core::str::from_utf8(&out[..olen]).expect("ascii output");
-    arena.alloc_str(text).map_err(|_| sql_err!("53200", "out of memory"))
+    arena.alloc_str(text).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// `to_number(text, fmt)`: parse a formatted number. The format determines the
@@ -1017,7 +1018,7 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
         if i + 1 < fb.len() {
             let two = [up, fb[i + 1].to_ascii_uppercase()];
             if &two == b"EE" {
-                return Err(sql_err!("0A000", "\"EEEE\" not supported for input"));
+                return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "\"EEEE\" not supported for input"));
             }
             if matches!(&two, b"FM" | b"MI" | b"PL" | b"SG" | b"PR" | b"TH") {
                 i += 2;
@@ -1031,8 +1032,8 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
                 }
             }
             b'.' | b'D' => seen_point = true,
-            b'V' => return Err(sql_err!("0A000", "\"V\" not supported for input")),
-            b'R' => return Err(sql_err!("0A000", "\"RN\" not supported for input")),
+            b'V' => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "\"V\" not supported for input")),
+            b'R' => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "\"RN\" not supported for input")),
             _ => {}
         }
         i += 1;
@@ -1050,7 +1051,7 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
         match c {
             b'0'..=b'9' => {
                 if k >= buffer.len() {
-                    return Err(sql_err!("22P02", "value too long for to_number"));
+                    return Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "value too long for to_number"));
                 }
                 buffer[k] = c;
                 k += 1;
@@ -1066,7 +1067,7 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
         }
     }
     if !digits {
-        return Err(sql_err!("22P02", "invalid input syntax for type numeric: \"{}\"", input));
+        return Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid input syntax for type numeric: \"{}\"", input));
     }
     if neg {
         buffer[0] = b'-';
@@ -1237,13 +1238,13 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
             num(&mut out, y % 10, 1, fm);
             i += 1;
         } else if rest[0].is_ascii_alphabetic() {
-            return Err(sql_err!("0A000", "to_char timestamp code not supported: \"{}\"", rest[0] as char));
+            return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "to_char timestamp code not supported: \"{}\"", rest[0] as char));
         } else {
             let _ = out.write_char(rest[0] as char);
             i += 1;
         }
     }
-    arena.alloc_str(out.as_str()).map_err(|_| sql_err!("53200", "out of memory"))
+    arena.alloc_str(out.as_str()).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 #[cfg(test)]

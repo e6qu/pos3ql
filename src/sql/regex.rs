@@ -11,6 +11,7 @@
 //! The matcher is a bounded backtracking recursion in continuation-passing
 //! style (no allocation); a step budget guards against pathological blow-up.
 
+use crate::sql::eval::sqlstate;
 use core::cell::Cell;
 
 use super::eval::SqlError;
@@ -178,7 +179,7 @@ pub fn find_captures(
     let mut starts = [0usize; MAX_GROUPS];
     let ng = group_starts(pat, &mut starts);
     if ng > MAX_GROUPS {
-        return Err(sql_err!("54000", "too many capture groups in regular expression"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many capture groups in regular expression"));
     }
     // Locate the leftmost-longest whole match first (POSIX semantics).
     let Some((mstart, mend)) = find(pattern, text, from, case_insensitive)? else {
@@ -225,14 +226,14 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
                     i += 1;
                 }
                 if i >= bytes.len() {
-                    return Err(sql_err!("2201B", "invalid regular expression: unbalanced ["));
+                    return Err(sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: unbalanced ["));
                 }
             }
             b'(' => depth += 1,
             b')' => {
                 depth -= 1;
                 if depth < 0 {
-                    return Err(sql_err!("2201B", "invalid regular expression: unbalanced ("));
+                    return Err(sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: unbalanced ("));
                 }
             }
             b'{' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => {
@@ -247,7 +248,7 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
         i += 1;
     }
     if depth != 0 {
-        return Err(sql_err!("2201B", "invalid regular expression: unbalanced ("));
+        return Err(sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: unbalanced ("));
     }
     Ok(())
 }
@@ -255,7 +256,7 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
 fn step(budget: &Cell<u32>) -> Result<(), SqlError> {
     let b = budget.get();
     if b == 0 {
-        return Err(sql_err!("54000", "regular expression is too complex"));
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "regular expression is too complex"));
     }
     budget.set(b - 1);
     Ok(())
@@ -514,7 +515,7 @@ fn parse_quant(pat: &str) -> Result<(Option<Quant>, &str), SqlError> {
 /// `(min, max, bytes_used)`. Bounds are validated exactly as PostgreSQL does:
 /// integers, `m <= n`, both at most 255.
 fn parse_bound(pat: &str) -> Result<(u32, u32, usize), SqlError> {
-    let bad = || sql_err!("2201B", "invalid regular expression: invalid repetition count(s)");
+    let bad = || sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: invalid repetition count(s)");
     let b = pat.as_bytes();
     let mut i = 1;
     let read_int = |i: &mut usize| -> Option<u32> {

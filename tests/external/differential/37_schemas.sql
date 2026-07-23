@@ -178,4 +178,6 @@ DROP SCHEMA s1, sb, sc, txs CASCADE;
 DROP SCHEMA IF EXISTS sd CASCADE;
 DROP TABLE public.t, public.taken;
 DROP SCHEMA pg_reserved_test;
-SELECT count(*) FROM pg_tables WHERE schemaname = 'public';
+-- Only this corpus's own objects: the harness may run other suites against
+-- either engine first, so a whole-schema count would not be hermetic.
+SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('t', 'taken', 'd1', 'mv', 'vt', 't2', 'cat_first');

@@ -205,6 +205,19 @@ from the bucket), so a torn disk-cache write is a miss, never data loss. **Miles
 a dataset whose hot set fits RAM but whose whole set does not is served mostly from
 cache; the config knobs finally do something; hit ratio is visible.
 
+**RAM tier started.** `store/cache.rs` wraps any `BlockStore` in a fixed set of
+frames, drawn from the budget at startup, with CLOCK eviction — one referenced
+bit per frame and a hand that clears bits until it meets one untouched since the
+last pass. It approximates LRU closely enough here and costs a bit and a pointer,
+where true LRU costs a list maintained on every hit. Writes go *through*: the
+store decides first and the cache only remembers what the store accepted, so a
+block the store rejected is never served. Frames hold payloads rather than framed
+blocks, since the block was verified on the way in. `hits`/`misses`/`evictions`/
+`insertions` are counted and readable, because a cache whose hit ratio cannot be
+seen is one nobody can size. Remaining for Stage B: the local disk tier beneath
+this, and reading `block_cache_bytes` / `disk_cache_bytes` from config to size
+both.
+
 ### Stage C — a real SST: sorted data blocks + sparse index + bloom filter
 
 Replace the whole-table SST with a **block-granular** SST so a read fetches only the

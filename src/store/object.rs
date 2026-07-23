@@ -61,6 +61,89 @@ fn store_error(e: S3Error) -> StoreError {
     }
 }
 
+fn put_block(
+    client: &mut S3Client,
+    prefix: &str,
+    scratch: &mut [u8],
+    payload: &[u8],
+    block_type: BlockType,
+    lsn: u64,
+) -> Result<BlockId, StoreError> {
+    let (id, n) = encode(payload, block_type, lsn, scratch)?;
+    let mut key_buffer = [0u8; 128];
+    let key = key_of(prefix, &id, &mut key_buffer);
+    // No precondition: the key is the content, so writing a block that is
+    // already there writes the same bytes. Conditional-create would turn a
+    // harmless retry into an error the caller would have to interpret.
+    client.put(key, &scratch[..n], Precondition::None).map_err(store_error)?;
+    Ok(id)
+}
+
+fn get_block(
+    client: &mut S3Client,
+    prefix: &str,
+    id: &BlockId,
+    into: &mut [u8],
+) -> Result<usize, StoreError> {
+    let mut key_buffer = [0u8; 128];
+    let key = key_of(prefix, id, &mut key_buffer);
+    let result = client.get(key, None).map_err(store_error)?;
+    let body = &client.body_bytes()[..result.len];
+    // Verified against the name it was fetched under, not merely against
+    // its own header — a bucket handing back a different intact block is
+    // exactly what content-addressing is here to catch.
+    let block = decode(body, true)?;
+    if block.id != *id {
+        return Err(StoreError::Corrupt(super::BlockError::IdentityMismatch));
+    }
+    if into.len() < block.payload.len() {
+        return Err(StoreError::BufferTooSmall);
+    }
+    into[..block.payload.len()].copy_from_slice(block.payload);
+    Ok(block.payload.len())
+}
+
+/// The bucket store that owns its client and scratch — the long-lived form a
+/// cache stack sits over, where a borrowed client would tangle lifetimes.
+pub(crate) struct OwnedObjectStore {
+    client: S3Client,
+    prefix: &'static str,
+    scratch: Vec<u8>,
+}
+
+impl OwnedObjectStore {
+    /// Startup-only: the scratch Vec is reserved once, before the allocator
+    /// freezes, and never grows.
+    pub(crate) fn new(client: S3Client, prefix: &'static str) -> Self {
+        Self { client, prefix, scratch: vec![0u8; super::BLOCK_SIZE] }
+    }
+}
+
+impl BlockStore for OwnedObjectStore {
+    fn put(
+        &mut self,
+        payload: &[u8],
+        block_type: BlockType,
+        lsn: u64,
+    ) -> Result<BlockId, StoreError> {
+        put_block(&mut self.client, self.prefix, &mut self.scratch, payload, block_type, lsn)
+    }
+
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError> {
+        get_block(&mut self.client, self.prefix, id, into)
+    }
+
+    fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
+        let mut key_buffer = [0u8; 128];
+        let key = key_of(self.prefix, id, &mut key_buffer);
+        match self.client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
+            Ok(_) => Ok(true),
+            Err(S3Error::Status { code: 404, .. }) => Ok(false),
+            Err(e) => Err(store_error(e)),
+        }
+    }
+}
+
 impl BlockStore for ObjectBlockStore<'_> {
     fn put(
         &mut self,
@@ -68,35 +151,11 @@ impl BlockStore for ObjectBlockStore<'_> {
         block_type: BlockType,
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
-        let (id, n) = encode(payload, block_type, lsn, self.scratch)?;
-        let mut key_buffer = [0u8; 128];
-        let key = key_of(self.prefix, &id, &mut key_buffer);
-        // No precondition: the key is the content, so writing a block that is
-        // already there writes the same bytes. Conditional-create would turn a
-        // harmless retry into an error the caller would have to interpret.
-        self.client
-            .put(key, &self.scratch[..n], Precondition::None)
-            .map_err(store_error)?;
-        Ok(id)
+        put_block(self.client, self.prefix, self.scratch, payload, block_type, lsn)
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError> {
-        let mut key_buffer = [0u8; 128];
-        let key = key_of(self.prefix, id, &mut key_buffer);
-        let result = self.client.get(key, None).map_err(store_error)?;
-        let body = &self.client.body_bytes()[..result.len];
-        // Verified against the name it was fetched under, not merely against
-        // its own header — a bucket handing back a different intact block is
-        // exactly what content-addressing is here to catch.
-        let block = decode(body, true)?;
-        if block.id != *id {
-            return Err(StoreError::Corrupt(super::BlockError::IdentityMismatch));
-        }
-        if into.len() < block.payload.len() {
-            return Err(StoreError::BufferTooSmall);
-        }
-        into[..block.payload.len()].copy_from_slice(block.payload);
-        Ok(block.payload.len())
+        get_block(self.client, self.prefix, id, into)
     }
 
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {

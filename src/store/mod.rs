@@ -18,11 +18,14 @@
 //! decoding borrows from one, so a block lives in whatever pool its owner
 //! reserved at startup.
 
-// Reached by this module's own tests and by the stages that build on it — the
-// tiered cache, the SST writer, the manifest log — but not yet by the running
-// server, so a --lib build sees it as dead while a --tests build does not.
-// `allow` rather than `expect` for that reason, as `prng` has it: an `expect`
-// here would be unfulfilled in the test build and fail it.
+
+// The checkpoint and cold-start paths now run through this module (the SST
+// writer, the range-scan reader, the tiered stack over the object store);
+// what a --lib build still sees as dead is the part the next stages reach —
+// the point-lookup path (`SstReader::get`, the bloom check, `contains`), the
+// cache/disk stats counters, and the memory/borrowed-object stores the tests
+// and the simulator drive. `allow` rather than `expect`, as `prng` has it: an
+// `expect` would be unfulfilled in the --tests build and fail it.
 #![allow(dead_code)]
 
 mod bloom;
@@ -32,6 +35,10 @@ mod memory;
 mod object;
 mod sst;
 mod tiered;
+
+pub(crate) use object::OwnedObjectStore;
+pub(crate) use sst::{SstError, SstHandle, SstReader, SstWriter};
+pub(crate) use tiered::{build as build_tiers, StackPlan, TieredStore};
 
 use crate::wal::crc32c::crc32c;
 
@@ -63,6 +70,10 @@ pub(crate) enum BlockType {
     ManifestLog = 4,
     /// A WAL segment shipped to the bucket.
     WalSegment = 5,
+    /// An SST's complete block roster (every identity the SST comprises,
+    /// itself included last as the index/filter are known by then) — what
+    /// garbage collection walks instead of the data blocks themselves.
+    SstRoster = 6,
 }
 
 impl BlockType {
@@ -73,6 +84,7 @@ impl BlockType {
             3 => BlockType::SstFilter,
             4 => BlockType::ManifestLog,
             5 => BlockType::WalSegment,
+            6 => BlockType::SstRoster,
             _ => return None,
         })
     }

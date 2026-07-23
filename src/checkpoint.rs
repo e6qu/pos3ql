@@ -1,29 +1,38 @@
 //! Checkpointing: the durable home of the database is the bucket.
 //!
-//! A checkpoint snapshots every live table into an SST object
-//! (`sst/<lsn>/<slot>.sst`), then publishes a `manifest` object naming them
+//! A checkpoint writes every live table as a block-granular SST — sorted
+//! data blocks, a sparse index, a bloom filter and a roster, all
+//! content-addressed objects under `blocks/` — through the tiered cache
+//! stack (`block_cache_bytes` RAM frames over a `disk_cache_bytes` slot
+//! file), then publishes a `manifest` object naming each SST's root blocks
 //! via compare-and-swap (`If-Match` on the previous ETag, `If-None-Match: *`
-//! for the first). After the manifest lands, superseded SSTs are deleted,
-//! the WAL restarts, and the row heap is compacted. A node with an empty
-//! disk cold-starts by loading the manifest, rehydrating SSTs, and
-//! replaying whatever WAL tail is newer than the manifest's LSN.
+//! for the first). After the manifest lands, unreferenced blocks are swept
+//! (each SST enumerable by its one roster block), the WAL restarts, and the
+//! row heap is compacted. A node with an empty disk cold-starts by loading
+//! the manifest, scanning each SST block-wise through the same cache, and
+//! replaying whatever WAL tail is newer than the manifest's LSN. Manifests
+//! from before the block grid (whole-object `sst/` entries) still load; the
+//! next checkpoint rewrites them as block SSTs and sweeps the old objects.
 //!
 //! CAS on the manifest means a second writer pointed at the same bucket
 //! fails loudly instead of corrupting anything.
 
-use std::io::Write as IoWrite;
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
-use crate::s3::sha256::{HexDigest, Sha256};
 use crate::s3::{Precondition, S3Client, S3Error};
 use crate::sql::eval::{sqlstate, SqlError};
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
+use crate::mem::arena::Arena;
 use crate::storage::{ColumnMeta, OwnedDatum, RowLoc, SqlName, Storage, TableDef, MAX_COLUMNS};
+use crate::store::{
+    BlockId, BlockStore, OwnedObjectStore, SstHandle, SstReader, SstWriter, StackPlan,
+    TieredStore,
+};
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
 
@@ -42,19 +51,30 @@ const SQLSTATE_CAS: &str = "40001";
 /// A prior checkpoint's SST reference for one table slot.
 #[derive(Clone, Copy)]
 struct PrevSst {
-    key: StackStr<64>,
+    handle: SstHandle,
     count: u64,
-    bytes: u64,
     crc: u32,
 }
 
 pub(crate) struct Checkpointer {
     client: S3Client,
+    /// The block-grid path to the bucket: RAM frames over a disk slot file
+    /// over content-addressed block objects — `block_cache_bytes` and
+    /// `disk_cache_bytes` finally sized to something. SST reads and writes go
+    /// through here; writes populate the tiers on the way out, so a cold
+    /// start warms what a later read wants.
+    blocks: TieredStore<OwnedObjectStore>,
+    /// Scratch for SST writers and readers, reset per table.
+    sst_arena: Arena,
+    /// Rosters of the SSTs the current manifest references (GC keep-set
+    /// source) and their sweep scratch.
+    roster_scratch: Vec<BlockId>,
+    doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
     manifest_etag: Option<StackStr<80>>,
     manifest_lsn: u64,
     /// Per-slot SST from the last published manifest; clean tables reuse
-    /// these keys (delta checkpoints). Capacity is reserved at startup so
+    /// these handles (delta checkpoints). Capacity is reserved at startup so
     /// the post-freeze checkpoint path never allocates.
     prev_ssts: Vec<Option<PrevSst>>,
     /// Keys referenced by the manifest just published (GC keep-set).
@@ -72,10 +92,21 @@ pub(crate) struct Checkpointer {
 /// the remainder to the next checkpoint.
 const MAX_CKPT_TABLES: usize = 1024;
 const MAX_SWEEP_KEYS: usize = 4096;
+/// Block identities the GC keep-set can hold across every live SST.
+const MAX_KEEP_BLOCKS: usize = 64 * 1024;
+/// Scratch for one SST writer or reader: the writer's pending block, index and
+/// filter, or the reader's index/data/assembly blocks — reset per table.
+const SST_ARENA_BYTES: usize = 8 * 1024 * 1024;
 
 impl Checkpointer {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
-        S3Client::budget_bytes(config) + MANIFEST_BUF_BYTES
+        // Two clients: one for manifest/WAL objects, one inside the block
+        // stack. The cache tiers draw their own budget in the constructor;
+        // this accounts the fixed parts.
+        2 * S3Client::budget_bytes(config)
+            + MANIFEST_BUF_BYTES
+            + crate::store::BLOCK_SIZE
+            + SST_ARENA_BYTES
     }
 
     /// Fails when S3 is enabled but credentials are missing — explicitly,
@@ -92,9 +123,31 @@ impl Checkpointer {
                 CheckpointSetupError::Credentials("s3_secret_key / AWS_SECRET_ACCESS_KEY")
             })?;
         }
+        let block_client = S3Client::new(&config, budget)
+            .map_err(|e| CheckpointSetupError::S3(e.to_string()))?;
+        let base = OwnedObjectStore::new(block_client, "blocks/");
+        let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
+        if plan.undersized_ram() || plan.undersized_disk() {
+            return Err(CheckpointSetupError::S3(
+                "block_cache_bytes / disk_cache_bytes smaller than one block; set 0 to disable a tier"
+                    .to_string(),
+            ));
+        }
+        // The WAL creates the data directory later in startup; the disk
+        // cache's slot file needs it now.
+        std::fs::create_dir_all(&config.data_dir)
+            .map_err(|e| CheckpointSetupError::S3(format!("create data_dir: {e}")))?;
+        let cache_dir = std::path::Path::new(&config.data_dir);
+        let blocks = crate::store::build_tiers(budget, base, plan, cache_dir)
+            .map_err(|e| CheckpointSetupError::S3(format!("block cache stack: {e:?}")))?;
         Ok(Self {
             client: S3Client::new(&config, budget)
                 .map_err(|e| CheckpointSetupError::S3(e.to_string()))?,
+            blocks,
+            sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
+                .map_err(CheckpointSetupError::Budget)?,
+            roster_scratch: Vec::with_capacity(MAX_KEEP_BLOCKS),
+            doomed_blocks: Vec::with_capacity(MAX_SWEEP_KEYS),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", MANIFEST_BUF_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
             manifest_etag: None,
@@ -225,6 +278,8 @@ impl Checkpointer {
         let mut pending_def: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])> =
             None;
         let mut ssts: Vec<(String, usize, u64, u64, u32)> = Vec::new();
+        // (mindex, count, crc, handle) — the block-grid form.
+        let mut bssts: Vec<(usize, u64, u32, Option<SstHandle>)> = Vec::new();
         let mut saw_end = false;
 
         let finish_pending = |storage: &mut Storage,
@@ -418,6 +473,25 @@ impl Checkpointer {
                     let crc: u32 = parse_field(words.next(), "sst crc")?;
                     ssts.push((key, mindex, count, bytes, crc));
                 }
+                Some("bsst") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let mindex: usize = parse_field(words.next(), "bsst table")?;
+                    let count: u64 = parse_field(words.next(), "bsst count")?;
+                    let crc: u32 = parse_field(words.next(), "bsst crc")?;
+                    let index = words.next().ok_or(CheckpointSetupError::Corrupt("bsst index"))?;
+                    let filter = words.next().ok_or(CheckpointSetupError::Corrupt("bsst filter"))?;
+                    let roster = words.next().ok_or(CheckpointSetupError::Corrupt("bsst roster"))?;
+                    let handle = if index == "-" {
+                        None
+                    } else {
+                        Some(SstHandle {
+                            index: parse_block_id(index)?,
+                            filter: parse_block_id(filter)?,
+                            roster: parse_block_id(roster)?,
+                        })
+                    };
+                    bssts.push((mindex, count, crc, handle));
+                }
                 Some("view") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let hex = words
@@ -517,17 +591,30 @@ impl Checkpointer {
                 .flatten()
                 .ok_or(CheckpointSetupError::Corrupt("sst references unknown table"))?;
             self.rehydrate_sst(storage, key, slot, *count, *bytes, *crc)?;
-            // Remember the SST so a later delta checkpoint can carry it.
+            // An old whole-object SST loads but is not carried forward: the
+            // next checkpoint rewrites the table as a block SST, after which
+            // the object is unreferenced and swept.
             if self.prev_ssts.len() <= slot {
                 self.prev_ssts.resize(slot + 1, None);
             }
-            self.prev_ssts[slot] = Some(PrevSst {
-                key: crate::stack_format!(64, "{}", key),
-                count: *count,
-                bytes: *bytes,
-                crc: *crc,
-            });
+            self.prev_ssts[slot] = None;
             self.referenced.push(crate::stack_format!(64, "{}", key));
+        }
+
+        for (mindex, count, crc, handle) in &bssts {
+            let slot = slot_of
+                .get(*mindex)
+                .copied()
+                .flatten()
+                .ok_or(CheckpointSetupError::Corrupt("bsst references unknown table"))?;
+            if let Some(handle) = handle {
+                self.rehydrate_block_sst(storage, slot, *count, handle)?;
+            }
+            if self.prev_ssts.len() <= slot {
+                self.prev_ssts.resize(slot + 1, None);
+            }
+            self.prev_ssts[slot] =
+                handle.map(|handle| PrevSst { handle, count: *count, crc: *crc });
         }
 
         storage.set_lsn(lsn);
@@ -536,6 +623,53 @@ impl Checkpointer {
         }
         self.manifest_lsn = lsn;
         Ok(lsn)
+    }
+
+    /// Rehydrates one block-grid SST: a full-range scan through the cache
+    /// stack, each row appended to the heap and installed committed.
+    fn rehydrate_block_sst(
+        &mut self,
+        storage: &mut Storage,
+        slot: usize,
+        count: u64,
+        handle: &SstHandle,
+    ) -> Result<(), CheckpointSetupError> {
+        self.sst_arena.reset();
+        let mut reader = SstReader::new(&self.sst_arena)
+            .map_err(|_| CheckpointSetupError::Corrupt("sst reader scratch"))?;
+        let mut seen = 0u64;
+        let blocks = &mut self.blocks;
+        let mut failed: Option<CheckpointSetupError> = None;
+        reader
+            .scan(blocks, handle, 0, u64::MAX, &mut |rowid, row| {
+                if failed.is_some() {
+                    return;
+                }
+                match storage.heap.append(row.len()) {
+                    Ok((loc, slice)) => {
+                        slice.copy_from_slice(row);
+                        storage.observe_rowid(rowid);
+                        let installed = storage
+                            .table_mut(slot)
+                            .rows
+                            .insert(rowid, crate::storage::RowState::committed_only(loc));
+                        if installed.is_err() {
+                            failed =
+                                Some(CheckpointSetupError::Corrupt("sst rows exceed table_rows"));
+                        }
+                        seen += 1;
+                    }
+                    Err(_) => failed = Some(CheckpointSetupError::Corrupt("heap full during rehydrate")),
+                }
+            })
+            .map_err(|_| CheckpointSetupError::Corrupt("sst scan failed"))?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        if seen != count {
+            return Err(CheckpointSetupError::Corrupt("sst row count mismatch"));
+        }
+        Ok(())
     }
 
     fn rehydrate_sst(
@@ -770,89 +904,70 @@ impl Checkpointer {
             }
             sort_scratch.as_mut_slice().sort_unstable_by_key(|(rowid, _)| *rowid);
 
-            // Pass 1: length, SHA-256 (for SigV4), CRC (for the footer).
-            let mut sha = Sha256::new();
+            // Content CRC over the sorted entries: the delta test that lets a
+            // clean table carry its SST forward by handle instead of
+            // rewriting every block.
             let mut crc = Crc32c::new();
-            let mut body_len = 0u64;
             for &(rowid, loc) in sort_scratch.iter() {
                 let row = storage.heap.get(loc);
                 let mut header = [0u8; SST_ENTRY_HEADER];
                 header[0..8].copy_from_slice(&rowid.to_le_bytes());
                 header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
-                sha.update(&header);
-                sha.update(row);
                 crc.update(&header);
                 crc.update(row);
-                body_len += (SST_ENTRY_HEADER + row.len()) as u64;
             }
             let crc = crc.finish();
             let count = sort_scratch.len() as u64;
-            let mut footer = [0u8; SST_FOOTER_LEN];
-            footer[0..8].copy_from_slice(&count.to_le_bytes());
-            footer[8..12].copy_from_slice(&crc.to_le_bytes());
-            footer[12..20].copy_from_slice(&SST_MAGIC.to_le_bytes());
-            sha.update(&footer);
-            let total_len = body_len + SST_FOOTER_LEN as u64;
-            let sha_hex = HexDigest::of(&sha.finish());
 
-            // Delta: a clean table whose prior SST still describes the same
-            // rows is carried forward by reference instead of re-uploaded.
             let prev = self.prev_ssts.get(slot).copied().flatten();
             let reuse = !storage.table(slot).dirty
                 && prev.is_some_and(|p| p.count == count && p.crc == crc);
-            let (key, ref_count, ref_bytes, ref_crc) = if reuse {
-                let p = prev.expect("reuse implies prev");
-                (p.key, p.count, p.bytes, p.crc)
+            let handle = if reuse {
+                prev.map(|p| p.handle)
+            } else if count == 0 {
+                None
             } else {
-                let key = stack_format!(64, "sst/{:020}/{:04}.sst", lsn, slot);
-                let heap = &storage.heap;
-                let rows = sort_scratch.as_slice();
-                self.client
-                    .put_streamed(
-                        key.as_str(),
-                        total_len,
-                        sha_hex.as_str(),
-                        Precondition::None,
-                        |stream| {
-                            let mut w = ChunkedWriter::new(stream);
-                            for &(rowid, loc) in rows {
-                                let row = heap.get(loc);
-                                let mut header = [0u8; SST_ENTRY_HEADER];
-                                header[0..8].copy_from_slice(&rowid.to_le_bytes());
-                                header[8..12]
-                                    .copy_from_slice(&(row.len() as u32).to_le_bytes());
-                                w.write_all(&header)?;
-                                w.write_all(row)?;
-                            }
-                            w.write_all(&footer)?;
-                            w.flush()
-                        },
-                    )
-                    .map_err(s3_to_sql)?;
-                (key, count, total_len, crc)
+                // Rows into the block grid through the cache stack: sorted
+                // data blocks, sparse index, bloom filter, roster.
+                self.sst_arena.reset();
+                let mut writer = SstWriter::new(&self.sst_arena).map_err(sst_to_sql)?;
+                for &(rowid, loc) in sort_scratch.iter() {
+                    writer
+                        .append(&mut self.blocks, rowid, storage.heap.get(loc))
+                        .map_err(sst_to_sql)?;
+                }
+                writer.finish(&mut self.blocks).map_err(sst_to_sql)?
             };
 
             if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
                 self.prev_scratch.resize(slot + 1, None);
             }
             if slot < self.prev_scratch.len() {
-                self.prev_scratch[slot] = Some(PrevSst {
-                    key,
-                    count: ref_count,
-                    bytes: ref_bytes,
-                    crc: ref_crc,
-                });
+                self.prev_scratch[slot] =
+                    handle.map(|handle| PrevSst { handle, count, crc });
             }
-            if self.ref_scratch.len() < MAX_SWEEP_KEYS {
-                self.ref_scratch.push(key);
+            if let Some(h) = handle {
+                let (mut ih, mut fh, mut rh) = ([0u8; 64], [0u8; 64], [0u8; 64]);
+                h.index.write_key(&mut ih);
+                h.filter.write_key(&mut fh);
+                h.roster.write_key(&mut rh);
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "bsst {slot} {count} {crc} {} {} {}",
+                        core::str::from_utf8(&ih).expect("hex"),
+                        core::str::from_utf8(&fh).expect("hex"),
+                        core::str::from_utf8(&rh).expect("hex"),
+                    ),
+                )?;
+            } else {
+                // An empty table still records its (zero-row) state so the
+                // loader creates it.
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!("bsst {slot} 0 {crc} - - -"),
+                )?;
             }
-            write_manifest(
-                &mut self.manifest_buf,
-                format_args!(
-                    "sst {} {slot} {ref_count} {ref_bytes} {ref_crc}",
-                    key.as_str()
-                ),
-            )?;
         }
         // Views: `view <hex-of-SELECT-text> <name>` (name is rest-of-line, so
         // it may contain spaces; the SELECT is hex so it survives the format).
@@ -919,9 +1034,77 @@ impl Checkpointer {
         std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
         std::mem::swap(&mut self.referenced, &mut self.ref_scratch);
 
-        // GC: delete any SST under sst/ not referenced by the new manifest.
+        // GC: delete any SST under sst/ not referenced by the new manifest,
+        // then any block not on a live SST's roster.
         self.collect_garbage()?;
+        self.collect_block_garbage()?;
         Ok(true)
+    }
+
+    /// Mark-and-sweep over `blocks/`: the keep-set is every identity on the
+    /// rosters of the SSTs the manifest just published (each roster is one
+    /// block read, through the cache), plus the rosters themselves; anything
+    /// else under the prefix is an orphan from a superseded checkpoint or an
+    /// interrupted write, and is deleted. Overflow defers to the next sweep
+    /// rather than deleting anything live.
+    fn collect_block_garbage(&mut self) -> Result<(), SqlError> {
+        self.roster_scratch.clear();
+        self.sst_arena.reset();
+        let scratch = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "gc scratch"))?;
+        for prev in self.prev_ssts.iter().flatten() {
+            let h = prev.handle;
+            if self.roster_scratch.len() + 1 > MAX_KEEP_BLOCKS {
+                eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
+                return Ok(());
+            }
+            self.roster_scratch.push(h.roster);
+            let n = self
+                .blocks
+                .get(&h.roster, scratch)
+                .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
+            for id_bytes in scratch[..n].chunks(32) {
+                if id_bytes.len() != 32 {
+                    return Err(sql_err!(SQLSTATE_IO, "gc roster is not a multiple of 32 bytes"));
+                }
+                if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
+                    eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
+                    return Ok(());
+                }
+                let mut id = [0u8; 32];
+                id.copy_from_slice(id_bytes);
+                self.roster_scratch.push(BlockId(id));
+            }
+        }
+        self.doomed_blocks.clear();
+        let keep = &self.roster_scratch;
+        let doomed = &mut self.doomed_blocks;
+        let mut overflow = false;
+        self.client
+            .list("blocks/", |key| {
+                let hex = key.strip_prefix("blocks/").unwrap_or(key);
+                let known = parse_block_id(hex)
+                    .map(|id| keep.contains(&id))
+                    .unwrap_or(false);
+                if !known {
+                    if doomed.len() < MAX_SWEEP_KEYS {
+                        doomed.push(crate::stack_format!(80, "{}", key));
+                    } else {
+                        overflow = true;
+                    }
+                }
+            })
+            .map_err(s3_to_sql)?;
+        for i in 0..self.doomed_blocks.len() {
+            let key = self.doomed_blocks[i];
+            self.client.delete(key.as_str()).map_err(s3_to_sql)?;
+        }
+        if overflow {
+            eprintln!("pos3ql: block garbage exceeds one sweep; continuing next checkpoint");
+        }
+        Ok(())
     }
 
     fn collect_garbage(&mut self) -> Result<(), SqlError> {
@@ -953,45 +1136,27 @@ impl Checkpointer {
     }
 }
 
-/// Fixed-stack buffered writer so streaming an SST does not issue one
-/// syscall per row.
-struct ChunkedWriter<'a> {
-    stream: &'a mut std::net::TcpStream,
-    buffer: [u8; 16384],
-    len: usize,
+fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return Err(CheckpointSetupError::Corrupt("block id is not 64 hex chars"));
+    }
+    let nibble = |b: u8| -> Result<u8, CheckpointSetupError> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            _ => Err(CheckpointSetupError::Corrupt("block id is not lowercase hex")),
+        }
+    };
+    let mut id = [0u8; 32];
+    for (i, pair) in bytes.chunks(2).enumerate() {
+        id[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Ok(BlockId(id))
 }
 
-impl<'a> ChunkedWriter<'a> {
-    fn new(stream: &'a mut std::net::TcpStream) -> Self {
-        Self {
-            stream,
-            buffer: [0; 16384],
-            len: 0,
-        }
-    }
-
-    fn write_all(&mut self, mut data: &[u8]) -> std::io::Result<()> {
-        while !data.is_empty() {
-            if self.len == self.buffer.len() {
-                self.flush_buf()?;
-            }
-            let take = data.len().min(self.buffer.len() - self.len);
-            self.buffer[self.len..self.len + take].copy_from_slice(&data[..take]);
-            self.len += take;
-            data = &data[take..];
-        }
-        Ok(())
-    }
-
-    fn flush_buf(&mut self) -> std::io::Result<()> {
-        self.stream.write_all(&self.buffer[..self.len])?;
-        self.len = 0;
-        Ok(())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.flush_buf()
-    }
+fn sst_to_sql(e: crate::store::SstError) -> SqlError {
+    sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", e)
 }
 
 fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {

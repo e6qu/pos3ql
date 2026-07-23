@@ -121,8 +121,8 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
-                    Datum::Range { text, kind } => {
-                        Ok(Datum::Bool(range::bound_inc(text, kind, name == "lower_inc")?))
+                    Datum::Range { text, kind: _ } => {
+                        Ok(Datum::Bool(range::bound_inc(text, name == "lower_inc")?))
                     }
                     other => Err(type_mismatch(name, &other)),
                 }
@@ -131,10 +131,10 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
-                    Datum::Range { text, kind } => Ok(Datum::Bool(if name == "lower_inf" {
-                        range::lower_inf(text, kind)?
+                    Datum::Range { text, kind: _ } => Ok(Datum::Bool(if name == "lower_inf" {
+                        range::lower_inf(text)?
                     } else {
-                        range::upper_inf(text, kind)?
+                        range::upper_inf(text)?
                     })),
                     other => Err(type_mismatch(name, &other)),
                 }

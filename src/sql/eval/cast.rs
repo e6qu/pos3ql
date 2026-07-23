@@ -195,7 +195,7 @@ pub fn cast_to<'a>(
         ColType::Range(kind) => match v {
             Datum::Range { kind: k, .. } if k == kind => v,
             Datum::Text(s) => {
-                let p = crate::sql::range::parse(s, kind)?;
+                let p = crate::sql::range::parse(s)?;
                 Datum::Range { text: crate::sql::range::canonical(&p, kind, arena)?, kind }
             }
             _ => return Err(cast_unsupported(&v, kind.name())),

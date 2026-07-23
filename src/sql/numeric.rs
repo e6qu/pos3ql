@@ -634,6 +634,13 @@ pub fn compare(a: &Numeric, b: &Numeric) -> Ordering {
 /// allocation-free — used where no arena is available (range sort/compare).
 /// Returns `None` if either string is not a plain decimal (e.g. contains an
 /// exponent); the caller then fails loudly rather than guessing.
+/// Whether `s` is a plain decimal literal — the check a range's numeric bound
+/// needs to name the offending side, since `cmp_decimal_str` fails without
+/// saying which of its two arguments was malformed.
+pub(crate) fn valid_decimal(s: &str) -> bool {
+    split_decimal(s).is_some()
+}
+
 pub fn cmp_decimal_str(a: &str, b: &str) -> Option<Ordering> {
     let (asign, aint, afrac) = split_decimal(a)?;
     let (bsign, bint, bfrac) = split_decimal(b)?;

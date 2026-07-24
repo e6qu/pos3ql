@@ -262,6 +262,35 @@ after=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' \
   -c "SELECT count(*), count(*) FILTER (WHERE id BETWEEN 100 AND 599), max(CASE WHEN id = 700 THEN pad END) FROM spilly" 2>&1)
 [[ "$after" == "23500|0|updated" ]] && ok "delta SSTs + tombstones survive a cold start" \
   || bad "delta/tombstone cold start (got: $after)"
+# Paced compaction: enough checkpointed delta cycles to cross the merge
+# trigger several times over, with interleaved deletes and updates so merges
+# see duplicates and tombstones. Every value must survive the merges, the
+# repointed spilled rows must still point-read, and a final wiped-disk cold
+# start must rebuild the merged lists from the manifest alone.
+for i in {1..7}; do
+  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
+    -c "INSERT INTO spilly(pad) SELECT repeat('m', 512) FROM generate_series(1, 200)" \
+    -c "DELETE FROM spilly WHERE id BETWEEN $((23000 + i * 100)) AND $((23000 + i * 100 + 49))" \
+    -c "UPDATE spilly SET pad = 'cycle-$i' WHERE id = 650" \
+    -c "CHECKPOINT" \
+    || { bad "paced merge cycle $i"; break; }
+done
+merged=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' \
+  -c "SELECT count(*), (SELECT pad FROM spilly WHERE id = 650), (SELECT count(*) FROM spilly WHERE id BETWEEN 23100 AND 23749), (SELECT length(pad) FROM spilly WHERE id = 12345) FROM spilly" 2>&1)
+[[ "$merged" == "24550|cycle-7|300|1024" ]] && ok "paced compaction keeps every row" \
+  || bad "paced compaction (got: $merged)"
+kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
+rm -rf "$WORK/data"
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+for i in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+merged_cold=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' \
+  -c "SELECT count(*), (SELECT pad FROM spilly WHERE id = 650) FROM spilly" 2>&1)
+[[ "$merged_cold" == "24550|cycle-7" ]] && ok "merged SST lists survive a cold start" \
+  || bad "merged-list cold start (got: $merged_cold)"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
 
 step "crash torture: random DML + kill -9 + cold starts vs real PostgreSQL"

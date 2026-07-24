@@ -437,6 +437,20 @@ histograms show no compaction spikes. **Note:** secondary indexes are a *forest*
 LSM trees (one per index, TigerBeetle-style) reusing Stages A–E; introduce here or
 defer.
 
+**Status (2026-07-24): paced merges landed.** A table's spill list at the merge
+trigger (4) gets its two oldest SSTs merged during the checkpoint — one bounded
+merge per table per cycle, rows streamed in rowid order through the block cache
+into a fresh SST (newer member wins duplicates, its tombstones consume the older
+member's rows, and nothing is older than member 0, so no tombstone survives the
+merge). The in-memory spill indexes remap only after the manifest CAS lands,
+like every other install, and the filled-list full rewrite remains the safety
+net (also the fallback when a pair exceeds the merge id scratch). Exercised in
+run.sh (seven checkpointed cycles with interleaved deletes and updates, then a
+wiped-disk cold start over the merged lists) and adversarially by the crash
+torture's random checkpoint/kill schedule. Remaining here: merge pacing across
+*beats* rather than per checkpoint, level-aware pair selection, and the
+manifest log (below).
+
 ### Stage F — MVCC snapshot reads over object-resident data
 
 Preserve snapshot isolation once the working set spills to the bucket. **This is more

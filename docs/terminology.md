@@ -53,7 +53,9 @@ short names are kept (rule 3) and defined here.
   journal, view change, and recovery.
 - **`wal`** — the write-ahead log / VSR journal format and replay.
 - **`s3`** — the object-storage client (HTTP/1.1, AWS Signature Version 4,
-  hand-rolled SHA-256 / HMAC, conditional writes, retries).
+  hand-rolled SHA-256 / HMAC, conditional writes, retries, the isolated
+  rustls TLS door), plus `s3::sim`, the deterministic *virtual bucket*
+  behind the same client seam (see Testing below).
 - **`pg`** (PostgreSQL) — the PostgreSQL wire protocol: framing, authentication,
   the simple and extended query flows, error responses.
 - **`sql`** — the SQL front end and engine. Sub-modules: **`lexer`**,
@@ -68,7 +70,9 @@ short names are kept (rule 3) and defined here.
   and the leveled read/compaction half is roadmapped — see [PLAN.md](../PLAN.md).)
 - **`checkpoint`** — snapshot live tables to SST objects and publish the
   compare-and-swap *manifest*; cold-start rehydration from the bucket.
-- **`sim`** (simulator) — the deterministic whole-cluster simulator (VOPR).
+- **`sim`** (simulator) — the deterministic simulators (VOPR): the VSR
+  whole-cluster simulator, and the storage VOPR (`sim::storage`) driving the
+  engine's storage stack against the virtual bucket.
 - **`util`** (utilities) — small shared helpers (e.g. `StackStr`, a stack-backed
   string).
 
@@ -84,25 +88,30 @@ vocabulary — with the meaning they carry in this codebase.
   node is a cluster of one.
 - **Log-Structured Merge tree (LSM)** — the storage model: writes land in an
   in-memory table and are later flushed to immutable sorted files, with
-  background compaction. *Current state:* pos3ql implements the in-memory half
-  (the memtable) plus checkpoint SSTs; memtable flush, leveled SSTs, and a
-  queryable multi-level read path with compaction are roadmapped (PLAN.md).
-- **memtable** — the in-memory, sorted write buffer at the top of the LSM.
-  Today it holds the whole live working set (`memtable_bytes`); flushing a
-  frozen memtable to an SST is roadmapped.
-- **Sorted String Table (SST)** — an immutable, sorted, block-structured object
-  of rows on object storage. Today an SST is a per-table *checkpoint snapshot*;
-  block-granular SSTs read a block at a time are roadmapped.
-- **block** — the fixed-size, checksummed, content-addressed unit the roadmapped
-  storage engine reads and caches: SST data/index/filter blocks, the manifest
-  log, and cache frames are all blocks (after TigerBeetle's *grid*). Roadmap.
-- **block grid** — the fixed array of blocks unifying on-object and cached
-  storage; the seam (`BlockStore`) with a local backend and an object-storage
-  backend. Roadmap.
+  background compaction. *Current state:* memtable + block SSTs with
+  spill-under-pressure, delta flushes with tombstones, and paced pair
+  merges; the remaining distance (a block-resident row map, beat-paced
+  merges) is the maturity roadmap in [PLAN.md](../PLAN.md).
+- **memtable** — the in-memory, sorted write buffer at the top of the LSM
+  (`memtable_bytes`). Under memory pressure committed row *bytes* spill to
+  the bucket and page back through the cache tiers; the per-row map stays
+  in RAM (making it block-resident is the maturity roadmap's gap 2).
+- **Sorted String Table (SST)** — an immutable, sorted, block-structured
+  object of rows on object storage: sorted data blocks + a sparse index
+  block + a bloom filter block, read block-at-a-time through the cache
+  tiers. Checkpoints write per-table block SSTs; delta flushes append to a
+  table's SST list and paced merges bound it.
+- **block** — the fixed-size (256 KiB), checksummed, content-addressed unit
+  the storage engine reads and caches: SST data/index/filter/roster blocks
+  (after TigerBeetle's *grid*), identified by the SHA-256 of the payload.
+- **block grid** — the array of blocks unifying on-object and cached
+  storage; the seam (`BlockStore`) with object-storage, RAM, disk-cache and
+  in-memory-test backends stacked by `store::build_tiers`.
 - **block cache / disk cache** — the RAM and local-disk read-through tiers in
   front of object storage (`block_cache_bytes` / `disk_cache_bytes`), the
-  "ClickHouse/Loki-style" cache of the founding vision. Reserved in config
-  today; wired in the roadmap.
+  "ClickHouse/Loki-style" cache of the founding vision: CLOCK-evicted RAM
+  frames over a preallocated slot file, both pure cache (a torn or stale
+  slot is a miss, never data loss).
 - **manifest log** — an append-only log of SST-added/removed records rooted by a
   CAS'd *superblock*, replacing the monolithic manifest rewrite (after
   TigerBeetle's `manifest_log` / Loki's index shipping). Roadmap.
@@ -217,8 +226,41 @@ Universal short names a systems engineer reads without expansion (rule 3); kept.
 
 ### Testing
 
-- **VOPR** — the Viewstamped-Operation deterministic simulator: whole-cluster
-  simulation with fault injection, reproducible from a seed.
+- **VOPR** — a deterministic fault-injecting simulator whose every run
+  reproduces exactly from a PRNG seed. The name is TigerBeetle's ("Viewstamped
+  Operation Replicator", their simulator of the VSR cluster — itself a nod to
+  the WOPR of *WarGames*); here it names the discipline: drive the real code
+  through simulated infrastructure, inject faults from a seeded PRNG, and
+  check invariants after every recovery. pos3ql has two: the *VSR VOPR*
+  (`sim`, the consensus cluster under message loss/reorder/partition) and the
+  *storage VOPR* below.
+- **storage VOPR** (`sim::storage`) — the storage-stack simulator: the real
+  `Engine` (WAL, spill, checkpoint, block SSTs, cache tiers, manifest CAS,
+  garbage sweep) runs against the *virtual bucket* under seeded fault
+  schedules — transient failures, ambiguous PUTs, flipped bits, outages
+  ending in crashes, corrupted disk-cache slots, warm restarts and
+  wiped-disk cold starts — while a model database tracks every acknowledged
+  write and recovery is checked against it exactly.
+- **virtual bucket** (`s3::sim`, `s3 = sim`) — the deterministic in-process
+  object store standing in for S3 behind the object-client seam. It also
+  enforces the bucket-side key discipline itself (see *blind overwrite*).
+  Refused by the real server binary; it exists for simulation tests.
+- **fault plan** — the virtual bucket's per-operation fault dice (parts per
+  thousand) plus the outage schedule (`fail_from_op`), all drawn from one
+  PCG stream so a failing run replays from its seed.
+- **ambiguous PUT** — a write that landed but whose response was lost: the
+  caller sees an error and cannot know the object exists. The classic
+  object-storage failure; retries and commit acknowledgements must both
+  treat the outcome as unknown, never as "did not happen".
+- **blind overwrite** — an unconditional PUT that changes an existing
+  object's bytes. The engine's key discipline forbids it (blocks are
+  content-addressed, the manifest moves only by CAS, a WAL segment only
+  grows by appended commits under its first-LSN key), so the virtual bucket
+  records one as a failed invariant.
+- **crash torture** (`tests/external/torture_diff.py`) — the process-level
+  sibling of the storage VOPR: seeded random DML against pos3ql *and* a real
+  PostgreSQL, with random `kill -9` restarts and wiped-disk cold starts,
+  the reference database serving as the model.
 - **PCG** — the permuted-congruential pseudo-random number generator used so
   every simulated run is reproducible from its seed.
 - **differential testing** — running the same SQL against real PostgreSQL and

@@ -132,7 +132,95 @@ pub struct GetResult {
     pub etag: StackStr<80>,
 }
 
+pub(crate) mod sim;
 pub(crate) mod tls;
+
+/// The object-client seam: the real HTTP client, or the deterministic
+/// virtual bucket (`s3 = sim`) the storage VOPR drives faults through. An
+/// enum, not a trait object, so no allocation or dynamic dispatch enters
+/// the storage path; both arms share the observable semantics callers rely
+/// on (fixed response buffer, inclusive ranges with 416 past the end,
+/// 404/412 statuses, LIST in key order with the key prefix stripped).
+// The size difference is the real client's inline connection state; a
+// handful of these exist per process, so boxing the variant would spend a
+// heap indirection to save bytes nobody is short of.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "two long-lived instances per process; boxing buys nothing"
+)]
+pub(crate) enum ObjectClient {
+    Real(S3Client),
+    Sim(sim::SimClient),
+}
+
+impl ObjectClient {
+    pub(crate) fn budget_bytes(config: &Config) -> usize {
+        S3Client::budget_bytes(config)
+    }
+
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, S3SetupError> {
+        if config.s3_sim {
+            Ok(Self::Sim(sim::SimClient::new(config, budget)?))
+        } else {
+            Ok(Self::Real(S3Client::new(config, budget)?))
+        }
+    }
+
+    pub(crate) fn put(
+        &mut self,
+        key: &str,
+        body: &[u8],
+        precondition: Precondition,
+    ) -> Result<StackStr<80>, S3Error> {
+        match self {
+            Self::Real(c) => c.put(key, body, precondition),
+            Self::Sim(c) => c.put(key, body, precondition),
+        }
+    }
+
+    pub(crate) fn get(
+        &mut self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<GetResult, S3Error> {
+        match self {
+            Self::Real(c) => c.get(key, range),
+            Self::Sim(c) => c.get(key, range),
+        }
+    }
+
+    pub(crate) fn body_bytes(&self) -> &[u8] {
+        match self {
+            Self::Real(c) => c.body_bytes(),
+            Self::Sim(c) => c.body_bytes(),
+        }
+    }
+
+    pub(crate) fn response_capacity(&self) -> usize {
+        match self {
+            Self::Real(c) => c.response_capacity(),
+            Self::Sim(c) => c.response_capacity(),
+        }
+    }
+
+    pub(crate) fn delete(&mut self, key: &str) -> Result<(), S3Error> {
+        match self {
+            Self::Real(c) => c.delete(key),
+            Self::Sim(c) => c.delete(key),
+        }
+    }
+
+    pub(crate) fn list(
+        &mut self,
+        prefix: &str,
+        each: impl FnMut(&str),
+    ) -> Result<usize, S3Error> {
+        match self {
+            Self::Real(c) => c.list(prefix, each),
+            Self::Sim(c) => c.list(prefix, each),
+        }
+    }
+}
 
 pub struct S3Client {
     host_header: String,

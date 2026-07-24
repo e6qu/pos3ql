@@ -31,6 +31,14 @@ fn run() -> Result<(), String> {
         FmtBytes(config.disk_cache_bytes)
     );
 
+    if config.s3_sim {
+        return Err(
+            "s3 = sim is the in-process simulator's mode (it allocates freely); \
+             the server refuses it — use s3 = on with a real endpoint"
+                .to_string(),
+        );
+    }
+
     let mut budget = mem::Budget::new(plan.total());
     let mut server =
         Server::new(&config, &mut budget).map_err(|e| format!("startup failed: {e}"))?;

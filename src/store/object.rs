@@ -12,13 +12,13 @@
 //! well as the CRC — the one case a checksum cannot cover is being handed a
 //! *different* block that is itself intact.
 
-use crate::s3::{Precondition, S3Client, S3Error};
+use crate::s3::{ObjectClient, Precondition, S3Error};
 
 use super::{decode, encode, BlockId, BlockStore, BlockType, StoreError, HEADER_LEN};
 
 /// Blocks kept as objects under a key prefix.
 pub(crate) struct ObjectBlockStore<'c> {
-    client: &'c mut S3Client,
+    client: &'c mut ObjectClient,
     /// Prefix every block key sits under, e.g. `blocks/`. Kept short: it is
     /// paid on every request line.
     prefix: &'static str,
@@ -31,7 +31,7 @@ pub(crate) struct ObjectBlockStore<'c> {
 impl<'c> ObjectBlockStore<'c> {
     /// `scratch` must hold a whole block — `HEADER_LEN + MAX_PAYLOAD`.
     pub(crate) fn new(
-        client: &'c mut S3Client,
+        client: &'c mut ObjectClient,
         prefix: &'static str,
         scratch: &'c mut [u8],
     ) -> Self {
@@ -62,7 +62,7 @@ fn store_error(e: S3Error) -> StoreError {
 }
 
 fn put_block(
-    client: &mut S3Client,
+    client: &mut ObjectClient,
     prefix: &str,
     scratch: &mut [u8],
     payload: &[u8],
@@ -80,7 +80,7 @@ fn put_block(
 }
 
 fn get_block(
-    client: &mut S3Client,
+    client: &mut ObjectClient,
     prefix: &str,
     id: &BlockId,
     into: &mut [u8],
@@ -106,7 +106,7 @@ fn get_block(
 /// The bucket store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
-    client: S3Client,
+    client: ObjectClient,
     prefix: &'static str,
     scratch: Vec<u8>,
 }
@@ -114,7 +114,7 @@ pub(crate) struct OwnedObjectStore {
 impl OwnedObjectStore {
     /// Startup-only: the scratch Vec is reserved once, before the allocator
     /// freezes, and never grows.
-    pub(crate) fn new(client: S3Client, prefix: &'static str) -> Self {
+    pub(crate) fn new(client: ObjectClient, prefix: &'static str) -> Self {
         Self { client, prefix, scratch: vec![0u8; super::BLOCK_SIZE] }
     }
 }

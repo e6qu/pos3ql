@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
-use crate::s3::{Precondition, S3Client, S3Error};
+use crate::s3::{ObjectClient, Precondition, S3Error};
 use crate::sql::eval::{sqlstate, SqlError};
 use crate::sql::types::ColType;
 use crate::sql_err;
@@ -93,7 +93,7 @@ impl SlotList {
 }
 
 pub(crate) struct Checkpointer {
-    client: S3Client,
+    client: ObjectClient,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
     /// over content-addressed block objects — `block_cache_bytes` and
     /// `disk_cache_bytes` finally sized to something. SST reads and writes go
@@ -161,7 +161,7 @@ impl Checkpointer {
         // Two clients: one for manifest/WAL objects, one inside the block
         // stack. The cache tiers draw their own budget in the constructor;
         // this accounts the fixed parts.
-        2 * S3Client::budget_bytes(config)
+        2 * ObjectClient::budget_bytes(config)
             + MANIFEST_BUF_BYTES
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
@@ -292,17 +292,19 @@ impl Checkpointer {
     /// at startup.
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
         let mut config = config.clone();
-        if config.s3_access_key.is_empty() {
+        // The virtual bucket signs nothing; requiring credentials for it
+        // would demand secrets no request will carry.
+        if config.s3_access_key.is_empty() && !config.s3_sim {
             config.s3_access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
                 CheckpointSetupError::Credentials("s3_access_key / AWS_ACCESS_KEY_ID")
             })?;
         }
-        if config.s3_secret_key.is_empty() {
+        if config.s3_secret_key.is_empty() && !config.s3_sim {
             config.s3_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
                 CheckpointSetupError::Credentials("s3_secret_key / AWS_SECRET_ACCESS_KEY")
             })?;
         }
-        let block_client = S3Client::new(&config, budget)
+        let block_client = ObjectClient::new(&config, budget)
             .map_err(|e| CheckpointSetupError::S3(e.to_string()))?;
         let base = OwnedObjectStore::new(block_client, "blocks/");
         let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
@@ -322,7 +324,7 @@ impl Checkpointer {
                 .map_err(|e| CheckpointSetupError::S3(format!("block cache stack: {e:?}")))?,
         ));
         Ok(Self {
-            client: S3Client::new(&config, budget)
+            client: ObjectClient::new(&config, budget)
                 .map_err(|e| CheckpointSetupError::S3(e.to_string()))?,
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)

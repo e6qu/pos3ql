@@ -552,6 +552,34 @@ clean; every failure reproduces from its seed — the gate that lets the object-
 tier be trusted the way the SQL layer is today. Stand this up as soon as **A** lands so
 every later stage is born simulation-tested, not retrofitted.
 
+**Status (2026-07-24): the storage VOPR is standing** — maturity-roadmap step 1.
+The seam is `ObjectClient` (an enum over the real HTTP client and `s3::sim`'s
+*virtual bucket*, selected by `s3 = sim`, which the real server binary
+refuses): a deterministic in-process object store whose faults all draw from
+one PCG stream — transient failures, ambiguous PUTs (applied, response
+lost), one flipped bit on a GET body, and outages that begin mid-sequence
+and end in a crash. The bucket also enforces the key discipline itself:
+an unconditional overwrite that changes an object's bytes is a recorded
+invariant violation (blocks content-addressed, manifest CAS-only, WAL
+segments grow-only under their first-LSN key). The harness
+(`sim::storage`) drives the real `Engine` — DML bursts, transactions,
+checkpoints, auto-checkpoints, fault storms, corrupted disk-cache slots,
+warm restarts, wiped-disk cold starts — against a model database with
+certain/uncertain outcome tracking (an errored commit is *unknown*: the
+engine must later show the before or the intended image, never a third).
+Runs as `cargo test` (4 seeds) and scales by environment
+(`POS3QL_STORAGE_VOPR_SEED0/SEEDS/STEPS`).
+
+Its first session caught two real engine bugs (B-156, B-157, both fixed):
+a commit whose synchronous WAL upload failed was left unpromoted — locally
+durable but invisible until a restart resurrected it (client-observable
+time-travel) — and a failed upload *retry* poisoned whatever innocent
+statement (even ROLLBACK) happened to trigger it. What remains of Stage H:
+the virtual *grid disk* (torn-write/bit-rot injection under the WAL and the
+disk cache — today the harness scribbles the cache file between
+incarnations), and folding the mid-flush/mid-compaction crash invariants
+into longer standing runs.
+
 ### Stage I — object-storage-adaptive execution (the four pillars)
 
 The storage stages make data *reachable* from the bucket; this stage makes queries

@@ -222,6 +222,12 @@ impl Engine {
         if !txn.is_active() {
             return Ok(());
         }
+        // A failed synchronous upload keeps its batch marker, so the next
+        // commit retries it. Whether *this* transaction added records to
+        // that batch decides who owns a retry failure below: the statement
+        // (its outcome really is unknown), or nobody (the records belong to
+        // commits already reported failed — the retry is background work).
+        let batch_bytes_before = self.wal.pending_batch_bytes();
         for i in 0..txn.touched().len() {
             let (table, rowid, _) = txn.touched()[i];
             // A row may be written several times in one transaction; journal
@@ -297,16 +303,36 @@ impl Engine {
             self.storage.table_mut(i).serial_dirty = false;
         }
         // One fsync per transaction, before any promotion: this is the
-        // durability point. In synchronous mode the batch is also uploaded to
-        // the bucket before acking (RPO=0 to S3); otherwise the upload is left
-        // for the event loop to drain, and only forced synchronously here when
-        // the accumulated batch has grown past the backpressure threshold.
+        // durability point — and the point of no return. A restart replays
+        // everything past it, so from here the transaction commits in this
+        // incarnation too, whatever the bucket says: an upload failure below
+        // is reported to the client (outcome unknown) only after the
+        // promotions, never instead of them. Failing first left a committed
+        // transaction invisible until the next restart resurrected it —
+        // state a client could watch move backward and then forward.
         self.wal.commit();
-        if self.wal_upload_sync
+        let contributed = self.wal.pending_batch_bytes() > batch_bytes_before;
+        let upload_result = if self.wal_upload_sync
             || self.wal.pending_batch_bytes() as usize >= self.wal_upload_backpressure
         {
-            self.upload_wal_batch()?;
-        }
+            match self.upload_wal_batch() {
+                Err(e) if !contributed => {
+                    // Retrying a previous commit's batch: everything in it
+                    // is locally durable and already reported failed to its
+                    // own client; a statement that wrote nothing must not
+                    // inherit the retry's error.
+                    eprintln!(
+                        "pos3ql: WAL segment upload retry failed ({}): {}",
+                        e.sqlstate,
+                        e.message.as_str()
+                    );
+                    Ok(())
+                }
+                result => result,
+            }
+        } else {
+            Ok(())
+        };
         for &(table, rowid, _) in txn.touched() {
             self.storage.commit_row(table as usize, rowid, txn.txid);
         }
@@ -340,7 +366,7 @@ impl Engine {
             }
         }
         txn.clear();
-        Ok(())
+        upload_result
     }
 
     /// Discards every uncommitted change and journal byte of the

@@ -18,6 +18,9 @@
               once the code is actually reached"
 )]
 
+#[cfg(test)]
+mod storage;
+
 use crate::prng::Pcg32;
 use crate::vsr::message::Message;
 use crate::vsr::replica::{Committed, Replica, MAX_REPLICAS};

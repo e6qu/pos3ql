@@ -447,9 +447,14 @@ like every other install, and the filled-list full rewrite remains the safety
 net (also the fallback when a pair exceeds the merge id scratch). Exercised in
 run.sh (seven checkpointed cycles with interleaved deletes and updates, then a
 wiped-disk cold start over the merged lists) and adversarially by the crash
-torture's random checkpoint/kill schedule. Remaining here: merge pacing across
-*beats* rather than per checkpoint, level-aware pair selection, and the
-manifest log (below).
+torture's random checkpoint/kill schedule. Level-aware pair
+selection followed (2026-07-24): the merge picks the adjacent pair with the
+smallest combined entry count — least write amplification now, big settled
+members left to accrete — and a pair away from the list head keeps its
+surviving tombstones (they still shadow earlier members at cold start), only
+the head merge dropping them. Remaining here: merge pacing across *beats*
+rather than per checkpoint, and the manifest log (below) — low value at
+today's table counts, noted for the day manifests are large.
 
 ### Stage F — MVCC snapshot reads over object-resident data
 

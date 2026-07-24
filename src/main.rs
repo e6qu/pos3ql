@@ -38,6 +38,7 @@ fn run() -> Result<(), String> {
     // The IANA zone-name catalog walks /usr/share/zoneinfo, which allocates —
     // it must happen on this side of the freeze. Zone files themselves load
     // on demand into fixed pools.
+    mem::guard::set_tls_budget(config.tls_pool_bytes as u64);
     pos3ql::sql::tzif::init_catalog();
     pos3ql::sql::exec::init_record_shapes();
 

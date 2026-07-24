@@ -507,9 +507,25 @@ trailers) decode into the bounded response buffer, refusing loudly on
 overflow; and WAL-segment replay streams in ranged windows, closing a latent
 unrecoverability — a committed batch larger than `s3_response_bytes` uploaded
 fine but could never be replayed at cold start. run.sh proves the round trip
-with the response buffer shrunk below one batch. Remaining here: TLS and the
-provider trait (next), and multipart upload (no current producer exceeds a
-single PUT).
+with the response buffer shrunk below one batch.
+
+**Status (2026-07-24, later): TLS landed — the deferred decision resolved as
+isolated rustls.** rustls (with compiled-in Mozilla roots) is the single
+whitelisted dependency exception, and `mem::guard::tls_scope` is its only
+door: the client configuration is built pre-freeze, and every runtime call —
+handshakes, record I/O, teardown — runs inside a scope whose allocations are
+charged against `tls_pool_bytes` and abort loudly past it, so the
+static-memory discipline holds everywhere else. `s3_tls = on` turns it on;
+`s3_tls_ca_file` adds PEM roots for self-signed endpoints (parsed by a
+hand-rolled PEM/base64 reader at startup — no new parsing dependency). Proven
+two ways: an in-process rustls server round trip in the unit tests (with a
+checked-in certificate whose provenance and the `CA:FALSE` lesson live in
+tests/data/README.md), and a run.sh durability cycle against MinIO serving
+HTTPS — commit, checkpoint, kill -9, wiped disk, cold start entirely over
+TLS. S3 I/O errors now carry the source error's words, so a certificate
+rejection names itself instead of flattening to `InvalidData`. Remaining
+here: the provider trait with GCS/Azure quirks, real-cloud matrix runs, and
+multipart upload (no current producer exceeds a single PUT).
 
 ### Stage H — deterministic storage simulation (VOPR for the whole stack)
 

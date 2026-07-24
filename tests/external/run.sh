@@ -347,6 +347,74 @@ else
   print -- "SKIP: real PostgreSQL 18 not installed"
 fi
 
+step "TLS to the bucket: durability cycle over HTTPS (rustls, isolated)"
+# A second MinIO with a self-signed certificate (MinIO enables TLS when certs
+# are present); pos3ql connects with s3_tls on, trusting the certificate via
+# s3_tls_ca_file. Commit, checkpoint, kill -9, wipe the disk: the cold start
+# rebuilds entirely over TLS.
+TLS_MINIO_PORT=$((MINIO_PORT + 1))
+TLS_MINIO_CONTAINER=pos3ql-external-minio-tls
+mkdir -p "$WORK/minio-certs"
+openssl req -x509 -newkey rsa:2048 -keyout "$WORK/minio-certs/private.key" \
+  -out "$WORK/minio-certs/public.crt" -days 30 -nodes -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -addext "basicConstraints=critical,CA:FALSE" 2>/dev/null
+chmod 644 "$WORK/minio-certs/private.key" "$WORK/minio-certs/public.crt"
+docker rm -f $TLS_MINIO_CONTAINER >/dev/null 2>&1
+# create + cp + start (not a bind mount): Docker Desktop on macOS mounts an
+# empty directory for unshared paths, silently — MinIO would come up plain
+# HTTP and the whole step would test nothing.
+if docker create --name $TLS_MINIO_CONTAINER -p ${TLS_MINIO_PORT}:9000 \
+    -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+    minio/minio:latest server /data >/dev/null 2>&1 \
+  && docker cp "$WORK/minio-certs/private.key" $TLS_MINIO_CONTAINER:/root/.minio/certs/private.key \
+  && docker cp "$WORK/minio-certs/public.crt" $TLS_MINIO_CONTAINER:/root/.minio/certs/public.crt \
+  && docker start $TLS_MINIO_CONTAINER >/dev/null; then
+  for i in {1..40}; do
+    docker exec $TLS_MINIO_CONTAINER mc alias set local https://localhost:9000 minioadmin minioadmin --insecure >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  docker exec $TLS_MINIO_CONTAINER mc mb --insecure --ignore-existing local/pos3ql-tls >/dev/null 2>&1
+  cat > "$WORK/tls-server.conf" <<EOF
+listen_addr = 127.0.0.1:$((PG_PORT + 1))
+data_dir = ${WORK}/tls-data
+s3 = on
+s3_tls = on
+s3_tls_ca_file = ${WORK}/minio-certs/public.crt
+s3_endpoint = 127.0.0.1:${TLS_MINIO_PORT}
+s3_bucket = pos3ql-tls
+s3_prefix = tls-run/
+s3_access_key = minioadmin
+s3_secret_key = minioadmin
+wal_upload = on
+EOF
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/tls-server.conf" > "$WORK/tls-server.log" 2>&1 &
+  TLS_SERVER_PID=$!
+  for i in {1..50}; do
+    "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U ext -X -q \
+    -c "CREATE TABLE tlst (id int, v text)" \
+    -c "INSERT INTO tlst VALUES (1, 'over-tls')" \
+    -c "CHECKPOINT" >/dev/null 2>&1
+  kill -9 $TLS_SERVER_PID 2>/dev/null; wait $TLS_SERVER_PID 2>/dev/null
+  rm -rf "$WORK/tls-data"
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/tls-server.conf" >> "$WORK/tls-server.log" 2>&1 &
+  TLS_SERVER_PID=$!
+  for i in {1..50}; do
+    "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  tls_out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U ext -X -t -A -c "SELECT v FROM tlst" 2>&1)
+  [[ "$tls_out" == "over-tls" ]] && ok "TLS cold start from the bucket" \
+    || { bad "TLS cold start (got: $tls_out)"; tail -5 "$WORK/tls-server.log"; }
+  kill -9 $TLS_SERVER_PID 2>/dev/null; wait $TLS_SERVER_PID 2>/dev/null
+  docker rm -f $TLS_MINIO_CONTAINER >/dev/null 2>&1
+else
+  print -- "SKIP: docker cannot mount $WORK for MinIO TLS certs"
+fi
+
 step "forced-spill differential: the whole suite with a 256KiB memtable over the bucket"
 # Every corpus and sqllogictest block runs against a pos3ql whose memtable is
 # three orders of magnitude under the dataset churn, so ordinary queries

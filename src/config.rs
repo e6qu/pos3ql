@@ -100,6 +100,14 @@ pub struct Config {
     pub s3_head_bytes: usize,
     /// Largest response body (bounds ranged GETs and LIST pages).
     pub s3_response_bytes: usize,
+    /// TLS to the object store (rustls, the single whitelisted dependency
+    /// exception, isolated behind mem::guard::tls_scope).
+    pub s3_tls: bool,
+    /// Extra PEM root certificates for `s3_tls` (self-signed test
+    /// endpoints); empty = the compiled-in Mozilla roots alone.
+    pub s3_tls_ca_file: String,
+    /// Byte budget for the isolated TLS component's allocations.
+    pub tls_pool_bytes: usize,
 }
 
 impl Config {
@@ -144,6 +152,9 @@ impl Config {
             s3_secret_key: String::new(),
             s3_head_bytes: 16 * KIB,
             s3_response_bytes: 4 * MIB,
+            s3_tls: false,
+            s3_tls_ca_file: String::new(),
+            tls_pool_bytes: 4 * MIB,
         }
     }
 
@@ -252,6 +263,20 @@ impl Config {
                 "s3_secret_key" => config.s3_secret_key = value.to_string(),
                 "s3_head_bytes" => config.s3_head_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "s3_response_bytes" => config.s3_response_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "s3_tls" => {
+                    config.s3_tls = match value {
+                        "on" | "true" => true,
+                        "off" | "false" => false,
+                        other => {
+                            return Err(ConfigError::at(
+                                line_no,
+                                format!("s3_tls must be on or off, got '{other}'"),
+                            ))
+                        }
+                    }
+                }
+                "s3_tls_ca_file" => config.s3_tls_ca_file = value.to_string(),
+                "tls_pool_bytes" => config.tls_pool_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }

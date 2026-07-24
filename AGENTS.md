@@ -43,7 +43,10 @@ These reinforce, and are subordinate to, the Boyscout Rule.
 - **Provenance required.** Never state facts unsourced; downloaded artifacts need
   pinned-commit provenance metadata.
 - **Static-memory discipline.** No heap allocation after startup; allocation-free sorts;
-  exhausting any pool is a loud error, never growth. Only runtime dependency is `libc`.
+  exhausting any pool is a loud error, never growth. Runtime dependencies are `libc` and
+  the isolated `rustls` TLS component (the one whitelisted exception — every call runs
+  inside `mem::guard::tls_scope`, charged against `tls_pool_bytes`, aborting loudly past
+  it; see PLAN.md Stage G).
 - **Docs:** update `PLAN.md` and `BUGS.md` in the same PR as the work. No phase numbers or
   BUGS IDs in source or code comments — the "why" belongs in commit messages.
 - **Names are spelled out.** No non-obvious abbreviations: `interval` not `iv`, `buffer`

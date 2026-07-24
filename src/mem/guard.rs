@@ -28,6 +28,37 @@ thread_local! {
     // const-initialized and droppable-free: accessing it never allocates,
     // which matters because it is read on every allocation.
     static FORBIDDEN: Cell<bool> = const { Cell::new(false) };
+    // Inside a [`tls_scope`]: allocations are permitted post-freeze but
+    // count against the global TLS pool budget.
+    static TLS_SCOPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Byte budget for the isolated TLS component (rustls), set once at startup;
+/// `u64::MAX` (the default) means unconfigured, as in tests.
+static TLS_BUDGET: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Live bytes the TLS component holds (allocations minus frees, both counted
+/// only inside scopes — which is why every rustls call site, drops included,
+/// enters through [`tls_scope`]).
+static TLS_USED: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_tls_budget(bytes: u64) {
+    TLS_BUDGET.store(bytes, Ordering::SeqCst);
+}
+
+/// Runs `f` with heap allocation permitted (even post-freeze) and charged to
+/// the TLS pool. This is the *only* door the TLS dependency is allowed
+/// through: exceeding the pool aborts as loudly as any other post-freeze
+/// allocation.
+pub fn tls_scope<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TLS_SCOPE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TLS_SCOPE.with(|c| c.replace(true));
+    let _restore = Restore(prev);
+    f()
 }
 
 /// Marks startup as complete. Every subsequent heap allocation in any
@@ -60,6 +91,23 @@ pub fn violations() -> u64 {
 
 #[cold]
 #[inline(never)]
+fn tls_fault() {
+    if COUNT_ONLY.load(Ordering::SeqCst) {
+        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+        return;
+    }
+    if std::thread::panicking() {
+        return;
+    }
+    let msg: &[u8] = b"pos3ql: TLS pool exhausted (tls_pool_bytes); aborting\n";
+    unsafe {
+        libc::write(2, msg.as_ptr().cast(), msg.len());
+    }
+    std::process::abort();
+}
+
+#[cold]
+#[inline(never)]
 fn fault() {
     if COUNT_ONLY.load(Ordering::SeqCst) {
         VIOLATIONS.fetch_add(1, Ordering::SeqCst);
@@ -85,29 +133,50 @@ fn fault() {
 }
 
 #[inline]
-fn check() {
+fn check(size: usize) {
+    if TLS_SCOPE.with(|c| c.get()) {
+        // Permitted, but charged: the TLS pool is the one bounded arena the
+        // isolated dependency draws from.
+        let used = TLS_USED.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+        if used > TLS_BUDGET.load(Ordering::Relaxed) {
+            tls_fault();
+        }
+        return;
+    }
     if FROZEN.load(Ordering::Relaxed) || FORBIDDEN.with(|c| c.get()) {
         fault();
     }
 }
 
+#[inline]
+fn credit(size: usize) {
+    if TLS_SCOPE.with(|c| c.get()) {
+        // Saturating: a non-TLS allocation freed inside a scope must not
+        // wrap the counter into a spurious pool-exhaustion abort.
+        let _ = TLS_USED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(size as u64))
+        });
+    }
+}
+
 unsafe impl GlobalAlloc for GuardedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        check();
+        check(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        check();
+        check(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        check();
+        check(new_size.saturating_sub(layout.size()));
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        credit(layout.size());
         unsafe { System.dealloc(ptr, layout) }
     }
 }

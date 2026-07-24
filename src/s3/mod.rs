@@ -1,5 +1,6 @@
 //! S3-compatible object storage client: hand-rolled HTTP/1.1 over a
-//! blocking, keep-alive TCP connection, signed with SigV4. Plaintext HTTP —
+//! blocking, keep-alive TCP connection, signed with SigV4. Plaintext HTTP or
+//! TLS (the isolated rustls door in [`tls`]) —
 //! development targets MinIO; TLS to public endpoints is an explicitly
 //! deferred decision (never hand-rolled).
 //!
@@ -35,6 +36,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum S3SetupError {
     Budget(BudgetError),
     Resolve(String, std::io::Error),
+    Tls(String),
 }
 
 impl std::fmt::Display for S3SetupError {
@@ -42,6 +44,7 @@ impl std::fmt::Display for S3SetupError {
         match self {
             Self::Budget(e) => write!(f, "{e}"),
             Self::Resolve(endpoint, e) => write!(f, "cannot resolve s3_endpoint '{endpoint}': {e}"),
+            Self::Tls(message) => write!(f, "tls: {message}"),
         }
     }
 }
@@ -55,7 +58,10 @@ impl From<BudgetError> for S3SetupError {
 }
 
 #[derive(Debug)]
-#[expect(
+// `allow`, not `expect`: whether the lint fires depends on the clippy
+// version's size thresholds (the inline detail field sits near them), and an
+// unfulfilled expectation is itself an error under -D warnings.
+#[allow(
     clippy::large_enum_variant,
     reason = "error text is carried inline on the stack; boxing would heap-allocate"
 )]
@@ -63,7 +69,13 @@ pub enum S3Error {
     /// Non-2xx status; message holds the beginning of the error body.
     Status { code: u16, message: StackStr<256> },
     /// Connection-level failure after retries.
-    Io { context: &'static str, kind: std::io::ErrorKind },
+    Io {
+        context: &'static str,
+        kind: std::io::ErrorKind,
+        /// The source error's own words — a TLS failure names its cause here
+        /// (kind alone reduces a certificate rejection to `InvalidData`).
+        detail: StackStr<160>,
+    },
     /// Response exceeded the fixed response buffer.
     ResponseTooLarge { content_length: usize, capacity: usize },
     /// Malformed HTTP from the server.
@@ -86,7 +98,13 @@ impl std::fmt::Display for S3Error {
             Self::Status { code, message } => {
                 write!(f, "object store returned {code}: {}", message.as_str())
             }
-            Self::Io { context, kind } => write!(f, "object store i/o ({context}): {kind:?}"),
+            Self::Io { context, kind, detail } => {
+                if detail.as_str().is_empty() {
+                    write!(f, "object store i/o ({context}): {kind:?}")
+                } else {
+                    write!(f, "object store i/o ({context}): {}", detail.as_str())
+                }
+            }
             Self::ResponseTooLarge {
                 content_length,
                 capacity,
@@ -114,6 +132,8 @@ pub struct GetResult {
     pub etag: StackStr<80>,
 }
 
+pub(crate) mod tls;
+
 pub struct S3Client {
     host_header: String,
     /// Resolved once at startup: `TcpStream::connect` on a string would
@@ -125,7 +145,9 @@ pub struct S3Client {
     region: String,
     access_key: String,
     secret_key: String,
-    stream: Option<TcpStream>,
+    stream: Option<tls::Transport>,
+    /// TLS client state when `s3_tls` is on (built at startup).
+    tls_context: Option<tls::TlsContext>,
     head: FixedBuf,
     body: FixedBuf,
     clock: fn() -> i64,
@@ -168,6 +190,19 @@ impl S3Client {
             access_key: config.s3_access_key.clone(),
             secret_key: config.s3_secret_key.clone(),
             stream: None,
+            tls_context: if config.s3_tls {
+                let host = config
+                    .s3_endpoint
+                    .rsplit_once(':')
+                    .map(|(h, _)| h)
+                    .unwrap_or(config.s3_endpoint.as_str());
+                Some(
+                    tls::build_context(host, &config.s3_tls_ca_file)
+                        .map_err(S3SetupError::Tls)?,
+                )
+            } else {
+                None
+            },
             head: FixedBuf::new(budget, "s3_head", config.s3_head_bytes)?,
             body: FixedBuf::new(budget, "s3_response", config.s3_response_bytes)?,
             clock: system_clock,
@@ -201,7 +236,7 @@ impl S3Client {
         content_length: u64,
         payload_sha256_hex: &str,
         precondition: Precondition,
-        mut write_body: impl FnMut(&mut TcpStream) -> std::io::Result<()>,
+        mut write_body: impl FnMut(&mut tls::Transport) -> std::io::Result<()>,
     ) -> Result<StackStr<80>, S3Error> {
         let mut last: Option<S3Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
@@ -222,7 +257,7 @@ impl S3Client {
                 let stream = self.stream.as_mut().expect("connected");
                 write_body(stream)
                     .and_then(|()| stream.flush())
-                    .map_err(|e| S3Error::Io { context: "send body", kind: e.kind() })?;
+                    .map_err(|e| S3Error::Io { context: "send body", kind: e.kind(), detail: stack_format!(160, "{e}") })?;
                 self.head.clear();
                 self.body.clear();
                 read_response(stream, &mut self.head, &mut self.body)
@@ -396,7 +431,7 @@ impl S3Client {
         let send = stream.write_all(body).and_then(|()| stream.flush());
         if let Err(e) = send {
             self.stream = None;
-            return Err(S3Error::Io { context: "send body", kind: e.kind() });
+            return Err(S3Error::Io { context: "send body", kind: e.kind(), detail: stack_format!(160, "{e}") });
         }
 
         // Receive: reuse `head` for the response head.
@@ -505,6 +540,7 @@ impl S3Client {
             move |e: std::io::Error| S3Error::Io {
                 context,
                 kind: e.kind(),
+                detail: stack_format!(160, "{e}"),
             }
         };
         if self.stream.is_none() {
@@ -512,12 +548,18 @@ impl S3Client {
             stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(io("timeout"))?;
             stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(io("timeout"))?;
             stream.set_nodelay(true).map_err(io("nodelay"))?;
-            self.stream = Some(stream);
+            self.stream = Some(match &self.tls_context {
+                Some(context) => {
+                    tls::Transport::tls(stream, &context.config, &context.server_name)
+                        .map_err(io("tls"))?
+                }
+                None => tls::Transport::plain(stream),
+            });
         }
         let stream = self.stream.as_mut().expect("connected above");
         if let Err(e) = stream.write_all(self.head.readable()) {
             self.stream = None;
-            return Err(S3Error::Io { context: "send head", kind: e.kind() });
+            return Err(S3Error::Io { context: "send head", kind: e.kind(), detail: stack_format!(160, "{e}") });
         }
         Ok(())
     }
@@ -525,7 +567,7 @@ impl S3Client {
 
 /// Reads one HTTP/1.1 response; the body lands in `body`.
 fn read_response(
-    stream: &mut TcpStream,
+    stream: &mut tls::Transport,
     head: &mut FixedBuf,
     body: &mut FixedBuf,
 ) -> Result<GetResult, S3Error> {
@@ -541,11 +583,13 @@ fn read_response(
         let n = stream.read(space).map_err(|e| S3Error::Io {
             context: "read head",
             kind: e.kind(),
+            detail: stack_format!(160, "{e}"),
         })?;
         if n == 0 {
             return Err(S3Error::Io {
                 context: "read head",
                 kind: std::io::ErrorKind::UnexpectedEof,
+                detail: StackStr::new(),
             });
         }
         head.advance(n);
@@ -575,11 +619,13 @@ fn read_response(
             let n = stream.read(&mut space[..want]).map_err(|e| S3Error::Io {
                 context: "read body",
                 kind: e.kind(),
+                detail: stack_format!(160, "{e}"),
             })?;
             if n == 0 {
                 return Err(S3Error::Io {
                     context: "read body",
                     kind: std::io::ErrorKind::UnexpectedEof,
+                    detail: StackStr::new(),
                 });
             }
             body.advance(n);
@@ -606,14 +652,14 @@ fn read_response(
 /// bounded by the response buffer — a loud [`S3Error::ResponseTooLarge`], as
 /// for a plain body.
 fn read_chunked_body(
-    stream: &mut TcpStream,
+    stream: &mut tls::Transport,
     leftover: &[u8],
     body: &mut FixedBuf,
 ) -> Result<(), S3Error> {
     // Bytes that arrived with the head drain first, then the socket.
     struct Feed<'a> {
         leftover: &'a [u8],
-        stream: &'a mut TcpStream,
+        stream: &'a mut tls::Transport,
     }
     impl Feed<'_> {
         fn read(&mut self, out: &mut [u8]) -> Result<usize, S3Error> {
@@ -625,7 +671,7 @@ fn read_chunked_body(
             }
             self.stream
                 .read(out)
-                .map_err(|e| S3Error::Io { context: "read chunk", kind: e.kind() })
+                .map_err(|e| S3Error::Io { context: "read chunk", kind: e.kind(), detail: stack_format!(160, "{e}") })
         }
     }
     fn fill(feed: &mut Feed, carry: &mut [u8; 512], carry_len: &mut usize) -> Result<(), S3Error> {
@@ -634,6 +680,7 @@ fn read_chunked_body(
             return Err(S3Error::Io {
                 context: "read chunk",
                 kind: std::io::ErrorKind::UnexpectedEof,
+                detail: StackStr::new(),
             });
         }
         *carry_len += n;
@@ -715,6 +762,7 @@ fn read_chunked_body(
                 return Err(S3Error::Io {
                     context: "read chunk",
                     kind: std::io::ErrorKind::UnexpectedEof,
+                    detail: StackStr::new(),
                 });
             }
             body.advance(n);
@@ -835,6 +883,123 @@ mod tests {
             stream.write_all(respond.as_bytes()).unwrap();
         });
         (port, handle)
+    }
+
+    #[test]
+    fn tls_round_trip() {
+        // An in-process rustls server (the dependency's own server side — no
+        // new dev dependency) answers one canned S3 response over TLS; the
+        // client connects with s3_tls on, trusting the checked-in self-signed
+        // certificate via s3_tls_ca_file (provenance: tests/data/README.md).
+        use std::sync::Arc;
+        let cert_pem = std::fs::read_to_string("tests/data/tls-test-cert.pem").unwrap();
+        let key_pem = std::fs::read_to_string("tests/data/tls-test-key.pem").unwrap();
+        let cert_der = {
+            let mut ders = Vec::new();
+            let mut in_block = false;
+            let mut b64 = String::new();
+            for line in cert_pem.lines() {
+                let line = line.trim();
+                if line.starts_with("-----BEGIN") {
+                    in_block = true;
+                    b64.clear();
+                } else if line.starts_with("-----END") {
+                    in_block = false;
+                    ders.push(b64.clone());
+                } else if in_block {
+                    b64.push_str(line);
+                }
+            }
+            test_b64(&ders[0])
+        };
+        let key_der = {
+            let mut b64 = String::new();
+            let mut in_block = false;
+            for line in key_pem.lines() {
+                let line = line.trim();
+                if line.starts_with("-----BEGIN") {
+                    in_block = true;
+                } else if line.starts_with("-----END") {
+                    in_block = false;
+                } else if in_block {
+                    b64.push_str(line);
+                }
+            }
+            test_b64(&b64)
+        };
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap(),
+            )
+            .unwrap();
+        let server_config = Arc::new(server_config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let session = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(session, stream);
+            // Read the request head (ignore its content).
+            let mut buf = [0u8; 4096];
+            let mut head = Vec::new();
+            loop {
+                let n = std::io::Read::read(&mut tls, &mut buf).unwrap();
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            std::io::Write::write_all(
+                &mut tls,
+                b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\netag: \"t\"\r\n\r\nover tls!",
+            )
+            .unwrap();
+        });
+        let mut config = test_config(port);
+        config.s3_tls = true;
+        config.s3_tls_ca_file = "tests/data/tls-test-cert.pem".to_string();
+        // The certificate carries an IP SAN for exactly this: `localhost`
+        // may resolve to ::1 while the listener binds 127.0.0.1.
+        config.s3_endpoint = format!("127.0.0.1:{port}");
+        let mut budget = Budget::new(1 << 20);
+        let mut client = S3Client::new(&config, &mut budget).unwrap();
+        client.with_clock(|| 1_440_938_160);
+        client.get("k", None).unwrap();
+        assert_eq!(client.body_bytes(), b"over tls!");
+        handle.join().unwrap();
+    }
+
+    /// Test-local base64 (the module under test has its own in tls.rs, kept
+    /// private there).
+    fn test_b64(text: &str) -> Vec<u8> {
+        fn value(c: u8) -> u8 {
+            match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0xFF,
+            }
+        }
+        let mut out = Vec::new();
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for &c in text.as_bytes() {
+            if c == b'=' {
+                break;
+            }
+            let v = value(c);
+            assert_ne!(v, 0xFF);
+            acc = (acc << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        out
     }
 
     #[test]

@@ -33,10 +33,10 @@ pub fn check_unique(
     if !any_unique {
         return Ok(());
     }
-    let table = storage.table(table_index);
-    for (&rowid, state) in table.rows.iter() {
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         }
         // Check both the committed image and any pending image: a commit
         // of either would collide.
@@ -86,7 +86,8 @@ pub fn check_unique(
                 ));
             }
         }
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 
@@ -168,10 +169,10 @@ fn tuple_uniqueness(
     if columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
     }
-    let table = storage.table(table_index);
-    for (&rowid, state) in table.rows.iter() {
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         }
         for (home, pending_of) in [
             (state.committed, None),
@@ -208,7 +209,8 @@ fn tuple_uniqueness(
                 ));
             }
         }
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 
@@ -325,9 +327,12 @@ fn parent_has_key(
     child_values: &[Datum],
     txid: u32,
 ) -> Result<bool, SqlError> {
-    let table = storage.table(parent_index);
-    for (&rowid, state) in table.rows.iter() {
-        let Some(home) = state.visible_to(txid) else { continue };
+    let mut found = false;
+    storage.for_each_row_state(parent_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        let Some(home) = state.visible_to(txid) else {
+            return Ok(ControlFlow::Continue(()));
+        };
         let all_eq = storage.with_row_bytes(parent_index, rowid, home, |bytes| {
             let mut prow = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, parent_schema, &mut prow)?;
@@ -339,10 +344,12 @@ fn parent_has_key(
             }))
         })?;
         if all_eq {
-            return Ok(true);
+            found = true;
+            return Ok(ControlFlow::Break(()));
         }
-    }
-    Ok(false)
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(found)
 }
 
 /// Referential-action cascades can chase foreign keys through many tables
@@ -420,21 +427,21 @@ pub(crate) fn apply_fk_parent_actions(
                     })
             };
             let mut n_match = 0usize;
-            {
-                let table = storage.table(child_index);
-                for (&rowid, state) in table.rows.iter() {
-                    let Some(home) = state.visible_to(txn.txid) else { continue };
-                    let is_match =
-                        storage.with_row_bytes(child_index, rowid, home, |bytes| {
-                            let mut crow = [Datum::Null; MAX_COLUMNS];
-                            rowenc::decode(bytes, cschema, &mut crow)?;
-                            Ok(refers(&crow[..cdef.n_columns]))
-                        })?;
-                    if is_match {
-                        n_match += 1;
-                    }
+            storage.for_each_row_state(child_index, &mut |rowid, state| {
+                use core::ops::ControlFlow;
+                let Some(home) = state.visible_to(txn.txid) else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                let is_match = storage.with_row_bytes(child_index, rowid, home, |bytes| {
+                    let mut crow = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, cschema, &mut crow)?;
+                    Ok(refers(&crow[..cdef.n_columns]))
+                })?;
+                if is_match {
+                    n_match += 1;
                 }
-            }
+                Ok(ControlFlow::Continue(()))
+            })?;
             if n_match == 0 {
                 continue;
             }
@@ -462,12 +469,14 @@ pub(crate) fn apply_fk_parent_actions(
                 })?;
             {
                 let mut at = 0usize;
-                let table = storage.table(child_index);
-                for (rowid, state) in table.rows.iter() {
-                    let Some(home) = state.visible_to(txn.txid) else { continue };
+                storage.for_each_row_state(child_index, &mut |rowid, state| {
+                    use core::ops::ControlFlow;
+                    let Some(home) = state.visible_to(txn.txid) else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
                     // The cascade mutates storage below, so a matching row is
                     // copied into the arena wherever its bytes live.
-                    let bytes = storage.row_bytes(child_index, *rowid, home, arena)?;
+                    let bytes = storage.row_bytes(child_index, rowid, home, arena)?;
                     let mut crow = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, cschema, &mut crow)?;
                     if refers(&crow[..cdef.n_columns]) {
@@ -477,10 +486,11 @@ pub(crate) fn apply_fk_parent_actions(
                                 "foreign key cascade exceeds the statement arena"
                             )
                         })?;
-                        matches[at] = (*rowid, &*copy);
+                        matches[at] = (rowid, &*copy);
                         at += 1;
                     }
-                }
+                    Ok(ControlFlow::Continue(()))
+                })?;
             }
 
             let child_schema = cdef.schema.as_str();

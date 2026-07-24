@@ -465,11 +465,11 @@ fn find_conflict(
     values: &[Datum],
     txid: u32,
 ) -> Option<u64> {
-    let table = storage.table(table_index);
-
-    for (&rowid, state) in table.rows.iter() {
+    let mut found: Option<u64> = None;
+    let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
         let Some(home) = state.visible_to(txid) else {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         };
         let hit = storage
             .with_row_bytes(table_index, rowid, home, |bytes| {
@@ -501,10 +501,12 @@ fn find_conflict(
             })
             .unwrap_or(false);
         if hit {
-            return Some(rowid);
+            found = Some(rowid);
+            return Ok(ControlFlow::Break(()));
         }
-    }
-    None
+        Ok(ControlFlow::Continue(()))
+    });
+    found
 }
 
 /// Column lookup for ON CONFLICT DO UPDATE: `excluded.<col>` resolves to the
@@ -1337,8 +1339,11 @@ pub fn create_index(
         // registered index (all borrows shared); a conflict is deferred so the
         // rollback drop_index (a mutable borrow) runs after the scan.
         let mut conflict: Option<SqlError> = None;
-        for (&rowid, state) in storage.table(table_index).rows.iter() {
-            let Some(home) = state.committed else { continue };
+        let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(home) = state.committed else {
+                return Ok(ControlFlow::Continue(()));
+            };
             // The whole check runs inside the fetch: the decoded values borrow
             // the fetched bytes, and the re-scan's own fetches nest into the
             // spill reader's second scratch.
@@ -1358,9 +1363,10 @@ pub fn create_index(
                 )
             }) {
                 conflict = Some(e);
-                break;
+                return Ok(ControlFlow::Break(()));
             }
-        }
+            Ok(ControlFlow::Continue(()))
+        });
         if let Some(e) = conflict {
             storage.rollback_index_create(slot);
             return sql_fail(e);
@@ -2182,16 +2188,18 @@ pub fn truncate(
         let mut rowids: [u64; 4096] = [0; 4096];
         loop {
             let mut count = 0usize;
-            for (rowid, state) in storage.table(table_index).rows.iter() {
+            let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+                use core::ops::ControlFlow;
                 if state.visible_to(txn.txid).is_none() {
-                    continue;
+                    return Ok(ControlFlow::Continue(()));
                 }
                 if count == rowids.len() {
-                    break;
+                    return Ok(ControlFlow::Break(()));
                 }
-                rowids[count] = *rowid;
+                rowids[count] = rowid;
                 count += 1;
-            }
+                Ok(ControlFlow::Continue(()))
+            });
             if count == 0 {
                 break;
             }
@@ -2423,17 +2431,25 @@ pub fn alter_table(
     // Collect (rowid, old committed loc).
     let mut row_count = 0usize;
     {
-        let table = storage.table(table_index);
-        for (&rowid, state) in table.rows.iter() {
-            let Some(loc) = state.committed else { continue };
+        let mut overflow = false;
+        let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(loc) = state.committed else {
+                return Ok(ControlFlow::Continue(()));
+            };
             if scratch.push((rowid, loc)).is_err() {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "ALTER touches more than {} rows",
-                    scratch.capacity()
-                ));
+                overflow = true;
+                return Ok(ControlFlow::Break(()));
             }
             row_count += 1;
+            Ok(ControlFlow::Continue(()))
+        });
+        if overflow {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "ALTER touches more than {} rows",
+                scratch.capacity()
+            ));
         }
     }
     let _ = row_count;
@@ -2696,12 +2712,13 @@ fn collect_matches<'a>(
     scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<(), SqlError> {
     scratch.clear();
-    let table = storage.table(table_index);
-    for (&rowid, state) in table.rows.iter() {
+    let def = &storage.table(table_index).def;
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
         let Some(loc) = state.visible_to(txid) else {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         };
-        if row_matches(storage, table_index, rowid, &table.def, schema, loc, where_clause, arena, params, hooks)? {
+        if row_matches(storage, table_index, rowid, def, schema, loc, where_clause, arena, params, hooks)? {
             scratch.push((rowid, loc)).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2710,7 +2727,8 @@ fn collect_matches<'a>(
                 )
             })?;
         }
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 
@@ -2731,10 +2749,10 @@ fn collect_join_matches<'a>(
     scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<(), SqlError> {
     scratch.clear();
-    let table = storage.table(table_index);
-    for (&rowid, state) in table.rows.iter() {
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
         let Some(loc) = state.visible_to(txid) else {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         };
         // Consume-in-place, as in row_matches: the joined-row probe reads
         // this row's values only while it runs.
@@ -2755,7 +2773,8 @@ fn collect_join_matches<'a>(
                 )
             })?;
         }
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 

@@ -1329,6 +1329,45 @@ impl Storage {
     /// The bytes of a visible row, wherever they live: a heap row borrows the
     /// heap directly; a spilled row is fetched through the cache tiers into
     /// `arena`. The two lifetimes unify, so call sites keep their shapes.
+    /// The one place a table's row states are enumerated — the seam the
+    /// maturity roadmap's "map spills" step flips. Today every row has a map
+    /// entry, so this walks the map; when the map becomes an overlay
+    /// (pending + hot rows over SST-resident cold rows), this is where the
+    /// merged newest-wins enumeration lives, and no caller changes. The
+    /// callback takes the state *by value* for the same reason: an
+    /// SST-resident row's state will be synthesized, not stored. Errors are
+    /// threaded now — enumerating from the bucket can fail — so the flip
+    /// never re-touches a call site.
+    ///
+    /// `Break` stops the walk early; the callback's own error aborts it.
+    pub fn for_each_row_state(
+        &self,
+        table_slot: usize,
+        each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<(), SqlError> {
+        for (&rowid, state) in self.tables[table_slot].rows.iter() {
+            if each(rowid, *state)?.is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// One row's state by id, through the same seam as the enumeration.
+    pub fn row_state(&self, table_slot: usize, rowid: u64) -> Option<RowState> {
+        self.tables[table_slot].rows.get(&rowid).copied()
+    }
+
+    /// How many rows `txid` sees — the `count(*)` fast path, through the
+    /// same seam.
+    pub fn visible_row_count(&self, table_slot: usize, txid: u32) -> usize {
+        self.tables[table_slot]
+            .rows
+            .iter()
+            .filter(|(_, s)| s.visible_to(txid).is_some())
+            .count()
+    }
+
     pub fn row_bytes<'a>(
         &'a self,
         table_slot: usize,

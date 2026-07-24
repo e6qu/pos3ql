@@ -261,6 +261,60 @@ kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
   && ok "commit-durable-on-bucket by default (no drain pause, no checkpoint)" \
   || bad "commit-durable-on-bucket default: '$out'"
 
+step "row count beyond table_rows: the map is an overlay, the bucket is the table"
+# A table_rows far below the dataset: the row map holds only the working
+# set, and reads, counts, updates, deletes and the cold start below all
+# reach entry-less rows through the spill list.
+cat > "$WORK/overlay.conf" <<EOF
+listen_addr = 127.0.0.1:$((PG_PORT + 3))
+data_dir = ${WORK}/overlay-data
+memtable_bytes = 512KiB
+table_rows = 1024
+s3 = on
+s3_endpoint = 127.0.0.1:${MINIO_PORT}
+s3_bucket = pos3ql-external
+s3_prefix = overlay-$$/
+s3_access_key = minioadmin
+s3_secret_key = minioadmin
+work_arena_bytes = 96MiB
+EOF
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/overlay.conf" > "$WORK/overlay.log" 2>&1 &
+OVERLAY_PID=$!
+for i in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+"$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q \
+  -c "CREATE TABLE big (id int PRIMARY KEY, v text)"
+# 5000 rows through a 1024-entry map: batches with checkpoints between, so
+# entries spill and evict as the data outgrows the overlay.
+for batch in 0 1 2 3 4; do
+  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q \
+    -c "INSERT INTO big SELECT $batch * 1000 + g, 'r' || ($batch * 1000 + g) FROM generate_series(0, 999) g" \
+    -c "CHECKPOINT"
+done
+"$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q \
+  -c "DELETE FROM big WHERE id % 100 = 7" \
+  -c "UPDATE big SET v = 'updated' WHERE id = 4321" \
+  -c "CHECKPOINT"
+out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -t -A -F'|' \
+  -c "SELECT (SELECT count(*) FROM big), (SELECT v FROM big WHERE id = 4321), (SELECT count(*) FROM big WHERE id % 100 = 7), (SELECT v FROM big WHERE id = 2500)" 2>&1)
+[[ "$out" == "4950|updated|0|r2500" ]] && ok "5000 rows through a 1024-entry map" \
+  || bad "overlay row count: '$out'"
+kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
+rm -rf "$WORK/overlay-data"
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/overlay.conf" >> "$WORK/overlay.log" 2>&1 &
+OVERLAY_PID=$!
+for i in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -t -A -F'|' \
+  -c "SELECT count(*), (SELECT v FROM big WHERE id = 4321) FROM big" 2>&1 | head -1)
+kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
+[[ "$out" == "4950|updated" ]] && ok "wiped-disk cold start of a dataset larger than table_rows" \
+  || bad "overlay cold start: '$out'"
+
 step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null

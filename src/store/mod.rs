@@ -37,6 +37,7 @@ mod sst;
 mod tiered;
 
 pub(crate) use object::OwnedObjectStore;
+pub(crate) use sst::{block_keys_at, index_block_count, index_block_id};
 pub(crate) use sst::{SstHandle, SstReader};
 pub(crate) use sst::{SstError, SstWriter, MAX_ASSEMBLED};
 pub(crate) use tiered::TieredStore;

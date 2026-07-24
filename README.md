@@ -124,12 +124,12 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   whole duration, but a single very large table's slice still blocks while
   it writes (per-block beats are the roadmap's Stage E). The explicit
   `CHECKPOINT` statement and the cold-start load remain atomic.
-- **The row index must fit RAM.** Row *bytes* spill to the bucket under
-  memory pressure and page back through the RAM/disk caches, but the per-row
-  map (visibility, uniqueness, bookkeeping) stays in RAM, so dataset size is
-  bounded in row *count* (`table_rows`) rather than bytes. Making the map
-  itself block-resident is gap 2 of the *Maturity roadmap* in
-  [PLAN.md](PLAN.md).
+- **The row map is an overlay, not an index.** `table_rows` bounds the
+  *working set* — pending changes plus rows not yet shed under pressure —
+  not the dataset: rows beyond it live only in the bucket's SSTs and are
+  read back through bloom-gated probes and merged walks. A single
+  transaction's touched rows must still fit the map, and with `s3 = off`
+  (no bucket) the map bound is the table bound.
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.

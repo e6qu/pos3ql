@@ -1237,46 +1237,49 @@ Ok(lsn)
         count: u64,
         handle: &SstHandle,
     ) -> Result<(), CheckpointSetupError> {
+        let _ = slot;
+        // The row map is an overlay, not an index: SST-resident rows need no
+        // entries, so loading an SST installs nothing — the spill list alone
+        // makes its rows reachable, and cold start costs O(manifest), not
+        // O(rows). What must still happen here: the SST's root blocks are
+        // verified reachable (fail at startup, not mid-query), and the
+        // rowid floor advances past everything the SST holds so no new row
+        // can collide with a stored one. The last data block's final key is
+        // the SST's maximum, found through the sparse index — three block
+        // reads however large the table. (Per-block checksums verify every
+        // later read; the old whole-SST scan's CRC pass went with it.)
+        let _ = (count, sst_index);
         self.sst_arena.reset();
-        let mut reader = SstReader::new(&self.sst_arena)
+        let index_buf = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| CheckpointSetupError::Corrupt("sst reader scratch"))?;
-        let mut seen = 0u64;
+        let data_buf = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| CheckpointSetupError::Corrupt("sst reader scratch"))?;
         let mut blocks = self.blocks.borrow_mut();
-        let mut failed: Option<CheckpointSetupError> = None;
-        reader
-            .scan(&mut *blocks, handle, 0, u64::MAX, &mut |rowid, row| {
-                if failed.is_some() {
-                    return;
-                }
-                storage.observe_rowid(rowid);
-                match row {
-                    Some(row) => {
-                        let installed = storage.table_mut(slot).rows.insert(
-                            rowid,
-                            crate::storage::RowState::committed_spilled(
-                                row.len() as u32,
-                                sst_index,
-                            ),
-                        );
-                        if installed.is_err() {
-                            failed = Some(CheckpointSetupError::Corrupt(
-                                "sst rows exceed table_rows",
-                            ));
-                        }
-                    }
-                    None => {
-                        let _ = storage.table_mut(slot).rows.remove(&rowid);
-                    }
-                }
-                seen += 1;
-            })
-            .map_err(|_| CheckpointSetupError::Corrupt("sst scan failed"))?;
-        drop(blocks);
-        if let Some(e) = failed {
-            return Err(e);
+        let index_len = blocks
+            .get(&handle.index, index_buf)
+            .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?;
+        let block_count = crate::store::index_block_count(&index_buf[..index_len]);
+        if block_count == 0 {
+            return Err(CheckpointSetupError::Corrupt("sst index names no blocks"));
         }
-        if seen != count {
-            return Err(CheckpointSetupError::Corrupt("sst row count mismatch"));
+        let last_id = crate::store::index_block_id(index_buf, block_count - 1);
+        let data_len = blocks
+            .get(&last_id, data_buf)
+            .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
+        let mut at = 0usize;
+        let mut max_rowid: Option<u64> = None;
+        while let Some((rowid, _, _, next)) = crate::store::block_keys_at(&data_buf[..data_len], at)
+        {
+            max_rowid = Some(rowid);
+            at = next;
+        }
+        drop(blocks);
+        if let Some(rowid) = max_rowid {
+            storage.observe_rowid(rowid);
         }
         Ok(())
     }

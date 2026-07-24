@@ -918,7 +918,32 @@ adaptive-execution capstone. This section is the plan of record for all of it.
    as the LSM forest; block compression and the multi-block index / sized
    filters (the remaining Stage C refinements) ride along since they touch
    the same format.
-   **Status (2026-07-24): the choke points are in** — the first half of the
+   **Status (2026-07-24, later): the overlay is live — a table's row count
+   is no longer bounded by RAM.** The map now holds only the working set:
+   pending changes, heap-resident rows, deletion markers, and whatever hot
+   entries pressure has not yet shed. Everything else lives only in the
+   bucket and is reached through the seam — the merged walk (per-member
+   block cursors leased from a fixed context pool, newest member winning a
+   rowid, tombstones suppressing) for enumeration, bloom-gated point probes
+   for lookups, and synthesis of `RowState` on the way out, so no call site
+   knows the difference. Writes to entry-less rows synthesize their
+   committed home on entry (a pending change must not hide the old image
+   from uniqueness scans); a committed DELETE leaves a shadowing marker
+   until the next publish's install makes the SSTs themselves say deleted
+   (the storage VOPR caught the resurrection the first build without it);
+   map-occupancy pressure now drives spilling exactly as heap pressure does
+   (a table of tiny rows fills its map long before its heap); and cold
+   start installs no entries at all — O(manifest), not O(rows), with the
+   rowid floor read from each SST's last data block in three block reads.
+   Proven by the VOPR with `table_rows` dropped far below the live row
+   count (the overlay sheds and re-fetches constantly under fault storms),
+   and by a run.sh step pushing 5000 rows through a 1024-entry map —
+   deletes, updates, point reads, counts, and a wiped-disk cold start of a
+   dataset larger than the map. Remaining in step 4: the secondary-index
+   LSM forest and block compression (with the multi-block index and sized
+   filters), now follow-ups on top of a settled overlay.
+
+   *Earlier (same day):* **the choke points went in first** — the first half of the
    two-PR shape this step takes (the query.rs-split playbook: mechanical
    seam first, semantics behind it after, each diff-gated). Every consumer
    that walked `Table.rows` by hand — the join scanner, the DML collectors,

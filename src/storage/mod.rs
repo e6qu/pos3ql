@@ -441,12 +441,6 @@ impl RowState {
         }
     }
 
-    pub fn committed_spilled(len: u32, sst: u8) -> Self {
-        Self {
-            committed: Some(RowHome::Spilled { len, sst }),
-            pending: None,
-        }
-    }
 
     /// What transaction `txid` sees: its own pending change, else the
     /// committed image. `None` = row invisible.
@@ -787,6 +781,40 @@ pub(crate) struct SpillReader {
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
     scratch: [std::cell::RefCell<SpillScratch>; 2],
+    /// Merged-enumeration contexts: one per concurrently-live row-state
+    /// walk (a join scans a table per depth, and a constraint scan can run
+    /// inside another walk's callback). Each holds a resident data block
+    /// per spill-list member plus an index buffer for cursor advances.
+    /// Exhaustion is a loud error naming the bound.
+    scan_contexts: [std::cell::RefCell<ScanContext>; SCAN_CONTEXTS],
+}
+
+/// How many row-state walks may be live at once: a full join
+/// ([`crate::sql::query::MAX_JOIN_TABLES`] deep), plus a constraint or
+/// validation scan running inside the innermost callback, with headroom.
+const SCAN_CONTEXTS: usize = 12;
+
+/// One merged walk's working memory: the current data block per member and
+/// a shared buffer for index-block navigation on block advances.
+struct ScanContext {
+    member_blocks: [Box<[u8]>; MAX_SPILL_SSTS],
+    index_buf: Box<[u8]>,
+}
+
+/// One member's cursor position inside a merged walk.
+#[derive(Clone, Copy)]
+struct MemberCursor {
+    /// Which data block the cursor stands in (ordinal in the sparse index).
+    ordinal: usize,
+    /// Byte offset of the next entry inside that block.
+    offset: usize,
+    /// Which ordinal the context's resident buffer currently holds, if any,
+    /// and how many bytes of it are the block (the buffer is oversized).
+    loaded: Option<usize>,
+    loaded_len: usize,
+    /// The head entry, parsed: `(rowid, tombstone, len)`.
+    head: Option<(u64, bool, u32)>,
+    done: bool,
 }
 
 /// The reader's owned block buffers (index, data, chain assembly).
@@ -806,6 +834,10 @@ impl SpillReader {
             2 * (2 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
             "spill reader",
         )?;
+        budget.draw(
+            SCAN_CONTEXTS * (MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD,
+            "row-state walk contexts",
+        )?;
         let fresh = || {
             std::cell::RefCell::new(SpillScratch {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -813,7 +845,25 @@ impl SpillReader {
                 assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
             })
         };
-        Ok(Self { blocks, scratch: [fresh(), fresh()] })
+        let context = || {
+            std::cell::RefCell::new(ScanContext {
+                member_blocks: core::array::from_fn(|_| {
+                    vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice()
+                }),
+                index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            })
+        };
+        Ok(Self {
+            blocks,
+            scratch: [fresh(), fresh()],
+            scan_contexts: core::array::from_fn(|_| context()),
+        })
+    }
+
+    /// The budget the contexts and scratch draw, for memory-plan estimates.
+    pub(crate) fn budget_bytes() -> usize {
+        2 * (2 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
+            + SCAN_CONTEXTS * (MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
     }
 }
 
@@ -1329,6 +1379,169 @@ impl Storage {
     /// The bytes of a visible row, wherever they live: a heap row borrows the
     /// heap directly; a spilled row is fetched through the cache tiers into
     /// `arena`. The two lifetimes unify, so call sites keep their shapes.
+    /// The merged walk behind the row-state seam: every SST-resident rowid
+    /// of `slot`'s spill list that no map entry shadows, in ascending rowid
+    /// order — the newest member's verdict wins a rowid, and a tombstone
+    /// verdict suppresses it. Cursors keep one resident data block per
+    /// member (leased from the spill reader's context pool), advancing
+    /// through the sparse index; only keys are parsed here — row bytes are
+    /// fetched later, by `row_bytes`, exactly as for any spilled row.
+    fn spill_merged_walk(
+        &self,
+        slot: usize,
+        emit: &mut dyn FnMut(u64, u32, u8) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<(), SqlError> {
+        let table = &self.tables[slot];
+        let n = table.n_spill_ssts;
+        if n == 0 {
+            return Ok(());
+        }
+        let Some(spill) = &self.spill else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "table has spill SSTs but no spill reader is attached"
+            ));
+        };
+        let Some(mut context) = spill.scan_contexts.iter().find_map(|c| c.try_borrow_mut().ok())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row scans nested deeper than {} concurrent walks",
+                SCAN_CONTEXTS
+            ));
+        };
+        let context = &mut *context;
+        let mut cursors = [MemberCursor {
+            ordinal: 0,
+            offset: 0,
+            loaded: None,
+            loaded_len: 0,
+            head: None,
+            done: false,
+        }; MAX_SPILL_SSTS];
+        for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+            Self::cursor_advance(spill, table, member, cursor, context)?;
+        }
+        loop {
+            let mut min: Option<u64> = None;
+            for cursor in cursors[..n].iter() {
+                if let Some((rowid, ..)) = cursor.head {
+                    min = Some(min.map_or(rowid, |m: u64| m.min(rowid)));
+                }
+            }
+            let Some(rowid) = min else { return Ok(()) };
+            // Newest member holding this rowid decides; every holder steps.
+            let mut verdict: Option<(bool, u32, u8)> = None;
+            for member in (0..n).rev() {
+                if let Some((r, tombstone, len)) = cursors[member].head
+                    && r == rowid
+                {
+                    if verdict.is_none() {
+                        verdict = Some((tombstone, len, member as u8));
+                    }
+                    Self::cursor_advance(spill, table, member, &mut cursors[member], context)?;
+                }
+            }
+            let (tombstone, len, member) = verdict.expect("min came from a head");
+            if !tombstone
+                && self.tables[slot].rows.get(&rowid).is_none()
+                && emit(rowid, len, member)?.is_break()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Steps one member cursor to its next entry, loading blocks (through
+    /// the cache tiers) as it crosses block boundaries.
+    fn cursor_advance(
+        spill: &SpillReader,
+        table: &Table,
+        member: usize,
+        cursor: &mut MemberCursor,
+        context: &mut ScanContext,
+    ) -> Result<(), SqlError> {
+        use crate::store::BlockStore as _;
+        cursor.head = None;
+        if cursor.done {
+            return Ok(());
+        }
+        let handle = table.spill_ssts[member].expect("cursor members exist");
+        loop {
+            if cursor.loaded != Some(cursor.ordinal) {
+                let mut blocks = spill.blocks.borrow_mut();
+                let index_len = blocks
+                    .get(&handle.index, &mut context.index_buf)
+                    .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+                let count = crate::store::index_block_count(&context.index_buf[..index_len]);
+                if cursor.ordinal >= count {
+                    cursor.done = true;
+                    return Ok(());
+                }
+                let id = crate::store::index_block_id(&context.index_buf, cursor.ordinal);
+                cursor.loaded_len = blocks
+                    .get(&id, &mut context.member_blocks[member])
+                    .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+                cursor.loaded = Some(cursor.ordinal);
+                cursor.offset = 0;
+            }
+            match crate::store::block_keys_at(
+                &context.member_blocks[member][..cursor.loaded_len],
+                cursor.offset,
+            ) {
+                Some((rowid, tombstone, len, next)) => {
+                    cursor.offset = next;
+                    cursor.head = Some((rowid, tombstone, len));
+                    return Ok(());
+                }
+                None => {
+                    cursor.ordinal += 1;
+                }
+            }
+        }
+    }
+
+    /// Point probe of the spill list: the newest member's verdict for
+    /// `rowid` — `Some((len, member))` for a live row, `None` for absent or
+    /// tombstoned. Bloom filters make the common absent answer cheap.
+    fn spill_probe(&self, slot: usize, rowid: u64) -> Result<Option<(u32, u8)>, SqlError> {
+        let table = &self.tables[slot];
+        if table.n_spill_ssts == 0 {
+            return Ok(None);
+        }
+        let Some(spill) = &self.spill else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "table has spill SSTs but no spill reader is attached"
+            ));
+        };
+        let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "spill fetches nested deeper than the reader scratch"
+            ));
+        };
+        let scratch = &mut *scratch;
+        let mut reader = crate::store::SstReader::over(
+            &mut scratch.index_buf,
+            &mut scratch.data_buf,
+            &mut scratch.assembly_buf,
+        );
+        for member in (0..table.n_spill_ssts).rev() {
+            let handle = table.spill_ssts[member].expect("counted");
+            let verdict = reader
+                .probe(&mut *spill.blocks.borrow_mut(), &handle, rowid)
+                .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+            match verdict {
+                Some(Some(len)) => return Ok(Some((len, member as u8))),
+                Some(None) => return Ok(None), // tombstoned
+                None => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// The one place a table's row states are enumerated — the seam the
     /// maturity roadmap's "map spills" step flips. Today every row has a map
     /// entry, so this walks the map; when the map becomes an overlay
@@ -1345,27 +1558,46 @@ impl Storage {
         table_slot: usize,
         each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
+        // The overlay first: pending changes and hot rows, whose entries
+        // shadow anything the spill list holds for the same rowid.
         for (&rowid, state) in self.tables[table_slot].rows.iter() {
             if each(rowid, *state)?.is_break() {
-                break;
+                return Ok(());
             }
         }
-        Ok(())
+        // Then everything that lives only in the bucket, synthesized.
+        self.spill_merged_walk(table_slot, &mut |rowid, len, member| {
+            each(
+                rowid,
+                RowState {
+                    committed: Some(RowHome::Spilled { len, sst: member }),
+                    pending: None,
+                },
+            )
+        })
     }
 
     /// One row's state by id, through the same seam as the enumeration.
-    pub fn row_state(&self, table_slot: usize, rowid: u64) -> Option<RowState> {
-        self.tables[table_slot].rows.get(&rowid).copied()
+    pub fn row_state(&self, table_slot: usize, rowid: u64) -> Result<Option<RowState>, SqlError> {
+        if let Some(state) = self.tables[table_slot].rows.get(&rowid) {
+            return Ok(Some(*state));
+        }
+        Ok(self.spill_probe(table_slot, rowid)?.map(|(len, member)| RowState {
+            committed: Some(RowHome::Spilled { len, sst: member }),
+            pending: None,
+        }))
     }
 
-    /// How many rows `txid` sees — the `count(*)` fast path, through the
-    /// same seam.
-    pub fn visible_row_count(&self, table_slot: usize, txid: u32) -> usize {
-        self.tables[table_slot]
-            .rows
-            .iter()
-            .filter(|(_, s)| s.visible_to(txid).is_some())
-            .count()
+    /// How many rows `txid` sees, through the same seam.
+    pub fn visible_row_count(&self, table_slot: usize, txid: u32) -> Result<usize, SqlError> {
+        let mut count = 0usize;
+        self.for_each_row_state(table_slot, &mut |_, state| {
+            if state.visible_to(txid).is_some() {
+                count += 1;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        Ok(count)
     }
 
     pub fn row_bytes<'a>(
@@ -1602,6 +1834,28 @@ impl Storage {
         let table = &mut self.tables[slot];
         table.n_tombstones = 0;
         table.tombstones_overflow = false;
+        // The install that cleared the buffer has made the SSTs themselves
+        // carry (or moot) every recorded deletion, so the shadowing markers
+        // are done shadowing.
+        loop {
+            let mut batch = [0u64; 512];
+            let mut n = 0usize;
+            for (&rowid, state) in table.rows.iter() {
+                if state.committed.is_none() && state.pending.is_none() {
+                    batch[n] = rowid;
+                    n += 1;
+                    if n == batch.len() {
+                        break;
+                    }
+                }
+            }
+            if n == 0 {
+                return;
+            }
+            for &rowid in &batch[..n] {
+                table.rows.remove(&rowid);
+            }
+        }
     }
 
     /// What the next checkpoint should do for this table: a delta flush (the
@@ -1737,24 +1991,99 @@ impl Storage {
             state.pending = Some(PendingChange { txid, loc });
             return Ok(prior);
         }
+        // An absent entry no longer means an absent row: the spill list may
+        // hold its committed image, and that image must ride into the entry
+        // — a pending change with `committed: None` would hide the old
+        // value from uniqueness scans and resurrect wrongly on rollback.
+        let committed = self
+            .spill_probe(table_index, rowid)?
+            .map(|(len, sst)| RowHome::Spilled { len, sst });
+        let table = &mut self.tables[table_index];
         if table.rows.len() == table.rows.capacity() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table row limit reached ({} rows in memtable)",
-                table.rows.capacity()
-            ));
+            // Entries the spill lists reproduce are droppable on demand.
+            self.evict_redundant_entries(table_index);
+            if self.tables[table_index].rows.len()
+                == self.tables[table_index].rows.capacity()
+            {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table row limit reached ({} rows in memtable)",
+                    self.tables[table_index].rows.capacity()
+                ));
+            }
         }
-        table
+        self.tables[table_index]
             .rows
             .insert(
                 rowid,
                 RowState {
-                    committed: None,
+                    committed,
                     pending: Some(PendingChange { txid, loc }),
                 },
             )
             .expect("capacity checked above");
         Ok(None)
+    }
+
+    /// Drops map entries the spill lists reproduce exactly — committed,
+    /// spilled, no pending change. A `Spilled` entry's member is the list's
+    /// newest mention of its rowid (installs are the only thing that moves
+    /// one, and they run at publish), so the merged walk and the point
+    /// probe synthesize the identical state after the entry is gone. This
+    /// is what unbinds a table's row count from `table_rows`: the map holds
+    /// the working set, the bucket holds the rest.
+    pub fn evict_redundant_entries(&mut self, slot: usize) {
+        let table = &mut self.tables[slot];
+        if table.n_spill_ssts == 0 {
+            return;
+        }
+        loop {
+            let mut batch = [0u64; 512];
+            let mut n = 0usize;
+            for (&rowid, state) in table.rows.iter() {
+                if matches!(state.committed, Some(RowHome::Spilled { .. }))
+                    && state.pending.is_none()
+                {
+                    batch[n] = rowid;
+                    n += 1;
+                    if n == batch.len() {
+                        break;
+                    }
+                }
+            }
+            if n == 0 {
+                return;
+            }
+            for &rowid in &batch[..n] {
+                table.rows.remove(&rowid);
+            }
+        }
+    }
+
+    /// Whether any live table's overlay is at least half full — the map's
+    /// analogue of heap pressure. Rows are counted against entries, not
+    /// bytes: a table of tiny rows fills its map long before its heap.
+    pub fn map_pressure(&self) -> bool {
+        self.tables.iter().any(|t| {
+            t.live
+                && t.n_spill_ssts > 0
+                && t.rows.len() * 100 >= t.rows.capacity() * 50
+        })
+    }
+
+    /// The map-occupancy pass after a publish: any table whose overlay is
+    /// half full sheds its redundant entries.
+    pub fn evict_entries(&mut self) {
+        for i in 0..self.tables.len() {
+            let table = &self.tables[i];
+            if !table.live
+                || table.n_spill_ssts == 0
+                || table.rows.len() * 100 < table.rows.capacity() * 50
+            {
+                continue;
+            }
+            self.evict_redundant_entries(i);
+        }
     }
 
     /// Restores a row's pending change to a prior image (for `ROLLBACK TO
@@ -1795,10 +2124,18 @@ impl Storage {
     /// recording the tombstone a later delta checkpoint needs.
     pub fn remove_committed(&mut self, table_index: usize, rowid: u64) {
         let table = &mut self.tables[table_index];
-        if table.rows.remove(&rowid).is_some() {
-            Self::record_tombstone(table, rowid);
-            table.mark_dirty();
+        if table.n_spill_ssts == 0 {
+            if table.rows.remove(&rowid).is_some() {
+                table.mark_dirty();
+            }
+            return;
         }
+        // The spill list may hold this row, so the delete must both
+        // tombstone (for the next flush) and leave a shadowing marker (for
+        // reads until then) — same discipline as a committed DELETE.
+        let _ = table.rows.insert(rowid, RowState { committed: None, pending: None });
+        Self::record_tombstone(table, rowid);
+        table.mark_dirty();
     }
 
     pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32) {
@@ -1811,10 +2148,19 @@ impl Storage {
                 state.committed = p.loc.map(RowHome::Heap);
                 state.pending = None;
                 if state.committed.is_none() {
-                    table.rows.remove(&rowid);
                     // A rowid that ever reached an SST — even if its latest
                     // version was heap-resident — must tombstone, or a cold
-                    // start resurrects the SST's version.
+                    // start resurrects the SST's version. And until that
+                    // tombstone is *flushed*, the entry itself stays behind
+                    // as a marker (`committed: None, pending: None`): the
+                    // merged walk treats any entry as shadowing the spill
+                    // list, so the marker is what keeps the deleted row
+                    // invisible right now. `clear_tombstones` purges the
+                    // markers once an install has made the SSTs themselves
+                    // say deleted.
+                    if table.n_spill_ssts == 0 {
+                        table.rows.remove(&rowid);
+                    }
                     Self::record_tombstone(table, rowid);
                 }
                 table.mark_dirty();

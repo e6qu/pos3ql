@@ -353,7 +353,7 @@ pub(crate) fn scan_source<'a>(
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
             let slot = scope.slots[order[depth]];
-            let count = storage.visible_row_count(slot, txid);
+            let count = storage.visible_row_count(slot, txid)?;
             let ordered = arena
                 .alloc_slice_with(count, |_| (0u64, crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 })))
                 .map_err(|_| arena_full())?;
@@ -456,7 +456,7 @@ pub(crate) fn scan_source<'a>(
         let n_rows = if let Some(rows) = scope.derived[t] {
             rows.len()
         } else {
-            storage.visible_row_count(scope.slots[t], txid)
+            storage.visible_row_count(scope.slots[t], txid)?
         };
         let flags = arena
             .alloc_slice_with(n_rows, |_| false)

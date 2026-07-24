@@ -433,6 +433,42 @@ impl<'a> SstReader<'a> {
         Ok(found.map(|(n, _)| n))
     }
 
+    /// Whether the SST holds `rowid`, without copying its bytes: `None` —
+    /// absent; `Some(None)` — a tombstone; `Some(Some(len))` — a live row of
+    /// `len` bytes. The filter and index gate the read exactly as `get`
+    /// does; this is the existence probe the row-map overlay answers point
+    /// lookups with.
+    pub(crate) fn probe(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+    ) -> Result<Option<Option<u32>>, SstError> {
+        let filter_len = store.get(&handle.filter, self.index_scratch)?;
+        if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
+            return Ok(None);
+        }
+        let count = self.load_index(store, &handle.index)?;
+        let Some(entry) = block_containing(self.index_scratch, count, rowid) else {
+            return Ok(None);
+        };
+        let block_id = block_id_at(self.index_scratch, entry);
+        let data_len = store.get(&block_id, self.data_scratch)?;
+        for entry in DataBlock(&self.data_scratch[..data_len]) {
+            if entry.key == rowid {
+                return Ok(Some(if entry.tombstone {
+                    None
+                } else {
+                    Some(entry.total_len as u32)
+                }));
+            }
+            if entry.key > rowid {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
     /// Streams every row whose key is in `[lo, hi]`, in key order, to `emit`.
     /// Locates the first covering data block through the sparse index, then
     /// reads consecutive data blocks and emits their in-range rows until one
@@ -631,6 +667,32 @@ impl<'a> Iterator for DataBlock<'a> {
             tombstone: false,
         })
     }
+}
+
+/// One `(rowid, tombstone, total_len, next_offset)` step through a data
+/// block's entries without copying row bytes — how the row-map overlay's
+/// merged enumeration walks keys. `at` is the previous step's returned
+/// offset (0 to start); `None` is the block's end.
+pub(crate) fn block_keys_at(block: &[u8], at: usize) -> Option<(u64, bool, u32, usize)> {
+    if at >= block.len() {
+        return None;
+    }
+    let remaining = &block[at..];
+    let before = remaining.len();
+    let mut entries = DataBlock(remaining);
+    let entry = entries.next()?;
+    let consumed = before - entries.0.len();
+    Some((entry.key, entry.tombstone, entry.total_len as u32, at + consumed))
+}
+
+/// The data-block count a fetched index block names.
+pub(crate) fn index_block_count(index_block: &[u8]) -> usize {
+    u32::from_le_bytes(index_block[0..4].try_into().unwrap()) as usize
+}
+
+/// The `i`th data block's identity in a fetched index block.
+pub(crate) fn index_block_id(index_block: &[u8], i: usize) -> BlockId {
+    block_id_at(index_block, i)
 }
 
 /// Copies a chained entry's row into `into`: the inline head chunk, then each

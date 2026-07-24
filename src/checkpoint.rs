@@ -53,9 +53,10 @@ const SQLSTATE_CAS: &str = "40001";
 enum SlotInstall {
     Append(SstHandle),
     Collapse(SstHandle),
-    /// Paced compaction merged the table's two oldest SSTs into one (`None`
-    /// when everything in them was deleted): remap in-memory spill indexes.
-    MergeOldest(Option<SstHandle>),
+    /// Paced compaction merged the adjacent pair at list positions
+    /// (`at`, `at + 1`) into one (`None` when everything in the pair was
+    /// deleted): remap in-memory spill indexes.
+    MergePair { at: usize, handle: Option<SstHandle> },
 }
 
 /// A prior checkpoint's SST reference for one table slot.
@@ -167,18 +168,22 @@ impl Checkpointer {
             + MERGE_SCRATCH_ENTRIES * core::mem::size_of::<(u64, u8)>()
     }
 
-    /// Paced compaction: merges a table's two oldest spill SSTs into one.
-    /// Rows come out in rowid order with the newer member winning duplicates
-    /// and its tombstones consuming the older member's rows; nothing is older
-    /// than member 0, so no tombstone survives into the merged SST. Returns
-    /// `Ok(None)` when the pair's combined entry count exceeds the id
-    /// scratch — the merge is skipped that cycle and the filled-list full
-    /// rewrite remains the safety net — and `Ok(Some(..))` with the merged
-    /// member (itself `None` when every row was deleted) otherwise.
-    fn merge_oldest_pair(
+    /// Paced compaction: merges an adjacent pair of a table's spill SSTs into
+    /// one. Rows come out in rowid order with the newer member winning
+    /// duplicates and its tombstones consuming the older member's rows. When
+    /// the pair sits at the head of the list (`drop_tombstones`) nothing is
+    /// older, so no tombstone survives; anywhere else the surviving
+    /// tombstones are carried into the merged SST — they still shadow earlier
+    /// members at cold start. Returns `Ok(None)` when the pair's combined
+    /// entry count exceeds the id scratch — the merge is skipped that cycle
+    /// and the filled-list full rewrite remains the safety net — and
+    /// `Ok(Some(..))` with the merged member (itself `None` when nothing
+    /// survived) otherwise.
+    fn merge_pair(
         &mut self,
         old0: &PrevSst,
         old1: &PrevSst,
+        drop_tombstones: bool,
     ) -> Result<Option<Option<PrevSst>>, SqlError> {
         if (old0.count + old1.count) as usize > MERGE_SCRATCH_ENTRIES {
             return Ok(None);
@@ -241,8 +246,19 @@ impl Checkpointer {
         for i in 0..keep {
             let (rowid, kind) = self.merge_scratch[i];
             if kind & 2 != 0 {
-                // A tombstone: its row (if any) lost the dedup above, and
-                // member 0 has nothing older to suppress — drop it.
+                // A tombstone: its within-pair row (if any) lost the dedup
+                // above. At the list head nothing older remains to suppress —
+                // drop it; elsewhere it still shadows earlier members at cold
+                // start, so it survives into the merged SST.
+                if !drop_tombstones {
+                    let mut header = [0u8; 8];
+                    header.copy_from_slice(&rowid.to_le_bytes());
+                    crc.update(&header);
+                    writer
+                        .append_tombstone(&mut *self.blocks.borrow_mut(), rowid)
+                        .map_err(sst_to_sql)?;
+                    count += 1;
+                }
                 continue;
             }
             let member = if kind & 1 == 0 { old0 } else { old1 };
@@ -1345,25 +1361,39 @@ impl Checkpointer {
                 }
             };
 
-            // Paced compaction: a list at the trigger merges its two oldest
-            // members — bounded work per table per checkpoint, keeping read
-            // fan-out low without the monolithic full rewrite a filled list
-            // forces.
+            // Paced compaction: a list at the trigger merges its cheapest
+            // adjacent pair — bounded work per table per checkpoint, keeping
+            // read fan-out low without the monolithic full rewrite a filled
+            // list forces. Level-aware selection: the pair with the smallest
+            // combined entry count costs the least write amplification now
+            // and leaves big, settled members to accrete more before their
+            // turn comes.
             let new_list: SlotList = if new_list.n >= MERGE_TRIGGER {
-                let old0 = new_list.ssts[0].expect("counted");
-                let old1 = new_list.ssts[1].expect("counted");
-                match self.merge_oldest_pair(&old0, &old1)? {
+                let at = (0..new_list.n - 1)
+                    .min_by_key(|&i| {
+                        new_list.ssts[i].expect("counted").count
+                            + new_list.ssts[i + 1].expect("counted").count
+                    })
+                    .expect("trigger implies at least one pair");
+                let old0 = new_list.ssts[at].expect("counted");
+                let old1 = new_list.ssts[at + 1].expect("counted");
+                match self.merge_pair(&old0, &old1, at == 0)? {
                     None => new_list, // over id-scratch capacity: skip this cycle
                     Some(merged) => {
                         let mut list = SlotList::EMPTY;
+                        for p in new_list.iter().take(at) {
+                            let _ = list.push(*p);
+                        }
                         if let Some(m) = merged {
                             let _ = list.push(m);
                         }
-                        for p in new_list.iter().skip(2) {
+                        for p in new_list.iter().skip(at + 2) {
                             let _ = list.push(*p);
                         }
-                        self.pending_installs
-                            .push((slot, SlotInstall::MergeOldest(merged.map(|m| m.handle))));
+                        self.pending_installs.push((
+                            slot,
+                            SlotInstall::MergePair { at, handle: merged.map(|m| m.handle) },
+                        ));
                         list
                     }
                 }
@@ -1498,7 +1528,9 @@ impl Checkpointer {
             match install {
                 SlotInstall::Append(h) => storage.append_spill(slot, h),
                 SlotInstall::Collapse(h) => storage.collapse_spill(slot, h),
-                SlotInstall::MergeOldest(h) => storage.merge_oldest_spill(slot, h),
+                SlotInstall::MergePair { at, handle } => {
+                    storage.merge_spill_pair(slot, at, handle)
+                }
             }
             storage.clear_tombstones(slot);
         }

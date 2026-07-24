@@ -92,6 +92,55 @@ impl SlotList {
     }
 }
 
+/// Where a paced merge stands between beats.
+enum MergePhase {
+    /// Building the id schedule: member `rank`'s scan resumes at `resume_lo`.
+    Schedule { rank: u8, resume_lo: u64 },
+    /// Streaming scheduled entries into the merged SST from `cursor`.
+    Write { cursor: usize },
+}
+
+/// A merge in flight across beats: which pair of which table's list, and
+/// the accumulated output bookkeeping. The half-written SST itself lives in
+/// the checkpointer's dedicated merge writer.
+struct MergeJob {
+    slot: usize,
+    at: usize,
+    old0: PrevSst,
+    old1: PrevSst,
+    /// True at the list head: nothing older remains for a tombstone to
+    /// suppress, so none survives the merge.
+    drop_tombstones: bool,
+    phase: MergePhase,
+    schedule_len: usize,
+    count: u64,
+    crc: Crc32c,
+}
+
+/// A finished merge awaiting the next publish, which composes it into the
+/// slot's list — or discards it if a collapse superseded the pair.
+struct CompletedMerge {
+    slot: usize,
+    at: usize,
+    old0: PrevSst,
+    old1: PrevSst,
+    merged: Option<PrevSst>,
+}
+
+/// One merge beat's verdict.
+enum MergeBeatOutcome {
+    Continue,
+    Cancel,
+    Finished(Option<PrevSst>),
+}
+
+/// The adjacent pair's handles at position `at`, if both exist.
+fn pair_at(list: &SlotList, at: usize) -> Option<(SstHandle, SstHandle)> {
+    let a = list.ssts.get(at).copied().flatten()?;
+    let b = list.ssts.get(at + 1).copied().flatten()?;
+    Some((a.handle, b.handle))
+}
+
 pub(crate) struct Checkpointer {
     client: ObjectClient,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
@@ -131,10 +180,24 @@ pub(crate) struct Checkpointer {
     doomed_scratch: Vec<StackStr<64>>,
     /// Sliced-checkpoint sweep state: whether a sweep is mid-flight, the
     /// table generation each slot's slice captured, and which slots were
-    /// sliced this sweep (a paced merge is paid at most once per sweep).
+    /// sliced this sweep.
     sweeping: bool,
     sliced_generation: Vec<u64>,
     sliced_this_sweep: Vec<bool>,
+    /// The slice writer (reset per table) and the merge writer, which holds
+    /// a half-written SST across beats — the reason the writer owns its
+    /// state instead of borrowing an arena.
+    slice_writer: SstWriter,
+    merge_writer: SstWriter,
+    merge_job: Option<MergeJob>,
+    merge_done: Option<CompletedMerge>,
+    /// Fairness toggle: merge beats and sweep beats alternate when both
+    /// want the engine, so neither starves the other.
+    merge_turn: bool,
+    /// Pairs whose scans overflowed the id scratch (their stored counts
+    /// under-reported); remembered per slot so the scheduler stops
+    /// proposing a merge that cannot be scheduled.
+    merge_overflow: Vec<Option<(BlockId, BlockId)>>,
 }
 
 /// One beat's outcome: nothing to publish, a slice written, or the manifest
@@ -170,114 +233,250 @@ const MERGE_TRIGGER: usize = 4;
 /// filled list stays the safety net).
 const MERGE_SCRATCH_ENTRIES: usize = 512 * 1024;
 
+/// How far one merge beat may go — the pause a beat inserts between
+/// statements is a handful of block transfers, never a whole pair. Data
+/// blocks *read* per schedule beat, data blocks *written* per write beat,
+/// and a cheap-entry cap so a tombstone-heavy stretch (which emits no
+/// blocks) still bounds its walking and checksum work.
+const MERGE_SCHEDULE_BEAT_BLOCKS: usize = 8;
+const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
+const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
+
 impl Checkpointer {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         // Two clients: one for manifest/WAL objects, one inside the block
         // stack. The cache tiers draw their own budget in the constructor;
         // this accounts the fixed parts.
         2 * ObjectClient::budget_bytes(config)
+            + 2 * SstWriter::budget_bytes()
             + MANIFEST_BUF_BYTES
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
             + MERGE_SCRATCH_ENTRIES * core::mem::size_of::<(u64, u8)>()
     }
 
-    /// Paced compaction: merges an adjacent pair of a table's spill SSTs into
-    /// one. Rows come out in rowid order with the newer member winning
-    /// duplicates and its tombstones consuming the older member's rows. When
-    /// the pair sits at the head of the list (`drop_tombstones`) nothing is
-    /// older, so no tombstone survives; anywhere else the surviving
-    /// tombstones are carried into the merged SST — they still shadow earlier
-    /// members at cold start. Returns `Ok(None)` when the pair's combined
-    /// entry count exceeds the id scratch — the merge is skipped that cycle
-    /// and the filled-list full rewrite remains the safety net — and
-    /// `Ok(Some(..))` with the merged member (itself `None` when nothing
-    /// survived) otherwise.
-    fn merge_pair(
-        &mut self,
-        old0: &PrevSst,
-        old1: &PrevSst,
-        drop_tombstones: bool,
-    ) -> Result<Option<Option<PrevSst>>, SqlError> {
-        if (old0.count + old1.count) as usize > MERGE_SCRATCH_ENTRIES {
-            return Ok(None);
+    /// One bounded step of the paced merge — the compaction work a beat may
+    /// do between statements. Starting a job, advancing its schedule scan a
+    /// few blocks, streaming a few output blocks, or finishing: each is one
+    /// beat, so a pair of any size merges without ever pausing the engine
+    /// for more than a handful of block transfers.
+    ///
+    /// A job survives publishes (its pair's list positions are stable under
+    /// delta appends, which only extend the tail) and is dropped when a
+    /// collapse or full rewrite supersedes the pair — its blocks sweep as
+    /// orphans. A crash loses only the job's progress, never data.
+    fn merge_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        let Some(mut job) = self.merge_job.take() else {
+            if let Some(job) = self.merge_candidate(storage) {
+                self.merge_scratch.clear();
+                self.merge_writer.reset();
+                self.merge_job = Some(job);
+            }
+            return Ok(());
+        };
+        // The published list must still hold the pair where the job left
+        // it; a collapse or full rewrite replaced it, and with it the merge.
+        let valid = self.prev_ssts.get(job.slot).is_some_and(|list| {
+            pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle))
+        });
+        if !valid {
+            return Ok(());
         }
+        let outcome = match job.phase {
+            MergePhase::Schedule { rank, resume_lo } => {
+                self.merge_schedule_beat(&mut job, rank, resume_lo)?
+            }
+            MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor)?,
+        };
+        match outcome {
+            MergeBeatOutcome::Continue => self.merge_job = Some(job),
+            MergeBeatOutcome::Cancel => {}
+            MergeBeatOutcome::Finished(merged) => {
+                self.merge_done = Some(CompletedMerge {
+                    slot: job.slot,
+                    at: job.at,
+                    old0: job.old0,
+                    old1: job.old1,
+                    merged,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The next pair worth merging: the first live table whose published
+    /// list is at the trigger, taking its cheapest adjacent pair — least
+    /// write amplification now, big settled members left to accrete —
+    /// skipping pairs the id scratch cannot hold (the filled-list full
+    /// rewrite stays the safety net) and pairs whose scans previously
+    /// overflowed it.
+    fn merge_candidate(&self, storage: &Storage) -> Option<MergeJob> {
+        if self.merge_job.is_some() || self.merge_done.is_some() {
+            return None;
+        }
+        for slot in 0..storage.table_count().min(MAX_CKPT_TABLES) {
+            if !storage.table(slot).live {
+                continue;
+            }
+            let Some(list) = self.prev_ssts.get(slot) else { continue };
+            if list.n < MERGE_TRIGGER {
+                continue;
+            }
+            let at = (0..list.n - 1)
+                .min_by_key(|&i| {
+                    list.ssts[i].expect("counted").count
+                        + list.ssts[i + 1].expect("counted").count
+                })
+                .expect("trigger implies at least one pair");
+            let old0 = list.ssts[at].expect("counted");
+            let old1 = list.ssts[at + 1].expect("counted");
+            if (old0.count + old1.count) as usize > MERGE_SCRATCH_ENTRIES {
+                continue;
+            }
+            if self.merge_overflow.get(slot).copied().flatten()
+                == Some((old0.handle.index, old1.handle.index))
+            {
+                continue;
+            }
+            return Some(MergeJob {
+                slot,
+                at,
+                old0,
+                old1,
+                drop_tombstones: at == 0,
+                phase: MergePhase::Schedule { rank: 0, resume_lo: 0 },
+                schedule_len: 0,
+                count: 0,
+                crc: Crc32c::new(),
+            });
+        }
+        None
+    }
+
+    /// Whether compaction has anything to do: a job mid-flight, a finished
+    /// merge awaiting its publish, or a published list at the trigger.
+    pub(crate) fn merge_work_pending(&self, storage: &Storage) -> bool {
+        self.merge_job.is_some()
+            || self.merge_done.is_some()
+            || self.merge_candidate(storage).is_some()
+    }
+
+    /// A schedule beat: scan a bounded stretch of one member, collecting
+    /// `(rowid, source-rank | tombstone-bit)`. When both members are done,
+    /// the transition sorts newer-wins and dedups — one in-place sort, paid
+    /// once per job.
+    fn merge_schedule_beat(
+        &mut self,
+        job: &mut MergeJob,
+        rank: u8,
+        resume_lo: u64,
+    ) -> Result<MergeBeatOutcome, SqlError> {
         self.sst_arena.reset();
         let mut reader = SstReader::new(&self.sst_arena).map_err(sst_to_sql)?;
-        // Pass 1: collect (rowid, source-rank | tombstone-bit) for both
-        // members. Each member's scan emits in rowid order; the sort below
-        // interleaves the two.
-        self.merge_scratch.clear();
-        {
-            let scratch = &mut self.merge_scratch;
-            let mut overflow = false;
-            for (rank, member) in [old0, old1].into_iter().enumerate() {
-                reader
-                    .scan(
-                        &mut *self.blocks.borrow_mut(),
-                        &member.handle,
-                        0,
-                        u64::MAX,
-                        &mut |rowid, bytes| {
-                            if scratch.len() == MERGE_SCRATCH_ENTRIES {
-                                overflow = true;
-                                return;
-                            }
-                            let kind = rank as u8 | (u8::from(bytes.is_none()) << 1);
-                            scratch.push((rowid, kind));
-                        },
-                    )
-                    .map_err(sst_to_sql)?;
+        let member = if rank == 0 { &job.old0 } else { &job.old1 };
+        let scratch = &mut self.merge_scratch;
+        let blocks = &self.blocks;
+        let mut overflow = false;
+        let next = reader
+            .scan_bounded(
+                &mut *blocks.borrow_mut(),
+                &member.handle,
+                resume_lo,
+                MERGE_SCHEDULE_BEAT_BLOCKS,
+                &mut |rowid, tombstone| {
+                    if scratch.len() == MERGE_SCRATCH_ENTRIES {
+                        overflow = true;
+                        return;
+                    }
+                    scratch.push((rowid, rank | (u8::from(tombstone) << 1)));
+                },
+            )
+            .map_err(sst_to_sql)?;
+        if overflow {
+            // The pair's counts under-reported its entries (corruption would
+            // show elsewhere); remember it so the scheduler stops proposing
+            // a merge that cannot be scheduled.
+            if job.slot < self.merge_overflow.len() {
+                self.merge_overflow[job.slot] =
+                    Some((job.old0.handle.index, job.old1.handle.index));
             }
-            if overflow {
-                // Counts under-reported the entries (corruption would show
-                // elsewhere); skip the merge rather than write a partial SST.
-                return Ok(None);
-            }
+            return Ok(MergeBeatOutcome::Cancel);
         }
-        // Newer-wins dedup: sort by (rowid, rank) and keep each rowid's last.
-        self.merge_scratch
-            .sort_unstable_by_key(|&(rowid, kind)| (rowid, kind & 1));
-        let mut keep = 0usize;
-        for i in 0..self.merge_scratch.len() {
-            if keep > 0 && self.merge_scratch[keep - 1].0 == self.merge_scratch[i].0 {
-                self.merge_scratch[keep - 1] = self.merge_scratch[i];
-            } else {
-                self.merge_scratch[keep] = self.merge_scratch[i];
-                keep += 1;
+        job.phase = match (next, rank) {
+            (Some(lo), _) => MergePhase::Schedule { rank, resume_lo: lo },
+            (None, 0) => MergePhase::Schedule { rank: 1, resume_lo: 0 },
+            (None, _) => {
+                // Newer-wins dedup: sort by (rowid, rank), keep each rowid's
+                // last. In-place and allocation-free (unstable sort).
+                self.merge_scratch
+                    .sort_unstable_by_key(|&(rowid, kind)| (rowid, kind & 1));
+                let mut keep = 0usize;
+                for i in 0..self.merge_scratch.len() {
+                    if keep > 0 && self.merge_scratch[keep - 1].0 == self.merge_scratch[i].0 {
+                        self.merge_scratch[keep - 1] = self.merge_scratch[i];
+                    } else {
+                        self.merge_scratch[keep] = self.merge_scratch[i];
+                        keep += 1;
+                    }
+                }
+                job.schedule_len = keep;
+                MergePhase::Write { cursor: 0 }
             }
-        }
-        // Pass 2: stream the surviving rows into the merged SST. Point reads
-        // ride the block cache, so a rowid-ordered walk touches each data
-        // block about once.
-        let mut writer = SstWriter::new(&self.sst_arena).map_err(sst_to_sql)?;
+        };
+        Ok(MergeBeatOutcome::Continue)
+    }
+
+    /// A write beat: stream scheduled entries into the merged SST until a
+    /// few output blocks have been emitted (or a cheap-entry cap trips on a
+    /// tombstone-heavy stretch), then suspend. Point reads ride the block
+    /// cache, so a rowid-ordered walk touches each source block about once
+    /// across the beats.
+    fn merge_write_beat(
+        &mut self,
+        job: &mut MergeJob,
+        cursor: usize,
+    ) -> Result<MergeBeatOutcome, SqlError> {
+        self.sst_arena.reset();
+        let mut reader = SstReader::new(&self.sst_arena).map_err(sst_to_sql)?;
         let row_buf = self
             .sst_arena
             .alloc_slice_with(crate::store::MAX_ASSEMBLED, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "merge scratch exceeds the checkpoint arena"))?;
-        let mut count = 0u64;
-        let mut crc = Crc32c::new();
-        for i in 0..keep {
-            let (rowid, kind) = self.merge_scratch[i];
+        let blocks = &self.blocks;
+        let writer = &mut self.merge_writer;
+        let scratch = &self.merge_scratch;
+        let start_blocks = writer.roster_so_far().len();
+        let mut cursor = cursor;
+        let mut processed = 0usize;
+        while cursor < job.schedule_len {
+            if processed >= MERGE_BEAT_ENTRIES
+                || writer.roster_so_far().len() - start_blocks >= MERGE_WRITE_BEAT_BLOCKS
+            {
+                job.phase = MergePhase::Write { cursor };
+                return Ok(MergeBeatOutcome::Continue);
+            }
+            let (rowid, kind) = scratch[cursor];
+            cursor += 1;
+            processed += 1;
             if kind & 2 != 0 {
-                // A tombstone: its within-pair row (if any) lost the dedup
-                // above. At the list head nothing older remains to suppress —
-                // drop it; elsewhere it still shadows earlier members at cold
+                // A tombstone: its within-pair row (if any) lost the dedup.
+                // At the list head nothing older remains to suppress — drop
+                // it; elsewhere it still shadows earlier members at cold
                 // start, so it survives into the merged SST.
-                if !drop_tombstones {
+                if !job.drop_tombstones {
                     let mut header = [0u8; 8];
                     header.copy_from_slice(&rowid.to_le_bytes());
-                    crc.update(&header);
+                    job.crc.update(&header);
                     writer
-                        .append_tombstone(&mut *self.blocks.borrow_mut(), rowid)
+                        .append_tombstone(&mut *blocks.borrow_mut(), rowid)
                         .map_err(sst_to_sql)?;
-                    count += 1;
+                    job.count += 1;
                 }
                 continue;
             }
-            let member = if kind & 1 == 0 { old0 } else { old1 };
+            let member = if kind & 1 == 0 { &job.old0 } else { &job.old1 };
             let len = reader
-                .get(&mut *self.blocks.borrow_mut(), &member.handle, rowid, row_buf)
+                .get(&mut *blocks.borrow_mut(), &member.handle, rowid, row_buf)
                 .map_err(sst_to_sql)?
                 .ok_or_else(|| {
                     sql_err!(SQLSTATE_IO, "merge lost row {} between scan and read", rowid)
@@ -285,21 +484,25 @@ impl Checkpointer {
             let mut header = [0u8; SST_ENTRY_HEADER];
             header[0..8].copy_from_slice(&rowid.to_le_bytes());
             header[8..12].copy_from_slice(&(len as u32).to_le_bytes());
-            crc.update(&header);
-            crc.update(&row_buf[..len]);
+            job.crc.update(&header);
+            job.crc.update(&row_buf[..len]);
             writer
-                .append(&mut *self.blocks.borrow_mut(), rowid, &row_buf[..len])
+                .append(&mut *blocks.borrow_mut(), rowid, &row_buf[..len])
                 .map_err(sst_to_sql)?;
-            count += 1;
+            job.count += 1;
         }
-        if count == 0 {
-            return Ok(Some(None));
+        if job.count == 0 {
+            return Ok(MergeBeatOutcome::Finished(None));
         }
         let handle = writer
-            .finish(&mut *self.blocks.borrow_mut())
+            .finish(&mut *blocks.borrow_mut())
             .map_err(sst_to_sql)?
             .ok_or_else(|| sql_err!(SQLSTATE_IO, "merge wrote rows but produced no SST"))?;
-        Ok(Some(Some(PrevSst { handle, count, crc: crc.finish() })))
+        Ok(MergeBeatOutcome::Finished(Some(PrevSst {
+            handle,
+            count: job.count,
+            crc: job.crc.finish(),
+        })))
     }
 
     /// Fails when S3 is enabled but credentials are missing — explicitly,
@@ -360,6 +563,12 @@ impl Checkpointer {
             sweeping: false,
             sliced_generation: vec![0; MAX_CKPT_TABLES],
             sliced_this_sweep: vec![false; MAX_CKPT_TABLES],
+            slice_writer: SstWriter::new(),
+            merge_writer: SstWriter::new(),
+            merge_job: None,
+            merge_done: None,
+            merge_turn: false,
+            merge_overflow: vec![None; MAX_CKPT_TABLES],
         })
     }
 
@@ -1174,11 +1383,26 @@ Ok(lsn)
         storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
+        // Merge beats interleave with sweep work — alternating when both
+        // want the engine, so a hot sweep cannot starve compaction and a
+        // long merge cannot starve publishes. A finished merge makes a
+        // sweep due even at an unchanged lsn: its install needs a publish.
+        let merge_due = self.merge_job.is_some()
+            || (self.merge_done.is_none() && self.merge_candidate(storage).is_some());
+        let sweep_due = self.sweeping
+            || storage.lsn() != self.manifest_lsn
+            || self.manifest_etag.is_none()
+            || self.merge_done.is_some();
+        if merge_due && (self.merge_turn || !sweep_due) {
+            self.merge_turn = false;
+            self.merge_beat(storage)?;
+            return Ok(CheckpointStep::Working);
+        }
+        self.merge_turn = true;
+        if !sweep_due {
+            return Ok(CheckpointStep::Idle);
+        }
         if !self.sweeping {
-            let lsn = storage.lsn();
-            if lsn == self.manifest_lsn && self.manifest_etag.is_some() {
-                return Ok(CheckpointStep::Idle);
-            }
             self.sweeping = true;
             self.sliced_generation.iter_mut().for_each(|g| *g = 0);
             self.sliced_this_sweep.iter_mut().for_each(|s| *s = false);
@@ -1201,22 +1425,11 @@ Ok(CheckpointStep::Published { lsn })
     }
 
     /// Whether `slot` still needs a slice this sweep: it changed since its
-    /// slice (or was never sliced while dirty), or its SST list is at the
-    /// merge trigger and this sweep has not yet paid its one paced merge.
+    /// slice, or was never sliced while dirty. (Compaction is the merge
+    /// job's business, not the sweep's.)
     fn needs_slice(&self, storage: &Storage, slot: usize) -> bool {
         let table = storage.table(slot);
-        if !table.live {
-            return false;
-        }
-        if table.dirty && self.sliced_generation[slot] != table.generation {
-            return true;
-        }
-        let list_len = if self.sliced_this_sweep[slot] {
-            self.prev_scratch.get(slot).map_or(0, |l| l.n)
-        } else {
-            self.prev_ssts.get(slot).map_or(0, |l| l.n)
-        };
-        !self.sliced_this_sweep[slot] && list_len >= MERGE_TRIGGER
+        table.live && table.dirty && self.sliced_generation[slot] != table.generation
     }
 
     /// Assembles and publishes the manifest from the sweep's recorded
@@ -1394,7 +1607,42 @@ Ok(CheckpointStep::Published { lsn })
                 self.prev_scratch[slot] =
                     self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
             }
-            let new_list = self.prev_scratch.get(slot).copied().unwrap_or(SlotList::EMPTY);
+            let mut new_list = self.prev_scratch.get(slot).copied().unwrap_or(SlotList::EMPTY);
+            // A merge finished since the last publish composes here: its
+            // pair still present at its position (a delta only appends at
+            // the tail, so positions are stable under it) means the merged
+            // member replaces the two; a collapse superseded it, and the
+            // merged blocks simply sweep as orphans. Recomputed from the
+            // carried base on every attempt, so a publish retried after a
+            // mid-CAS failure applies it exactly once.
+            if let Some(done) = &self.merge_done
+                && done.slot == slot
+                && pair_at(&new_list, done.at) == Some((done.old0.handle, done.old1.handle))
+            {
+                let mut list = SlotList::EMPTY;
+                for p in new_list.iter().take(done.at) {
+                    let _ = list.push(*p);
+                }
+                if let Some(m) = done.merged {
+                    let _ = list.push(m);
+                }
+                for p in new_list.iter().skip(done.at + 2) {
+                    let _ = list.push(*p);
+                }
+                self.pending_installs
+                    .retain(|(s, i)| !(*s == slot && matches!(i, SlotInstall::MergePair { .. })));
+                self.pending_installs.push((
+                    slot,
+                    SlotInstall::MergePair {
+                        at: done.at,
+                        handle: done.merged.map(|m| m.handle),
+                    },
+                ));
+                new_list = list;
+                if slot < self.prev_scratch.len() {
+                    self.prev_scratch[slot] = new_list;
+                }
+            }
             for (idx, p) in new_list.iter().enumerate() {
                 let h = p.handle;
                 let (mut ih, mut fh, mut rh) = ([0u8; 64], [0u8; 64], [0u8; 64]);
@@ -1538,6 +1786,10 @@ Ok(CheckpointStep::Published { lsn })
             storage.clear_tombstones(slot);
         }
         self.pending_installs.clear();
+        // The completed merge is consumed with the installs — whether it
+        // composed in or a collapse had superseded it, this publish settled
+        // its fate either way.
+        self.merge_done = None;
         // The sweep is complete the instant the installs land: everything
         // after the CAS is cleanup of the superseded generation. Marking it
         // here (not in the caller) is load-bearing — a failure below must
@@ -1642,28 +1894,30 @@ Ok(CheckpointStep::Published { lsn })
                     // roster. A spilled row's bytes come back through the
                     // cache on the way into a full rewrite.
                     self.sst_arena.reset();
-                    let mut writer = SstWriter::new(&self.sst_arena).map_err(sst_to_sql)?;
+                    self.slice_writer.reset();
+                    let writer = &mut self.slice_writer;
+                    let blocks = &self.blocks;
                     let mut ti = 0usize;
                     for &(rowid, home) in sort_scratch.iter() {
                         while ti < tomb_sorted.len() && tomb_sorted[ti] < rowid {
                             writer
-                                .append_tombstone(&mut *self.blocks.borrow_mut(), tomb_sorted[ti])
+                                .append_tombstone(&mut *blocks.borrow_mut(), tomb_sorted[ti])
                                 .map_err(sst_to_sql)?;
                             ti += 1;
                         }
                         storage.with_row_bytes(slot, rowid, home, |row| {
                             writer
-                                .append(&mut *self.blocks.borrow_mut(), rowid, row)
+                                .append(&mut *blocks.borrow_mut(), rowid, row)
                                 .map_err(sst_to_sql)
                         })?;
                     }
                     while ti < tomb_sorted.len() {
                         writer
-                            .append_tombstone(&mut *self.blocks.borrow_mut(), tomb_sorted[ti])
+                            .append_tombstone(&mut *blocks.borrow_mut(), tomb_sorted[ti])
                             .map_err(sst_to_sql)?;
                         ti += 1;
                     }
-                    writer.finish(&mut *self.blocks.borrow_mut()).map_err(sst_to_sql)?
+                    writer.finish(&mut *blocks.borrow_mut()).map_err(sst_to_sql)?
                 };
 
                 // Storage is not touched yet: the list installs (and the
@@ -1698,46 +1952,6 @@ Ok(CheckpointStep::Published { lsn })
                 }
             };
 
-            // Paced compaction: a list at the trigger merges its cheapest
-            // adjacent pair — bounded work per table per checkpoint, keeping
-            // read fan-out low without the monolithic full rewrite a filled
-            // list forces. Level-aware selection: the pair with the smallest
-            // combined entry count costs the least write amplification now
-            // and leaves big, settled members to accrete more before their
-            // turn comes.
-            let new_list: SlotList = if new_list.n >= MERGE_TRIGGER {
-                let at = (0..new_list.n - 1)
-                    .min_by_key(|&i| {
-                        new_list.ssts[i].expect("counted").count
-                            + new_list.ssts[i + 1].expect("counted").count
-                    })
-                    .expect("trigger implies at least one pair");
-                let old0 = new_list.ssts[at].expect("counted");
-                let old1 = new_list.ssts[at + 1].expect("counted");
-                match self.merge_pair(&old0, &old1, at == 0)? {
-                    None => new_list, // over id-scratch capacity: skip this cycle
-                    Some(merged) => {
-                        let mut list = SlotList::EMPTY;
-                        for p in new_list.iter().take(at) {
-                            let _ = list.push(*p);
-                        }
-                        if let Some(m) = merged {
-                            let _ = list.push(m);
-                        }
-                        for p in new_list.iter().skip(at + 2) {
-                            let _ = list.push(*p);
-                        }
-                        self.pending_installs.push((
-                            slot,
-                            SlotInstall::MergePair { at, handle: merged.map(|m| m.handle) },
-                        ));
-                        list
-                    }
-                }
-            } else {
-                new_list
-            };
-
         if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
             self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
         }
@@ -1760,6 +1974,17 @@ Ok(CheckpointStep::Published { lsn })
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "gc scratch"))?;
+        // A merge mid-flight has written blocks no published roster names
+        // yet; sweeping them would destroy the job's progress.
+        if self.merge_job.is_some() {
+            for id in self.merge_writer.roster_so_far() {
+                if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
+                    eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
+                    return Ok(());
+                }
+                self.roster_scratch.push(*id);
+            }
+        }
         for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
             let h = prev.handle;
             if self.roster_scratch.len() + 1 > MAX_KEEP_BLOCKS {

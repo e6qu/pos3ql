@@ -453,9 +453,17 @@ selection followed (2026-07-24): the merge picks the adjacent pair with the
 smallest combined entry count — least write amplification now, big settled
 members left to accrete — and a pair away from the list head keeps its
 surviving tombstones (they still shadow earlier members at cold start), only
-the head merge dropping them. Remaining here: merge pacing across *beats*
-rather than per checkpoint, and the manifest log (below) — low value at
-today's table counts, noted for the day manifests are large.
+the head merge dropping them. **Beat pacing landed (2026-07-24, maturity-roadmap step 3):** the merge left
+the checkpoint entirely and became a background *job* crossing beats — its
+id schedule built a few block reads per beat, its output streamed a few
+block writes per beat, alternating fairly with sweep work, surviving
+publishes (a delta only appends at the tail, so the pair's positions hold),
+cancelled without loss when a collapse supersedes its pair, and its
+half-written SST kept alive in the garbage sweep's keep-set until the
+result publishes. The `SstWriter` now owns its state (buffers + cursors, no
+arena borrow) precisely so a half-written SST can persist between beats.
+What remains of Stage E: the manifest log — low value at today's table
+counts, noted for the day manifests are large.
 
 ### Stage F — MVCC snapshot reads over object-resident data
 
@@ -486,6 +494,19 @@ reading back through the cache tiers — green, with the bucket showing hundreds
 of content-addressed blocks written during the run. What remains of Stage F is
 the real multi-session prerequisite: LSN-keyed row versions and the
 snapshot-aware merge read.
+
+**Deferral, stated loudly (2026-07-24, maturity-roadmap step 3):** the
+LSN-keyed version model is deferred to land *with Stage I's suspendable row
+source*, not because it is hard but because until then it is unobservable:
+every read path materializes within its statement (portals fully
+materialize, cursors materialize at DECLARE), so no reader can outlive a
+statement, the oldest-live-snapshot watermark is always "now", and
+compaction can never drop a version any reader still needs. Beat pacing —
+the half of step 3 with observable value — did not need it either: merges
+read only immutable SSTs. The first construct that lets a reader suspend
+(the async row source) is the first that needs a version history, and
+building the two together means the version format is designed against its
+real consumer.
 
 ### Stage G — S3 client hardening & multi-provider reach
 
@@ -888,6 +909,11 @@ adaptive-execution capstone. This section is the plan of record for all of it.
 3. **Stage F MVCC + Stage E beat pacing** — LSN-keyed row versions,
    snapshot-aware merge reads, compaction retention above the oldest-snapshot
    watermark, merge work amortized across statements.
+   **Status (2026-07-24): beat pacing landed; the MVCC half is deferred to
+   ride with Stage I's suspendable row source** — see Stage E's status (the
+   merge is now a background job bounded to a few block transfers per beat)
+   and Stage F's stated deferral (no reader can observe a version history
+   until a reader can suspend; the two land together).
 4. **The map spills (gap 2)** — block-resident row index; secondary indexes
    as the LSM forest; block compression and the multi-block index / sized
    filters (the remaining Stage C refinements) ride along since they touch

@@ -123,26 +123,103 @@ vocabulary — with the meaning they carry in this codebase.
 - **leveled / tiered compaction** — the two LSM compaction shapes (low
   read-amplification vs low write-amplification) weighed against object-storage
   economics in the roadmap. Roadmap.
-- **sweep / beat (sliced checkpoint)** — a checkpoint *sweep* is the whole
-  unit of work from trigger to manifest publish; a *beat* is one slice of
-  it — one table's SST/delta/merge writes — run between query messages (and
-  by the idle event loop), so the engine serves statements while a
-  checkpoint is in flight. The publish beat runs only when no table has
-  changed since its slice, which per-table generations guarantee. The word
-  *beat* is TigerBeetle's, for the same amortize-the-work idea.
+- **sweep / beat** — a checkpoint *sweep* is the whole unit of work from
+  trigger to manifest publish; a *beat* is one bounded step of background
+  work run between query messages (and by the idle event loop): one
+  table's slice, one stretch of a paced merge, or the publish itself. The
+  publish beat runs only when no table has changed since its slice, which
+  per-table generations guarantee. Merge beats and sweep beats alternate
+  when both want the engine. The word *beat* is TigerBeetle's, for the
+  same amortize-the-work idea.
+- **paced merge (merge job)** — compaction as a background job crossing
+  beats: a table's spill list at the merge trigger gets its cheapest
+  adjacent pair merged — the schedule built a few block *reads* per beat,
+  the output streamed a few block *writes* per beat — surviving publishes
+  (a delta only appends at the tail, so the pair's positions hold) and
+  cancelled without loss if a collapse supersedes the pair. The half-built
+  SST's blocks join the garbage sweep's keep-set until the job's result
+  publishes.
 - **Write-Ahead Log (WAL)** — the durable operation log; here it doubles as the
-  VSR journal. Replayed on recovery.
+  VSR journal. Every committed row image and definition change is appended
+  and fsynced before the commit acknowledges (the local durability point),
+  and replay after a crash rebuilds state from the last checkpoint forward.
+- **WAL segment** — a committed WAL batch uploaded to the bucket as one
+  object, keyed by its first LSN. A segment only *grows* under its key: a
+  failed upload keeps the batch marker, so the retry carries the old bytes
+  plus newly committed ones. Cold start replays segments newer than the
+  manifest; a checkpoint prunes segments it made redundant.
+- **commit-durable-on-bucket** — the default posture with `s3 = on`
+  (`wal_upload_sync`): a commit acknowledges only after its WAL segment is
+  in the bucket, so wiping the local disk at any instant loses nothing
+  acknowledged — the disk is formally a cache.
+- **RPO (recovery point objective)** — how much acknowledged work a
+  disaster may lose. RPO=0 against total node loss is what
+  commit-durable-on-bucket buys; the asynchronous drain trades a
+  drain-window of RPO for local-fsync commit latency.
+- **group commit** — amortizing the per-commit durability round-trip by
+  covering many concurrent commits with one fsync/PUT before their acks.
+  The WAL's local fsync already batches per transaction; the
+  cross-connection segment-PUT form is deferred to the reactor's async
+  work (it requires holding acks, and every ack already follows its PUT).
 - **manifest** — the single object-storage object naming the current set of SSTs
   and the catalog root, updated by a compare-and-swap conditional write.
 - **compare-and-swap (CAS)** — a conditional object-storage write
   (`If-Match` / `If-None-Match`) used so a lagging or split-brained node cannot
   clobber the manifest.
 - **Log Sequence Number (LSN)** — the monotonically increasing position of a
-  committed operation; snapshots are LSNs.
-- **Multi-Version Concurrency Control (MVCC)** — snapshot isolation via
-  per-version visibility, keyed by transaction id and LSN.
-- **tombstone** — a marker recording that a key was deleted, carried through
-  compaction until it can be dropped.
+  write in the WAL, assigned per journaled record and never reused or reset
+  (a truncated journal keeps counting from where it was). It is the
+  engine's clock for durability questions: the manifest names the LSN its
+  snapshot covers, WAL replay applies only records newer than the manifest
+  it loaded (the monotonic-LSN rule that makes replay idempotent), WAL
+  segments are keyed by their batch's first LSN, and the roadmap's
+  LSN-keyed MVCC will stamp row versions with their commit LSN so a
+  snapshot is just an LSN.
+- **Multi-Version Concurrency Control (MVCC)** — letting readers and
+  writers coexist by keeping more than one version of a row, each reader
+  seeing the versions its snapshot admits rather than blocking writers.
+  *Today's model* is the minimal two-version form: each row is at most one
+  committed image plus one uncommitted pending image, visibility decided by
+  transaction id (READ COMMITTED — every statement sees what was committed
+  when it started), and a second concurrent writer fails fast with `40001`
+  rather than blocking. *The roadmap's model* (Stage F) is genuine
+  LSN-keyed versioning: versions appended (never repointed in place)
+  stamped with their commit LSN, a read at snapshot `S` taking the newest
+  version with `commit_lsn <= S`, and compaction retaining any version
+  still visible to the *oldest live snapshot* watermark. It lands with the
+  suspendable row source (Stage I), the first place a reader can outlive a
+  statement and so first needs a version history.
+- **snapshot** — the point in time a read is served *as of*. Under READ
+  COMMITTED it is per-statement (identified by transaction id today); under
+  the roadmap's LSN-keyed MVCC it is literally an LSN.
+- **oldest live snapshot (watermark)** — the earliest snapshot any live
+  reader still holds; compaction may drop a superseded row version only
+  once it falls below this watermark. (With no suspendable readers, the
+  watermark today is always "now", which is why compaction needs no
+  version retention yet.)
+- **write-write conflict (`40001`)** — two transactions writing the same
+  row: the second fails immediately with SQLSTATE `40001` (serialization
+  failure) instead of blocking on a lock the way PostgreSQL's READ
+  COMMITTED would; applications retry.
+- **tombstone** — a marker recording that a key was deleted, written into
+  delta SSTs so an older member's version stays dead at cold start, and
+  carried through merges until the pair sits at the head of the list —
+  where nothing older remains to suppress, and it is dropped.
+- **spill / spill list** — under memory pressure a committed row's *bytes*
+  leave the heap: the row's map entry flips to `Spilled`, naming which
+  member of its table's **spill list** (the ordered SSTs in the manifest's
+  `dsst` lines) holds them; reads fetch them back through the cache tiers.
+  Later members shadow earlier ones; tombstones delete.
+- **delta flush** — a dirty table with spilled SSTs checkpoints only its
+  heap-resident committed rows plus the tombstones recorded since the last
+  checkpoint, appended as one new list member — instead of rewriting
+  everything it already made durable.
+- **roster** — one block per SST listing every block identity the SST
+  comprises, so the garbage sweeper enumerates an SST with a single read.
+- **generation** (`Table::mark_dirty`) — a per-table counter bumped on
+  every committed change; the sliced checkpoint compares it against the
+  generation its slice captured, which is how a publish knows no table
+  changed after its slice.
 - **transaction id (`transaction_id`)** — the identifier of a transaction's
   snapshot, used for row visibility. (Field name: previously `txid`.)
 

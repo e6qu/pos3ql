@@ -102,55 +102,71 @@ impl From<StoreError> for SstError {
 /// flushed only once it cannot take the next row — no block is written
 /// half-empty except the last.
 ///
-/// The writer holds one block's worth of scratch and the index as it grows;
-/// both are arena-allocated, so building an SST reserves its working memory
-/// from the caller's arena rather than the heap.
-pub(crate) struct SstWriter<'a> {
+/// The writer owns its whole state — buffers and cursors, no borrow of an
+/// arena — so an owner can hold a half-written SST across checkpoint beats
+/// (the paced merge does) and reuse one writer for slice after slice.
+/// Construction allocates (startup or tests only); `reset` returns a used
+/// writer to empty without touching the allocator.
+pub(crate) struct SstWriter {
     /// Rows accumulating for the current data block.
-    pending: &'a mut [u8],
+    pending: Box<[u8]>,
     pending_len: usize,
     /// The first key in the current data block, set when its first row lands.
     pending_first: Option<u64>,
     /// The index as it grows: `(first_rowid, block_id)` per flushed data block.
-    index: &'a mut [(u64, BlockId)],
+    index: Box<[(u64, BlockId)]>,
     index_len: usize,
     /// The last key written, so out-of-order rows are caught rather than
     /// producing an SST whose binary search silently misses them.
     last_key: Option<u64>,
     /// The filter's bit array, one key set into it per append. It becomes the
     /// filter block at finish.
-    filter: &'a mut [u8],
+    filter: Box<[u8]>,
     /// Every block identity written so far (data and chain blocks), for the
     /// roster.
-    roster: &'a mut [BlockId],
+    roster: Box<[BlockId]>,
     roster_len: usize,
 }
 
-impl<'a> SstWriter<'a> {
-    pub(crate) fn new(arena: &'a Arena) -> Result<Self, SstError> {
-        let pending = arena
-            .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
-            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        let index = arena
-            .alloc_slice_with(MAX_DATA_BLOCKS, |_| (0u64, BlockId([0u8; 32])))
-            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        let filter = arena
-            .alloc_slice_with(FILTER_BYTES, |_| 0u8)
-            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        let roster = arena
-            .alloc_slice_with(MAX_ROSTER, |_| BlockId([0u8; 32]))
-            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        Ok(Self {
-            pending,
+impl SstWriter {
+    /// Allocates the writer's fixed buffers (about 0.9 MiB). Startup only —
+    /// after the freeze, `reset` is how a writer is reused.
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             pending_len: 0,
             pending_first: None,
-            index,
+            index: vec![(0u64, BlockId([0u8; 32])); MAX_DATA_BLOCKS].into_boxed_slice(),
             index_len: 0,
             last_key: None,
-            filter,
-            roster,
+            filter: vec![0u8; FILTER_BYTES].into_boxed_slice(),
+            roster: vec![BlockId([0u8; 32]); MAX_ROSTER].into_boxed_slice(),
             roster_len: 0,
-        })
+        }
+    }
+
+    /// The fixed bytes one writer reserves, for budget estimates.
+    pub(crate) fn budget_bytes() -> usize {
+        MAX_PAYLOAD
+            + MAX_DATA_BLOCKS * core::mem::size_of::<(u64, BlockId)>()
+            + FILTER_BYTES
+            + MAX_ROSTER * 32
+    }
+
+    /// Empties the writer for its next SST. Allocation-free.
+    pub(crate) fn reset(&mut self) {
+        self.pending_len = 0;
+        self.pending_first = None;
+        self.index_len = 0;
+        self.last_key = None;
+        self.filter.fill(0);
+        self.roster_len = 0;
+    }
+
+    /// The identities written so far — a garbage sweep running while a
+    /// half-built SST is in flight must keep these alive.
+    pub(crate) fn roster_so_far(&self) -> &[BlockId] {
+        &self.roster[..self.roster_len]
     }
 
     /// Appends one row. Flushes the current data block first when the row would
@@ -183,7 +199,7 @@ impl<'a> SstWriter<'a> {
             self.pending_first = Some(rowid);
         }
         self.last_key = Some(rowid);
-        bloom::insert(self.filter, rowid);
+        bloom::insert(&mut self.filter, rowid);
         Ok(())
     }
 
@@ -227,7 +243,7 @@ impl<'a> SstWriter<'a> {
         self.pending_len = cursor + head_room;
         self.pending_first = Some(rowid);
         self.last_key = Some(rowid);
-        bloom::insert(self.filter, rowid);
+        bloom::insert(&mut self.filter, rowid);
         self.flush_data(store)
     }
 
@@ -289,7 +305,7 @@ impl<'a> SstWriter<'a> {
     /// block's identity — the SST's root — or `None` when no rows were written,
     /// since an empty SST has no root to name.
     pub(crate) fn finish(
-        mut self,
+        &mut self,
         store: &mut dyn BlockStore,
     ) -> Result<Option<SstHandle>, SstError> {
         self.flush_data(store)?;
@@ -297,7 +313,7 @@ impl<'a> SstWriter<'a> {
             return Ok(None);
         }
         // The filter block, so a reader can skip this SST without the index.
-        let filter = store.put(self.filter, BlockType::SstFilter, 0)?;
+        let filter = store.put(&self.filter, BlockType::SstFilter, 0)?;
         self.record(filter)?;
         // The index block: count, then (first_rowid, block_id) per data block.
         let bytes = 4 + self.index_len * INDEX_ENTRY;
@@ -476,6 +492,41 @@ impl<'a> SstReader<'a> {
         Ok(())
     }
 
+    /// A bounded slice of a full scan: streams rows with keys `>= lo`, in key
+    /// order, reading at most `max_blocks` data blocks, and returns where to
+    /// resume — `Some(next_lo)` when the SST has more, `None` when it is
+    /// exhausted. This is what lets a paced merge pay for its schedule a few
+    /// block reads per beat instead of one unbounded pass.
+    pub(crate) fn scan_bounded(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        lo: u64,
+        max_blocks: usize,
+        emit: &mut dyn FnMut(u64, bool),
+    ) -> Result<Option<u64>, SstError> {
+        let count = self.load_index(store, &handle.index)?;
+        let start = block_containing(self.index_scratch, count, lo).unwrap_or(0);
+        let end = (start + max_blocks).min(count);
+        let mut last_key: Option<u64> = None;
+        for entry_index in start..end {
+            let block_id = block_id_at(self.index_scratch, entry_index);
+            let data_len = store.get(&block_id, self.data_scratch)?;
+            for entry in DataBlock(&self.data_scratch[..data_len]) {
+                if entry.key >= lo {
+                    emit(entry.key, entry.tombstone);
+                }
+                last_key = Some(last_key.map_or(entry.key, |k| k.max(entry.key)));
+            }
+        }
+        if end == count {
+            return Ok(None);
+        }
+        // Resuming one past the largest key seen re-locates through the index
+        // and cannot skip an entry: keys are unique and ascending.
+        Ok(Some(last_key.map_or(lo, |k| k + 1)))
+    }
+
     /// Reads and validates the index block, returning its data-block count.
     fn load_index(&mut self, store: &mut dyn BlockStore, root: &BlockId) -> Result<usize, SstError> {
         store.get(root, self.index_scratch)?;
@@ -626,8 +677,8 @@ mod tests {
     }
 
     /// Builds an SST from `(rowid, row)` pairs, returns its root.
-    fn build(store: &mut MemoryBlockStore, arena: &Arena, rows: &[(u64, Vec<u8>)]) -> Option<SstHandle> {
-        let mut w = SstWriter::new(arena).unwrap();
+    fn build(store: &mut MemoryBlockStore, rows: &[(u64, Vec<u8>)]) -> Option<SstHandle> {
+        let mut w = SstWriter::new();
         for (rowid, row) in rows {
             w.append(store, *rowid, row).unwrap();
         }
@@ -651,7 +702,7 @@ mod tests {
     fn one_row_round_trips() {
         let (_b, mut s) = store();
         let a = arena();
-        let root = build(&mut s, &a, &[(1, b"only row".to_vec())]).expect("has a root");
+        let root = build(&mut s, &[(1, b"only row".to_vec())]).expect("has a root");
         let mut r = SstReader::new(&a).unwrap();
         assert_eq!(get(&mut r, &mut s, &root, 1).as_deref(), Some(&b"only row"[..]));
         assert_eq!(get(&mut r, &mut s, &root, 2), None);
@@ -661,8 +712,7 @@ mod tests {
     #[test]
     fn an_empty_sst_has_no_root() {
         let (_b, mut s) = store();
-        let a = arena();
-        assert_eq!(build(&mut s, &a, &[]), None);
+        assert_eq!(build(&mut s, &[]), None);
     }
 
     #[test]
@@ -673,7 +723,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (0..5000u64).map(|i| (i * 2 + 1, vec![i as u8; 400])).collect();
-        let root = build(&mut s, &a, &rows).expect("has a root");
+        let root = build(&mut s, &rows).expect("has a root");
         let mut r = SstReader::new(&a).unwrap();
         for (rowid, row) in &rows {
             assert_eq!(get(&mut r, &mut s, &root, *rowid).as_ref(), Some(row), "row {rowid}");
@@ -691,7 +741,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (0..3000u64).map(|i| (i + 1, vec![7u8; 500])).collect();
-        let root = build(&mut s, &a, &rows).expect("has a root");
+        let root = build(&mut s, &rows).expect("has a root");
         let mut r = SstReader::new(&a).unwrap();
         let before = s.reads();
         let _ = get(&mut r, &mut s, &root, 2500);
@@ -709,7 +759,7 @@ mod tests {
         // a rare one would read more, so the test probes several odd keys and
         // requires that most cost a single read.
         let rows: Vec<_> = (0..3000u64).map(|i| (i * 2, vec![7u8; 500])).collect();
-        let root = build(&mut s, &a, &rows).expect("has a root");
+        let root = build(&mut s, &rows).expect("has a root");
         let mut r = SstReader::new(&a).unwrap();
         let mut single_read = 0;
         for probe in (1..200u64).step_by(2) {
@@ -725,8 +775,7 @@ mod tests {
     #[test]
     fn rows_out_of_order_are_refused() {
         let (_b, mut s) = store();
-        let a = arena();
-        let mut w = SstWriter::new(&a).unwrap();
+        let mut w = SstWriter::new();
         w.append(&mut s, 5, b"five").unwrap();
         assert_eq!(w.append(&mut s, 3, b"three").err(), Some(SstError::KeyOutOfOrder));
         assert_eq!(w.append(&mut s, 5, b"again").err(), Some(SstError::KeyOutOfOrder));
@@ -739,7 +788,7 @@ mod tests {
         // both sides of it.
         let (_b, mut s) = store();
         let a = Arena::new(&mut Budget::new(64 << 20), "sst chain", 16 << 20).expect("arena");
-        let mut w = SstWriter::new(&a).unwrap();
+        let mut w = SstWriter::new();
         let huge: Vec<u8> = (0..MAX_PAYLOAD + 50_000).map(|i| (i * 31 % 251) as u8).collect();
         w.append(&mut s, 1, &[7u8; 40]).unwrap();
         w.append(&mut s, 2, &huge).unwrap();
@@ -768,7 +817,7 @@ mod tests {
         // ordinary rows holds.
         let (_b, mut s) = store();
         let a = arena();
-        let mut w = SstWriter::new(&a).unwrap();
+        let mut w = SstWriter::new();
         w.append(&mut s, 1, &[7u8; 8]).unwrap();
         w.append_tombstone(&mut s, 2).unwrap();
         w.append(&mut s, 3, &[9u8; 8]).unwrap();
@@ -786,8 +835,7 @@ mod tests {
     #[test]
     fn a_row_beyond_the_chain_bound_is_refused() {
         let (_b, mut s) = store();
-        let a = Arena::new(&mut Budget::new(96 << 20), "sst chain", 64 << 20).expect("arena");
-        let mut w = SstWriter::new(&a).unwrap();
+        let mut w = SstWriter::new();
         let huge = vec![0u8; MAX_ASSEMBLED + MAX_PAYLOAD];
         assert_eq!(w.append(&mut s, 1, &huge).err(), Some(SstError::RowTooLarge));
     }
@@ -796,7 +844,7 @@ mod tests {
     fn a_short_output_buffer_is_refused() {
         let (_b, mut s) = store();
         let a = arena();
-        let root = build(&mut s, &a, &[(1, vec![9u8; 100])]).expect("root");
+        let root = build(&mut s, &[(1, vec![9u8; 100])]).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         let mut small = [0u8; 10];
         assert_eq!(
@@ -826,7 +874,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (1..=50u64).map(|i| (i, vec![i as u8; 20])).collect();
-        let root = build(&mut s, &a, &rows).expect("root");
+        let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         let got = scan(&mut r, &mut s, &root, 10, 20);
         assert_eq!(got.len(), 11);
@@ -845,7 +893,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (0..4000u64).map(|i| (i, vec![(i % 251) as u8; 400])).collect();
-        let root = build(&mut s, &a, &rows).expect("root");
+        let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         let got = scan(&mut r, &mut s, &root, 1000, 2999);
         assert_eq!(got.len(), 2000);
@@ -860,7 +908,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (10..=30u64).map(|i| (i, vec![i as u8; 8])).collect();
-        let root = build(&mut s, &a, &rows).expect("root");
+        let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         // Below, above, and straddling both ends.
         assert_eq!(scan(&mut r, &mut s, &root, 0, 5).len(), 0, "before the first key");
@@ -877,7 +925,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (1..=40u64).map(|i| (i * 3, vec![i as u8; 16])).collect();
-        let root = build(&mut s, &a, &rows).expect("root");
+        let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         assert_eq!(scan(&mut r, &mut s, &root, 30, 30), vec![(30, vec![10u8; 16])]);
         // A key that falls in a gap between stored keys returns nothing.
@@ -889,7 +937,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (1..=10u64).map(|i| (i, vec![i as u8; 4])).collect();
-        let root = build(&mut s, &a, &rows).expect("root");
+        let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         assert_eq!(scan(&mut r, &mut s, &root, 8, 3), vec![], "hi below lo yields nothing");
     }
@@ -902,7 +950,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (0..3000u64).map(|i| (i, vec![9u8; 500])).collect();
-        let root = build(&mut s, &a, &rows).expect("root");
+        let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         let before = s.reads();
         let got = scan(&mut r, &mut s, &root, 2500, 2510);
@@ -917,7 +965,7 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (1..=20u64).map(|i| (i, vec![i as u8; (i * 3) as usize])).collect();
-        let root = build(&mut s, &a, &rows).expect("root");
+        let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         for (rowid, row) in &rows {
             assert_eq!(get(&mut r, &mut s, &root, *rowid).as_ref(), Some(row), "row {rowid}");

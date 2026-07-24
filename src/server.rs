@@ -251,7 +251,7 @@ impl Server {
             // returns to that work; otherwise block until the next event.
             let timeout = if self.engine.has_pending_wal_upload() {
                 Some(upload_backoff)
-            } else if self.engine.checkpoint_sweep_active() {
+            } else if self.engine.checkpoint_work_pending() {
                 Some(beat_backoff)
             } else {
                 None
@@ -281,11 +281,12 @@ impl Server {
                     Duration::from_secs(1)
                 };
             }
-            // An active checkpoint sweep advances even on an idle server —
-            // a trigger must not wait for the next client message to finish
-            // what it started. One beat per loop turn, backing off when the
-            // bucket errors.
-            if self.engine.checkpoint_sweep_active() {
+            // Active checkpoint and compaction work advances even on an
+            // idle server — a trigger must not wait for the next client
+            // message to finish what it started, and a merge owes its beats
+            // regardless of traffic. One beat per loop turn, backing off
+            // when the bucket errors.
+            if self.engine.checkpoint_work_pending() {
                 beat_backoff = if self.engine.maybe_checkpoint() {
                     Duration::ZERO
                 } else {

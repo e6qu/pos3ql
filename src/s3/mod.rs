@@ -58,7 +58,10 @@ impl From<BudgetError> for S3SetupError {
 }
 
 #[derive(Debug)]
-#[expect(
+// `allow`, not `expect`: whether the lint fires depends on the clippy
+// version's size thresholds (the inline detail field sits near them), and an
+// unfulfilled expectation is itself an error under -D warnings.
+#[allow(
     clippy::large_enum_variant,
     reason = "error text is carried inline on the stack; boxing would heap-allocate"
 )]

@@ -551,36 +551,40 @@ fn read_response(
         head.advance(n);
     };
 
-    let (status, content_length, etag) = parse_head(&head.readable()[..head_end])?;
-    let mut already = head.readable().len() - head_end;
+    let (status, content_length, etag, chunked) = parse_head(&head.readable()[..head_end])?;
 
-    if content_length > body.capacity() {
-        return Err(S3Error::ResponseTooLarge {
-            content_length,
-            capacity: body.capacity(),
-        });
-    }
-    // Move any body bytes that arrived with the head.
-    let take = already.min(content_length);
-    let leftover = &head.readable()[head_end..head_end + take];
-    assert!(body.append(leftover), "checked against capacity");
-    already = take;
-
-    while already < content_length {
-        let space = body.writable();
-        let want = (content_length - already).min(space.len());
-        let n = stream.read(&mut space[..want]).map_err(|e| S3Error::Io {
-            context: "read body",
-            kind: e.kind(),
-        })?;
-        if n == 0 {
-            return Err(S3Error::Io {
-                context: "read body",
-                kind: std::io::ErrorKind::UnexpectedEof,
+    if chunked {
+        read_chunked_body(stream, &head.readable()[head_end..], body)?;
+    } else {
+        let mut already = head.readable().len() - head_end;
+        if content_length > body.capacity() {
+            return Err(S3Error::ResponseTooLarge {
+                content_length,
+                capacity: body.capacity(),
             });
         }
-        body.advance(n);
-        already += n;
+        // Move any body bytes that arrived with the head.
+        let take = already.min(content_length);
+        let leftover = &head.readable()[head_end..head_end + take];
+        assert!(body.append(leftover), "checked against capacity");
+        already = take;
+
+        while already < content_length {
+            let space = body.writable();
+            let want = (content_length - already).min(space.len());
+            let n = stream.read(&mut space[..want]).map_err(|e| S3Error::Io {
+                context: "read body",
+                kind: e.kind(),
+            })?;
+            if n == 0 {
+                return Err(S3Error::Io {
+                    context: "read body",
+                    kind: std::io::ErrorKind::UnexpectedEof,
+                });
+            }
+            body.advance(n);
+            already += n;
+        }
     }
 
     if !(200..300).contains(&status) {
@@ -596,11 +600,143 @@ fn read_response(
     })
 }
 
+/// Decodes a `Transfer-Encoding: chunked` body into `body`: hex-sized chunks
+/// separated by CRLF, a zero-size chunk ending the stream (trailers, if any,
+/// are read to their final CRLF and dropped). The decoded body is still
+/// bounded by the response buffer — a loud [`S3Error::ResponseTooLarge`], as
+/// for a plain body.
+fn read_chunked_body(
+    stream: &mut TcpStream,
+    leftover: &[u8],
+    body: &mut FixedBuf,
+) -> Result<(), S3Error> {
+    // Bytes that arrived with the head drain first, then the socket.
+    struct Feed<'a> {
+        leftover: &'a [u8],
+        stream: &'a mut TcpStream,
+    }
+    impl Feed<'_> {
+        fn read(&mut self, out: &mut [u8]) -> Result<usize, S3Error> {
+            if !self.leftover.is_empty() {
+                let n = self.leftover.len().min(out.len());
+                out[..n].copy_from_slice(&self.leftover[..n]);
+                self.leftover = &self.leftover[n..];
+                return Ok(n);
+            }
+            self.stream
+                .read(out)
+                .map_err(|e| S3Error::Io { context: "read chunk", kind: e.kind() })
+        }
+    }
+    fn fill(feed: &mut Feed, carry: &mut [u8; 512], carry_len: &mut usize) -> Result<(), S3Error> {
+        let n = feed.read(&mut carry[*carry_len..])?;
+        if n == 0 {
+            return Err(S3Error::Io {
+                context: "read chunk",
+                kind: std::io::ErrorKind::UnexpectedEof,
+            });
+        }
+        *carry_len += n;
+        Ok(())
+    }
+    let mut feed = Feed { leftover, stream };
+    // A small carry window for chunk framing (size lines, CRLFs, trailers);
+    // chunk payloads copy straight into `body`.
+    let mut carry = [0u8; 512];
+    let mut carry_len = 0usize;
+    loop {
+        // Read the size line (hex, optional extensions after ';').
+        let line_end = loop {
+            if let Some(p) = carry[..carry_len].windows(2).position(|w| w == b"\r\n") {
+                break p;
+            }
+            if carry_len == carry.len() {
+                return Err(S3Error::Protocol("chunk size line too long"));
+            }
+            fill(&mut feed, &mut carry, &mut carry_len)?;
+        };
+        let line = core::str::from_utf8(&carry[..line_end])
+            .map_err(|_| S3Error::Protocol("non-UTF-8 chunk size"))?;
+        let hex = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(hex, 16)
+            .map_err(|_| S3Error::Protocol("bad chunk size"))?;
+        // Drop the size line from the carry.
+        carry.copy_within(line_end + 2..carry_len, 0);
+        carry_len -= line_end + 2;
+
+        if size == 0 {
+            // Trailers (if any) end with an empty line; the carry may already
+            // hold it.
+            loop {
+                if carry[..carry_len].starts_with(b"\r\n")
+                    || carry[..carry_len].windows(4).any(|w| w == b"\r\n\r\n")
+                {
+                    return Ok(());
+                }
+                if carry_len == carry.len() {
+                    return Err(S3Error::Protocol("chunk trailers too long"));
+                }
+                match fill(&mut feed, &mut carry, &mut carry_len) {
+                    Ok(()) => {}
+                    // Connection close after the last chunk is a valid end.
+                    Err(S3Error::Io { kind: std::io::ErrorKind::UnexpectedEof, .. })
+                        if carry_len == 0 =>
+                    {
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // Chunk payload: first whatever the carry holds, then the feed.
+        let mut remaining = size;
+        let from_carry = remaining.min(carry_len);
+        if !body.append(&carry[..from_carry]) {
+            return Err(S3Error::ResponseTooLarge {
+                content_length: body.readable().len() + remaining,
+                capacity: body.capacity(),
+            });
+        }
+        carry.copy_within(from_carry..carry_len, 0);
+        carry_len -= from_carry;
+        remaining -= from_carry;
+        while remaining > 0 {
+            let space = body.writable();
+            if space.is_empty() {
+                return Err(S3Error::ResponseTooLarge {
+                    content_length: body.readable().len() + remaining,
+                    capacity: body.capacity(),
+                });
+            }
+            let want = remaining.min(space.len());
+            let n = feed.read(&mut space[..want])?;
+            if n == 0 {
+                return Err(S3Error::Io {
+                    context: "read chunk",
+                    kind: std::io::ErrorKind::UnexpectedEof,
+                });
+            }
+            body.advance(n);
+            remaining -= n;
+        }
+        // The chunk's trailing CRLF.
+        while carry_len < 2 {
+            fill(&mut feed, &mut carry, &mut carry_len)?;
+        }
+        if &carry[..2] != b"\r\n" {
+            return Err(S3Error::Protocol("chunk missing its trailing CRLF"));
+        }
+        carry.copy_within(2..carry_len, 0);
+        carry_len -= 2;
+    }
+}
+
 fn find_head_end(data: &[u8]) -> Option<usize> {
     data.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-fn parse_head(head: &[u8]) -> Result<(u16, usize, StackStr<80>), S3Error> {
+fn parse_head(head: &[u8]) -> Result<(u16, usize, StackStr<80>, bool), S3Error> {
     let text = core::str::from_utf8(head).map_err(|_| S3Error::Protocol("non-UTF-8 head"))?;
     let mut lines = text.split("\r\n");
     let status_line = lines.next().ok_or(S3Error::Protocol("empty response"))?;
@@ -634,10 +770,7 @@ fn parse_head(head: &[u8]) -> Result<(u16, usize, StackStr<80>), S3Error> {
             chunked = true;
         }
     }
-    if chunked {
-        return Err(S3Error::Protocol("chunked responses not supported"));
-    }
-    Ok((status, content_length, etag))
+    Ok((status, content_length, etag, chunked))
 }
 
 /// First occurrence of `<tag>text</tag>`; no entity decoding (S3 keys we
@@ -702,6 +835,43 @@ mod tests {
             stream.write_all(respond.as_bytes()).unwrap();
         });
         (port, handle)
+    }
+
+    #[test]
+    fn chunked_bodies_decode() {
+        // Two data chunks (with an extension on the first size line), a zero
+        // chunk, and a trailer — the shape MinIO/GCS actually send.
+        let (port, server) = mock_server(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: t\r\n\r\n",
+            |_| {},
+        );
+        let config = test_config(port);
+        let mut budget = Budget::new(1 << 20);
+        let mut client = S3Client::new(&config, &mut budget).unwrap();
+        client.with_clock(|| 1_440_938_160);
+        client.get("k", None).unwrap();
+        assert_eq!(client.body_bytes(), b"hello world");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn chunked_body_overflow_is_loud() {
+        // A chunk stream larger than the response buffer must refuse, not
+        // truncate: the declared capacity below is 64 KiB and the single
+        // chunk claims 128 KiB.
+        let mut big = String::from("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n20000\r\n");
+        big.push_str(&"y".repeat(0x20000));
+        big.push_str("\r\n0\r\n\r\n");
+        let leaked: &'static str = Box::leak(big.into_boxed_str());
+        let (port, server) = mock_server(leaked, |_| {});
+        let config = test_config(port);
+        let mut budget = Budget::new(1 << 20);
+        let mut client = S3Client::new(&config, &mut budget).unwrap();
+        client.with_clock(|| 1_440_938_160);
+        let err = client.get("k", None).unwrap_err();
+        assert!(matches!(err, S3Error::ResponseTooLarge { .. }), "{err:?}");
+        // The mock's write may fail once the client stops reading; ignore.
+        let _ = server.join();
     }
 
     #[test]

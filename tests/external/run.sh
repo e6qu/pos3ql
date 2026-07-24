@@ -79,6 +79,10 @@ table_rows = 32768
 # A full scan of spilled rows stages them in the statement work arena (the
 # streaming read path is a later stage); size it for the spilled dataset.
 work_arena_bytes = 192MiB
+# Smaller than one committed WAL batch can be (wal_buffer is 4MiB): the
+# async-WAL recovery below proves segments larger than the response buffer
+# stream back in ranged windows.
+s3_response_bytes = 256KiB
 EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
@@ -197,6 +201,11 @@ step "async WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WA
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
   -c "CREATE TABLE waltest (id int, v text)" \
   -c "INSERT INTO waltest VALUES (10,'async-a'),(20,'async-b'),(30,'async-c')"
+# One commit whose WAL batch (~600 KiB of row images, within the statement
+# arena) exceeds the 256 KiB response buffer: its uploaded segment must
+# still replay, in ranged windows, after the wipe.
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
+  -c "INSERT INTO waltest SELECT 1000 + g, repeat('w', 1024) FROM generate_series(1, 600) g"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
@@ -207,8 +216,8 @@ for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
-out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT string_agg(v, ',' ORDER BY id) FROM waltest" 2>&1)
-[[ "$out" == "async-a,async-b,async-c" ]] && ok "async WAL upload recovers from MinIO (no checkpoint)" || bad "async WAL recovery: '$out'"
+out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
+[[ "$out" == "async-a,async-b,async-c|600" ]] && ok "async WAL upload recovers from MinIO (segments beyond the response buffer)" || bad "async WAL recovery: '$out'"
 
 step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CHECKPOINT"

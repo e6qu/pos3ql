@@ -11,6 +11,14 @@ edition = "2024"
 # deterministic for simulation testing.
 [dependencies]
 libc = "0.2"
+# The single whitelisted exception to the libc-only policy (see AGENTS.md and
+# PLAN.md Stage G): TLS is never hand-rolled. rustls runs isolated — every
+# call from the S3 client enters through `mem::guard::tls_scope`, whose
+# allocations are counted against a startup-configured budget and abort loudly
+# past it, so the static-memory discipline holds everywhere else.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Compiled-in Mozilla root certificates (pure data, no code paths).
+webpki-roots = "0.26"
 
 [profile.release]
 panic = "abort"

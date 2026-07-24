@@ -34,6 +34,13 @@ struct RawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for RawRow<'_, '_, 'a> {
+    fn table_schema(&self, table: &str) -> Option<&str> {
+        let t = self.scope.table_index(table).ok()?;
+        let def = self.scope.defs[t]?;
+        (self.scope.names[t] == def.name.as_str() && !def.schema.as_str().is_empty())
+            .then(|| def.schema.as_str())
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         // The raw row stores every table's columns concatenated in scope
         // order (merges hide nothing here).
@@ -70,6 +77,13 @@ impl<'a> ColumnLookup<'a> for RawRow<'_, '_, 'a> {
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn table_schema(&self, table: &str) -> Option<&str> {
+        let t = self.0.table_index(table).ok()?;
+        let def = self.0.defs[t]?;
+        (self.0.names[t] == def.name.as_str() && !def.schema.as_str().is_empty())
+            .then(|| def.schema.as_str())
+    }
+
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name))
     }
@@ -111,12 +125,12 @@ pub(crate) fn finalize_projected_row<'a>(
     out: &mut [Datum<'a>; MAX_PROJ],
 ) -> Result<(), SqlError> {
     for (i, slot) in out.iter_mut().take(width).enumerate() {
-        *slot = crate::sql::exec::decode_projected_pub(bytes, i);
+        *slot = crate::sql::exec::decode_projected_col_record(bytes, i, arena)?;
     }
     let Some(d) = deferred else { return Ok(()) };
     let mut raw = [Datum::Null; MAX_COLUMNS * MAX_JOIN_TABLES];
     for (k, slot) in raw.iter_mut().enumerate().take(d.n_raw) {
-        *slot = crate::sql::exec::decode_projected_pub(bytes, d.raw_at + k);
+        *slot = crate::sql::exec::decode_projected_col_record(bytes, d.raw_at + k, arena)?;
     }
     let raw_row = RawRow { scope, values: &raw[..d.n_raw] };
     // `postponed` is indexed by item; wildcards (never postponed) advance the

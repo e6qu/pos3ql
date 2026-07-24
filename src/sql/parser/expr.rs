@@ -611,13 +611,15 @@ impl<'a> Parser<'a> {
                 // Qualified name: the pg_catalog / information_schema schemas are
                 // transparent (pg_catalog.version() == version()), so a leading
                 // recognized schema qualifier is dropped.
-                let name = if (name == "pg_catalog" || name == "information_schema")
+                let (name, stripped_schema) = if (name == "pg_catalog"
+                    || name == "information_schema")
                     && self.peeked == Tok::Op(".")
                 {
+                    let stripped = name;
                     self.advance()?;
-                    self.any_ident("function or column name")?
+                    (self.any_ident("function or column name")?, Some(stripped))
                 } else {
-                    name
+                    (name, None)
                 };
                 // `ARRAY[...]` array constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("[") {
@@ -684,6 +686,30 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
+                    // A third part makes it `schema.table.column` — as does a
+                    // transparently stripped `pg_catalog.`/`information_schema.`
+                    // prefix, which must still validate as the schema part.
+                    if self.peeked == Tok::Op(".") {
+                        self.advance()?;
+                        if self.peeked == Tok::Op("*") {
+                            return Err(self.err_here(
+                                "schema-qualified star expansion is not supported yet",
+                            ));
+                        }
+                        let third = self.any_ident("column name")?;
+                        return self.arena_expr(Expr::SchemaColumn {
+                            schema: name,
+                            table: column,
+                            name: third,
+                        });
+                    }
+                    if let Some(schema) = stripped_schema {
+                        return self.arena_expr(Expr::SchemaColumn {
+                            schema,
+                            table: name,
+                            name: column,
+                        });
+                    }
                     return self.arena_expr(Expr::Column {
                         qualifier: Some(name),
                         name: column,
@@ -737,6 +763,20 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
+                    if self.peeked == Tok::Op(".") {
+                        self.advance()?;
+                        if self.peeked == Tok::Op("*") {
+                            return Err(self.err_here(
+                                "schema-qualified star expansion is not supported yet",
+                            ));
+                        }
+                        let third = self.any_ident("column name")?;
+                        return self.arena_expr(Expr::SchemaColumn {
+                            schema: name,
+                            table: column,
+                            name: third,
+                        });
+                    }
                     return self.arena_expr(Expr::Column {
                         qualifier: Some(name),
                         name: column,

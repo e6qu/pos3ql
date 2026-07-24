@@ -394,7 +394,7 @@ impl<'d> QueryScope<'d> {
             for (i, row) in rows.iter().enumerate() {
                 let mut vals = [Datum::Null; MAX_COLUMNS];
                 for (c, slot) in vals[..base_cols].iter_mut().enumerate() {
-                    *slot = crate::sql::exec::decode_projected_pub(row, c);
+                    *slot = crate::sql::exec::decode_projected_col_record(row, c, arena)?;
                 }
                 vals[base_cols] = Datum::Int8((i + 1) as i64);
                 wrapped[i] = crate::sql::exec::encode_projected_pub(&vals[..base_cols + 1], arena)?;

@@ -850,6 +850,12 @@ fn rewrite_grouped_expr<'a>(
             "column \"{}.*\" must appear in the GROUP BY clause or be used in an aggregate function",
             t
         )),
+        Expr::SchemaColumn { table, name, .. } => Err(sql_err!(
+            sqlstate::GROUPING_ERROR,
+            "column \"{}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+            table,
+            name
+        )),
         Expr::Null
         | Expr::Bool(_)
         | Expr::Int(_)
@@ -2307,6 +2313,43 @@ fn describe_scope_record_star<'q>(
             let value_type = super::exec::json_each_value_type_pub(name).expect("checked");
             push(ColDesc::of_type("value", value_type), &mut n)?;
         }
+        // A record-typed column (or nested record field) with a registered
+        // shape expands to its fields.
+        _ if super::exec::expr_record_handle_pub(base, &ScopeCols(scope)).is_some() => {
+            let handle = super::exec::expr_record_handle_pub(base, &ScopeCols(scope))
+                .expect("checked");
+            let mut push_err = None;
+            super::exec::visit_record_shape_pub(handle, |field_name, ctype| {
+                if push_err.is_some() {
+                    return;
+                }
+                // Copy the registry name into the arena? ColDesc borrows 'q —
+                // registry names are thread-local copies; the caller's arena
+                // is not in reach here, so lease the static field names when
+                // they match, else fail loudly below.
+                let leased = super::exec::RECORD_FIELD_NAMES
+                    .iter()
+                    .chain(["key", "value"].iter())
+                    .find(|n| n.eq_ignore_ascii_case(field_name))
+                    .copied();
+                match leased {
+                    Some(name) => {
+                        if let Err(e) = push(ColDesc::of_type(name, ctype), &mut n) {
+                            push_err = Some(e);
+                        }
+                    }
+                    None => {
+                        push_err = Some(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "row expansion of this record's field names is not supported here"
+                        ))
+                    }
+                }
+            });
+            if let Some(e) = push_err {
+                return Err(e);
+            }
+        }
         _ => {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
@@ -2318,7 +2361,7 @@ fn describe_scope_record_star<'q>(
 }
 
 /// Resolves column types across all tables in a join scope.
-pub(super) struct ScopeCols<'s, 'd>(&'s QueryScope<'d>);
+pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let entry = self.0.find_column(qualifier, name)?;
@@ -2337,6 +2380,26 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         let t = self.0.table_index(name).ok()?;
         let def = self.0.defs[t]?;
         Some(&def.columns()[..def.n_columns])
+    }
+
+    fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let entry = self.0.find_column(qualifier, name).ok()?;
+        if self.0.output_type(entry) != ColType::Record {
+            return None;
+        }
+        match entry {
+            scope::ResolvedColumn::Table(t, c) => {
+                Some(self.0.defs[t]?.columns()[c].type_mod)
+            }
+            _ => None,
+        }
+    }
+
+    fn table_schema(&self, table: &str) -> Option<&str> {
+        let t = self.0.table_index(table).ok()?;
+        let def = self.0.defs[t]?;
+        (self.0.names[t] == def.name.as_str() && !def.schema.as_str().is_empty())
+            .then(|| def.schema.as_str())
     }
 }
 

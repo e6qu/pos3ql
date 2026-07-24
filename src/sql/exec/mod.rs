@@ -36,6 +36,11 @@ pub struct RowCtx<'s, 'v, 'd> {
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
+    fn table_schema(&self, table: &str) -> Option<&str> {
+        (self.def.name.as_str() == table && !self.def.schema.as_str().is_empty())
+            .then(|| self.def.schema.as_str())
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
             && q != self.def.name.as_str() {
@@ -104,7 +109,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod describe;
-pub use describe::{could_not_identify, not_composite,
+pub use describe::{could_not_identify, init_record_shapes, not_composite, register_shape_for, reset_record_shapes, expr_record_handle as expr_record_handle_pub, visit_record_shape as visit_record_shape_pub,
     check_row_field_types, derived_name, describe_items, infer_type_pub, infer_type_res,
     record_field_type, record_shape, typeof_static, typeof_static_coltype, ColTypeResolver, DefCols, NoCols,
     RECORD_FIELD_NAMES,
@@ -113,7 +118,7 @@ pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeri
 
 mod projected;
 pub use projected::{
-    decode_projected_pub, decode_projected_value, encode_projected_pub, projected_prefix_len,
+    decode_projected_col_record, decode_projected_pub, decode_projected_value, encode_projected_pub, projected_prefix_len,
     projected_value_len, sort_dedup_projected,
 };
 
@@ -517,6 +522,11 @@ struct ExcludedCtx<'s, 'v, 'd> {
 }
 
 impl<'v> ColumnLookup<'v> for ExcludedCtx<'_, 'v, '_> {
+    fn table_schema(&self, table: &str) -> Option<&str> {
+        (self.def.name.as_str() == table && !self.def.schema.as_str().is_empty())
+            .then(|| self.def.schema.as_str())
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         let src = if qualifier == Some("excluded") {
             self.excluded

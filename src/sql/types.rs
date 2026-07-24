@@ -98,6 +98,11 @@ pub enum ColType {
     Bit { varying: bool },
     /// A multirange type (int4multirange/…), stored as canonical text.
     Multirange(RangeKind),
+    /// An anonymous composite (`ROW(...)`, a whole-row reference, a record
+    /// SRF) carried through a derived table's columns. Transient only: a real
+    /// table column can never have this type (DDL refuses records), so it has
+    /// no on-disk presence.
+    Record,
 }
 
 /// Base storage codes for the parameterized type families. They must stay far
@@ -192,6 +197,7 @@ impl ColType {
             Self::Bit { varying: false } => oid::BIT,
             Self::Bit { varying: true } => oid::VARBIT,
             Self::Multirange(k) => k.multirange_oid(),
+            Self::Record => oid::RECORD,
         }
     }
 
@@ -207,6 +213,7 @@ impl ColType {
             Self::Name => 64,
             Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
+            Self::Record => -1,
         }
     }
 
@@ -249,6 +256,7 @@ impl ColType {
             Self::Bit { varying: false } => "bit",
             Self::Bit { varying: true } => "varbit",
             Self::Multirange(k) => k.multirange_name(),
+            Self::Record => "record",
         }
     }
 
@@ -280,6 +288,7 @@ impl ColType {
             Self::Bit { varying: false } => "bit",
             Self::Bit { varying: true } => "bit varying",
             Self::Multirange(k) => k.multirange_name(),
+            Self::Record => "record",
         }
     }
 
@@ -314,6 +323,10 @@ impl ColType {
             Self::Name => 42,
             Self::Multirange(k) => MULTIRANGE_CODE_BASE + k.code(),
             Self::Array(e) => ARRAY_CODE_BASE + e.code(),
+            // Records are transient (never a stored column); the code is a
+            // loud sentinel with no `from_code` inverse, so any leak into the
+            // persistence layer fails visibly at reload.
+            Self::Record => 46,
         }
     }
 

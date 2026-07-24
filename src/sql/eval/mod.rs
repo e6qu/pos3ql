@@ -181,6 +181,14 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The real schema of the *unaliased base table* a FROM entry exposes as
+    /// `table`, or None when no such entry exists (aliases hide their table
+    /// name, and a derived table has no schema) — a three-part reference
+    /// `schema.table.column` only binds when this matches its schema part.
+    fn table_schema(&self, _table: &str) -> Option<&str> {
+        None
+    }
+
     /// The named table's row as record fields (name + type + value), or None
     /// for an outer-join null row. Used to build a `Datum::Record` for a
     /// whole-row reference; contexts without join rows reject it.
@@ -246,6 +254,14 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         (**self).whole_row_is_scalar(table)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        (**self).column_identity(qualifier, name)
+    }
+
+    fn table_schema(&self, table: &str) -> Option<&str> {
+        (**self).table_schema(table)
     }
 }
 
@@ -369,7 +385,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
     match expression {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
         | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. }
-        | Expr::WholeRow(_)
+        | Expr::WholeRow(_) | Expr::SchemaColumn { .. }
         | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
@@ -604,6 +620,19 @@ pub fn eval_full<'a>(
             }
             Err(e) => Err(e),
         },
+        Expr::SchemaColumn { schema, table, name } => {
+            // The qualifier pair must be an unaliased FROM entry whose base
+            // table really lives in that schema; only then does the reference
+            // bind, exactly as PostgreSQL resolves three-part names.
+            match row.table_schema(table) {
+                Some(actual) if actual == schema => row.lookup(Some(table), name),
+                _ => Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    table
+                )),
+            }
+        }
         Expr::Param(n) => params
             .get(n as usize - 1)
             .copied()
@@ -1068,15 +1097,28 @@ pub fn eval_full<'a>(
             }
             let b = eval_full(base, arena, params, row, hooks)?;
             // A record arriving indirectly — CASE, a scalar subquery, an
-            // aggregate, a field of a field — is anonymous to PostgreSQL: no
-            // field name resolves in it, however it was built.
+            // aggregate — is anonymous to PostgreSQL: no field name resolves
+            // in it. A chain of field accesses is judged by its root: rooted
+            // in a column or whole row (whose record types are known) it
+            // resolves; rooted in an anonymous constructor it does not, even
+            // through a field that exists.
+            fn chain_root<'e, 'x>(e: &'e Expr<'x>) -> &'e Expr<'x> {
+                match e {
+                    Expr::Field { base, .. } => chain_root(base),
+                    other => other,
+                }
+            }
             let anonymous_source = match base {
                 Expr::Call { name, .. } => !(name.eq_ignore_ascii_case("row")
                     || name.eq_ignore_ascii_case("json_each")
                     || name.eq_ignore_ascii_case("jsonb_each")
                     || name.eq_ignore_ascii_case("json_each_text")
                     || name.eq_ignore_ascii_case("jsonb_each_text")),
-                Expr::Case { .. } | Expr::Subquery(_) | Expr::Field { .. } => true,
+                Expr::Case { .. } | Expr::Subquery(_) => true,
+                Expr::Field { .. } => matches!(
+                    chain_root(base),
+                    Expr::Call { .. } | Expr::Case { .. } | Expr::Subquery(_)
+                ),
                 _ => false,
             };
             match b {
@@ -1707,6 +1749,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::NumericLit(_) => Some(ColType::Numeric),
         Expr::Str(_) => Some(ColType::Text),
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
+        Expr::SchemaColumn { table, name, .. } => row.col_type(Some(table), name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
         Expr::Unary { operator: UnaryOp::Neg, operand } => static_type(operand, row),
         Expr::Unary { operator: UnaryOp::Not, .. } | Expr::IsNull { .. }

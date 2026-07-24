@@ -55,10 +55,18 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Range { text, .. } => 5 + text.len(),
         Datum::Bit { bits, .. } => 5 + bits.len(),
         Datum::Multirange { text, .. } => 5 + text.len(),
-        // A record is stored as its rendered text (decode has no arena to
-        // rebuild the field slice); the column's RECORD type comes from the
-        // describe pass, so output is unaffected.
-        Datum::Record(_) => 4 + record_text_len(v),
+        // A record stores its rendered text (the arena-free decode returns
+        // that, keeping comparators and output unchanged) followed by a
+        // structural tail — field names, OIDs, nested tagged values — that
+        // [`decode_projected_col_record`] rebuilds into a `Datum::Record`
+        // when a consumer needs field access.
+        Datum::Record(fields) => {
+            let mut n = 4 + record_text_len(v) + 1;
+            for f in *fields {
+                n += 1 + f.name.len() + 4 + projected_value_len(&f.value);
+            }
+            n
+        }
     }
 }
 
@@ -215,10 +223,10 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[6..6 + text.len()].copy_from_slice(text.as_bytes());
             6 + text.len()
         }
-        Datum::Record(_) => {
+        Datum::Record(fields) => {
             use core::fmt::Write as _;
             // A cursor writing Display output straight into `out` after the
-            // 5-byte header (tag + u32 length).
+            // 5-byte header (tag + u32 text length).
             struct SliceWriter<'b> {
                 buf: &'b mut [u8],
                 at: usize,
@@ -235,7 +243,21 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             let _ = write!(w, "{v}");
             let text_len = w.at - 5;
             out[1..5].copy_from_slice(&(text_len as u32).to_le_bytes());
-            5 + text_len
+            // Structural tail: field count, then per field its name, type
+            // OID, and nested tagged value.
+            let mut at = 5 + text_len;
+            out[at] = fields.len() as u8;
+            at += 1;
+            for f in *fields {
+                out[at] = f.name.len() as u8;
+                at += 1;
+                out[at..at + f.name.len()].copy_from_slice(f.name.as_bytes());
+                at += f.name.len();
+                out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
+                at += 4;
+                at += write_projected_value(&f.value, &mut out[at..]);
+            }
+            at
         }
     }
 }
@@ -327,11 +349,13 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             (Datum::Multirange { text: s, kind }, 5 + len)
         }
         19 => {
-            // A record is stored as its rendered text; the column's RECORD
-            // type comes from describe, so returning Text renders it right.
+            // The arena-free decode returns a record's rendered text — right
+            // for comparators and output. Field access goes through
+            // [`decode_projected_col_record`], which rebuilds the structure
+            // from the tail this arm skips over.
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             let s = core::str::from_utf8(&bytes[at + 4..at + 4 + len]).unwrap_or("");
-            (Datum::Text(s), 4 + len)
+            (Datum::Text(s), 4 + len + record_tail_len(bytes, at + 4 + len))
         }
         9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
         10 => {
@@ -436,6 +460,94 @@ fn cmp_projected_prefix(a: &[u8], b: &[u8], width: usize) -> core::cmp::Ordering
         ib += sb;
     }
     core::cmp::Ordering::Equal
+}
+
+/// The byte length of a record's structural tail starting at `at` (the field
+/// count byte), nested records included.
+fn record_tail_len(bytes: &[u8], at: usize) -> usize {
+    let mut cursor = at;
+    let n_fields = bytes[cursor] as usize;
+    cursor += 1;
+    for _ in 0..n_fields {
+        let name_len = bytes[cursor] as usize;
+        cursor += 1 + name_len + 4;
+        let tag = bytes[cursor];
+        cursor += 1;
+        cursor += decode_projected_value(bytes, tag, cursor).1;
+    }
+    cursor - at
+}
+
+/// Reads column `col` of an encoded row like [`decode_projected_pub`], but
+/// rebuilds a record column into a structural [`Datum::Record`] (fields
+/// arena-allocated, nested records included) instead of its rendered text.
+pub fn decode_projected_col_record<'a>(
+    bytes: &'a [u8],
+    col: usize,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut at = 1usize;
+    let mut current = 0usize;
+    loop {
+        let tag = bytes[at];
+        at += 1;
+        let (value, size) = decode_projected_value(bytes, tag, at);
+        if current == col {
+            if tag == 19 {
+                let text_len =
+                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                return decode_record_tail(bytes, at + 4 + text_len, arena);
+            }
+            return Ok(value);
+        }
+        at += size;
+        current += 1;
+    }
+}
+
+/// Rebuilds a `Datum::Record` from the structural tail at `at`.
+fn decode_record_tail<'a>(
+    bytes: &'a [u8],
+    at: usize,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use crate::sql::types::RecordField;
+    let mut cursor = at;
+    let n_fields = bytes[cursor] as usize;
+    cursor += 1;
+    let fields = arena
+        .alloc_slice_with(n_fields, |_| RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        })
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "record decode exceeds the statement arena"
+            )
+        })?;
+    for f in fields.iter_mut() {
+        let name_len = bytes[cursor] as usize;
+        cursor += 1;
+        f.name = core::str::from_utf8(&bytes[cursor..cursor + name_len]).unwrap_or("");
+        cursor += name_len;
+        f.type_oid = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        cursor += 4;
+        let tag = bytes[cursor];
+        cursor += 1;
+        if tag == 19 {
+            let text_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            f.value = decode_record_tail(bytes, cursor + 4 + text_len, arena)?;
+            cursor += decode_projected_value(bytes, tag, cursor).1;
+        } else {
+            let (value, size) = decode_projected_value(bytes, tag, cursor);
+            f.value = value;
+            cursor += size;
+        }
+    }
+    Ok(Datum::Record(fields))
 }
 
 /// DISTINCT over encoded rows: sorts (grouping SQL-equal rows adjacently,

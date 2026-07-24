@@ -140,6 +140,13 @@ pub(super) fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_
 /// (which PostgreSQL forbids in CHECK).
 fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError> {
     match expression {
+        Expr::SchemaColumn { table, .. } => {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "invalid reference to FROM-clause entry for table \"{}\"",
+                table
+            ));
+        }
         Expr::WholeRow(t) => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,

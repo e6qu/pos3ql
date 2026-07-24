@@ -696,7 +696,7 @@ fn ungrouped_column<'e, 'a>(
     let first =
         |parts: &[&'e Expr<'a>]| parts.iter().find_map(|e| ungrouped_column(e, group_by, scope));
     match expression {
-        Expr::Column { .. } | Expr::WholeRow(_) => Some(expression),
+        Expr::Column { .. } | Expr::WholeRow(_) | Expr::SchemaColumn { .. } => Some(expression),
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_) | Expr::Str(_)
         | Expr::BitLit(_) | Expr::Param(_) | Expr::DefaultMarker | Expr::Subquery(_) | Expr::Exists(_)
         | Expr::ArraySubquery(_) => None,

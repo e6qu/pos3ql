@@ -592,6 +592,8 @@ pub(super) fn merge_correlated<'a, 'b>(
 /// (no spurious error), matching that these accept an unknown literal as-is.
 fn type_witness(ct: ColType) -> Datum<'static> {
     match ct {
+        // An empty record: enough for coerce_unknown to leave values alone.
+        ColType::Record => Datum::Record(&[]),
         ColType::Bool => Datum::Bool(false),
         ColType::Int2 | ColType::Int4 => Datum::Int4(0),
         ColType::Int8 => Datum::Int8(0),
@@ -925,15 +927,19 @@ fn run_set_subquery<'a>(
     }
     let (start, n) = set_window(rows.len(), outer_select, arena, params)?;
     let mut saw_null = false;
+    // The slice is reserved before any element decodes: a record column's
+    // structural decode allocates its fields from the same arena, which must
+    // not interleave with the slice's own reservation.
     let out = arena
-        .alloc_slice_with(n, |i| {
-            let v = crate::sql::exec::decode_projected_pub(rows[start + i], 0);
-            if v.is_null() {
-                saw_null = true;
-            }
-            v
-        })
+        .alloc_slice_with(n, |_| Datum::Null)
         .map_err(|_| arena_full())?;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let v = crate::sql::exec::decode_projected_col_record(rows[start + i], 0, arena)?;
+        if v.is_null() {
+            saw_null = true;
+        }
+        *slot = v;
+    }
     Ok((&*out, saw_null, type_witness(target[0])))
 }
 
@@ -955,10 +961,11 @@ fn set_record_rows<'a>(
         let text = stack_format!(12, "f{}", column + 1);
         *name = arena.alloc_str(text.as_str()).map_err(|_| arena_full())?;
     }
-    let record = |values: &mut dyn FnMut(usize) -> Datum<'a>| -> Result<Datum<'a>, SqlError> {
+    let record = |values: &mut dyn FnMut(usize) -> Result<Datum<'a>, SqlError>|
+     -> Result<Datum<'a>, SqlError> {
         let mut fields = [RecordField { name: "", type_oid: 0, value: Datum::Null }; MAX_PROJ];
         for (column, field) in fields[..target.len()].iter_mut().enumerate() {
-            let value = values(column);
+            let value = values(column)?;
             *field = RecordField { name: names[column], type_oid: value.type_oid(), value };
         }
         let fields = arena.alloc_slice_copy(&fields[..target.len()]).map_err(|_| arena_full())?;
@@ -967,12 +974,12 @@ fn set_record_rows<'a>(
     let out = arena.alloc_slice_with(n, |_| Datum::Null).map_err(|_| arena_full())?;
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = record(&mut |column| {
-            crate::sql::exec::decode_projected_pub(rows[start + i], column)
+            crate::sql::exec::decode_projected_col_record(rows[start + i], column, arena)
         })?;
     }
     // The witness types the IN operand before any comparison, so it is built
     // from the column types rather than from a row that may not exist.
-    let witness = record(&mut |column| type_witness(target[column]))?;
+    let witness = record(&mut |column| Ok(type_witness(target[column])))?;
     // A record itself is never null here; a null *field* makes an individual
     // membership comparison unknown, which `membership_eq` decides.
     Ok((&*out, false, witness))

@@ -284,6 +284,9 @@ pub(crate) fn decode<'a>(
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Multirange { text: s, kind };
             }
+            // Records are transient (DDL refuses them as stored columns), so
+            // a record column in the storage row schema is corruption.
+            ColType::Record => return Err(corrupt()),
             ColType::Bit { varying } => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let payload = u32::from_le_bytes(b.try_into().unwrap()) as usize;

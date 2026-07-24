@@ -41,6 +41,12 @@ pub fn cast_to<'a>(
         other => other,
     };
     let out = match target {
+        // A cast *to* record has no source but a record itself; PostgreSQL
+        // has no input conversion for anonymous records either.
+        ColType::Record => match v {
+            Datum::Record(_) => v,
+            _ => return Err(cast_unsupported(&v, "record")),
+        },
         ColType::Bool => match v {
             Datum::Bool(_) => v,
             Datum::Int4(x) => Datum::Bool(x != 0),

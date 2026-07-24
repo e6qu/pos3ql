@@ -184,7 +184,7 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
         Ok(id)
     }
 
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError> {
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
         if let Some(&slot) = self.index.get(id) {
             let len = self.slots[slot].len;
             if self.file.read_at(&mut self.scratch[..len], (slot * SLOT_SIZE) as u64).is_ok() {
@@ -199,7 +199,7 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
                     into[..block.payload.len()].copy_from_slice(block.payload);
                     self.slots[slot].referenced = true;
                     self.stats.hits += 1;
-                    return Ok(block.payload.len());
+                    return Ok((block.payload.len(), block.block_type));
                 }
             }
             // Torn, rotted, or holding some other block: drop it and fall
@@ -207,13 +207,12 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
             self.drop_corrupt(id, slot);
         }
         self.stats.misses += 1;
-        let len = self.inner.get(id, into)?;
-        // The block's frame metadata is not recoverable from the payload alone,
-        // so a block fetched through here is re-framed as SstData at lsn 0 for
-        // the slot. The header is the cache's own; the payload is what matters,
-        // and it is verified against the identity on the next read regardless.
-        self.admit(*id, BlockType::SstData, 0, &into[..len]);
-        Ok(len)
+        let (len, block_type) = self.inner.get(id, into)?;
+        // Re-framed with the store's own type at lsn 0: the type must
+        // survive the round trip through the slot (a cached compressed
+        // block still has to say so), the lsn need not.
+        self.admit(*id, block_type, 0, &into[..len]);
+        Ok((len, block_type))
     }
 
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
@@ -257,7 +256,7 @@ mod tests {
 
     fn read(c: &mut DiskCache<MemoryBlockStore>, id: &BlockId) -> Vec<u8> {
         let mut out = vec![0u8; 4096];
-        let n = c.get(id, &mut out).expect("reads");
+        let (n, _) = c.get(id, &mut out).expect("reads");
         out.truncate(n);
         out
     }

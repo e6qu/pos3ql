@@ -84,7 +84,7 @@ fn get_block(
     prefix: &str,
     id: &BlockId,
     into: &mut [u8],
-) -> Result<usize, StoreError> {
+) -> Result<(usize, BlockType), StoreError> {
     let mut key_buffer = [0u8; 128];
     let key = key_of(prefix, id, &mut key_buffer);
     let result = client.get(key, None).map_err(store_error)?;
@@ -100,7 +100,7 @@ fn get_block(
         return Err(StoreError::BufferTooSmall);
     }
     into[..block.payload.len()].copy_from_slice(block.payload);
-    Ok(block.payload.len())
+    Ok((block.payload.len(), block.block_type))
 }
 
 /// The bucket store that owns its client and scratch — the long-lived form a
@@ -129,7 +129,7 @@ impl BlockStore for OwnedObjectStore {
         put_block(&mut self.client, self.prefix, &mut self.scratch, payload, block_type, lsn)
     }
 
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError> {
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
         get_block(&mut self.client, self.prefix, id, into)
     }
 
@@ -154,7 +154,7 @@ impl BlockStore for ObjectBlockStore<'_> {
         put_block(self.client, self.prefix, self.scratch, payload, block_type, lsn)
     }
 
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError> {
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
         get_block(self.client, self.prefix, id, into)
     }
 

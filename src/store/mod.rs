@@ -36,8 +36,10 @@ mod object;
 mod sst;
 mod tiered;
 
+pub(crate) mod lz4;
+
 pub(crate) use object::OwnedObjectStore;
-pub(crate) use sst::{block_keys_at, index_block_count, index_block_id};
+pub(crate) use sst::{block_keys_at, data_block_total, locate_data_block, read_data_block};
 pub(crate) use sst::{SstHandle, SstReader};
 pub(crate) use sst::{SstError, SstWriter, MAX_ASSEMBLED};
 pub(crate) use tiered::TieredStore;
@@ -77,6 +79,10 @@ pub(crate) enum BlockType {
     /// itself included last as the index/filter are known by then) — what
     /// garbage collection walks instead of the data blocks themselves.
     SstRoster = 6,
+    /// A sorted-row data block whose payload is LZ4-block-compressed (the
+    /// hand-rolled [`lz4`]); the writer keeps whichever of raw/compressed
+    /// is smaller, so both types coexist in one SST.
+    SstDataLz4 = 7,
 }
 
 impl BlockType {
@@ -88,6 +94,7 @@ impl BlockType {
             4 => BlockType::ManifestLog,
             5 => BlockType::WalSegment,
             6 => BlockType::SstRoster,
+            7 => BlockType::SstDataLz4,
             _ => return None,
         })
     }
@@ -131,6 +138,9 @@ pub(crate) enum BlockError {
     TooLarge,
     /// A `block_type` this build does not know.
     UnknownType,
+    /// A compressed payload that does not decode. The checksum passed, so
+    /// this is a writer's bug, not transit damage.
+    Payload,
 }
 
 /// Writes `payload` into `out` as a complete block and returns its identity and
@@ -223,9 +233,11 @@ pub(crate) trait BlockStore {
         lsn: u64,
     ) -> Result<BlockId, StoreError>;
 
-    /// Reads the block named `id` into `into`, returning its payload length.
-    /// Verifies the block; a mismatch is an error, never a shorter answer.
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError>;
+    /// Reads the block named `id` into `into`, returning its payload length
+    /// and its type — the type travels because a cached compressed block
+    /// stays compressed, and only the type says so. Verifies the block; a
+    /// mismatch is an error, never a shorter answer.
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError>;
 
     /// Whether the block is present without reading it.
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError>;

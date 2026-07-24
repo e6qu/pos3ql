@@ -119,14 +119,42 @@ pub(crate) struct SstWriter {
     /// The last key written, so out-of-order rows are caught rather than
     /// producing an SST whose binary search silently misses them.
     last_key: Option<u64>,
-    /// The filter's bit array, one key set into it per append. It becomes the
-    /// filter block at finish.
-    filter: Box<[u8]>,
+    /// The filter ladder: every key is set into all three candidate sizes,
+    /// and finish keeps the smallest whose bits-per-key stays healthy — a
+    /// small SST no longer pays a 128 KiB filter for a handful of rows.
+    filters: [Box<[u8]>; FILTER_TIERS.len()],
+    key_count: usize,
     /// Every block identity written so far (data and chain blocks), for the
     /// roster.
     roster: Box<[BlockId]>,
     roster_len: usize,
+    /// LZ4 staging for data-block flushes: the smaller of raw/compressed is
+    /// what gets stored.
+    compress_buf: Box<[u8]>,
+    /// Flushed index leaves: `(first_rowid, data_block_count, id)`. One leaf
+    /// makes the classic single-block index; more make a two-level one, so
+    /// an SST is no longer capped at one index block's worth of data.
+    leaves: Box<[(u64, u32, BlockId)]>,
+    leaves_len: usize,
 }
+
+/// The filter ladder's sizes. Ten bits per key is the design point (~1%
+/// false positives at seven hashes); the tiers cover ~1.5k, ~13k and ~100k
+/// keys, degrading gracefully past the top as before.
+const FILTER_TIERS: [usize; 3] = [2 * 1024, 16 * 1024, FILTER_BYTES];
+
+/// The most index leaves a root block tracks: at 44 bytes per entry a root
+/// could hold ~5900, but the writer's own memory bounds it lower — still
+/// about 26 million data blocks (terabytes) per SST, checked and raised
+/// rather than overrun.
+const MAX_LEAVES: usize = 4096;
+
+/// A root index block starts with this in place of a leaf's entry count.
+/// Unambiguous: a leaf's count is at most `MAX_DATA_BLOCKS` (~6.5k).
+pub(crate) const INDEX_ROOT_MAGIC: u32 = 0xFFFF_FFFF;
+
+/// One root entry: `first_rowid u64 | data_block_count u32 | leaf id 32B`.
+const ROOT_ENTRY: usize = 8 + 4 + 32;
 
 impl SstWriter {
     /// Allocates the writer's fixed buffers (about 0.9 MiB). Startup only —
@@ -139,18 +167,27 @@ impl SstWriter {
             index: vec![(0u64, BlockId([0u8; 32])); MAX_DATA_BLOCKS].into_boxed_slice(),
             index_len: 0,
             last_key: None,
-            filter: vec![0u8; FILTER_BYTES].into_boxed_slice(),
+            filters: [
+                vec![0u8; FILTER_TIERS[0]].into_boxed_slice(),
+                vec![0u8; FILTER_TIERS[1]].into_boxed_slice(),
+                vec![0u8; FILTER_TIERS[2]].into_boxed_slice(),
+            ],
+            key_count: 0,
             roster: vec![BlockId([0u8; 32]); MAX_ROSTER].into_boxed_slice(),
             roster_len: 0,
+            compress_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+            leaves: vec![(0u64, 0u32, BlockId([0u8; 32])); MAX_LEAVES].into_boxed_slice(),
+            leaves_len: 0,
         }
     }
 
     /// The fixed bytes one writer reserves, for budget estimates.
     pub(crate) fn budget_bytes() -> usize {
-        MAX_PAYLOAD
+        2 * MAX_PAYLOAD // pending + compress staging
             + MAX_DATA_BLOCKS * core::mem::size_of::<(u64, BlockId)>()
-            + FILTER_BYTES
+            + FILTER_TIERS.iter().sum::<usize>()
             + MAX_ROSTER * 32
+            + MAX_LEAVES * core::mem::size_of::<(u64, u32, BlockId)>()
     }
 
     /// Empties the writer for its next SST. Allocation-free.
@@ -159,8 +196,12 @@ impl SstWriter {
         self.pending_first = None;
         self.index_len = 0;
         self.last_key = None;
-        self.filter.fill(0);
+        for filter in &mut self.filters {
+            filter.fill(0);
+        }
+        self.key_count = 0;
         self.roster_len = 0;
+        self.leaves_len = 0;
     }
 
     /// The identities written so far — a garbage sweep running while a
@@ -199,7 +240,10 @@ impl SstWriter {
             self.pending_first = Some(rowid);
         }
         self.last_key = Some(rowid);
-        bloom::insert(&mut self.filter, rowid);
+        for filter in &mut self.filters {
+            bloom::insert(filter, rowid);
+        }
+        self.key_count += 1;
         Ok(())
     }
 
@@ -243,7 +287,10 @@ impl SstWriter {
         self.pending_len = cursor + head_room;
         self.pending_first = Some(rowid);
         self.last_key = Some(rowid);
-        bloom::insert(&mut self.filter, rowid);
+        for filter in &mut self.filters {
+            bloom::insert(filter, rowid);
+        }
+        self.key_count += 1;
         self.flush_data(store)
     }
 
@@ -289,15 +336,52 @@ impl SstWriter {
             return Ok(());
         }
         if self.index_len == MAX_DATA_BLOCKS {
-            return Err(SstError::TooManyBlocks);
+            // One index leaf is full; start another. The finish decides
+            // whether a root is needed over them.
+            self.flush_index_leaf(store)?;
         }
         let first = self.pending_first.expect("a non-empty block has a first key");
-        let id = store.put(&self.pending[..self.pending_len], BlockType::SstData, 0)?;
+        // Store whichever of raw/LZ4 is smaller: on object storage the bytes
+        // are latency, bandwidth and money, and an incompressible block
+        // costs nothing but this attempt.
+        let raw = &self.pending[..self.pending_len];
+        let id = match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
+            Some(n) if n < raw.len() => {
+                store.put(&self.compress_buf[..n], BlockType::SstDataLz4, 0)?
+            }
+            _ => store.put(raw, BlockType::SstData, 0)?,
+        };
         self.record(id)?;
         self.index[self.index_len] = (first, id);
         self.index_len += 1;
         self.pending_len = 0;
         self.pending_first = None;
+        Ok(())
+    }
+
+    /// Writes the accumulated index entries as one leaf block (the classic
+    /// count-prefixed layout) and records it for the root.
+    fn flush_index_leaf(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
+        if self.index_len == 0 {
+            return Ok(());
+        }
+        if self.leaves_len == MAX_LEAVES {
+            return Err(SstError::TooManyBlocks);
+        }
+        let bytes = 4 + self.index_len * INDEX_ENTRY;
+        let buffer = &mut *self.compress_buf; // free between data flushes
+        buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
+        for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
+            let at = 4 + i * INDEX_ENTRY;
+            buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
+            buffer[at + 8..at + INDEX_ENTRY].copy_from_slice(&id.0);
+        }
+        let id = store.put(&self.compress_buf[..bytes], BlockType::SstIndex, 0)?;
+        self.record(id)?;
+        self.leaves[self.leaves_len] =
+            (self.index[0].0, self.index_len as u32, id);
+        self.leaves_len += 1;
+        self.index_len = 0;
         Ok(())
     }
 
@@ -309,22 +393,45 @@ impl SstWriter {
         store: &mut dyn BlockStore,
     ) -> Result<Option<SstHandle>, SstError> {
         self.flush_data(store)?;
-        if self.index_len == 0 {
+        if self.index_len == 0 && self.leaves_len == 0 {
             return Ok(None);
         }
-        // The filter block, so a reader can skip this SST without the index.
-        let filter = store.put(&self.filter, BlockType::SstFilter, 0)?;
+        // The filter block, so a reader can skip this SST without the
+        // index — the smallest ladder tier still giving ~10 bits per key.
+        let tier = self
+            .filters
+            .iter()
+            .position(|f| self.key_count * 10 <= f.len() * 8)
+            .unwrap_or(self.filters.len() - 1);
+        let filter = store.put(&self.filters[tier], BlockType::SstFilter, 0)?;
         self.record(filter)?;
-        // The index block: count, then (first_rowid, block_id) per data block.
-        let bytes = 4 + self.index_len * INDEX_ENTRY;
-        let buffer = &mut *self.pending; // reuse the data scratch; it is done with
-        buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
-        for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
-            let at = 4 + i * INDEX_ENTRY;
-            buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
-            buffer[at + 8..at + INDEX_ENTRY].copy_from_slice(&id.0);
-        }
-        let index = store.put(&buffer[..bytes], BlockType::SstIndex, 0)?;
+        // The index. One leaf's worth of entries makes the classic single
+        // block; more make leaves under a root, so SST size is no longer
+        // bounded by one index block.
+        let index = if self.leaves_len == 0 {
+            let bytes = 4 + self.index_len * INDEX_ENTRY;
+            let buffer = &mut *self.pending; // reuse the data scratch; it is done with
+            buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
+            for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
+                let at = 4 + i * INDEX_ENTRY;
+                buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
+                buffer[at + 8..at + INDEX_ENTRY].copy_from_slice(&id.0);
+            }
+            store.put(&buffer[..bytes], BlockType::SstIndex, 0)?
+        } else {
+            self.flush_index_leaf(store)?;
+            let bytes = 8 + self.leaves_len * ROOT_ENTRY;
+            let buffer = &mut *self.pending;
+            buffer[0..4].copy_from_slice(&INDEX_ROOT_MAGIC.to_le_bytes());
+            buffer[4..8].copy_from_slice(&(self.leaves_len as u32).to_le_bytes());
+            for (i, (first, count, id)) in self.leaves[..self.leaves_len].iter().enumerate() {
+                let at = 8 + i * ROOT_ENTRY;
+                buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
+                buffer[at + 8..at + 12].copy_from_slice(&count.to_le_bytes());
+                buffer[at + 12..at + ROOT_ENTRY].copy_from_slice(&id.0);
+            }
+            store.put(&buffer[..bytes], BlockType::SstIndex, 0)?
+        };
         if self.roster_len == MAX_ROSTER {
             return Err(SstError::TooManyBlocks);
         }
@@ -335,6 +442,7 @@ impl SstWriter {
         // identity is a hash of its contents — so the sweeper keeps the
         // roster alive through the handle that names it.
         let roster_bytes = self.roster_len * 32;
+        let buffer = &mut *self.pending;
         for (i, id) in self.roster[..self.roster_len].iter().enumerate() {
             buffer[i * 32..i * 32 + 32].copy_from_slice(&id.0);
         }
@@ -352,6 +460,27 @@ pub(crate) struct SstReader<'a> {
     /// Scratch a range scan assembles a chained row into (a point lookup
     /// assembles straight into the caller's buffer instead).
     assembly: &'a mut [u8],
+}
+
+/// Fetches a data block, transparently decompressing an LZ4 one: `buf`
+/// receives the raw entries either way; `bounce` stages the compressed
+/// bytes (any MAX_PAYLOAD-sized buffer that is free at the call).
+pub(crate) fn read_data_block(
+    store: &mut dyn BlockStore,
+    id: &BlockId,
+    buf: &mut [u8],
+    bounce: &mut [u8],
+) -> Result<usize, SstError> {
+    let (n, block_type) = store.get(id, buf)?;
+    match block_type {
+        BlockType::SstData => Ok(n),
+        BlockType::SstDataLz4 => {
+            bounce[..n].copy_from_slice(&buf[..n]);
+            super::lz4::decompress(&bounce[..n], buf)
+                .ok_or(SstError::Store(StoreError::Corrupt(super::BlockError::Payload)))
+        }
+        _ => Err(SstError::Store(StoreError::Corrupt(super::BlockError::UnknownType))),
+    }
 }
 
 impl<'a> SstReader<'a> {
@@ -393,11 +522,11 @@ impl<'a> SstReader<'a> {
     ) -> Result<Option<usize>, SstError> {
         // The filter reuses the index buffer: it is consulted and done with
         // before the index is read, so the two never coexist.
-        let filter_len = store.get(&handle.filter, self.index_scratch)?;
+        let (filter_len, _) = store.get(&handle.filter, self.index_scratch)?;
         if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
             return Ok(None);
         }
-        let count = self.load_index(store, &handle.index)?;
+        let count = self.load_covering_leaf(store, &handle.index, rowid)?;
         let Some(entry) = block_containing(self.index_scratch, count, rowid) else {
             return Ok(None);
         };
@@ -406,7 +535,7 @@ impl<'a> SstReader<'a> {
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
-        let data_len = store.get(&block_id, self.data_scratch)?;
+        let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
         let mut found: Option<(usize, bool)> = None;
         for entry in DataBlock(&self.data_scratch[..data_len]) {
             if entry.key == rowid {
@@ -444,16 +573,16 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         rowid: u64,
     ) -> Result<Option<Option<u32>>, SstError> {
-        let filter_len = store.get(&handle.filter, self.index_scratch)?;
+        let (filter_len, _) = store.get(&handle.filter, self.index_scratch)?;
         if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
             return Ok(None);
         }
-        let count = self.load_index(store, &handle.index)?;
+        let count = self.load_covering_leaf(store, &handle.index, rowid)?;
         let Some(entry) = block_containing(self.index_scratch, count, rowid) else {
             return Ok(None);
         };
         let block_id = block_id_at(self.index_scratch, entry);
-        let data_len = store.get(&block_id, self.data_scratch)?;
+        let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
         for entry in DataBlock(&self.data_scratch[..data_len]) {
             if entry.key == rowid {
                 return Ok(Some(if entry.tombstone {
@@ -486,14 +615,25 @@ impl<'a> SstReader<'a> {
             return Ok(());
         }
         // A range is not a point-membership question, so the filter does not
-        // help here; the index locates the covering blocks directly.
-        let count = self.load_index(store, &handle.index)?;
+        // help here; the index locates the covering blocks directly. Leaves
+        // walk in order (a single-block index is its own only leaf), the
+        // root refetched per leaf advance through the cache.
+        let start_leaf = self.leaf_for(store, &handle.index, lo)?;
+        let mut leaf_ordinal = start_leaf;
+        'leaves: loop {
+        let Some(count) = self.load_leaf(store, &handle.index, leaf_ordinal)? else {
+            break 'leaves;
+        };
         // The block `lo` falls in, or — when `lo` precedes every key — the
         // first block, since the range may still cover it from the left.
-        let start = block_containing(self.index_scratch, count, lo).unwrap_or(0);
+        let start = if leaf_ordinal == start_leaf {
+            block_containing(self.index_scratch, count, lo).unwrap_or(0)
+        } else {
+            0
+        };
         for entry_index in start..count {
             let block_id = block_id_at(self.index_scratch, entry_index);
-            let data_len = store.get(&block_id, self.data_scratch)?;
+            let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
             let mut ran_past = false;
             // A chained entry owns its whole block, so at most one assembly
             // happens per block and the borrow of `data_scratch` has ended by
@@ -522,8 +662,10 @@ impl<'a> SstReader<'a> {
             // A block ending past `hi` bounds the scan: later blocks hold only
             // larger keys, so none of them can be in range.
             if ran_past {
-                break;
+                break 'leaves;
             }
+        }
+        leaf_ordinal += 1;
         }
         Ok(())
     }
@@ -541,33 +683,195 @@ impl<'a> SstReader<'a> {
         max_blocks: usize,
         emit: &mut dyn FnMut(u64, bool),
     ) -> Result<Option<u64>, SstError> {
-        let count = self.load_index(store, &handle.index)?;
-        let start = block_containing(self.index_scratch, count, lo).unwrap_or(0);
-        let end = (start + max_blocks).min(count);
+        let start_leaf = self.leaf_for(store, &handle.index, lo)?;
+        let mut leaf_ordinal = start_leaf;
+        let mut budget = max_blocks;
         let mut last_key: Option<u64> = None;
-        for entry_index in start..end {
-            let block_id = block_id_at(self.index_scratch, entry_index);
-            let data_len = store.get(&block_id, self.data_scratch)?;
-            for entry in DataBlock(&self.data_scratch[..data_len]) {
-                if entry.key >= lo {
-                    emit(entry.key, entry.tombstone);
+        loop {
+            let Some(count) = self.load_leaf(store, &handle.index, leaf_ordinal)? else {
+                return Ok(None); // the SST is exhausted
+            };
+            let start = if leaf_ordinal == start_leaf {
+                block_containing(self.index_scratch, count, lo).unwrap_or(0)
+            } else {
+                0
+            };
+            let end = (start + budget).min(count);
+            for entry_index in start..end {
+                let block_id = block_id_at(self.index_scratch, entry_index);
+                let data_len =
+                    read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
+                for entry in DataBlock(&self.data_scratch[..data_len]) {
+                    if entry.key >= lo {
+                        emit(entry.key, entry.tombstone);
+                    }
+                    last_key = Some(last_key.map_or(entry.key, |k| k.max(entry.key)));
                 }
-                last_key = Some(last_key.map_or(entry.key, |k| k.max(entry.key)));
             }
-        }
-        if end == count {
-            return Ok(None);
+            budget -= end - start;
+            if budget == 0 && end < count {
+                break;
+            }
+            if end == count && budget > 0 {
+                leaf_ordinal += 1;
+                continue;
+            }
+            if budget == 0 {
+                // The budget ran out exactly at a leaf boundary; whether more
+                // leaves follow is the resume's question, not this beat's.
+                break;
+            }
         }
         // Resuming one past the largest key seen re-locates through the index
         // and cannot skip an entry: keys are unique and ascending.
         Ok(Some(last_key.map_or(lo, |k| k + 1)))
     }
 
-    /// Reads and validates the index block, returning its data-block count.
-    fn load_index(&mut self, store: &mut dyn BlockStore, root: &BlockId) -> Result<usize, SstError> {
-        store.get(root, self.index_scratch)?;
+    /// Loads leaf `ordinal` of the index into the index scratch and returns
+    /// its entry count — `None` past the last leaf. A single-block index is
+    /// its own leaf 0; a two-level one descends through the root.
+    fn load_leaf(
+        &mut self,
+        store: &mut dyn BlockStore,
+        root: &BlockId,
+        ordinal: usize,
+    ) -> Result<Option<usize>, SstError> {
+        let _ = store.get(root, self.index_scratch)?;
+        let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
+        if head != INDEX_ROOT_MAGIC {
+            return Ok((ordinal == 0).then_some(head as usize));
+        }
+        let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
+        if ordinal >= leaves {
+            return Ok(None);
+        }
+        let at = 8 + ordinal * ROOT_ENTRY;
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&self.index_scratch[at + 12..at + ROOT_ENTRY]);
+        let _ = store.get(&BlockId(id), self.index_scratch)?;
+        Ok(Some(
+            u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize,
+        ))
+    }
+
+    /// The leaf ordinal whose key range covers `rowid` (the last leaf whose
+    /// first key does not exceed it; 0 when `rowid` precedes everything).
+    fn leaf_for(
+        &mut self,
+        store: &mut dyn BlockStore,
+        root: &BlockId,
+        rowid: u64,
+    ) -> Result<usize, SstError> {
+        let _ = store.get(root, self.index_scratch)?;
+        let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
+        if head != INDEX_ROOT_MAGIC {
+            return Ok(0);
+        }
+        let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
+        Ok(root_leaf_containing(self.index_scratch, leaves, rowid).unwrap_or(0))
+    }
+
+    /// Loads the leaf covering `rowid` and returns its entry count — after
+    /// this the classic `block_containing`/`block_id_at` searches apply to
+    /// the scratch exactly as with a single-block index.
+    fn load_covering_leaf(
+        &mut self,
+        store: &mut dyn BlockStore,
+        root: &BlockId,
+        rowid: u64,
+    ) -> Result<usize, SstError> {
+        let _ = store.get(root, self.index_scratch)?;
+        let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
+        if head != INDEX_ROOT_MAGIC {
+            // The single-block shape: the root is its own covering leaf, and
+            // a point lookup still costs filter + index + one data block.
+            return Ok(head as usize);
+        }
+        let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
+        let leaf = root_leaf_containing(self.index_scratch, leaves, rowid).unwrap_or(0);
+        let at = 8 + leaf * ROOT_ENTRY;
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&self.index_scratch[at + 12..at + ROOT_ENTRY]);
+        let _ = store.get(&BlockId(id), self.index_scratch)?;
         Ok(u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize)
     }
+}
+
+/// The root entry (last one whose first key does not exceed `key`) in a
+/// fetched two-level root. `None` when `key` precedes every leaf.
+fn root_leaf_containing(root: &[u8], leaves: usize, key: u64) -> Option<usize> {
+    let first_key = |i: usize| {
+        let at = 8 + i * ROOT_ENTRY;
+        u64::from_le_bytes(root[at..at + 8].try_into().unwrap())
+    };
+    if leaves == 0 || key < first_key(0) {
+        return None;
+    }
+    let (mut lo, mut hi) = (0usize, leaves - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if first_key(mid) <= key {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
+}
+
+/// Resolves global data-block `ordinal` through an SST's index root of
+/// either shape, fetching blocks through `store` into `buf` (clobbered).
+/// `None` past the end. This is how the storage overlay's member cursors
+/// walk an SST without holding its whole index resident.
+pub(crate) fn locate_data_block(
+    store: &mut dyn BlockStore,
+    root: &BlockId,
+    buf: &mut [u8],
+    ordinal: usize,
+) -> Result<Option<BlockId>, SstError> {
+    let _ = store.get(root, buf)?;
+    let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if head != INDEX_ROOT_MAGIC {
+        let count = head as usize;
+        if ordinal >= count {
+            return Ok(None);
+        }
+        return Ok(Some(block_id_at(buf, ordinal)));
+    }
+    let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+    let mut remaining = ordinal;
+    for leaf in 0..leaves {
+        let at = 8 + leaf * ROOT_ENTRY;
+        let count = u32::from_le_bytes(buf[at + 8..at + 12].try_into().unwrap()) as usize;
+        if remaining < count {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&buf[at + 12..at + ROOT_ENTRY]);
+            let _ = store.get(&BlockId(id), buf)?;
+            return Ok(Some(block_id_at(buf, remaining)));
+        }
+        remaining -= count;
+    }
+    Ok(None)
+}
+
+/// Total data blocks under an SST's index root of either shape.
+pub(crate) fn data_block_total(
+    store: &mut dyn BlockStore,
+    root: &BlockId,
+    buf: &mut [u8],
+) -> Result<usize, SstError> {
+    let _ = store.get(root, buf)?;
+    let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if head != INDEX_ROOT_MAGIC {
+        return Ok(head as usize);
+    }
+    let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+    let mut total = 0usize;
+    for leaf in 0..leaves {
+        let at = 8 + leaf * ROOT_ENTRY;
+        total += u32::from_le_bytes(buf[at + 8..at + 12].try_into().unwrap()) as usize;
+    }
+    Ok(total)
 }
 
 /// Binary-searches the sparse index for the last block whose first key does not
@@ -710,7 +1014,7 @@ fn assemble_chain(
     for id_bytes in entry.chain.chunks(32) {
         let mut id = [0u8; 32];
         id.copy_from_slice(id_bytes);
-        let n = store.get(&BlockId(id), &mut into[at..])?;
+        let (n, _) = store.get(&BlockId(id), &mut into[at..])?;
         at += n;
     }
     if at != entry.total_len {
@@ -1020,6 +1324,106 @@ mod tests {
         let read = s.reads() - before;
         // Index + the one or two data blocks an eleven-key window touches.
         assert!(read <= 4, "a narrow range read {read} blocks; expected the index and a few data blocks");
+    }
+
+    #[test]
+    fn a_two_level_index_serves_every_read_path() {
+        // Forcing leaf flushes between appends builds a real two-level SST
+        // without the gigabytes a naturally-overflowing index would need:
+        // five leaves of two data blocks each, verified through every
+        // navigation path — point get, probe, full scan, bounded scan
+        // resumption, and the ordinal resolvers the overlay cursors use.
+        let (_b, mut s) = store();
+        let a = arena();
+        let mut w = SstWriter::new();
+        let row = |i: u64| vec![(i % 251) as u8; 100_000]; // ~2 rows per block
+        let mut written = Vec::new();
+        for group in 0..5u64 {
+            for i in 0..4u64 {
+                let rowid = group * 100 + i * 3 + 1;
+                w.append(&mut s, rowid, &row(rowid)).unwrap();
+                written.push(rowid);
+            }
+            w.flush_data(&mut s).unwrap();
+            w.flush_index_leaf(&mut s).unwrap();
+        }
+        let handle = w.finish(&mut s).unwrap().expect("root");
+
+        let mut r = SstReader::new(&a).unwrap();
+        // The root really is two-level.
+        let mut buf = vec![0u8; MAX_PAYLOAD];
+        let (_, _) = s.get(&handle.index, &mut buf).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            INDEX_ROOT_MAGIC
+        );
+        let total = super::data_block_total(&mut s, &handle.index, &mut buf).unwrap();
+        assert!(total >= 10, "five groups of two blocks, got {total}");
+        // Every ordinal resolves; one past the end does not.
+        for ordinal in 0..total {
+            assert!(super::locate_data_block(&mut s, &handle.index, &mut buf, ordinal)
+                .unwrap()
+                .is_some());
+        }
+        assert!(super::locate_data_block(&mut s, &handle.index, &mut buf, total)
+            .unwrap()
+            .is_none());
+        // Point reads and probes, present and absent.
+        let mut out = vec![0u8; 128 * 1024];
+        for &rowid in &written {
+            assert_eq!(
+                r.get(&mut s, &handle, rowid, &mut out).unwrap(),
+                Some(100_000),
+                "row {rowid}"
+            );
+            assert_eq!(r.probe(&mut s, &handle, rowid).unwrap(), Some(Some(100_000)));
+        }
+        assert_eq!(r.get(&mut s, &handle, 2, &mut out).unwrap(), None);
+        assert_eq!(r.probe(&mut s, &handle, 100_000).unwrap(), None);
+        // A full scan crosses every leaf in order.
+        let mut seen = Vec::new();
+        r.scan(&mut s, &handle, 0, u64::MAX, &mut |rowid, row| {
+            assert!(row.is_some());
+            seen.push(rowid);
+        })
+        .unwrap();
+        assert_eq!(seen, written);
+        // A bounded scan resumes across leaf boundaries to the same total.
+        let mut walked = Vec::new();
+        let mut lo = 0u64;
+        while let Some(next) = r
+            .scan_bounded(&mut s, &handle, lo, 3, &mut |rowid, tomb| {
+                assert!(!tomb);
+                walked.push(rowid);
+            })
+            .unwrap()
+        {
+            lo = next;
+        }
+        assert_eq!(walked, written);
+    }
+
+    #[test]
+    fn compressible_blocks_store_fewer_bytes_than_raw() {
+        // Repetitive rows must land as LZ4 blocks: the store's used bytes
+        // stay well under the raw payload total, and every row still reads
+        // back exactly — meaning the whole read path decompresses.
+        let (_b, mut s) = store();
+        let a = arena();
+        let rows: Vec<_> = (1..=40u64)
+            .map(|i| (i, format!("row {i} says the same thing over and over; ").repeat(400).into_bytes()))
+            .collect();
+        let raw_total: usize = rows.iter().map(|(_, r)| r.len()).sum();
+        let root = build(&mut s, &rows).expect("root");
+        assert!(
+            s.used() < raw_total / 3,
+            "{} bytes stored for {raw_total} raw",
+            s.used()
+        );
+        let mut r = SstReader::new(&a).unwrap();
+        for (rowid, row) in &rows {
+            assert_eq!(get(&mut r, &mut s, &root, *rowid).as_ref(), Some(row), "row {rowid}");
+        }
     }
 
     #[test]

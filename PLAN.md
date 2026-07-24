@@ -335,8 +335,9 @@ from before the block grid still load, their whole-object SSTs rewritten as
 block SSTs by the next checkpoint and swept. The full external harness — kill
 -9 recovery, async-WAL rebuild, checkpointed cold start from a wiped disk —
 passes over the block path, and the fidelity suites are untouched by
-construction. What remains of Stage C proper: the multi-block index and a sized
-filter, both refinements.
+construction. What remained of Stage C proper — the multi-block index and the sized
+filter — closed with maturity-roadmap step 4's format follow-ups
+(2026-07-25), alongside LZ4 data-block compression.
 
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 
@@ -942,6 +943,25 @@ adaptive-execution capstone. This section is the plan of record for all of it.
    dataset larger than the map. Remaining in step 4: the secondary-index
    LSM forest and block compression (with the multi-block index and sized
    filters), now follow-ups on top of a settled overlay.
+   **Status (2026-07-25): the format follow-ups landed.** Data blocks are
+   **LZ4-compressed** when it pays (a hand-rolled implementation of the
+   published LZ4 block format — the same dependency-policy footing as the
+   hand-rolled SHA-256 and TZif — with the writer keeping whichever of
+   raw/compressed is smaller, strict bounds-checked decompression, and the
+   block *type* now traveling through every cache tier so a cached
+   compressed block still says so). The index went **two-level** — leaves in
+   the classic count-prefixed layout under a magic-prefixed root carrying
+   per-leaf block counts — so an SST is no longer capped at one index
+   block's worth of data (~1.6 GB); the cap is now terabytes, and every
+   read path (point get, probe, scans, bounded-scan resumption, the
+   overlay's ordinal cursors, cold-start rowid floors) navigates both
+   shapes through shared resolvers. Filters are **sized from a ladder**:
+   every key inserts into three candidate sizes and the finish keeps the
+   smallest still giving ~10 bits per key, so a small SST no longer pays
+   128 KiB for a handful of rows. What remains of step 4: the
+   secondary-index LSM forest — a planner/executor concern, next.
+   (Stage C's own "remaining: multi-block index and sized filter" is
+   thereby closed.)
 
    *Earlier (same day):* **the choke points went in first** — the first half of the
    two-PR shape this step takes (the query.rs-split playbook: mechanical

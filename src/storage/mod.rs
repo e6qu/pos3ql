@@ -817,11 +817,13 @@ struct MemberCursor {
     done: bool,
 }
 
-/// The reader's owned block buffers (index, data, chain assembly).
+/// The reader's owned block buffers (index, data, chain assembly, and the
+/// staging bounce a compressed data block decompresses through).
 struct SpillScratch {
     index_buf: Box<[u8]>,
     data_buf: Box<[u8]>,
     assembly_buf: Box<[u8]>,
+    bounce_buf: Box<[u8]>,
 }
 
 impl SpillReader {
@@ -831,7 +833,7 @@ impl SpillReader {
         blocks: std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
     ) -> Result<Self, BudgetError> {
         budget.draw(
-            2 * (2 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
+            2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
             "spill reader",
         )?;
         budget.draw(
@@ -843,6 +845,7 @@ impl SpillReader {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
+                bounce_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             })
         };
         let context = || {
@@ -862,7 +865,7 @@ impl SpillReader {
 
     /// The budget the contexts and scratch draw, for memory-plan estimates.
     pub(crate) fn budget_bytes() -> usize {
-        2 * (2 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
+        2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             + SCAN_CONTEXTS * (MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
     }
 }
@@ -1461,7 +1464,6 @@ impl Storage {
         cursor: &mut MemberCursor,
         context: &mut ScanContext,
     ) -> Result<(), SqlError> {
-        use crate::store::BlockStore as _;
         cursor.head = None;
         if cursor.done {
             return Ok(());
@@ -1470,18 +1472,27 @@ impl Storage {
         loop {
             if cursor.loaded != Some(cursor.ordinal) {
                 let mut blocks = spill.blocks.borrow_mut();
-                let index_len = blocks
-                    .get(&handle.index, &mut context.index_buf)
-                    .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
-                let count = crate::store::index_block_count(&context.index_buf[..index_len]);
-                if cursor.ordinal >= count {
+                // Both index shapes resolve through one helper; the index
+                // buffer is scratch for the descent and the decompression
+                // bounce alike.
+                let Some(id) = crate::store::locate_data_block(
+                    &mut *blocks,
+                    &handle.index,
+                    &mut context.index_buf,
+                    cursor.ordinal,
+                )
+                .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?
+                else {
                     cursor.done = true;
                     return Ok(());
-                }
-                let id = crate::store::index_block_id(&context.index_buf, cursor.ordinal);
-                cursor.loaded_len = blocks
-                    .get(&id, &mut context.member_blocks[member])
-                    .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+                };
+                cursor.loaded_len = crate::store::read_data_block(
+                    &mut *blocks,
+                    &id,
+                    &mut context.member_blocks[member],
+                    &mut context.index_buf,
+                )
+                .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
                 cursor.loaded = Some(cursor.ordinal);
                 cursor.offset = 0;
             }
@@ -1645,7 +1656,7 @@ impl Storage {
                     ));
                 };
                 let mut blocks = spill.blocks.borrow_mut();
-                let SpillScratch { index_buf, data_buf, assembly_buf } = &mut *scratch;
+                let SpillScratch { index_buf, data_buf, assembly_buf, .. } = &mut *scratch;
                 let mut reader =
                     crate::store::SstReader::over(index_buf, data_buf, assembly_buf);
                 let got = reader
@@ -1701,15 +1712,18 @@ impl Storage {
                         "spilled-row fetches nested deeper than the reader supports"
                     ));
                 };
-                let SpillScratch { index_buf, data_buf, assembly_buf } = &mut *scratch;
+                let SpillScratch { index_buf, data_buf, assembly_buf, bounce_buf } =
+                    &mut *scratch;
                 // The assembly buffer doubles as the row destination: `get`
                 // assembles a chained row into the caller buffer directly, so
-                // the two uses never overlap.
+                // the two uses never overlap. The reader's own staging slot is
+                // the bounce buffer (a compressed data block decompresses
+                // through it).
                 let row_buf = &mut assembly_buf[..len as usize];
                 let got = {
                     let mut blocks = spill.blocks.borrow_mut();
                     let mut reader =
-                        crate::store::SstReader::over(index_buf, data_buf, &mut []);
+                        crate::store::SstReader::over(index_buf, data_buf, bounce_buf);
                     reader
                         .get(&mut *blocks, &handle, rowid, row_buf)
                         .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?

@@ -60,6 +60,12 @@ impl MemoryBlockStore {
     pub(crate) fn remaining(&self) -> usize {
         self.slab.len() - self.used
     }
+
+    /// Bytes the stored blocks occupy — what a compression test measures.
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used
+    }
 }
 
 impl BlockStore for MemoryBlockStore {
@@ -85,7 +91,7 @@ impl BlockStore for MemoryBlockStore {
         Ok(id)
     }
 
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError> {
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
         let Some(extent) = self.index.get(id).copied() else {
             return Err(StoreError::NotFound);
         };
@@ -98,7 +104,7 @@ impl BlockStore for MemoryBlockStore {
         }
         into[..block.payload.len()].copy_from_slice(block.payload);
         self.reads += 1;
-        Ok(block.payload.len())
+        Ok((block.payload.len(), block.block_type))
     }
 
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
@@ -121,7 +127,7 @@ mod tests {
         let id = s.put(b"hello", BlockType::SstData, 3).unwrap();
         assert!(s.contains(&id).unwrap());
         let mut out = [0u8; 32];
-        assert_eq!(s.get(&id, &mut out).unwrap(), 5);
+        assert_eq!(s.get(&id, &mut out).unwrap(), (5, BlockType::SstData));
         assert_eq!(&out[..5], b"hello");
     }
 

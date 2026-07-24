@@ -1259,17 +1259,18 @@ Ok(lsn)
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| CheckpointSetupError::Corrupt("sst reader scratch"))?;
         let mut blocks = self.blocks.borrow_mut();
-        let index_len = blocks
-            .get(&handle.index, index_buf)
+        let block_count = crate::store::data_block_total(&mut *blocks, &handle.index, index_buf)
             .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?;
-        let block_count = crate::store::index_block_count(&index_buf[..index_len]);
         if block_count == 0 {
             return Err(CheckpointSetupError::Corrupt("sst index names no blocks"));
         }
-        let last_id = crate::store::index_block_id(index_buf, block_count - 1);
-        let data_len = blocks
-            .get(&last_id, data_buf)
-            .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
+        let last_id =
+            crate::store::locate_data_block(&mut *blocks, &handle.index, index_buf, block_count - 1)
+                .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?
+                .ok_or(CheckpointSetupError::Corrupt("sst index names no blocks"))?;
+        let data_len =
+            crate::store::read_data_block(&mut *blocks, &last_id, data_buf, index_buf)
+                .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
         let mut at = 0usize;
         let mut max_rowid: Option<u64> = None;
         while let Some((rowid, _, _, next)) = crate::store::block_keys_at(&data_buf[..data_len], at)
@@ -2039,6 +2040,7 @@ Ok(CheckpointStep::Published { lsn })
                 .blocks
                 .borrow_mut()
                 .get(&h.roster, scratch)
+                .map(|(n, _)| n)
                 .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
             for id_bytes in scratch[..n].chunks(32) {
                 if id_bytes.len() != 32 {

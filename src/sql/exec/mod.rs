@@ -36,14 +36,9 @@ pub struct RowCtx<'s, 'v, 'd> {
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
-    fn table_schema(&self, table: &str) -> Option<&str> {
-        (self.def.name.as_str() == table && !self.def.schema.as_str().is_empty())
-            .then(|| self.def.schema.as_str())
-    }
-
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
-            && q != self.def.name.as_str() {
+            && !crate::sql::eval::qualifier_answers_single(self.def, q) {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "missing FROM-clause entry for table \"{}\"",
@@ -522,17 +517,12 @@ struct ExcludedCtx<'s, 'v, 'd> {
 }
 
 impl<'v> ColumnLookup<'v> for ExcludedCtx<'_, 'v, '_> {
-    fn table_schema(&self, table: &str) -> Option<&str> {
-        (self.def.name.as_str() == table && !self.def.schema.as_str().is_empty())
-            .then(|| self.def.schema.as_str())
-    }
-
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         let src = if qualifier == Some("excluded") {
             self.excluded
         } else {
             if let Some(q) = qualifier
-                && q != self.def.name.as_str()
+                && !crate::sql::eval::qualifier_answers_single(self.def, q)
             {
                 return Err(sql_err!(sqlstate::UNDEFINED_TABLE, "missing FROM-clause entry for table \"{}\"", q));
             }
@@ -1725,7 +1715,7 @@ fn emit_projected(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                if *q != def.name.as_str() {
+                if !crate::sql::eval::qualifier_answers_single(def, q) {
                     return Ok(Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",

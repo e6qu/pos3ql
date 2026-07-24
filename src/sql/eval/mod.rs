@@ -86,6 +86,7 @@ pub mod sqlstate {
     pub const DUPLICATE_CURSOR: &str = "42P03";
     pub const UNDEFINED_CURSOR: &str = "34000";
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
+    pub const AMBIGUOUS_ALIAS: &str = "42P09";
     pub const INVALID_SCHEMA_NAME: &str = "3F000";
     pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
     pub const UNDEFINED_OBJECT: &str = "42704";
@@ -184,13 +185,7 @@ pub trait ColumnLookup<'a> {
         None
     }
 
-    /// The real schema of the *unaliased base table* a FROM entry exposes as
-    /// `table`, or None when no such entry exists (aliases hide their table
-    /// name, and a derived table has no schema) — a three-part reference
-    /// `schema.table.column` only binds when this matches its schema part.
-    fn table_schema(&self, _table: &str) -> Option<&str> {
-        None
-    }
+
 
     /// The named table's row as record fields (name + type + value), or None
     /// for an outer-join null row. Used to build a `Datum::Record` for a
@@ -263,8 +258,14 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).column_identity(qualifier, name)
     }
 
-    fn table_schema(&self, table: &str) -> Option<&str> {
-        (**self).table_schema(table)
+}
+
+/// Whether a qualifier answers to one concrete table: its bare name, or the
+/// composed `schema.table` a three-part reference resolves through.
+pub fn qualifier_answers_single(def: &crate::storage::TableDef, q: &str) -> bool {
+    match q.split_once('.') {
+        None => q == def.name.as_str(),
+        Some((schema, table)) => schema == def.schema.as_str() && table == def.name.as_str(),
     }
 }
 
@@ -624,17 +625,15 @@ pub fn eval_full<'a>(
             Err(e) => Err(e),
         },
         Expr::SchemaColumn { schema, table, name } => {
-            // The qualifier pair must be an unaliased FROM entry whose base
-            // table really lives in that schema; only then does the reference
-            // bind, exactly as PostgreSQL resolves three-part names.
-            match row.table_schema(table) {
-                Some(actual) if actual == schema => row.lookup(Some(table), name),
-                _ => Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    table
-                )),
-            }
+            // A three-part reference resolves through a composed
+            // `schema.table` qualifier: only an unaliased FROM entry whose
+            // base table really lives in that schema answers to it, exactly
+            // as PostgreSQL binds these — and it disambiguates two
+            // same-named tables from different schemas.
+            let composed = arena
+                .alloc_str(crate::stack_format!(130, "{}.{}", schema, table).as_str())
+                .map_err(|_| arena_full())?;
+            row.lookup(Some(composed), name)
         }
         Expr::Param(n) => params
             .get(n as usize - 1)

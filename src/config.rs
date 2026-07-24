@@ -445,9 +445,13 @@ sql_arena_bytes = 4096
         c.txn_rows = 10;
         c.memtable_bytes = 1000;
         c.block_cache_bytes = 2000;
+        c.max_cursors = 1;
+        c.cursor_bytes = 64;
         let plan = c.memory_plan(500, 250);
-        assert_eq!(plan.connections, 9000);
-        assert_eq!(plan.total(), 12750);
+        // 100+200+300 + 2*30 + 2*(20+40) + cursor pool + 10*12 per connection.
+        let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
+        assert_eq!(plan.connections, (900 + cursor_pool) * 10);
+        assert_eq!(plan.total(), (900 + cursor_pool) * 10 + 1000 + 2000 + 500 + 250);
     }
 
     #[test]

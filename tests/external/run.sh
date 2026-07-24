@@ -338,6 +338,29 @@ else
   print -- "SKIP: real PostgreSQL 18 not installed"
 fi
 
+step "forced-spill differential: the whole suite with a 256KiB memtable over the bucket"
+# Every corpus and sqllogictest block runs against a pos3ql whose memtable is
+# three orders of magnitude under the dataset churn, so ordinary queries
+# continuously spill, checkpoint (paced merges included), and read rows back
+# through the cache tiers — while the reference PostgreSQL sees plain SQL.
+# Pure-SQL semantics must be indistinguishable from the in-memory run.
+if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
+  docker exec $MINIO_CONTAINER mc mb --ignore-existing local/pos3ql-external >/dev/null 2>&1
+  if POS3QL_DIFF_S3=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_EXTRA_CONF="s3_endpoint = 127.0.0.1:${MINIO_PORT}
+s3_bucket = pos3ql-external
+s3_prefix = spilldiff-$$/
+s3_access_key = minioadmin
+s3_secret_key = minioadmin
+wal_upload = on
+work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then
+    ok "forced-spill differential ($(grep -c '^PASS' "$WORK/spilldiff.out") corpora)"
+  else
+    bad "forced-spill differential"; tail -30 "$WORK/spilldiff.out"
+  fi
+else
+  print -- "SKIP: forced-spill differential needs real PostgreSQL 18"
+fi
+
 step "summary"
 print -- "passed: $PASS  failed: $FAIL"
 [[ $FAIL -eq 0 ]]

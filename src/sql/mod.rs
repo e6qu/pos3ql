@@ -235,11 +235,11 @@ impl Engine {
             if txn.touched()[..i].iter().any(|&(t, r, _)| t == table && r == rowid) {
                 continue;
             }
-            let t = self.storage.table(table as usize);
-            let Some(state) = t.rows.get(&rowid) else {
+            let Some(state) = self.storage.row_state(table as usize, rowid) else {
                 continue;
             };
             let Some(p) = state.pending else { continue };
+            let t = self.storage.table(table as usize);
             if p.txid != txn.txid {
                 continue;
             }

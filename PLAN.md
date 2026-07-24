@@ -918,6 +918,22 @@ adaptive-execution capstone. This section is the plan of record for all of it.
    as the LSM forest; block compression and the multi-block index / sized
    filters (the remaining Stage C refinements) ride along since they touch
    the same format.
+   **Status (2026-07-24): the choke points are in** — the first half of the
+   two-PR shape this step takes (the query.rs-split playbook: mechanical
+   seam first, semantics behind it after, each diff-gated). Every consumer
+   that walked `Table.rows` by hand — the join scanner, the DML collectors,
+   TRUNCATE, ALTER's rewrite, every uniqueness and foreign-key scan, the
+   checkpoint's slice collection — now goes through three storage seams:
+   `for_each_row_state` (states by *value*, errors threaded), `row_state`,
+   and `visible_row_count`. Behavior-identical today (the seam walks the
+   map); the second half flips the seam's internals to the overlay model —
+   the map holding only pending + hot rows, SST-resident rows enumerated by
+   a newest-wins merge over the spill list, entries evicted under pressure,
+   cold start installing no entries — and no call site changes again. The
+   VOPR promptly paid for itself once more during this PR: a fresh seed
+   sweep caught B-160 (the ambiguous-CAS recognition of B-158 failing once
+   state advanced past the lost write; fixed structurally with a manifest
+   writer-identity line).
 5. **Compatibility wave** — COPY (+ the pg_dump round-trip milestone),
    server-side TLS, ALTER TABLE breadth, roles/GRANT, EXPLAIN,
    VACUUM/ANALYZE as real operations, LISTEN/NOTIFY.

@@ -198,6 +198,15 @@ pub(crate) struct Checkpointer {
     /// under-reported); remembered per slot so the scheduler stops
     /// proposing a merge that cannot be scheduled.
     merge_overflow: Vec<Option<(BlockId, BlockId)>>,
+    /// This database's writer identity, stamped into every manifest it
+    /// publishes (`writer <hex>`). Deterministic from the node's identity
+    /// (bucket, key prefix, data directory), so every incarnation of the
+    /// same node shares it and two nodes pointed at one bucket do not. Its
+    /// job is disambiguating a failed compare-and-swap: a manifest carrying
+    /// our id was our own PUT whose response was lost — adopt its etag and
+    /// republish; any other id is a genuine second writer, which stays a
+    /// loud error.
+    writer_id: u64,
 }
 
 /// One beat's outcome: nothing to publish, a slice written, or the manifest
@@ -569,6 +578,17 @@ impl Checkpointer {
             merge_done: None,
             merge_turn: false,
             merge_overflow: vec![None; MAX_CKPT_TABLES],
+            writer_id: {
+                let mut crc = Crc32c::new();
+                crc.update(config.s3_bucket.as_bytes());
+                crc.update(config.s3_prefix.as_bytes());
+                crc.update(config.data_dir.as_bytes());
+                let low = crc.finish();
+                let mut crc2 = Crc32c::new();
+                crc2.update(config.data_dir.as_bytes());
+                crc2.update(config.s3_bucket.as_bytes());
+                (u64::from(crc2.finish()) << 32) | u64::from(low)
+            },
         })
     }
 
@@ -1120,6 +1140,9 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     saw_end = true;
                 }
+                // The writer identity is CAS bookkeeping (see `writer_id`),
+                // not state; the loader has no use for it.
+                Some("writer") => {}
                 Some("") | None => {}
                 Some(other) => {
                     return Err(CheckpointSetupError::S3(format!(
@@ -1447,6 +1470,10 @@ Ok(CheckpointStep::Published { lsn })
             &mut self.manifest_buf,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
+        write_manifest(
+            &mut self.manifest_buf,
+            format_args!("writer {:016x}", self.writer_id),
+        )?;
 
         // Schemas: `nsp <hex-name>` (public is implicit and never written).
         for (_, schema) in storage.live_schemas() {
@@ -1745,24 +1772,35 @@ Ok(CheckpointStep::Published { lsn })
             Ok(etag) => etag,
             Err(e) if e.is_precondition_failed() => {
                 // A previous attempt's PUT may have landed with its response
-                // lost (the ambiguous failure): the bucket then holds
-                // exactly the bytes this retry carries, under an etag this
-                // process never learned. Recognize our own write before
-                // declaring another writer — without this, one ambiguous
-                // CAS wedges every future checkpoint on a stale etag.
-                let ours = self
-                    .client
-                    .get(MANIFEST_KEY, None)
-                    .map(|_| self.client.body_bytes() == self.manifest_buf.readable())
-                    .unwrap_or(false);
+                // lost (the ambiguous failure): the bucket then holds a
+                // manifest of ours under an etag this process never learned
+                // — possibly an *older* one of ours, if state advanced since
+                // that attempt, so byte comparison cannot recognize it. The
+                // writer line can: our identity means our own write — adopt
+                // its etag and republish the current state over it. Any
+                // other identity is a genuine second writer, which stays a
+                // loud error rather than a clobber.
+                let refreshed = self.client.get(MANIFEST_KEY, None).map_err(s3_to_sql)?;
+                let ours = {
+                    let body = self.client.body_bytes();
+                    let expect = crate::stack_format!(40, "writer {:016x}", self.writer_id);
+                    core::str::from_utf8(body)
+                        .ok()
+                        .is_some_and(|text| text.lines().any(|l| l == expect.as_str()))
+                };
                 if !ours {
                     return Err(sql_err!(
                         SQLSTATE_CAS,
                         "manifest compare-and-swap failed: another writer owns this bucket"
                     ));
                 }
-                let refreshed = self.client.get(MANIFEST_KEY, None).map_err(s3_to_sql)?;
-                refreshed.etag
+                self.client
+                    .put(
+                        MANIFEST_KEY,
+                        self.manifest_buf.readable(),
+                        Precondition::IfMatch(refreshed.etag.as_str()),
+                    )
+                    .map_err(s3_to_sql)?
             }
             Err(e) => return Err(s3_to_sql(e)),
         };
@@ -1834,7 +1872,6 @@ Ok(CheckpointStep::Published { lsn })
         slot: usize,
     ) -> Result<(), SqlError> {
         self.pending_installs.retain(|(s, _)| *s != slot);
-        let table = storage.table(slot);
             // A clean table carries its whole SST list forward untouched.
             let clean = !storage.table(slot).dirty
                 && self.prev_ssts.get(slot).is_some_and(|l| l.n > 0);
@@ -1848,17 +1885,20 @@ Ok(CheckpointStep::Published { lsn })
             } else {
                 // Collect the rows this SST will hold.
                 sort_scratch.clear();
-                for (&rowid, state) in table.rows.iter() {
+                storage.for_each_row_state(slot, &mut |rowid, state| {
+                    use core::ops::ControlFlow;
                     let Some(home) = state.committed else {
-                        continue;
+                        return Ok(ControlFlow::Continue(()));
                     };
                     if delta && !matches!(home, RowHome::Heap(_)) {
-                        continue; // already durable in an earlier list member
+                        // Already durable in an earlier list member.
+                        return Ok(ControlFlow::Continue(()));
                     }
                     sort_scratch.push((rowid, home)).map_err(|e| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "checkpoint scratch: {}", e)
                     })?;
-                }
+                    Ok(ControlFlow::Continue(()))
+                })?;
                 sort_scratch.as_mut_slice().sort_unstable_by_key(|(rowid, _)| *rowid);
                 self.tomb_scratch.clear();
                 if delta {

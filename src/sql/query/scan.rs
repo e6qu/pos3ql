@@ -352,22 +352,20 @@ pub(crate) fn scan_source<'a>(
             // locations into the per-statement arena and sort by offset. Only
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
-            let table = storage.table(scope.slots[order[depth]]);
-            let mut count = 0usize;
-            for (_, state) in table.rows.iter() {
-                if state.visible_to(txid).is_some() {
-                    count += 1;
-                }
-            }
-            let mut src = table.rows.iter();
+            let slot = scope.slots[order[depth]];
+            let count = storage.visible_row_count(slot, txid);
             let ordered = arena
-                .alloc_slice_with(count, |_| loop {
-                    let (&rowid, state) = src.next().expect("visible count is stable");
-                    if let Some(home) = state.visible_to(txid) {
-                        break (rowid, home);
-                    }
-                })
+                .alloc_slice_with(count, |_| (0u64, crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 })))
                 .map_err(|_| arena_full())?;
+            let mut fill = 0usize;
+            storage.for_each_row_state(slot, &mut |rowid, state| {
+                if let Some(home) = state.visible_to(txid) {
+                    ordered[fill] = (rowid, home);
+                    fill += 1;
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            debug_assert_eq!(fill, count, "visible count is stable");
             // Spilled rows sort by rowid (their SST order — the physical order
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group.
@@ -394,19 +392,20 @@ pub(crate) fn scan_source<'a>(
                 }
             }
         } else {
-            let table = storage.table(scope.slots[order[depth]]);
+            let slot = scope.slots[order[depth]];
             let mut index = 0usize;
-            for (&rowid, state) in table.rows.iter() {
+            let mut aborted = false;
+            storage.for_each_row_state(slot, &mut |rowid, state| {
+                use core::ops::ControlFlow;
                 check_timeout()?;
                 let Some(home) = state.visible_to(txid) else {
-                    continue;
+                    return Ok(ControlFlow::Continue(()));
                 };
-                bound[order[depth]] =
-                    Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
+                bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
                 let this = index;
                 index += 1;
                 if !on_matches(bound)? || !passes_pushdown(bound)? {
-                    continue;
+                    return Ok(ControlFlow::Continue(()));
                 }
                 matched_any = true;
                 if let Some(m) = matched[depth] {
@@ -416,8 +415,13 @@ pub(crate) fn scan_source<'a>(
                     storage, scope, from, txid, where_clause, arena, params, hooks,
                     outer, depth + 1, bound, matched, pushdown, order, f,
                 )? {
-                    return Ok(false);
+                    aborted = true;
+                    return Ok(ControlFlow::Break(()));
                 }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            if aborted {
+                return Ok(false);
             }
         }
         // LEFT/FULL join with no match at this level: emit one null row (the
@@ -452,8 +456,7 @@ pub(crate) fn scan_source<'a>(
         let n_rows = if let Some(rows) = scope.derived[t] {
             rows.len()
         } else {
-            let table = storage.table(scope.slots[t]);
-            table.rows.iter().filter(|(_, s)| s.visible_to(txid).is_some()).count()
+            storage.visible_row_count(scope.slots[t], txid)
         };
         let flags = arena
             .alloc_slice_with(n_rows, |_| false)
@@ -569,11 +572,12 @@ pub(crate) fn scan_source<'a>(
                 }
             }
         } else {
-            let table = storage.table(scope.slots[d]);
             let mut index = 0usize;
-            for (&rowid, state) in table.rows.iter() {
+            let mut done = false;
+            storage.for_each_row_state(scope.slots[d], &mut |rowid, state| {
+                use core::ops::ControlFlow;
                 let Some(home) = state.visible_to(txid) else {
-                    continue;
+                    return Ok(ControlFlow::Continue(()));
                 };
                 let this = index;
                 index += 1;
@@ -583,8 +587,13 @@ pub(crate) fn scan_source<'a>(
                         f,
                     )?
                 {
-                    return Ok(());
+                    done = true;
+                    return Ok(ControlFlow::Break(()));
                 }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            if done {
+                return Ok(());
             }
         }
     }

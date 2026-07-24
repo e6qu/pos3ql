@@ -24,6 +24,7 @@ pub mod range;
 pub mod to_char;
 pub mod timezone;
 pub mod tzif;
+pub mod cursor;
 
 use crate::checkpoint::{Checkpointer, CheckpointSetupError};
 use crate::config::Config;
@@ -572,12 +573,14 @@ impl Engine {
     /// SQL errors become ErrorResponses and stop the remainder, as in
     /// PostgreSQL. `Err(WireFull)` means the send buffer overflowed and the
     /// connection must handle it.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_simple(
         &mut self,
         text: &str,
         arena: &Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<(), WireFull> {
@@ -599,7 +602,7 @@ impl Engine {
                 Ok(Some(statement)) => {
                     executed_any = true;
                     emit_parse_warnings(&mut parser, responder)?;
-                    if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, guc, responder)? {
+                    if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder)? {
                         if txn.is_explicit() {
                             txn.failed = true;
                         } else {
@@ -642,6 +645,7 @@ impl Engine {
         params: &[Datum],
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<bool, WireFull> {
@@ -660,7 +664,7 @@ impl Engine {
         let outcome = match parser.next_stmt() {
             Ok(Some(statement)) => {
                 emit_parse_warnings(&mut parser, responder)?;
-                self.execute_stmt(&statement, arena, params, txn, sqlprep, guc, responder)?
+                self.execute_stmt(&statement, arena, params, txn, sqlprep, cursors, guc, responder)?
             }
             Ok(None) => {
                 responder.empty_query_response()?;
@@ -919,6 +923,7 @@ impl Engine {
 
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
         &mut self,
         statement: &Stmt,
@@ -926,6 +931,7 @@ impl Engine {
         params: &[Datum],
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -1160,7 +1166,7 @@ impl Engine {
                         Err(e) => return Ok(Err(e)),
                     };
                     if let Err(e) = self
-                        .execute_stmt(requalified, arena, params, txn, sqlprep, guc, responder)?
+                        .execute_stmt(requalified, arena, params, txn, sqlprep, cursors, guc, responder)?
                     {
                         return Ok(Err(e));
                     }
@@ -1176,6 +1182,134 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::DeclareCursor { name, scroll, hold, sql } => {
+                if !txn.is_explicit() {
+                    return Ok(Err(sql_err!(
+                        crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                        "DECLARE CURSOR can only be used in transaction blocks"
+                    )));
+                }
+                let at = match cursors.open(name, *scroll, *hold) {
+                    Ok(at) => at,
+                    Err(e) => return Ok(Err(e)),
+                };
+                // Materialize the whole result now — PostgreSQL's insensitive
+                // cursor snapshot — by running the SELECT with a responder
+                // aimed at the cursor's own buffer.
+                let out = {
+                    let mut inner = match Parser::new(sql, arena) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            cursors.abandon(at);
+                            return Ok(Err(SqlError {
+                                sqlstate: e.sqlstate,
+                                message: stack_format!(192, "{}", e.message.as_str()),
+                            }));
+                        }
+                    };
+                    let parsed = match inner.next_stmt() {
+                        Ok(Some(p)) => p,
+                        _ => {
+                            cursors.abandon(at);
+                            return Ok(Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "DECLARE CURSOR requires a SELECT"
+                            )));
+                        }
+                    };
+                    let mut capture = Responder::new(cursors.result_buffer(at));
+                    capture.set_render(guc.render());
+                    match &parsed {
+                        Stmt::Select(sel) => {
+                            let sel = match query::expand_ctes_exec(
+                                sel, &self.storage, txn.txid, &self.work, params,
+                            ) {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    cursors.abandon(at);
+                                    return Ok(Err(e));
+                                }
+                            };
+                            if sel.from.is_none() {
+                                query::constant_select(
+                                    &self.storage, txn.txid, sel, &self.work, params,
+                                    &mut capture,
+                                )
+                            } else {
+                                query::select_query(
+                                    &self.storage, txn.txid, sel, &self.work, params,
+                                    &mut capture,
+                                )
+                            }
+                        }
+                        Stmt::SetQuery(q) => query::set_query(
+                            &self.storage, txn.txid, q, &self.work, params, &mut capture,
+                        ),
+                        _ => {
+                            cursors.abandon(at);
+                            return Ok(Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "DECLARE CURSOR requires a SELECT"
+                            )));
+                        }
+                    }
+                };
+                match out {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        cursors.abandon(at);
+                        return Ok(Err(e));
+                    }
+                    Err(WireFull) => {
+                        cursors.abandon(at);
+                        return Ok(Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "cursor result exceeds cursor_bytes; raise it or narrow the query"
+                        )));
+                    }
+                }
+                if let Err(e) = cursors.seal(at) {
+                    cursors.abandon(at);
+                    return Ok(Err(e));
+                }
+                responder.command_complete("DECLARE CURSOR")?;
+                Ok(Ok(()))
+            }
+            Stmt::FetchCursor { name, motion, move_only } => {
+                let count = match cursors.fetch(name, *motion) {
+                    Ok(c) => c,
+                    Err(e) => return Ok(Err(e)),
+                };
+                if !*move_only {
+                    let (description, rows) =
+                        cursors.wire_parts(name).expect("fetch found it");
+                    responder.raw(description)?;
+                    for &(offset, len) in cursors.emitted() {
+                        let (offset, len) = (offset as usize, len as usize);
+                        responder.raw(&rows[offset..offset + len])?;
+                    }
+                    responder.command_complete(stack_format!(32, "FETCH {}", count).as_str())?;
+                } else {
+                    responder.command_complete(stack_format!(32, "MOVE {}", count).as_str())?;
+                }
+                Ok(Ok(()))
+            }
+            Stmt::CloseCursor(name) => {
+                match name {
+                    Some(n) => {
+                        if !cursors.close(n) {
+                            return Ok(Err(sql_err!(
+                                crate::sql::eval::sqlstate::UNDEFINED_CURSOR,
+                                "cursor \"{}\" does not exist",
+                                n
+                            )));
+                        }
+                    }
+                    None => cursors.close_all(),
+                }
+                responder.command_complete("CLOSE CURSOR")?;
+                Ok(Ok(()))
+            }
             Stmt::Begin => {
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
@@ -1195,8 +1329,12 @@ impl Engine {
                 let tag = if txn.failed { "ROLLBACK" } else { "COMMIT" };
                 if txn.failed {
                     self.rollback_txn(txn);
-                } else if let Err(e) = self.commit_txn(txn) {
-                    return Ok(Err(e));
+                    cursors.on_rollback();
+                } else {
+                    if let Err(e) = self.commit_txn(txn) {
+                        return Ok(Err(e));
+                    }
+                    cursors.on_commit();
                 }
                 responder.command_complete(tag)?;
                 // Later statements in this message get a fresh implicit txn.
@@ -1211,6 +1349,7 @@ impl Engine {
                     responder.warning("25P01", "there is no transaction in progress")?;
                 }
                 self.rollback_txn(txn);
+                cursors.on_rollback();
                 responder.command_complete("ROLLBACK")?;
                 // Freeze this statement's clock before anything anchors a
                 // transaction to it.
@@ -1440,6 +1579,7 @@ impl Engine {
                         &inner_params[..args.len()],
                         txn,
                         sqlprep,
+                        cursors,
                         guc,
                         responder,
                     ),

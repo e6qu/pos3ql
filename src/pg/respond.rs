@@ -553,6 +553,16 @@ impl<'b> Responder<'b> {
         }
     }
 
+    /// Forwards pre-encoded wire message bytes verbatim (cursor FETCH replays
+    /// captured RowDescription/DataRow messages).
+    pub fn raw(&mut self, bytes: &[u8]) -> Result<(), WireFull> {
+        if self.buffer.append(bytes) {
+            Ok(())
+        } else {
+            Err(WireFull)
+        }
+    }
+
     pub fn command_complete(&mut self, tag: &str) -> Result<(), WireFull> {
         let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
         m.cstr(tag);

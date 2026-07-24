@@ -90,6 +90,7 @@ pub struct Conn {
     pub arena: Arena,
     pub txn: TxnState,
     pub sqlprep: SqlPreparedPool,
+    pub cursors: crate::sql::cursor::CursorPool,
     pub guc: GucState,
     scram: ScramFlow,
     prepared: Vec<Prepared>,
@@ -135,6 +136,7 @@ impl Conn {
             arena: Arena::new(budget, "conn_sql_arena", config.sql_arena_bytes)?,
             txn: TxnState::new(budget, config.txn_rows)?,
             sqlprep: SqlPreparedPool::new(config, budget)?,
+            cursors: crate::sql::cursor::CursorPool::new(config, budget)?,
             guc: GucState::new(),
             scram: ScramFlow::new(),
             prepared,
@@ -964,6 +966,7 @@ impl Conn {
                     &params[..portal.n_params as usize],
                     &mut self.txn,
                     &mut self.sqlprep,
+                    &mut self.cursors,
                     &mut self.guc,
                     &mut responder,
                 )
@@ -975,6 +978,7 @@ impl Conn {
                     &params[..portal.n_params as usize],
                     &mut self.txn,
                     &mut self.sqlprep,
+                    &mut self.cursors,
                     &mut self.guc,
                     &mut responder,
                 )
@@ -1100,7 +1104,7 @@ impl Conn {
             if let Some(fd) = fd {
                 responder = responder.with_flush(fd);
             }
-            engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.guc, &mut responder)
+            engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.cursors, &mut self.guc, &mut responder)
         };
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.set_nonblocking(true);

@@ -60,6 +60,10 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
+    /// Open SQL cursors per connection (DECLARE ... CURSOR).
+    pub max_cursors: usize,
+    /// Bytes of materialized rows one cursor may hold.
+    pub cursor_bytes: usize,
     /// Per-table rowid-map capacity (rows resident in the memtable).
     pub table_rows: usize,
     /// RAM cache of object-storage blocks.
@@ -123,6 +127,8 @@ impl Config {
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
             max_tables: 32,
+            max_cursors: 4,
+            cursor_bytes: 256 * 1024,
             table_rows: 8192,
             block_cache_bytes: 128 * MIB,
             disk_cache_bytes: GIB,
@@ -196,6 +202,8 @@ impl Config {
                 "wal_bytes" => config.wal_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "wal_buffer_bytes" => config.wal_buffer_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "max_tables" => config.max_tables = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
+                "max_cursors" => config.max_cursors = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
+                "cursor_bytes" => config.cursor_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "table_rows" => config.table_rows = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
                 "block_cache_bytes" => config.block_cache_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "disk_cache_bytes" => config.disk_cache_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
@@ -259,6 +267,7 @@ impl Config {
             + self.sql_arena_bytes
             + self.max_prepared * self.prepared_bytes
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
+            + crate::sql::cursor::CursorPool::budget_bytes(self)
             + self.txn_rows * 12;
         MemoryPlan {
             memtable: self.memtable_bytes,
@@ -436,9 +445,13 @@ sql_arena_bytes = 4096
         c.txn_rows = 10;
         c.memtable_bytes = 1000;
         c.block_cache_bytes = 2000;
+        c.max_cursors = 1;
+        c.cursor_bytes = 64;
         let plan = c.memory_plan(500, 250);
-        assert_eq!(plan.connections, 9000);
-        assert_eq!(plan.total(), 12750);
+        // 100+200+300 + 2*30 + 2*(20+40) + cursor pool + 10*12 per connection.
+        let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
+        assert_eq!(plan.connections, (900 + cursor_pool) * 10);
+        assert_eq!(plan.total(), (900 + cursor_pool) * 10 + 1000 + 2000 + 500 + 250);
     }
 
     #[test]

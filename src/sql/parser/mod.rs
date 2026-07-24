@@ -281,6 +281,109 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// DECLARE name [BINARY] [INSENSITIVE|ASENSITIVE] [[NO] SCROLL] CURSOR
+    /// [{WITH|WITHOUT} HOLD] FOR select ("declare" not yet consumed). BINARY
+    /// is refused loudly (binary-format simple-query rows are not produced).
+    fn declare_cursor(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.advance()?; // declare
+        let name = self.col_ident("cursor name")?;
+        let mut scroll = false;
+        loop {
+            if self.eat_ident("binary")? {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: crate::stack_format!(96, "BINARY cursors are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if self.eat_ident("insensitive")? || self.eat_ident("asensitive")? {
+                // Materialization makes every cursor insensitive.
+            } else if self.eat_ident("scroll")? {
+                scroll = true;
+            } else if self.eat_ident("no")? {
+                self.expect_ident("scroll")?;
+                scroll = false;
+            } else {
+                break;
+            }
+        }
+        self.expect_ident("cursor")?;
+        let hold = if self.eat_ident("with")? {
+            self.expect_ident("hold")?;
+            true
+        } else {
+            if self.eat_ident("without")? {
+                self.expect_ident("hold")?;
+            }
+            false
+        };
+        self.expect_ident("for")?;
+        // Capture the raw SELECT text; validated by parsing it now.
+        let start = self.peek_at;
+        let _ = self.query()?;
+        let end = self.peek_at;
+        let sql = self.text[start..end].trim();
+        Ok(Stmt::DeclareCursor { name, scroll, hold, sql })
+    }
+
+    /// FETCH/MOVE [direction] [FROM|IN] cursor ("fetch"/"move" not consumed).
+    fn fetch_cursor(&mut self, move_only: bool) -> Result<Stmt<'a>, ParseError> {
+        use crate::sql::cursor::FetchMotion;
+        self.advance()?; // fetch | move
+        let signed_count = |p: &mut Self| -> Result<i64, ParseError> {
+            let negative = p.eat_op("-")?;
+            match p.peeked {
+                Tok::Num(text) => {
+                    let v: i64 = text
+                        .parse()
+                        .map_err(|_| p.unexpected("expected a row count"))?;
+                    p.advance()?;
+                    Ok(if negative { -v } else { v })
+                }
+                _ => Err(p.unexpected("expected a row count")),
+            }
+        };
+        let motion = if self.eat_ident("next")? {
+            FetchMotion::Count(1)
+        } else if self.eat_ident("prior")? {
+            FetchMotion::Count(-1)
+        } else if self.eat_ident("first")? {
+            FetchMotion::Absolute(1)
+        } else if self.eat_ident("last")? {
+            FetchMotion::Absolute(-1)
+        } else if self.eat_ident("absolute")? {
+            FetchMotion::Absolute(signed_count(self)?)
+        } else if self.eat_ident("relative")? {
+            FetchMotion::Relative(signed_count(self)?)
+        } else if self.eat_ident("forward")? {
+            if self.eat_ident("all")? {
+                FetchMotion::All
+            } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+                FetchMotion::Count(signed_count(self)?)
+            } else {
+                FetchMotion::Count(1)
+            }
+        } else if self.eat_ident("backward")? {
+            if self.eat_ident("all")? {
+                FetchMotion::BackwardAll
+            } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+                FetchMotion::Count(-signed_count(self)?)
+            } else {
+                FetchMotion::Count(-1)
+            }
+        } else if self.eat_ident("all")? {
+            FetchMotion::All
+        } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+            FetchMotion::Count(signed_count(self)?)
+        } else {
+            FetchMotion::Count(1)
+        };
+        if !self.eat_ident("from")? {
+            let _ = self.eat_ident("in")?;
+        }
+        let name = self.col_ident("cursor name")?;
+        Ok(Stmt::FetchCursor { name, motion, move_only })
+    }
+
     fn truncate(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // truncate
         let _ = self.eat_ident("table")?;
@@ -334,6 +437,16 @@ impl<'a> Parser<'a> {
             Tok::Ident("update") => self.update(),
             Tok::Ident("delete") => self.delete(),
             Tok::Ident("truncate") => self.truncate(),
+            Tok::Ident("declare") => self.declare_cursor(),
+            Tok::Ident("fetch") => self.fetch_cursor(false),
+            Tok::Ident("move") => self.fetch_cursor(true),
+            Tok::Ident("close") => {
+                self.advance()?;
+                if self.eat_ident("all")? {
+                    return Ok(Stmt::CloseCursor(None));
+                }
+                Ok(Stmt::CloseCursor(Some(self.col_ident("cursor name")?)))
+            }
             Tok::Ident("begin") => {
                 self.advance()?;
                 self.skip_transaction_modifiers()?;

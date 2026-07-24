@@ -70,12 +70,17 @@ pub struct Config {
     pub block_cache_bytes: usize,
     /// Disk budget for locally cached objects (not RAM).
     pub disk_cache_bytes: usize,
-    /// Object storage on/offset. When on, checkpoints snapshot to the bucket
+    /// Object storage on/off. When on, checkpoints snapshot to the bucket
     /// and a wiped node cold-starts from it; credentials are required.
     pub s3_on: bool,
+    /// `s3 = sim`: object storage backed by the in-process deterministic
+    /// virtual bucket instead of a network endpoint — the storage VOPR's
+    /// seam. Implies `s3_on`; refused by the real server binary (the
+    /// virtual bucket allocates freely and exists for simulation tests).
+    pub s3_sim: bool,
     /// Upload committed WAL batches to the bucket (backup / RPO). Requires
     /// s3 = on. By default the upload is asynchronous: a commit is durable on
-    /// local disk (fsync) immediately and the S3 upload is drained offset the
+    /// local disk (fsync) immediately and the S3 upload is drained off the
     /// commit path, so commit latency never includes the S3 round-trip.
     pub wal_upload: bool,
     /// Make WAL upload synchronous: a commit blocks until its batch is in the
@@ -141,6 +146,7 @@ impl Config {
             block_cache_bytes: 128 * MIB,
             disk_cache_bytes: GIB,
             s3_on: false,
+            s3_sim: false,
             wal_upload: false,
             wal_upload_sync: false,
             wal_upload_buffer_bytes: 8 * MIB,
@@ -243,18 +249,20 @@ impl Config {
                     }
                 }
                 "wal_upload_buffer_bytes" => config.wal_upload_buffer_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "s3" => {
-                    config.s3_on = match value {
-                        "on" | "true" => true,
-                        "off" | "false" => false,
-                        other => {
-                            return Err(ConfigError::at(
-                                line_no,
-                                format!("s3 must be on or off, got '{other}'"),
-                            ))
-                        }
+                "s3" => match value {
+                    "on" | "true" => config.s3_on = true,
+                    "off" | "false" => config.s3_on = false,
+                    "sim" => {
+                        config.s3_on = true;
+                        config.s3_sim = true;
                     }
-                }
+                    other => {
+                        return Err(ConfigError::at(
+                            line_no,
+                            format!("s3 must be on, off or sim, got '{other}'"),
+                        ))
+                    }
+                },
                 "s3_endpoint" => config.s3_endpoint = value.to_string(),
                 "s3_bucket" => config.s3_bucket = value.to_string(),
                 "s3_prefix" => config.s3_prefix = value.to_string(),

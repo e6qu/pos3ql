@@ -544,6 +544,7 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::Checkpoint)
             }
             Tok::Ident("alter") => self.alter_table(),
+            Tok::Ident("copy") => self.copy_statement(),
             Tok::Ident("prepare") => self.prepare(),
             Tok::Ident("execute") => self.execute_prepared(),
             Tok::Ident("deallocate") => {
@@ -1297,6 +1298,82 @@ impl<'a> Parser<'a> {
             base,
             joins: self.arena_slice(&joins[..n])?,
         })
+    }
+
+    /// `COPY table [(col, ...)] FROM STDIN | TO STDOUT [[WITH] (options)]`.
+    /// Text format with default delimiters is what this engine speaks (what
+    /// psql and pg_dump emit); every other option is refused loudly.
+    fn copy_statement(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("copy")?;
+        let table = self.qual_name("table name")?;
+        let mut columns = [""; crate::storage::MAX_COLUMNS];
+        let mut n_columns = 0usize;
+        if self.peeked == Tok::Op("(") {
+            self.advance()?;
+            loop {
+                if n_columns == columns.len() {
+                    return Err(self.unexpected("too many COPY columns"));
+                }
+                columns[n_columns] = self.col_ident("column name")?;
+                n_columns += 1;
+                if self.peeked == Tok::Op(",") {
+                    self.advance()?;
+                    continue;
+                }
+                break;
+            }
+            if self.peeked != Tok::Op(")") {
+                return Err(self.unexpected("expected ')'"));
+            }
+            self.advance()?;
+        }
+        let to = if self.eat_ident("to")? {
+            self.expect_ident("stdout")
+                .map_err(|_| self.unexpected("COPY TO supports only STDOUT"))?;
+            true
+        } else if self.eat_ident("from")? {
+            self.expect_ident("stdin")
+                .map_err(|_| self.unexpected("COPY FROM supports only STDIN"))?;
+            false
+        } else {
+            return Err(self.unexpected("expected FROM or TO"));
+        };
+        // Options: `WITH (FORMAT text)` and friends. Only the text format
+        // with default delimiters is implemented; anything else must fail
+        // loudly rather than mis-read data.
+        let _ = self.eat_ident("with")?;
+        if self.peeked == Tok::Op("(") {
+            self.advance()?;
+            loop {
+                let option = self.any_ident("COPY option")?;
+                let supported = match option {
+                    "format" => self.eat_ident("text")?,
+                    _ => false,
+                };
+                if !supported {
+                    return Err(self.unsupported_copy_option(option));
+                }
+                if self.peeked == Tok::Op(",") {
+                    self.advance()?;
+                    continue;
+                }
+                break;
+            }
+            if self.peeked != Tok::Op(")") {
+                return Err(self.unexpected("expected ')'"));
+            }
+            self.advance()?;
+        }
+        let columns = self.arena_slice(&columns[..n_columns])?;
+        Ok(Stmt::Copy(crate::sql::ast::CopyStmt { table, columns, to }))
+    }
+
+    fn unsupported_copy_option(&self, option: &str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "COPY option \"{}\" is not supported", option),
+            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+        }
     }
 
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {

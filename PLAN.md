@@ -958,10 +958,19 @@ adaptive-execution capstone. This section is the plan of record for all of it.
    shapes through shared resolvers. Filters are **sized from a ladder**:
    every key inserts into three candidate sizes and the finish keeps the
    smallest still giving ~10 bits per key, so a small SST no longer pays
-   128 KiB for a handful of rows. What remains of step 4: the
-   secondary-index LSM forest — a planner/executor concern, next.
-   (Stage C's own "remaining: multi-block index and sized filter" is
+   128 KiB for a handful of rows. (Stage C's own "remaining: multi-block index and sized filter" is
    thereby closed.)
+   **Deferral, stated loudly (2026-07-25): the secondary-index LSM forest
+   waits.** Uniqueness and foreign keys are *correct* today — enforced by
+   full scans through the seam — so the forest is an acceleration, not a
+   gap, and its two honest prerequisites belong to later steps: a
+   value-keyed index LSM needs multiset merge semantics (a tombstone for
+   one `(value, rowid)` pair must not shadow another row with the same
+   value — different laws than the rowid trees), and its read-side payoff
+   needs the planner cost model that only arrives with Stage I. Bulk loads
+   into uniquely-constrained tables are meanwhile quadratic (correct,
+   loud in wall-clock rather than in wrongness); the forest lands with
+   Stage I's planner work, designed once against its real consumer.
 
    *Earlier (same day):* **the choke points went in first** — the first half of the
    two-PR shape this step takes (the query.rs-split playbook: mechanical
@@ -982,6 +991,30 @@ adaptive-execution capstone. This section is the plan of record for all of it.
 5. **Compatibility wave** — COPY (+ the pg_dump round-trip milestone),
    server-side TLS, ALTER TABLE breadth, roles/GRANT, EXPLAIN,
    VACUUM/ANALYZE as real operations, LISTEN/NOTIFY.
+   **Status (2026-07-25): COPY landed** — the wave's largest hole. The
+   wire subprotocol (CopyInResponse/CopyOutResponse/CopyData/CopyDone/
+   CopyFail, the connection holding its query cycle open in copy-in mode,
+   `\.` honored for pg_dump scripts), PostgreSQL's text format exactly
+   (tab-delimited, `\N` nulls, the full escape set both directions,
+   literal-carriage-return refusal), values through each type's input
+   function on the way in and the *wire output function* on the way out
+   (styled timestamps, GUC-honoring bytea, `t` booleans — a shared
+   `datum_wire_text` so COPY and SELECT can never drift), rows through
+   the same insert core as INSERT (defaults, sequences, NOT NULL,
+   uniqueness, CHECK, foreign keys), one transaction per COPY (aborts
+   store nothing; inside BEGIN it commits and rolls back with the
+   transaction), insertion-order output, and column lists both ways.
+   Non-default formats and delimiters refuse loudly (0A000) rather than
+   mis-read data; the extended-protocol COPY flow is likewise refused
+   pending its own wiring. Proven differentially: corpus 40 runs
+   the whole surface — escape round-trips, typed columns, constraint
+   aborts, transactional behavior — against real PostgreSQL, which also
+   caught two fidelity bugs en route (boolean COPY output as `true`
+   instead of the output function's `t`, and column-level PRIMARY KEY
+   violations naming `<table>_<column>_pkey` where PostgreSQL names
+   `<table>_pkey` — the catalog already knew better). The pg_dump
+   round-trip milestone stays open pending the catalog surface pg_dump
+   itself queries.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;

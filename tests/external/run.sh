@@ -315,6 +315,19 @@ kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
 [[ "$out" == "4950|updated" ]] && ok "wiped-disk cold start of a dataset larger than table_rows" \
   || bad "overlay cold start: '$out'"
 
+step "COPY: client-side round trip through psql \\copy"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
+  -c "CREATE TABLE copy_rt (id int, v text, w text)" \
+  -c "INSERT INTO copy_rt VALUES (1, E'tab\\there', 'plain'), (2, E'nl\\nhere', NULL), (3, 'back\\slash', 'x')"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "\\copy copy_rt TO '$WORK/copy_rt.tsv'"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
+  -c "CREATE TABLE copy_rt2 (id int, v text, w text)" \
+  -c "\\copy copy_rt2 FROM '$WORK/copy_rt.tsv'"
+out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A \
+  -c "SELECT count(*) FROM copy_rt2 t2 JOIN copy_rt t ON t.id = t2.id AND t.v = t2.v AND t.w IS NOT DISTINCT FROM t2.w" 2>&1)
+[[ "$out" == "3" ]] && ok "psql \\copy round trip (escapes and NULLs intact)" \
+  || bad "copy round trip: '$out'"
+
 step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null

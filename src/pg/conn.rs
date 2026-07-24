@@ -93,6 +93,11 @@ pub struct Conn {
     pub cursors: crate::sql::cursor::CursorPool,
     pub guc: GucState,
     scram: ScramFlow,
+    /// A COPY FROM STDIN in flight: the connection is in copy-in mode, and
+    /// frontend messages are CopyData/CopyDone/CopyFail until it ends.
+    copy: Option<CopyInProgress>,
+    /// Staging for one COPY data row (rows split across CopyData messages).
+    copy_buf: FixedBuf,
     prepared: Vec<Prepared>,
     portals: Vec<Portal>,
     phase: Phase,
@@ -139,6 +144,8 @@ impl Conn {
             cursors: crate::sql::cursor::CursorPool::new(config, budget)?,
             guc: GucState::new(),
             scram: ScramFlow::new(),
+            copy: None,
+            copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
             prepared,
             portals,
             phase: Phase::Startup,
@@ -549,6 +556,14 @@ impl Conn {
             return Step::NeedMoreData;
         }
 
+        if self.copy.is_some() {
+            let step = self.process_copy_message(engine, msg_type, total);
+            if !matches!(step, Step::Close) {
+                self.recv.consume(total);
+            }
+            return step;
+        }
+
         if self.phase == Phase::SkipToSync {
             let is_sync = msg_type == wire::FMSG_SYNC;
             self.recv.consume(total);
@@ -592,6 +607,129 @@ impl Conn {
         step
     }
 
+
+    /// Frontend traffic while a COPY FROM STDIN is in flight. CopyData
+    /// chunks accumulate into whole lines; the first error stops storing
+    /// but keeps draining, as PostgreSQL does; CopyDone settles the
+    /// transaction and answers; CopyFail aborts on the client's behalf.
+    fn process_copy_message(&mut self, engine: &mut Engine, msg_type: u8, total: usize) -> Step {
+        match msg_type {
+            wire::FMSG_COPY_DATA => {
+                self.copy_data_chunk(engine, total);
+                Step::Continue
+            }
+            wire::FMSG_COPY_DONE => self.copy_finish(engine),
+            wire::FMSG_COPY_FAIL => {
+                engine.copy_abort(&mut self.txn);
+                self.copy = None;
+                self.copy_buf.clear();
+                let status = self.txn.status_byte();
+                let mut responder = Responder::new(&mut self.send);
+                let sent = responder
+                    .error(sqlstate::QUERY_CANCELED, "COPY from stdin failed")
+                    .and_then(|()| responder.ready_for_query(status));
+                if sent.is_err() { Step::Close } else { Step::Continue }
+            }
+            wire::FMSG_TERMINATE => Step::Close,
+            // Flush and Sync during copy-in are ignored, as PostgreSQL does.
+            wire::FMSG_SYNC | wire::FMSG_FLUSH => Step::Continue,
+            _ => {
+                engine.copy_abort(&mut self.txn);
+                self.copy = None;
+                self.copy_buf.clear();
+                let status = self.txn.status_byte();
+                let mut responder = Responder::new(&mut self.send);
+                let sent = responder
+                    .error(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "unexpected message type during COPY from stdin",
+                    )
+                    .and_then(|()| responder.ready_for_query(status));
+                if sent.is_err() { Step::Close } else { Step::Continue }
+            }
+        }
+    }
+
+    fn copy_data_chunk(&mut self, engine: &mut Engine, total: usize) {
+        let copy = self.copy.as_mut().expect("in copy-in mode");
+        // Stage the chunk; a row larger than the staging buffer is the
+        // COPY's first error (drained like any other).
+        {
+            let payload = &self.recv.readable()[5..total];
+            if !self.copy_buf.append(payload) && copy.failed.is_none() {
+                copy.failed = Some(crate::sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "COPY row exceeds copy_line_bytes ({})",
+                    self.copy_buf.capacity()
+                ));
+            }
+        }
+        loop {
+            let Some(line_end) = self.copy_buf.readable().iter().position(|&b| b == b'\n')
+            else {
+                // No complete line; if the buffer is full without one, the
+                // row cannot ever complete.
+                if self.copy_buf.len() == self.copy_buf.capacity() && copy.failed.is_none() {
+                    copy.failed = Some(crate::sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "COPY row exceeds copy_line_bytes ({})",
+                        self.copy_buf.capacity()
+                    ));
+                }
+                return;
+            };
+            self.arena.reset();
+            {
+                let line = &self.copy_buf.readable()[..line_end];
+                if copy.end_seen || copy.failed.is_some() {
+                    // Draining: data after the end marker or an error is
+                    // read and dropped, never stored.
+                } else if crate::sql::copy::is_end_marker(line) {
+                    copy.end_seen = true;
+                } else {
+                    match engine.copy_row_line(&copy.setup, &mut self.txn, &self.arena, line) {
+                        Ok(()) => copy.count += 1,
+                        Err(e) => copy.failed = Some(e),
+                    }
+                }
+            }
+            self.copy_buf.consume(line_end + 1);
+        }
+    }
+
+    fn copy_finish(&mut self, engine: &mut Engine) -> Step {
+        // A final line without a trailing newline is still a line.
+        if !self.copy_buf.is_empty() {
+            let copy = self.copy.as_mut().expect("in copy-in mode");
+            self.arena.reset();
+            let line = self.copy_buf.readable();
+            if !copy.end_seen && copy.failed.is_none() && !crate::sql::copy::is_end_marker(line)
+            {
+                match engine.copy_row_line(&copy.setup, &mut self.txn, &self.arena, line) {
+                    Ok(()) => copy.count += 1,
+                    Err(e) => copy.failed = Some(e),
+                }
+            }
+            self.copy_buf.clear();
+        }
+        let copy = self.copy.take().expect("in copy-in mode");
+        let outcome = match copy.failed {
+            Some(e) => {
+                engine.copy_abort(&mut self.txn);
+                Err(e)
+            }
+            None => engine.copy_finish(&mut self.txn).map(|()| copy.count),
+        };
+        let status = self.txn.status_byte();
+        let mut responder = Responder::new(&mut self.send);
+        let sent = match outcome {
+            Ok(count) => responder
+                .command_complete(crate::stack_format!(32, "COPY {count}").as_str()),
+            Err(e) => responder.error(e.sqlstate, e.message.as_str()),
+        }
+        .and_then(|()| responder.ready_for_query(status));
+        if sent.is_err() { Step::Close } else { Step::Continue }
+    }
 
     fn handle_parse(&mut self, total: usize) -> Step {
         let payload = &self.recv.readable()[5..total];
@@ -984,6 +1122,17 @@ impl Conn {
                 )
             };
             engine.maybe_checkpoint();
+            if engine.take_pending_copy().is_some() {
+                // The extended protocol's COPY flow (CopyInResponse after
+                // Execute) is not wired; refuse loudly rather than leave
+                // the portal cycle wedged. psql and pg_dump use the simple
+                // protocol for COPY.
+                engine.copy_abort(&mut self.txn);
+                return ext_err(&mut self.send, &mut self.phase, 
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COPY FROM STDIN is not supported via the extended protocol",
+                );
+            }
             self.arena.reset();
             match result {
                 Ok(true) => {}
@@ -1116,6 +1265,20 @@ impl Conn {
         let status = self.txn.status_byte();
         let step = match result {
             Ok(()) => {
+                // A COPY FROM STDIN holds its query cycle open: the
+                // connection enters copy-in mode and ReadyForQuery waits
+                // for CopyDone.
+                if let Some(setup) = engine.take_pending_copy() {
+                    self.copy = Some(CopyInProgress {
+                        setup,
+                        count: 0,
+                        failed: None,
+                        end_seen: false,
+                    });
+                    self.copy_buf.clear();
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
                 let mut responder = Responder::new(&mut self.send);
                 match responder.ready_for_query(status) {
                     Ok(()) => Step::Continue,
@@ -1123,6 +1286,9 @@ impl Conn {
                 }
             }
             Err(WireFull) => {
+                if engine.take_pending_copy().is_some() {
+                    engine.copy_abort(&mut self.txn);
+                }
                 let mut responder = Responder::new(&mut self.send);
                 let recovered = responder
                     .replace_with_overflow_error(mark)
@@ -1161,6 +1327,16 @@ enum Step {
     Continue,
     NeedMoreData,
     Close,
+}
+
+/// The connection half of a COPY FROM STDIN: the engine's setup, the rows
+/// stored so far, the first error (data after it drains unparsed, as
+/// PostgreSQL does), and whether the classic `\.` end marker was seen.
+struct CopyInProgress {
+    setup: crate::sql::exec::CopySetup,
+    count: u64,
+    failed: Option<crate::sql::eval::SqlError>,
+    end_seen: bool,
 }
 
 fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {

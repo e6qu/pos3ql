@@ -37,6 +37,9 @@ impl ResultFmt {
     }
 }
 
+/// A deterministic emitter of one COPY row's escaped bytes.
+pub type CopyRowWriter<'a> = dyn Fn(&mut dyn FnMut(&[u8])) + 'a;
+
 pub struct Responder<'b> {
     pub buffer: &'b mut FixedBuf,
     /// Extended-protocol Execute must not resend RowDescription (the
@@ -96,6 +99,10 @@ impl<'b> Responder<'b> {
     /// Sets the session value-rendering context (DateStyle / time zone).
     /// Updates the value-rendering context in place (e.g. after a SET changed
     /// DateStyle mid-batch).
+    pub fn render_context(&self) -> crate::sql::guc::RenderContext {
+        self.render
+    }
+
     pub fn set_render(&mut self, render: crate::sql::guc::RenderContext) {
         self.render = render;
     }
@@ -265,6 +272,46 @@ impl<'b> Responder<'b> {
         })
     }
 
+    /// CopyInResponse / CopyOutResponse: text overall format, every column
+    /// text — the only formats this engine's COPY speaks.
+    pub fn copy_in_response(&mut self, n_columns: usize) -> Result<(), WireFull> {
+        self.copy_response(b'G', n_columns)
+    }
+
+    pub fn copy_out_response(&mut self, n_columns: usize) -> Result<(), WireFull> {
+        self.copy_response(b'H', n_columns)
+    }
+
+    fn copy_response(&mut self, kind: u8, n_columns: usize) -> Result<(), WireFull> {
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, kind);
+            m.u8(0); // overall format: text
+            m.i16(n_columns as i16);
+            for _ in 0..n_columns {
+                m.i16(0);
+            }
+            m.finish()
+        })
+    }
+
+    /// One CopyData row: `write` emits the escaped fields and separators;
+    /// the trailing newline is appended here. `write` may run twice (the
+    /// flush-and-retry path), so it must be deterministic.
+    pub fn copy_data_row(&mut self, write: &CopyRowWriter<'_>) -> Result<(), WireFull> {
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, b'd');
+            write(&mut |bytes| {
+                m.bytes(bytes);
+            });
+            m.bytes(b"\n");
+            m.finish()
+        })
+    }
+
+    pub fn copy_done(&mut self) -> Result<(), WireFull> {
+        self.with_retry(|buffer| MsgOut::begin(buffer, b'c').finish())
+    }
+
     pub fn data_row(&mut self, values: &[Datum]) -> Result<(), WireFull> {
         let formats = self.formats;
         let render = self.render;
@@ -399,6 +446,75 @@ impl<'b> Responder<'b> {
                 }
             }
         }
+    }
+
+    /// One value's wire-text form as an arena string — the same output
+    /// function semantics `encode_value_text` streams onto the wire (styled
+    /// dates and timestamps, GUC-honoring bytea, Display for the rest), for
+    /// consumers that must post-process the text (COPY escapes it).
+    /// `None` is NULL.
+    pub fn datum_wire_text<'a>(
+        v: &Datum<'a>,
+        render: crate::sql::guc::RenderContext,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<Option<&'a str>, crate::sql::eval::SqlError> {
+        use crate::sql::eval::sqlstate;
+        let full = || {
+            crate::sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "COPY row exceeds the statement arena"
+            )
+        };
+        Ok(Some(match v {
+            Datum::Null => return Ok(None),
+            Datum::Text(s) | Datum::Bpchar(s) => s,
+            Datum::Bytea(b) if render.bytea_escape => {
+                let escaped_len: usize = b
+                    .iter()
+                    .map(|&byte| match byte {
+                        b'\\' => 2,
+                        0x20..=0x7e => 1,
+                        _ => 4,
+                    })
+                    .sum();
+                let out = arena.alloc_slice_with(escaped_len, |_| 0u8).map_err(|_| full())?;
+                let mut at = 0;
+                for &byte in b.iter() {
+                    match byte {
+                        b'\\' => {
+                            out[at..at + 2].copy_from_slice(b"\\\\");
+                            at += 2;
+                        }
+                        0x20..=0x7e => {
+                            out[at] = byte;
+                            at += 1;
+                        }
+                        _ => {
+                            out[at] = b'\\';
+                            out[at + 1] = b'0' + (byte >> 6);
+                            out[at + 2] = b'0' + ((byte >> 3) & 7);
+                            out[at + 3] = b'0' + (byte & 7);
+                            at += 4;
+                        }
+                    }
+                }
+                core::str::from_utf8(out).expect("escaped bytea is ASCII")
+            }
+            Datum::Date(d) => arena
+                .alloc_str(crate::sql::datetime::format_date_styled(*d, render.datestyle).as_str())
+                .map_err(|_| full())?,
+            Datum::Timestamp(t) | Datum::Timestamptz(t) => {
+                let with_timezone = matches!(v, Datum::Timestamptz(_));
+                let text = crate::sql::datetime::format_timestamp_styled(
+                    *t,
+                    with_timezone,
+                    render.datestyle,
+                    render.parsed_timezone,
+                );
+                arena.alloc_str(text.as_str()).map_err(|_| full())?
+            }
+            other => arena.alloc_str_display(other).map_err(|_| full())?,
+        }))
     }
 
     /// Binary wire representations, per PostgreSQL's send functions:

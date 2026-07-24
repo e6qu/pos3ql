@@ -303,6 +303,13 @@ The performance vocabulary of the object-storage LSM and its adaptive executor
 
 ### SQL and wire
 
+- **COPY (subprotocol)** — PostgreSQL's bulk-data flow inside the wire
+  protocol: after `COPY ... FROM STDIN` the backend answers
+  CopyInResponse and the frontend streams CopyData until CopyDone (or
+  CopyFail), the query cycle held open throughout; `COPY ... TO STDOUT`
+  streams CopyData out. pos3ql speaks the *text format* — tab-delimited,
+  `\N` nulls, backslash escapes — exactly as psql and pg_dump emit it.
+
 - **object identifier (OID)** — PostgreSQL's numeric type/relation identifier,
   sent on the wire and stored in the catalog. `OID` is treated as a well-known
   term; the spelled-out form is used in prose.

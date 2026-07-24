@@ -118,7 +118,11 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
-    fn get(&mut self, id: &super::BlockId, into: &mut [u8]) -> Result<usize, super::StoreError> {
+    fn get(
+        &mut self,
+        id: &super::BlockId,
+        into: &mut [u8],
+    ) -> Result<(usize, super::BlockType), super::StoreError> {
         match self {
             Layer::Base(s) => s.get(id, into),
             Layer::Disk(d) => d.get(id, into),
@@ -154,7 +158,11 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         }
     }
 
-    fn get(&mut self, id: &super::BlockId, into: &mut [u8]) -> Result<usize, super::StoreError> {
+    fn get(
+        &mut self,
+        id: &super::BlockId,
+        into: &mut [u8],
+    ) -> Result<(usize, super::BlockType), super::StoreError> {
         match self {
             TieredStore::WithRam(c) => c.get(id, into),
             TieredStore::WithoutRam(l) => l.get(id, into),
@@ -195,7 +203,7 @@ mod tests {
 
     fn read(s: &mut TieredStore<MemoryBlockStore>, id: &BlockId) -> Vec<u8> {
         let mut out = vec![0u8; 4096];
-        let n = s.get(id, &mut out).expect("reads");
+        let (n, _) = s.get(id, &mut out).expect("reads");
         out.truncate(n);
         out
     }

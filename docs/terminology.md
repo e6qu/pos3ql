@@ -117,6 +117,20 @@ vocabulary — with the meaning they carry in this codebase.
   TigerBeetle's `manifest_log` / Loki's index shipping). Roadmap.
 - **superblock** — the single compare-and-swap root object naming the manifest
   log's tail; the storage engine's linearization point. Roadmap.
+- **LZ4 (block format)** — the compression applied to SST data blocks when
+  it shrinks them: a hand-rolled implementation of the published LZ4 block
+  format (pinned to the reference repository's spec), greedy compressor,
+  strict bounds-checked decompressor; the writer stores whichever of
+  raw/compressed is smaller, and the block type says which, surviving every
+  cache tier.
+- **index leaf / index root (two-level index)** — past one block's worth of
+  index entries, an SST's sparse index splits: *leaves* keep the classic
+  count-prefixed layout and a magic-prefixed *root* names them with their
+  first keys and block counts, lifting the per-SST size cap from ~1.6 GB to
+  terabytes. A single-leaf SST keeps the classic one-block index.
+- **filter ladder** — the SST writer inserts every key into three candidate
+  bloom sizes and keeps the smallest still giving about ten bits per key,
+  so filters are sized to their SSTs instead of a fixed 128 KiB.
 - **content-addressed** — an object keyed by the hash of its bytes, hence
   immutable and safe to cache indefinitely and to reference across an eventually
   consistent LIST.

@@ -26,6 +26,9 @@ use super::{BlockId, BlockStore, BlockType, StoreError, MAX_PAYLOAD};
 struct Frame {
     id: Option<BlockId>,
     len: usize,
+    /// The framed type, kept because a compressed block cached here must
+    /// still say so when served back.
+    block_type: BlockType,
     /// Touched since the hand last passed. CLOCK clears it rather than evicting
     /// on the first sweep, so a block used twice survives one round of pressure.
     referenced: bool,
@@ -72,7 +75,10 @@ impl<S: BlockStore> BlockCache<S> {
         Ok(Self {
             inner,
             slots: vec![0u8; frame_count * MAX_PAYLOAD].into_boxed_slice(),
-            frames: vec![Frame { id: None, len: 0, referenced: false }; frame_count]
+            frames: vec![
+                Frame { id: None, len: 0, block_type: BlockType::SstData, referenced: false };
+                frame_count
+            ]
                 .into_boxed_slice(),
             index,
             hand: 0,
@@ -122,7 +128,7 @@ impl<S: BlockStore> BlockCache<S> {
         }
     }
 
-    fn admit(&mut self, id: BlockId, payload: &[u8]) {
+    fn admit(&mut self, id: BlockId, block_type: BlockType, payload: &[u8]) {
         // A payload too large for a frame is simply not cached; it still
         // reached the caller from the store, so nothing is lost but the reuse.
         if payload.len() > MAX_PAYLOAD {
@@ -131,7 +137,8 @@ impl<S: BlockStore> BlockCache<S> {
         let frame = self.claim_frame();
         self.slots[frame * MAX_PAYLOAD..frame * MAX_PAYLOAD + payload.len()]
             .copy_from_slice(payload);
-        self.frames[frame] = Frame { id: Some(id), len: payload.len(), referenced: true };
+        self.frames[frame] =
+            Frame { id: Some(id), len: payload.len(), block_type, referenced: true };
         // The index has one slot per frame and the frame was just freed, so
         // this cannot overflow; a failure would mean the two disagree.
         self.index.insert(id, frame).expect("index has a slot per frame");
@@ -150,13 +157,13 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
     ) -> Result<BlockId, StoreError> {
         let id = self.inner.put(payload, block_type, lsn)?;
         if self.index.get(&id).is_none() {
-            self.admit(id, payload);
+            self.admit(id, block_type, payload);
             self.stats.insertions += 1;
         }
         Ok(id)
     }
 
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<usize, StoreError> {
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
         if let Some(&frame) = self.index.get(id) {
             let len = self.frames[frame].len;
             if into.len() < len {
@@ -165,14 +172,14 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
             into[..len].copy_from_slice(&self.slot(frame)[..len]);
             self.frames[frame].referenced = true;
             self.stats.hits += 1;
-            return Ok(len);
+            return Ok((len, self.frames[frame].block_type));
         }
         self.stats.misses += 1;
-        let len = self.inner.get(id, into)?;
+        let (len, block_type) = self.inner.get(id, into)?;
         // Admitted from the caller's buffer, which now holds exactly the block
         // the store returned and verified.
-        self.admit(*id, &into[..len]);
-        Ok(len)
+        self.admit(*id, block_type, &into[..len]);
+        Ok((len, block_type))
     }
 
     /// Presence in the cache proves presence in the store — a frame is only
@@ -201,7 +208,7 @@ mod tests {
 
     fn read(c: &mut BlockCache<MemoryBlockStore>, id: &BlockId) -> Vec<u8> {
         let mut out = vec![0u8; 4096];
-        let n = c.get(id, &mut out).expect("reads");
+        let (n, _) = c.get(id, &mut out).expect("reads");
         out.truncate(n);
         out
     }

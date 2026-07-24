@@ -1,8 +1,8 @@
 # pos3ql
 
 A PostgreSQL-compatible database engine whose durable storage is S3-compatible
-object storage (AWS S3, GCS, MinIO), written in Rust with TigerBeetle-style
-engineering discipline.
+object storage (AWS S3, MinIO, or any endpoint speaking the S3 API), written
+in Rust with TigerBeetle-style engineering discipline.
 
 ## Design pillars
 
@@ -10,14 +10,15 @@ engineering discipline.
   simple *and* extended query) and the SQL dialect follow PostgreSQL so that
   psql, JDBC, npgsql, psycopg, node-postgres, etc. work — including the
   introspection queries drivers issue on connect.
-- **Object storage is the durable home.** Checkpoint SSTs, WAL segments, and
-  the manifest live in an S3-compatible bucket, and a node can cold-start from
-  an empty disk. *Today* this is a snapshot model: the live working set is held
-  in a fixed in-memory heap (`memtable_bytes`) and object storage is written at
-  checkpoint and read at cold start, not paged on the query path. The
-  ClickHouse/Loki-style **local disk + RAM cache in front of the bucket**, and
-  a leveled LSM so the working set can exceed RAM, are the planned next arc —
-  see the *Object-storage LSM roadmap* in [PLAN.md](PLAN.md).
+- **Object storage is the durable home.** Content-addressed, checksummed
+  block SSTs, WAL segments, and the CAS'd manifest live in an S3-compatible
+  bucket, and a node can cold-start from an empty disk. Reads go **RAM block
+  cache → local disk cache → ranged GET** (`block_cache_bytes` /
+  `disk_cache_bytes`), and under memory pressure committed row bytes spill to
+  the bucket and page back through the caches, so ingest is not bounded by
+  RAM *bytes*. The remaining RAM bound is the per-row index (row *count*),
+  and commit durability is still the local WAL first — closing both is the
+  *Maturity roadmap* in [PLAN.md](PLAN.md).
 - **Static allocation.** All memory is acquired at startup, sized from
   config. No heap allocation after init — enforced by a guarding global
   allocator. Every pool and queue has a fixed limit; exhaustion is a loud
@@ -33,9 +34,11 @@ engineering discipline.
 ## Dependency policy
 
 `std` + `libc` only (raw syscall bindings). No async runtime, no protocol or
-parser crates, no cloud SDKs. TLS will never be hand-rolled: development
-targets MinIO/HTTP; the TLS approach for public endpoints (isolated rustls vs
-terminating proxy) is an explicitly deferred decision.
+parser crates, no cloud SDKs. TLS is never hand-rolled: the one whitelisted
+exception is an **isolated rustls component** for HTTPS to the object store
+(`s3_tls = on`, optional `s3_tls_ca_file` for self-signed endpoints) — every
+rustls call runs inside a budgeted allocator scope (`tls_pool_bytes`) so the
+static-memory discipline holds everywhere else.
 
 ## Status
 
@@ -61,7 +64,9 @@ Working single-node database:
   MinIO (psql golden files, raw wire probes, psycopg driver suite, kill-9 and
   cold-start durability scenarios, differential vs PostgreSQL 18).
 
-Not yet: multi-replica VSR and TLS. See [PLAN.md](PLAN.md) for the roadmap and
+Not yet: multi-replica VSR and client-facing TLS (TLS to the bucket is in;
+the server's SSLRequest answer is still `N`). See [PLAN.md](PLAN.md) for the
+roadmap and
 [BUGS.md](BUGS.md) for known divergences; the headline ones are summarized
 under **Limitations** below. [AGENTS.md](AGENTS.md) holds the standing
 directives, and [docs/terminology.md](docs/terminology.md) is the glossary and
@@ -114,17 +119,19 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
 - **Checkpoint S3 calls are synchronous.** A `CHECKPOINT` (and cold-start load)
   stalls other connections while it runs. WAL-segment upload, by contrast, is
   asynchronous (B-008).
-- **The live working set must fit RAM.** All live rows are held in one fixed
-  in-memory heap (`memtable_bytes`); object storage is written at checkpoint and
-  read only at cold start, not paged on the query path, and there is no
-  read-through cache yet (`block_cache_bytes` / `disk_cache_bytes` are reserved
-  but not yet wired). A full memtable fails loudly. Lifting this — a block-grid
-  cache tier and a leveled LSM that pages from the bucket — is the
-  *Object-storage LSM roadmap* in [PLAN.md](PLAN.md).
+- **The row index must fit RAM.** Row *bytes* spill to the bucket under
+  memory pressure and page back through the RAM/disk caches, but the per-row
+  map (visibility, uniqueness, bookkeeping) stays in RAM, so dataset size is
+  bounded in row *count* (`table_rows`) rather than bytes. Making the map
+  itself block-resident is gap 2 of the *Maturity roadmap* in
+  [PLAN.md](PLAN.md).
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.
-- **No TLS.** Endpoints are plaintext (MinIO/HTTP) pending the TLS decision.
+- **No client-facing TLS.** The object-store side speaks HTTPS
+  (`s3_tls = on`, isolated rustls); the PostgreSQL wire side still answers
+  the SSLRequest probe with `N` — server-side TLS is in the maturity
+  roadmap's compatibility wave.
 
 ## Quick start
 

@@ -588,11 +588,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether a checkpoint sweep is mid-flight — the event loop keeps
-    /// beating an active sweep between events, so an idle server still
-    /// finishes what a trigger started.
-    pub fn checkpoint_sweep_active(&self) -> bool {
-        self.ckpt.as_ref().is_some_and(|c| c.sweep_active())
+    /// Whether checkpoint or compaction work is pending — an active sweep,
+    /// a paced merge (mid-flight, finished-awaiting-publish, or a list at
+    /// the trigger). The event loop keeps beating pending work between
+    /// events, so an idle server still finishes what a trigger started and
+    /// compacts what its lists owe.
+    pub fn checkpoint_work_pending(&self) -> bool {
+        self.ckpt
+            .as_ref()
+            .is_some_and(|c| c.sweep_active() || c.merge_work_pending(&self.storage))
     }
 
     /// One checkpoint beat: a trigger (heap or journal filling) starts a
@@ -609,7 +613,11 @@ impl Engine {
         };
         let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
-        if !(ckpt.sweep_active() || heap_full || wal_full) {
+        if !(ckpt.sweep_active()
+            || ckpt.merge_work_pending(&self.storage)
+            || heap_full
+            || wal_full)
+        {
             return true;
         }
         self.wal.commit();

@@ -53,6 +53,9 @@ const SQLSTATE_CAS: &str = "40001";
 enum SlotInstall {
     Append(SstHandle),
     Collapse(SstHandle),
+    /// Paced compaction merged the table's two oldest SSTs into one (`None`
+    /// when everything in them was deleted): remap in-memory spill indexes.
+    MergeOldest(Option<SstHandle>),
 }
 
 /// A prior checkpoint's SST reference for one table slot.
@@ -102,6 +105,8 @@ pub(crate) struct Checkpointer {
     /// Spill-list updates computed during a checkpoint, applied to storage
     /// only after the manifest CAS lands.
     pending_installs: Vec<(usize, SlotInstall)>,
+    /// Pre-reserved id scratch for a paced merge: (rowid, source-and-kind).
+    merge_scratch: Vec<(u64, u8)>,
     /// Pre-reserved sort scratch for a delta's tombstones.
     tomb_scratch: Vec<u64>,
     /// Rosters of the SSTs the current manifest references (GC keep-set
@@ -134,7 +139,21 @@ const MAX_SWEEP_KEYS: usize = 4096;
 const MAX_KEEP_BLOCKS: usize = 64 * 1024;
 /// Scratch for one SST writer or reader: the writer's pending block, index and
 /// filter, or the reader's index/data/assembly blocks — reset per table.
-const SST_ARENA_BYTES: usize = 8 * 1024 * 1024;
+/// Sized for a reader and a writer living together (a paced merge streams
+/// one SST pair through both) plus an assembled-row bounce buffer.
+const SST_ARENA_BYTES: usize = 16 * 1024 * 1024;
+
+/// A table whose spill list reaches this many SSTs gets its two oldest
+/// members merged during the checkpoint — one bounded merge per table per
+/// cycle, so read fan-out stays low without the monolithic full rewrite that
+/// a filled list used to force.
+const MERGE_TRIGGER: usize = 4;
+
+/// Merge id-scratch capacity, in (rowid, source) entries. Sized generously
+/// past a full table plus its tombstone backlog; a pair whose combined count
+/// exceeds it skips its merge that cycle (the full-rewrite fallback at a
+/// filled list stays the safety net).
+const MERGE_SCRATCH_ENTRIES: usize = 512 * 1024;
 
 impl Checkpointer {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
@@ -145,6 +164,112 @@ impl Checkpointer {
             + MANIFEST_BUF_BYTES
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
+            + MERGE_SCRATCH_ENTRIES * core::mem::size_of::<(u64, u8)>()
+    }
+
+    /// Paced compaction: merges a table's two oldest spill SSTs into one.
+    /// Rows come out in rowid order with the newer member winning duplicates
+    /// and its tombstones consuming the older member's rows; nothing is older
+    /// than member 0, so no tombstone survives into the merged SST. Returns
+    /// `Ok(None)` when the pair's combined entry count exceeds the id
+    /// scratch — the merge is skipped that cycle and the filled-list full
+    /// rewrite remains the safety net — and `Ok(Some(..))` with the merged
+    /// member (itself `None` when every row was deleted) otherwise.
+    fn merge_oldest_pair(
+        &mut self,
+        old0: &PrevSst,
+        old1: &PrevSst,
+    ) -> Result<Option<Option<PrevSst>>, SqlError> {
+        if (old0.count + old1.count) as usize > MERGE_SCRATCH_ENTRIES {
+            return Ok(None);
+        }
+        self.sst_arena.reset();
+        let mut reader = SstReader::new(&self.sst_arena).map_err(sst_to_sql)?;
+        // Pass 1: collect (rowid, source-rank | tombstone-bit) for both
+        // members. Each member's scan emits in rowid order; the sort below
+        // interleaves the two.
+        self.merge_scratch.clear();
+        {
+            let scratch = &mut self.merge_scratch;
+            let mut overflow = false;
+            for (rank, member) in [old0, old1].into_iter().enumerate() {
+                reader
+                    .scan(
+                        &mut *self.blocks.borrow_mut(),
+                        &member.handle,
+                        0,
+                        u64::MAX,
+                        &mut |rowid, bytes| {
+                            if scratch.len() == MERGE_SCRATCH_ENTRIES {
+                                overflow = true;
+                                return;
+                            }
+                            let kind = rank as u8 | (u8::from(bytes.is_none()) << 1);
+                            scratch.push((rowid, kind));
+                        },
+                    )
+                    .map_err(sst_to_sql)?;
+            }
+            if overflow {
+                // Counts under-reported the entries (corruption would show
+                // elsewhere); skip the merge rather than write a partial SST.
+                return Ok(None);
+            }
+        }
+        // Newer-wins dedup: sort by (rowid, rank) and keep each rowid's last.
+        self.merge_scratch
+            .sort_unstable_by_key(|&(rowid, kind)| (rowid, kind & 1));
+        let mut keep = 0usize;
+        for i in 0..self.merge_scratch.len() {
+            if keep > 0 && self.merge_scratch[keep - 1].0 == self.merge_scratch[i].0 {
+                self.merge_scratch[keep - 1] = self.merge_scratch[i];
+            } else {
+                self.merge_scratch[keep] = self.merge_scratch[i];
+                keep += 1;
+            }
+        }
+        // Pass 2: stream the surviving rows into the merged SST. Point reads
+        // ride the block cache, so a rowid-ordered walk touches each data
+        // block about once.
+        let mut writer = SstWriter::new(&self.sst_arena).map_err(sst_to_sql)?;
+        let row_buf = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_ASSEMBLED, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "merge scratch exceeds the checkpoint arena"))?;
+        let mut count = 0u64;
+        let mut crc = Crc32c::new();
+        for i in 0..keep {
+            let (rowid, kind) = self.merge_scratch[i];
+            if kind & 2 != 0 {
+                // A tombstone: its row (if any) lost the dedup above, and
+                // member 0 has nothing older to suppress — drop it.
+                continue;
+            }
+            let member = if kind & 1 == 0 { old0 } else { old1 };
+            let len = reader
+                .get(&mut *self.blocks.borrow_mut(), &member.handle, rowid, row_buf)
+                .map_err(sst_to_sql)?
+                .ok_or_else(|| {
+                    sql_err!(SQLSTATE_IO, "merge lost row {} between scan and read", rowid)
+                })?;
+            let mut header = [0u8; SST_ENTRY_HEADER];
+            header[0..8].copy_from_slice(&rowid.to_le_bytes());
+            header[8..12].copy_from_slice(&(len as u32).to_le_bytes());
+            crc.update(&header);
+            crc.update(&row_buf[..len]);
+            writer
+                .append(&mut *self.blocks.borrow_mut(), rowid, &row_buf[..len])
+                .map_err(sst_to_sql)?;
+            count += 1;
+        }
+        if count == 0 {
+            return Ok(Some(None));
+        }
+        let handle = writer
+            .finish(&mut *self.blocks.borrow_mut())
+            .map_err(sst_to_sql)?
+            .ok_or_else(|| sql_err!(SQLSTATE_IO, "merge wrote rows but produced no SST"))?;
+        Ok(Some(Some(PrevSst { handle, count, crc: crc.finish() })))
     }
 
     /// Fails when S3 is enabled but credentials are missing — explicitly,
@@ -187,6 +312,7 @@ impl Checkpointer {
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
             pending_installs: Vec::with_capacity(MAX_CKPT_TABLES),
+            merge_scratch: Vec::with_capacity(MERGE_SCRATCH_ENTRIES),
             tomb_scratch: Vec::with_capacity(crate::storage::MAX_TOMBSTONES),
             roster_scratch: Vec::with_capacity(MAX_KEEP_BLOCKS),
             doomed_blocks: Vec::with_capacity(MAX_SWEEP_KEYS),
@@ -1219,6 +1345,32 @@ impl Checkpointer {
                 }
             };
 
+            // Paced compaction: a list at the trigger merges its two oldest
+            // members — bounded work per table per checkpoint, keeping read
+            // fan-out low without the monolithic full rewrite a filled list
+            // forces.
+            let new_list: SlotList = if new_list.n >= MERGE_TRIGGER {
+                let old0 = new_list.ssts[0].expect("counted");
+                let old1 = new_list.ssts[1].expect("counted");
+                match self.merge_oldest_pair(&old0, &old1)? {
+                    None => new_list, // over id-scratch capacity: skip this cycle
+                    Some(merged) => {
+                        let mut list = SlotList::EMPTY;
+                        if let Some(m) = merged {
+                            let _ = list.push(m);
+                        }
+                        for p in new_list.iter().skip(2) {
+                            let _ = list.push(*p);
+                        }
+                        self.pending_installs
+                            .push((slot, SlotInstall::MergeOldest(merged.map(|m| m.handle))));
+                        list
+                    }
+                }
+            } else {
+                new_list
+            };
+
             if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
                 self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
             }
@@ -1346,6 +1498,7 @@ impl Checkpointer {
             match install {
                 SlotInstall::Append(h) => storage.append_spill(slot, h),
                 SlotInstall::Collapse(h) => storage.collapse_spill(slot, h),
+                SlotInstall::MergeOldest(h) => storage.merge_oldest_spill(slot, h),
             }
             storage.clear_tombstones(slot);
         }

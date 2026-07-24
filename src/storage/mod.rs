@@ -1472,6 +1472,41 @@ impl Storage {
         }
     }
 
+    /// Paced compaction merged the two oldest spill SSTs into one (`None`
+    /// when everything in them was deleted): the merged member takes slot 0,
+    /// later members shift down, and every spilled row's index follows. A
+    /// live row can only reference a dropped pair when the merge kept it, so
+    /// `None` never strands one.
+    pub(crate) fn merge_oldest_spill(
+        &mut self,
+        slot: usize,
+        handle: Option<crate::store::SstHandle>,
+    ) {
+        let table = &mut self.tables[slot];
+        let removed = if handle.is_some() { 1 } else { 2 };
+        let mut ssts = [None; MAX_SPILL_SSTS];
+        let mut n = 0;
+        if let Some(h) = handle {
+            ssts[0] = Some(h);
+            n = 1;
+        }
+        for i in 2..table.n_spill_ssts {
+            ssts[n] = table.spill_ssts[i];
+            n += 1;
+        }
+        table.spill_ssts = ssts;
+        table.n_spill_ssts = n;
+        for (_, state) in table.rows.iter_mut() {
+            if let Some(RowHome::Spilled { len, sst }) = state.committed {
+                let sst = match sst {
+                    0 | 1 => 0,
+                    k => k - removed,
+                };
+                state.committed = Some(RowHome::Spilled { len, sst });
+            }
+        }
+    }
+
     /// A delta flush: the new SST (heap rows + tombstones) joins the list;
     /// existing spilled entries keep their slots. Clears the flushed
     /// tombstones. The caller guarantees the list has room.

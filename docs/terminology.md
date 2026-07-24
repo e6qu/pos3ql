@@ -123,6 +123,13 @@ vocabulary — with the meaning they carry in this codebase.
 - **leveled / tiered compaction** — the two LSM compaction shapes (low
   read-amplification vs low write-amplification) weighed against object-storage
   economics in the roadmap. Roadmap.
+- **sweep / beat (sliced checkpoint)** — a checkpoint *sweep* is the whole
+  unit of work from trigger to manifest publish; a *beat* is one slice of
+  it — one table's SST/delta/merge writes — run between query messages (and
+  by the idle event loop), so the engine serves statements while a
+  checkpoint is in flight. The publish beat runs only when no table has
+  changed since its slice, which per-table generations guarantee. The word
+  *beat* is TigerBeetle's, for the same amortize-the-work idea.
 - **Write-Ahead Log (WAL)** — the durable operation log; here it doubles as the
   VSR journal. Replayed on recovery.
 - **manifest** — the single object-storage object naming the current set of SSTs

@@ -85,17 +85,18 @@ Durability *against loss of the local disk itself* is tiered by configuration:
 | Mode | Commit latency | Survives process crash | Survives total local-disk loss |
 |------|----------------|------------------------|--------------------------------|
 | `s3 = off` (or `wal_upload = off`) | local fsync | yes (WAL replay) | only up to the last `CHECKPOINT` snapshot in the bucket |
-| `wal_upload = on` (**async, default**) | local fsync | yes | **eventually** — the S3 upload is drained off the commit path, so a transaction committed within the last drain window is lost from S3 if the disk is also lost in that window |
-| `wal_upload = on`, `wal_upload_sync = on` | local fsync **+ S3 round-trip** | yes | yes (RPO=0 to S3 — the batch is in the bucket before the ack) |
+| `wal_upload = on`, `wal_upload_sync = off` | local fsync | yes | **eventually** — the S3 upload is drained off the commit path, so a transaction committed within the last drain window is lost from S3 if the disk is also lost in that window |
+| `wal_upload_sync = on` (**default with s3 = on**) | local fsync **+ S3 round-trip** | yes | yes (RPO=0 to S3 — the batch is in the bucket before the ack) |
 | Multi-replica VSR | quorum-disk | yes | yes (quorum) | *(not yet active — see PLAN.md)* |
 
 `CHECKPOINT` snapshots every table to the bucket behind a compare-and-swap
 manifest; a node with a wiped disk cold-starts entirely from the last snapshot
-plus any newer uploaded WAL segments. The default asynchronous `wal_upload`
-keeps commit latency to a local fsync; choose `wal_upload_sync = on` when you
-need zero data loss against destruction of the whole node and can pay the S3
-latency on every commit. The low-latency path to RPO=0 is VSR replication, not
-single-node synchronous upload.
+plus any newer uploaded WAL segments. **Commit-durable-on-bucket is the
+default whenever object storage is on**: the local disk is a mere cache, so an
+acknowledged commit must not live only there. Set `wal_upload_sync = off` to
+trade that for local-fsync commit latency with an asynchronous drain; the
+low-latency path to RPO=0 is VSR replication, not single-node synchronous
+upload.
 
 ## Limitations
 
@@ -116,9 +117,13 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   `GROUP BY` materialize in a fixed shared arena (`work_arena_bytes`, 64 MiB
   default — larger than PostgreSQL's 4 MiB default `work_mem`). A result that
   exceeds it errors `54000` rather than spilling to temporary files (B-006).
-- **Checkpoint S3 calls are synchronous.** A `CHECKPOINT` (and cold-start load)
-  stalls other connections while it runs. WAL-segment upload, by contrast, is
-  asynchronous (B-008).
+- **A checkpoint beat blocks for one table's write.** The auto-checkpoint is
+  sliced — one table's SSTs per beat, beats interleaved with statements and
+  driven on by the idle event loop, publishing only when no table changed
+  since its slice — so a checkpoint no longer stalls connections for its
+  whole duration, but a single very large table's slice still blocks while
+  it writes (per-block beats are the roadmap's Stage E). The explicit
+  `CHECKPOINT` statement and the cold-start load remain atomic.
 - **The row index must fit RAM.** Row *bytes* spill to the bucket under
   memory pressure and page back through the RAM/disk caches, but the per-row
   map (visibility, uniqueness, bookkeeping) stays in RAM, so dataset size is

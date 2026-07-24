@@ -857,9 +857,34 @@ adaptive-execution capstone. This section is the plan of record for all of it.
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with
    PCG-driven fault injection and seeded invariant checks. Deliberately
    *before* the durability surgery, so steps 2–4 are born simulation-tested
-   rather than retrofitted.
+   rather than retrofitted. **Done** (see Stage H status above).
 2. **Durability to the bucket (gaps 1 + 3)** — group-commit WAL-segment PUT
    on the acknowledge path; asynchronous checkpoint through the reactor.
+   **Status (2026-07-24): landed as defaults + the sliced checkpoint.**
+   Commit-durable-on-bucket is now the *default* whenever `s3 = on`
+   (`wal_upload`/`wal_upload_sync` resolve on unless explicitly set off;
+   run.sh proves the posture with an ack → immediate kill -9 → wiped-disk
+   cold start, no drain pause, no checkpoint). The checkpoint stall is
+   broken up: the auto-checkpoint is **sliced** — one table's SST/delta/
+   merge work per beat, a beat per query message plus idle-loop beats with
+   backoff, publishing only in a beat where no table changed since its
+   slice (per-table `generation` behind the new `Table::mark_dirty` choke
+   point); the explicit `CHECKPOINT` statement drives the same beats to
+   completion atomically, so there is one code path. The storage VOPR
+   promptly caught the new machinery's one real hazard before it ever
+   merged — a publish failing *after* its CAS+installs (in the advisory GC
+   tail) left the sweep active over swapped scratch, and the retry CAS'd a
+   manifest whose lsn claimed state its lists did not carry, shadowing the
+   local WAL tail — fixed by ending the sweep at the install point and
+   demoting GC to logged-and-retried cleanup; two pre-existing bugs fell
+   out of the same investigation (B-158 ambiguous manifest-CAS lockout,
+   B-159 GC failure mislabeling a completed checkpoint). *Deliberately
+   deferred from this step:* cross-connection group commit (holding acks so
+   one segment PUT covers many concurrent commits) — a throughput
+   optimization, not a correctness gap (every ack already follows its PUT);
+   its ack-deferral plumbing belongs with the reactor's suspendable
+   row-source work (Stage I pillar 2). Per-block beat pacing for a single
+   huge table's slice remains Stage E's item in step 3.
 3. **Stage F MVCC + Stage E beat pacing** — LSN-keyed row versions,
    snapshot-aware merge reads, compaction retention above the oldest-snapshot
    watermark, merge work amortized across statements.
@@ -886,12 +911,15 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   paced level-aware pair merges. What remains RAM-bound is the row *map*
   (visibility, uniqueness, per-row bookkeeping) — gap 2 of the maturity
   roadmap above.
-- **Checkpoint S3 calls are synchronous** in the single-threaded loop: a
-  checkpoint stalls other connections while it runs. Fine at dev scale; the
-  fix is step 2 of the maturity roadmap (async checkpoint through the
-  reactor, alongside commit-durable-on-bucket). WAL-segment upload is already
-  asynchronous — drained off the commit path by the event loop (B-008), with a
-  `wal_upload_sync` opt-in for synchronous RPO=0-to-S3.
+- **Checkpoint S3 calls are synchronous** — *superseded by the sliced
+  checkpoint* (maturity-roadmap step 2): the auto-checkpoint runs one
+  table's write per beat, beats interleaved with statements and driven by
+  the idle event loop, publishing only when no table changed since its
+  slice. The remaining stall is one table's slice (per-block beats are
+  Stage E's pacing); the explicit `CHECKPOINT` statement stays atomic by
+  design. WAL-segment upload is synchronous-by-default with s3 on
+  (commit-durable-on-bucket), with `wal_upload_sync = off` as the stated
+  asynchronous opt-out (B-008's drain).
 
 ## Verification
 

@@ -239,16 +239,20 @@ impl Server {
     /// The event loop. Runs until SIGTERM/SIGINT, then drains connections,
     /// takes a final checkpoint, and returns cleanly.
     pub fn run(&mut self) -> std::io::Result<()> {
-        // Backoff for the asynchronous WAL-upload drain: zero while healthy
-        // (drain eagerly between events), one second after a failure so a
-        // persistently-unreachable bucket cannot spin the loop.
+        // Backoff for the asynchronous WAL-upload drain and the idle
+        // checkpoint beats: zero while healthy (work eagerly between
+        // events), one second after a failure so a persistently-unreachable
+        // bucket cannot spin the loop.
         let mut upload_backoff = Duration::ZERO;
+        let mut beat_backoff = Duration::ZERO;
         while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-            // While committed WAL awaits asynchronous upload, poll with the
-            // backoff timeout so the loop returns to drain it; otherwise block
-            // until the next event.
+            // While committed WAL awaits asynchronous upload or a checkpoint
+            // sweep is mid-flight, poll with the backoff timeout so the loop
+            // returns to that work; otherwise block until the next event.
             let timeout = if self.engine.has_pending_wal_upload() {
                 Some(upload_backoff)
+            } else if self.engine.checkpoint_sweep_active() {
+                Some(beat_backoff)
             } else {
                 None
             };
@@ -268,10 +272,21 @@ impl Server {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
             }
-            // Upload committed WAL offset the commit path so request handling and
-            // S3 latency never gate each other; back offset if the bucket errors.
+            // Upload committed WAL off the commit path so request handling and
+            // S3 latency never gate each other; back off if the bucket errors.
             if self.engine.has_pending_wal_upload() {
                 upload_backoff = if self.engine.drain_wal_upload() {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                };
+            }
+            // An active checkpoint sweep advances even on an idle server —
+            // a trigger must not wait for the next client message to finish
+            // what it started. One beat per loop turn, backing off when the
+            // bucket errors.
+            if self.engine.checkpoint_sweep_active() {
+                beat_backoff = if self.engine.maybe_checkpoint() {
                     Duration::ZERO
                 } else {
                     Duration::from_secs(1)

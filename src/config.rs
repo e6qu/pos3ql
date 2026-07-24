@@ -79,13 +79,15 @@ pub struct Config {
     /// virtual bucket allocates freely and exists for simulation tests).
     pub s3_sim: bool,
     /// Upload committed WAL batches to the bucket (backup / RPO). Requires
-    /// s3 = on. By default the upload is asynchronous: a commit is durable on
-    /// local disk (fsync) immediately and the S3 upload is drained off the
-    /// commit path, so commit latency never includes the S3 round-trip.
+    /// s3 = on, and defaults on with it — the local disk is a cache, so an
+    /// acknowledged commit must not live only there. Set off explicitly for
+    /// the asynchronous-only or bucket-as-backup postures.
     pub wal_upload: bool,
     /// Make WAL upload synchronous: a commit blocks until its batch is in the
     /// bucket (RPO=0 against total local-disk loss), at the cost of S3 latency
-    /// on every commit. Off by default (asynchronous). Requires wal_upload.
+    /// on every commit. Defaults on when s3 and wal_upload are on
+    /// (commit-durable-on-bucket, the plan of record); set off explicitly to
+    /// trade the tail of durability for local-fsync commit latency.
     pub wal_upload_sync: bool,
     /// Accumulation buffer for asynchronous WAL upload. Commits batch into it
     /// between drains; when it fills, a commit drains synchronously
@@ -288,6 +290,19 @@ impl Config {
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
+        // Commit-durable-on-bucket is the default whenever object storage is
+        // on: a database whose disk is a mere cache must not quietly leave
+        // acknowledged commits living only on that disk. An explicit
+        // `wal_upload = off` / `wal_upload_sync = off` still wins — the
+        // opt-out is a stated choice, never an accident of omission.
+        if config.s3_on {
+            if !seen.iter().any(|s| s == "wal_upload") {
+                config.wal_upload = true;
+            }
+            if config.wal_upload && !seen.iter().any(|s| s == "wal_upload_sync") {
+                config.wal_upload_sync = true;
+            }
+        }
         Ok(config)
     }
 
@@ -453,6 +468,23 @@ sql_arena_bytes = 4096
         let err = Config::parse("memtable_bytes = 1MiB\nmemtable_bytes = 2MiB\n").unwrap_err();
         assert_eq!(err.line, 2);
         assert!(err.message.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn s3_on_defaults_to_commit_durable_on_bucket() {
+        let c = Config::parse("s3 = on\n").unwrap();
+        assert!(c.wal_upload && c.wal_upload_sync, "the plan-of-record default");
+        // Explicit settings win over the resolved defaults.
+        let c = Config::parse("s3 = on\nwal_upload = off\n").unwrap();
+        assert!(!c.wal_upload && !c.wal_upload_sync);
+        let c = Config::parse("s3 = on\nwal_upload_sync = off\n").unwrap();
+        assert!(c.wal_upload && !c.wal_upload_sync, "async upload, stated");
+        // Without object storage nothing is implied.
+        let c = Config::parse("").unwrap();
+        assert!(!c.s3_on && !c.wal_upload && !c.wal_upload_sync);
+        // The simulator mode is object storage too.
+        let c = Config::parse("s3 = sim\n").unwrap();
+        assert!(c.s3_sim && c.wal_upload && c.wal_upload_sync);
     }
 
     #[test]

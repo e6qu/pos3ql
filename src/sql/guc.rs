@@ -419,7 +419,7 @@ impl GucState {
     }
 }
 
-/// Parses a PostgreSQL boolean GUC value (on/offset/true/false/1/0), allocation-free.
+/// Parses a PostgreSQL boolean GUC value (on/off/true/false/1/0), allocation-free.
 fn parse_on_off(v: &str) -> Option<bool> {
     if ["on", "true", "yes", "1"].iter().any(|s| v.eq_ignore_ascii_case(s)) {
         Some(true)

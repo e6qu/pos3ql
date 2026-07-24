@@ -72,6 +72,9 @@ s3_prefix = run-$$/
 s3_access_key = minioadmin
 s3_secret_key = minioadmin
 wal_upload = on
+# The asynchronous posture, stated: this suite's async-WAL step tests the
+# drain path, and s3 = on now defaults to synchronous upload.
+wal_upload_sync = off
 sql_arena_bytes = 4MiB
 wal_buffer_bytes = 4MiB
 max_tables = 64
@@ -194,7 +197,8 @@ out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(*) FROM 
 [[ "$out" == "2" ]] && ok "kill -9 recovery" || bad "kill -9 recovery: '$out'"
 
 step "async WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WAL"
-# wal_upload = on with the default asynchronous drain. Commit without any
+# wal_upload = on with the asynchronous drain stated (wal_upload_sync = off —
+# synchronous is the default now). Commit without any
 # CHECKPOINT, then destroy the local disk: recovery must come entirely from the
 # WAL segments the async drain uploaded to MinIO. A trailing SELECT plus a short
 # pause guarantees the event loop has drained the commit's segment to the bucket.
@@ -218,6 +222,44 @@ for i in {1..50}; do
 done
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
 [[ "$out" == "async-a,async-b,async-c|600" ]] && ok "async WAL upload recovers from MinIO (segments beyond the response buffer)" || bad "async WAL recovery: '$out'"
+
+step "commit-durable-on-bucket by default: ack, kill -9 at once, wipe, cold start"
+# A config that says nothing but `s3 = on` gets the plan-of-record posture:
+# the commit's segment is in the bucket before the acknowledgement, so the
+# kill needs no drain pause and the wiped-disk recovery needs no checkpoint.
+cat > "$WORK/rpo0.conf" <<EOF
+listen_addr = 127.0.0.1:$((PG_PORT + 2))
+data_dir = ${WORK}/rpo0-data
+s3 = on
+s3_endpoint = 127.0.0.1:${MINIO_PORT}
+s3_bucket = pos3ql-external
+s3_prefix = rpo0-$$/
+s3_access_key = minioadmin
+s3_secret_key = minioadmin
+EOF
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/rpo0.conf" > "$WORK/rpo0.log" 2>&1 &
+RPO0_PID=$!
+for i in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+"$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U ext -X -q \
+  -c "CREATE TABLE rpo0 (id int, v text)" \
+  -c "INSERT INTO rpo0 VALUES (1,'acked-then-killed'),(2,'still-here')"
+kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
+rm -rf "$WORK/rpo0-data"
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/rpo0.conf" >> "$WORK/rpo0.log" 2>&1 &
+RPO0_PID=$!
+for i in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U ext -X -t -A \
+  -c "SELECT string_agg(v, ',' ORDER BY id) FROM rpo0" 2>&1)
+kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
+[[ "$out" == "acked-then-killed,still-here" ]] \
+  && ok "commit-durable-on-bucket by default (no drain pause, no checkpoint)" \
+  || bad "commit-durable-on-bucket default: '$out'"
 
 step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CHECKPOINT"
@@ -429,6 +471,7 @@ s3_prefix = spilldiff-$$/
 s3_access_key = minioadmin
 s3_secret_key = minioadmin
 wal_upload = on
+wal_upload_sync = off
 work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then
     ok "forced-spill differential ($(grep -c '^PASS' "$WORK/spilldiff.out") corpora)"
   else

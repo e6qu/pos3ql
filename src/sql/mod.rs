@@ -26,7 +26,7 @@ pub mod timezone;
 pub mod tzif;
 pub mod cursor;
 
-use crate::checkpoint::{Checkpointer, CheckpointSetupError};
+use crate::checkpoint::{CheckpointStep, Checkpointer, CheckpointSetupError};
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
@@ -93,7 +93,7 @@ pub struct Engine {
     ckpt: Option<Checkpointer>,
     wal_upload: bool,
     /// When set, a commit blocks until its WAL batch is uploaded (RPO=0 to
-    /// S3). Otherwise the upload is drained offset the commit path.
+    /// S3). Otherwise the upload is drained off the commit path.
     wal_upload_sync: bool,
     /// Backpressure threshold: once this many bytes of committed WAL await
     /// asynchronous upload, the next commit drains synchronously.
@@ -518,11 +518,11 @@ impl Engine {
         self.wal_upload && !self.wal_upload_sync && self.wal.pending_batch_bytes() > 0
     }
 
-    /// Uploads the committed WAL batch awaiting asynchronous upload, offset the
+    /// Uploads the committed WAL batch awaiting asynchronous upload, off the
     /// commit path. Returns whether the drain succeeded (or had nothing to do);
     /// a failure is logged, not propagated — the data is already durable on
     /// local disk, so a bucket hiccup must not disturb request processing. The
-    /// caller backs offset before retrying so a persistently-down bucket does not
+    /// caller backs off before retrying so a persistently-down bucket does not
     /// spin the event loop.
     pub fn drain_wal_upload(&mut self) -> bool {
         if !self.has_pending_wal_upload() {
@@ -540,7 +540,9 @@ impl Engine {
     }
 
     /// Snapshots to object storage, then truncates the journal and compacts
-    /// the heap. `Ok(false)` = nothing to do.
+    /// the heap. The atomic form — drives the sliced checkpoint's beats to
+    /// completion in one call, for the explicit `CHECKPOINT` statement and
+    /// shutdown. `Ok(false)` = nothing to do.
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {
@@ -551,48 +553,88 @@ impl Engine {
         // Everything the snapshot will contain must be journal-durable
         // first, so an interrupted checkpoint never strands acked writes.
         self.wal.commit();
-        let lsn = self.storage.lsn();
-        let wrote = ckpt.checkpoint(&mut self.storage, &mut self.scratch)?;
-        if wrote {
-            self.storage.clear_dirty();
-            if self.wal_upload {
-                let _ = ckpt.prune_wal_segments(lsn);
+        match ckpt.checkpoint(&mut self.storage, &mut self.scratch)? {
+            Some(lsn) => {
+                self.after_publish(lsn)?;
+                Ok(true)
             }
-            self.wal.reset_after_checkpoint();
-            // The checkpoint installed each table's spill-SST list as it
-            // wrote (full rewrites collapse a list, deltas append).
-            self.storage.compact_heap(&mut self.compact_scratch)?;
-            // Under memory pressure, committed bytes leave the heap: the map
-            // entries flip to spilled and a second compaction drops the
-            // bytes. Reads fetch them back through the cache tiers. Below the
-            // threshold nothing spills and reads stay heap-fast.
-            if self.storage.spill_attached()
-                && self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
-            {
-                self.storage.evict_committed();
-                self.storage.compact_heap(&mut self.compact_scratch)?;
-            }
+            None => Ok(false),
         }
-        Ok(wrote)
     }
 
-    /// Auto-checkpoint when the heap or journal is filling up. Called after
-    /// each query message; failures are reported on stderr and retried on
-    /// the next message rather than failing unrelated statements.
-    pub fn maybe_checkpoint(&mut self) {
-        if self.ckpt.is_none() {
-            return;
+    /// The journal and heap bookkeeping owed once a manifest has published:
+    /// everything at or below `lsn` is bucket-durable, so the local journal
+    /// restarts and the heap compacts (spilling under memory pressure).
+    fn after_publish(&mut self, lsn: u64) -> Result<(), SqlError> {
+        self.storage.clear_dirty();
+        if self.wal_upload
+            && let Some(ckpt) = self.ckpt.as_mut() {
+                let _ = ckpt.prune_wal_segments(lsn);
+            }
+        self.wal.reset_after_checkpoint();
+        // The checkpoint installed each table's spill-SST list as it
+        // wrote (full rewrites collapse a list, deltas append).
+        self.storage.compact_heap(&mut self.compact_scratch)?;
+        // Under memory pressure, committed bytes leave the heap: the map
+        // entries flip to spilled and a second compaction drops the
+        // bytes. Reads fetch them back through the cache tiers. Below the
+        // threshold nothing spills and reads stay heap-fast.
+        if self.storage.spill_attached()
+            && self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
+        {
+            self.storage.evict_committed();
+            self.storage.compact_heap(&mut self.compact_scratch)?;
         }
+        Ok(())
+    }
+
+    /// Whether a checkpoint sweep is mid-flight — the event loop keeps
+    /// beating an active sweep between events, so an idle server still
+    /// finishes what a trigger started.
+    pub fn checkpoint_sweep_active(&self) -> bool {
+        self.ckpt.as_ref().is_some_and(|c| c.sweep_active())
+    }
+
+    /// One checkpoint beat: a trigger (heap or journal filling) starts a
+    /// sweep, and an active sweep advances one slice per call until its
+    /// manifest publishes — so a checkpoint never stalls the connections for
+    /// its whole duration, only for one table's write. Called after each
+    /// query message and by the idle event loop. Failures are reported on
+    /// stderr and the beat retried rather than failing unrelated statements;
+    /// the return is false on a failed beat so the idle driver can back off
+    /// a persistently-down bucket.
+    pub fn maybe_checkpoint(&mut self) -> bool {
+        let Some(ckpt) = self.ckpt.as_mut() else {
+            return true;
+        };
         let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
-        if (heap_full || wal_full)
-            && let Err(e) = self.checkpoint() {
+        if !(ckpt.sweep_active() || heap_full || wal_full) {
+            return true;
+        }
+        self.wal.commit();
+        match ckpt.checkpoint_step(&mut self.storage, &mut self.scratch) {
+            Ok(CheckpointStep::Published { lsn }) => {
+                if let Err(e) = self.after_publish(lsn) {
+                    eprintln!(
+                        "pos3ql: post-checkpoint bookkeeping failed ({}): {}",
+                        e.sqlstate,
+                        e.message.as_str()
+                    );
+                    return false;
+                }
+                true
+            }
+            Ok(_) => true,
+            Err(e) => {
                 eprintln!(
                     "pos3ql: auto-checkpoint failed ({}): {}",
                     e.sqlstate,
                     e.message.as_str()
                 );
+                false
             }
+        }
     }
 
     /// Executes a simple-query string (possibly several statements).

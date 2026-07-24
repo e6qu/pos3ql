@@ -582,7 +582,7 @@ fn pattern_prefers_longest(pat: &str) -> bool {
     true
 }
 
-/// Splits offset the first atom of `pat`: a single char, `.`, an escaped char, or
+/// Splits off the first atom of `pat`: a single char, `.`, an escaped char, or
 /// a `[...]` class.
 fn take_atom(pat: &str) -> (&str, &str) {
     let b = pat.as_bytes();

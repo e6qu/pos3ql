@@ -526,6 +526,13 @@ pub struct Table {
     pub pending_ddl: Option<PendingDdl>,
     /// Changed since the last checkpoint (drives delta checkpoints).
     pub dirty: bool,
+    /// Bumped on every committed change ([`Table::mark_dirty`], the one
+    /// place `dirty` may be set). The sliced checkpoint compares it against
+    /// the generation it captured when it wrote the table's SSTs, so a
+    /// table that changed after its slice is re-sliced before the manifest
+    /// publishes — the bug class this kills is a snapshot quietly missing
+    /// writes that landed between beats.
+    pub generation: u64,
     /// Per-column sequence state for serial/identity columns: the last value
     /// a *default* assignment handed out. PostgreSQL's sequence, not a max
     /// scan — explicit inserts do not advance it, deletes and TRUNCATE
@@ -568,6 +575,14 @@ pub struct PendingDdl {
 }
 
 impl Table {
+    /// The one place `dirty` is set: every committed change advances the
+    /// generation with it, so the sliced checkpoint can tell "dirty since
+    /// the last publish" from "dirty since my slice of this sweep".
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.generation += 1;
+    }
+
     /// Whether `txid` sees this table exist: its own pending CREATE/DROP,
     /// else the committed `live` baseline (another transaction's uncommitted
     /// DDL is invisible).
@@ -839,6 +854,7 @@ impl Storage {
                     live: false,
                     pending_ddl: None,
                     dirty: false,
+                    generation: 1,
                     serial_last: [0; MAX_COLUMNS],
                     serial_dirty: false,
                     spill_ssts: [None; MAX_SPILL_SSTS],
@@ -1742,7 +1758,7 @@ impl Storage {
         let table = &mut self.tables[table_index];
         if table.rows.remove(&rowid).is_some() {
             Self::record_tombstone(table, rowid);
-            table.dirty = true;
+            table.mark_dirty();
         }
     }
 
@@ -1762,7 +1778,7 @@ impl Storage {
                     // start resurrects the SST's version.
                     Self::record_tombstone(table, rowid);
                 }
-                table.dirty = true;
+                table.mark_dirty();
             }
             _ => {}
         }
@@ -1814,7 +1830,7 @@ impl Storage {
         table.rows.clear();
         table.live = pending.is_none();
         table.pending_ddl = pending;
-        table.dirty = true;
+        table.mark_dirty();
         // A reused slot must not inherit the dropped table's sequences or
         // spilled rows.
         table.serial_last = [0; MAX_COLUMNS];
@@ -1876,14 +1892,14 @@ impl Storage {
     pub fn drop_table(&mut self, index: usize) {
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
-        self.tables[index].dirty = true;
+        self.tables[index].mark_dirty();
     }
 
     /// Transactional drop: the table stays visible to every other transaction
     /// (committed baseline) until `txid` commits.
     pub fn drop_table_in(&mut self, index: usize, txid: u32) {
         self.tables[index].pending_ddl = Some(PendingDdl { txid, creating: false });
-        self.tables[index].dirty = true;
+        self.tables[index].mark_dirty();
     }
 
     /// Promotes an uncommitted CREATE to the committed image.
@@ -2270,7 +2286,7 @@ impl Storage {
         let old_schema = self.tables[index].def.schema;
         let name = self.tables[index].def.name;
         self.tables[index].def.schema = new_schema;
-        self.tables[index].dirty = true;
+        self.tables[index].mark_dirty();
         for x in self.indexes.iter_mut() {
             if x.live
                 && x.schema.as_str() == old_schema.as_str()
@@ -2294,7 +2310,7 @@ impl Storage {
                 }
             }
             if changed {
-                t.dirty = true;
+                t.mark_dirty();
             }
         }
     }
@@ -2310,7 +2326,7 @@ impl Storage {
             def.fkeys[f] = def.fkeys[f + 1];
         }
         def.n_fkeys -= 1;
-        self.tables[index].dirty = true;
+        self.tables[index].mark_dirty();
         Some(removed)
     }
 
@@ -2320,14 +2336,14 @@ impl Storage {
         if def.n_fkeys < MAX_FKEYS {
             def.fkeys[def.n_fkeys] = fk;
             def.n_fkeys += 1;
-            self.tables[index].dirty = true;
+            self.tables[index].mark_dirty();
         }
     }
 
     /// Replaces a table's definition in place (ALTER TABLE).
     pub fn set_table_def(&mut self, index: usize, def: TableDef) {
         self.tables[index].def = def;
-        self.tables[index].dirty = true;
+        self.tables[index].mark_dirty();
     }
 
     pub fn next_rowid(&mut self) -> u64 {

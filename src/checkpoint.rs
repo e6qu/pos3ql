@@ -129,6 +129,20 @@ pub(crate) struct Checkpointer {
     ref_scratch: Vec<StackStr<64>>,
     /// Pre-reserved scratch for GC / WAL-segment sweeps.
     doomed_scratch: Vec<StackStr<64>>,
+    /// Sliced-checkpoint sweep state: whether a sweep is mid-flight, the
+    /// table generation each slot's slice captured, and which slots were
+    /// sliced this sweep (a paced merge is paid at most once per sweep).
+    sweeping: bool,
+    sliced_generation: Vec<u64>,
+    sliced_this_sweep: Vec<bool>,
+}
+
+/// One beat's outcome: nothing to publish, a slice written, or the manifest
+/// published at `lsn`.
+pub(crate) enum CheckpointStep {
+    Idle,
+    Working,
+    Published { lsn: u64 },
 }
 
 /// Upper bounds reserved at startup so checkpoint-time bookkeeping never
@@ -343,6 +357,9 @@ impl Checkpointer {
             prev_scratch: Vec::with_capacity(MAX_CKPT_TABLES),
             ref_scratch: Vec::with_capacity(MAX_CKPT_TABLES),
             doomed_scratch: Vec::with_capacity(MAX_SWEEP_KEYS),
+            sweeping: false,
+            sliced_generation: vec![0; MAX_CKPT_TABLES],
+            sliced_this_sweep: vec![false; MAX_CKPT_TABLES],
         })
     }
 
@@ -972,7 +989,7 @@ impl Checkpointer {
             storage.observe_rowid(next_rowid - 1);
         }
         self.manifest_lsn = lsn;
-        Ok(lsn)
+Ok(lsn)
     }
 
     /// Rehydrates one block-grid SST in list order: rows install *spilled*
@@ -1115,22 +1132,101 @@ impl Checkpointer {
 
     /// Uploads a full snapshot and publishes it. The caller resets the WAL
     /// and compacts the heap afterwards. No-op when nothing changed.
+    /// The atomic form: drives beats to completion in one call — the
+    /// explicit `CHECKPOINT` statement and shutdown want to return only when
+    /// the manifest is published. Returns the published LSN, `None` when
+    /// there was nothing to do.
     pub(crate) fn checkpoint(
         &mut self,
         storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
-    ) -> Result<bool, SqlError> {
-        let lsn = storage.lsn();
-        if lsn == self.manifest_lsn && self.manifest_etag.is_some() {
-            return Ok(false);
+    ) -> Result<Option<u64>, SqlError> {
+        loop {
+            match self.checkpoint_step(storage, sort_scratch)? {
+                CheckpointStep::Idle => return Ok(None),
+                CheckpointStep::Working => continue,
+                CheckpointStep::Published { lsn } => return Ok(Some(lsn)),
+            }
         }
+    }
 
-        // Manifest is assembled as SSTs upload. Delta bookkeeping collects
-        // the new per-slot references and GC keep-set into pre-reserved
-        // scratch so this post-freeze path never allocates.
-        self.prev_scratch.clear();
+    /// Whether a sweep is mid-flight — once true, every beat advances it
+    /// until the manifest publishes, trigger conditions or not.
+    pub(crate) fn sweep_active(&self) -> bool {
+        self.sweeping
+    }
+
+    /// One beat of the sliced checkpoint: write one table's SSTs, or — when
+    /// every table's slice is current — publish the manifest. Between beats
+    /// the engine serves statements, so a checkpoint no longer stalls every
+    /// connection for its whole duration; consistency holds because a table
+    /// that changes after its slice ([`Table::mark_dirty`] bumps its
+    /// generation) is re-sliced before the publish, and the publish itself
+    /// runs only in a beat where no table has an outdated slice.
+    ///
+    /// A failed beat (an object-store error) leaves the sweep state where it
+    /// stands; the next beat retries the same work — block writes are
+    /// content-addressed, so a retry re-uploading the same bytes is free,
+    /// and a crash mid-sweep leaves only orphan blocks for the next
+    /// publish's garbage sweep.
+    pub(crate) fn checkpoint_step(
+        &mut self,
+        storage: &mut Storage,
+        sort_scratch: &mut FixedVec<(u64, RowHome)>,
+    ) -> Result<CheckpointStep, SqlError> {
+        if !self.sweeping {
+            let lsn = storage.lsn();
+            if lsn == self.manifest_lsn && self.manifest_etag.is_some() {
+                return Ok(CheckpointStep::Idle);
+            }
+            self.sweeping = true;
+            self.sliced_generation.iter_mut().for_each(|g| *g = 0);
+            self.sliced_this_sweep.iter_mut().for_each(|s| *s = false);
+            self.pending_installs.clear();
+        }
+        for slot in 0..storage.table_count().min(MAX_CKPT_TABLES) {
+            if !self.needs_slice(storage, slot) {
+                continue;
+            }
+            let generation = storage.table(slot).generation;
+            self.build_table_list(storage, sort_scratch, slot)?;
+            self.sliced_generation[slot] = generation;
+            self.sliced_this_sweep[slot] = true;
+return Ok(CheckpointStep::Working);
+        }
+        let lsn = storage.lsn();
+self.publish(storage, lsn)?;
+        self.sweeping = false;
+Ok(CheckpointStep::Published { lsn })
+    }
+
+    /// Whether `slot` still needs a slice this sweep: it changed since its
+    /// slice (or was never sliced while dirty), or its SST list is at the
+    /// merge trigger and this sweep has not yet paid its one paced merge.
+    fn needs_slice(&self, storage: &Storage, slot: usize) -> bool {
+        let table = storage.table(slot);
+        if !table.live {
+            return false;
+        }
+        if table.dirty && self.sliced_generation[slot] != table.generation {
+            return true;
+        }
+        let list_len = if self.sliced_this_sweep[slot] {
+            self.prev_scratch.get(slot).map_or(0, |l| l.n)
+        } else {
+            self.prev_ssts.get(slot).map_or(0, |l| l.n)
+        };
+        !self.sliced_this_sweep[slot] && list_len >= MERGE_TRIGGER
+    }
+
+    /// Assembles and publishes the manifest from the sweep's recorded
+    /// per-table lists, then installs the new spill state and sweeps
+    /// garbage. Runs only when no table has an outdated slice.
+    fn publish(&mut self, storage: &mut Storage, lsn: u64) -> Result<(), SqlError> {
+        // Delta bookkeeping collects the new per-slot references and GC
+        // keep-set into pre-reserved scratch so this post-freeze path never
+        // allocates.
         self.ref_scratch.clear();
-        self.pending_installs.clear();
         self.manifest_buf.clear();
         write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
         write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
@@ -1154,6 +1250,11 @@ impl Checkpointer {
         for slot in 0..storage.table_count() {
             let table = storage.table(slot);
             if !table.live {
+                // A dropped table's recorded list must not linger into the
+                // GC keep-set the swap below publishes.
+                if slot < self.prev_scratch.len() {
+                    self.prev_scratch[slot] = SlotList::EMPTY;
+                }
                 continue;
             }
             // Table + columns into the manifest.
@@ -1281,6 +1382,207 @@ impl Checkpointer {
                 )?;
             }
 
+            // A slot not sliced this sweep carries its published list
+            // forward untouched — the table is clean, so today's list is
+            // yesterday's. A sliced slot's list was recorded by its beat.
+            if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
+                self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
+            }
+            if !self.sliced_this_sweep.get(slot).copied().unwrap_or(false)
+                && slot < self.prev_scratch.len()
+            {
+                self.prev_scratch[slot] =
+                    self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
+            }
+            let new_list = self.prev_scratch.get(slot).copied().unwrap_or(SlotList::EMPTY);
+            for (idx, p) in new_list.iter().enumerate() {
+                let h = p.handle;
+                let (mut ih, mut fh, mut rh) = ([0u8; 64], [0u8; 64], [0u8; 64]);
+                h.index.write_key(&mut ih);
+                h.filter.write_key(&mut fh);
+                h.roster.write_key(&mut rh);
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "dsst {slot} {idx} {} {} {} {} {}",
+                        p.count,
+                        p.crc,
+                        core::str::from_utf8(&ih).expect("hex"),
+                        core::str::from_utf8(&fh).expect("hex"),
+                        core::str::from_utf8(&rh).expect("hex"),
+                    ),
+                )?;
+            }
+            if new_list.n == 0 {
+                // An empty table still records its (zero-row) state so the
+                // loader creates it.
+                write_manifest(&mut self.manifest_buf, format_args!("dsst {slot} 0 0 0 - - -"))?;
+            }
+        }
+        // Views: `vw2 <hex-SELECT> <hex-schema> <hex-creation-path> <hex-name>`
+        // (all hex, so every field survives the space-separated format; the
+        // loader still reads the older `view` line for old manifests).
+        for view in storage.live_views() {
+            use core::fmt::Write;
+            let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
+            for b in view.sql.as_str().as_bytes() {
+                let _ = write!(hex, "{b:02x}");
+            }
+            let mut hschema = StackStr::<130>::new();
+            for b in view.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{b:02x}");
+            }
+            let mut hpath = StackStr::<260>::new();
+            for b in view.creation_path.as_str().as_bytes() {
+                let _ = write!(hpath, "{b:02x}");
+            }
+            let mut hname = StackStr::<130>::new();
+            for b in view.name.as_str().as_bytes() {
+                let _ = write!(hname, "{b:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "vw2 {} {} {} {}",
+                    hex.as_str(),
+                    hschema.as_str(),
+                    hpath.as_str(),
+                    hname.as_str()
+                ),
+            )?;
+        }
+        // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
+        for index in storage.live_indexes() {
+            use core::fmt::Write;
+            let mut columns = StackStr::<128>::new();
+            for c in &index.columns[..index.n_cols] {
+                let _ = write!(columns, "{c} ");
+            }
+            let mut hex_name = StackStr::<130>::new();
+            for b in index.name.as_str().as_bytes() {
+                let _ = write!(hex_name, "{b:02x}");
+            }
+            let mut htable = StackStr::<130>::new();
+            for b in index.table.as_str().as_bytes() {
+                let _ = write!(htable, "{b:02x}");
+            }
+            let mut hschema = StackStr::<130>::new();
+            for b in index.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{b:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "idx {} {} {}{} {} {}",
+                    u8::from(index.unique),
+                    index.n_cols,
+                    columns.as_str(),
+                    hex_name.as_str(),
+                    htable.as_str(),
+                    hschema.as_str()
+                ),
+            )?;
+        }
+        write_manifest(&mut self.manifest_buf, "end")?;
+
+        // Publish via CAS.
+        let precondition = match &self.manifest_etag {
+            Some(etag) => Precondition::IfMatch(etag.as_str()),
+            None => Precondition::IfNoneMatchAny,
+        };
+        let etag = match self
+            .client
+            .put(MANIFEST_KEY, self.manifest_buf.readable(), precondition)
+        {
+            Ok(etag) => etag,
+            Err(e) if e.is_precondition_failed() => {
+                // A previous attempt's PUT may have landed with its response
+                // lost (the ambiguous failure): the bucket then holds
+                // exactly the bytes this retry carries, under an etag this
+                // process never learned. Recognize our own write before
+                // declaring another writer — without this, one ambiguous
+                // CAS wedges every future checkpoint on a stale etag.
+                let ours = self
+                    .client
+                    .get(MANIFEST_KEY, None)
+                    .map(|_| self.client.body_bytes() == self.manifest_buf.readable())
+                    .unwrap_or(false);
+                if !ours {
+                    return Err(sql_err!(
+                        SQLSTATE_CAS,
+                        "manifest compare-and-swap failed: another writer owns this bucket"
+                    ));
+                }
+                let refreshed = self.client.get(MANIFEST_KEY, None).map_err(s3_to_sql)?;
+                refreshed.etag
+            }
+            Err(e) => return Err(s3_to_sql(e)),
+        };
+        self.manifest_etag = Some(etag);
+        self.manifest_lsn = lsn;
+        std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
+        std::mem::swap(&mut self.referenced, &mut self.ref_scratch);
+        // The manifest is durable: install the new spill lists (a collapse
+        // remaps the table's spilled entries to slot 0) and forget the
+        // flushed tombstones. A failed CAS above reaches none of this, so a
+        // retry recomputes against unchanged state and the orphaned blocks
+        // are swept as garbage.
+        for &(slot, install) in &self.pending_installs {
+            match install {
+                SlotInstall::Append(h) => storage.append_spill(slot, h),
+                SlotInstall::Collapse(h) => storage.collapse_spill(slot, h),
+                SlotInstall::MergePair { at, handle } => {
+                    storage.merge_spill_pair(slot, at, handle)
+                }
+            }
+            storage.clear_tombstones(slot);
+        }
+        self.pending_installs.clear();
+        // The sweep is complete the instant the installs land: everything
+        // after the CAS is cleanup of the superseded generation. Marking it
+        // here (not in the caller) is load-bearing — a failure below must
+        // not leave the sweep active, because the swap above repurposed
+        // `prev_scratch`, and a retried publish reading it would CAS a
+        // manifest whose lsn claims state its lists do not carry, silently
+        // shadowing every local WAL record the lsn covers.
+        self.sweeping = false;
+
+        // GC: delete any SST under sst/ not referenced by the new manifest,
+        // then any block not on a live SST's roster. Advisory: a failure
+        // leaves orphans for the next publish's sweep (mark-and-sweep is
+        // idempotent), never a failed checkpoint — the checkpoint's promise
+        // was kept at the CAS.
+        if let Err(e) = self.collect_garbage() {
+            eprintln!(
+                "pos3ql: post-checkpoint garbage sweep failed ({}): {}",
+                e.sqlstate,
+                e.message.as_str()
+            );
+        }
+        if let Err(e) = self.collect_block_garbage() {
+            eprintln!(
+                "pos3ql: post-checkpoint block sweep failed ({}): {}",
+                e.sqlstate,
+                e.message.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    /// One beat's work for one table: computes its new SST list — carrying,
+    /// delta-flushing, fully rewriting, and paying at most one paced merge —
+    /// records it for the publish, and queues the storage installs that
+    /// apply only after the manifest CAS lands. A re-slice (the table
+    /// changed after an earlier beat of this sweep) recomputes from the
+    /// published base and replaces its queued installs.
+    fn build_table_list(
+        &mut self,
+        storage: &mut Storage,
+        sort_scratch: &mut FixedVec<(u64, RowHome)>,
+        slot: usize,
+    ) -> Result<(), SqlError> {
+        self.pending_installs.retain(|(s, _)| *s != slot);
+        let table = storage.table(slot);
             // A clean table carries its whole SST list forward untouched.
             let clean = !storage.table(slot).dirty
                 && self.prev_ssts.get(slot).is_some_and(|l| l.n > 0);
@@ -1436,146 +1738,13 @@ impl Checkpointer {
                 new_list
             };
 
-            if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
-                self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
-            }
-            for (idx, p) in new_list.iter().enumerate() {
-                let h = p.handle;
-                let (mut ih, mut fh, mut rh) = ([0u8; 64], [0u8; 64], [0u8; 64]);
-                h.index.write_key(&mut ih);
-                h.filter.write_key(&mut fh);
-                h.roster.write_key(&mut rh);
-                write_manifest(
-                    &mut self.manifest_buf,
-                    format_args!(
-                        "dsst {slot} {idx} {} {} {} {} {}",
-                        p.count,
-                        p.crc,
-                        core::str::from_utf8(&ih).expect("hex"),
-                        core::str::from_utf8(&fh).expect("hex"),
-                        core::str::from_utf8(&rh).expect("hex"),
-                    ),
-                )?;
-            }
-            if new_list.n == 0 {
-                // An empty table still records its (zero-row) state so the
-                // loader creates it.
-                write_manifest(&mut self.manifest_buf, format_args!("dsst {slot} 0 0 0 - - -"))?;
-            }
-            if slot < self.prev_scratch.len() {
-                self.prev_scratch[slot] = new_list;
-            }
+        if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
+            self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
         }
-        // Views: `vw2 <hex-SELECT> <hex-schema> <hex-creation-path> <hex-name>`
-        // (all hex, so every field survives the space-separated format; the
-        // loader still reads the older `view` line for old manifests).
-        for view in storage.live_views() {
-            use core::fmt::Write;
-            let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
-            for b in view.sql.as_str().as_bytes() {
-                let _ = write!(hex, "{b:02x}");
-            }
-            let mut hschema = StackStr::<130>::new();
-            for b in view.schema.as_str().as_bytes() {
-                let _ = write!(hschema, "{b:02x}");
-            }
-            let mut hpath = StackStr::<260>::new();
-            for b in view.creation_path.as_str().as_bytes() {
-                let _ = write!(hpath, "{b:02x}");
-            }
-            let mut hname = StackStr::<130>::new();
-            for b in view.name.as_str().as_bytes() {
-                let _ = write!(hname, "{b:02x}");
-            }
-            write_manifest(
-                &mut self.manifest_buf,
-                format_args!(
-                    "vw2 {} {} {} {}",
-                    hex.as_str(),
-                    hschema.as_str(),
-                    hpath.as_str(),
-                    hname.as_str()
-                ),
-            )?;
+        if slot < self.prev_scratch.len() {
+            self.prev_scratch[slot] = new_list;
         }
-        // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
-        for index in storage.live_indexes() {
-            use core::fmt::Write;
-            let mut columns = StackStr::<128>::new();
-            for c in &index.columns[..index.n_cols] {
-                let _ = write!(columns, "{c} ");
-            }
-            let mut hex_name = StackStr::<130>::new();
-            for b in index.name.as_str().as_bytes() {
-                let _ = write!(hex_name, "{b:02x}");
-            }
-            let mut htable = StackStr::<130>::new();
-            for b in index.table.as_str().as_bytes() {
-                let _ = write!(htable, "{b:02x}");
-            }
-            let mut hschema = StackStr::<130>::new();
-            for b in index.schema.as_str().as_bytes() {
-                let _ = write!(hschema, "{b:02x}");
-            }
-            write_manifest(
-                &mut self.manifest_buf,
-                format_args!(
-                    "idx {} {} {}{} {} {}",
-                    u8::from(index.unique),
-                    index.n_cols,
-                    columns.as_str(),
-                    hex_name.as_str(),
-                    htable.as_str(),
-                    hschema.as_str()
-                ),
-            )?;
-        }
-        write_manifest(&mut self.manifest_buf, "end")?;
-
-        // Publish via CAS.
-        let precondition = match &self.manifest_etag {
-            Some(etag) => Precondition::IfMatch(etag.as_str()),
-            None => Precondition::IfNoneMatchAny,
-        };
-        let etag = self
-            .client
-            .put(MANIFEST_KEY, self.manifest_buf.readable(), precondition)
-            .map_err(|e| {
-                if e.is_precondition_failed() {
-                    sql_err!(
-                        SQLSTATE_CAS,
-                        "manifest compare-and-swap failed: another writer owns this bucket"
-                    )
-                } else {
-                    s3_to_sql(e)
-                }
-            })?;
-        self.manifest_etag = Some(etag);
-        self.manifest_lsn = lsn;
-        std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
-        std::mem::swap(&mut self.referenced, &mut self.ref_scratch);
-        // The manifest is durable: install the new spill lists (a collapse
-        // remaps the table's spilled entries to slot 0) and forget the
-        // flushed tombstones. A failed CAS above reaches none of this, so a
-        // retry recomputes against unchanged state and the orphaned blocks
-        // are swept as garbage.
-        for &(slot, install) in &self.pending_installs {
-            match install {
-                SlotInstall::Append(h) => storage.append_spill(slot, h),
-                SlotInstall::Collapse(h) => storage.collapse_spill(slot, h),
-                SlotInstall::MergePair { at, handle } => {
-                    storage.merge_spill_pair(slot, at, handle)
-                }
-            }
-            storage.clear_tombstones(slot);
-        }
-        self.pending_installs.clear();
-
-        // GC: delete any SST under sst/ not referenced by the new manifest,
-        // then any block not on a live SST's roster.
-        self.collect_garbage()?;
-        self.collect_block_garbage()?;
-        Ok(true)
+        Ok(())
     }
 
     /// Mark-and-sweep over `blocks/`: the keep-set is every identity on the

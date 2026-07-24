@@ -328,6 +328,19 @@ pub(super) fn synth_derived_def<'a>(
                         }
                         SelectItem::RecordStar(base) => slot += record_star_width(base, &ss),
                         SelectItem::Expr { expression, .. } => {
+                            // A record-valued item registers its field shape;
+                            // the column's type_mod carries the handle so
+                            // later field access is typed statically.
+                            if slot < n
+                                && descriptors[slot].type_oid
+                                    == crate::sql::types::oid::RECORD
+                                && let Some(handle) = crate::sql::exec::register_shape_for(
+                                    expression,
+                                    &super::ScopeCols(&ss),
+                                )
+                            {
+                                descriptors[slot].type_mod = handle;
+                            }
                             if slot < n
                                 && descriptors[slot].type_oid == crate::sql::types::oid::TEXT
                                 && let Expr::Subquery(inner_sub) = &**expression
@@ -355,7 +368,25 @@ pub(super) fn synth_derived_def<'a>(
                 }
                 n
             }
-            None => describe_items(sub.items, None, &mut descriptors)?,
+            None => {
+                let n = describe_items(sub.items, None, &mut descriptors)?;
+                let mut slot = 0usize;
+                for item in sub.items {
+                    if let SelectItem::Expr { expression, .. } = item {
+                        if slot < n
+                            && descriptors[slot].type_oid == crate::sql::types::oid::RECORD
+                            && let Some(handle) = crate::sql::exec::register_shape_for(
+                                expression,
+                                &crate::sql::exec::NoCols,
+                            )
+                        {
+                            descriptors[slot].type_mod = handle;
+                        }
+                        slot += 1;
+                    }
+                }
+                n
+            }
         },
     };
     if n_cols > MAX_COLUMNS {

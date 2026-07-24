@@ -129,10 +129,49 @@ fn describe_record_star<'q>(
             }
             Ok(())
         }
-        _ => Err(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "row expansion is not supported on this expression"
-        )),
+        // A record-typed column (or nested record field) with a registered
+        // shape expands to its fields. Names come from static leases (fN,
+        // key/value); a shape whose names this cannot cover refuses loudly.
+        _ => {
+            let resolver: &dyn ColTypeResolver = match def {
+                Some(d) => &DefCols(d),
+                None => &NoCols,
+            };
+            let Some(handle) = expr_record_handle(base, resolver) else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                ));
+            };
+            let mut push_err = None;
+            visit_record_shape(handle, |field_name, ctype| {
+                if push_err.is_some() {
+                    return;
+                }
+                let leased = RECORD_FIELD_NAMES
+                    .iter()
+                    .chain(["key", "value"].iter())
+                    .find(|n| n.eq_ignore_ascii_case(field_name))
+                    .copied();
+                match leased {
+                    Some(name) => {
+                        if let Err(e) = push(ColDesc::of_type(name, ctype)) {
+                            push_err = Some(e);
+                        }
+                    }
+                    None => {
+                        push_err = Some(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "row expansion of this record's field names is not supported here"
+                        ))
+                    }
+                }
+            });
+            match push_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
     }
 }
 
@@ -167,6 +206,7 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::TSTZMULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Tstz),
         oid::BIT => ColType::Bit { varying: false },
         oid::VARBIT => ColType::Bit { varying: true },
+        oid::RECORD => ColType::Record,
         // `"char"` (internal single-byte) appears in catalog columns; treat it
         // as text so catalog-derived tables describe.
         18 => ColType::Text,
@@ -252,7 +292,7 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
-        Expr::Column { name, .. } => Some(name),
+        Expr::Column { name, .. } | Expr::SchemaColumn { name, .. } => Some(name),
         // The desugarings of syntax-only constructs must not be labelled with
         // the internal name they carry: `SIMILAR TO` is an operator, so its
         // column is anonymous, while PostgreSQL does label OVERLAPS.
@@ -340,6 +380,257 @@ pub trait ColTypeResolver {
     fn table_columns(&self, _name: &str) -> Option<&[ColumnMeta]> {
         None
     }
+
+    /// The registered shape handle of a record-typed *column* (a derived
+    /// table's `type_mod` carries it), or None when the column is not a
+    /// record or has no shape.
+    fn record_column_handle(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
+        None
+    }
+
+    /// The real schema of the unaliased base table exposed as `table`, for
+    /// validating a three-part `schema.table.column` reference. None when no
+    /// such entry (or no schema) exists.
+    fn table_schema(&self, _table: &str) -> Option<&str> {
+        None
+    }
+}
+
+/// One field of a registered record shape (see [`register_record_shape`]).
+#[derive(Clone, Copy)]
+pub(crate) struct RecordShapeField {
+    pub name: crate::util::StackStr<64>,
+    pub ctype: ColType,
+    /// Registry handle of a record-typed field's own shape, or -1.
+    pub nested: i32,
+}
+
+const MAX_SHAPE_FIELDS: usize = 16;
+const MAX_SHAPES: usize = 32;
+
+struct ShapePool {
+    fields: [[RecordShapeField; MAX_SHAPE_FIELDS]; MAX_SHAPES],
+    lens: [u8; MAX_SHAPES],
+    n: usize,
+}
+
+std::thread_local! {
+    /// Statement-scoped registry of record shapes: a derived table's
+    /// record-typed column stores a handle here (in its `type_mod`, which
+    /// records otherwise never use) so field access can be typed statically —
+    /// PostgreSQL knows the row type; this is our transient stand-in. Reset
+    /// at each statement start. Boxed, not inline: glibc places static TLS
+    /// inside each thread's stack allocation (the PR-114 stack overflow), so
+    /// TLS slots stay pointer-sized; the box is allocated by
+    /// [`init_record_shapes`] before the allocator freezes.
+    static RECORD_SHAPES: core::cell::RefCell<Option<Box<ShapePool>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+fn empty_shape_pool() -> Box<ShapePool> {
+    Box::new(ShapePool {
+        fields: [[RecordShapeField {
+            name: crate::util::StackStr::new(),
+            ctype: ColType::Record,
+            nested: -1,
+        }; MAX_SHAPE_FIELDS]; MAX_SHAPES],
+        lens: [0; MAX_SHAPES],
+        n: 0,
+    })
+}
+
+/// Allocates the shape pool; the server calls this at startup, before the
+/// allocator freezes. (Tests allocate lazily on first registration instead —
+/// their allocator never freezes.)
+pub fn init_record_shapes() {
+    RECORD_SHAPES.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.is_none() {
+            *p = Some(empty_shape_pool());
+        }
+    });
+}
+
+/// Clears the shape registry; the engine calls this per statement.
+pub fn reset_record_shapes() {
+    RECORD_SHAPES.with(|p| {
+        if let Some(pool) = p.borrow_mut().as_mut() {
+            pool.n = 0;
+        }
+    });
+}
+
+/// Registers a record shape, returning its handle, or None when the
+/// statement's pool is exhausted (the caller then leaves the column without
+/// a shape and field access fails loudly, never wrongly).
+pub(crate) fn register_record_shape(fields: &[RecordShapeField]) -> Option<i32> {
+    RECORD_SHAPES.with(|p| {
+        let mut p = p.borrow_mut();
+        let pool = p.get_or_insert_with(empty_shape_pool);
+        if pool.n == MAX_SHAPES || fields.len() > MAX_SHAPE_FIELDS {
+            return None;
+        }
+        let at = pool.n;
+        pool.fields[at][..fields.len()].copy_from_slice(fields);
+        pool.lens[at] = fields.len() as u8;
+        pool.n += 1;
+        Some(at as i32)
+    })
+}
+
+/// Looks up one field of a registered shape by (case-insensitive) name.
+pub(crate) fn record_shape_field(handle: i32, field: &str) -> Option<(ColType, i32)> {
+    RECORD_SHAPES.with(|p| {
+        let p = p.borrow();
+        let pool = p.as_ref()?;
+        let at = usize::try_from(handle).ok()?;
+        if at >= pool.n {
+            return None;
+        }
+        pool.fields[at][..pool.lens[at] as usize]
+            .iter()
+            .find(|f| f.name.as_str().eq_ignore_ascii_case(field))
+            .map(|f| (f.ctype, f.nested))
+    })
+}
+
+/// Visits every (name, type) of a registered shape.
+pub fn visit_record_shape(handle: i32, mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
+    RECORD_SHAPES.with(|p| {
+        let p = p.borrow();
+        let pool = p.as_ref()?;
+        let at = usize::try_from(handle).ok()?;
+        if at >= pool.n {
+            return None;
+        }
+        for f in &pool.fields[at][..pool.lens[at] as usize] {
+            visit(f.name.as_str(), f.ctype);
+        }
+        Some(pool.lens[at] as usize)
+    })
+}
+
+/// The shape handle of a record-valued expression, when one is registered: a
+/// record-typed column carries it in its type modifier, and a field of such a
+/// column may itself be a nested record.
+pub fn expr_record_handle(base: &Expr, columns: &dyn ColTypeResolver) -> Option<i32> {
+    match base {
+        Expr::Column { qualifier, name } => {
+            if columns.is_whole_row(name) {
+                return None;
+            }
+            let handle = columns.record_column_handle(*qualifier, name)?;
+            (handle >= 0).then_some(handle)
+        }
+        Expr::Field { base: inner, field } => {
+            if let Some(parent) = expr_record_handle(inner, columns) {
+                let (ctype, nested) = record_shape_field(parent, field)?;
+                return (ctype == ColType::Record && nested >= 0).then_some(nested);
+            }
+            // A record-typed column reached through its table's whole row
+            // (`(v).r` where `r` is a record column of `v`).
+            let table = match inner {
+                Expr::WholeRow(table) => table,
+                Expr::Column { qualifier: None, name } if columns.is_whole_row(name) => name,
+                _ => return None,
+            };
+            let column = columns
+                .table_columns(table)?
+                .iter()
+                .find(|c| c.name.as_str().eq_ignore_ascii_case(field))?;
+            (column.ctype == ColType::Record && column.type_mod >= 0)
+                .then_some(column.type_mod)
+        }
+        _ => None,
+    }
+}
+
+/// Registers the shape of a record-valued select item, so a derived table's
+/// record column can carry it (in `type_mod`) for later field access. A
+/// record column propagates its existing handle; a `ROW(...)` derives one
+/// from its arguments (nested rows recursively); a whole-row reference takes
+/// its table's columns; the `json_each` family its declared pair. None when
+/// no static shape exists (field access then fails loudly, never wrongly).
+pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<i32> {
+    if let Some(handle) = expr_record_handle(expr, columns) {
+        return Some(handle);
+    }
+    let mut fields = [RecordShapeField {
+        name: crate::util::StackStr::new(),
+        ctype: ColType::Record,
+        nested: -1,
+    }; MAX_SHAPE_FIELDS];
+    let mut n = 0usize;
+    match expr {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+            if args.len() > MAX_SHAPE_FIELDS {
+                return None;
+            }
+            for (i, arg) in args.iter().enumerate() {
+                let type_oid = infer_type_res(arg, columns).ok()?.0;
+                let ctype = if type_oid == oid::UNKNOWN {
+                    ColType::Text
+                } else {
+                    coltype_of_oid(type_oid)?
+                };
+                // A nested ROW(...) is an *anonymous* record even inside a
+                // named shape — PostgreSQL refuses its fields — while a
+                // nested whole-row or record column keeps its named type.
+                let anonymous_nested =
+                    matches!(arg, Expr::Call { name, .. } if name.eq_ignore_ascii_case("row"));
+                let nested = if ctype == ColType::Record && !anonymous_nested {
+                    register_shape_for(arg, columns)?
+                } else {
+                    -1
+                };
+                let mut field_name = crate::util::StackStr::new();
+                let _ = core::fmt::Write::write_str(&mut field_name, RECORD_FIELD_NAMES[i]);
+                fields[i] = RecordShapeField { name: field_name, ctype, nested };
+                n += 1;
+            }
+        }
+        Expr::Call { name, .. } if json_each_value_type(name).is_some() => {
+            let mut key = crate::util::StackStr::new();
+            let _ = core::fmt::Write::write_str(&mut key, "key");
+            let mut value = crate::util::StackStr::new();
+            let _ = core::fmt::Write::write_str(&mut value, "value");
+            fields[0] = RecordShapeField { name: key, ctype: ColType::Text, nested: -1 };
+            fields[1] = RecordShapeField {
+                name: value,
+                ctype: json_each_value_type(name)?,
+                nested: -1,
+            };
+            n = 2;
+        }
+        Expr::WholeRow(table) => {
+            let cols = columns.table_columns(table)?;
+            if cols.len() > MAX_SHAPE_FIELDS {
+                return None;
+            }
+            for (i, c) in cols.iter().enumerate() {
+                let mut field_name = crate::util::StackStr::new();
+                let _ = core::fmt::Write::write_str(&mut field_name, c.name.as_str());
+                fields[i] =
+                    RecordShapeField { name: field_name, ctype: c.ctype, nested: -1 };
+                n += 1;
+            }
+        }
+        Expr::Column { qualifier: None, name } if columns.is_whole_row(name) => {
+            let cols = columns.table_columns(name)?;
+            if cols.len() > MAX_SHAPE_FIELDS {
+                return None;
+            }
+            for (i, c) in cols.iter().enumerate() {
+                let mut field_name = crate::util::StackStr::new();
+                let _ = core::fmt::Write::write_str(&mut field_name, c.name.as_str());
+                fields[i] =
+                    RecordShapeField { name: field_name, ctype: c.ctype, nested: -1 };
+                n += 1;
+            }
+        }
+        _ => return None,
+    }
+    register_record_shape(&fields[..n])
 }
 
 /// Static field names PostgreSQL assigns an anonymous record (`ROW(...)`):
@@ -396,6 +687,13 @@ pub fn record_shape(
             Some(2)
         }
         Expr::WholeRow(table) => shape_from_columns(columns.table_columns(table)?, visit),
+        // A record-typed column (or a record field of one) with a registered
+        // shape exposes its fields for selection and star expansion.
+        Expr::Column { .. } | Expr::Field { .. }
+            if expr_record_handle(base, columns).is_some() =>
+        {
+            visit_record_shape(expr_record_handle(base, columns)?, visit)
+        }
         Expr::Column { qualifier: None, name } if columns.is_whole_row(name) => {
             shape_from_columns(columns.table_columns(name)?, visit)
         }
@@ -472,13 +770,22 @@ pub fn record_field_type(
         return Err(not_composite(field, type_name));
     }
     found.ok_or_else(|| match base {
-        // A whole-row reference names the missing column with its table.
-        Expr::WholeRow(table) | Expr::Column { qualifier: None, name: table } => sql_err!(
+        // A whole-row reference names the missing column with its table; a
+        // record-typed *column* keeps the anonymous-record wording.
+        Expr::WholeRow(table) => sql_err!(
             sqlstate::UNDEFINED_COLUMN,
             "column {}.{} does not exist",
             table,
             field
         ),
+        Expr::Column { qualifier: None, name: table } if columns.is_whole_row(table) => {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column {}.{} does not exist",
+                table,
+                field
+            )
+        }
         _ => could_not_identify(field),
     })
 }
@@ -524,6 +831,17 @@ impl ColTypeResolver for DefCols<'_> {
             Some(i) => Ok(self.0.columns()[i].ctype),
             None => Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name)),
         }
+    }
+
+    fn record_column_handle(&self, _qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let i = self.0.column_index(name)?;
+        let column = &self.0.columns()[i];
+        (column.ctype == ColType::Record).then_some(column.type_mod)
+    }
+
+    fn table_schema(&self, table: &str) -> Option<&str> {
+        (self.0.name.as_str() == table && !self.0.schema.as_str().is_empty())
+            .then(|| self.0.schema.as_str())
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -637,6 +955,16 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             Some(ty) => of(ty),
             None => (oid::RECORD, -1),
         },
+        Expr::SchemaColumn { schema, table, name } => {
+            if columns.table_schema(table) != Some(schema) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    table
+                ));
+            }
+            of(columns.resolve(Some(table), name)?)
+        }
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {

@@ -936,6 +936,7 @@ impl Engine {
         // install this session's effective search path for the statement:
         // every name resolution below reads it from storage.
         let _ = eval::take_diagnostic();
+        exec::reset_record_shapes();
         eval::funcs::system::set_session_user(guc.session_user());
         let path =
             self.storage.compute_path(guc.search_path(), guc.session_user(), txn.txid);

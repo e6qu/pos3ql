@@ -581,6 +581,10 @@ pub enum Expr<'a> {
     /// only as a `count()` argument; anywhere else it is rejected at type
     /// analysis (record values are not first-class here).
     WholeRow(&'a str),
+    /// A three-part column reference `schema.table.column`: the qualifier
+    /// pair must match an unaliased FROM entry that really is that schema's
+    /// table (PostgreSQL's rule), then resolves like `table.column`.
+    SchemaColumn { schema: &'a str, table: &'a str, name: &'a str },
     /// `operand operator ANY/ALL (array)` — quantified comparison.
     AnyAll {
         operand: &'a Expr<'a>,
@@ -637,7 +641,7 @@ impl Expr<'_> {
         match self {
             Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
             | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) => true,
-            Expr::WholeRow(_) => false,
+            Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
             Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_)
             | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,

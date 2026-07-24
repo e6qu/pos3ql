@@ -39,6 +39,7 @@ fn run() -> Result<(), String> {
     // it must happen on this side of the freeze. Zone files themselves load
     // on demand into fixed pools.
     pos3ql::sql::tzif::init_catalog();
+    pos3ql::sql::exec::init_record_shapes();
 
     mem::guard::freeze();
     println!(

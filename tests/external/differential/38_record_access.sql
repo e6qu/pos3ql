@@ -55,3 +55,44 @@ WITH w AS (SELECT 7 AS q) SELECT (w).q FROM w;
 INSERT INTO rt VALUES (3, 'z') RETURNING (rt.*).b;
 
 DROP TABLE rt;
+
+-- Record-typed derived-table columns: selection, field access, ordering,
+-- distinctness, and nesting — the row type flows through the subquery.
+SELECT q FROM (SELECT ROW(1,'t'::text) AS q) s;
+SELECT (q).f1, (q).f2 FROM (SELECT ROW(1,'t'::text) AS q) s;
+SELECT pg_typeof((q).f1), pg_typeof((q).f2) FROM (SELECT ROW(1,'t'::text) AS q) s;
+SELECT (q).* FROM (SELECT ROW(1,'t'::text) AS q) s;
+SELECT (q).f1 + 1 FROM (SELECT ROW(1,2) AS q) s;
+SELECT (q).nosuch FROM (SELECT ROW(1,2) AS q) s;
+SELECT (c).key, (c).value FROM (SELECT json_each('{"k":5,"j":6}') AS c) sub ORDER BY 1;
+SELECT (c).* FROM (SELECT json_each('{"k":5}') AS c) sub;
+CREATE TABLE rt2(a int, b text);
+INSERT INTO rt2 VALUES (2,'y'),(1,'x');
+SELECT (v).r, ((v).r).a FROM (SELECT rt2 AS r FROM rt2) v ORDER BY 2;
+SELECT ((v).r).b FROM (SELECT rt2 AS r FROM rt2) v ORDER BY 1;
+SELECT q FROM (SELECT ROW(2,'b'::text) AS q UNION ALL SELECT ROW(1,'a'::text)) s ORDER BY q;
+SELECT DISTINCT q FROM (SELECT ROW(1,2) AS q UNION ALL SELECT ROW(1,2)) s;
+SELECT count(q) FROM (SELECT ROW(1,2) AS q) s;
+SELECT (q).f2.f1 FROM (SELECT ROW(1,ROW(2,3)) AS q) s;
+WITH w AS (SELECT ROW(9,'z'::text) AS q) SELECT (q).f1 FROM w;
+DROP TABLE rt2;
+
+-- Three-part column references: schema.table.column binds only to an
+-- unaliased FROM entry whose base table really is that schema's table.
+CREATE TABLE rt3(a int, b text);
+INSERT INTO rt3 VALUES (1,'x');
+SELECT public.rt3.a FROM rt3;
+SELECT public.rt3.a, rt3.b FROM public.rt3;
+SELECT nosuch.rt3.a FROM rt3;
+SELECT public.rt3.a FROM rt3 AS aliased;
+SELECT public.aliased.a FROM rt3 AS aliased;
+SELECT pg_catalog.rt3.a FROM rt3;
+SELECT public.rt3.a FROM rt3 WHERE public.rt3.b = 'x';
+SELECT public.rt3.a, count(*) FROM rt3 GROUP BY public.rt3.a;
+CREATE SCHEMA s3p;
+CREATE TABLE s3p.rt3(z int);
+INSERT INTO s3p.rt3 VALUES (7);
+SELECT s3p.rt3.z FROM s3p.rt3;
+SELECT public.rt3.a FROM s3p.rt3;
+DROP SCHEMA s3p CASCADE;
+DROP TABLE rt3;

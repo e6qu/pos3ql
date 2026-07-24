@@ -640,7 +640,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
     };
     match e {
         Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | BitLit(_) | Param(_)
-        | DefaultMarker | Column { .. } | WholeRow(_) => 0,
+        | DefaultMarker | Column { .. } | WholeRow(_) | SchemaColumn { .. } => 0,
         Unary { operator: crate::sql::ast::UnaryOp::Not, operand } => postpone_cost(operand, scope, arena),
         Unary { operand, .. } => postpone_cost(operand, scope, arena) + 2,
         IsNull { operand, .. } => postpone_cost(operand, scope, arena),

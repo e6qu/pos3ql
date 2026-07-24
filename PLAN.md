@@ -414,9 +414,13 @@ backs `current_user`), `ALTER TABLE ... SET SCHEMA`, multi-name DROP, views
 bound to their creation path, schema-aware catalogs, and additive WAL/manifest
 persistence proven across kill -9 replay and wiped-disk cold starts. The
 record-access half of B-071 turned out mostly stale; its real divergences from
-PostgreSQL's static-type binding closed as B-151, leaving record-typed
-derived-table columns (B-152) and three-part column references (B-153) as the
-recorded remainder.
+PostgreSQL's static-type binding closed as B-151. The remainder closed next:
+record-typed derived-table columns (B-152 — a structural tail on the projected
+encoding's record tag plus a statement-scoped shape registry standing in for
+PostgreSQL's composite-type catalog) and three-part column references (B-153 —
+`schema.table.column` binding only to an unaliased FROM entry of that schema,
+42P01 otherwise). Recorded gaps: same-named tables from two schemas in one
+FROM, and `schema.table.*` (B-154).
 
 ### Stage E — leveled compaction (background, paced, allocation-free)
 

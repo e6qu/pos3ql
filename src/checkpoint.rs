@@ -386,15 +386,48 @@ impl Checkpointer {
             let Ok(_first_lsn) = digits.parse::<u64>() else {
                 continue;
             };
-            self.client
-                .get(key, None)
-                .map_err(|e| CheckpointSetupError::S3(format!("get wal segment: {e}")))?;
-            let body = self.client.body_bytes();
-            // Records are the same framed format as the local journal.
-            let n = replay_segment_bytes(body, floor, &mut apply)
-                .map_err(CheckpointSetupError::Replay)?;
-            if n > last_lsn {
-                last_lsn = n;
+            // Ranged, buffer-sized windows: a segment is one committed WAL
+            // batch, whose size is bounded by wal_buffer_bytes — which may
+            // exceed the response buffer. An unranged GET would upload fine
+            // and then be unrecoverable at cold start (ResponseTooLarge), so
+            // the segment streams through the buffer instead; a partially
+            // fetched record re-fetches from its own start.
+            let mut offset = 0u64;
+            loop {
+                let to = offset + self.client.response_capacity() as u64 - 1;
+                match self.client.get(key, Some((offset, to))) {
+                    Ok(_) => {}
+                    // Past the end of the object: the segment is fully read.
+                    Err(crate::s3::S3Error::Status { code: 416, .. }) => break,
+                    Err(e) => {
+                        return Err(CheckpointSetupError::S3(format!("get wal segment: {e}")))
+                    }
+                }
+                let body = self.client.body_bytes();
+                if body.is_empty() {
+                    break;
+                }
+                // Records are the same framed format as the local journal.
+                let (n, consumed) = replay_segment_bytes(body, floor, &mut apply)
+                    .map_err(CheckpointSetupError::Replay)?;
+                if n > last_lsn {
+                    last_lsn = n;
+                }
+                if consumed == 0 {
+                    if body.len() < self.client.response_capacity() {
+                        // A trailing partial record (torn upload tail): the
+                        // local-journal replay rule — stop at the first
+                        // invalid record — applies here too.
+                        break;
+                    }
+                    return Err(CheckpointSetupError::S3(format!(
+                        "wal record in {key} exceeds s3_response_bytes; raise it past wal_buffer_bytes"
+                    )));
+                }
+                offset += consumed as u64;
+                if body.len() < self.client.response_capacity() {
+                    break;
+                }
             }
         }
         Ok(last_lsn)
@@ -1679,11 +1712,14 @@ fn s3_to_sql(e: S3Error) -> SqlError {
 /// Parses framed WAL records from an uploaded segment (same layout as the
 /// local journal: crc u32 | len u32 | lsn u64 | payload) and applies each
 /// with lsn > floor. Returns the highest LSN seen.
+/// Replays the complete records in `bytes`, returning (highest applied LSN,
+/// bytes consumed) — a trailing partial record is left for the caller's next
+/// window to re-fetch whole.
 fn replay_segment_bytes(
     bytes: &[u8],
     floor: u64,
     apply: &mut impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
-) -> Result<u64, SqlError> {
+) -> Result<(u64, usize), SqlError> {
     const HEADER_LEN: usize = 24;
     let mut at = 0usize;
     let mut last = floor;
@@ -1708,7 +1744,7 @@ fn replay_segment_bytes(
         }
         at += total;
     }
-    Ok(last)
+    Ok((last, at))
 }
 
 #[derive(Debug)]

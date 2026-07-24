@@ -501,6 +501,16 @@ extend `tests/minio_it.rs` into a provider matrix. **Risk:** TLS is the single
 dependency-policy exception; keep it isolated behind the trait so the core stays
 `libc`-only.
 
+**Status (2026-07-24): chunked decoding and streaming WAL-segment replay
+landed.** Chunked-transfer responses (hex-framed chunks with extensions and
+trailers) decode into the bounded response buffer, refusing loudly on
+overflow; and WAL-segment replay streams in ranged windows, closing a latent
+unrecoverability — a committed batch larger than `s3_response_bytes` uploaded
+fine but could never be replayed at cold start. run.sh proves the round trip
+with the response buffer shrunk below one batch. Remaining here: TLS and the
+provider trait (next), and multipart upload (no current producer exceeds a
+single PUT).
+
 ### Stage H — deterministic storage simulation (VOPR for the whole stack)
 
 Prove the above correct under adversarial faults — the TigerBeetle VOPR discipline,

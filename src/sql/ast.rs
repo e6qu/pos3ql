@@ -85,6 +85,17 @@ pub enum Stmt<'a> {
     },
     /// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT].
     DropSchema { names: &'a [&'a str], if_exists: bool, cascade: bool },
+    /// DECLARE name [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
+    /// `sql` is the raw SELECT text, materialized at DECLARE.
+    DeclareCursor { name: &'a str, scroll: bool, hold: bool, sql: &'a str },
+    /// FETCH/MOVE direction [FROM|IN] cursor. MOVE positions without rows.
+    FetchCursor {
+        name: &'a str,
+        motion: crate::sql::cursor::FetchMotion,
+        move_only: bool,
+    },
+    /// CLOSE cursor | CLOSE ALL (None).
+    CloseCursor(Option<&'a str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

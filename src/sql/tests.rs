@@ -46,7 +46,7 @@ fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8>
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut guc, &mut responder)
+        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder)
         .unwrap();
     buffer.readable().to_vec()
 }
@@ -56,6 +56,13 @@ fn test_pool(budget: &mut Budget) -> SqlPreparedPool {
     c.max_prepared = 4;
     c.prepared_bytes = 1024;
     SqlPreparedPool::new(&c, budget).unwrap()
+}
+
+fn test_cursors(budget: &mut Budget) -> crate::sql::cursor::CursorPool {
+    let mut c = Config::default_dev();
+    c.max_cursors = 2;
+    c.cursor_bytes = 16 * 1024;
+    crate::sql::cursor::CursorPool::new(&c, budget).unwrap()
 }
 
 fn message_types(bytes: &[u8]) -> Vec<u8> {
@@ -253,7 +260,7 @@ fn run_txn(
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut responder)
+        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder)
         .unwrap();
     String::from_utf8_lossy(buffer.readable()).to_string()
 }
@@ -1206,7 +1213,7 @@ fn run_with_txn_bytes(
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, txn, &mut pool, &mut guc, &mut responder)
+        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder)
         .unwrap();
     buffer.readable().to_vec()
 }

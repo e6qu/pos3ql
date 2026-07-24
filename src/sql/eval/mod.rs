@@ -83,6 +83,9 @@ pub mod sqlstate {
     pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
     pub const RESERVED_NAME: &str = "42939";
     pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
+    pub const DUPLICATE_CURSOR: &str = "42P03";
+    pub const UNDEFINED_CURSOR: &str = "34000";
+    pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
     pub const INVALID_SCHEMA_NAME: &str = "3F000";
     pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
     pub const UNDEFINED_OBJECT: &str = "42704";

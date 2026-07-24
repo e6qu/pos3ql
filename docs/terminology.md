@@ -216,6 +216,16 @@ vocabulary — with the meaning they carry in this codebase.
   everything it already made durable.
 - **roster** — one block per SST listing every block identity the SST
   comprises, so the garbage sweeper enumerates an SST with a single read.
+- **overlay (row map)** — the in-RAM `Table.rows` map after the "map
+  spills" step: it holds only pending changes, heap-resident rows, deletion
+  markers, and hot entries — an entry *shadows* whatever the spill list
+  holds for its rowid, and rows without entries are served from the bucket
+  by the merged walk and point probes, their states synthesized. Sized by
+  `table_rows`, which therefore bounds the working set, not the dataset.
+- **deletion marker** — an overlay entry with neither a committed nor a
+  pending image: a committed DELETE of a bucket-resident row leaves one to
+  shadow the spill list until the next publish's install writes the
+  tombstone into the SSTs themselves, at which point the markers purge.
 - **generation** (`Table::mark_dirty`) — a per-table counter bumped on
   every committed change; the sliced checkpoint compares it against the
   generation its slice captured, which is how a publish knows no table

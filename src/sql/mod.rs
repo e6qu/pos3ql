@@ -127,7 +127,7 @@ impl Engine {
                 // The checkpointer's fixed parts plus the spilled-row reader's
                 // two scratch sets.
                 Checkpointer::budget_bytes(config)
-                    + 2 * (2 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
+                    + crate::storage::SpillReader::budget_bytes()
             } else {
                 0
             }
@@ -235,7 +235,7 @@ impl Engine {
             if txn.touched()[..i].iter().any(|&(t, r, _)| t == table && r == rowid) {
                 continue;
             }
-            let Some(state) = self.storage.row_state(table as usize, rowid) else {
+            let Some(state) = self.storage.row_state(table as usize, rowid)? else {
                 continue;
             };
             let Some(p) = state.pending else { continue };
@@ -580,11 +580,16 @@ impl Engine {
         // bytes. Reads fetch them back through the cache tiers. Below the
         // threshold nothing spills and reads stay heap-fast.
         if self.storage.spill_attached()
-            && self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
+            && (self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
+                || self.storage.map_pressure())
         {
             self.storage.evict_committed();
             self.storage.compact_heap(&mut self.compact_scratch)?;
         }
+        // Map-occupancy pressure sheds redundant entries the same way heap
+        // pressure sheds bytes: the overlay keeps the working set, the
+        // bucket keeps the rows.
+        self.storage.evict_entries();
         Ok(())
     }
 

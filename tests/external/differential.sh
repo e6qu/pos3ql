@@ -45,15 +45,19 @@ SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
 "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC" \
   -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 
-# pos3ql (object storage off: this suite is pure SQL semantics).
+# pos3ql (object storage off by default: this suite is pure SQL semantics).
+# POS3QL_EXTRA_CONF appends config lines — the forced-spill mode runs the
+# same corpora with a deliberately tiny memtable over a real bucket, so
+# every query also exercises the spill/checkpoint/read-back path.
 cargo build --release -q || { bad build; exit 1; }
 cat > "$WORK/p3.conf" <<EOF
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
-s3 = off
+s3 = ${POS3QL_DIFF_S3:-off}
 max_tables = 64
 table_rows = 65536
-memtable_bytes = 256MiB
+memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
+${POS3QL_EXTRA_CONF:-}
 EOF
 # A leftover server on our port would silently answer the readiness probe
 # below and the whole run would test a stale binary. Refuse to start.

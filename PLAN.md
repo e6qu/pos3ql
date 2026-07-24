@@ -471,6 +471,16 @@ streamed blocks with bounded read-ahead), and the executor's scan path
 identical SI semantics whether data is in RAM or on the bucket; the *full differential
 suite is green with `memtable_bytes` shrunk tiny* — a powerful new forced-spill CI mode.
 
+**Status (2026-07-24): the forced-spill differential mode landed early** — the
+single-session half of the milestone needs no MVCC change, so it now runs as a
+standing run.sh step: the whole suite (43 corpora, the exact-error corpus, all
+3205 sqllogictest blocks) against a pos3ql with a 256 KiB memtable over MinIO,
+every query continuously spilling, checkpointing (paced merges included), and
+reading back through the cache tiers — green, with the bucket showing hundreds
+of content-addressed blocks written during the run. What remains of Stage F is
+the real multi-session prerequisite: LSN-keyed row versions and the
+snapshot-aware merge read.
+
 ### Stage G — S3 client hardening & multi-provider reach
 
 Make the client production-shaped and reach real clouds, not just MinIO. Loki abstracts

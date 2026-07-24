@@ -69,15 +69,6 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         self.scope.func_scalar_type(table).is_some()
     }
 
-    fn table_schema(&self, table: &str) -> Option<&str> {
-        let t = self.scope.table_index(table).ok()?;
-        let def = self.scope.defs[t]?;
-        // Only an unaliased base table: an alias hides the table name, and a
-        // derived table has no schema.
-        (self.scope.names[t] == def.name.as_str() && !def.schema.as_str().is_empty())
-            .then(|| def.schema.as_str())
-    }
-
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         let t = self.scope.table_index(table)?;
         match self.values[t] {
@@ -138,11 +129,6 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
-    fn table_schema(&self, table: &str) -> Option<&str> {
-        self.inner
-            .table_schema(table)
-            .or_else(|| self.outer.and_then(|o| o.table_schema(table)))
-    }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         match self.inner.whole_row_present(table) {

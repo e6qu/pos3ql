@@ -61,7 +61,8 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                let matches = def.is_some_and(|d| d.name.as_str() == *q);
+                let matches =
+                    def.is_some_and(|d| crate::sql::eval::qualifier_answers_single(d, q));
                 if !matches {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
@@ -388,12 +389,6 @@ pub trait ColTypeResolver {
         None
     }
 
-    /// The real schema of the unaliased base table exposed as `table`, for
-    /// validating a three-part `schema.table.column` reference. None when no
-    /// such entry (or no schema) exists.
-    fn table_schema(&self, _table: &str) -> Option<&str> {
-        None
-    }
 }
 
 /// One field of a registered record shape (see [`register_record_shape`]).
@@ -824,7 +819,7 @@ pub struct DefCols<'d>(pub &'d TableDef);
 impl ColTypeResolver for DefCols<'_> {
     fn resolve(&self, q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(q) = q
-            && q != self.0.name.as_str() {
+            && !crate::sql::eval::qualifier_answers_single(self.0, q) {
                 return Err(sql_err!(sqlstate::UNDEFINED_TABLE, "missing FROM-clause entry for table \"{}\"", q));
             }
         match self.0.column_index(name) {
@@ -839,10 +834,7 @@ impl ColTypeResolver for DefCols<'_> {
         (column.ctype == ColType::Record).then_some(column.type_mod)
     }
 
-    fn table_schema(&self, table: &str) -> Option<&str> {
-        (self.0.name.as_str() == table && !self.0.schema.as_str().is_empty())
-            .then(|| self.0.schema.as_str())
-    }
+
 
     fn is_whole_row(&self, name: &str) -> bool {
         name == self.0.name.as_str()
@@ -956,14 +948,14 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             None => (oid::RECORD, -1),
         },
         Expr::SchemaColumn { schema, table, name } => {
-            if columns.table_schema(table) != Some(schema) {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    table
-                ));
-            }
-            of(columns.resolve(Some(table), name)?)
+            // Composed-qualifier resolution, as the evaluator binds it: only
+            // an unaliased base table of that schema answers.
+            let mut composed = crate::util::StackStr::<130>::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut composed,
+                format_args!("{schema}.{table}"),
+            );
+            of(columns.resolve(Some(composed.as_str()), name)?)
         }
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),

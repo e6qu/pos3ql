@@ -96,3 +96,26 @@ SELECT s3p.rt3.z FROM s3p.rt3;
 SELECT public.rt3.a FROM s3p.rt3;
 DROP SCHEMA s3p CASCADE;
 DROP TABLE rt3;
+
+-- Same-named tables from two schemas in one FROM: bare references are
+-- ambiguous, three-part references (and schema.table.*) disambiguate, and
+-- true duplicates still refuse.
+CREATE SCHEMA d1; CREATE SCHEMA d2;
+CREATE TABLE d1.t(a int, b int); CREATE TABLE d2.t(a int, c int);
+INSERT INTO d1.t VALUES (1, 10); INSERT INTO d2.t VALUES (2, 20);
+SELECT d1.t.a, d2.t.a FROM d1.t, d2.t;
+SELECT t.a FROM d1.t, d2.t;
+SELECT a FROM d1.t, d2.t;
+SELECT b, c FROM d1.t, d2.t;
+SELECT d1.t.*, d2.t.c FROM d1.t, d2.t;
+SELECT t.* FROM d1.t, d2.t;
+SELECT * FROM d1.t, d2.t;
+SELECT * FROM d1.t, d1.t;
+SELECT * FROM d1.t, d2.t AS t;
+SELECT d1.t.* FROM d1.t;
+SELECT public.nosuch.a FROM d1.t;
+SELECT nosuch.t.a FROM d1.t;
+SELECT d1.t.a FROM d1.t JOIN d2.t ON d1.t.a < d2.t.a;
+SELECT d1.t.b, count(*) FROM d1.t, d2.t GROUP BY d1.t.b;
+SELECT d2.t.* FROM d1.t, d2.t WHERE d2.t.c = 20 ORDER BY d2.t.a;
+DROP SCHEMA d1, d2 CASCADE;

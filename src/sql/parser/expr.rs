@@ -692,8 +692,12 @@ impl<'a> Parser<'a> {
                     if self.peeked == Tok::Op(".") {
                         self.advance()?;
                         if self.peeked == Tok::Op("*") {
-                            return Err(self.err_here(
-                                "schema-qualified star expansion is not supported yet",
+                            self.advance()?;
+                            // `schema.table.*`: a whole-row reference under a
+                            // composed qualifier, which scope resolution binds
+                            // to the unaliased base table of that schema.
+                            return self.arena_expr(Expr::WholeRow(
+                                self.composed_qualifier(name, column)?,
                             ));
                         }
                         let third = self.any_ident("column name")?;
@@ -766,8 +770,9 @@ impl<'a> Parser<'a> {
                     if self.peeked == Tok::Op(".") {
                         self.advance()?;
                         if self.peeked == Tok::Op("*") {
-                            return Err(self.err_here(
-                                "schema-qualified star expansion is not supported yet",
+                            self.advance()?;
+                            return self.arena_expr(Expr::WholeRow(
+                                self.composed_qualifier(name, column)?,
                             ));
                         }
                         let third = self.any_ident("column name")?;

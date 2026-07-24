@@ -2395,12 +2395,6 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         }
     }
 
-    fn table_schema(&self, table: &str) -> Option<&str> {
-        let t = self.0.table_index(table).ok()?;
-        let def = self.0.defs[t]?;
-        (self.0.names[t] == def.name.as_str() && !def.schema.as_str().is_empty())
-            .then(|| def.schema.as_str())
-    }
 }
 
 /// The number of columns a `(base).*` record expansion contributes, or 0 when

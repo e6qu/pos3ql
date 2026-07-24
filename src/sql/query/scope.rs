@@ -439,12 +439,27 @@ impl<'d> QueryScope<'d> {
         };
         let def = &storage.table(slot).def;
         let exposed = alias.unwrap_or(def.name.as_str());
-        if self.names[..self.n].contains(&exposed) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_ALIAS,
-                "table name \"{}\" specified more than once",
-                exposed
-            ));
+        // Two same-named entries coexist only when both are *unaliased base
+        // tables of different schemas* (their references then need the
+        // three-part spelling); any other duplicate — aliases, the same
+        // table twice — is PostgreSQL's 42712.
+        for t in 0..self.n {
+            if self.names[t] != exposed {
+                continue;
+            }
+            let both_distinct_tables = alias.is_none()
+                && self.defs[t].is_some_and(|d| {
+                    self.slots[t] != usize::MAX
+                        && d.name.as_str() == exposed
+                        && d.schema.as_str() != def.schema.as_str()
+                });
+            if !both_distinct_tables {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_ALIAS,
+                    "table name \"{}\" specified more than once",
+                    exposed
+                ));
+            }
         }
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def);
@@ -726,9 +741,56 @@ impl<'d> QueryScope<'d> {
     }
 
     /// The scope index of the FROM item exposed as `name` (for `t.*`).
+    /// Whether entry `t` answers to qualifier `q`. A plain qualifier matches
+    /// the exposed name; a composed `schema.table` qualifier (a three-part
+    /// reference) matches only an unaliased base table of that schema.
+    fn entry_answers_to(&self, t: usize, q: &str) -> bool {
+        match q.split_once('.') {
+            None => self.names[t] == q,
+            Some((schema, table)) => {
+                let Some(def) = self.defs[t] else { return false };
+                self.names[t] == table
+                    && def.name.as_str() == table
+                    && def.schema.as_str() == schema
+            }
+        }
+    }
+
     pub fn table_index(&self, name: &str) -> Result<usize, SqlError> {
-        self.names[..self.n].iter().position(|n| *n == name).ok_or_else(|| {
-            sql_err!(sqlstate::UNDEFINED_TABLE, "missing FROM-clause entry for table \"{}\"", name)
+        let mut found = None;
+        for t in 0..self.n {
+            if self.entry_answers_to(t, name) {
+                if found.is_some() {
+                    // Two same-named tables from different schemas: a bare
+                    // reference cannot pick one, exactly as PostgreSQL.
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::AMBIGUOUS_ALIAS,
+                        "table reference \"{}\" is ambiguous",
+                        name
+                    ));
+                }
+                found = Some(t);
+            }
+        }
+        found.ok_or_else(|| match name.split_once('.') {
+            // A composed qualifier whose table name matches some entry is an
+            // *invalid* reference (wrong schema or an alias); one matching
+            // nothing is *missing* — PostgreSQL's two wordings.
+            Some((_, table)) if self.names[..self.n].contains(&table) => sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "invalid reference to FROM-clause entry for table \"{}\"",
+                table
+            ),
+            Some((_, table)) => sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                table
+            ),
+            None => sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                name
+            ),
         })
     }
 
@@ -752,13 +814,7 @@ impl<'d> QueryScope<'d> {
     ) -> Result<ResolvedColumn, SqlError> {
         match qualifier {
             Some(q) => {
-                let Some(t) = self.names[..self.n].iter().position(|n| *n == q) else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "missing FROM-clause entry for table \"{}\"",
-                        q
-                    ));
-                };
+                let t = self.table_index(q)?;
                 match self.defs[t].expect("resolved").column_index(name) {
                     Some(c) => Ok(ResolvedColumn::Table(t, c)),
                     None => Err(sql_err!(

@@ -1907,6 +1907,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `schema.table` composed into one arena string — the qualifier form a
+    /// three-part star (`schema.table.*`) resolves through.
+    pub(super) fn composed_qualifier(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<&'a str, ParseError> {
+        let text = crate::stack_format!(130, "{}.{}", schema, table);
+        self.arena
+            .alloc_str(text.as_str())
+            .map_err(|_| ParseError {
+                at: self.peek_at,
+                message: crate::stack_format!(96, "statement too large for SQL arena"),
+                sqlstate: crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            })
+    }
+
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {
         self.arena
             .alloc(e)

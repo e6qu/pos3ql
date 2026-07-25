@@ -1311,7 +1311,10 @@ pub fn create_index(
         };
         columns[i] = column_index as u16;
     }
-    let n_cols = columns.len();
+    // The written column list's length — not the fixed array's, whose
+    // padding would quietly widen the index's tuple (a UNIQUE index on (b)
+    // must not enforce uniqueness of (b, first-column) instead).
+    let n_cols = column_names.len();
     let sqlname = match SqlName::parse(name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),

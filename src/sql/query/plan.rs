@@ -220,56 +220,101 @@ pub(super) fn where_passes<'e, 'a>(
     Ok(true)
 }
 
-/// Folds `col IS NOT NULL` to TRUE and `col IS NULL` to FALSE for a column with
-/// a NOT NULL constraint, as PostgreSQL does using the constraint — so
-/// `WHERE x/0 = 1 OR id IS NOT NULL` (id NOT NULL) drops the erroring branch.
-/// Rewrites only the boolean spine (AND/OR/NOT/IS NULL); other nodes pass
-/// through, since an IS NULL test appears as a boolean operand.
+/// Reduces NullTests on NOT NULL columns exactly as far as PostgreSQL's
+/// planner does (verified against 18 with `EXPLAIN (VERBOSE)`): a top-level
+/// conjunct that *is* the bare test folds (`IS NULL` → FALSE, `IS NOT NULL`
+/// → TRUE), and a top-level conjunct that is an OR folds to TRUE when any
+/// arm of its (recursively flattened) OR spine is an `IS NOT NULL` on such
+/// a column — a constant-true arm makes the whole disjunction true. Nothing
+/// deeper is rewritten: a test inside a nested AND, or under NOT, stays for
+/// execution's left-to-right short circuit, because folding it changes
+/// which side effects fire — PostgreSQL keeps `ts IS NULL OR (x/0 = 1 AND
+/// id IS NULL)` erroring on the division, and so must we (a fuzzer caught
+/// the over-eager rewrite as a missing 22012).
 pub(super) fn fold_null<'a>(
     e: &'a Expr<'a>,
     scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    use crate::sql::ast::{BinaryOp, UnaryOp};
-    match e {
-        Expr::IsNull { operand: Expr::Column { qualifier, name }, negated }
-            if scope
+    use crate::sql::ast::BinaryOp;
+
+    fn not_null_test<'a>(e: &Expr<'a>, scope: &QueryScope<'a>) -> Option<bool> {
+        // Some(negated) when `e` is a NullTest on a provably NOT NULL plain
+        // column. A merged USING/NATURAL column can be null even over
+        // NOT NULL parts (outer-join null rows) — never a candidate.
+        if let Expr::IsNull { operand: Expr::Column { qualifier, name }, negated } = e
+            && scope
                 .find_column(*qualifier, name)
                 .ok()
                 .and_then(|entry| match entry {
                     ResolvedColumn::Table(t, c) => {
                         scope.defs[t].map(|d| d.columns()[c].not_null)
                     }
-                    // A merged USING/NATURAL column can be null even over
-                    // NOT NULL parts (outer-join null rows) — never fold.
                     ResolvedColumn::Merged(_) => None,
                 })
-                .unwrap_or(false) =>
+                .unwrap_or(false)
         {
-            Ok(&*arena.alloc(Expr::Bool(*negated)).map_err(|_| arena_full())?)
+            return Some(*negated);
         }
-        Expr::Binary { operator: operator @ (BinaryOp::And | BinaryOp::Or), left, right } => {
-            let (l, r) = (fold_null(left, scope, arena)?, fold_null(right, scope, arena)?);
-            if core::ptr::eq(l, *left) && core::ptr::eq(r, *right) {
-                Ok(e)
-            } else {
-                Ok(&*arena
-                    .alloc(Expr::Binary { operator: *operator, left: l, right: r })
-                    .map_err(|_| arena_full())?)
-            }
-        }
-        Expr::Unary { operator: UnaryOp::Not, operand } => {
-            let o = fold_null(operand, scope, arena)?;
-            if core::ptr::eq(o, *operand) {
-                Ok(e)
-            } else {
-                Ok(&*arena
-                    .alloc(Expr::Unary { operator: UnaryOp::Not, operand: o })
-                    .map_err(|_| arena_full())?)
-            }
-        }
-        _ => Ok(e),
+        None
     }
+
+    fn or_spine_has_true<'a>(e: &Expr<'a>, scope: &QueryScope<'a>) -> bool {
+        match e {
+            Expr::Binary { operator: BinaryOp::Or, left, right } => {
+                or_spine_has_true(left, scope) || or_spine_has_true(right, scope)
+            }
+            other => not_null_test(other, scope) == Some(true),
+        }
+    }
+
+    fn fold_conjunct<'a>(e: &'a Expr<'a>, scope: &QueryScope<'a>) -> Option<bool> {
+        if let Some(negated) = not_null_test(e, scope) {
+            return Some(negated); // IS NOT NULL → TRUE, IS NULL → FALSE
+        }
+        if matches!(e, Expr::Binary { operator: BinaryOp::Or, .. })
+            && or_spine_has_true(e, scope)
+        {
+            return Some(true);
+        }
+        None
+    }
+
+    // Walk the top-level AND spine only.
+    let mut conjuncts: [&Expr; MAX_CONJUNCTS] = [e; MAX_CONJUNCTS];
+    let mut n = 0;
+    if !flatten_and(e, &mut conjuncts, &mut n) {
+        return Ok(e);
+    }
+    let mut changed = false;
+    let mut kept: [&Expr; MAX_CONJUNCTS] = [e; MAX_CONJUNCTS];
+    let mut n_kept = 0;
+    for &c in &conjuncts[..n] {
+        match fold_conjunct(c, scope) {
+            Some(false) => {
+                // One constant-false conjunct falsifies the predicate.
+                return Ok(&*arena.alloc(Expr::Bool(false)).map_err(|_| arena_full())?);
+            }
+            Some(true) => changed = true, // dropped
+            None => {
+                kept[n_kept] = c;
+                n_kept += 1;
+            }
+        }
+    }
+    if !changed {
+        return Ok(e);
+    }
+    if n_kept == 0 {
+        return Ok(&*arena.alloc(Expr::Bool(true)).map_err(|_| arena_full())?);
+    }
+    let mut acc = kept[0];
+    for &c in &kept[1..n_kept] {
+        acc = arena
+            .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: c })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(acc)
 }
 
 /// Reorders a WHERE predicate's top-level AND conjuncts by PostgreSQL's
@@ -587,6 +632,37 @@ pub(super) fn simplify_qual<'a>(e: &'a Expr<'a>, arena: &'a Arena) -> Result<&'a
                 Expr::IsNull { operand: inner, negated } => arena
                     .alloc(Expr::IsNull { operand: inner, negated: !negated })
                     .map_err(|_| arena_full())?,
+                // A comparison flips to its negator, as PostgreSQL's
+                // `negate_clause` does (exact under three-valued logic:
+                // both sides yield NULL together). This is load-bearing for
+                // conjunct order: `NOT (x <> c)` becomes the equality
+                // `x = c`, which the equivalence-class routing re-appends
+                // after other conjuncts — a fuzzer caught the difference as
+                // an error firing on the wrong side of a reorder.
+                Expr::Binary {
+                    operator:
+                        operator @ (BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq),
+                    left,
+                    right,
+                } => {
+                    let negator = match operator {
+                        BinaryOp::Eq => BinaryOp::NotEq,
+                        BinaryOp::NotEq => BinaryOp::Eq,
+                        BinaryOp::Lt => BinaryOp::GtEq,
+                        BinaryOp::LtEq => BinaryOp::Gt,
+                        BinaryOp::Gt => BinaryOp::LtEq,
+                        BinaryOp::GtEq => BinaryOp::Lt,
+                        _ => unreachable!("matched comparisons only"),
+                    };
+                    arena
+                        .alloc(Expr::Binary { operator: negator, left, right })
+                        .map_err(|_| arena_full())?
+                }
                 _ => return Ok(e),
             };
             simplify_qual(negated, arena)

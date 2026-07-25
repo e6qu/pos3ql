@@ -928,6 +928,76 @@ impl<'a> Datum<'a> {
 
 /// Text-format rendering per PostgreSQL output conventions: booleans as
 /// `t`/`f`, floats via Rust's shortest-roundtrip formatting.
+/// PostgreSQL's `float8out`: shortest round-trip digits, fixed notation
+/// only while the decimal exponent lies in [-4, 15), scientific otherwise
+/// with a signed, at-least-two-digit exponent (`1e+15`, `1e-05`). Rust's
+/// `{}` never chooses scientific notation, so `1e300` printed as 301
+/// digits until a COPY-of-every-type corpus caught it.
+fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
+    if v.is_infinite() {
+        return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    if v.is_nan() {
+        return f.write_str("NaN");
+    }
+    // `{:e}` is the shortest round-trip form; reformat it under
+    // PostgreSQL's notation rule.
+    let mut sci = crate::util::StackStr::<64>::new();
+    let _ = write!(sci, "{v:e}");
+    let text = sci.as_str();
+    let (mantissa, exp_text) = text.split_once('e').expect("LowerExp always has an exponent");
+    let exp: i32 = exp_text.parse().expect("LowerExp exponent is an integer");
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    let (head, tail) = match mantissa.split_once('.') {
+        Some((h, t)) => (h, t),
+        None => (mantissa, ""),
+    };
+    debug_assert_eq!(head.len(), 1, "LowerExp mantissa has one leading digit");
+    if (-4..15).contains(&exp) {
+        f.write_str(sign)?;
+        if exp < 0 {
+            // 0.000ddd…
+            f.write_str("0.")?;
+            for _ in 0..(-exp - 1) {
+                f.write_str("0")?;
+            }
+            f.write_str(head)?;
+            f.write_str(tail)?;
+        } else {
+            let exp = exp as usize;
+            let digits_after_head = tail.len();
+            f.write_str(head)?;
+            if digits_after_head <= exp {
+                // All digits precede the point; pad with zeros.
+                f.write_str(tail)?;
+                for _ in 0..(exp - digits_after_head) {
+                    f.write_str("0")?;
+                }
+            } else {
+                f.write_str(&tail[..exp])?;
+                f.write_str(".")?;
+                f.write_str(&tail[exp..])?;
+            }
+        }
+        Ok(())
+    } else {
+        f.write_str(sign)?;
+        f.write_str(head)?;
+        if !tail.is_empty() {
+            f.write_str(".")?;
+            f.write_str(tail)?;
+        }
+        if exp < 0 {
+            write!(f, "e-{:02}", -exp)
+        } else {
+            write!(f, "e+{exp:02}")
+        }
+    }
+}
+
 impl fmt::Display for Datum<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -937,15 +1007,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Int2(v) => write!(f, "{v}"),
             Datum::Int4(v) => write!(f, "{v}"),
             Datum::Int8(v) => write!(f, "{v}"),
-            Datum::Float8(v) => {
-                if v.is_infinite() {
-                    f.write_str(if *v > 0.0 { "Infinity" } else { "-Infinity" })
-                } else if v.is_nan() {
-                    f.write_str("NaN")
-                } else {
-                    write!(f, "{v}")
-                }
-            }
+            Datum::Float8(v) => write_pg_float8(f, *v),
             // The output function emits the padding — psql shows `hi   `.
             Datum::Text(s) | Datum::Bpchar(s) => f.write_str(s),
             Datum::Date(d) => f.write_str(super::datetime::format_date(*d).as_str()),

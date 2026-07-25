@@ -38,6 +38,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_type"
                 | "pg_namespace"
                 | "pg_tables"
+                | "pg_indexes"
                 | "pg_views"
                 | "pg_roles"
                 | "pg_database"
@@ -83,6 +84,7 @@ pub fn synthesize<'a>(
         (false, "pg_type") => pg_type(arena),
         (false, "pg_namespace") => pg_namespace(storage, arena),
         (false, "pg_tables") => pg_tables(storage, arena),
+        (false, "pg_indexes") => pg_indexes(storage, arena),
         (false, "pg_am") => finish(
             def_of(
                 "pg_am",
@@ -1137,6 +1139,79 @@ fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
             arena,
         )?;
         n += 1;
+    }
+    finish(def, &out[..n], arena)
+}
+
+/// `pg_indexes`: one row per index relation, with the full `CREATE INDEX`
+/// text PostgreSQL's view reconstructs. The same enumeration as `pg_class`'s
+/// index rows, so psql and this view can never disagree about what exists.
+fn pg_indexes<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_indexes",
+        &[
+            ("schemaname", ColType::Text),
+            ("tablename", ColType::Text),
+            ("indexname", ColType::Text),
+            ("tablespace", ColType::Text),
+            ("indexdef", ColType::Text),
+        ],
+    );
+    let mut indices = [None; MAX_SYNTH_INDEXES];
+    let count = collect_indexes(storage, &mut indices);
+    let mut out: [&[Datum]; MAX_SYNTH_INDEXES] = [&[]; MAX_SYNTH_INDEXES];
+    let mut n = 0;
+    for info in indices[..count].iter().flatten() {
+        let table_def = &storage.table(info.table_slot).def;
+        let mut indexdef = StackStr::<384>::new();
+        {
+            use core::fmt::Write as _;
+            let _ = write!(
+                indexdef,
+                "CREATE {}INDEX {} ON {}.{} USING btree (",
+                if info.is_unique { "UNIQUE " } else { "" },
+                info.name.as_str(),
+                table_def.schema.as_str(),
+                table_def.name.as_str()
+            );
+            for k in 0..info.n_cols {
+                if k > 0 {
+                    let _ = indexdef.write_str(", ");
+                }
+                let _ = indexdef
+                    .write_str(table_def.columns()[info.columns[k] as usize].name.as_str());
+            }
+            let _ = indexdef.write_str(")");
+        }
+        out[n] = row(
+            &[
+                text(
+                    arena
+                        .alloc_str(table_def.schema.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                text(table_def.name.as_str(), arena)?,
+                text(
+                    arena
+                        .alloc_str(info.name.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                Datum::Null,
+                text(
+                    arena
+                        .alloc_str(indexdef.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+            ],
+            arena,
+        )?;
+        n += 1;
+        if n == out.len() {
+            break;
+        }
     }
     finish(def, &out[..n], arena)
 }

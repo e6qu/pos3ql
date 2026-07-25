@@ -874,6 +874,19 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   is part of "mature".
 - **LISTEN / NOTIFY** — smaller, but common in real applications.
 
+### Bug sweep (2026-07-25, between steps 5 and 6)
+
+One deliberate adversarial pass — 52 fresh fuzzer seeds × 1200 statements
+against real PostgreSQL, a 64-seed × 250-step storage-VOPR sweep, and three
+new probing corpora (COPY × every type, NullTest-fold reach, explicit
+indexes) — netted six fixes and one recorded gap: the silently-unenforced
+UNIQUE index (B-162, the sweep's catch of consequence), the two
+qual-planning error-timing divergences the fuzzer isolated (B-163 fold
+reach, B-164 negator rewrite), `i64::MIN` unparseable (B-165), float8's
+missing scientific notation (B-166), the absent `pg_indexes` view, and
+`real`-is-really-float8 recorded open as B-167 (its own PR, the smallint
+playbook). The storage half came through the sweep clean.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

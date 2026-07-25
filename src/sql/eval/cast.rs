@@ -524,13 +524,23 @@ fn classify_int_literal(s: &str) -> IntLiteral {
         buffer[n] = c;
         n += 1;
     }
-    let Ok(cleaned) = core::str::from_utf8(&buffer[..n]) else {
+    // Parse with the sign attached: i64::MIN's magnitude exceeds i64::MAX,
+    // so parse-positive-then-negate cannot represent it and rejected
+    // "-9223372036854775808" as out of range.
+    let mut signed = [0u8; 81];
+    let start = usize::from(neg);
+    if neg {
+        signed[0] = b'-';
+    }
+    signed[start..start + n].copy_from_slice(&buffer[..n]);
+    let text_len = start + n;
+    let Ok(cleaned) = core::str::from_utf8(&signed[..text_len]) else {
         return Malformed;
     };
     // The digits are already validated for the radix, so a parse failure here is
     // an overflow, not a malformation.
     match i64::from_str_radix(cleaned, radix) {
-        Ok(v) => Value(if neg { -v } else { v }),
+        Ok(v) => Value(v),
         Err(_) => Overflow,
     }
 }

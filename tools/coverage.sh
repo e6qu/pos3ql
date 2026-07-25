@@ -64,8 +64,8 @@ if [ -n "$POS3QL_VENV" ] && [ -x "$PGBIN/pg_ctl" ]; then
     if POS3QL_BIN="$BIN" zsh tests/external/run.sh > "$TMP/run.log" 2>&1; then
         tail -2 "$TMP/run.log"
     else
-        echo "NOTE: tests/external/run.sh did not run (needs docker + MinIO);"
-        echo "      the durability and cold-start paths are not counted below"
+        echo "NOTE: tests/external/run.sh did not pass in full; its FAIL lines:"
+        grep '^FAIL' "$TMP/run.log" || echo "      (none — it exited before any check, likely docker/MinIO)"
         tail -2 "$TMP/run.log"
     fi
 else

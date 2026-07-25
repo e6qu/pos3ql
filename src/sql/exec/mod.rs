@@ -1786,7 +1786,7 @@ pub fn copy_row_binary(
 /// true int2, `timetz`, the text family, and the composite array / range /
 /// multirange / bit formats) directly. Only anonymous `record` is refused at
 /// [`copy_begin`], so it never reaches here.
-fn decode_binary_field<'a>(
+pub(crate) fn decode_binary_field<'a>(
     ctype: ColType,
     bytes: &'a [u8],
     arena: &'a Arena,

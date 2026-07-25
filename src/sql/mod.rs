@@ -1027,8 +1027,34 @@ impl Engine {
                             ast::QualName { schema: from.base.schema, name: from.base.table };
                         self.infer_where_params(&table, w, txid, oids);
                     }
+                // A parameter explicitly cast in the select list — `$n::type`
+                // — takes that type, as PostgreSQL resolves an otherwise-unknown
+                // parameter from the cast wrapping it.
+                for item in s.items {
+                    if let ast::SelectItem::Expr { expression, .. } = item {
+                        Self::infer_cast_param(expression, oids);
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Types a parameter written as `$n::type` (possibly through further casts)
+    /// by the innermost cast wrapping it, as PostgreSQL resolves an otherwise-
+    /// unknown parameter from the cast.
+    fn infer_cast_param(expr: &Expr, oids: &mut [i32; MAX_BIND_PARAMS]) {
+        if let Expr::Cast { operand, type_name, .. } = expr {
+            if let Expr::Param(n) = operand {
+                if *n >= 1
+                    && (*n as usize) <= MAX_BIND_PARAMS
+                    && let Some(ct) = types::ColType::from_sql_name(type_name)
+                {
+                    oids[*n as usize - 1] = ct.oid();
+                }
+            } else {
+                Self::infer_cast_param(operand, oids);
+            }
         }
     }
 

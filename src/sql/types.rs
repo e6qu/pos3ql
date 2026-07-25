@@ -956,34 +956,11 @@ fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
     }
     // `{:e}` is the shortest round-trip form; reformat it under PostgreSQL's
     // notation rule. float8out uses fixed notation for decimal exponents in
-    // [-4, 15).
+    // [-4, 15). (float8's own Ryū port — matching PostgreSQL's tie-breaking
+    // exactly, as write_pg_float4 does for real — is a follow-up; see B-170.)
     let mut sci = crate::util::StackStr::<64>::new();
     let _ = write!(sci, "{v:e}");
-    write_pg_float_notation(f, sci.as_str(), 15)
-}
-
-/// `real`/float4 output. Identical to float8 output but over the f32's own
-/// shortest round-trip digits and PostgreSQL's narrower float4out window:
-/// fixed notation for decimal exponents in [-4, 6), scientific otherwise.
-fn write_pg_float4(f: &mut fmt::Formatter<'_>, v: f32) -> fmt::Result {
-    if v.is_infinite() {
-        return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
-    }
-    if v.is_nan() {
-        return f.write_str("NaN");
-    }
-    let mut sci = crate::util::StackStr::<64>::new();
-    let _ = write!(sci, "{v:e}");
-    write_pg_float_notation(f, sci.as_str(), 6)
-}
-
-/// Reformats a Rust `{:e}` (shortest round-trip) rendering under PostgreSQL's
-/// float output rule: fixed notation when the decimal exponent is in
-/// `[-4, upper)`, otherwise `d.ddde±XX` with a signed, ≥2-digit exponent. The
-/// `upper` bound is the only thing that differs between float8 (15) and float4
-/// (6). Infinities and NaN are handled by the callers.
-fn write_pg_float_notation(f: &mut fmt::Formatter<'_>, text: &str, upper: i32) -> fmt::Result {
-    let (mantissa, exp_text) = text.split_once('e').expect("LowerExp always has an exponent");
+    let (mantissa, exp_text) = sci.as_str().split_once('e').expect("LowerExp always has an exponent");
     let exp: i32 = exp_text.parse().expect("LowerExp exponent is an integer");
     let (sign, mantissa) = match mantissa.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -993,7 +970,51 @@ fn write_pg_float_notation(f: &mut fmt::Formatter<'_>, text: &str, upper: i32) -
         Some((h, t)) => (h, t),
         None => (mantissa, ""),
     };
-    debug_assert_eq!(head.len(), 1, "LowerExp mantissa has one leading digit");
+    write_pg_float_notation(f, sign, head, tail, exp, 15)
+}
+
+/// `real`/float4 output, byte-for-byte with PostgreSQL. Its shortest digits
+/// come from PostgreSQL's own Ryū (see [`crate::sql::ryu`]) — Rust's
+/// `{:e}` resolves boundary cases differently — and its notation window is
+/// narrower: fixed notation for decimal exponents in [-4, 6), scientific
+/// otherwise.
+fn write_pg_float4(f: &mut fmt::Formatter<'_>, v: f32) -> fmt::Result {
+    if v.is_infinite() {
+        return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    if v.is_nan() {
+        return f.write_str("NaN");
+    }
+    if v == 0.0 {
+        return f.write_str(if v.is_sign_negative() { "-0" } else { "0" });
+    }
+    let (digits, exp10) = crate::sql::ryu::f32_shortest(v);
+    let mut buf = crate::util::StackStr::<16>::new();
+    let _ = write!(buf, "{digits}");
+    let digits = buf.as_str();
+    let (head, tail) = digits.split_at(1);
+    // The exponent of the first significant digit.
+    let exp = exp10 + (digits.len() as i32 - 1);
+    let sign = if v.is_sign_negative() { "-" } else { "" };
+    write_pg_float_notation(f, sign, head, tail, exp, 6)
+}
+
+/// Renders shortest-decimal digits under PostgreSQL's float output rule: fixed
+/// notation when the first significant digit's decimal exponent is in
+/// `[-4, upper)`, otherwise `d.ddde±XX` with a signed, ≥2-digit exponent. The
+/// `upper` bound is the only thing that differs between float8 (15) and float4
+/// (6). `head`+`tail` are the significant digits (one leading digit, then the
+/// rest); `exp` is the exponent of `head`. Sign, infinities, zero and NaN are
+/// handled by the callers.
+fn write_pg_float_notation(
+    f: &mut fmt::Formatter<'_>,
+    sign: &str,
+    head: &str,
+    tail: &str,
+    exp: i32,
+    upper: i32,
+) -> fmt::Result {
+    debug_assert_eq!(head.len(), 1, "one leading significant digit");
     if (-4..upper).contains(&exp) {
         f.write_str(sign)?;
         if exp < 0 {

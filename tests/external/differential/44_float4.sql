@@ -2,10 +2,14 @@
 -- Every value is rounded to f32 on input, arithmetic between two reals stays
 -- single precision, and output uses PostgreSQL's float4out rule (shortest f32
 -- round-trip; fixed notation for decimal exponents in [-4, 6), scientific
--- otherwise). Pinned against PostgreSQL 18. Output values are kept clear of
--- shortest-representation ties, which Rust and PostgreSQL break differently
--- (B-170) for both real and double precision.
+-- otherwise). Pinned against PostgreSQL 18. real output goes through
+-- PostgreSQL's own Ryū (its non-STRICTLY_SHORTEST boundary handling), so even
+-- shortest-representation boundary cases match exactly.
 DROP TABLE IF EXISTS f4;
+
+-- Boundary cases where Rust's shortest-float and PostgreSQL's Ryū disagree
+-- (PostgreSQL keeps the extra digit): these must match PostgreSQL now.
+SELECT 87535936::real, 59326392::real, 3188318.25::real, 1.0000005e6::real;
 
 -- Output: the fixed/scientific window differs from float8's [-4, 15). Values
 -- that need f32 rounding (12345678, 0.100000001, 16777217) are the whole point.

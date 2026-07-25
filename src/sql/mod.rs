@@ -21,6 +21,7 @@ pub mod query;
 pub mod txn;
 pub mod types;
 pub mod range;
+pub mod ryu;
 pub mod to_char;
 pub mod timezone;
 pub mod tzif;

@@ -958,7 +958,22 @@ data migrates. Corpus `44_float4` pins the surface against PostgreSQL 18.
 The sweep also turned up four Boyscout fixes (float→int now ties to even;
 `float8 % float8` rejected at plan time; smallint/real no longer JSON-quoted;
 smallint/real UNION unifies) and one honest open item, B-170 (shortest-float
-tie-breaking, shared with float8, deferred to its own Ryu-style formatter).
+boundary output), since fixed for `real` — see below.
+
+### Exact real output via PostgreSQL's Ryū (2026-07-25, B-170)
+
+`real` output diverged from PostgreSQL in ~0.3% of values (B-170). The cause,
+pinned precisely: PostgreSQL builds its Ryū float formatter **without**
+`STRICTLY_SHORTEST`, so `acceptBounds` is always false and it keeps an extra
+digit at rounding boundaries (`87535936::real` → `8.7535936e+07`, where Rust's
+`{:e}` gives the equally-valid `8.753594e+07`) — not the tie-to-even rounding
+first suspected. Fixed by porting PostgreSQL 18.4's exact `src/common/f2s.c`
+Ryū into `src/sql/ryu.rs` (`f32_shortest`, `acceptBounds = false`, verbatim
+tables) and feeding its digits into the shared notation formatter. 4000+
+random f32 bit patterns (subnormals included) now diff empty against
+PostgreSQL. `double precision` still formats through Rust's `{:e}` (~0.07% of
+values differ in the last digit); the same fix applies through a `d2s` port
+(the larger 128-bit `d2s_full_table.h` tables) in its own PR.
 
 ### ALTER TABLE ALTER COLUMN family (2026-07-25)
 

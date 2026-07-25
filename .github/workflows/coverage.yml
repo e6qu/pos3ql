@@ -5,9 +5,13 @@
 # instruments that binary too, which is what takes the figure to ~80%.
 #
 # The external suite is sharded across parallel jobs so that no job runs past
-# 15 minutes: each shard measures its slice strictly, exports an lcov
+# 15 minutes: each coverage shard measures its slice strictly, exports an lcov
 # tracefile, and the merge job unions the tracefiles and holds the floor over
-# the whole. Shard percentages alone are meaningless and never compared.
+# the whole. Shard percentages alone are meaningless and never compared. The
+# crash-torture shards are correctness-only (runtest:*): they kill -9 every
+# server, which never flushes a profile, so they contribute no coverage and
+# stay out of the merge — they gate the workflow by running and passing, and
+# build uninstrumented (no profiler tax) so they run several times faster.
 name: coverage
 on:
   push:
@@ -27,14 +31,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # sql: in-process tests + the differential corpora and
-          # sqllogictest blocks. The run:* shards are tests/external/run.sh
-          # step groups (see the group table at the top of that script).
+          # The coverage shards (run:* / sql) are the ones whose work lands on a
+          # server that shuts down gracefully and flushes a profile — sql's
+          # in-process tests + differential corpora, wire-durability on the
+          # base-port server run.sh stops at cleanup, and spilldiff on the
+          # differential harness's own server. Everything else runs
+          # uninstrumented for correctness only (runtest:*, several times
+          # faster) and stays out of the merge: the spill group kill -9's a side
+          # server (overlay) or just iterates the same spill/merge/cold-start
+          # code at scale (ingest) that the forced-spill differential already
+          # instruments; tls kill -9's its TLS server; torture kill -9's
+          # everything. Their line coverage is carried by the coverage shards;
+          # what they add here is that they *run and pass*. Torture depth is two
+          # independent seeds rather than one 12-round run.
           - { name: sql, shard: "sql" }
           - { name: wire-durability, shard: "run:proto,dur" }
-          - { name: spill, shard: "run:spill" }
-          - { name: torture, shard: "run:torture" }
-          - { name: tls-spilldiff, shard: "run:tls,spilldiff" }
+          - { name: spilldiff, shard: "run:spilldiff" }
+          - { name: spill-correctness, shard: "runtest:overlay,ingest,tls" }
+          - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }
+          - { name: torture-b, shard: "runtest:torture", torture_seed: 20260725 }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,11 +75,16 @@ jobs:
           POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
           COVERAGE_SHARD: ${{ matrix.shard }}
           COVERAGE_LCOV: ${{ github.workspace }}/coverage-${{ matrix.name }}.lcov
+          POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
+          POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}
         run: sh tools/coverage.sh
       - uses: actions/upload-artifact@v4
         with:
           name: lcov-${{ matrix.name }}
           path: coverage-*.lcov
+          # The runtest:* (torture) shards write no tracefile by design; let
+          # their upload find nothing rather than error.
+          if-no-files-found: ignore
 
   merge-and-gate:
     needs: shard

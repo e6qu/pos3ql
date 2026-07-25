@@ -894,13 +894,53 @@ carried psycopg2) and reduced to one uncounted NOTE line by the tolerant
 path built for docker-less laptops (B-168). The repair is structural, and it
 also brought the coverage job under the 15-minute CI ceiling (it ran ~30
 minutes; the policy is that **no CI job runs past 15**): run.sh's steps are
-now grouped (`POS3QL_RUN_GROUPS` — proto, dur, spill, torture, tls,
-spilldiff, each self-contained) with per-step wall-clock reporting, and the
-coverage workflow fans out into five parallel shards (`COVERAGE_SHARD`),
+now grouped (`POS3QL_RUN_GROUPS` — proto, dur, overlay, ingest, torture,
+tls, spilldiff, each self-contained) with per-step wall-clock reporting, and
+the coverage workflow fans out into parallel shards (`COVERAGE_SHARD`),
 each running its slice *strictly* — a failing step fails the shard — and
 exporting an lcov tracefile; `tools/coverage-merge.py` unions the shards
 and holds the 70% floor over the merged whole, since one shard's percentage
 alone means nothing.
+
+Getting under the ceiling turned up a real scaling wall, not just slow CI.
+The overlay-pressure step spent ~256 s of its budget in one place: it loaded
+5000 rows into a `PRIMARY KEY` table, and uniqueness enforcement is O(rows)
+per insert once the table spills — every insert probes the whole spilled SST
+forest for a duplicate, quadratic overall (B-169, the deferred
+secondary-index forest). The step never even *asserted* uniqueness; the
+constraint was pure cost. Rewritten to earn it: the scale table drops the
+constraint (the overlay/spill read path is what it exercises, now ~17 s),
+and a separate bounded 1500-row `PRIMARY KEY` table asserts the property
+that actually matters — a duplicate of a key long evicted from the overlay
+is still caught against its spilled row. The crash-torture shard, still ~15
+minutes at 12 rounds on the instrumented binary, is split across two seeds
+at half depth each (`POS3QL_TORTURE_ROUNDS`/`POS3QL_TORTURE_SEED`), which
+also widens the random coverage. Torture is a correctness shard, not a
+coverage one: it kill -9's every server it starts, and SIGKILL never runs the
+profiler's atexit flush, so a torture shard yields no `.profraw` and stays out
+of the coverage merge (`runtest:*`) — it earns its place by running and
+passing, which for the whole of its prior life (B-168) it did neither. Being
+coverage-free, it builds *uninstrumented* and so runs several times faster,
+which is what keeps its two seed-shards comfortably under the ceiling.
+
+The same `runtest:*` reasoning generalises into which groups can be coverage
+shards at all: only those whose work lands on a server that shuts down
+*gracefully* and flushes a profile. That is the base-port server run.sh
+stops at cleanup (sql's in-process tests + corpora, wire-durability) and the
+differential harness's own server (spilldiff). Everything else run.sh drives
+either kill -9's a side server — overlay flushes nothing, its idle base-port
+server would give ~zero — or, like ingest, merely iterates at scale the same
+spill/merge/cold-start code the forced-spill differential already
+instruments. So overlay, ingest and tls join torture as uninstrumented
+correctness shards: they earn their place by running and passing, and their
+line coverage is carried by the coverage shards. To make the coverage shards
+that *do* flush deterministic rather than racing the caller, run.sh's cleanup
+now stops the base-port server gracefully and waits for it to exit — up to
+five seconds, then forces it — before returning, so `cargo llvm-cov report`
+never reads `target/` while the profile is still being written. The floor is
+carried comfortably by the differential corpora alone (~80% on their own),
+with wire-durability and spilldiff adding the durability, WAL and forced-spill
+paths on top.
 
 ### The order (dependency-driven)
 

@@ -585,6 +585,34 @@ impl<'a> Parser<'a> {
                 let name = self.any_ident("prepared statement name")?;
                 Ok(Stmt::Deallocate(Some(name)))
             }
+            Tok::Ident("listen") => {
+                self.advance()?;
+                Ok(Stmt::Listen(self.col_ident("channel name")?))
+            }
+            Tok::Ident("unlisten") => {
+                self.advance()?;
+                if self.eat_op("*")? {
+                    Ok(Stmt::Unlisten(None))
+                } else {
+                    Ok(Stmt::Unlisten(Some(self.col_ident("channel name")?)))
+                }
+            }
+            Tok::Ident("notify") => {
+                self.advance()?;
+                let channel = self.col_ident("channel name")?;
+                let payload = if self.eat_op(",")? {
+                    match self.peeked {
+                        Tok::Str(s) => {
+                            self.advance()?;
+                            Some(s)
+                        }
+                        _ => return Err(self.unexpected("expected a payload string literal")),
+                    }
+                } else {
+                    None
+                };
+                Ok(Stmt::Notify { channel, payload })
+            }
             _ => Err(self.unexpected("expected a statement")),
         }
     }

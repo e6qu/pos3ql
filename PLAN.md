@@ -864,9 +864,12 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   today. The isolated rustls component and the budgeted `tls_scope` machinery
   exist for the S3 side; pointing the same component at the server socket is
   now a bounded task, not a policy question.
-- **ALTER TABLE breadth** — today: ADD/DROP/RENAME COLUMN, RENAME TO, SET
-  SCHEMA. Missing: `ALTER COLUMN TYPE / SET NOT NULL / DROP NOT NULL / SET
-  DEFAULT / DROP DEFAULT`, `ADD CONSTRAINT`, and kin.
+- **ALTER TABLE breadth** — done: ADD/DROP/RENAME COLUMN, RENAME TO, SET
+  SCHEMA, `ALTER COLUMN TYPE [USING]`, `SET`/`DROP NOT NULL`, `SET`/`DROP
+  DEFAULT`, `ADD`/`DROP`/`RENAME CONSTRAINT` — the metadata changes journal
+  through the shape swap, and a type change rewrites every stored row through
+  the shared `ColSource` plan. Remaining ALTER surface (owner/tablespace/storage
+  parameters) is properties this engine does not model.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).
@@ -875,7 +878,16 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   the statistics Stage I's cost model needs anyway.
 - **Roles and GRANT** — effectively single-user today; privilege enforcement
   is part of "mature".
-- **LISTEN / NOTIFY** — smaller, but common in real applications.
+- **LISTEN / NOTIFY** — done: `LISTEN`/`UNLISTEN [*]`/`NOTIFY channel[, payload]`
+  with PostgreSQL's transactional semantics (delivered at commit, discarded on
+  rollback, subtransaction-aware, same-transaction de-duplication) and
+  cross-connection delivery. The registry and delivery outbox live on the shared
+  engine; the server drains the outbox after each message and fans each
+  notification out to the listening connections as an asynchronous
+  NotificationResponse (the notifying connection's id is the PID). Fixed pools:
+  a transaction buffers at most `PER_TXN` notifications over `PER_TXN_PAYLOAD_BYTES`
+  of payload and a connection listens on at most `CHANNELS_PER_CONN` channels —
+  exceeding any is a loud, bounded error.
 
 ### Bug sweep (2026-07-25, between steps 5 and 6)
 

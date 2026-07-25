@@ -179,6 +179,7 @@ impl World {
             &mut session.cursors,
             &mut session.guc,
             &mut responder,
+            1,
         );
         assert!(sent.is_ok(), "seed {}: send buffer overflow on: {sql}", self.seed);
         // What the connection loop does after every query message: the

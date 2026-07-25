@@ -48,7 +48,22 @@ fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8>
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder)
+        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, 1)
+        .unwrap();
+    buffer.readable().to_vec()
+}
+
+/// Runs one simple-query message as a specific connection id (for LISTEN /
+/// NOTIFY, whose semantics are cross-connection).
+fn run_as(engine: &mut Engine, budget: &mut Budget, conn_id: i32, sql_text: &str) -> Vec<u8> {
+    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(budget, 1024).unwrap();
+    let mut pool = test_pool(budget);
+    let mut guc = GucState::new();
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, conn_id)
         .unwrap();
     buffer.readable().to_vec()
 }
@@ -262,7 +277,7 @@ fn run_txn(
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder)
+        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, 1)
         .unwrap();
     String::from_utf8_lossy(buffer.readable()).to_string()
 }
@@ -1215,7 +1230,7 @@ fn run_with_txn_bytes(
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder)
+        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, 1)
         .unwrap();
     buffer.readable().to_vec()
 }
@@ -3070,4 +3085,48 @@ fn copy_formats_and_unsupported() {
     // COPY FROM STDIN in a multi-statement string has nowhere to stream.
     let out = run_with(&mut engine, &mut budget, "COPY c FROM STDIN; SELECT 1");
     assert!(String::from_utf8_lossy(&out).contains("0A000"));
+}
+
+#[test]
+fn listen_notify_engine_semantics() {
+    let (mut engine, mut budget) = test_engine();
+
+    // Connection 1 listens on two channels; the registrations take effect at
+    // the (implicit) commit of each statement.
+    let out = run_as(&mut engine, &mut budget, 1, "LISTEN a");
+    assert!(String::from_utf8_lossy(&out).contains("LISTEN"));
+    run_as(&mut engine, &mut budget, 1, "LISTEN b");
+    assert!(engine.is_listening(1, "a"));
+    assert!(engine.is_listening(1, "b"));
+    assert!(!engine.is_listening(2, "a"));
+
+    // Connection 2 raises a notification; after its commit the outbox carries
+    // it, stamped with connection 2's PID. A channel nobody listens on still
+    // enqueues (delivery filters by listener, not the raise).
+    run_as(&mut engine, &mut budget, 2, "NOTIFY a, 'hi'");
+    assert_eq!(engine.notifications().len(), 1);
+    let n = &engine.notifications()[0];
+    assert_eq!(n.pid, 2);
+    assert_eq!(n.channel.as_str(), "a");
+    assert_eq!(n.payload.as_str(), "hi");
+    engine.clear_notifications();
+
+    // A rolled-back NOTIFY is discarded; a committed one fires; a duplicate
+    // (channel, payload) within one transaction collapses to a single entry.
+    run_as(&mut engine, &mut budget, 2, "BEGIN; NOTIFY b, 'x'; ROLLBACK");
+    assert_eq!(engine.notifications().len(), 0);
+    run_as(&mut engine, &mut budget, 2, "BEGIN; NOTIFY b, 'y'; NOTIFY b, 'y'; NOTIFY b, 'z'; COMMIT");
+    assert_eq!(engine.notifications().len(), 2);
+    engine.clear_notifications();
+
+    // UNLISTEN drops one channel; UNLISTEN * drops the rest.
+    run_as(&mut engine, &mut budget, 1, "UNLISTEN a");
+    assert!(!engine.is_listening(1, "a"));
+    assert!(engine.is_listening(1, "b"));
+    run_as(&mut engine, &mut budget, 1, "UNLISTEN *");
+    assert!(!engine.is_listening(1, "b"));
+
+    // A rolled-back LISTEN never registers.
+    run_as(&mut engine, &mut budget, 3, "BEGIN; LISTEN c; ROLLBACK");
+    assert!(!engine.is_listening(3, "c"));
 }

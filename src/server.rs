@@ -410,9 +410,71 @@ impl Server {
                 }
             }
         }
+        // A NOTIFY committed by the message just processed leaves notifications
+        // in the engine outbox; fan them out to every listening connection.
+        if self.engine.has_notifications() {
+            self.deliver_notifications();
+        }
+    }
+
+    /// Delivers every queued notification to the connections listening on its
+    /// channel, then clears the outbox. A listener whose send buffer cannot hold
+    /// the message (it is not draining its socket) is closed rather than sent a
+    /// truncated stream.
+    fn deliver_notifications(&mut self) {
+        for n_index in 0..self.engine.notifications().len() {
+            // `Notification` is `Copy`, so lift it out and drop the engine
+            // borrow before touching the slots.
+            let notification = self.engine.notifications()[n_index];
+            for index in 0..self.slots.len() {
+                if !self.slots[index].conn.is_open() {
+                    continue;
+                }
+                let conn_id = self.slots[index].conn.id();
+                if !self.engine.is_listening(conn_id, notification.channel.as_str()) {
+                    continue;
+                }
+                let delivered = self.slots[index].conn.queue_notification(
+                    notification.pid,
+                    notification.channel.as_str(),
+                    notification.payload.as_str(),
+                );
+                if delivered {
+                    self.sync_write_interest(index);
+                } else {
+                    self.release(index);
+                }
+            }
+        }
+        self.engine.clear_notifications();
+    }
+
+    /// Reconciles a slot's registered write interest with whether it now has
+    /// buffered output (mirrors the `dispatch` tail after appending bytes out of
+    /// band).
+    fn sync_write_interest(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        if !slot.conn.is_open() {
+            return;
+        }
+        let desired = slot.conn.wants_write();
+        if desired != slot.want_write {
+            let fd = slot.conn.stream().as_raw_fd();
+            let token = token_for(index as u32, slot.generation);
+            match self.reactor.set_write_interest(fd, token, desired) {
+                Ok(()) => slot.want_write = desired,
+                Err(e) => {
+                    log_io("set write interest", &e);
+                    self.release(index);
+                }
+            }
+        }
     }
 
     fn release(&mut self, index: usize) {
+        // Drop the connection's LISTEN registrations so its channels free up and
+        // no stale entry can match a later connection that reuses the id.
+        self.engine.drop_connection(self.slots[index].conn.id());
         let slot = &mut self.slots[index];
         if let Some(stream) = slot.conn.close() {
             // Closing the fd drops its kqueue registrations; an explicit

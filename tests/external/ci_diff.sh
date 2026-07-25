@@ -146,6 +146,14 @@ else
   bad "COPY binary round-trip"; cat "$WORK/copybin.out"
 fi
 
+# --- LISTEN / NOTIFY (cross-connection; needs two live connections per engine) -
+echo "=== LISTEN / NOTIFY (real PostgreSQL vs pos3ql) ==="
+if "$PY" "$EXT/listen_notify_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/listen.out" 2>&1; then
+  ok "LISTEN / NOTIFY ($(grep '^ok:' "$WORK/listen.out" | tail -1))"
+else
+  bad "LISTEN / NOTIFY"; cat "$WORK/listen.out"
+fi
+
 # --- vendored sqllogictest replay (real PostgreSQL is the oracle) ----------
 # Query-block sharded: all files, all statements; this shard runs its slice of
 # the read-only query blocks.

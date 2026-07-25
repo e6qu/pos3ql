@@ -60,6 +60,10 @@ Working single-node database:
   included (arrays, ranges, multiranges, bit strings).
 - Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED snapshot isolation,
   transactional DDL, and fail-fast (`40001`) write-conflict detection.
+- LISTEN / NOTIFY: `LISTEN`/`UNLISTEN`/`NOTIFY channel[, payload]` with
+  PostgreSQL's transactional delivery (fired at commit, dropped on rollback,
+  de-duplicated within a transaction) and asynchronous cross-connection
+  NotificationResponse delivery.
 - Durability: CRC-checksummed WAL with F_FULLFSYNC (kill -9 safe); CHECKPOINT
   snapshots every table to the bucket behind a compare-and-swap manifest, a
   node with an empty disk cold-starts entirely from it, and `wal_upload`

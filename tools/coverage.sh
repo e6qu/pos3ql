@@ -137,22 +137,24 @@ sql)
 run:*)
     GROUPS_SELECTED=${SHARD#run:}
     echo "=== external suite, groups: $GROUPS_SELECTED ==="
-    if ! POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$GROUPS_SELECTED" \
-         zsh tests/external/run.sh > "$TMP/run.log" 2>&1; then
-        echo "FAIL: tests/external/run.sh (groups $GROUPS_SELECTED); its FAIL lines and tail:"
+    # Stream the suite's output into the job log as it runs: a shard that
+    # hits its CI timeout would otherwise be killed with everything buffered
+    # in a file nobody ever sees — no step times, no culprit. The status
+    # file carries the exit code across the tee pipe (POSIX sh has no
+    # pipefail).
+    { POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$GROUPS_SELECTED" \
+        zsh tests/external/run.sh 2>&1; echo $? > "$TMP/run.status"; } | tee "$TMP/run.log"
+    if [ "$(cat "$TMP/run.status")" != "0" ]; then
+        echo "FAIL: tests/external/run.sh (groups $GROUPS_SELECTED); its FAIL lines:"
         grep '^FAIL' "$TMP/run.log" || true
-        tail -60 "$TMP/run.log"
         exit 1
     fi
     # A shard that ran nothing (an environment gap turning every step into a
     # SKIP) must not pass as an empty success.
     if ! grep -q '^PASS' "$TMP/run.log"; then
         echo "FAIL: the shard produced no PASS lines; nothing was measured"
-        tail -30 "$TMP/run.log"
         exit 1
     fi
-    grep -E '^step time|^PASS|^SKIP' "$TMP/run.log"
-    tail -2 "$TMP/run.log"
     write_lcov
     ;;
 *)

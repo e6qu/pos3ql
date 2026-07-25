@@ -30,10 +30,15 @@ jobs:
           # sql: in-process tests + the differential corpora and
           # sqllogictest blocks. The run:* shards are tests/external/run.sh
           # step groups (see the group table at the top of that script).
+          # Torture depth is split across two independent seeds rather than
+          # one 12-round run: the instrumented binary on these runners is
+          # ~4x slower than a dev machine, and two seeds at half depth buy
+          # comparable breadth inside the ceiling.
           - { name: sql, shard: "sql" }
           - { name: wire-durability, shard: "run:proto,dur" }
-          - { name: spill, shard: "run:spill" }
-          - { name: torture, shard: "run:torture" }
+          - { name: spill, shard: "run:overlay,ingest" }
+          - { name: torture-a, shard: "run:torture", torture_seed: 20260723 }
+          - { name: torture-b, shard: "run:torture", torture_seed: 20260725 }
           - { name: tls-spilldiff, shard: "run:tls,spilldiff" }
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +65,8 @@ jobs:
           POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
           COVERAGE_SHARD: ${{ matrix.shard }}
           COVERAGE_LCOV: ${{ github.workspace }}/coverage-${{ matrix.name }}.lcov
+          POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
+          POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}
         run: sh tools/coverage.sh
       - uses: actions/upload-artifact@v4
         with:

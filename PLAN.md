@@ -894,13 +894,28 @@ carried psycopg2) and reduced to one uncounted NOTE line by the tolerant
 path built for docker-less laptops (B-168). The repair is structural, and it
 also brought the coverage job under the 15-minute CI ceiling (it ran ~30
 minutes; the policy is that **no CI job runs past 15**): run.sh's steps are
-now grouped (`POS3QL_RUN_GROUPS` — proto, dur, spill, torture, tls,
-spilldiff, each self-contained) with per-step wall-clock reporting, and the
-coverage workflow fans out into five parallel shards (`COVERAGE_SHARD`),
+now grouped (`POS3QL_RUN_GROUPS` — proto, dur, overlay, ingest, torture,
+tls, spilldiff, each self-contained) with per-step wall-clock reporting, and
+the coverage workflow fans out into six parallel shards (`COVERAGE_SHARD`),
 each running its slice *strictly* — a failing step fails the shard — and
 exporting an lcov tracefile; `tools/coverage-merge.py` unions the shards
 and holds the 70% floor over the merged whole, since one shard's percentage
 alone means nothing.
+
+Getting under the ceiling turned up a real scaling wall, not just slow CI.
+The overlay-pressure step spent ~256 s of its budget in one place: it loaded
+5000 rows into a `PRIMARY KEY` table, and uniqueness enforcement is O(rows)
+per insert once the table spills — every insert probes the whole spilled SST
+forest for a duplicate, quadratic overall (B-169, the deferred
+secondary-index forest). The step never even *asserted* uniqueness; the
+constraint was pure cost. Rewritten to earn it: the scale table drops the
+constraint (the overlay/spill read path is what it exercises, now ~17 s),
+and a separate bounded 1500-row `PRIMARY KEY` table asserts the property
+that actually matters — a duplicate of a key long evicted from the overlay
+is still caught against its spilled row. The crash-torture shard, still ~15
+minutes at 12 rounds on the instrumented binary, is split across two seeds
+at half depth each (`POS3QL_TORTURE_ROUNDS`/`POS3QL_TORTURE_SEED`), which
+also widens the random coverage.
 
 ### The order (dependency-driven)
 

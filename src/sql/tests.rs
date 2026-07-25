@@ -1535,6 +1535,38 @@ fn alter_add_drop_constraint() {
 }
 
 #[test]
+fn vacuum_and_analyze() {
+    let config = test_config("vacuum");
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    run_with(&mut e, &mut b, "CREATE TABLE vt (a int, b text)");
+    run_with(&mut e, &mut b, "INSERT INTO vt VALUES (1, 'x'), (2, 'y')");
+    // The various forms parse and succeed, returning the command tag.
+    for cmd in [
+        "VACUUM",
+        "VACUUM vt",
+        "VACUUM FULL vt",
+        "VACUUM (FULL, ANALYZE) vt",
+        "VACUUM ANALYZE vt, vt",
+    ] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
+        assert!(text.contains("VACUUM"), "{cmd}: {text}");
+    }
+    for cmd in ["ANALYZE", "ANALYZE vt", "ANALYZE vt (a, b)"] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
+        assert!(text.contains("ANALYZE"), "{cmd}: {text}");
+    }
+    // The data is untouched.
+    let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM vt");
+    assert_eq!(data_rows(&bytes), ["2"]);
+    // VACUUM is non-transactional (25001); ANALYZE is allowed.
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "BEGIN; VACUUM vt; ROLLBACK")).to_string();
+    assert!(text.contains("25001"), "{text}");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "BEGIN; ANALYZE vt; COMMIT")).to_string();
+    assert!(!text.contains("25001") && !text.contains("ERROR"), "{text}");
+}
+
+#[test]
 fn joins_group_by_subqueries() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE d (id int, name text)");

@@ -1012,6 +1012,22 @@ not retain that name, so `DROP CONSTRAINT <explicit_name>` cannot find it —
 retaining names for single-column keys is the fix. Still to do: comma-
 separated multi-action lists.
 
+### VACUUM and ANALYZE (2026-07-25)
+
+Both were flat syntax errors, which broke tools that issue them after bulk
+loads. `VACUUM [options] [table [(cols)] [, ...]]` now reclaims space by
+driving a checkpoint — the LSM's flush + compaction, which prunes superseded
+versions and tombstones — subsuming any named table; with `s3 = off` there is
+no store to compact to and it succeeds with nothing to reclaim, as PostgreSQL
+does on a clean table. It is non-transactional (25001 inside a block).
+`ANALYZE [options] [table [(cols)] [, ...]]` is accepted and returns its tag:
+this planner reads live table state rather than a stored statistics catalog,
+so there is no statistics artifact to build and none is client-observable
+(not a silent skip — there is genuinely nothing to compute or expose), and it
+is allowed inside a transaction. Options and per-table/column targets are
+parsed. Corpus `48_vacuum_analyze` (the `VERBOSE` form omitted — it prints
+INFO progress this engine does not emit).
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

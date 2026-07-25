@@ -99,6 +99,14 @@ pub enum Stmt<'a> {
     },
     /// CLOSE cursor | CLOSE ALL (None).
     CloseCursor(Option<&'a str>),
+    /// VACUUM [options] [table [(columns)] [, ...]] — drives a checkpoint
+    /// (this engine's space reclamation); options and targets are parsed and
+    /// the whole store is compacted.
+    Vacuum,
+    /// ANALYZE [options] [table [(columns)] [, ...]] — accepted; the planner
+    /// works from live table state, not collected statistics, so there is no
+    /// statistics artifact to build and none is client-observable.
+    Analyze,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

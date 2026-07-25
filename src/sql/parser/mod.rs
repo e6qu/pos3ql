@@ -543,6 +543,8 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(Stmt::Checkpoint)
             }
+            Tok::Ident("vacuum") => self.vacuum_or_analyze(true),
+            Tok::Ident("analyze") | Tok::Ident("analyse") => self.vacuum_or_analyze(false),
             Tok::Ident("alter") => self.alter_table(),
             Tok::Ident("copy") => self.copy_statement(),
             Tok::Ident("prepare") => self.prepare(),
@@ -1386,6 +1388,57 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(AlterAction::AlterColumnType { column, type_name, type_mod, using })
+    }
+
+    /// VACUUM / ANALYZE with their shared shape: an optional parenthesized or
+    /// bare option list, then an optional comma-separated table list, each
+    /// table with an optional column list. Options and targets are consumed;
+    /// the command's behavior does not depend on them here.
+    fn vacuum_or_analyze(&mut self, is_vacuum: bool) -> Result<Stmt<'a>, ParseError> {
+        self.advance()?; // the VACUUM / ANALYZE keyword
+        if self.eat_op("(")? {
+            // A parenthesized option list — consume up to the matching ')'.
+            let mut depth = 1;
+            while depth > 0 {
+                if self.peeked == Tok::Eof {
+                    return Err(self.unexpected("unterminated option list"));
+                }
+                if self.eat_op("(")? {
+                    depth += 1;
+                } else if self.eat_op(")")? {
+                    depth -= 1;
+                } else {
+                    self.advance()?;
+                }
+            }
+        } else {
+            // The bare-keyword form: FULL / FREEZE / VERBOSE / ANALYZE.
+            while self.eat_ident("full")?
+                || self.eat_ident("freeze")?
+                || self.eat_ident("verbose")?
+                || self.eat_ident("analyze")?
+                || self.eat_ident("analyse")?
+            {}
+        }
+        // An optional table list, each with an optional column list.
+        if !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            loop {
+                let _ = self.qual_name("table name")?;
+                if self.eat_op("(")? {
+                    loop {
+                        let _ = self.col_ident("column name")?;
+                        if !self.eat_op(",")? {
+                            break;
+                        }
+                    }
+                    self.expect_op(")")?;
+                }
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+        }
+        Ok(if is_vacuum { Stmt::Vacuum } else { Stmt::Analyze })
     }
 
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {

@@ -1156,6 +1156,14 @@ impl Engine {
                 ),
             }));
         }
+        // VACUUM is non-transactional (25001); ANALYZE, by contrast, is allowed
+        // inside a transaction block.
+        if txn.is_explicit() && matches!(statement, Stmt::Vacuum) {
+            return Ok(Err(SqlError {
+                sqlstate: sqlstate::ACTIVE_SQL_TRANSACTION,
+                message: stack_format!(192, "VACUUM cannot run inside a transaction block"),
+            }));
+        }
         match statement {
             Stmt::Select(s) => {
                 // WITH CTEs expand into derived tables before execution; a
@@ -1594,6 +1602,29 @@ impl Engine {
                 }
                 Err(e) => Ok(Err(e)),
             },
+            // VACUUM reclaims space; in this LSM that is a checkpoint (flush +
+            // compaction, pruning superseded versions and tombstones). The
+            // options and per-table targets are parsed; a checkpoint compacts
+            // the whole store, which subsumes any named table. Without object
+            // storage there is nothing to compact to, and — as VACUUM on a
+            // table with nothing to reclaim does in PostgreSQL — it succeeds.
+            Stmt::Vacuum => {
+                if self.ckpt.is_some()
+                    && let Err(e) = self.checkpoint()
+                {
+                    return Ok(Err(e));
+                }
+                responder.command_complete("VACUUM")?;
+                Ok(Ok(()))
+            }
+            // ANALYZE collects planner statistics. This planner reads live
+            // table state rather than a stored statistics catalog, so there is
+            // nothing to compute and nothing a client can observe — the command
+            // succeeds with its tag.
+            Stmt::Analyze => {
+                responder.command_complete("ANALYZE")?;
+                Ok(Ok(()))
+            }
             Stmt::AlterTable(a) => {
                 if txn.is_explicit() {
                     return Ok(Err(SqlError {

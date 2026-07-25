@@ -10,7 +10,8 @@
 # the whole. Shard percentages alone are meaningless and never compared. The
 # crash-torture shards are correctness-only (runtest:*): they kill -9 every
 # server, which never flushes a profile, so they contribute no coverage and
-# stay out of the merge — they gate the workflow by running and passing.
+# stay out of the merge — they gate the workflow by running and passing, and
+# build uninstrumented (no profiler tax) so they run several times faster.
 name: coverage
 on:
   push:
@@ -39,10 +40,15 @@ jobs:
           # comparable breadth inside the ceiling.
           - { name: sql, shard: "sql" }
           - { name: wire-durability, shard: "run:proto,dur" }
-          - { name: spill, shard: "run:overlay,ingest" }
+          # overlay and ingest are separate shards: their wiped-disk cold
+          # starts rebuild thousands of rows through the instrumented binary,
+          # and combined they crept toward the ceiling on a slow runner.
+          - { name: overlay, shard: "run:overlay" }
+          - { name: ingest, shard: "run:ingest" }
           # Torture is a correctness shard, not a coverage one: it kill -9's
           # every server, and SIGKILL never flushes a coverage profile, so it
-          # produces no tracefile and stays out of the merge (runtest:*).
+          # produces no tracefile and stays out of the merge (runtest:*, built
+          # uninstrumented so it runs several times faster).
           - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }
           - { name: torture-b, shard: "runtest:torture", torture_seed: 20260725 }
           - { name: tls-spilldiff, shard: "run:tls,spilldiff" }

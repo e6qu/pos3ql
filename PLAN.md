@@ -896,7 +896,7 @@ also brought the coverage job under the 15-minute CI ceiling (it ran ~30
 minutes; the policy is that **no CI job runs past 15**): run.sh's steps are
 now grouped (`POS3QL_RUN_GROUPS` — proto, dur, overlay, ingest, torture,
 tls, spilldiff, each self-contained) with per-step wall-clock reporting, and
-the coverage workflow fans out into six parallel shards (`COVERAGE_SHARD`),
+the coverage workflow fans out into parallel shards (`COVERAGE_SHARD`),
 each running its slice *strictly* — a failing step fails the shard — and
 exporting an lcov tracefile; `tools/coverage-merge.py` unions the shards
 and holds the 70% floor over the merged whole, since one shard's percentage
@@ -919,7 +919,9 @@ also widens the random coverage. Torture is a correctness shard, not a
 coverage one: it kill -9's every server it starts, and SIGKILL never runs the
 profiler's atexit flush, so a torture shard yields no `.profraw` and stays out
 of the coverage merge (`runtest:*`) — it earns its place by running and
-passing, which for the whole of its prior life (B-168) it did neither.
+passing, which for the whole of its prior life (B-168) it did neither. Being
+coverage-free, it builds *uninstrumented* and so runs several times faster,
+which is what keeps its two seed-shards comfortably under the ceiling.
 
 ### The order (dependency-driven)
 

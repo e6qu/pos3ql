@@ -11,16 +11,21 @@
 # harnesses then run that binary through POS3QL_BIN and their profiles land in
 # the same directory, so one report covers everything.
 #
-# Two ways to run it:
-#   - whole suite (COVERAGE_SHARD unset): everything in one process, the
-#     floor enforced at the end. This is the local command.
-#   - one shard (COVERAGE_SHARD=sql or COVERAGE_SHARD=run:<groups>): the
-#     shard's slice runs strictly (a failure fails the shard — CI runners
-#     have docker, MinIO and the reference PostgreSQL, so there is nothing
-#     to tolerate), and the profile is written as an lcov tracefile to
-#     COVERAGE_LCOV instead of being compared to the floor: one shard's
-#     number is meaningless alone. tools/coverage-merge.py unions the
-#     tracefiles and holds the floor over the merged whole.
+# Ways to run it (COVERAGE_SHARD):
+#   - unset — whole suite in one process, the floor enforced at the end. This
+#     is the local command.
+#   - sql / run:<groups> — a coverage shard: its slice runs strictly (a failure
+#     fails the shard) against an instrumented binary, and the profile is
+#     written as an lcov tracefile to COVERAGE_LCOV instead of being compared to
+#     the floor (one shard's number is meaningless alone). tools/coverage-
+#     merge.py unions the tracefiles and holds the floor over the merged whole.
+#   - runtest:<groups> — a correctness-only shard: it runs run.sh groups
+#     strictly but produces no coverage, so it builds an *uninstrumented*
+#     binary (much faster) and writes no tracefile. This is for crash torture,
+#     which kill -9's every server it starts — SIGKILL never runs the profiler's
+#     atexit flush, so an instrumented torture shard yields zero .profraw and
+#     only pays the instrumentation tax for nothing. Its value is that it runs
+#     and passes (the whole of what B-168 restored).
 #
 # Ratchet, like tools/check-dups.sh: MIN may be raised as coverage improves and
 # is never lowered without a reason.
@@ -32,13 +37,56 @@ SHARD=${COVERAGE_SHARD:-}
 LCOV_OUT=${COVERAGE_LCOV:-}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
+
+# Run run.sh for a set of groups, strictly: stream its output into the job log
+# as it runs (a shard killed at its CI timeout would otherwise die with
+# everything buffered in a file nobody sees — no step times, no culprit), fail
+# the shard on any failing step, and refuse to pass a shard that measured
+# nothing (an environment gap turning every step into a SKIP). The status file
+# carries the exit code across the tee pipe (POSIX sh has no pipefail). Uses the
+# global BIN, which the caller sets first.
+run_groups_strict() {
+    groups=$1
+    echo "=== external suite, groups: $groups ==="
+    { POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$groups" \
+        zsh tests/external/run.sh 2>&1; echo $? > "$TMP/run.status"; } | tee "$TMP/run.log"
+    if [ "$(cat "$TMP/run.status")" != "0" ]; then
+        echo "FAIL: tests/external/run.sh (groups $groups); its FAIL lines:"
+        grep '^FAIL' "$TMP/run.log" || true
+        exit 1
+    fi
+    if ! grep -q '^PASS' "$TMP/run.log"; then
+        echo "FAIL: the shard produced no PASS lines; nothing was measured"
+        exit 1
+    fi
+}
+
+# A correctness-only shard never touches llvm-cov: it builds a plain release
+# binary (no instrumentation tax) and runs its groups. Handle it before any of
+# the coverage machinery below.
+case "$SHARD" in
+runtest:*)
+    echo "=== building the server (uninstrumented; correctness shard) ==="
+    # Force the rebuild: cargo does not reliably re-fingerprint on the coverage
+    # RUSTFLAGS/wrapper changing, so an *instrumented* binary left in target/ by
+    # a prior coverage run would otherwise survive into this uninstrumented
+    # build — and run several times slower for nothing. (A fresh CI runner has
+    # no such binary; this matters for back-to-back local runs.)
+    touch src/lib.rs
+    cargo build --release 2>&1 | tail -1
+    BIN="$PWD/target/release/pos3ql"
+    run_groups_strict "${SHARD#runtest:}"
+    echo "test-only shard: no coverage to write (uninstrumented, servers kill -9'd)"
+    exit 0
+    ;;
+esac
 
 command -v cargo-llvm-cov >/dev/null 2>&1 || {
     echo "FAIL: cargo-llvm-cov is not installed (cargo install cargo-llvm-cov)"
     exit 1
 }
-# Coverage-producing shards need a tracefile to merge; a runtest:* shard does
-# not (see its arm below) and is exempt.
+# Coverage-producing shards need a tracefile to merge.
 case "$SHARD" in
 sql | run:*)
     if [ -z "$LCOV_OUT" ]; then
@@ -75,8 +123,6 @@ touch src/lib.rs
 cargo build --release 2>&1 | tail -1
 BIN="$PWD/target/release/pos3ql"
 
-PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
-
 run_differential() {
     echo "=== differential suite (server binary) ==="
     # A pipe would mask the suite's exit status, and a suite that aborts (a
@@ -95,28 +141,6 @@ write_lcov() {
     echo "=== lcov tracefile ==="
     cargo llvm-cov report --release --lcov --output-path "$LCOV_OUT"
     echo "wrote $LCOV_OUT"
-}
-
-# Run run.sh for a set of groups, strictly: stream its output into the job log
-# as it runs (a shard killed at its CI timeout would otherwise die with
-# everything buffered in a file nobody sees — no step times, no culprit), fail
-# the shard on any failing step, and refuse to pass a shard that measured
-# nothing (an environment gap turning every step into a SKIP). The status file
-# carries the exit code across the tee pipe (POSIX sh has no pipefail).
-run_groups_strict() {
-    groups=$1
-    echo "=== external suite, groups: $groups ==="
-    { POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$groups" \
-        zsh tests/external/run.sh 2>&1; echo $? > "$TMP/run.status"; } | tee "$TMP/run.log"
-    if [ "$(cat "$TMP/run.status")" != "0" ]; then
-        echo "FAIL: tests/external/run.sh (groups $groups); its FAIL lines:"
-        grep '^FAIL' "$TMP/run.log" || true
-        exit 1
-    fi
-    if ! grep -q '^PASS' "$TMP/run.log"; then
-        echo "FAIL: the shard produced no PASS lines; nothing was measured"
-        exit 1
-    fi
 }
 
 case "$SHARD" in
@@ -166,16 +190,6 @@ sql)
 run:*)
     run_groups_strict "${SHARD#run:}"
     write_lcov
-    ;;
-runtest:*)
-    # A correctness-only shard: it runs run.sh groups strictly but produces no
-    # coverage, so it writes no tracefile and is left out of the merge. This is
-    # for crash torture, which kill -9's every server it starts — SIGKILL never
-    # runs the profiler's atexit flush, so a torture shard yields zero .profraw
-    # and has nothing to report. It has never contributed coverage (the old
-    # serial job got none from it either); its value is that it runs and passes.
-    run_groups_strict "${SHARD#runtest:}"
-    echo "test-only shard: no coverage to write (servers are kill -9'd)"
     ;;
 *)
     echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected sql, run:<groups> or runtest:<groups>)"

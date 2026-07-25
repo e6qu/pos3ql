@@ -626,9 +626,10 @@ for i in {1..50}; do
   "$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
-# Queries run over TLS, and the connection is actually encrypted.
+# A query under sslmode=require only completes if the server negotiated TLS
+# (psql aborts if the SSLRequest is declined), so this both runs SQL over the
+# encrypted link and proves it is encrypted.
 enc=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -t -A -c "SELECT 'ok'" 2>&1)
-ssl=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -c '\conninfo' 2>&1 | grep -c 'SSL connection')
 # A plaintext client must still connect (the SSLRequest is declined with 'N').
 plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=disable" -X -t -A -c "SELECT 'plain'" 2>&1)
 # A large result (>64KiB, the send buffer) exercises the streaming drain through
@@ -639,10 +640,10 @@ plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=disable" -X -
 big_tls=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -t -A -c "SELECT n, s FROM stls ORDER BY n" 2>&1 | md5sum | cut -d' ' -f1)
 big_plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=disable" -X -t -A -c "SELECT n, s FROM stls ORDER BY n" 2>&1 | md5sum | cut -d' ' -f1)
 kill -9 $STLS_PID 2>/dev/null; wait $STLS_PID 2>/dev/null
-if [[ "$enc" == "ok" && "$ssl" == "1" && "$plain" == "plain" && "$big_tls" == "$big_plain" && -n "$big_tls" ]]; then
-  ok "server-side TLS (encrypted, plaintext coexists, streaming byte-exact)"
+if [[ "$enc" == "ok" && "$plain" == "plain" && "$big_tls" == "$big_plain" && -n "$big_tls" ]]; then
+  ok "server-side TLS (sslmode=require works, plaintext coexists, streaming byte-exact)"
 else
-  bad "server-side TLS (enc=$enc ssl=$ssl plain=$plain tls_md5=$big_tls plain_md5=$big_plain)"
+  bad "server-side TLS (enc=$enc plain=$plain tls_md5=$big_tls plain_md5=$big_plain)"
   tail -10 "$WORK/server-tls.log"
 fi
 

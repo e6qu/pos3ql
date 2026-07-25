@@ -954,22 +954,19 @@ fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
     if v.is_nan() {
         return f.write_str("NaN");
     }
-    // `{:e}` is the shortest round-trip form; reformat it under PostgreSQL's
-    // notation rule. float8out uses fixed notation for decimal exponents in
-    // [-4, 15). (float8's own Ryū port — matching PostgreSQL's tie-breaking
-    // exactly, as write_pg_float4 does for real — is a follow-up; see B-170.)
-    let mut sci = crate::util::StackStr::<64>::new();
-    let _ = write!(sci, "{v:e}");
-    let (mantissa, exp_text) = sci.as_str().split_once('e').expect("LowerExp always has an exponent");
-    let exp: i32 = exp_text.parse().expect("LowerExp exponent is an integer");
-    let (sign, mantissa) = match mantissa.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", mantissa),
-    };
-    let (head, tail) = match mantissa.split_once('.') {
-        Some((h, t)) => (h, t),
-        None => (mantissa, ""),
-    };
+    if v == 0.0 {
+        return f.write_str(if v.is_sign_negative() { "-0" } else { "0" });
+    }
+    // Shortest digits from PostgreSQL's own Ryū (its non-STRICTLY_SHORTEST
+    // boundary handling, which Rust's `{:e}` does not reproduce). float8out
+    // uses fixed notation for decimal exponents in [-4, 15).
+    let (digits, exp10) = crate::sql::ryu::f64_shortest(v);
+    let mut buf = crate::util::StackStr::<24>::new();
+    let _ = write!(buf, "{digits}");
+    let digits = buf.as_str();
+    let (head, tail) = digits.split_at(1);
+    let exp = exp10 + (digits.len() as i32 - 1);
+    let sign = if v.is_sign_negative() { "-" } else { "" };
     write_pg_float_notation(f, sign, head, tail, exp, 15)
 }
 

@@ -64,6 +64,9 @@ Working single-node database:
   PostgreSQL's transactional delivery (fired at commit, dropped on rollback,
   de-duplicated within a transaction) and asynchronous cross-connection
   NotificationResponse delivery.
+- TLS: server-side TLS for client connections (`tls_on` with `tls_cert_file` /
+  `tls_key_file`) — `sslmode=require` negotiates TLS 1.3 via the isolated rustls
+  component; clients that do not request TLS still connect in the clear.
 - Durability: CRC-checksummed WAL with F_FULLFSYNC (kill -9 safe); CHECKPOINT
   snapshots every table to the bucket behind a compare-and-swap manifest, a
   node with an empty disk cold-starts entirely from it, and `wal_upload`

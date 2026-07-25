@@ -603,6 +603,50 @@ else
   print -- "SKIP: docker cannot mount $WORK for MinIO TLS certs"
 fi
 
+# --- Server-side TLS: the client connects over TLS (no object store needed) --
+step "server-side TLS: psql connects with sslmode=require"
+STLS_PORT=$((PG_PORT + 2))
+mkdir -p "$WORK/server-tls"
+openssl req -x509 -newkey rsa:2048 -keyout "$WORK/server-tls/key.pem" \
+  -out "$WORK/server-tls/cert.pem" -days 30 -nodes -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+cat > "$WORK/server-tls.conf" <<EOF
+listen_addr = 127.0.0.1:${STLS_PORT}
+data_dir = ${WORK}/server-tls-data
+s3 = off
+sql_arena_bytes = 32MiB
+work_arena_bytes = 64MiB
+tls_on = on
+tls_cert_file = ${WORK}/server-tls/cert.pem
+tls_key_file = ${WORK}/server-tls/key.pem
+EOF
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server-tls.conf" > "$WORK/server-tls.log" 2>&1 &
+STLS_PID=$!
+for i in {1..50}; do
+  "$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+# A query under sslmode=require only completes if the server negotiated TLS
+# (psql aborts if the SSLRequest is declined), so this both runs SQL over the
+# encrypted link and proves it is encrypted.
+enc=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -t -A -c "SELECT 'ok'" 2>&1)
+# A plaintext client must still connect (the SSLRequest is declined with 'N').
+plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=disable" -X -t -A -c "SELECT 'plain'" 2>&1)
+# A large result (>64KiB, the send buffer) exercises the streaming drain through
+# the session: its bytes must match the same query over plaintext exactly.
+"$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -q \
+  -c "CREATE TABLE stls (n int, s text)" \
+  -c "INSERT INTO stls SELECT g, repeat('x',100) FROM generate_series(1,5000) g" >/dev/null 2>&1
+big_tls=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=require" -X -t -A -c "SELECT n, s FROM stls ORDER BY n" 2>&1 | md5sum | cut -d' ' -f1)
+big_plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=ext sslmode=disable" -X -t -A -c "SELECT n, s FROM stls ORDER BY n" 2>&1 | md5sum | cut -d' ' -f1)
+kill -9 $STLS_PID 2>/dev/null; wait $STLS_PID 2>/dev/null
+if [[ "$enc" == "ok" && "$plain" == "plain" && "$big_tls" == "$big_plain" && -n "$big_tls" ]]; then
+  ok "server-side TLS (sslmode=require works, plaintext coexists, streaming byte-exact)"
+else
+  bad "server-side TLS (enc=$enc plain=$plain tls_md5=$big_tls plain_md5=$big_plain)"
+  tail -10 "$WORK/server-tls.log"
+fi
+
 fi # tls
 
 if want spilldiff; then

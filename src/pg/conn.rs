@@ -104,6 +104,12 @@ pub struct Conn {
     /// Negotiated protocol minor version (major is always 3).
     minor: u16,
     id: i32,
+    /// The live TLS session, once the handshake starts. All socket bytes for
+    /// `recv`/`send` tunnel through it.
+    tls: Option<crate::pg::tls::ServerSession>,
+    /// A TLS session staged by the SSLRequest handler, promoted to `tls` once
+    /// the plaintext `S` acknowledgement has left the socket.
+    pending_tls: Option<crate::pg::tls::ServerSession>,
 }
 
 impl Conn {
@@ -151,6 +157,8 @@ impl Conn {
             phase: Phase::Startup,
             minor: 0,
             id: 0,
+            tls: None,
+            pending_tls: None,
         })
     }
 
@@ -171,9 +179,15 @@ impl Conn {
         self.phase = Phase::Startup;
         self.minor = 0;
         self.id = id;
+        self.tls = None;
+        self.pending_tls = None;
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
+        // Drop the TLS session (inside its scope, so the pool is credited)
+        // before the socket goes.
+        self.tls = None;
+        self.pending_tls = None;
         self.stream.take()
     }
 
@@ -186,7 +200,7 @@ impl Conn {
     }
 
     pub fn wants_write(&self) -> bool {
-        !self.send.is_empty()
+        !self.send.is_empty() || self.tls.as_ref().is_some_and(|t| t.wants_write())
     }
 
     /// The connection's id (the backend PID reported in BackendKeyData and in
@@ -218,10 +232,11 @@ impl Conn {
         engine: &mut Engine,
         cancel_key: &[u8],
         auth: &AuthContext,
+        tls_config: Option<&std::sync::Arc<rustls::ServerConfig>>,
     ) -> After {
-        let Some(stream) = self.stream.as_mut() else {
+        if self.stream.is_none() {
             return After::Close;
-        };
+        }
         let space = self.recv.writable();
         if space.is_empty() {
             // Inbound message larger than the receive buffer: a protocol
@@ -234,31 +249,58 @@ impl Conn {
             let _ = self.flush();
             return After::Close;
         }
-        match stream.read(space) {
+        // Decrypted plaintext when a TLS session is live; raw bytes otherwise.
+        let read_result = if let Some(tls) = self.tls.as_mut() {
+            tls.read(self.stream.as_mut().unwrap(), space)
+        } else {
+            self.stream.as_mut().unwrap().read(space)
+        };
+        match read_result {
             Ok(0) => return After::Close,
             Ok(n) => self.recv.advance(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return After::Close,
         }
-        let after = self.process(engine, cancel_key, auth);
-        match self.flush() {
+        let after = self.process(engine, cancel_key, auth, tls_config);
+        let flushed = self.flush();
+        self.activate_pending_tls();
+        match flushed {
             Ok(()) => after,
             Err(()) => After::Close,
         }
     }
 
     pub fn on_writable(&mut self) -> After {
-        match self.flush() {
+        let flushed = self.flush();
+        self.activate_pending_tls();
+        // A TLS session mid-handshake may still owe the peer bytes after the
+        // socket accepted what it could; keep the connection alive.
+        match flushed {
             Ok(()) => After::Continue,
             Err(()) => After::Close,
         }
     }
 
-    fn process(&mut self, engine: &mut Engine, cancel_key: &[u8], auth: &AuthContext) -> After {
+    /// Promotes a TLS session staged by the SSLRequest handler once the
+    /// plaintext `S` acknowledgement has fully left the send buffer, so the
+    /// next socket bytes (the ClientHello) are read through the session.
+    fn activate_pending_tls(&mut self) {
+        if self.pending_tls.is_some() && self.send.is_empty() {
+            self.tls = self.pending_tls.take();
+        }
+    }
+
+    fn process(
+        &mut self,
+        engine: &mut Engine,
+        cancel_key: &[u8],
+        auth: &AuthContext,
+        tls_config: Option<&std::sync::Arc<rustls::ServerConfig>>,
+    ) -> After {
         loop {
             let after = match self.phase {
-                Phase::Startup => self.process_startup(cancel_key, auth),
+                Phase::Startup => self.process_startup(cancel_key, auth, tls_config),
                 Phase::AwaitPassword | Phase::AwaitSaslInit | Phase::AwaitSaslFinal => {
                     self.process_auth(cancel_key, auth)
                 }
@@ -272,7 +314,12 @@ impl Conn {
         }
     }
 
-    fn process_startup(&mut self, cancel_key: &[u8], auth: &AuthContext) -> Step {
+    fn process_startup(
+        &mut self,
+        cancel_key: &[u8],
+        auth: &AuthContext,
+        tls_config: Option<&std::sync::Arc<rustls::ServerConfig>>,
+    ) -> Step {
         let data = self.recv.readable();
         if data.len() < 4 {
             return Step::NeedMoreData;
@@ -287,10 +334,37 @@ impl Conn {
         }
         let code = i32::from_be_bytes(data[4..8].try_into().unwrap());
         match code {
-            wire::REQUEST_SSL | wire::REQUEST_GSSENC => {
+            wire::REQUEST_SSL => {
                 self.recv.consume(len);
-                // No TLS/GSS support: 'N' tells the client to continue in
-                // the clear, per the protocol flow.
+                match tls_config {
+                    Some(config) if self.tls.is_none() && self.pending_tls.is_none() => {
+                        // Acknowledge with 'S' in the clear; the session is
+                        // staged and activated once that byte has been flushed,
+                        // so the client's ClientHello is read through TLS.
+                        match crate::pg::tls::ServerSession::new(config) {
+                            Ok(session) => {
+                                if !self.send.append(b"S") {
+                                    return Step::Close;
+                                }
+                                self.pending_tls = Some(session);
+                                Step::Continue
+                            }
+                            Err(_) => Step::Close,
+                        }
+                    }
+                    _ => {
+                        // TLS not configured (or already negotiated): decline,
+                        // the client continues in the clear.
+                        if !self.send.append(b"N") {
+                            return Step::Close;
+                        }
+                        Step::Continue
+                    }
+                }
+            }
+            wire::REQUEST_GSSENC => {
+                self.recv.consume(len);
+                // GSSAPI encryption is not offered; 'N' declines it.
                 if !self.send.append(b"N") {
                     return Step::Close;
                 }
@@ -1381,7 +1455,11 @@ impl Conn {
         }
         let result = {
             let mut responder = Responder::new(&mut self.send);
-            if let Some(fd) = fd {
+            // Over TLS the drain must encrypt through the session onto the
+            // blocking socket; in the clear it writes the fd directly.
+            if let Some(session) = self.tls.as_mut() {
+                responder = responder.with_flush_tls(session, self.stream.as_mut().unwrap());
+            } else if let Some(fd) = fd {
                 responder = responder.with_flush(fd);
             }
             engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.cursors, &mut self.guc, &mut responder, self.id)
@@ -1442,9 +1520,28 @@ impl Conn {
     /// Writes as much of the send buffer as the socket accepts.
     /// `Err` means the connection is broken.
     fn flush(&mut self) -> Result<(), ()> {
-        let Some(stream) = self.stream.as_mut() else {
+        if self.stream.is_none() {
             return Err(());
-        };
+        }
+        if let Some(tls) = self.tls.as_mut() {
+            let socket = self.stream.as_mut().unwrap();
+            // Hand the plaintext to the session (it buffers into records), then
+            // push as much ciphertext to the socket as it accepts. Leftover
+            // ciphertext stays queued in rustls; `wants_write` keeps write
+            // interest registered until it drains.
+            while !self.send.is_empty() {
+                match tls.queue(self.send.readable()) {
+                    Ok(0) => return Err(()),
+                    Ok(n) => self.send.consume(n),
+                    Err(_) => return Err(()),
+                }
+            }
+            return match tls.flush_nonblocking(socket) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(()),
+            };
+        }
+        let stream = self.stream.as_mut().unwrap();
         while !self.send.is_empty() {
             match stream.write(self.send.readable()) {
                 Ok(0) => return Err(()),

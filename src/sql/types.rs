@@ -200,6 +200,73 @@ impl ColType {
         }
     }
 
+    /// Inverse of [`ColType::oid`]: the column type a PostgreSQL type OID names,
+    /// or `None` for an OID this engine does not model. Used to decode a
+    /// binary-format parameter whose type the client declared by OID.
+    pub fn from_oid(type_oid: i32) -> Option<ColType> {
+        // Scalars.
+        let scalar = match type_oid {
+            oid::BOOL => Some(Self::Bool),
+            oid::INT2 => Some(Self::Int2),
+            oid::INT4 => Some(Self::Int4),
+            oid::INT8 => Some(Self::Int8),
+            oid::FLOAT4 => Some(Self::Float4),
+            oid::FLOAT8 => Some(Self::Float8),
+            oid::TEXT => Some(Self::Text),
+            oid::NAME => Some(Self::Name),
+            oid::VARCHAR => Some(Self::Varchar),
+            oid::BPCHAR => Some(Self::Bpchar),
+            oid::DATE => Some(Self::Date),
+            oid::TIMESTAMP => Some(Self::Timestamp),
+            oid::TIMESTAMPTZ => Some(Self::Timestamptz),
+            oid::TIME => Some(Self::Time),
+            oid::TIMETZ => Some(Self::Timetz),
+            oid::INTERVAL => Some(Self::Interval),
+            oid::JSON => Some(Self::Json),
+            oid::JSONB => Some(Self::Jsonb),
+            oid::UUID => Some(Self::Uuid),
+            oid::BYTEA => Some(Self::Bytea),
+            oid::NUMERIC => Some(Self::Numeric),
+            oid::BIT => Some(Self::Bit { varying: false }),
+            oid::VARBIT => Some(Self::Bit { varying: true }),
+            _ => None,
+        };
+        if scalar.is_some() {
+            return scalar;
+        }
+        // Ranges and multiranges.
+        for kind in [
+            RangeKind::Int4,
+            RangeKind::Int8,
+            RangeKind::Num,
+            RangeKind::Date,
+            RangeKind::Ts,
+            RangeKind::Tstz,
+        ] {
+            if type_oid == kind.oid() {
+                return Some(Self::Range(kind));
+            }
+            if type_oid == kind.multirange_oid() {
+                return Some(Self::Multirange(kind));
+            }
+        }
+        // Arrays: match the element type's array OID.
+        for element in [
+            ArrElem::Bool, ArrElem::Int2, ArrElem::Int4, ArrElem::Int8, ArrElem::Float4,
+            ArrElem::Float8, ArrElem::Text, ArrElem::Name, ArrElem::Varchar, ArrElem::Bpchar,
+            ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz, ArrElem::Time, ArrElem::Timetz,
+            ArrElem::Interval, ArrElem::Json, ArrElem::Jsonb, ArrElem::Uuid, ArrElem::Bytea,
+            ArrElem::Numeric,
+        ] {
+            if type_oid == element.array_oid() {
+                return Some(Self::Array(element));
+            }
+        }
+        // Bit-string arrays have no array-element type here, so they (and any
+        // other unmodeled OID) fall through unsupported.
+        None
+    }
+
     pub fn typlen(self) -> i16 {
         match self {
             Self::Bool => 1,
@@ -1357,6 +1424,37 @@ mod tests {
         assert_eq!(ColType::from_sql_name("integer"), Some(ColType::Int4));
         assert_eq!(ColType::from_sql_name("float8"), Some(ColType::Float8));
         assert_eq!(ColType::from_sql_name("geometry"), None);
+    }
+
+    #[test]
+    fn from_oid_inverts_oid() {
+        // Every type the binary-parameter path can name by OID round-trips.
+        let mut types = vec![
+            ColType::Bool, ColType::Int2, ColType::Int4, ColType::Int8, ColType::Float4,
+            ColType::Float8, ColType::Text, ColType::Name, ColType::Varchar, ColType::Bpchar,
+            ColType::Date, ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Timetz,
+            ColType::Interval, ColType::Json, ColType::Jsonb, ColType::Uuid, ColType::Bytea,
+            ColType::Numeric, ColType::Bit { varying: false }, ColType::Bit { varying: true },
+        ];
+        for k in [RangeKind::Int4, RangeKind::Int8, RangeKind::Num, RangeKind::Date, RangeKind::Ts, RangeKind::Tstz] {
+            types.push(ColType::Range(k));
+            types.push(ColType::Multirange(k));
+        }
+        for e in [
+            ArrElem::Bool, ArrElem::Int2, ArrElem::Int4, ArrElem::Int8, ArrElem::Float4,
+            ArrElem::Float8, ArrElem::Text, ArrElem::Name, ArrElem::Varchar, ArrElem::Bpchar,
+            ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz, ArrElem::Time, ArrElem::Timetz,
+            ArrElem::Interval, ArrElem::Json, ArrElem::Jsonb, ArrElem::Uuid, ArrElem::Bytea,
+            ArrElem::Numeric,
+        ] {
+            types.push(ColType::Array(e));
+        }
+        for t in types {
+            assert_eq!(ColType::from_oid(t.oid()), Some(t), "{t:?} did not round-trip through its OID");
+        }
+        // An OID this engine does not model is None, never a wrong type.
+        assert_eq!(ColType::from_oid(0), None);
+        assert_eq!(ColType::from_oid(2249), None); // record
     }
 }
 

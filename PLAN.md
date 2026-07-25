@@ -1259,9 +1259,18 @@ INFO progress this engine does not emit).
    engines over the wire with psycopg and checks TO-binary byte-identity plus
    FROM-binary round-trips in both directions across the full scalar tower and
    every composite (arrays with NULL/empty, ranges with empty/infinite bounds,
-   multiranges, bit/varbit), wired into the CI differential. The
-   extended-protocol COPY flow is refused pending its own wiring. The pg_dump
-   round-trip milestone stays open pending the catalog surface pg_dump queries.
+   multiranges, bit/varbit), wired into the CI differential. **Binary
+   *parameters* of composite types** are also accepted now: the extended-protocol
+   Bind decoder (`decode_binary_param`) routes an array / range / multirange /
+   bit OID through the same COPY-binary receiver via a new `ColType::from_oid`
+   reverse map, and a Bind resolves any parameter the client left untyped
+   (OID 0 — an empty range has no subtype to declare) from its use, including a
+   `$n::type` cast in the select list, so it decodes as its real type without a
+   prior Describe. Verified by `tests/external/binary_param_diff.py` (arrays with
+   NULL/empty, int4/int8 ranges incl. the untyped empty range, multiranges)
+   diffing against real PostgreSQL. The extended-protocol COPY flow is refused
+   pending its own wiring. The pg_dump round-trip milestone stays open pending
+   the catalog surface pg_dump queries.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;

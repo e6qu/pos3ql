@@ -154,6 +154,14 @@ else
   bad "LISTEN / NOTIFY"; cat "$WORK/listen.out"
 fi
 
+# --- extended-protocol binary parameters (composite types over the wire) ------
+echo "=== binary parameters (real PostgreSQL vs pos3ql) ==="
+if "$PY" "$EXT/binary_param_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/binparam.out" 2>&1; then
+  ok "binary parameters ($(tail -1 "$WORK/binparam.out"))"
+else
+  bad "binary parameters"; cat "$WORK/binparam.out"
+fi
+
 # --- vendored sqllogictest replay (real PostgreSQL is the oracle) ----------
 # Query-block sharded: all files, all statements; this shard runs its slice of
 # the read-only query blocks.

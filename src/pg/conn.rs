@@ -1277,6 +1277,18 @@ impl Conn {
                 core::str::from_utf8(prepared.text.readable()).expect("stored from valid UTF-8");
             let mut params = [Datum::Null; MAX_BIND_PARAMS];
             let raw = portal.params.readable();
+            // Resolve any parameter the client left untyped (OID 0) from its use
+            // in the query, so a binary-format value decodes as its real type
+            // even without a prior statement Describe — e.g. an empty range,
+            // which the client cannot subtype and so sends untyped. Mirrors what
+            // Describe already does; text params are unaffected.
+            let mut param_oids = prepared.param_oids;
+            let has_untyped_binary = (0..portal.n_params as usize)
+                .any(|i| portal.binary[i] && param_oids[i] == 0);
+            if has_untyped_binary {
+                param_oids =
+                    engine.infer_param_types(text, &self.arena, &self.txn, &prepared.param_oids);
+            }
             for (i, &(offset, len)) in portal.spans.iter().take(portal.n_params as usize).enumerate() {
                 if len == u32::MAX {
                     params[i] = Datum::Null;
@@ -1284,7 +1296,7 @@ impl Conn {
                 }
                 let bytes = &raw[offset as usize..(offset + len) as usize];
                 if portal.binary[i] {
-                    match decode_binary_param(prepared.param_oids[i], bytes, &self.arena) {
+                    match decode_binary_param(param_oids[i], bytes, &self.arena) {
                         Ok(v) => params[i] = v,
                         Err(message) => {
                             return ext_err(&mut self.send, &mut self.phase, sqlstate::FEATURE_NOT_SUPPORTED, message)
@@ -1667,7 +1679,18 @@ pub(crate) fn decode_binary_param<'a>(
                 .map(Datum::Numeric)
                 .map_err(|_| "binary numeric out of range")
         }
-        _ => Err("binary format for this parameter type is not implemented (use text)"),
+        // Composite types (arrays, ranges, multiranges, bit strings) share the
+        // COPY-binary receive codec, driven by the column type the OID names.
+        _ => match crate::sql::types::ColType::from_oid(oid) {
+            Some(
+                ctype @ (crate::sql::types::ColType::Array(_)
+                | crate::sql::types::ColType::Range(_)
+                | crate::sql::types::ColType::Multirange(_)
+                | crate::sql::types::ColType::Bit { .. }),
+            ) => crate::sql::exec::decode_binary_field(ctype, bytes, arena)
+                .map_err(|_| "invalid binary composite parameter"),
+            _ => Err("binary format for this parameter type is not implemented (use text)"),
+        },
     }
 }
 

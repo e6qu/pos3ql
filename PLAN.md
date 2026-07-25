@@ -923,6 +923,25 @@ passing, which for the whole of its prior life (B-168) it did neither. Being
 coverage-free, it builds *uninstrumented* and so runs several times faster,
 which is what keeps its two seed-shards comfortably under the ceiling.
 
+The same `runtest:*` reasoning generalises into which groups can be coverage
+shards at all: only those whose work lands on a server that shuts down
+*gracefully* and flushes a profile. That is the base-port server run.sh
+stops at cleanup (sql's in-process tests + corpora, wire-durability) and the
+differential harness's own server (spilldiff). Everything else run.sh drives
+either kill -9's a side server — overlay flushes nothing, its idle base-port
+server would give ~zero — or, like ingest, merely iterates at scale the same
+spill/merge/cold-start code the forced-spill differential already
+instruments. So overlay, ingest and tls join torture as uninstrumented
+correctness shards: they earn their place by running and passing, and their
+line coverage is carried by the coverage shards. To make the coverage shards
+that *do* flush deterministic rather than racing the caller, run.sh's cleanup
+now stops the base-port server gracefully and waits for it to exit — up to
+five seconds, then forces it — before returning, so `cargo llvm-cov report`
+never reads `target/` while the profile is still being written. The floor is
+carried comfortably by the differential corpora alone (~80% on their own),
+with wire-durability and spilldiff adding the durability, WAL and forced-spill
+paths on top.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

@@ -56,7 +56,16 @@ ok()   { PASS=$((PASS+1)); print -- "PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
 
 cleanup() {
-  [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
+  # Stop the base-port server gracefully and wait for it to exit before
+  # returning. Under coverage the server flushes its profile on a clean
+  # shutdown (a SIGKILL never would), and the caller reads target/ the moment
+  # this script exits — so a fire-and-forget SIGTERM races the flush. Give it
+  # up to five seconds to go, then force it.
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    kill "$SERVER_PID" 2>/dev/null
+    for _ in {1..50}; do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$SERVER_PID" 2>/dev/null
+  fi
   docker rm -f $MINIO_CONTAINER >/dev/null 2>&1
   if [[ "$KEEP" == "--keep" ]]; then
     print -- "work dir kept: $WORK"

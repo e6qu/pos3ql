@@ -2,20 +2,39 @@
 # and put the wire protocol at 6%, which measures what is instrumented rather
 # than what is tested: the corpora, the sqllogictest blocks and the psql golden
 # suite all drive the server binary as a subprocess. tools/coverage.sh
-# instruments that binary too, which is what takes the figure to ~78%.
+# instruments that binary too, which is what takes the figure to ~80%.
+#
+# The external suite is sharded across parallel jobs so that no job runs past
+# 15 minutes: each shard measures its slice strictly, exports an lcov
+# tracefile, and the merge job unions the tracefiles and holds the floor over
+# the whole. Shard percentages alone are meaningless and never compared.
 name: coverage
 on:
   push:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  coverage:
+  shard:
+    name: shard ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # run.sh runs in full on these runners (docker + MinIO work) and takes
-    # ~26 minutes by itself; the ceiling covers it with headroom rather than
-    # cancelling a slow-but-healthy sweep at the finish line.
-    timeout-minutes: 50
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # sql: in-process tests + the differential corpora and
+          # sqllogictest blocks. The run:* shards are tests/external/run.sh
+          # step groups (see the group table at the top of that script).
+          - { name: sql, shard: "sql" }
+          - { name: wire-durability, shard: "run:proto,dur" }
+          - { name: spill, shard: "run:spill" }
+          - { name: torture, shard: "run:torture" }
+          - { name: tls-spilldiff, shard: "run:tls,spilldiff" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,11 +49,32 @@ jobs:
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           sudo apt-get update && sudo apt-get install -y postgresql-18 zsh
-      - name: Python venv for the sqllogictest replay
-        run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary
+      # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
+      # the crash-torture and fuzz harnesses, which use its API directly.
+      - name: Python venv for the differential harnesses
+        run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'
       - name: Measure
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
           POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
+          COVERAGE_SHARD: ${{ matrix.shard }}
+          COVERAGE_LCOV: ${{ github.workspace }}/coverage-${{ matrix.name }}.lcov
         run: sh tools/coverage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov-${{ matrix.name }}
+          path: coverage-*.lcov
+
+  merge-and-gate:
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lcov-*
+          merge-multiple: true
+      - name: Union the shards and hold the floor
+        run: python3 tools/coverage-merge.py 70 coverage-*.lcov

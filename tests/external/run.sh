@@ -22,7 +22,32 @@ MINIO_CONTAINER=pos3ql-external-minio
 
 PASS=0
 FAIL=0
-step() { print -- "\n=== $1 ==="; }
+
+# The suite is sharded on CI so no job runs past its time budget:
+# POS3QL_RUN_GROUPS selects a comma-separated subset of the step groups
+# below, and unset (or "all") runs everything. The groups are independent —
+# each talks to its own tables, server or bucket prefix — so any subset is
+# a complete run of what it selects.
+#   proto      psql golden files, protocol versions, raw wire probes,
+#              the psycopg driver suite and the \copy round trip
+#   dur        durability cycles on the main server: kill -9 recovery,
+#              async WAL rebuild, commit-durable-on-bucket, cold start
+#   spill      overlay map pressure and beyond-memtable ingest/compaction
+#   torture    randomized crash torture against real PostgreSQL
+#   tls        the durability cycle over HTTPS
+#   spilldiff  the differential suites (plain and forced-spill)
+SELECTED_GROUPS=${POS3QL_RUN_GROUPS:-all}
+want() { [[ "$SELECTED_GROUPS" == all || ",$SELECTED_GROUPS," == *",$1,"* ]] }
+
+# Every step reports its wall-clock cost so a slow CI shard names its
+# culprit instead of being a 15-minute mystery.
+typeset -F SECONDS
+STEP_TITLE=""
+STEP_STARTED=0.0
+step_close() {
+  [[ -n "$STEP_TITLE" ]] && printf 'step time: %.1fs  (%s)\n' $((SECONDS - STEP_STARTED)) "$STEP_TITLE"
+}
+step() { step_close; STEP_TITLE=$1; STEP_STARTED=$SECONDS; print -- "\n=== $1 ==="; }
 ok()   { PASS=$((PASS+1)); print -- "PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
 
@@ -108,6 +133,8 @@ psql_run() { # <name>
   fi
 }
 
+if want proto; then
+
 step "psql golden tests (SQL dialect over the wire)"
 psql_run basic
 psql_run errors
@@ -142,6 +169,23 @@ then
 else
   bad "psycopg driver suite"; cat "$WORK/driver.out"
 fi
+
+step "COPY: client-side round trip through psql \\copy"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
+  -c "CREATE TABLE copy_rt (id int, v text, w text)" \
+  -c "INSERT INTO copy_rt VALUES (1, E'tab\\there', 'plain'), (2, E'nl\\nhere', NULL), (3, 'back\\slash', 'x')"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "\\copy copy_rt TO '$WORK/copy_rt.tsv'"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
+  -c "CREATE TABLE copy_rt2 (id int, v text, w text)" \
+  -c "\\copy copy_rt2 FROM '$WORK/copy_rt.tsv'"
+out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A \
+  -c "SELECT count(*) FROM copy_rt2 t2 JOIN copy_rt t ON t.id = t2.id AND t.v = t2.v AND t.w IS NOT DISTINCT FROM t2.w" 2>&1)
+[[ "$out" == "3" ]] && ok "psql \\copy round trip (escapes and NULLs intact)" \
+  || bad "copy round trip: '$out'"
+
+fi # proto
+
+if want dur; then
 
 step "durability: kill -9, restart, data intact"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
@@ -261,6 +305,28 @@ kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
   && ok "commit-durable-on-bucket by default (no drain pause, no checkpoint)" \
   || bad "commit-durable-on-bucket default: '$out'"
 
+step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
+"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CHECKPOINT"
+kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
+rm -rf "$WORK/data"
+"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+for i in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT v FROM crashy ORDER BY id LIMIT 1" 2>&1)
+[[ "$out" == "pre-crash" ]] && ok "cold start from bucket" || bad "cold start from bucket: '$out'"
+# Schemas and their contents rebuild from the manifest alone (wiped disk).
+ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
+  -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v)" 2>&1)
+[[ "$ns" == "1|7" ]] && ok "schema objects survive a cold start" \
+  || bad "schema objects after cold start: '$ns'"
+
+fi # dur
+
+if want spill; then
+
 step "row count beyond table_rows: the map is an overlay, the bucket is the table"
 # A table_rows far below the dataset: the row map holds only the working
 # set, and reads, counts, updates, deletes and the cold start below all
@@ -314,37 +380,6 @@ out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -t -A -F'|' \
 kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
 [[ "$out" == "4950|updated" ]] && ok "wiped-disk cold start of a dataset larger than table_rows" \
   || bad "overlay cold start: '$out'"
-
-step "COPY: client-side round trip through psql \\copy"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
-  -c "CREATE TABLE copy_rt (id int, v text, w text)" \
-  -c "INSERT INTO copy_rt VALUES (1, E'tab\\there', 'plain'), (2, E'nl\\nhere', NULL), (3, 'back\\slash', 'x')"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "\\copy copy_rt TO '$WORK/copy_rt.tsv'"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
-  -c "CREATE TABLE copy_rt2 (id int, v text, w text)" \
-  -c "\\copy copy_rt2 FROM '$WORK/copy_rt.tsv'"
-out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A \
-  -c "SELECT count(*) FROM copy_rt2 t2 JOIN copy_rt t ON t.id = t2.id AND t.v = t2.v AND t.w IS NOT DISTINCT FROM t2.w" 2>&1)
-[[ "$out" == "3" ]] && ok "psql \\copy round trip (escapes and NULLs intact)" \
-  || bad "copy round trip: '$out'"
-
-step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "CHECKPOINT"
-kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
-rm -rf "$WORK/data"
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
-out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT v FROM crashy ORDER BY id LIMIT 1" 2>&1)
-[[ "$out" == "pre-crash" ]] && ok "cold start from bucket" || bad "cold start from bucket: '$out'"
-# Schemas and their contents rebuild from the manifest alone (wiped disk).
-ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
-  -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v)" 2>&1)
-[[ "$ns" == "1|7" ]] && ok "schema objects survive a cold start" \
-  || bad "schema objects after cold start: '$ns'"
 
 step "ingest beyond memtable_bytes: rows spill to the bucket and read back"
 # The Stage D milestone: sustained inserts well past the heap's capacity,
@@ -411,6 +446,10 @@ merged_cold=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' \
   || bad "merged-list cold start (got: $merged_cold)"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
 
+fi # spill
+
+if want torture; then
+
 step "crash torture: random DML + kill -9 + cold starts vs real PostgreSQL"
 TORTURE_PGBIN="${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}"
 if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBIN/postgres" ]]; then
@@ -445,16 +484,9 @@ else
   print -- "SKIP: torture needs POS3QL_VENV and a reference PostgreSQL"
 fi
 
-step "differential vs real PostgreSQL 18 (when installed)"
-if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
-  if tests/external/differential.sh > "$WORK/differential.out" 2>&1; then
-    ok "differential suite ($(grep -c '^PASS' "$WORK/differential.out") corpora)"
-  else
-    bad "differential suite"; tail -30 "$WORK/differential.out"
-  fi
-else
-  print -- "SKIP: real PostgreSQL 18 not installed"
-fi
+fi # torture
+
+if want tls; then
 
 step "TLS to the bucket: durability cycle over HTTPS (rustls, isolated)"
 # A second MinIO with a self-signed certificate (MinIO enables TLS when certs
@@ -524,6 +556,21 @@ else
   print -- "SKIP: docker cannot mount $WORK for MinIO TLS certs"
 fi
 
+fi # tls
+
+if want spilldiff; then
+
+step "differential vs real PostgreSQL 18 (when installed)"
+if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
+  if tests/external/differential.sh > "$WORK/differential.out" 2>&1; then
+    ok "differential suite ($(grep -c '^PASS' "$WORK/differential.out") corpora)"
+  else
+    bad "differential suite"; tail -30 "$WORK/differential.out"
+  fi
+else
+  print -- "SKIP: real PostgreSQL 18 not installed"
+fi
+
 step "forced-spill differential: the whole suite with a 256KiB memtable over the bucket"
 # Every corpus and sqllogictest block runs against a pos3ql whose memtable is
 # three orders of magnitude under the dataset churn, so ordinary queries
@@ -548,6 +595,9 @@ else
   print -- "SKIP: forced-spill differential needs real PostgreSQL 18"
 fi
 
+fi # spilldiff
+
 step "summary"
+print -- "groups: $SELECTED_GROUPS"
 print -- "passed: $PASS  failed: $FAIL"
 [[ $FAIL -eq 0 ]]

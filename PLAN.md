@@ -887,6 +887,21 @@ missing scientific notation (B-166), the absent `pg_indexes` view, and
 `real`-is-really-float8 recorded open as B-167 (its own PR, the smallint
 playbook). The storage half came through the sweep clean.
 
+The sweep also exposed a CI blind spot the moment coverage.sh started
+printing run.sh's FAIL lines: crash torture had failed on **every** main
+coverage run since it landed — dead on `import psycopg` (the CI venv only
+carried psycopg2) and reduced to one uncounted NOTE line by the tolerant
+path built for docker-less laptops (B-168). The repair is structural, and it
+also brought the coverage job under the 15-minute CI ceiling (it ran ~30
+minutes; the policy is that **no CI job runs past 15**): run.sh's steps are
+now grouped (`POS3QL_RUN_GROUPS` — proto, dur, spill, torture, tls,
+spilldiff, each self-contained) with per-step wall-clock reporting, and the
+coverage workflow fans out into five parallel shards (`COVERAGE_SHARD`),
+each running its slice *strictly* — a failing step fails the shard — and
+exporting an lcov tracefile; `tools/coverage-merge.py` unions the shards
+and holds the 70% floor over the merged whole, since one shard's percentage
+alone means nothing.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

@@ -960,20 +960,23 @@ The sweep also turned up four Boyscout fixes (float→int now ties to even;
 smallint/real UNION unifies) and one honest open item, B-170 (shortest-float
 boundary output), since fixed for `real` — see below.
 
-### Exact real output via PostgreSQL's Ryū (2026-07-25, B-170)
+### Exact float output via PostgreSQL's Ryū (2026-07-25, B-170 — closed)
 
-`real` output diverged from PostgreSQL in ~0.3% of values (B-170). The cause,
-pinned precisely: PostgreSQL builds its Ryū float formatter **without**
-`STRICTLY_SHORTEST`, so `acceptBounds` is always false and it keeps an extra
-digit at rounding boundaries (`87535936::real` → `8.7535936e+07`, where Rust's
-`{:e}` gives the equally-valid `8.753594e+07`) — not the tie-to-even rounding
-first suspected. Fixed by porting PostgreSQL 18.4's exact `src/common/f2s.c`
-Ryū into `src/sql/ryu.rs` (`f32_shortest`, `acceptBounds = false`, verbatim
-tables) and feeding its digits into the shared notation formatter. 4000+
-random f32 bit patterns (subnormals included) now diff empty against
-PostgreSQL. `double precision` still formats through Rust's `{:e}` (~0.07% of
-values differ in the last digit); the same fix applies through a `d2s` port
-(the larger 128-bit `d2s_full_table.h` tables) in its own PR.
+`real` and `double precision` output diverged from PostgreSQL at rounding
+boundaries (~0.3% of reals, ~0.07% of float8s). The cause, pinned precisely:
+PostgreSQL builds its Ryū float formatter **without** `STRICTLY_SHORTEST`, so
+`acceptBounds` is always false and it keeps an extra digit at rounding
+boundaries (`87535936::real` → `8.7535936e+07`, where Rust's `{:e}` gives the
+equally-valid `8.753594e+07`; `632900811120955.2::float8` likewise) — not the
+tie-to-even rounding first suspected. Fixed by porting PostgreSQL 18.4's exact
+`src/common/f2s.c` and `d2s.c` Ryū into `src/sql/ryu.rs` (`f32_shortest`/
+`f64_shortest`, `acceptBounds = false`) and feeding the digits into the shared
+notation formatter. The f32 tables are transcribed verbatim; the larger 128-bit
+double tables are generated from the Ryū definition (`DOUBLE_POW5_BITCOUNT`
+121, inverse 122) and validated to match PostgreSQL. 4000+ random f32 and
+10000+ random f64 bit patterns — subnormals and the extremes (`5e-324`,
+`DBL_MAX`) included — diff empty against PostgreSQL. Both types are now
+byte-exact; B-170 is closed.
 
 ### ALTER TABLE ALTER COLUMN family (2026-07-25)
 

@@ -8,8 +8,10 @@
 DROP TABLE IF EXISTS f4;
 
 -- Boundary cases where Rust's shortest-float and PostgreSQL's Ryū disagree
--- (PostgreSQL keeps the extra digit): these must match PostgreSQL now.
+-- (PostgreSQL keeps the extra digit): these must match PostgreSQL now. Both
+-- real and double precision go through PostgreSQL's Ryū.
 SELECT 87535936::real, 59326392::real, 3188318.25::real, 1.0000005e6::real;
+SELECT 632900811120955.2::float8, 563195025258225.2::float8, 5e-324::float8, 1.7976931348623157e308::float8;
 
 -- Output: the fixed/scientific window differs from float8's [-4, 15). Values
 -- that need f32 rounding (12345678, 0.100000001, 16777217) are the whole point.

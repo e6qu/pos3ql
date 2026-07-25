@@ -40,6 +40,20 @@ impl ResultFmt {
 /// A deterministic emitter of one COPY row's escaped bytes.
 pub type CopyRowWriter<'a> = dyn Fn(&mut dyn FnMut(&[u8])) + 'a;
 
+/// Where a full send buffer drains (blocking) so arbitrarily large results
+/// stream instead of failing with 54000: nowhere, a raw fd (plaintext), or the
+/// connection's TLS session (the plaintext is encrypted, then written to the
+/// blocking socket). The borrows share the Responder's lifetime — all are
+/// disjoint fields of the same connection, live for the streamed query.
+pub enum FlushSink<'b> {
+    None,
+    Fd(i32),
+    Tls {
+        session: &'b mut crate::pg::tls::ServerSession,
+        socket: &'b mut std::net::TcpStream,
+    },
+}
+
 pub struct Responder<'b> {
     pub buffer: &'b mut FixedBuf,
     /// Extended-protocol Execute must not resend RowDescription (the
@@ -47,11 +61,9 @@ pub struct Responder<'b> {
     suppress_row_description: bool,
     /// Per-column result format requested by Bind.
     formats: ResultFmt,
-    /// When set, a full send buffer is drained to this fd (blocking) and
-    /// the message retried, so arbitrarily large results stream instead of
-    /// failing with 54000. The fd is put in blocking mode by the caller for
-    /// the duration.
-    flush_fd: Option<i32>,
+    /// Where a full send buffer drains so large results stream. The socket is
+    /// put in blocking mode by the caller for the duration.
+    flush: FlushSink<'b>,
     /// Session value-rendering settings (DateStyle, time zone).
     render: crate::sql::guc::RenderContext,
 }
@@ -62,7 +74,7 @@ impl<'b> Responder<'b> {
             buffer,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
-            flush_fd: None,
+            flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
         }
     }
@@ -72,7 +84,7 @@ impl<'b> Responder<'b> {
             buffer,
             suppress_row_description: true,
             formats,
-            flush_fd: None,
+            flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
         }
     }
@@ -84,7 +96,7 @@ impl<'b> Responder<'b> {
             buffer,
             suppress_row_description: false,
             formats,
-            flush_fd: None,
+            flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
         }
     }
@@ -92,7 +104,18 @@ impl<'b> Responder<'b> {
     /// Enables streaming: a full buffer drains to `fd` and the message is
     /// retried. `fd` must be a blocking socket for the drain to complete.
     pub fn with_flush(mut self, fd: i32) -> Self {
-        self.flush_fd = Some(fd);
+        self.flush = FlushSink::Fd(fd);
+        self
+    }
+
+    /// Enables streaming over a TLS session: a full buffer is encrypted and
+    /// written to the (blocking) socket, then the message is retried.
+    pub fn with_flush_tls(
+        mut self,
+        session: &'b mut crate::pg::tls::ServerSession,
+        socket: &'b mut std::net::TcpStream,
+    ) -> Self {
+        self.flush = FlushSink::Tls { session, socket };
         self
     }
 
@@ -107,34 +130,46 @@ impl<'b> Responder<'b> {
         self.render = render;
     }
 
-    /// Drains the whole send buffer to the flush fd, blocking. Returns
-    /// whether it fully drained (false = the fd errored).
-    fn drain_to_fd(&mut self) -> bool {
-        let Some(fd) = self.flush_fd else {
-            return false;
-        };
-        while !self.buffer.is_empty() {
-            let data = self.buffer.readable();
-            let n = unsafe {
-                libc::write(fd, data.as_ptr().cast(), data.len())
-            };
-            if n > 0 {
-                self.buffer.consume(n as usize);
-            } else if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+    /// Drains the whole send buffer to the flush sink, blocking. Returns
+    /// whether it fully drained (false = the sink errored or there is none).
+    fn drain(&mut self) -> bool {
+        match &mut self.flush {
+            FlushSink::None => false,
+            FlushSink::Fd(fd) => {
+                let fd = *fd;
+                while !self.buffer.is_empty() {
+                    let data = self.buffer.readable();
+                    let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+                    if n > 0 {
+                        self.buffer.consume(n as usize);
+                    } else if n < 0 {
+                        if std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        return false;
+                    } else {
+                        return false;
+                    }
                 }
-                return false;
-            } else {
-                return false;
+                true
+            }
+            FlushSink::Tls { session, socket } => {
+                // Encrypt the whole buffer through the session onto the blocking
+                // socket, then mark it consumed in one step.
+                if !session.write_all_blocking(socket, self.buffer.readable()) {
+                    return false;
+                }
+                let n = self.buffer.readable().len();
+                self.buffer.consume(n);
+                true
             }
         }
-        true
     }
 
     /// Builds a message with `build`; on a full buffer, drains to the flush
-    /// fd (if streaming) and retries once.
+    /// sink (if streaming) and retries once.
     fn with_retry(
         &mut self,
         build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
@@ -143,7 +178,7 @@ impl<'b> Responder<'b> {
         match build(self.buffer) {
             Ok(()) => Ok(()),
             Err(WireFull) => {
-                if self.flush_fd.is_none() {
+                if matches!(self.flush, FlushSink::None) {
                     return Err(WireFull);
                 }
                 self.buffer.truncate_to(mark);
@@ -151,7 +186,7 @@ impl<'b> Responder<'b> {
                     // The message alone exceeds the whole buffer.
                     return Err(WireFull);
                 }
-                if !self.drain_to_fd() {
+                if !self.drain() {
                     return Err(WireFull);
                 }
                 build(self.buffer)

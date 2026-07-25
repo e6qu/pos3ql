@@ -101,7 +101,7 @@ pub(super) fn build_context(
         let pem = std::fs::read_to_string(ca_file)
             .map_err(|e| format!("s3_tls_ca_file {ca_file}: {e}"))?;
         let mut added = 0usize;
-        for der in pem_certificates(&pem)? {
+        for der in crate::pem::certificates(&pem)? {
             roots
                 .add(rustls::pki_types::CertificateDer::from(der))
                 .map_err(|e| format!("s3_tls_ca_file {ca_file}: bad certificate: {e}"))?;
@@ -119,57 +119,3 @@ pub(super) fn build_context(
     Ok(TlsContext { config: Arc::new(config), server_name })
 }
 
-/// Extracts the DER payloads of every `-----BEGIN CERTIFICATE-----` block in
-/// a PEM file, decoding the base64 by hand (the codebase already refuses a
-/// base64 dependency; startup-only, allocation still free).
-fn pem_certificates(pem: &str) -> Result<Vec<Vec<u8>>, String> {
-    let mut out = Vec::new();
-    let mut in_block = false;
-    let mut b64 = String::new();
-    for line in pem.lines() {
-        let line = line.trim();
-        if line == "-----BEGIN CERTIFICATE-----" {
-            in_block = true;
-            b64.clear();
-        } else if line == "-----END CERTIFICATE-----" {
-            in_block = false;
-            out.push(base64_decode(&b64)?);
-        } else if in_block {
-            b64.push_str(line);
-        }
-    }
-    Ok(out)
-}
-
-fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
-    const BAD: u8 = 0xFF;
-    fn value(c: u8) -> u8 {
-        match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => BAD,
-        }
-    }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for &c in text.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let v = value(c);
-        if v == BAD {
-            return Err("invalid base64 in certificate".to_string());
-        }
-        acc = (acc << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Ok(out)
-}

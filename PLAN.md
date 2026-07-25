@@ -860,10 +860,20 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   database restores into real PostgreSQL, and vice versa* — which doubles as the
   forcing function for the remaining `pg_catalog` completeness (`\d table`,
   B-033). The extended-protocol COPY sub-flow is refused pending its own wiring.
-- **Server-side TLS for clients** — the SSLRequest probe is answered `N`
-  today. The isolated rustls component and the budgeted `tls_scope` machinery
-  exist for the S3 side; pointing the same component at the server socket is
-  now a bounded task, not a policy question.
+- **Server-side TLS for clients** — done. With `tls_on` (plus `tls_cert_file`
+  and `tls_key_file`), the SSLRequest probe is answered `S` and the connection
+  negotiates TLS; a client that does not ask for TLS still connects in the
+  clear, and GSSAPI encryption is declined. Unlike the blocking S3 client, the
+  server socket is non-blocking and reactor-driven, so it uses the low-level
+  rustls `read_tls`/`process_new_packets`/`write_tls` API rather than
+  `StreamOwned`: `recv`/`send` tunnel through the session, `wants_write` covers
+  rustls's outbound queue so write-interest tracks it, and the large-result
+  streaming drain encrypts through the session onto the (blocking) socket. Every
+  runtime rustls call runs inside `mem::guard::tls_scope`; the `tls_pool_bytes`
+  budget is grown by `max_connections` server sessions at startup, and each
+  session is dropped inside a scope so its buffers are credited back. Verified
+  against real psql over `sslmode=require` (TLS 1.3), including a byte-exact
+  500 KiB streamed result and plaintext coexistence.
 - **ALTER TABLE breadth** — done: ADD/DROP/RENAME COLUMN, RENAME TO, SET
   SCHEMA, `ALTER COLUMN TYPE [USING]`, `SET`/`DROP NOT NULL`, `SET`/`DROP
   DEFAULT`, `ADD`/`DROP`/`RENAME CONSTRAINT` — the metadata changes journal

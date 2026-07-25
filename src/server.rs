@@ -50,6 +50,8 @@ pub struct Server {
     /// Pre-rendered "too many connections" ErrorResponse for refusals.
     refusal: ([u8; 128], usize),
     auth: AuthContext,
+    /// Server-side TLS configuration, built at startup when `tls_on`.
+    tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// Read end of the shutdown self-pipe.
     shutdown_read: i32,
 }
@@ -206,6 +208,17 @@ impl Server {
             scram,
         };
 
+        // Built here, before the allocator freezes, so its startup allocations
+        // are free; runtime session work is charged to the TLS pool.
+        let tls_config = if config.tls_on {
+            Some(
+                crate::pg::tls::build_server_config(&config.tls_cert_file, &config.tls_key_file)
+                    .map_err(|e| ServerSetupError::Io("tls", std::io::Error::other(e)))?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             reactor,
             listener,
@@ -216,6 +229,7 @@ impl Server {
             next_conn_id: 1,
             refusal,
             auth,
+            tls_config,
             shutdown_read: pipe_fds[0],
         })
     }
@@ -381,7 +395,12 @@ impl Server {
             return;
         }
         let after = if readable {
-            slot.conn.on_readable(&mut self.engine, &self.cancel_key, &self.auth)
+            slot.conn.on_readable(
+                &mut self.engine,
+                &self.cancel_key,
+                &self.auth,
+                self.tls_config.as_ref(),
+            )
         } else if writable {
             slot.conn.on_writable()
         } else {

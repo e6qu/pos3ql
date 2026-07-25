@@ -122,8 +122,16 @@ pub struct Config {
     /// Extra PEM root certificates for `s3_tls` (self-signed test
     /// endpoints); empty = the compiled-in Mozilla roots alone.
     pub s3_tls_ca_file: String,
-    /// Byte budget for the isolated TLS component's allocations.
+    /// Byte budget for the isolated TLS component's allocations (the S3 client
+    /// and, when `tls_on`, every server-side session).
     pub tls_pool_bytes: usize,
+    /// Server-side TLS: answer the SSLRequest probe with `S` and negotiate TLS
+    /// for the client connection. Requires `tls_cert_file` and `tls_key_file`.
+    pub tls_on: bool,
+    /// PEM certificate chain presented to clients when `tls_on`.
+    pub tls_cert_file: String,
+    /// PEM private key for `tls_cert_file`.
+    pub tls_key_file: String,
     /// Per-connection staging for one COPY FROM data row (rows may split
     /// across CopyData messages). A row larger than this fails loudly.
     pub copy_line_bytes: usize,
@@ -177,6 +185,9 @@ impl Config {
             s3_tls: false,
             s3_tls_ca_file: String::new(),
             tls_pool_bytes: 4 * MIB,
+            tls_on: false,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
             copy_line_bytes: 256 * KIB,
         }
     }
@@ -304,6 +315,20 @@ impl Config {
                 }
                 "s3_tls_ca_file" => config.s3_tls_ca_file = value.to_string(),
                 "tls_pool_bytes" => config.tls_pool_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "tls_on" => {
+                    config.tls_on = match value {
+                        "on" | "true" => true,
+                        "off" | "false" => false,
+                        other => {
+                            return Err(ConfigError::at(
+                                line_no,
+                                format!("tls_on must be on or off, got '{other}'"),
+                            ))
+                        }
+                    }
+                }
+                "tls_cert_file" => config.tls_cert_file = value.to_string(),
+                "tls_key_file" => config.tls_key_file = value.to_string(),
                 "copy_line_bytes" => config.copy_line_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
@@ -319,6 +344,16 @@ impl Config {
             }
             if config.wal_upload && !seen.iter().any(|s| s == "wal_upload_sync") {
                 config.wal_upload_sync = true;
+            }
+        }
+        // Server TLS needs a certificate and a key: refuse a half-configured
+        // toggle rather than silently accept plaintext.
+        if config.tls_on {
+            if config.tls_cert_file.is_empty() {
+                return Err(ConfigError::at(0, "tls_on requires tls_cert_file".to_string()));
+            }
+            if config.tls_key_file.is_empty() {
+                return Err(ConfigError::at(0, "tls_on requires tls_key_file".to_string()));
             }
         }
         Ok(config)

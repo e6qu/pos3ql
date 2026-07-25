@@ -12,6 +12,7 @@ pub(crate) mod checkpoint;
 pub mod config;
 pub mod io;
 pub mod mem;
+pub(crate) mod pem;
 pub mod pg;
 pub(crate) mod prng;
 pub mod s3;

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod conn;
 pub mod respond;
+pub mod tls;
 pub mod wire;
 
 /// Version reported via ParameterStatus and `SHOW server_version`.

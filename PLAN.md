@@ -1009,8 +1009,16 @@ name, or a single-column PK/UNIQUE by its generated name (`<table>_pkey`,
 `47_alter_constraint`. Known gap (its own follow-up): a single-column
 UNIQUE/PK added under an *explicit* name is stored as a column flag that does
 not retain that name, so `DROP CONSTRAINT <explicit_name>` cannot find it —
-retaining names for single-column keys is the fix. Still to do: comma-
-separated multi-action lists.
+retaining names for single-column keys is the fix. `RENAME CONSTRAINT old TO
+new` followed (2026-07-25): renames a CHECK / table-level UNIQUE-or-PK / FK by
+its stored name, refusing a name already in use (42710) and a missing old name
+(42704); the renamed constraint keeps enforcement and is reachable by the new
+name. Same single-column-key naming limitation applies (a single-column
+UNIQUE/PK flag has no stored name to rename). Corpus `49_rename_constraint`.
+A related pre-existing gap surfaced and is noted for its own PR: CHECK
+constraints auto-name as `<table>_check` rather than PostgreSQL's
+`<table>_<column>_check` for column-level checks (and lack the numeric
+disambiguation suffix). Still to do: comma-separated multi-action lists.
 
 ### VACUUM and ANALYZE (2026-07-25)
 

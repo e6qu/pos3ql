@@ -1535,6 +1535,29 @@ fn alter_add_drop_constraint() {
 }
 
 #[test]
+fn alter_rename_constraint() {
+    let config = test_config("rename-constraint");
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    run_with(&mut e, &mut b, "CREATE TABLE rc (id int, a int, b int)");
+    run_with(&mut e, &mut b, "ALTER TABLE rc ADD CONSTRAINT ck0 CHECK (a > 0)");
+    run_with(&mut e, &mut b, "ALTER TABLE rc ADD CONSTRAINT u UNIQUE (b, id)");
+    run_with(&mut e, &mut b, "ALTER TABLE rc RENAME CONSTRAINT ck0 TO ck");
+    run_with(&mut e, &mut b, "ALTER TABLE rc RENAME CONSTRAINT u TO u2");
+    // Onto an existing name is 42710; a missing old name is 42704.
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TABLE rc ADD CONSTRAINT keep CHECK (a < 9); ALTER TABLE rc RENAME CONSTRAINT ck TO keep")).to_string();
+    assert!(text.contains("42710"), "{text}");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TABLE rc RENAME CONSTRAINT nope TO whatever")).to_string();
+    assert!(text.contains("42704"), "{text}");
+    // The renamed CHECK is still enforced and droppable by its new name.
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO rc VALUES (1, -1, 1)")).to_string();
+    assert!(text.contains("23514"), "{text}");
+    run_with(&mut e, &mut b, "ALTER TABLE rc DROP CONSTRAINT ck");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO rc VALUES (2, -1, 2)")).to_string();
+    assert!(!text.contains("ERROR"), "{text}");
+}
+
+#[test]
 fn vacuum_and_analyze() {
     let config = test_config("vacuum");
     let mut b = Budget::new(1 << 24);

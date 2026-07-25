@@ -2870,6 +2870,49 @@ pub fn alter_table(
                 )?;
             }
         }
+        AlterAction::RenameConstraint { from, to } => {
+            // The new name must be free among this table's constraints.
+            let taken = new_def.checks[..new_def.n_checks].iter().any(|c| c.name.as_str() == *to)
+                || new_def.uniques[..new_def.n_uniques].iter().any(|k| k.name.as_str() == *to)
+                || new_def.fkeys[..new_def.n_fkeys].iter().any(|f| f.name.as_str() == *to);
+            if taken {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "constraint \"{}\" for relation \"{}\" already exists",
+                    to,
+                    def.name.as_str()
+                ));
+            }
+            let new_name = match SqlName::parse(to) {
+                Ok(n) => n,
+                Err(e) => return sql_fail(e),
+            };
+            let renamed = new_def.checks[..new_def.n_checks]
+                .iter_mut()
+                .find(|c| c.name.as_str() == *from)
+                .map(|c| c.name = new_name)
+                .or_else(|| {
+                    new_def.uniques[..new_def.n_uniques]
+                        .iter_mut()
+                        .find(|k| k.name.as_str() == *from)
+                        .map(|k| k.name = new_name)
+                })
+                .or_else(|| {
+                    new_def.fkeys[..new_def.n_fkeys]
+                        .iter_mut()
+                        .find(|f| f.name.as_str() == *from)
+                        .map(|f| f.name = new_name)
+                })
+                .is_some();
+            if !renamed {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" for table \"{}\" does not exist",
+                    from,
+                    def.name.as_str()
+                ));
+            }
+        }
     }
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];

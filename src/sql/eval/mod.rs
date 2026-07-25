@@ -122,6 +122,7 @@ pub mod sqlstate {
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
     pub const DUPLICATE_COLUMN: &str = "42701";
     pub const DUPLICATE_ALIAS: &str = "42712";
+    pub const DUPLICATE_OBJECT: &str = "42710";
     pub const GROUPING_ERROR: &str = "42803";
     pub const WRONG_OBJECT_TYPE: &str = "42809";
     pub const INVALID_COLUMN_REFERENCE: &str = "42P10";

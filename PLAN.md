@@ -1191,17 +1191,30 @@ INFO progress this engine does not emit).
    uniqueness, CHECK, foreign keys), one transaction per COPY (aborts
    store nothing; inside BEGIN it commits and rolls back with the
    transaction), insertion-order output, and column lists both ways.
-   Non-default formats and delimiters refuse loudly (0A000) rather than
-   mis-read data; the extended-protocol COPY flow is likewise refused
-   pending its own wiring. Proven differentially: corpus 40 runs
+   Proven differentially: corpus 40 runs
    the whole surface — escape round-trips, typed columns, constraint
    aborts, transactional behavior — against real PostgreSQL, which also
    caught two fidelity bugs en route (boolean COPY output as `true`
    instead of the output function's `t`, and column-level PRIMARY KEY
    violations naming `<table>_<column>_pkey` where PostgreSQL names
-   `<table>_pkey` — the catalog already knew better). The pg_dump
-   round-trip milestone stays open pending the catalog surface pg_dump
-   itself queries.
+   `<table>_pkey` — the catalog already knew better).
+   **CSV followed (2026-07-25):** `FORMAT csv` both directions with the full
+   option set — `DELIMITER`, `NULL`, `HEADER`, `QUOTE`, `ESCAPE`,
+   `FORCE_QUOTE (*|cols)`, `FORCE_NOT_NULL`, `FORCE_NULL`, `ENCODING` — and
+   both the modern `WITH (FORMAT csv, ...)` and legacy `CSV HEADER ...`
+   spellings real tools emit. CSV quoting is exact (a field is quoted only when
+   it holds the delimiter/quote/newline, or is forced, or matches the NULL
+   string; the quote and escape characters double inside), and a CSV input row
+   is found quote-aware in the connection layer so a newline inside a quoted
+   field spans CopyData chunks rather than splitting the row. Corpus
+   `51_copy_csv` runs it against real PostgreSQL 18. **Binary format is the one
+   remaining COPY gap, refused loudly (0A000):** a faithful COPY BINARY needs a
+   per-type binary send/recv codec matching PostgreSQL's exact formats for every
+   type (the extended-protocol binary path shortcuts range/bit/multirange to
+   text), which is a genuinely large, self-contained follow-up rather than a
+   quick option. The extended-protocol COPY flow is likewise refused pending its
+   own wiring. The pg_dump round-trip milestone stays open pending the catalog
+   surface pg_dump itself queries.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;

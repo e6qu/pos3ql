@@ -664,11 +664,20 @@ impl Conn {
                 ));
             }
         }
+        let csv = copy.setup.fmt.csv;
+        let (quote, escape) = (copy.setup.fmt.quote, copy.setup.fmt.escape);
         loop {
-            let Some(line_end) = self.copy_buf.readable().iter().position(|&b| b == b'\n')
-            else {
-                // No complete line; if the buffer is full without one, the
-                // row cannot ever complete.
+            // A CSV row can carry a newline inside a quoted field, so its end is
+            // found quote-aware, not at the first newline.
+            let readable = self.copy_buf.readable();
+            let line_end = if csv {
+                crate::sql::copy::csv_row_len(readable, quote, escape)
+            } else {
+                readable.iter().position(|&b| b == b'\n')
+            };
+            let Some(line_end) = line_end else {
+                // No complete row; if the buffer is full without one, the row
+                // cannot ever complete.
                 if self.copy_buf.len() == self.copy_buf.capacity() && copy.failed.is_none() {
                     copy.failed = Some(crate::sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -681,9 +690,12 @@ impl Conn {
             self.arena.reset();
             {
                 let line = &self.copy_buf.readable()[..line_end];
-                if copy.end_seen || copy.failed.is_some() {
-                    // Draining: data after the end marker or an error is
-                    // read and dropped, never stored.
+                if copy.header_pending {
+                    // The first line is the header of column names: skip it.
+                    copy.header_pending = false;
+                } else if copy.end_seen || copy.failed.is_some() {
+                    // Draining: data after the end marker or an error is read
+                    // and dropped, never stored.
                 } else if crate::sql::copy::is_end_marker(line) {
                     copy.end_seen = true;
                 } else {
@@ -703,7 +715,12 @@ impl Conn {
             let copy = self.copy.as_mut().expect("in copy-in mode");
             self.arena.reset();
             let line = self.copy_buf.readable();
-            if !copy.end_seen && copy.failed.is_none() && !crate::sql::copy::is_end_marker(line)
+            if copy.header_pending {
+                // A header line with no trailing newline: skip it.
+                copy.header_pending = false;
+            } else if !copy.end_seen
+                && copy.failed.is_none()
+                && !crate::sql::copy::is_end_marker(line)
             {
                 match engine.copy_row_line(&copy.setup, &mut self.txn, &self.arena, line) {
                     Ok(()) => copy.count += 1,
@@ -1269,11 +1286,13 @@ impl Conn {
                 // connection enters copy-in mode and ReadyForQuery waits
                 // for CopyDone.
                 if let Some(setup) = engine.take_pending_copy() {
+                    let header_pending = setup.fmt.header;
                     self.copy = Some(CopyInProgress {
                         setup,
                         count: 0,
                         failed: None,
                         end_seen: false,
+                        header_pending,
                     });
                     self.copy_buf.clear();
                     self.recv.consume(total);
@@ -1337,6 +1356,8 @@ struct CopyInProgress {
     count: u64,
     failed: Option<crate::sql::eval::SqlError>,
     end_seen: bool,
+    /// CSV/text HEADER: the first data line is column names to skip, not a row.
+    header_pending: bool,
 }
 
 fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {

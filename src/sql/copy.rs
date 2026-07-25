@@ -183,6 +183,209 @@ pub fn is_end_marker(line: &[u8]) -> bool {
     line == b"\\."
 }
 
+/// Appends one CSV field. NULL is the (unquoted) null string; a value is quoted
+/// when forced, when it equals the null string, or when it contains the
+/// delimiter, the quote, or a newline/CR. Inside a quoted field the quote and
+/// escape characters are prefixed with the escape character (with the default
+/// escape = quote, that doubles the quote).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_field_csv(
+    out: &mut dyn FnMut(&[u8]),
+    value: Option<&str>,
+    null_str: &str,
+    delimiter: u8,
+    quote: u8,
+    escape: u8,
+    force_quote: bool,
+) {
+    let Some(text) = value else {
+        out(null_str.as_bytes());
+        return;
+    };
+    let bytes = text.as_bytes();
+    let needs_quote = force_quote
+        || text == null_str
+        || bytes.iter().any(|&b| b == delimiter || b == quote || b == b'\n' || b == b'\r');
+    if !needs_quote {
+        out(bytes);
+        return;
+    }
+    out(&[quote]);
+    let mut from = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == quote || b == escape {
+            if from < i {
+                out(&bytes[from..i]);
+            }
+            out(&[escape]);
+            from = i;
+        }
+    }
+    if from < bytes.len() {
+        out(&bytes[from..]);
+    }
+    out(&[quote]);
+}
+
+/// Parses one CSV row into `fields`. Unquoted fields split on the delimiter; a
+/// quoted field may contain the delimiter, a newline, or (by doubling or the
+/// escape character) the quote. An unquoted field equal to the null string is
+/// NULL unless FORCE_NOT_NULL names it; a quoted field is the literal string,
+/// NULL only under FORCE_NULL. A trailing CR (from CRLF) is ignored. Returns the
+/// field count.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_row_csv<'a>(
+    line: &[u8],
+    arena: &'a Arena,
+    fields: &mut [Option<&'a str>],
+    delimiter: u8,
+    quote: u8,
+    escape: u8,
+    null_str: &str,
+    force_not_null: &dyn Fn(usize) -> bool,
+    force_null: &dyn Fn(usize) -> bool,
+) -> Result<usize, SqlError> {
+    let line = match line.split_last() {
+        Some((b'\r', head)) => head,
+        _ => line,
+    };
+    let mut n = 0usize;
+    let mut at = 0usize;
+    loop {
+        if n == fields.len() {
+            return Err(sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "extra data after last expected column"
+            ));
+        }
+        let quoted = line.get(at) == Some(&quote);
+        let (text, next) = if quoted {
+            parse_quoted_csv(line, at, arena, quote, escape, delimiter)?
+        } else {
+            parse_unquoted_csv(line, at, arena, delimiter)?
+        };
+        let is_null = if quoted {
+            force_null(n) && text == null_str
+        } else {
+            text == null_str && !force_not_null(n)
+        };
+        fields[n] = if is_null { None } else { Some(text) };
+        n += 1;
+        match next {
+            Some(after) => at = after,
+            None => return Ok(n),
+        }
+    }
+}
+
+fn parse_unquoted_csv<'a>(
+    line: &[u8],
+    at: usize,
+    arena: &'a Arena,
+    delimiter: u8,
+) -> Result<(&'a str, Option<usize>), SqlError> {
+    let mut end = at;
+    while end < line.len() && line[end] != delimiter {
+        if line[end] == b'\r' {
+            return Err(literal_carriage_return());
+        }
+        end += 1;
+    }
+    let copy = arena.alloc_slice_copy(&line[at..end]).map_err(|_| copy_row_too_large())?;
+    let text = core::str::from_utf8(&*copy).map_err(|_| invalid_utf8())?;
+    let next = if end < line.len() { Some(end + 1) } else { None };
+    Ok((text, next))
+}
+
+fn parse_quoted_csv<'a>(
+    line: &[u8],
+    at: usize,
+    arena: &'a Arena,
+    quote: u8,
+    escape: u8,
+    delimiter: u8,
+) -> Result<(&'a str, Option<usize>), SqlError> {
+    let unterminated =
+        || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "unterminated CSV quoted field");
+    let buf = arena
+        .alloc_slice_with(line.len().saturating_sub(at), |_| 0u8)
+        .map_err(|_| copy_row_too_large())?;
+    let mut w = 0usize;
+    let mut i = at + 1; // past the opening quote
+    loop {
+        let &c = line.get(i).ok_or_else(unterminated)?;
+        if escape != quote && c == escape {
+            i += 1;
+            let &e = line.get(i).ok_or_else(unterminated)?;
+            buf[w] = e;
+            w += 1;
+            i += 1;
+        } else if c == quote {
+            if escape == quote && line.get(i + 1) == Some(&quote) {
+                buf[w] = quote;
+                w += 1;
+                i += 2;
+            } else {
+                i += 1; // closing quote
+                break;
+            }
+        } else {
+            buf[w] = c;
+            w += 1;
+            i += 1;
+        }
+    }
+    let text = core::str::from_utf8(&buf[..w]).map_err(|_| invalid_utf8())?;
+    let next = if i >= line.len() {
+        None
+    } else if line[i] == delimiter {
+        Some(i + 1)
+    } else {
+        return Err(sql_err!(
+            sqlstate::BAD_COPY_FILE_FORMAT,
+            "extra data after last expected column"
+        ));
+    };
+    Ok((text, next))
+}
+
+/// The length of the first complete CSV row in `buf` (up to but excluding its
+/// terminating newline), or `None` if the buffer holds no complete row yet — a
+/// newline inside a quoted field is not a row terminator, so a row can span
+/// several CopyData chunks.
+pub fn csv_row_len(buf: &[u8], quote: u8, escape: u8) -> Option<usize> {
+    let mut i = 0usize;
+    let mut in_quote = false;
+    while i < buf.len() {
+        let c = buf[i];
+        if in_quote {
+            if escape != quote && c == escape {
+                i += 2; // the escaped byte cannot end the row
+                continue;
+            }
+            if c == quote {
+                in_quote = false;
+            }
+            i += 1;
+        } else if c == quote {
+            in_quote = true;
+            i += 1;
+        } else if c == b'\n' {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn invalid_utf8() -> SqlError {
+    sql_err!(
+        sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+        "invalid byte sequence for encoding \"UTF8\""
+    )
+}
+
 fn literal_carriage_return() -> SqlError {
     sql_err!(
         sqlstate::BAD_COPY_FILE_FORMAT,
@@ -267,5 +470,62 @@ mod tests {
         assert!(is_end_marker(b"\\."));
         assert!(!is_end_marker(b"\\.."));
         assert!(!is_end_marker(b" \\."));
+    }
+
+    fn no_force(_: usize) -> bool {
+        false
+    }
+
+    fn decode_csv(line: &[u8], null: &str) -> Vec<Option<String>> {
+        let a = arena();
+        let mut fields = [None; 16];
+        let n = decode_row_csv(line, &a, &mut fields, b',', b'"', b'"', null, &no_force, &no_force)
+            .expect("decodes");
+        fields[..n].iter().map(|f| f.map(|s| s.to_string())).collect()
+    }
+
+    fn encode_csv(value: Option<&str>, null: &str, force: bool) -> String {
+        let mut out = Vec::new();
+        encode_field_csv(&mut |b| out.extend_from_slice(b), value, null, b',', b'"', b'"', force);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn csv_decodes_quoting_and_nulls() {
+        // Unquoted empty is NULL; quoted empty is the empty string.
+        assert_eq!(decode_csv(b"a,,\"\"", ""), vec![Some("a".into()), None, Some("".into())]);
+        // A quoted field carries the delimiter and doubled quotes.
+        assert_eq!(
+            decode_csv(b"\"a,b\",\"say \"\"hi\"\"\"", ""),
+            vec![Some("a,b".into()), Some("say \"hi\"".into())]
+        );
+        // The NULL string only nulls an unquoted field.
+        assert_eq!(decode_csv(b"NA,\"NA\"", "NA"), vec![None, Some("NA".into())]);
+        // A trailing CR (CRLF line ending) is ignored.
+        assert_eq!(decode_csv(b"x,y\r", ""), vec![Some("x".into()), Some("y".into())]);
+    }
+
+    #[test]
+    fn csv_encodes_only_when_needed() {
+        assert_eq!(encode_csv(Some("plain"), "", false), "plain");
+        assert_eq!(encode_csv(Some("a,b"), "", false), "\"a,b\"");
+        assert_eq!(encode_csv(Some("say \"hi\""), "", false), "\"say \"\"hi\"\"\"");
+        assert_eq!(encode_csv(Some("a\nb"), "", false), "\"a\nb\"");
+        assert_eq!(encode_csv(None, "", false), "");
+        assert_eq!(encode_csv(None, "NA", false), "NA");
+        // A value equal to the NULL string is quoted to stay distinct from NULL.
+        assert_eq!(encode_csv(Some("NA"), "NA", false), "\"NA\"");
+        // FORCE_QUOTE quotes an otherwise-plain value.
+        assert_eq!(encode_csv(Some("plain"), "", true), "\"plain\"");
+    }
+
+    #[test]
+    fn csv_row_len_respects_quotes() {
+        // A newline inside a quoted field is not the row end.
+        assert_eq!(csv_row_len(b"a,\"x\ny\",b\nrest", b'"', b'"'), Some(9));
+        // No complete row yet (quote still open).
+        assert_eq!(csv_row_len(b"a,\"x\ny", b'"', b'"'), None);
+        // Plain row.
+        assert_eq!(csv_row_len(b"a,b,c\n", b'"', b'"'), Some(5));
     }
 }

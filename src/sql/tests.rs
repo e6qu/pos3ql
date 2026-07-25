@@ -3022,26 +3022,34 @@ fn correlated_in_subquery() {
 }
 
 #[test]
-fn copy_options_beyond_default_text_are_refused() {
-    // The engine speaks COPY's text format with default delimiters — what
-    // psql and pg_dump emit. Every other option must refuse loudly rather
-    // than mis-read a data stream.
+fn copy_csv_options_supported_binary_refused() {
+    // The engine speaks COPY's text and CSV formats with their options; binary
+    // and CSV-only options misused in text mode still refuse loudly rather than
+    // mis-read a data stream.
     let (mut engine, mut budget) = test_engine();
     let ok = run_with(&mut engine, &mut budget, "CREATE TABLE c (a int)");
     assert!(!message_types(&ok).contains(&b'E'));
     for statement in [
         "COPY c TO STDOUT (FORMAT csv)",
+        "COPY c TO STDOUT (FORMAT csv, DELIMITER ';', NULL 'x', HEADER, QUOTE '#')",
+        "COPY c TO STDOUT (FORMAT text)",
+        "COPY c TO STDOUT CSV HEADER",
+    ] {
+        let out = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !message_types(&out).contains(&b'E'),
+            "{statement}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    for statement in [
         "COPY c TO STDOUT (FORMAT binary)",
-        "COPY c TO STDOUT (DELIMITER ',')",
-        "COPY c TO STDOUT (HEADER true)",
+        "COPY c TO STDOUT (FORMAT text, QUOTE '#')",
     ] {
         let out = run_with(&mut engine, &mut budget, statement);
         let text = String::from_utf8_lossy(&out).to_string();
         assert!(text.contains("0A000"), "{statement}: {text}");
     }
-    // The supported spelling stays accepted.
-    let out = run_with(&mut engine, &mut budget, "COPY c TO STDOUT (FORMAT text)");
-    assert!(!message_types(&out).contains(&b'E'), "{:?}", String::from_utf8_lossy(&out));
     // COPY FROM STDIN in a multi-statement string has nowhere to stream.
     let out = run_with(&mut engine, &mut budget, "COPY c FROM STDIN; SELECT 1");
     assert!(String::from_utf8_lossy(&out).contains("0A000"));

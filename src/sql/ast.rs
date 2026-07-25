@@ -423,6 +423,91 @@ pub struct CopyStmt<'a> {
     pub columns: &'a [&'a str],
     /// `TO STDOUT` when true; `FROM STDIN` otherwise.
     pub to: bool,
+    pub options: CopyOptions<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CopyFormat {
+    /// Tab-delimited, backslash-escaped (the default).
+    Text,
+    /// Comma-separated with double-quote quoting.
+    Csv,
+}
+
+/// The `WITH (...)` options of a COPY, as written. Character options are stored
+/// as given; the effective values (format defaults filled in) are resolved at
+/// execution. The `force_*` column lists name columns, resolved against the
+/// table there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CopyOptions<'a> {
+    pub format: CopyFormat,
+    /// Field separator; `None` = the format default (tab for text, comma CSV).
+    pub delimiter: Option<u8>,
+    /// The string that stands for NULL; `None` = the format default (`\N` text,
+    /// empty CSV).
+    pub null_string: Option<&'a str>,
+    /// CSV only: emit / expect a header line of column names.
+    pub header: bool,
+    /// CSV only: the quoting character (default `"`).
+    pub quote: Option<u8>,
+    /// CSV only: the character that escapes a quote inside a quoted field
+    /// (default: the quote character itself).
+    pub escape: Option<u8>,
+    /// CSV output: quote every column unconditionally (`FORCE_QUOTE *`).
+    pub force_quote_all: bool,
+    /// CSV output: columns to always quote.
+    pub force_quote: &'a [&'a str],
+    /// CSV input: columns whose empty unquoted field is the empty string, not
+    /// NULL, even when it matches the NULL string.
+    pub force_not_null: &'a [&'a str],
+    /// CSV input: columns whose quoted value matching the NULL string is NULL.
+    pub force_null: &'a [&'a str],
+}
+
+impl CopyOptions<'_> {
+    /// The default text-format options.
+    pub const TEXT: CopyOptions<'static> = CopyOptions {
+        format: CopyFormat::Text,
+        delimiter: None,
+        null_string: None,
+        header: false,
+        quote: None,
+        escape: None,
+        force_quote_all: false,
+        force_quote: &[],
+        force_not_null: &[],
+        force_null: &[],
+    };
+
+    /// The effective field delimiter.
+    pub fn delimiter_byte(&self) -> u8 {
+        self.delimiter.unwrap_or(match self.format {
+            CopyFormat::Text => b'\t',
+            CopyFormat::Csv => b',',
+        })
+    }
+
+    /// The effective quote character (CSV).
+    pub fn quote_byte(&self) -> u8 {
+        self.quote.unwrap_or(b'"')
+    }
+
+    /// The effective escape character (CSV): the quote character by default.
+    pub fn escape_byte(&self) -> u8 {
+        self.escape.unwrap_or_else(|| self.quote_byte())
+    }
+
+    /// The effective NULL sentinel.
+    pub fn null_str(&self) -> &str {
+        self.null_string.unwrap_or(match self.format {
+            CopyFormat::Text => "\\N",
+            CopyFormat::Csv => "",
+        })
+    }
+
+    pub fn is_csv(&self) -> bool {
+        matches!(self.format, CopyFormat::Csv)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

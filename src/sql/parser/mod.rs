@@ -1367,21 +1367,16 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.unexpected("expected FROM or TO"));
         };
-        // Options: `WITH (FORMAT text)` and friends. Only the text format
-        // with default delimiters is implemented; anything else must fail
-        // loudly rather than mis-read data.
+        // Options: both the modern `WITH (FORMAT csv, HEADER, ...)` list and the
+        // legacy bare `[WITH] CSV HEADER DELIMITER 'x' ...` shorthand real tools
+        // still emit. Binary format and unknown options fail loudly rather than
+        // mis-read data.
+        let mut options = CopyOptions::TEXT;
         let _ = self.eat_ident("with")?;
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             loop {
-                let option = self.any_ident("COPY option")?;
-                let supported = match option {
-                    "format" => self.eat_ident("text")?,
-                    _ => false,
-                };
-                if !supported {
-                    return Err(self.unsupported_copy_option(option));
-                }
+                self.copy_modern_option(&mut options)?;
                 if self.peeked == Tok::Op(",") {
                     self.advance()?;
                     continue;
@@ -1392,15 +1387,233 @@ impl<'a> Parser<'a> {
                 return Err(self.unexpected("expected ')'"));
             }
             self.advance()?;
+        } else {
+            while self.copy_legacy_option(&mut options)? {}
         }
+        self.validate_copy_options(&options)?;
         let columns = self.arena_slice(&columns[..n_columns])?;
-        Ok(Stmt::Copy(crate::sql::ast::CopyStmt { table, columns, to }))
+        Ok(Stmt::Copy(crate::sql::ast::CopyStmt { table, columns, to, options }))
     }
 
-    fn unsupported_copy_option(&self, option: &str) -> ParseError {
+    /// One option inside `COPY ... WITH ( ... )`.
+    fn copy_modern_option(&mut self, options: &mut CopyOptions<'a>) -> Result<(), ParseError> {
+        let option = self.any_ident("COPY option")?;
+        match option {
+            "format" => {
+                let format = self.any_ident("COPY format")?;
+                options.format = match format {
+                    "text" => CopyFormat::Text,
+                    "csv" => CopyFormat::Csv,
+                    "binary" => return Err(self.copy_unsupported("COPY format \"binary\"")),
+                    other => {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(96, "COPY format \"{}\" does not exist", other),
+                            sqlstate: sqlstate::UNDEFINED_OBJECT,
+                        })
+                    }
+                };
+            }
+            "delimiter" => options.delimiter = Some(self.copy_char("DELIMITER")?),
+            "null" => options.null_string = Some(self.copy_string("NULL")?),
+            "quote" => options.quote = Some(self.copy_char("QUOTE")?),
+            "escape" => options.escape = Some(self.copy_char("ESCAPE")?),
+            "header" => options.header = self.copy_bool_default_true()?,
+            "encoding" => self.copy_encoding()?,
+            "force_quote" => {
+                if self.eat_op("*")? {
+                    options.force_quote_all = true;
+                } else {
+                    options.force_quote = self.copy_column_list()?;
+                }
+            }
+            "force_not_null" => options.force_not_null = self.copy_column_list()?,
+            "force_null" => options.force_null = self.copy_column_list()?,
+            "freeze" | "oids" | "on_error" | "log_verbosity" | "default" => {
+                return Err(self.copy_unsupported_option(option))
+            }
+            _ => return Err(self.copy_unsupported_option(option)),
+        }
+        Ok(())
+    }
+
+    /// One legacy bare option; returns whether one was consumed.
+    fn copy_legacy_option(&mut self, options: &mut CopyOptions<'a>) -> Result<bool, ParseError> {
+        if self.eat_ident("binary")? {
+            return Err(self.copy_unsupported("COPY WITH BINARY"));
+        }
+        if self.eat_ident("csv")? {
+            options.format = CopyFormat::Csv;
+        } else if self.eat_ident("header")? {
+            options.header = true;
+        } else if self.eat_ident("delimiter")? {
+            let _ = self.eat_ident("as")?;
+            options.delimiter = Some(self.copy_char("DELIMITER")?);
+        } else if self.eat_ident("null")? {
+            let _ = self.eat_ident("as")?;
+            options.null_string = Some(self.copy_string("NULL")?);
+        } else if self.eat_ident("quote")? {
+            let _ = self.eat_ident("as")?;
+            options.quote = Some(self.copy_char("QUOTE")?);
+        } else if self.eat_ident("escape")? {
+            let _ = self.eat_ident("as")?;
+            options.escape = Some(self.copy_char("ESCAPE")?);
+        } else if self.eat_ident("encoding")? {
+            let _ = self.eat_ident("as")?;
+            self.copy_encoding()?;
+        } else if self.eat_ident("force")? {
+            if self.eat_ident("quote")? {
+                if self.eat_op("*")? {
+                    options.force_quote_all = true;
+                } else {
+                    options.force_quote = self.copy_column_list()?;
+                }
+            } else if self.eat_ident("not")? {
+                self.expect_ident("null")?;
+                options.force_not_null = self.copy_column_list()?;
+            } else {
+                self.expect_ident("null")?;
+                options.force_null = self.copy_column_list()?;
+            }
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The CSV-only options are meaningless in text format, exactly as
+    /// PostgreSQL rejects them.
+    fn validate_copy_options(&self, options: &CopyOptions) -> Result<(), ParseError> {
+        if !options.is_csv() {
+            let csv_only = if options.quote.is_some() {
+                Some("QUOTE")
+            } else if options.escape.is_some() {
+                Some("ESCAPE")
+            } else if options.force_quote_all || !options.force_quote.is_empty() {
+                Some("FORCE_QUOTE")
+            } else if !options.force_not_null.is_empty() {
+                Some("FORCE_NOT_NULL")
+            } else if !options.force_null.is_empty() {
+                Some("FORCE_NULL")
+            } else {
+                None
+            };
+            if let Some(name) = csv_only {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "COPY {} requires CSV mode", name),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A single-byte character option (`DELIMITER`, `QUOTE`, `ESCAPE`).
+    fn copy_char(&mut self, what: &'static str) -> Result<u8, ParseError> {
+        let s = self.copy_string(what)?;
+        let bytes = s.as_bytes();
+        if bytes.len() != 1 {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "COPY {} must be a single one-byte character", what),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
+        Ok(bytes[0])
+    }
+
+    /// A string-literal option value.
+    fn copy_string(&mut self, what: &'static str) -> Result<&'a str, ParseError> {
+        match self.peeked {
+            Tok::Str(s) => {
+                self.advance()?;
+                Ok(s)
+            }
+            _ => Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "COPY {} requires a quoted string", what),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+            }),
+        }
+    }
+
+    /// `HEADER` with an optional boolean (`true`/`false`/`on`/`off`); bare = true.
+    fn copy_bool_default_true(&mut self) -> Result<bool, ParseError> {
+        if self.eat_ident("true")? || self.eat_ident("on")? {
+            Ok(true)
+        } else if self.eat_ident("false")? || self.eat_ident("off")? {
+            Ok(false)
+        } else if let Tok::Str(s) = self.peeked {
+            self.advance()?;
+            Ok(matches!(s, "true" | "on" | "1"))
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// `ENCODING 'utf8'` — only UTF-8 is supported; anything else is loud.
+    /// Compared case-insensitively, ignoring `-`/`_`, without allocating.
+    fn copy_encoding(&mut self) -> Result<(), ParseError> {
+        let encoding = self.copy_string("ENCODING")?;
+        let mut norm = [0u8; 12];
+        let mut n = 0usize;
+        for &b in encoding.as_bytes() {
+            if b == b'-' || b == b'_' {
+                continue;
+            }
+            if n == norm.len() {
+                return Err(self.copy_unsupported("a COPY ENCODING other than UTF8"));
+            }
+            norm[n] = b.to_ascii_lowercase();
+            n += 1;
+        }
+        if matches!(&norm[..n], b"utf8" | b"unicode") {
+            Ok(())
+        } else {
+            Err(self.copy_unsupported("a COPY ENCODING other than UTF8"))
+        }
+    }
+
+    /// A parenthesized column-name list `( a, b, ... )` for a FORCE option.
+    fn copy_column_list(&mut self) -> Result<&'a [&'a str], ParseError> {
+        if self.peeked != Tok::Op("(") {
+            return Err(self.unexpected("expected '(' for a COPY column list"));
+        }
+        self.advance()?;
+        let mut names = [""; crate::storage::MAX_COLUMNS];
+        let mut n = 0usize;
+        loop {
+            if n == names.len() {
+                return Err(self.unexpected("too many COPY columns"));
+            }
+            names[n] = self.col_ident("column name")?;
+            n += 1;
+            if self.peeked == Tok::Op(",") {
+                self.advance()?;
+                continue;
+            }
+            break;
+        }
+        if self.peeked != Tok::Op(")") {
+            return Err(self.unexpected("expected ')'"));
+        }
+        self.advance()?;
+        self.arena_slice(&names[..n])
+    }
+
+    fn copy_unsupported_option(&self, option: &str) -> ParseError {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "COPY option \"{}\" is not supported", option),
+            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+        }
+    }
+
+    fn copy_unsupported(&self, what: &str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "{} is not supported", what),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
         }
     }

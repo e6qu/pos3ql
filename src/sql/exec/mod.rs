@@ -1488,9 +1488,82 @@ pub struct CopySetup {
     pub table_index: usize,
     pub targets: [usize; MAX_COLUMNS],
     pub n_targets: usize,
+    pub fmt: CopyFmt,
 }
 
-/// Resolves a COPY statement's table and column list.
+/// The resolved, owned form of a COPY's format options — owned because a COPY
+/// FROM STDIN's [`CopySetup`] outlives the statement arena. The `force_*` fields
+/// are bitmasks over table column indices.
+#[derive(Clone, Copy)]
+pub struct CopyFmt {
+    pub csv: bool,
+    pub delimiter: u8,
+    pub quote: u8,
+    pub escape: u8,
+    pub header: bool,
+    pub null: StackStr<64>,
+    pub force_quote_all: bool,
+    pub force_quote: u64,
+    pub force_not_null: u64,
+    pub force_null: u64,
+}
+
+impl CopyFmt {
+    fn resolve(
+        def: &TableDef,
+        table_name: &str,
+        options: &crate::sql::ast::CopyOptions,
+    ) -> Result<CopyFmt, SqlError> {
+        use core::fmt::Write as _;
+        let mut null = StackStr::<64>::new();
+        let _ = null.write_str(options.null_str());
+        if null.is_truncated() {
+            return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "COPY NULL string is too long"));
+        }
+        // Resolve a FORCE column list into a bitmask over table columns.
+        let mask = |names: &[&str]| -> Result<u64, SqlError> {
+            let mut bits = 0u64;
+            for name in names {
+                let Some(index) = def.column_index(name) else {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        table_name
+                    ));
+                };
+                bits |= 1u64 << index;
+            }
+            Ok(bits)
+        };
+        let delimiter = options.delimiter_byte();
+        let quote = options.quote_byte();
+        if options.is_csv() && delimiter == quote {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY delimiter and quote must be different"
+            ));
+        }
+        Ok(CopyFmt {
+            csv: options.is_csv(),
+            delimiter,
+            quote,
+            escape: options.escape_byte(),
+            header: options.header,
+            null,
+            force_quote_all: options.force_quote_all,
+            force_quote: mask(options.force_quote)?,
+            force_not_null: mask(options.force_not_null)?,
+            force_null: mask(options.force_null)?,
+        })
+    }
+
+    fn forced(mask: u64, column: usize) -> bool {
+        column < 64 && mask & (1u64 << column) != 0
+    }
+}
+
+/// Resolves a COPY statement's table, column list, and format options.
 pub fn copy_begin(
     storage: &Storage,
     statement: &crate::sql::ast::CopyStmt,
@@ -1518,7 +1591,28 @@ pub fn copy_begin(
         }
         statement.columns.len()
     };
-    Ok(CopySetup { table_index, targets, n_targets })
+    // Direction-only options are refused as PostgreSQL does.
+    let opts = &statement.options;
+    if !statement.to && (opts.force_quote_all || !opts.force_quote.is_empty()) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY FORCE_QUOTE cannot be used with COPY FROM"
+        ));
+    }
+    if statement.to && !opts.force_not_null.is_empty() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "COPY FORCE_NOT_NULL cannot be used with COPY TO"
+        ));
+    }
+    if statement.to && !opts.force_null.is_empty() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "COPY FORCE_NULL cannot be used with COPY TO"
+        ));
+    }
+    let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
+    Ok(CopySetup { table_index, targets, n_targets, fmt })
 }
 
 /// One COPY FROM data line: text fields decode, coerce through each column's
@@ -1534,7 +1628,22 @@ pub fn copy_row(
 ) -> Result<(), SqlError> {
     let def = storage.table(setup.table_index).def;
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
-    let n_fields = crate::sql::copy::decode_row(line, arena, &mut fields[..setup.n_targets])?;
+    let fmt = &setup.fmt;
+    let n_fields = if fmt.csv {
+        crate::sql::copy::decode_row_csv(
+            line,
+            arena,
+            &mut fields[..setup.n_targets],
+            fmt.delimiter,
+            fmt.quote,
+            fmt.escape,
+            fmt.null.as_str(),
+            &|i| CopyFmt::forced(fmt.force_not_null, setup.targets[i]),
+            &|i| CopyFmt::forced(fmt.force_null, setup.targets[i]),
+        )?
+    } else {
+        crate::sql::copy::decode_row(line, arena, &mut fields[..setup.n_targets])?
+    };
     if n_fields < setup.n_targets {
         return Err(sql_err!(
             sqlstate::BAD_COPY_FILE_FORMAT,
@@ -1591,7 +1700,29 @@ pub fn copy_out(
     let def = storage.table(setup.table_index).def;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
+    let fmt = &setup.fmt;
     responder.copy_out_response(setup.n_targets).map_err(wire_to_sql)?;
+    // A header line of column names, in the same field format as the data.
+    if fmt.header {
+        responder
+            .copy_data_row(&|out| {
+                for i in 0..setup.n_targets {
+                    if i > 0 {
+                        out(&[fmt.delimiter]);
+                    }
+                    let name = def.columns()[setup.targets[i]].name.as_str();
+                    if fmt.csv {
+                        crate::sql::copy::encode_field_csv(
+                            out, Some(name), fmt.null.as_str(), fmt.delimiter, fmt.quote,
+                            fmt.escape, false,
+                        );
+                    } else {
+                        crate::sql::copy::encode_field(out, Some(name));
+                    }
+                }
+            })
+            .map_err(wire_to_sql)?;
+    }
     // Rowid order is insertion order (rowids are monotonic), which is the
     // order PostgreSQL's COPY TO emits for a freshly-loaded table. Snapshot
     // the visible tokens first, sort, then stream.
@@ -1634,9 +1765,20 @@ pub fn copy_out(
                 .copy_data_row(&|out| {
                     for (i, text) in texts.iter().enumerate().take(setup.n_targets) {
                         if i > 0 {
-                            out(b"\t");
+                            out(&[fmt.delimiter]);
                         }
-                        crate::sql::copy::encode_field(out, *text);
+                        if fmt.csv {
+                            let force = fmt.force_quote_all
+                                || CopyFmt::forced(fmt.force_quote, setup.targets[i]);
+                            crate::sql::copy::encode_field_csv(
+                                out, *text, fmt.null.as_str(), fmt.delimiter, fmt.quote,
+                                fmt.escape, force,
+                            );
+                        } else if let Some(value) = text {
+                            crate::sql::copy::encode_field(out, Some(value));
+                        } else {
+                            out(fmt.null.as_str().as_bytes());
+                        }
                     }
                 })
                 .map_err(wire_to_sql)?;

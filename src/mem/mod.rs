@@ -14,6 +14,7 @@ pub mod fixed_map;
 pub mod fixed_vec;
 pub mod guard;
 pub mod pool;
+pub mod value_index;
 
 pub use arena::{Arena, ArenaFull};
 pub use budget::{Budget, BudgetError};

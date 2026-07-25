@@ -15,7 +15,7 @@ use crate::storage::{
     CheckConstraint, ColumnMeta, ForeignKey, OwnedDatum, SqlName, Storage, TableDef, UniqueKey,
     MAX_COLUMNS, MAX_INDEX_COLS,
 };
-use crate::{sql_err, stack_format};
+use crate::sql_err;
 
 use super::apply_typmod;
 
@@ -137,8 +137,11 @@ pub(super) fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_
 
 /// Validates that every column reference in a CHECK predicate names a real
 /// column of the table being defined, and that the predicate uses no subquery
-/// (which PostgreSQL forbids in CHECK).
-fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError> {
+/// (which PostgreSQL forbids in CHECK). Each referenced column's index is OR'd
+/// into `cols` (bit `i` = column `i`), so the caller can name the constraint
+/// the way PostgreSQL does — `<table>_<column>_check` when the predicate
+/// references exactly one column, `<table>_check` otherwise.
+fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Result<(), SqlError> {
     match expression {
         Expr::SchemaColumn { table, .. } => {
             return Err(sql_err!(
@@ -155,13 +158,15 @@ fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError
             ))
         }
         Expr::Column { name, .. } => {
-            if def.column_index(name).is_none() {
+            let Some(index) = def.column_index(name) else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" does not exist",
                     name
                 ));
-            }
+            };
+            // MAX_COLUMNS is 64, so a column index always fits the u64 mask.
+            *cols |= 1u64 << index;
         }
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
         | Expr::ArraySubquery(_) => {
@@ -172,41 +177,41 @@ fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError
         }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
-        | Expr::IsNull { operand, .. } => validate_check_refs(operand, def)?,
+        | Expr::IsNull { operand, .. } => validate_check_refs(operand, def, cols)?,
         Expr::Binary { left, right, .. } => {
-            validate_check_refs(left, def)?;
-            validate_check_refs(right, def)?;
+            validate_check_refs(left, def, cols)?;
+            validate_check_refs(right, def, cols)?;
         }
         Expr::Call { args, .. } => {
             for a in *args {
-                validate_check_refs(a, def)?;
+                validate_check_refs(a, def, cols)?;
             }
         }
         Expr::InList { operand, list, .. } => {
-            validate_check_refs(operand, def)?;
+            validate_check_refs(operand, def, cols)?;
             for a in *list {
-                validate_check_refs(a, def)?;
+                validate_check_refs(a, def, cols)?;
             }
         }
         Expr::Between { operand, low, high, .. } => {
-            validate_check_refs(operand, def)?;
-            validate_check_refs(low, def)?;
-            validate_check_refs(high, def)?;
+            validate_check_refs(operand, def, cols)?;
+            validate_check_refs(low, def, cols)?;
+            validate_check_refs(high, def, cols)?;
         }
         Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            validate_check_refs(operand, def)?;
-            validate_check_refs(pattern, def)?;
+            validate_check_refs(operand, def, cols)?;
+            validate_check_refs(pattern, def, cols)?;
         }
         Expr::Case { operand, whens, otherwise, .. } => {
             if let Some(o) = operand {
-                validate_check_refs(o, def)?;
+                validate_check_refs(o, def, cols)?;
             }
             for (w, t) in *whens {
-                validate_check_refs(w, def)?;
-                validate_check_refs(t, def)?;
+                validate_check_refs(w, def, cols)?;
+                validate_check_refs(t, def, cols)?;
             }
             if let Some(o) = otherwise {
-                validate_check_refs(o, def)?;
+                validate_check_refs(o, def, cols)?;
             }
         }
         Expr::Null
@@ -220,17 +225,17 @@ fn validate_check_refs(expression: &Expr, def: &TableDef) -> Result<(), SqlError
         | Expr::DefaultMarker => {}
         Expr::Array(items) => {
             for e in *items {
-                validate_check_refs(e, def)?;
+                validate_check_refs(e, def, cols)?;
             }
         }
         Expr::Subscript { base, index } => {
-            validate_check_refs(base, def)?;
-            validate_check_refs(index, def)?;
+            validate_check_refs(base, def, cols)?;
+            validate_check_refs(index, def, cols)?;
         }
-        Expr::Field { base, .. } => validate_check_refs(base, def)?,
+        Expr::Field { base, .. } => validate_check_refs(base, def, cols)?,
         Expr::AnyAll { operand, array, .. } => {
-            validate_check_refs(operand, def)?;
-            validate_check_refs(array, def)?;
+            validate_check_refs(operand, def, cols)?;
+            validate_check_refs(array, def, cols)?;
         }
     }
     Ok(())
@@ -266,7 +271,11 @@ pub(super) fn attach_constraints(
                 for &column_index in &indices[..n] {
                     def.columns[column_index as usize].not_null = true;
                 }
-                if n == 1 {
+                // An unnamed single-column key rides the column flag with a
+                // synthesized name; an explicitly named one is a first-class
+                // key so DROP / RENAME CONSTRAINT and the violation message all
+                // see the given name (its NOT NULL is already set above).
+                if n == 1 && name.is_none() {
                     def.columns[indices[0] as usize].primary = true;
                     def.columns[indices[0] as usize].unique = true;
                 } else {
@@ -275,14 +284,15 @@ pub(super) fn attach_constraints(
             }
             TableConstraint::Unique { name, columns } => {
                 let (indices, n) = resolve_cols(def, columns)?;
-                if n == 1 {
+                if n == 1 && name.is_none() {
                     def.columns[indices[0] as usize].unique = true;
                 } else {
                     add_unique_key(def, *name, "key", &indices, n, false)?;
                 }
             }
             TableConstraint::Check { name, expression, text } => {
-                validate_check_refs(expression, def)?;
+                let mut referenced_cols = 0u64;
+                validate_check_refs(expression, def, &mut referenced_cols)?;
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -299,9 +309,7 @@ pub(super) fn attach_constraints(
                 }
                 let constraint_name = match name {
                     Some(n) => SqlName::parse(n)?,
-                    None => SqlName::parse(
-                        stack_format!(64, "{}_check", def.name.as_str()).as_str(),
-                    )?,
+                    None => auto_check_name(def, referenced_cols)?,
                 };
                 let mut c = CheckConstraint { name: constraint_name, expression: crate::util::StackStr::new() };
                 let _ = core::fmt::Write::write_str(&mut c.expression, text);
@@ -356,6 +364,87 @@ pub(super) fn auto_key_name(
         ));
     }
     SqlName::parse(nm.as_str())
+}
+
+/// PostgreSQL's auto-generated CHECK name: `<table>_<column>_check` when the
+/// predicate references exactly one column, `<table>_check` when it references
+/// zero or several — with the smallest numeric suffix (`_check1`, `_check2`, …)
+/// that avoids colliding with a constraint the table already carries.
+fn auto_check_name(def: &TableDef, referenced_cols: u64) -> Result<SqlName, SqlError> {
+    use core::fmt::Write as _;
+    let mut base = crate::util::StackStr::<64>::new();
+    let _ = write!(base, "{}", def.name.as_str());
+    if referenced_cols.count_ones() == 1 {
+        let column = referenced_cols.trailing_zeros() as usize;
+        let _ = write!(base, "_{}", def.columns()[column].name.as_str());
+    }
+    let _ = write!(base, "_check");
+    if base.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "generated constraint name is too long"
+        ));
+    }
+    disambiguate_constraint_name(def, base.as_str())
+}
+
+/// Appends the smallest numeric suffix (none, then 1, 2, …) that makes `base`
+/// unique among the table's existing constraint names — PostgreSQL's
+/// `ChooseConstraintName`. Constraint names are unique per table, so this
+/// searches the checks, keys, foreign keys, and the single-column key names
+/// synthesized from column flags.
+fn disambiguate_constraint_name(def: &TableDef, base: &str) -> Result<SqlName, SqlError> {
+    use core::fmt::Write as _;
+    if !constraint_name_taken(def, base) {
+        return SqlName::parse(base);
+    }
+    // The table's constraint arrays are all bounded (a few each), so a free
+    // suffix is found almost immediately; the ceiling is just a loud backstop.
+    for suffix in 1u32..=u16::MAX as u32 {
+        let mut candidate = crate::util::StackStr::<64>::new();
+        let _ = write!(candidate, "{}{}", base, suffix);
+        if candidate.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "generated constraint name is too long"
+            ));
+        }
+        if !constraint_name_taken(def, candidate.as_str()) {
+            return SqlName::parse(candidate.as_str());
+        }
+    }
+    Err(sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "could not find a free constraint name for \"{}\"",
+        base
+    ))
+}
+
+/// Whether `name` is already the name of any constraint on `def`: a stored
+/// CHECK, unique key, or foreign key, or one of the names synthesized for the
+/// single-column PRIMARY KEY / UNIQUE flags (`<table>_pkey` / `<table>_<col>_key`).
+fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
+    use core::fmt::Write as _;
+    if def.checks[..def.n_checks].iter().any(|c| c.name.as_str() == name)
+        || def.uniques[..def.n_uniques].iter().any(|k| k.name.as_str() == name)
+        || def.fkeys[..def.n_fkeys].iter().any(|f| f.name.as_str() == name)
+    {
+        return true;
+    }
+    for c in def.columns() {
+        let mut synthesized = crate::util::StackStr::<64>::new();
+        if c.primary {
+            let _ = write!(synthesized, "{}_pkey", def.name.as_str());
+        } else if c.unique {
+            let _ = write!(synthesized, "{}_{}_key", def.name.as_str(), c.name.as_str());
+        } else {
+            continue;
+        }
+        if !synthesized.is_truncated() && synthesized.as_str() == name {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn add_unique_key(

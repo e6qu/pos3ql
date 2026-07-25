@@ -133,6 +133,12 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   read back through bloom-gated probes and merged walks. A single
   transaction's touched rows must still fit the map, and with `s3 = off`
   (no bucket) the map bound is the table bound.
+- **Uniqueness is value-indexed.** A `PRIMARY KEY` / `UNIQUE` constraint keeps
+  an in-RAM `value → rowid` index, so a duplicate check is a hash seek rather
+  than a scan of the whole spilled dataset. It bounds a constrained table to
+  `value_index_rows` committed rows (a loud error past it) — the price of an
+  in-RAM index; lifting that bound for unboundedly-spilling *constrained* tables
+  is the persistent index forest on the roadmap.
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.

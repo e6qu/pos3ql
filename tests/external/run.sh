@@ -33,7 +33,7 @@ FAIL=0
 #   dur        durability cycles on the main server: kill -9 recovery,
 #              async WAL rebuild, commit-durable-on-bucket, cold start
 #   overlay    row-map pressure: 5000 rows through a 1024-entry map, plus
-#              bounded uniqueness enforcement across the spill boundary
+#              value-indexed uniqueness enforcement across the spill boundary
 #   ingest     beyond-memtable ingest, paced compaction, cold starts
 #   torture    randomized crash torture against real PostgreSQL
 #              (POS3QL_TORTURE_ROUNDS / POS3QL_TORTURE_SEED size one run,
@@ -363,14 +363,14 @@ for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
-# The scale table carries no unique constraint on purpose: the point here is
-# the overlay/spill read path (count, point read, update, delete, cold start)
-# over a dataset far larger than the map, and a UNIQUE/PRIMARY KEY would make
-# every insert probe the whole spilled SST forest for a duplicate — O(rows)
-# per insert, quadratic overall (B-169, the deferred secondary-index forest).
-# Uniqueness across the spill boundary is proven separately and bounded below.
+# The scale table carries a PRIMARY KEY: the value index (B-169) makes a
+# uniqueness probe a hash seek against the committed rows rather than a scan of
+# the whole spilled SST forest, so a constrained table spills and grows past its
+# overlay without the old quadratic. This exercises the overlay/spill read path
+# (count, point read, update, delete, cold start) over a constrained dataset far
+# larger than the map.
 "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q \
-  -c "CREATE TABLE big (id int, v text)"
+  -c "CREATE TABLE big (id int PRIMARY KEY, v text)"
 # 5000 rows through a 1024-entry map: batches with checkpoints between, so
 # entries spill and evict as the data outgrows the overlay.
 for batch in 0 1 2 3 4; do
@@ -389,11 +389,11 @@ out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -t -A -F'|' \
 
 # Uniqueness must hold across the spill boundary: a duplicate of a key long
 # evicted from the overlay must still be caught against its spilled row, not
-# silently inserted. Bounded at 1500 rows (past the 1024 map, enough to force
-# eviction) because the enforcing probe is the quadratic path above.
+# silently inserted. Now that the probe is a value-index seek (B-169), this runs
+# at 5000 rows — far past the 1024 map — without the old quadratic cost.
 "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q \
   -c "CREATE TABLE uniq (id int PRIMARY KEY, v text)"
-for batch in 0 1 2; do
+for batch in 0 1 2 3 4 5 6 7 8 9; do
   "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -q \
     -c "INSERT INTO uniq SELECT $batch * 500 + g, 'r' || ($batch * 500 + g) FROM generate_series(0, 499) g" \
     -c "CHECKPOINT"
@@ -401,11 +401,11 @@ done
 dup_spilled=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -t -A \
   -c "INSERT INTO uniq VALUES (5, 'dup')" 2>&1 | head -1)
 dup_fresh=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -t -A \
-  -c "INSERT INTO uniq VALUES (9999, 'fresh')" 2>&1 | head -1)
+  -c "INSERT INTO uniq VALUES (99999, 'fresh')" 2>&1 | head -1)
 uniq_count=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U ext -X -t -A \
   -c "SELECT count(*) FROM uniq" 2>&1)
-[[ "$dup_spilled" == *"duplicate key value"* && "$dup_fresh" == "INSERT 0 1" && "$uniq_count" == "1501" ]] \
-  && ok "uniqueness enforced across the spill boundary" \
+[[ "$dup_spilled" == *"duplicate key value"* && "$dup_fresh" == "INSERT 0 1" && "$uniq_count" == "5001" ]] \
+  && ok "uniqueness enforced across the spill boundary at scale" \
   || bad "spill-boundary uniqueness: dup='$dup_spilled' fresh='$dup_fresh' count='$uniq_count'"
 
 kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null

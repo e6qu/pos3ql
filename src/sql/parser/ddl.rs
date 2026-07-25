@@ -313,9 +313,37 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("default")? {
                     default = Some(self.expression(0)?);
                 } else if self.eat_ident("unique")? {
+                    // An explicitly named single-column UNIQUE desugars to a
+                    // table constraint so the name is retained; an unnamed one
+                    // rides the column flag with a synthesized name.
+                    if let Some(cons_name) = col_cons_name {
+                        if n_cons == MAX_LIST {
+                            return Err(self.limit("constraint list", MAX_LIST));
+                        }
+                        cons[n_cons] = TableConstraint::Unique {
+                            name: Some(cons_name),
+                            columns: self.arena_slice(&[col_name])?,
+                        };
+                        n_cons += 1;
+                        continue;
+                    }
                     unique = true;
                 } else if self.eat_ident("primary")? {
                     self.expect_ident("key")?;
+                    if let Some(cons_name) = col_cons_name {
+                        if n_cons == MAX_LIST {
+                            return Err(self.limit("constraint list", MAX_LIST));
+                        }
+                        cons[n_cons] = TableConstraint::PrimaryKey {
+                            name: Some(cons_name),
+                            columns: self.arena_slice(&[col_name])?,
+                        };
+                        n_cons += 1;
+                        // PRIMARY KEY implies NOT NULL; attach_constraints sets
+                        // it, but a `LIKE` copy reads the flag, so set it here.
+                        not_null = true;
+                        continue;
+                    }
                     primary = true;
                     unique = true;
                     not_null = true;

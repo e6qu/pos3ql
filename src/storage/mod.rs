@@ -13,8 +13,9 @@ use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
-use crate::sql::eval::{sqlstate, SqlError};
-use crate::sql::types::ColType;
+use crate::mem::value_index::ValueIndexPool;
+use crate::sql::eval::{hash_key, sqlstate, SqlError};
+use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::util::StackStr;
 
@@ -552,6 +553,11 @@ pub struct Table {
     pub(crate) tombstones: [u64; MAX_TOMBSTONES],
     pub(crate) n_tombstones: usize,
     pub(crate) tombstones_overflow: bool,
+    /// The value indexes accelerating this table's uniqueness/foreign-key
+    /// probes, one per constraint, rebuilt from `def` whenever the definition or
+    /// index set changes and maintained per committed row otherwise.
+    pub(crate) enforcers: [Option<Enforcer>; MAX_UNIQUE_ENFORCERS],
+    pub(crate) n_enforcers: usize,
 }
 
 /// The most delta SSTs a table accumulates before a checkpoint merges them
@@ -561,6 +567,28 @@ pub(crate) const MAX_SPILL_SSTS: usize = 8;
 /// Deletes remembered between checkpoints; past this the next checkpoint
 /// rewrites the table fully rather than lose one.
 pub(crate) const MAX_TOMBSTONES: usize = 1024;
+
+/// The most value indexes one table can carry: one per single-column
+/// UNIQUE/PRIMARY KEY flag, per multi-column key, and per UNIQUE index.
+/// Exceeding it at DDL is a loud error.
+pub(crate) const MAX_UNIQUE_ENFORCERS: usize = 16;
+
+/// A table's binding of one uniqueness constraint to its value index: the key
+/// columns it covers and the pool slot holding the `value_hash → rowid` map for
+/// the committed rows. A uniqueness probe finds the enforcer whose columns match
+/// and seeks the index instead of scanning every row (B-169's quadratic).
+#[derive(Clone, Copy)]
+pub(crate) struct Enforcer {
+    slot: u32,
+    columns: [u16; MAX_INDEX_COLS],
+    n_cols: usize,
+}
+
+impl Enforcer {
+    fn columns(&self) -> &[u16] {
+        &self.columns[..self.n_cols]
+    }
+}
 
 /// An uncommitted catalog change to one table, owned by one transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -773,6 +801,15 @@ pub struct Storage {
     /// checkpointer, plus owned reader scratch. `None` without object storage
     /// — then rows never spill and the heap-full error stands.
     spill: Option<SpillReader>,
+    /// Startup-allocated value indexes shared by every table's enforcers. Held
+    /// in an `Option` so a rebuild can take it out for the duration of a row
+    /// walk (which borrows the rest of `self`) and put it back.
+    value_indexes: Option<ValueIndexPool>,
+    /// The logical cap on a constrained table's committed rows: an enforcer's
+    /// index holds this many (plus a one-transaction headroom the physical slot
+    /// array carries), and an insert past it is a loud error. This is the price
+    /// of an in-RAM value index under unbounded spill.
+    value_index_cap: usize,
 }
 
 /// Fetches spilled rows back through the cache tiers. The buffers are owned
@@ -882,6 +919,10 @@ impl Storage {
                 + size_of::<ViewDef>()
                 + size_of::<IndexDef>())
             + MAX_SCHEMAS * size_of::<SchemaDef>()
+            + ValueIndexPool::budget_bytes(
+                config.max_value_indexes,
+                config.value_index_rows + config.table_rows,
+            )
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -918,6 +959,8 @@ impl Storage {
                     tombstones: [0; MAX_TOMBSTONES],
                     n_tombstones: 0,
                     tombstones_overflow: false,
+                    enforcers: [None; MAX_UNIQUE_ENFORCERS],
+                    n_enforcers: 0,
                 })
                 .expect("sized to max_tables");
         }
@@ -964,6 +1007,15 @@ impl Storage {
                 })
                 .expect("sized to max_tables");
         }
+        // A transaction's committed batch is bounded by the overlay, so the
+        // physical index carries the cap plus one overlay-worth of headroom: the
+        // per-row commit maintenance never overflows, while the cap itself is
+        // enforced gracefully at insert time.
+        let value_indexes = ValueIndexPool::new(
+            budget,
+            config.max_value_indexes,
+            config.value_index_rows + config.table_rows,
+        )?;
         Ok(Self {
             heap,
             tables,
@@ -975,6 +1027,8 @@ impl Storage {
             next_rowid: 1,
             lsn: 0,
             spill: None,
+            value_indexes: Some(value_indexes),
+            value_index_cap: config.value_index_rows,
         })
     }
 
@@ -2156,34 +2210,321 @@ impl Storage {
     }
 
     pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32) {
-        let table = &mut self.tables[table_index];
-        let Some(state) = table.rows.get_mut(&rowid) else {
-            return;
-        };
-        match state.pending {
-            Some(p) if p.txid == txid => {
-                state.committed = p.loc.map(RowHome::Heap);
-                state.pending = None;
-                if state.committed.is_none() {
-                    // A rowid that ever reached an SST — even if its latest
-                    // version was heap-resident — must tombstone, or a cold
-                    // start resurrects the SST's version. And until that
-                    // tombstone is *flushed*, the entry itself stays behind
-                    // as a marker (`committed: None, pending: None`): the
-                    // merged walk treats any entry as shadowing the spill
-                    // list, so the marker is what keeps the deleted row
-                    // invisible right now. `clear_tombstones` purges the
-                    // markers once an install has made the SSTs themselves
-                    // say deleted.
-                    if table.n_spill_ssts == 0 {
-                        table.rows.remove(&rowid);
-                    }
-                    Self::record_tombstone(table, rowid);
-                }
-                table.mark_dirty();
+        // Read the transition without holding a mutable borrow.
+        let (old_committed, new_loc) = {
+            let Some(state) = self.tables[table_index].rows.get(&rowid) else {
+                return;
+            };
+            match state.pending {
+                Some(p) if p.txid == txid => (state.committed, p.loc),
+                _ => return,
             }
-            _ => {}
+        };
+        // Maintain the value indexes: drop the old committed value's key, add
+        // the new one. The row images are still readable (committed not yet
+        // repointed, new bytes already in the heap).
+        self.maintain_indexes_on_commit(table_index, rowid, old_committed, new_loc);
+
+        let table = &mut self.tables[table_index];
+        let state = table.rows.get_mut(&rowid).expect("row present after read");
+        state.committed = new_loc.map(RowHome::Heap);
+        state.pending = None;
+        if state.committed.is_none() {
+            // A rowid that ever reached an SST — even if its latest version was
+            // heap-resident — must tombstone, or a cold start resurrects the
+            // SST's version. And until that tombstone is *flushed*, the entry
+            // itself stays behind as a marker (`committed: None, pending:
+            // None`): the merged walk treats any entry as shadowing the spill
+            // list, so the marker is what keeps the deleted row invisible right
+            // now. `clear_tombstones` purges the markers once an install has
+            // made the SSTs themselves say deleted.
+            if table.n_spill_ssts == 0 {
+                table.rows.remove(&rowid);
+            }
+            Self::record_tombstone(table, rowid);
         }
+        table.mark_dirty();
+    }
+
+    /// Decodes the row at `home` and hashes every enforcer key whose columns are
+    /// all non-NULL (a NULL key is SQL-distinct, never indexed), writing
+    /// `(enforcer_index, hash)` for each into `out`. Returns the count.
+    fn row_enforcer_hashes(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        home: RowHome,
+        out: &mut [(usize, u64); MAX_UNIQUE_ENFORCERS],
+    ) -> Result<usize, SqlError> {
+        let table = &self.tables[table_index];
+        let n_enf = table.n_enforcers;
+        if n_enf == 0 {
+            return Ok(0);
+        }
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = table.def.schema(&mut schema);
+        let mut cols = [([0u16; MAX_INDEX_COLS], 0usize); MAX_UNIQUE_ENFORCERS];
+        for (i, entry) in cols.iter_mut().enumerate().take(n_enf) {
+            let e = table.enforcers[i].expect("enforcer present");
+            *entry = (e.columns, e.n_cols);
+        }
+        self.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+            let mut n_out = 0;
+            for (i, (c, n)) in cols.iter().take(n_enf).enumerate() {
+                let columns = &c[..*n];
+                if columns.iter().any(|&col| values[col as usize].is_null()) {
+                    continue;
+                }
+                out[n_out] = (i, hash_key(&values, columns));
+                n_out += 1;
+            }
+            Ok(n_out)
+        })
+    }
+
+    /// The value-index maintenance for one committed row transition: remove the
+    /// old committed value's key, insert the new value's key. Physical headroom
+    /// guarantees the insert fits (the logical cap is enforced at insert time),
+    /// so this is infallible; a decode failure on our own encoded row is a bug,
+    /// surfaced loudly.
+    fn maintain_indexes_on_commit(
+        &mut self,
+        table_index: usize,
+        rowid: u64,
+        old_committed: Option<RowHome>,
+        new_loc: Option<RowLoc>,
+    ) {
+        if self.tables[table_index].n_enforcers == 0 {
+            return;
+        }
+        let mut removals = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
+        let n_removals = match old_committed {
+            Some(home) => self
+                .row_enforcer_hashes(table_index, rowid, home, &mut removals)
+                .expect("committed row decodes"),
+            None => 0,
+        };
+        let mut inserts = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
+        let n_inserts = match new_loc {
+            Some(loc) => self
+                .row_enforcer_hashes(table_index, rowid, RowHome::Heap(loc), &mut inserts)
+                .expect("new row decodes"),
+            None => 0,
+        };
+        let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
+        for (i, s) in slots.iter_mut().enumerate().take(self.tables[table_index].n_enforcers) {
+            *s = self.tables[table_index].enforcers[i].expect("enforcer").slot;
+        }
+        let pool = self.value_indexes.as_mut().expect("value index pool present");
+        for &(ei, hash) in &removals[..n_removals] {
+            pool.get_mut(slots[ei]).remove(hash, rowid);
+        }
+        for &(ei, hash) in &inserts[..n_inserts] {
+            pool.get_mut(slots[ei])
+                .insert(hash, rowid)
+                .expect("value index headroom absorbs a commit batch");
+        }
+    }
+
+    /// Probes the value index for the enforcer covering exactly `columns`,
+    /// visiting every candidate rowid whose key hashes to `hash`. Returns true
+    /// if an index served the probe; false if no enforcer covers these columns,
+    /// so the caller must fall back to a full scan.
+    pub fn probe_unique(
+        &self,
+        table_index: usize,
+        columns: &[u16],
+        hash: u64,
+        mut visit: impl FnMut(u64),
+    ) -> bool {
+        let table = &self.tables[table_index];
+        for i in 0..table.n_enforcers {
+            let e = table.enforcers[i].expect("enforcer present");
+            if e.columns() == columns {
+                self.value_indexes
+                    .as_ref()
+                    .expect("value index pool present")
+                    .get(e.slot)
+                    .probe(hash, &mut visit);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the enforcer covering `columns` already holds its logical cap of
+    /// committed rows, so a further new key would exceed `value_index_rows`.
+    pub fn enforcer_at_capacity(&self, table_index: usize, columns: &[u16]) -> bool {
+        let table = &self.tables[table_index];
+        for i in 0..table.n_enforcers {
+            let e = table.enforcers[i].expect("enforcer present");
+            if e.columns() == columns {
+                return self
+                    .value_indexes
+                    .as_ref()
+                    .expect("value index pool present")
+                    .get(e.slot)
+                    .len()
+                    >= self.value_index_cap;
+            }
+        }
+        false
+    }
+
+    /// The configured committed-row cap for a constrained table.
+    pub fn value_index_cap(&self) -> usize {
+        self.value_index_cap
+    }
+
+    /// Releases a table's enforcer index slots back to the pool and clears its
+    /// enforcer list. Called before a slot is reused and when a table is
+    /// dropped.
+    fn release_enforcers(&mut self, table_index: usize) {
+        let n = self.tables[table_index].n_enforcers;
+        if n == 0 {
+            return;
+        }
+        let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
+        for (i, s) in slots.iter_mut().enumerate().take(n) {
+            if let Some(e) = self.tables[table_index].enforcers[i] {
+                *s = e.slot;
+            }
+        }
+        if let Some(pool) = self.value_indexes.as_mut() {
+            for &slot in slots.iter().take(n) {
+                if slot != u32::MAX {
+                    pool.release(slot);
+                }
+            }
+        }
+        self.tables[table_index].enforcers = [None; MAX_UNIQUE_ENFORCERS];
+        self.tables[table_index].n_enforcers = 0;
+    }
+
+    /// Rebuilds every live table's value-index enforcers from its committed
+    /// rows. Called once at startup after journal replay (whose row installs
+    /// bypass the per-row commit maintenance), so the indexes reflect the
+    /// recovered committed state before any query runs.
+    pub fn rebuild_all_enforcers(&mut self) -> Result<(), SqlError> {
+        for i in 0..self.tables.len() {
+            if self.tables[i].live {
+                self.refresh_enforcers(i)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuilds a table's value-index enforcers from its current definition and
+    /// unique indexes, then repopulates them from the committed rows. Idempotent
+    /// — call it whenever the definition, the index set, or the committed rows
+    /// change outside the per-row [`Self::commit_row`] maintenance (ALTER, a
+    /// committed CREATE, CREATE/DROP INDEX, cold-start replay).
+    pub fn refresh_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
+        self.release_enforcers(table_index);
+        let mut want = [([0u16; MAX_INDEX_COLS], 0usize); MAX_UNIQUE_ENFORCERS];
+        let mut n_want = 0usize;
+        let too_many = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a table can have at most {} uniqueness constraints with value indexes",
+                MAX_UNIQUE_ENFORCERS
+            )
+        };
+        {
+            let def = &self.tables[table_index].def;
+            for (i, col) in def.columns().iter().enumerate() {
+                if col.unique {
+                    if n_want == MAX_UNIQUE_ENFORCERS {
+                        return Err(too_many());
+                    }
+                    want[n_want].0[0] = i as u16;
+                    want[n_want].1 = 1;
+                    n_want += 1;
+                }
+            }
+            for uk in def.uniques() {
+                if n_want == MAX_UNIQUE_ENFORCERS {
+                    return Err(too_many());
+                }
+                let cols = uk.columns();
+                want[n_want].0[..cols.len()].copy_from_slice(cols);
+                want[n_want].1 = cols.len();
+                n_want += 1;
+            }
+        }
+        // A CREATE UNIQUE INDEX keeps its existing full-scan enforcement (a
+        // separate feature from the PRIMARY KEY / UNIQUE constraints B-169 names)
+        // — it is not given a value index here, so the pending/live index
+        // lifecycle stays out of this path.
+        #[allow(clippy::needless_range_loop)]
+        for w in 0..n_want {
+            let slot = match self.value_indexes.as_mut().expect("pool present").acquire() {
+                Some(s) => s,
+                None => {
+                    // Give back what this call already took, then fail loudly.
+                    self.release_enforcers(table_index);
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "value index pool exhausted (raise max_value_indexes)"
+                    ));
+                }
+            };
+            self.tables[table_index].enforcers[w] =
+                Some(Enforcer { slot, columns: want[w].0, n_cols: want[w].1 });
+        }
+        self.tables[table_index].n_enforcers = n_want;
+        self.populate_enforcers(table_index)
+    }
+
+    /// Populates a table's enforcer indexes from its committed rows. Takes the
+    /// pool out of `self` so the row walk (which borrows the rest of `self`) and
+    /// the index inserts do not overlap.
+    fn populate_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
+        if self.tables[table_index].n_enforcers == 0 {
+            return Ok(());
+        }
+        let mut pool = self.value_indexes.take().expect("pool present");
+        let result = self.populate_into(table_index, &mut pool);
+        self.value_indexes = Some(pool);
+        result
+    }
+
+    fn populate_into(&self, table_index: usize, pool: &mut ValueIndexPool) -> Result<(), SqlError> {
+        let n_enf = self.tables[table_index].n_enforcers;
+        let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
+        for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
+            *s = self.tables[table_index].enforcers[i].expect("enforcer").slot;
+        }
+        let mut error: Result<(), SqlError> = Ok(());
+        let mut buf = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
+        self.for_each_row_state(table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(home) = state.committed else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let n = match self.row_enforcer_hashes(table_index, rowid, home, &mut buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    error = Err(e);
+                    return Ok(ControlFlow::Break(()));
+                }
+            };
+            for &(ei, hash) in &buf[..n] {
+                if pool.get_mut(slots[ei]).insert(hash, rowid).is_err() {
+                    error = Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "table \"{}\" exceeds its value-index capacity ({} rows); raise value_index_rows",
+                        self.tables[table_index].def.name.as_str(),
+                        self.value_index_cap
+                    ));
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        error
     }
 
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
@@ -2224,6 +2565,8 @@ impl Storage {
                 self.tables.len()
             ));
         };
+        // A reused slot must not keep the dropped table's value indexes.
+        self.release_enforcers(slot);
         self.catalog_seq += 1;
         let stamp = self.catalog_seq;
         let table = &mut self.tables[slot];
@@ -2254,7 +2597,11 @@ impl Storage {
                 def.name.as_str()
             ));
         }
-        self.alloc_table(def, None)
+        let slot = self.alloc_table(def, None)?;
+        // Build the (empty) enforcers now; replay repopulates them once its rows
+        // are applied (see the rebuild in Engine startup).
+        self.refresh_enforcers(slot)?;
+        Ok(slot)
     }
 
     /// Transactional create: the table exists only for `txid` until commit.
@@ -2278,7 +2625,11 @@ impl Storage {
                 def.name.as_str()
             ));
         }
-        self.alloc_table(def, Some(PendingDdl { txid, creating: true }))
+        let slot = self.alloc_table(def, Some(PendingDdl { txid, creating: true }))?;
+        // Build the enforcers now (fallible pool acquire surfaces at CREATE, not
+        // at commit); this transaction's inserts maintain them at commit.
+        self.refresh_enforcers(slot)?;
+        Ok(slot)
     }
 
     /// The txid of another transaction holding uncommitted DDL for `name`.
@@ -2292,6 +2643,7 @@ impl Storage {
     /// Committed drop (journal replay): rows are retained; the slot is freed at
     /// checkpoint.
     pub fn drop_table(&mut self, index: usize) {
+        self.release_enforcers(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].mark_dirty();
@@ -2313,6 +2665,7 @@ impl Storage {
     /// Applies a committed DROP: the table leaves the image and its rows are
     /// reclaimed.
     pub fn commit_drop(&mut self, index: usize) {
+        self.release_enforcers(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].rows.clear();
@@ -2320,6 +2673,7 @@ impl Storage {
 
     /// Rolls back an uncommitted CREATE, freeing the slot.
     pub fn rollback_create(&mut self, index: usize) {
+        self.release_enforcers(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].rows.clear();
@@ -2787,6 +3141,8 @@ mod tests {
         c.memtable_bytes = 1 << 16;
         c.max_tables = 4;
         c.table_rows = 128;
+        c.value_index_rows = 512;
+        c.max_value_indexes = 8;
         c
     }
 

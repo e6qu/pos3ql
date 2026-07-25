@@ -66,6 +66,15 @@ pub struct Config {
     pub cursor_bytes: usize,
     /// Per-table rowid-map capacity (rows resident in the memtable).
     pub table_rows: usize,
+    /// Committed-row cap for a table carrying a UNIQUE / PRIMARY KEY / unique
+    /// index: its value index holds this many committed rows, and an insert past
+    /// it is a loud error. This is the price of an in-RAM value index that keeps
+    /// a uniqueness probe O(1) even after the table spills — see B-169.
+    pub value_index_rows: usize,
+    /// Total value-index buffers shared across all tables' constraints (one per
+    /// UNIQUE/PRIMARY KEY flag, multi-column key, and unique index). Exhausting
+    /// the pool at DDL is a loud error.
+    pub max_value_indexes: usize,
     /// RAM cache of object-storage blocks.
     pub block_cache_bytes: usize,
     /// Disk budget for locally cached objects (not RAM).
@@ -148,6 +157,8 @@ impl Config {
             max_cursors: 4,
             cursor_bytes: 256 * 1024,
             table_rows: 8192,
+            value_index_rows: 8192,
+            max_value_indexes: 16,
             block_cache_bytes: 128 * MIB,
             disk_cache_bytes: GIB,
             s3_on: false,
@@ -228,6 +239,8 @@ impl Config {
                 "max_cursors" => config.max_cursors = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
                 "cursor_bytes" => config.cursor_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "table_rows" => config.table_rows = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
+                "value_index_rows" => config.value_index_rows = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
+                "max_value_indexes" => config.max_value_indexes = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
                 "block_cache_bytes" => config.block_cache_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "disk_cache_bytes" => config.disk_cache_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "wal_upload" => {

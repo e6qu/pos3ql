@@ -46,6 +46,33 @@ fn push_mask(
     *n += 1;
     Ok(())
 }
+/// Upper bound on subcommands in one comma-separated ALTER TABLE.
+pub const MAX_ALTER_ACTIONS: usize = 32;
+
+/// PostgreSQL executes ALTER TABLE subcommands in a fixed pass order rather
+/// than the written order: drops first, then column-type changes, then column
+/// adds, then constraint adds, then column-attribute changes. This returns the
+/// pass number the parser sorts by so that, e.g., an ADD CONSTRAINT can
+/// reference a column ADDed later in the same statement. The standalone forms
+/// (RENAME/SET SCHEMA) never share a list, so their pass is irrelevant.
+fn alter_pass(action: &AlterAction) -> u8 {
+    match action {
+        AlterAction::DropColumn(_) | AlterAction::DropConstraint { .. } => 0,
+        AlterAction::AlterColumnType { .. } => 1,
+        AlterAction::AddColumn(_) => 2,
+        AlterAction::AddConstraint(_) => 3,
+        AlterAction::SetDefault { .. }
+        | AlterAction::DropDefault { .. }
+        | AlterAction::SetNotNull { .. }
+        | AlterAction::DropNotNull { .. } => 4,
+        // Standalone forms; never appear in a multi-action list.
+        AlterAction::RenameTable(_)
+        | AlterAction::RenameColumn { .. }
+        | AlterAction::RenameConstraint { .. }
+        | AlterAction::SetSchema(_) => 5,
+    }
+}
+
 pub const MAX_ROWS: usize = 256;
 
 /// Words that cannot appear as a bare column reference; mirrors the
@@ -1445,11 +1472,16 @@ impl<'a> Parser<'a> {
         self.expect_ident("alter")?;
         self.expect_ident("table")?;
         let table = self.qual_name("table name")?;
-        let action = if self.eat_ident("set")? {
+        // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
+        // combine them with a comma-separated subcommand list, so they parse to
+        // a single-element list on their own.
+        if self.eat_ident("set")? {
             self.expect_ident("schema")?;
-            AlterAction::SetSchema(self.col_ident("schema name")?)
-        } else if self.eat_ident("rename")? {
-            if self.eat_ident("to")? {
+            let action = AlterAction::SetSchema(self.col_ident("schema name")?);
+            return Ok(Stmt::AlterTable(AlterTable { table, actions: self.arena_slice(&[action])? }));
+        }
+        if self.eat_ident("rename")? {
+            let action = if self.eat_ident("to")? {
                 AlterAction::RenameTable(self.col_ident("new table name")?)
             } else if self.eat_ident("constraint")? {
                 let from = self.col_ident("constraint name")?;
@@ -1462,24 +1494,50 @@ impl<'a> Parser<'a> {
                 self.expect_ident("to")?;
                 let to = self.col_ident("new column name")?;
                 AlterAction::RenameColumn { from, to }
+            };
+            return Ok(Stmt::AlterTable(AlterTable { table, actions: self.arena_slice(&[action])? }));
+        }
+        // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
+        let mut buffer = [AlterAction::DropDefault { column: "" }; MAX_ALTER_ACTIONS];
+        let mut count = 0usize;
+        loop {
+            if count == MAX_ALTER_ACTIONS {
+                return Err(self.err_here("too many actions in one ALTER TABLE"));
             }
-        } else if self.eat_ident("add")? {
+            buffer[count] = self.alter_table_cmd()?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        // PostgreSQL executes the subcommands in a fixed pass order, not the
+        // written order, so a constraint can reference a column added later in
+        // the same statement. A stable insertion sort by pass keeps the written
+        // order within a pass and allocates nothing.
+        for i in 1..count {
+            let mut j = i;
+            while j > 0 && alter_pass(&buffer[j - 1]) > alter_pass(&buffer[j]) {
+                buffer.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        Ok(Stmt::AlterTable(AlterTable { table, actions: self.arena_slice(&buffer[..count])? }))
+    }
+
+    /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
+    /// forms; RENAME and SET SCHEMA are handled by the caller).
+    fn alter_table_cmd(&mut self) -> Result<AlterAction<'a>, ParseError> {
+        if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
-                return Ok(Stmt::AlterTable(AlterTable {
-                    table,
-                    action: AlterAction::AddConstraint(self.table_constraint(Some(cname))?),
-                }));
+                return Ok(AlterAction::AddConstraint(self.table_constraint(Some(cname))?));
             }
             if matches!(
                 self.peeked,
                 Tok::Ident("primary") | Tok::Ident("unique") | Tok::Ident("check") | Tok::Ident("foreign")
             ) {
-                return Ok(Stmt::AlterTable(AlterTable {
-                    table,
-                    action: AlterAction::AddConstraint(self.table_constraint(None)?),
-                }));
+                return Ok(AlterAction::AddConstraint(self.table_constraint(None)?));
             }
             let _ = self.eat_ident("column")?;
             let name = self.col_ident("column name")?;
@@ -1501,7 +1559,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            AlterAction::AddColumn(ColumnDef {
+            Ok(AlterAction::AddColumn(ColumnDef {
                 name,
                 type_name,
                 type_mod,
@@ -1509,7 +1567,7 @@ impl<'a> Parser<'a> {
                 unique,
                 primary: false,
                 default,
-            })
+            }))
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {
                 let if_exists = self.eat_ident("if")? && {
@@ -1521,10 +1579,10 @@ impl<'a> Parser<'a> {
                 // dependencies on a constraint, so both are accepted and the
                 // drop is unconditional.
                 let _ = self.eat_ident("cascade")? || self.eat_ident("restrict")?;
-                AlterAction::DropConstraint { name, if_exists }
+                Ok(AlterAction::DropConstraint { name, if_exists })
             } else {
                 let _ = self.eat_ident("column")?;
-                AlterAction::DropColumn(self.col_ident("column name")?)
+                Ok(AlterAction::DropColumn(self.col_ident("column name")?))
             }
         } else if self.eat_ident("alter")? {
             // ALTER [COLUMN] col { SET DEFAULT e | DROP DEFAULT | SET NOT NULL
@@ -1535,33 +1593,32 @@ impl<'a> Parser<'a> {
             // `SET DEFAULT`/`SET NOT NULL` and `DROP DEFAULT`/`DROP NOT NULL`
             // are the other four ALTER COLUMN forms.
             if self.eat_ident("type")? {
-                self.alter_column_type(column)?
+                self.alter_column_type(column)
             } else if self.eat_ident("set")? {
                 if self.eat_ident("data")? {
                     self.expect_ident("type")?;
-                    self.alter_column_type(column)?
+                    self.alter_column_type(column)
                 } else if self.eat_ident("default")? {
-                    AlterAction::SetDefault { column, value: self.expression(0)? }
+                    Ok(AlterAction::SetDefault { column, value: self.expression(0)? })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;
-                    AlterAction::SetNotNull { column }
+                    Ok(AlterAction::SetNotNull { column })
                 }
             } else if self.eat_ident("drop")? {
                 if self.eat_ident("default")? {
-                    AlterAction::DropDefault { column }
+                    Ok(AlterAction::DropDefault { column })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;
-                    AlterAction::DropNotNull { column }
+                    Ok(AlterAction::DropNotNull { column })
                 }
             } else {
-                return Err(self.unexpected("expected TYPE, SET or DROP"));
+                Err(self.unexpected("expected TYPE, SET or DROP"))
             }
         } else {
-            return Err(self.unexpected("expected RENAME, ADD, DROP or ALTER"));
-        };
-        Ok(Stmt::AlterTable(AlterTable { table, action }))
+            Err(self.unexpected("expected ADD, DROP or ALTER"))
+        }
     }
 
     fn prepare(&mut self) -> Result<Stmt<'a>, ParseError> {

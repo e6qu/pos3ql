@@ -475,7 +475,12 @@ pub struct Delete<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AlterTable<'a> {
     pub table: QualName<'a>,
-    pub action: AlterAction<'a>,
+    /// One or more subcommands. PostgreSQL applies a comma-separated list in a
+    /// fixed pass order (drops, then type changes, then adds, then constraints,
+    /// then column-attribute changes), not left to right; the parser sorts the
+    /// list into that order. The standalone forms (RENAME …, SET SCHEMA) are
+    /// never combined and arrive as a single-element list.
+    pub actions: &'a [AlterAction<'a>],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

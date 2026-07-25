@@ -55,6 +55,15 @@ pub enum EngineSetupError {
     Budget(BudgetError),
     Wal(WalSetupError),
     Checkpoint(CheckpointSetupError),
+    /// A storage operation during recovery failed loudly — e.g. the recovered
+    /// data exceeds the configured value-index capacity.
+    Storage(SqlError),
+}
+
+impl From<SqlError> for EngineSetupError {
+    fn from(e: SqlError) -> Self {
+        Self::Storage(e)
+    }
 }
 
 impl std::fmt::Display for EngineSetupError {
@@ -63,6 +72,7 @@ impl std::fmt::Display for EngineSetupError {
             Self::Budget(e) => write!(f, "{e}"),
             Self::Wal(e) => write!(f, "{e}"),
             Self::Checkpoint(e) => write!(f, "{e}"),
+            Self::Storage(e) => write!(f, "{}", e.message.as_str()),
         }
     }
 }
@@ -181,6 +191,10 @@ impl Engine {
                 storage.set_lsn(applied_to);
             }
         }
+        // Replay's row installs bypass the per-row value-index maintenance, so
+        // rebuild every table's uniqueness indexes from the recovered committed
+        // rows before serving queries.
+        storage.rebuild_all_enforcers()?;
         // The upload buffer must hold at least one full WAL batch, plus room
         // to accumulate more before backpressure forces a synchronous drain.
         let upload_buf = config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes);

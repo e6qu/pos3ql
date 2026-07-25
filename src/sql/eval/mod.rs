@@ -27,7 +27,7 @@ pub use pattern::{like_match, regex_split_pub, regexp_flags};
 pub(crate) use pattern::regex_split;
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
-pub use operators::compare_datums;
+pub use operators::{compare_datums, hash_key};
 pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
 pub(crate) use operators::arithmetic;
 use operators::{binary, coerce_unknown, logic, membership_eq, range_mismatch, unary};

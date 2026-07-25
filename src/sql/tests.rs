@@ -19,6 +19,8 @@ fn test_config(name: &str) -> Config {
     config.memtable_bytes = 1 << 20;
     config.max_tables = 8;
     config.table_rows = 1024;
+    config.value_index_rows = 2048;
+    config.max_value_indexes = 8;
     config.wal_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 14;
     config.work_arena_bytes = 1 << 21;
@@ -1555,6 +1557,219 @@ fn alter_rename_constraint() {
     run_with(&mut e, &mut b, "ALTER TABLE rc DROP CONSTRAINT ck");
     let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO rc VALUES (2, -1, 2)")).to_string();
     assert!(!text.contains("ERROR"), "{text}");
+}
+
+#[test]
+fn check_constraint_auto_naming() {
+    let config = test_config("check-naming");
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    // Four unnamed CHECKs: a>0 and a<100 and a<>50 each reference only `a`, so
+    // they collide on cn_a_check and disambiguate to cn_a_check / cn_a_check1 /
+    // cn_a_check2 in declaration order; a>b references two columns and is
+    // cn_check. Each insert below violates exactly one, so the reported name is
+    // unambiguous.
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE cn (a int CHECK (a > 0), b int, CHECK (a > b), CHECK (a < 100), CHECK (a <> 50))",
+    );
+    for (sql, name) in [
+        ("INSERT INTO cn VALUES (-1, -9)", "cn_a_check\""),
+        ("INSERT INTO cn VALUES (5, 10)", "cn_check\""),
+        ("INSERT INTO cn VALUES (200, 0)", "cn_a_check1\""),
+        ("INSERT INTO cn VALUES (50, 0)", "cn_a_check2\""),
+    ] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, sql)).to_string();
+        assert!(text.contains("23514") && text.contains(name), "{sql} => {text}");
+    }
+    // A column-level CHECK naming only another column is keyed off that column.
+    run_with(&mut e, &mut b, "CREATE TABLE cm (a int CHECK (b > 0), b int)");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (1, -1)")).to_string();
+    assert!(text.contains("23514") && text.contains("cm_b_check\""), "{text}");
+    // An explicit name wins and is not disambiguated; the later unnamed CHECK on
+    // the same column takes the base generated name.
+    run_with(&mut e, &mut b, "CREATE TABLE ck (a int CONSTRAINT keep_me CHECK (a > 0), CHECK (a < 100))");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO ck VALUES (-1)")).to_string();
+    assert!(text.contains("keep_me\""), "{text}");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO ck VALUES (200)")).to_string();
+    assert!(text.contains("ck_a_check\""), "{text}");
+    // ALTER TABLE ADD CHECK auto-names identically and the generated name is
+    // what DROP CONSTRAINT uses.
+    run_with(&mut e, &mut b, "ALTER TABLE cm ADD CHECK (a < 10)");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (20, 1)")).to_string();
+    assert!(text.contains("23514") && text.contains("cm_a_check\""), "{text}");
+    run_with(&mut e, &mut b, "ALTER TABLE cm DROP CONSTRAINT cm_a_check");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (20, 1)")).to_string();
+    assert!(!text.contains("ERROR"), "{text}");
+}
+
+#[test]
+fn value_index_matches_uniqueness_oracle() {
+    // B-169: the value index must give exactly the verdicts a full scan would.
+    // A deterministic workload of inserts/updates/deletes over a small key space
+    // (frequent collisions) is checked against a ground-truth set of committed
+    // keys, across a restart (which rebuilds the indexes from replay).
+    let config = test_config("value-index-oracle");
+    let mut rng: u64 = 0x243f_6a88_85a3_08d3;
+    let mut next = move || {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        rng = rng.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        rng
+    };
+    let mut present: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // Each statement gets a fresh scratch budget: the harness's per-statement
+    // draws are not reclaimed, and this workload runs a thousand of them.
+    let run = |e: &mut Engine, sql: &str| {
+        String::from_utf8_lossy(&run_with(e, &mut Budget::new(1 << 20), sql)).to_string()
+    };
+
+    {
+        let mut b = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run(&mut e, "CREATE TABLE t (k int UNIQUE, v int)");
+        for _ in 0..800 {
+            let key = (next() % 50) as i64;
+            match next() % 3 {
+                0 => {
+                    let out = run(&mut e, &format!("INSERT INTO t VALUES ({}, {})", key, next() % 1000));
+                    if present.contains(&key) {
+                        assert!(out.contains("23505"), "dup insert {key}: {out}");
+                    } else {
+                        assert!(!out.contains("ERROR"), "new insert {key}: {out}");
+                        present.insert(key);
+                    }
+                }
+                1 => {
+                    run(&mut e, &format!("DELETE FROM t WHERE k = {key}"));
+                    present.remove(&key);
+                }
+                _ => {
+                    let to = (next() % 50) as i64;
+                    let out = run(&mut e, &format!("UPDATE t SET k = {to} WHERE k = {key}"));
+                    if present.contains(&key) {
+                        if to != key && present.contains(&to) {
+                            assert!(out.contains("23505"), "update {key}->{to} dup: {out}");
+                        } else {
+                            assert!(!out.contains("ERROR"), "update {key}->{to}: {out}");
+                            present.remove(&key);
+                            present.insert(to);
+                        }
+                    } else {
+                        assert!(!out.contains("ERROR"), "update absent {key}: {out}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Restart: the index is gone and must be rebuilt from the replayed rows.
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    let bytes = run_with(&mut e, &mut Budget::new(1 << 20), "SELECT count(*) FROM t");
+    assert_eq!(data_rows(&bytes), [format!("{}", present.len())]);
+    for _ in 0..200 {
+        let key = (next() % 50) as i64;
+        let out = run(&mut e, &format!("INSERT INTO t VALUES ({key}, 1)"));
+        if present.contains(&key) {
+            assert!(out.contains("23505"), "post-restart dup {key}: {out}");
+        } else {
+            assert!(!out.contains("ERROR"), "post-restart new {key}: {out}");
+            present.insert(key);
+        }
+    }
+}
+
+#[test]
+fn named_single_column_key_retains_name() {
+    let config = test_config("named-single-key");
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    // An explicit name on a single-column UNIQUE is kept: the violation names it
+    // and DROP CONSTRAINT finds it.
+    run_with(&mut e, &mut b, "CREATE TABLE t (a int CONSTRAINT myc UNIQUE, b int)");
+    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 1)");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 2)")).to_string();
+    assert!(text.contains("23505") && text.contains("myc\""), "{text}");
+    run_with(&mut e, &mut b, "ALTER TABLE t DROP CONSTRAINT myc");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 3)")).to_string();
+    assert!(!text.contains("ERROR"), "drop by name: {text}");
+    // A named single-column PRIMARY KEY: the violation names it, and DROP NOT
+    // NULL on its column is rejected (the key implies NOT NULL).
+    run_with(&mut e, &mut b, "CREATE TABLE p (id int CONSTRAINT p_id PRIMARY KEY, v int)");
+    run_with(&mut e, &mut b, "INSERT INTO p VALUES (1, 1)");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO p VALUES (1, 2)")).to_string();
+    assert!(text.contains("23505") && text.contains("p_id\""), "{text}");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TABLE p ALTER COLUMN id DROP NOT NULL")).to_string();
+    assert!(text.contains("42P16") && text.contains("primary key"), "{text}");
+    // Renaming an unnamed single-column key by its synthesized name materializes
+    // it as a named key; the new name then enforces and drops.
+    run_with(&mut e, &mut b, "CREATE TABLE u (x int UNIQUE)");
+    run_with(&mut e, &mut b, "ALTER TABLE u RENAME CONSTRAINT u_x_key TO xkey");
+    run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)")).to_string();
+    assert!(text.contains("23505") && text.contains("xkey\""), "rename materialize: {text}");
+    run_with(&mut e, &mut b, "ALTER TABLE u DROP CONSTRAINT xkey");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)")).to_string();
+    assert!(!text.contains("ERROR"), "drop renamed: {text}");
+}
+
+#[test]
+fn alter_table_multi_action() {
+    let config = test_config("alter-multi");
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    run_with(&mut e, &mut b, "CREATE TABLE m (a int)");
+    run_with(&mut e, &mut b, "INSERT INTO m VALUES (1), (2), (3)");
+    // Several ADD COLUMNs with defaults applied in one statement.
+    run_with(&mut e, &mut b, "ALTER TABLE m ADD COLUMN b int DEFAULT 10, ADD COLUMN c text DEFAULT 'x'");
+    let bytes = run_with(&mut e, &mut b, "SELECT a, b, c FROM m ORDER BY a");
+    assert_eq!(data_rows(&bytes), ["1|10|x", "2|10|x", "3|10|x"]);
+    // Pass ordering: an ADD CONSTRAINT can reference a column ADDed later in the
+    // same statement even though it is written first.
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE m ADD CONSTRAINT dpos CHECK (d > 0), ADD COLUMN d int DEFAULT 1",
+    ))
+    .to_string();
+    assert!(!text.contains("ERROR"), "{text}");
+    // A type change composes with a SET NOT NULL validated on the new image.
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE m ALTER COLUMN a TYPE bigint, ALTER COLUMN a SET NOT NULL",
+    ))
+    .to_string();
+    assert!(!text.contains("ERROR"), "{text}");
+    // A uniqueness constraint added alongside a rewrite is validated across the
+    // rewritten images: a constant-default column collides on every row (23505).
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE m ADD COLUMN u int DEFAULT 7, ADD UNIQUE (u)",
+    ))
+    .to_string();
+    assert!(text.contains("23505"), "{text}");
+    // That failed ALTER left the table untouched — `u` was never added.
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT u FROM m")).to_string();
+    assert!(text.contains("42703"), "u should not exist: {text}");
+    // A mid-list error is atomic: the ADD before the bad DROP does not apply.
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE m ADD COLUMN g int, DROP COLUMN nope",
+    ))
+    .to_string();
+    assert!(text.contains("42703"), "{text}");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT g FROM m")).to_string();
+    assert!(text.contains("42703"), "g should not exist: {text}");
+    // DROP one column and ADD another in one statement.
+    run_with(&mut e, &mut b, "ALTER TABLE m DROP COLUMN c, ADD COLUMN h int DEFAULT 99");
+    let bytes = run_with(&mut e, &mut b, "SELECT a, b, d, h FROM m ORDER BY a");
+    assert_eq!(data_rows(&bytes), ["1|10|1|99", "2|10|1|99", "3|10|1|99"]);
 }
 
 #[test]

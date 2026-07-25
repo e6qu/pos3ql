@@ -36,6 +36,11 @@ jobs:
       - name: No-op guard
         run: zsh tools/check-noops.sh
 
+      # BUGS.md is not a backlog: every `open` bug must state why it is
+      # intractable and must not read as a deferral. See tools/check-bugs.sh.
+      - name: BUGS.md discipline guard
+        run: zsh tools/check-bugs.sh
+
       - name: Set up Node (for the duplicate-code guard)
         uses: actions/setup-node@v4
         with:

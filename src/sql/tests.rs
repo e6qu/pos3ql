@@ -1444,6 +1444,38 @@ fn altered_table_survives_restart() {
 }
 
 #[test]
+fn alter_column_default_and_not_null() {
+    let config = test_config("alter-column");
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    run_with(&mut e, &mut b, "CREATE TABLE ac (id int, a int, b text)");
+    run_with(&mut e, &mut b, "INSERT INTO ac VALUES (1, NULL, 'x')");
+    // SET DEFAULT (COLUMN keyword optional) fills omitted columns on INSERT.
+    run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN b SET DEFAULT 'd'");
+    run_with(&mut e, &mut b, "ALTER TABLE ac ALTER a SET DEFAULT 7");
+    let bytes = run_with(&mut e, &mut b, "INSERT INTO ac (id) VALUES (2) RETURNING a, b");
+    assert_eq!(data_rows(&bytes), ["7|d"]);
+    // DROP DEFAULT: the column falls back to NULL.
+    run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a DROP DEFAULT");
+    let bytes = run_with(&mut e, &mut b, "INSERT INTO ac (id) VALUES (3) RETURNING coalesce(a, -1)");
+    assert_eq!(data_rows(&bytes), ["-1"]);
+    // SET NOT NULL is refused while a NULL is present (23502).
+    let bytes = run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a SET NOT NULL");
+    assert!(String::from_utf8_lossy(&bytes).contains("23502"), "expected not-null violation");
+    run_with(&mut e, &mut b, "UPDATE ac SET a = 0 WHERE a IS NULL");
+    run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a SET NOT NULL");
+    // Now enforced on new inserts.
+    let bytes = run_with(&mut e, &mut b, "INSERT INTO ac (id, b) VALUES (4, 'z')");
+    assert!(String::from_utf8_lossy(&bytes).contains("23502"), "expected enforcement");
+    // DROP NOT NULL lifts it; a NULL then inserts.
+    run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a DROP NOT NULL");
+    run_with(&mut e, &mut b, "INSERT INTO ac (id, b) VALUES (5, 'w')");
+    // Rows 1,2,3,5 — the id=4 insert was rejected above, so four remain.
+    let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM ac");
+    assert_eq!(data_rows(&bytes), ["4"]);
+}
+
+#[test]
 fn joins_group_by_subqueries() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE d (id int, name text)");

@@ -2421,6 +2421,45 @@ const MAX_TRUNCATE_TABLES: usize = 16;
 /// shape atomically. Two-phase in memory: all new row images are prepared
 /// first, then the definition and row map swap; a failure part-way leaves
 /// the table untouched (only heap bytes leak until compaction).
+/// Scans a table's committed rows for a NULL in column `col`, for ALTER COLUMN
+/// SET NOT NULL. Errors on the first NULL, naming the column and relation as
+/// PostgreSQL does.
+fn ensure_column_not_null(
+    storage: &Storage,
+    table_slot: usize,
+    def: &TableDef,
+    col: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    let schema = &schema[..def.n_columns];
+    let mut has_null = false;
+    storage.for_each_row_state(table_slot, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        let Some(home) = state.committed else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let bytes = storage.row_bytes(table_slot, rowid, home, arena)?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, schema, &mut values)?;
+        if values[col].is_null() {
+            has_null = true;
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    if has_null {
+        return Err(sql_err!(
+            sqlstate::NOT_NULL_VIOLATION,
+            "column \"{}\" of relation \"{}\" contains null values",
+            def.columns[col].name.as_str(),
+            def.name.as_str()
+        ));
+    }
+    Ok(())
+}
+
 pub fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -2581,6 +2620,57 @@ pub fn alter_table(
             }
             new_def.n_columns -= 1;
             dropped = Some(i);
+        }
+        AlterAction::SetDefault { column, value } => {
+            let Some(i) = def.column_index(column) else {
+                return sql_fail(undefined_column(column));
+            };
+            let ctype = def.columns[i].ctype;
+            let type_mod = def.columns[i].type_mod;
+            // The default is a constant expression, cast to the column's type
+            // and stored as its owned value — the same path CREATE TABLE uses.
+            let owned = match eval(value, arena, crate::sql::eval::NO_PARAMS, &NoColumns)
+                .map_err(|_| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "DEFAULT must be a constant expression"))
+                .and_then(|v| cast_to(v, ctype, arena))
+                .and_then(|v| apply_typmod(v, ctype, type_mod, arena))
+                .and_then(|v| crate::storage::OwnedDatum::from_datum(&v))
+            {
+                Ok(od) => od,
+                Err(e) => return sql_fail(e),
+            };
+            new_def.columns[i].default_value = Some(owned);
+        }
+        AlterAction::DropDefault { column } => {
+            let Some(i) = def.column_index(column) else {
+                return sql_fail(undefined_column(column));
+            };
+            new_def.columns[i].default_value = None;
+            // Dropping a serial column's default detaches its auto-increment.
+            new_def.columns[i].auto_increment = false;
+        }
+        AlterAction::SetNotNull { column } => {
+            let Some(i) = def.column_index(column) else {
+                return sql_fail(undefined_column(column));
+            };
+            // Reject if any existing row holds NULL in this column, naming the
+            // column and relation as PostgreSQL does.
+            if let Err(e) = ensure_column_not_null(storage, table_index, &def, i, arena) {
+                return sql_fail(e);
+            }
+            new_def.columns[i].not_null = true;
+        }
+        AlterAction::DropNotNull { column } => {
+            let Some(i) = def.column_index(column) else {
+                return sql_fail(undefined_column(column));
+            };
+            if def.columns[i].primary {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "column \"{}\" is in a primary key",
+                    column
+                ));
+            }
+            new_def.columns[i].not_null = false;
         }
     }
 

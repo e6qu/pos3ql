@@ -709,7 +709,7 @@ pub const MAX_MULTIRANGE: usize = 64;
 /// Splits a canonical multirange text `{r1,r2,...}` into its component range
 /// texts (no canonicalization; input is assumed already canonical). Commas
 /// inside a component's brackets are not separators. Returns the count.
-fn split_components<'a>(text: &'a str, out: &mut [&'a str; MAX_MULTIRANGE]) -> Result<usize, SqlError> {
+pub fn split_components<'a>(text: &'a str, out: &mut [&'a str; MAX_MULTIRANGE]) -> Result<usize, SqlError> {
     let bad = || sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "malformed multirange literal: \"{}\"", text);
     let inner = text
         .trim()

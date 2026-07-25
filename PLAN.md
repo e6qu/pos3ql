@@ -852,11 +852,14 @@ adaptive-execution capstone. This section is the plan of record for all of it.
 
 ### The compatibility wave (a fresh audit of what real deployments touch)
 
-- **COPY is absent entirely** — no COPY IN/OUT, text/csv/binary. The largest
-  single compatibility hole: `pg_dump`/`pg_restore`, bulk loaders, ETL, and
-  many ORMs speak COPY. Milestone: *a pg_dump of a pos3ql database restores
-  into real PostgreSQL, and vice versa* — which doubles as the forcing
-  function for the remaining `pg_catalog` completeness (`\d table`, B-033).
+- **COPY** — IN/OUT in text, CSV, and binary are implemented (see the datatype
+  section above; binary is byte-exact against PostgreSQL across the whole type
+  surface, composites included). What remains of this once-largest hole is the
+  end-to-end `pg_dump`/`pg_restore` round-trip, gated not on COPY itself but on
+  the `pg_catalog` surface `pg_dump` queries. Milestone: *a pg_dump of a pos3ql
+  database restores into real PostgreSQL, and vice versa* — which doubles as the
+  forcing function for the remaining `pg_catalog` completeness (`\d table`,
+  B-033). The extended-protocol COPY sub-flow is refused pending its own wiring.
 - **Server-side TLS for clients** — the SSLRequest probe is answered `N`
   today. The isolated rustls component and the budgeted `tls_scope` machinery
   exist for the S3 side; pointing the same component at the server socket is
@@ -1216,17 +1219,27 @@ INFO progress this engine does not emit).
    numeric / temporal / uuid / bytea / json tower encodes and decodes byte-exact
    against PostgreSQL (including the ones the extended-protocol path already got
    right — `smallint` as a true int2, `timetz`'s westward zone flip, numeric's
-   base-10000 groups, interval, timestamptz). The types whose real binary wire
-   format is not yet emitted — arrays, ranges, multiranges, bit strings (the
-   extended-protocol binary path shortcuts them to canonical text, which a
-   binary consumer would misparse) — are refused loudly (0A000) rather than
-   corrupt the stream; their binary codec is a self-contained follow-up. Binary
-   data is not line-oriented, so it cannot be fed through a psql `-f` corpus;
-   `tests/external/copy_binary_diff.py` drives both engines over the wire with
-   psycopg and checks TO-binary byte-identity plus FROM-binary round-trips in
-   both directions, wired into the CI differential. The extended-protocol COPY
-   flow is likewise refused pending its own wiring. The pg_dump round-trip
-   milestone stays open pending the catalog surface pg_dump itself queries.
+   base-10000 groups, interval, timestamptz). The composite types now follow the
+   real binary wire format too — **arrays** (int32 ndim / has-null / element OID,
+   the one dim descriptor, per-element int32 length + binary, NULL element as
+   length -1, empty array as ndim 0), **ranges** (the flags byte —
+   empty/inclusive/infinite — then each finite bound as int32 length + binary),
+   **multiranges** (int32 range count, each range length-framed), and **bit
+   strings** (int32 bit length then MSB-first packed bytes) — encoded on the
+   arena-aware `copy_out` path (range bounds need typed parsing) and decoded via
+   the shared per-type receiver; only anonymous `record`, which has no stored
+   column representation, stays refused (0A000). The extended-protocol *binary
+   results* path shares the array and bit codecs (arena-free), and falls back to
+   canonical text only for ranges/multiranges, whose bounds the arena-free wire
+   primitive cannot re-parse — the rare case of a client Binding binary results
+   for a range column. Binary data is not line-oriented, so it cannot be fed
+   through a psql `-f` corpus; `tests/external/copy_binary_diff.py` drives both
+   engines over the wire with psycopg and checks TO-binary byte-identity plus
+   FROM-binary round-trips in both directions across the full scalar tower and
+   every composite (arrays with NULL/empty, ranges with empty/infinite bounds,
+   multiranges, bit/varbit), wired into the CI differential. The
+   extended-protocol COPY flow is refused pending its own wiring. The pg_dump
+   round-trip milestone stays open pending the catalog surface pg_dump queries.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;

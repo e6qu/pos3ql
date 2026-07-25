@@ -13,6 +13,10 @@ use crate::storage::rowenc;
 use super::eval::{sqlstate, SqlError};
 use super::types::{ArrElem, Datum};
 
+/// Maximum number of elements in any one array value. Bounds the fixed
+/// element buffers used when parsing or decoding an array.
+pub const MAX_ELEMENTS: usize = 1024;
+
 fn arena_full() -> SqlError {
     sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value exceeds the statement arena")
 }
@@ -77,7 +81,7 @@ pub fn parse_literal<'a>(
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))
         .ok_or_else(bad)?;
-    let mut items = [Datum::Null; 1024];
+    let mut items = [Datum::Null; MAX_ELEMENTS];
     let mut n = 0;
     let ct = element.to_coltype();
     if !inner.trim().is_empty() {

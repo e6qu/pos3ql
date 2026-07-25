@@ -94,6 +94,22 @@ impl<'a> MsgOut<'a> {
         self
     }
 
+    /// Writes an int32-length-prefixed field: reserves the length, runs
+    /// `write`, then back-patches the length with however many bytes `write`
+    /// appended. Used for the composite binary formats (array/range/…), whose
+    /// length is not known until the body is written.
+    pub fn field(&mut self, write: impl FnOnce(&mut MsgOut)) -> &mut Self {
+        let len_at = self.buffer.mark();
+        self.ok = self.ok && self.buffer.append(&[0, 0, 0, 0]);
+        write(self);
+        if self.ok {
+            let len = (self.buffer.mark() - len_at - 4) as i32;
+            let filled = self.buffer.filled_mut();
+            filled[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
+        }
+        self
+    }
+
     /// NUL-terminated string. The text must not contain NUL itself.
     pub fn cstr(&mut self, v: &str) -> &mut Self {
         debug_assert!(!v.as_bytes().contains(&0));

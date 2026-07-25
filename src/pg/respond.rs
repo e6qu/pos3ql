@@ -611,17 +611,36 @@ impl<'b> Responder<'b> {
                     m.bytes(text.as_bytes());
                 }
                 Datum::Range { text, .. } | Datum::Multirange { text, .. } => {
-                    // The binary range/multirange wire format is elaborate; send
-                    // the canonical text (correct for the common text path).
+                    // The binary range/multirange format requires re-parsing the
+                    // bounds into typed datums (numeric bounds need an arena),
+                    // which this arena-free wire primitive has no access to.
+                    // COPY BINARY encodes ranges via the arena-aware path in
+                    // `copy_out`; the only path reaching here is an extended-
+                    // protocol Bind requesting binary results for a range column
+                    // (rare), which receives the canonical text form.
                     m.i32(text.len() as i32);
                     m.bytes(text.as_bytes());
                 }
                 Datum::Bit { bits, .. } => {
-                    // The binary bit-string format (int32 bit length + packed
-                    // bytes) is not emitted; the canonical `0`/`1` text is sent,
-                    // correct for the common text-format path (as for ranges).
-                    m.i32(bits.len() as i32);
-                    m.bytes(bits.as_bytes());
+                    // int32 bit length, then ceil(len/8) bytes, bits packed
+                    // MSB-first with the last byte's low bits zero-padded.
+                    m.field(|m| {
+                        m.i32(bits.len() as i32);
+                        let mut byte = 0u8;
+                        let mut fill = 0u32;
+                        for ch in bits.bytes() {
+                            byte = (byte << 1) | u8::from(ch == b'1');
+                            fill += 1;
+                            if fill == 8 {
+                                m.u8(byte);
+                                byte = 0;
+                                fill = 0;
+                            }
+                        }
+                        if fill > 0 {
+                            m.u8(byte << (8 - fill));
+                        }
+                    });
                 }
                 Datum::Float4(x) => {
                     m.i32(4);
@@ -644,31 +663,30 @@ impl<'b> Responder<'b> {
                     m.bytes(b);
                 }
                 Datum::Array { element, raw } => {
-                    // The full binary array wire format (ndim/dims/per-element
-                    // binary) is not emitted; a binary-requesting client gets
-                    // the canonical text form instead (arrays are near-always
-                    // consumed in text format). Documented as a known gap.
-                    // Stream Display so a long array is never silently truncated.
-                    use core::fmt::Write as _;
-                    struct Counter(usize);
-                    impl core::fmt::Write for Counter {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0 += s.len();
-                            Ok(())
+                    // int32 ndim (0 for empty, else 1 — arrays are strictly
+                    // one-dimensional here), int32 has-null flag, int32 element
+                    // OID; then for a non-empty array one dim descriptor
+                    // {count, lower-bound=1}; then each element as int32 length
+                    // (-1 for NULL) + its binary (elements are always scalars).
+                    let elem_oid = element.to_coltype().oid();
+                    let count = crate::sql::array::len(raw);
+                    m.field(|m| {
+                        m.i32(if count == 0 { 0 } else { 1 });
+                        let has_null = (0..count).any(|i| {
+                            crate::sql::array::get(raw, *element, i).is_none_or(|d| d.is_null())
+                        });
+                        m.i32(i32::from(has_null));
+                        m.i32(elem_oid);
+                        if count > 0 {
+                            m.i32(count as i32);
+                            m.i32(1);
                         }
-                    }
-                    struct MsgWriter<'w, 'b>(&'w mut MsgOut<'b>);
-                    impl core::fmt::Write for MsgWriter<'_, '_> {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0.bytes(s.as_bytes());
-                            Ok(())
+                        for i in 0..count {
+                            let elem = crate::sql::array::get(raw, *element, i)
+                                .unwrap_or(Datum::Null);
+                            Self::encode_value_binary(m, &elem);
                         }
-                    }
-                    let array = Datum::Array { element: *element, raw };
-                    let mut counter = Counter(0);
-                    let _ = write!(counter, "{array}");
-                    m.i32(counter.0 as i32);
-                    let _ = write!(MsgWriter(m), "{array}");
+                    });
                 }
                 Datum::Record(_) => {
                     use core::fmt::Write as _;

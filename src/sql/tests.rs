@@ -3050,10 +3050,16 @@ fn copy_formats_and_unsupported() {
         out.windows(6).any(|w| w == b"PGCOPY"),
         "binary output should carry the signature"
     );
-    // Binary of an array column, and a CSV-only option in text mode, refuse.
+    // Binary of an array column now succeeds and carries the signature.
     run_with(&mut engine, &mut budget, "CREATE TABLE arr (a int[])");
+    let out = run_with(&mut engine, &mut budget, "COPY arr TO STDOUT (FORMAT binary)");
+    assert!(!message_types(&out).contains(&b'E'), "{:?}", String::from_utf8_lossy(&out));
+    assert!(
+        out.windows(6).any(|w| w == b"PGCOPY"),
+        "binary array output should carry the signature"
+    );
+    // A CSV-only option in text mode, and HEADER in binary mode, still refuse.
     for statement in [
-        "COPY arr TO STDOUT (FORMAT binary)",
         "COPY c TO STDOUT (FORMAT text, QUOTE '#')",
         "COPY c TO STDOUT (FORMAT binary, HEADER)",
     ] {

@@ -583,6 +583,10 @@ impl<'b> Responder<'b> {
                     m.i32(bits.len() as i32);
                     m.bytes(bits.as_bytes());
                 }
+                Datum::Float4(x) => {
+                    m.i32(4);
+                    m.bytes(&x.to_bits().to_be_bytes());
+                }
                 Datum::Float8(x) => {
                     m.i32(8);
                     m.bytes(&x.to_bits().to_be_bytes());

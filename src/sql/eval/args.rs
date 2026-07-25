@@ -107,6 +107,7 @@ pub(crate) fn num_f64<'a>(
         Datum::Int2(v) => Ok(Some(v as f64)),
         Datum::Int4(v) => Ok(Some(v as f64)),
         Datum::Int8(v) => Ok(Some(v as f64)),
+        Datum::Float4(v) => Ok(Some(f64::from(v))),
         Datum::Float8(v) => Ok(Some(v)),
         Datum::Numeric(n) => Ok(Some(n.to_f64())),
         other => Err(type_mismatch(name, &other)),
@@ -119,6 +120,7 @@ pub(crate) fn datum_f64(name: &str, d: Datum<'_>) -> Result<f64, SqlError> {
         Datum::Int2(v) => Ok(v as f64),
         Datum::Int4(v) => Ok(v as f64),
         Datum::Int8(v) => Ok(v as f64),
+        Datum::Float4(v) => Ok(f64::from(v)),
         Datum::Float8(v) => Ok(v),
         Datum::Numeric(n) => Ok(n.to_f64()),
         other => Err(type_mismatch(name, &other)),
@@ -336,6 +338,7 @@ pub(crate) fn datum_numeric<'a>(name: &str, d: Datum<'a>, arena: &'a Arena) -> R
         Datum::Int2(v) => Numeric::from_i64(v as i64, arena),
         Datum::Int4(v) => Numeric::from_i64(v as i64, arena),
         Datum::Int8(v) => Numeric::from_i64(v, arena),
+        Datum::Float4(v) => Numeric::parse(stack_format!(64, "{}", v).as_str(), arena),
         Datum::Float8(v) => Numeric::parse(stack_format!(64, "{}", v).as_str(), arena),
         other => Err(type_mismatch(name, &other)),
     }

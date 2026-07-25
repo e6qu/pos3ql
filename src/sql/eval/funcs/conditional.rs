@@ -85,14 +85,16 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int2(_) | Datum::Int4(_) => 1,
                     Datum::Int8(_) => 2,
                     Datum::Numeric(_) => 3,
-                    Datum::Float8(_) => 4,
+                    Datum::Float4(_) => 4,
+                    Datum::Float8(_) => 5,
                     _ => 0,
                 };
                 let static_rank = |t: ColType| match t {
-                    ColType::Int4 => 1,
+                    ColType::Int2 | ColType::Int4 => 1,
                     ColType::Int8 => 2,
                     ColType::Numeric => 3,
-                    ColType::Float8 => 4,
+                    ColType::Float4 => 4,
+                    ColType::Float8 => 5,
                     _ => 0,
                 };
                 let mut best: Option<Datum> = None;
@@ -117,12 +119,23 @@ pub(crate) fn dispatch<'a>(
                 }
                 let best = best.unwrap_or(Datum::Null);
                 Ok(match (widest, best) {
-                    (4, d) => Datum::Float8(match d {
+                    (5, d) => Datum::Float8(match d {
                         Datum::Int2(x) => x as f64,
                         Datum::Int4(x) => x as f64,
                         Datum::Int8(x) => x as f64,
                         Datum::Numeric(n) => n.to_f64(),
+                        Datum::Float4(f) => f64::from(f),
                         Datum::Float8(f) => f,
+                        other => return Ok(other),
+                    }),
+                    // real wins over int and numeric, so the result widens to
+                    // real (double precision would need a float8 present).
+                    (4, d) => Datum::Float4(match d {
+                        Datum::Int2(x) => x as f32,
+                        Datum::Int4(x) => x as f32,
+                        Datum::Int8(x) => x as f32,
+                        Datum::Numeric(n) => n.to_f64() as f32,
+                        Datum::Float4(f) => f,
                         other => return Ok(other),
                     }),
                     (3, d) => match d {

@@ -1013,9 +1013,12 @@ pub fn write_datum_json_styled(
     match v {
         Datum::Null => out.write_str("null"),
         Datum::Bool(b) => out.write_str(if *b { "true" } else { "false" }),
-        Datum::Int4(_) | Datum::Int8(_) | Datum::Float8(_) | Datum::Numeric(_) => {
-            write!(out, "{v}")
-        }
+        Datum::Int2(_)
+        | Datum::Int4(_)
+        | Datum::Int8(_)
+        | Datum::Float4(_)
+        | Datum::Float8(_)
+        | Datum::Numeric(_) => write!(out, "{v}"),
         Datum::Json { text, .. } => out.write_str(text),
         Datum::Array { element, raw } => {
             out.write_char('[')?;

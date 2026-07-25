@@ -2474,6 +2474,7 @@ fn num_factor(d: &Datum) -> Option<f64> {
         Datum::Int2(x) => Some(f64::from(*x)),
         Datum::Int4(x) => Some(f64::from(*x)),
         Datum::Int8(x) => Some(*x as f64),
+        Datum::Float4(x) => Some(f64::from(*x)),
         Datum::Float8(x) => Some(*x),
         Datum::Numeric(n) => Some(n.to_f64()),
         _ => None,
@@ -2774,6 +2775,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",
         Datum::Int8(_) => "bigint",
+        Datum::Float4(_) => "real",
         Datum::Float8(_) => "double precision",
         Datum::Numeric(_) => "numeric",
         Datum::Text(_) => "text",
@@ -2813,6 +2815,7 @@ fn as_f64(d: &Datum) -> Option<f64> {
         Datum::Int2(x) => Some(f64::from(*x)),
         Datum::Int4(x) => Some(f64::from(*x)),
         Datum::Int8(x) => Some(*x as f64),
+        Datum::Float4(x) => Some(f64::from(*x)),
         Datum::Float8(x) => Some(*x),
         _ => None,
     }

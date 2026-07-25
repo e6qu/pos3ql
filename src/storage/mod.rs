@@ -98,6 +98,9 @@ impl OwnedDatum {
             Datum::Int4(v) => Self::Int4(*v),
             Datum::Int2(v) => Self::Int4(*v as i32),
             Datum::Int8(v) => Self::Int8(*v),
+            // Widened like int2→int4; the column re-coerces the default back to
+            // real (f64→f32 is lossless for a value that was already f32).
+            Datum::Float4(v) => Self::Float8(f64::from(*v)),
             Datum::Float8(v) => Self::Float8(*v),
             Datum::Date(_)
             | Datum::Timestamp(_)

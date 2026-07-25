@@ -996,8 +996,21 @@ mirroring `pg_cast` plus the to-string/from-string I/O rule, so an
 explicit-only cast such as text→int is refused with 42804 as PostgreSQL does),
 or, with `USING`, through an expression evaluated per row over the old
 columns; the type modifier is applied and the change survives a restart.
-Corpus `46_alter_column_type`. Still to do (own PRs): `ADD`/`DROP CONSTRAINT`
-and comma-separated multi-action lists.
+Corpus `46_alter_column_type`. `ADD`/`DROP CONSTRAINT` followed
+(2026-07-25): `ADD [CONSTRAINT name] {CHECK | UNIQUE | PRIMARY KEY | FOREIGN
+KEY}` builds the constraint into the definition (reusing CREATE TABLE's
+`attach_constraints`) and validates every committed row against the whole
+constraint set before attaching — the added one is the only one that can
+fail, surfacing the INSERT-path SQLSTATE (23514/23505/23503, or 23502 for a
+new PK's NOT NULL); it is then enforced on later DML. `DROP CONSTRAINT [IF
+EXISTS] name` removes a CHECK / table-level UNIQUE-or-PK / FK by its stored
+name, or a single-column PK/UNIQUE by its generated name (`<table>_pkey`,
+`<table>_<column>_key`), with the `IF EXISTS` skip notice. Corpus
+`47_alter_constraint`. Known gap (its own follow-up): a single-column
+UNIQUE/PK added under an *explicit* name is stored as a column flag that does
+not retain that name, so `DROP CONSTRAINT <explicit_name>` cannot find it —
+retaining names for single-column keys is the fix. Still to do: comma-
+separated multi-action lists.
 
 ### The order (dependency-driven)
 

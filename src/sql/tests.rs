@@ -1501,6 +1501,40 @@ fn alter_column_type_rewrites_and_persists() {
 }
 
 #[test]
+fn alter_add_drop_constraint() {
+    let config = test_config("alter-constraint");
+    {
+        let mut b = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run_with(&mut e, &mut b, "CREATE TABLE ch (id int, a int, b int)");
+        run_with(&mut e, &mut b, "INSERT INTO ch VALUES (1, 5, 10), (2, 7, 20)");
+        // ADD CHECK: violated by an existing row is refused (23514).
+        let bytes = run_with(&mut e, &mut b, "ALTER TABLE ch ADD CONSTRAINT ck CHECK (a > 6)");
+        assert!(String::from_utf8_lossy(&bytes).contains("23514"), "expected check violation on add");
+        // A satisfied one attaches and is then enforced.
+        run_with(&mut e, &mut b, "ALTER TABLE ch ADD CONSTRAINT ck CHECK (a > 0)");
+        let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (3, -1, 30)");
+        assert!(String::from_utf8_lossy(&bytes).contains("23514"), "expected check enforced");
+        // ADD UNIQUE, then DROP by the generated name lifts enforcement.
+        run_with(&mut e, &mut b, "ALTER TABLE ch ADD UNIQUE (b)");
+        let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (4, 8, 10)");
+        assert!(String::from_utf8_lossy(&bytes).contains("23505"), "expected unique enforced");
+        run_with(&mut e, &mut b, "ALTER TABLE ch DROP CONSTRAINT ch_b_key");
+        run_with(&mut e, &mut b, "INSERT INTO ch VALUES (5, 9, 10)");
+        // DROP of a missing constraint errors (42704).
+        let bytes = run_with(&mut e, &mut b, "ALTER TABLE ch DROP CONSTRAINT nope");
+        assert!(String::from_utf8_lossy(&bytes).contains("42704"), "expected undefined constraint");
+    }
+    // The CHECK constraint survives a restart and stays enforced.
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (6, -5, 60)");
+    assert!(String::from_utf8_lossy(&bytes).contains("23514"), "check survives restart");
+    let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM ch");
+    assert_eq!(data_rows(&bytes), ["3"]);
+}
+
+#[test]
 fn joins_group_by_subqueries() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE d (id int, name text)");

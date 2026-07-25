@@ -2458,6 +2458,98 @@ fn alter_type_auto_castable(from: ColType, to: ColType) -> bool {
     )
 }
 
+/// Validates every committed row against a table's whole constraint set, for
+/// ALTER TABLE ADD CONSTRAINT — the just-added constraint is the only one that
+/// can fail, and its violation surfaces with the same SQLSTATE the INSERT path
+/// would give (23514 CHECK, 23505 UNIQUE, 23503 FK, 23502 the PK's NOT NULL).
+fn validate_all_rows(
+    storage: &Storage,
+    table_index: usize,
+    new_def: &TableDef,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let checks = parse_checks(new_def, arena)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    new_def.schema(&mut schema);
+    let schema = &schema[..new_def.n_columns];
+    let mut result = Ok(());
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        let Some(home) = state.committed else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, schema, &mut values)?;
+        let values = &values[..new_def.n_columns];
+        let check = check_not_null(new_def, values).and_then(|()| {
+            enforce_row_constraints(
+                storage, table_index, new_def, schema, values, Some(rowid), u32::MAX, &checks, arena, &[],
+            )
+        });
+        if let Err(e) = check {
+            result = Err(e);
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    result
+}
+
+/// Removes a named constraint from `def` for ALTER TABLE DROP CONSTRAINT:
+/// a CHECK, a table-level UNIQUE/PRIMARY KEY, or an FK by its stored name, plus
+/// the generated names of a single-column primary key (`<table>_pkey`) or
+/// unique column (`<table>_<column>_key`). Returns whether one was found.
+fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
+    for i in 0..def.n_checks {
+        if def.checks[i].name.as_str() == name {
+            for j in i..def.n_checks - 1 {
+                def.checks[j] = def.checks[j + 1];
+            }
+            def.n_checks -= 1;
+            return true;
+        }
+    }
+    for i in 0..def.n_uniques {
+        if def.uniques[i].name.as_str() == name {
+            for j in i..def.n_uniques - 1 {
+                def.uniques[j] = def.uniques[j + 1];
+            }
+            def.n_uniques -= 1;
+            return true;
+        }
+    }
+    for i in 0..def.n_fkeys {
+        if def.fkeys[i].name.as_str() == name {
+            for j in i..def.n_fkeys - 1 {
+                def.fkeys[j] = def.fkeys[j + 1];
+            }
+            def.n_fkeys -= 1;
+            return true;
+        }
+    }
+    // A single-column primary key is a column flag named "<table>_pkey".
+    let pkey = crate::stack_format!(96, "{}_pkey", def.name.as_str());
+    if name == pkey.as_str()
+        && let Some(c) = def.columns[..def.n_columns].iter_mut().find(|c| c.primary)
+    {
+        c.primary = false;
+        c.unique = false;
+        return true;
+    }
+    // A single-column UNIQUE is "<table>_<column>_key".
+    for i in 0..def.n_columns {
+        if def.columns[i].unique && !def.columns[i].primary {
+            let key = crate::stack_format!(128, "{}_{}_key", def.name.as_str(), def.columns[i].name.as_str());
+            if name == key.as_str() {
+                def.columns[i].unique = false;
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Scans a table's committed rows for a NULL in column `col`, for ALTER COLUMN
 /// SET NOT NULL. Errors on the first NULL, naming the column and relation as
 /// PostgreSQL does.
@@ -2736,6 +2828,47 @@ pub fn alter_table(
             new_def.columns[i].ctype = target;
             new_def.columns[i].type_mod = *type_mod;
             retyped = Some((i, target, *type_mod, *using));
+        }
+        AlterAction::AddConstraint(constraint) => {
+            // Build the constraint into the new definition (u32::MAX sees all
+            // committed catalog, e.g. an FK's parent), then validate every
+            // committed row against the whole new constraint set — the added
+            // one is the only one that can fail. No row rewrite is needed.
+            if let Err(e) = crate::sql::exec::ddl::attach_constraints(
+                storage,
+                &mut new_def,
+                core::slice::from_ref(constraint),
+                u32::MAX,
+                arena,
+            ) {
+                return sql_fail(e);
+            }
+            if let Err(e) = validate_all_rows(storage, table_index, &new_def, arena) {
+                return sql_fail(e);
+            }
+        }
+        AlterAction::DropConstraint { name, if_exists } => {
+            if !drop_named_constraint(&mut new_def, name) {
+                if !*if_exists {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "constraint \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        def.name.as_str()
+                    ));
+                }
+                // IF EXISTS: PostgreSQL emits a skip notice (SQLSTATE 00000).
+                responder.notice(
+                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "constraint \"{}\" of relation \"{}\" does not exist, skipping",
+                        name,
+                        def.name.as_str()
+                    )
+                    .as_str(),
+                )?;
+            }
         }
     }
 

@@ -432,6 +432,8 @@ pub enum CopyFormat {
     Text,
     /// Comma-separated with double-quote quoting.
     Csv,
+    /// PostgreSQL's length-framed binary wire format.
+    Binary,
 }
 
 /// The `WITH (...)` options of a COPY, as written. Character options are stored
@@ -479,11 +481,11 @@ impl CopyOptions<'_> {
         force_null: &[],
     };
 
-    /// The effective field delimiter.
+    /// The effective field delimiter (text/CSV; unused for binary).
     pub fn delimiter_byte(&self) -> u8 {
         self.delimiter.unwrap_or(match self.format {
-            CopyFormat::Text => b'\t',
             CopyFormat::Csv => b',',
+            CopyFormat::Text | CopyFormat::Binary => b'\t',
         })
     }
 
@@ -497,16 +499,20 @@ impl CopyOptions<'_> {
         self.escape.unwrap_or_else(|| self.quote_byte())
     }
 
-    /// The effective NULL sentinel.
+    /// The effective NULL sentinel (text/CSV; unused for binary).
     pub fn null_str(&self) -> &str {
         self.null_string.unwrap_or(match self.format {
-            CopyFormat::Text => "\\N",
             CopyFormat::Csv => "",
+            CopyFormat::Text | CopyFormat::Binary => "\\N",
         })
     }
 
     pub fn is_csv(&self) -> bool {
         matches!(self.format, CopyFormat::Csv)
+    }
+
+    pub fn is_binary(&self) -> bool {
+        matches!(self.format, CopyFormat::Binary)
     }
 }
 

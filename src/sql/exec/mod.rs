@@ -1497,6 +1497,7 @@ pub struct CopySetup {
 #[derive(Clone, Copy)]
 pub struct CopyFmt {
     pub csv: bool,
+    pub binary: bool,
     pub delimiter: u8,
     pub quote: u8,
     pub escape: u8,
@@ -1546,6 +1547,7 @@ impl CopyFmt {
         }
         Ok(CopyFmt {
             csv: options.is_csv(),
+            binary: options.is_binary(),
             delimiter,
             quote,
             escape: options.escape_byte(),
@@ -1612,7 +1614,38 @@ pub fn copy_begin(
         ));
     }
     let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
+    // Binary format speaks each type's real binary wire form. The types whose
+    // binary format is not yet emitted (arrays, ranges, multiranges, bit
+    // strings, records — they fall back to canonical text, which a binary
+    // consumer would misparse) are refused loudly rather than corrupt the
+    // stream. Their binary codec is a self-contained follow-up.
+    if fmt.binary {
+        for &target in &targets[..n_targets] {
+            let ctype = def.columns()[target].ctype;
+            if !binary_copy_supported(ctype) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COPY BINARY of type {} is not supported yet",
+                    ctype.name()
+                ));
+            }
+        }
+    }
     Ok(CopySetup { table_index, targets, n_targets, fmt })
+}
+
+/// Whether COPY BINARY can round-trip a column of this type (its binary wire
+/// format is emitted and decoded faithfully). The text-shortcut types are not
+/// yet covered.
+fn binary_copy_supported(ctype: ColType) -> bool {
+    !matches!(
+        ctype,
+        ColType::Array(_)
+            | ColType::Range(_)
+            | ColType::Multirange(_)
+            | ColType::Bit { .. }
+            | ColType::Record
+    )
 }
 
 /// One COPY FROM data line: text fields decode, coerce through each column's
@@ -1687,6 +1720,126 @@ pub fn copy_row(
     store_row(storage, txn, setup.table_index, None, &values[..def.n_columns])
 }
 
+/// One COPY FROM binary row: `row` is the int16 field count followed by each
+/// field's int32 length (or -1 for NULL) and its binary bytes. Fields decode
+/// through each column's binary input, then store through the same row core as
+/// INSERT — defaults, sequences, NOT NULL, uniqueness, CHECK and foreign keys.
+pub fn copy_row_binary(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    setup: &CopySetup,
+    row: &[u8],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let def = storage.table(setup.table_index).def;
+    let count = i16::from_be_bytes([row[0], row[1]]);
+    if count < 0 || count as usize != setup.n_targets {
+        return Err(sql_err!(
+            sqlstate::BAD_COPY_FILE_FORMAT,
+            "COPY binary row has {} fields, expected {}",
+            count,
+            setup.n_targets
+        ));
+    }
+    let checks = parse_checks(&def, arena)?;
+    let mut values = [Datum::Null; MAX_COLUMNS];
+    for (i, col) in def.columns().iter().enumerate() {
+        if let Some(d) = &col.default_value {
+            values[i] = d.as_datum();
+        }
+    }
+    let mut explicit = [false; MAX_COLUMNS];
+    let mut at = 2usize;
+    for i in 0..setup.n_targets {
+        let flen = i32::from_be_bytes([row[at], row[at + 1], row[at + 2], row[at + 3]]);
+        at += 4;
+        let col_index = setup.targets[i];
+        let col = def.columns()[col_index];
+        values[col_index] = if flen == -1 {
+            Datum::Null
+        } else {
+            let field = &row[at..at + flen as usize];
+            at += flen as usize;
+            let decoded = decode_binary_field(col.ctype, field, arena)?;
+            coerce(decoded, &col, arena)?
+        };
+        explicit[col_index] = true;
+    }
+    fill_auto_increment(storage, setup.table_index, &def, &mut values, &explicit)?;
+    check_not_null(&def, &values)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    enforce_row_constraints(
+        storage,
+        setup.table_index,
+        &def,
+        &schema[..def.n_columns],
+        &values[..def.n_columns],
+        None,
+        txn.txid,
+        &checks,
+        arena,
+        &[],
+    )?;
+    store_row(storage, txn, setup.table_index, None, &values[..def.n_columns])
+}
+
+/// Decodes one COPY-binary field into a datum of `ctype`, per PostgreSQL's
+/// per-type binary receive format. Reuses the extended-protocol binary decoder
+/// for the shared scalar types; handles the ones it does not (`smallint` as a
+/// true int2, `timetz`, and the text family) directly. The unsupported types
+/// are refused at [`copy_begin`], so they never reach here.
+fn decode_binary_field<'a>(
+    ctype: ColType,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use crate::sql::types::oid as oids;
+    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary field for type {}", ctype.name());
+    let via = |oid| crate::pg::conn::decode_binary_param(oid, bytes, arena).map_err(|_| bad());
+    match ctype {
+        ColType::Bool => via(oids::BOOL),
+        ColType::Int2 => {
+            let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;
+            Ok(Datum::Int2(i16::from_be_bytes(b)))
+        }
+        ColType::Int4 => via(oids::INT4),
+        ColType::Int8 => via(oids::INT8),
+        ColType::Float4 => via(oids::FLOAT4),
+        ColType::Float8 => via(oids::FLOAT8),
+        ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
+            core::str::from_utf8(bytes).map(Datum::Text).map_err(|_| bad())
+        }
+        ColType::Date => via(oids::DATE),
+        ColType::Timestamp => via(oids::TIMESTAMP),
+        ColType::Timestamptz => via(oids::TIMESTAMPTZ),
+        ColType::Time => via(oids::TIME),
+        ColType::Timetz => {
+            // 8-byte time then a 4-byte zone counted west of UTC; the stored
+            // offset is the eastward negation, as the send side flips it.
+            let b: [u8; 12] = bytes.try_into().map_err(|_| bad())?;
+            let time = i64::from_be_bytes(b[0..8].try_into().unwrap());
+            let zone = i32::from_be_bytes(b[8..12].try_into().unwrap());
+            Ok(Datum::Timetz(time, -zone))
+        }
+        ColType::Interval => via(oids::INTERVAL),
+        ColType::Json => via(oids::JSON),
+        ColType::Jsonb => via(oids::JSONB),
+        ColType::Uuid => via(oids::UUID),
+        ColType::Bytea => via(oids::BYTEA),
+        ColType::Numeric => via(oids::NUMERIC),
+        ColType::Array(_)
+        | ColType::Range(_)
+        | ColType::Multirange(_)
+        | ColType::Bit { .. }
+        | ColType::Record => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY BINARY of type {} is not supported yet",
+            ctype.name()
+        )),
+    }
+}
+
 /// COPY TO STDOUT: every visible row, targets in COPY order, each value in
 /// its wire text form with COPY's escapes. Returns the row count for the
 /// command tag.
@@ -1701,7 +1854,10 @@ pub fn copy_out(
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let fmt = &setup.fmt;
-    responder.copy_out_response(setup.n_targets).map_err(wire_to_sql)?;
+    responder.copy_out_response(setup.n_targets, fmt.binary).map_err(wire_to_sql)?;
+    if fmt.binary {
+        responder.copy_binary_header().map_err(wire_to_sql)?;
+    }
     // A header line of column names, in the same field format as the data.
     if fmt.header {
         responder
@@ -1750,6 +1906,18 @@ pub fn copy_out(
         storage.with_row_bytes(setup.table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
+            if fmt.binary {
+                // Each field is its value's binary form (int32 length + bytes,
+                // or -1 for NULL). No text rendering.
+                responder
+                    .copy_binary_row(setup.n_targets, &|m| {
+                        for i in 0..setup.n_targets {
+                            Responder::encode_value_binary(m, &values[setup.targets[i]]);
+                        }
+                    })
+                    .map_err(wire_to_sql)?;
+                return Ok(());
+            }
             // Render each target into the arena first (fallible), so the
             // wire write below is a deterministic, retry-safe emission.
             let render = responder.render_context();
@@ -1785,6 +1953,9 @@ pub fn copy_out(
             Ok(())
         })?;
         count += 1;
+    }
+    if fmt.binary {
+        responder.copy_binary_trailer().map_err(wire_to_sql)?;
     }
     responder.copy_done().map_err(wire_to_sql)?;
     Ok(count)

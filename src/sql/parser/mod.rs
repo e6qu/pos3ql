@@ -1404,7 +1404,7 @@ impl<'a> Parser<'a> {
                 options.format = match format {
                     "text" => CopyFormat::Text,
                     "csv" => CopyFormat::Csv,
-                    "binary" => return Err(self.copy_unsupported("COPY format \"binary\"")),
+                    "binary" => CopyFormat::Binary,
                     other => {
                         return Err(ParseError {
                             at: self.peek_at,
@@ -1440,9 +1440,8 @@ impl<'a> Parser<'a> {
     /// One legacy bare option; returns whether one was consumed.
     fn copy_legacy_option(&mut self, options: &mut CopyOptions<'a>) -> Result<bool, ParseError> {
         if self.eat_ident("binary")? {
-            return Err(self.copy_unsupported("COPY WITH BINARY"));
-        }
-        if self.eat_ident("csv")? {
+            options.format = CopyFormat::Binary;
+        } else if self.eat_ident("csv")? {
             options.format = CopyFormat::Csv;
         } else if self.eat_ident("header")? {
             options.header = true;
@@ -1484,6 +1483,25 @@ impl<'a> Parser<'a> {
     /// The CSV-only options are meaningless in text format, exactly as
     /// PostgreSQL rejects them.
     fn validate_copy_options(&self, options: &CopyOptions) -> Result<(), ParseError> {
+        // Binary format takes none of the text/CSV field options.
+        if options.is_binary() {
+            let text_only = if options.delimiter.is_some() {
+                Some("DELIMITER")
+            } else if options.null_string.is_some() {
+                Some("NULL")
+            } else if options.header {
+                Some("HEADER")
+            } else {
+                None
+            };
+            if let Some(name) = text_only {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "cannot specify {} in BINARY mode", name),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            }
+        }
         if !options.is_csv() {
             let csv_only = if options.quote.is_some() {
                 Some("QUOTE")

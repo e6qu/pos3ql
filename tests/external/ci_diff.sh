@@ -138,6 +138,14 @@ for f in "$EXT"/differential_exact/*.sql; do
   else bad "exact errors: $n"; head -40 "$WORK/$n.diff"; fi
 done
 
+# --- COPY binary round-trip (binary data cannot be fed through a psql corpus) -
+echo "=== COPY binary round-trip (real PostgreSQL vs pos3ql) ==="
+if "$PY" "$EXT/copy_binary_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/copybin.out" 2>&1; then
+  ok "COPY binary round-trip ($(tail -1 "$WORK/copybin.out"))"
+else
+  bad "COPY binary round-trip"; cat "$WORK/copybin.out"
+fi
+
 # --- vendored sqllogictest replay (real PostgreSQL is the oracle) ----------
 # Query-block sharded: all files, all statements; this shard runs its slice of
 # the read-only query blocks.

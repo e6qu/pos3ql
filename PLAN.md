@@ -960,6 +960,21 @@ The sweep also turned up four Boyscout fixes (float→int now ties to even;
 smallint/real UNION unifies) and one honest open item, B-170 (shortest-float
 tie-breaking, shared with float8, deferred to its own Ryu-style formatter).
 
+### ALTER TABLE ALTER COLUMN family (2026-07-25)
+
+`ALTER TABLE` handled ADD/DROP/RENAME COLUMN and RENAME TO but not the ALTER
+COLUMN sub-commands. Added `ALTER [COLUMN] col SET/DROP DEFAULT` and
+`SET/DROP NOT NULL` (the COLUMN keyword optional, as in PostgreSQL): SET
+DEFAULT evaluates and casts the constant through the column's type on the
+same path CREATE TABLE uses; SET NOT NULL scans the committed rows and
+refuses with 23502 (naming the column and relation) while a NULL is present,
+then is enforced on later DML; DROP NOT NULL is refused on a primary-key
+column (42P16). All changes journal as the existing DropTable+CreateTable
+shape swap, so they survive a kill -9 restart. Corpus `45_alter_column`
+matches PostgreSQL 18. Still to do (own PRs): `ALTER COLUMN TYPE` (needs a
+per-row cast rewrite — the row-rewrite path already exists for ADD/DROP
+COLUMN), `ADD`/`DROP CONSTRAINT`, and comma-separated multi-action lists.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

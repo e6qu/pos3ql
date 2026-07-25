@@ -1426,8 +1426,32 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("drop")? {
             let _ = self.eat_ident("column")?;
             AlterAction::DropColumn(self.col_ident("column name")?)
+        } else if self.eat_ident("alter")? {
+            // ALTER [COLUMN] col { SET DEFAULT e | DROP DEFAULT | SET NOT NULL
+            // | DROP NOT NULL }.
+            let _ = self.eat_ident("column")?;
+            let column = self.col_ident("column name")?;
+            if self.eat_ident("set")? {
+                if self.eat_ident("default")? {
+                    AlterAction::SetDefault { column, value: self.expression(0)? }
+                } else {
+                    self.expect_ident("not")?;
+                    self.expect_ident("null")?;
+                    AlterAction::SetNotNull { column }
+                }
+            } else if self.eat_ident("drop")? {
+                if self.eat_ident("default")? {
+                    AlterAction::DropDefault { column }
+                } else {
+                    self.expect_ident("not")?;
+                    self.expect_ident("null")?;
+                    AlterAction::DropNotNull { column }
+                }
+            } else {
+                return Err(self.unexpected("expected SET or DROP"));
+            }
         } else {
-            return Err(self.unexpected("expected RENAME, ADD or DROP"));
+            return Err(self.unexpected("expected RENAME, ADD, DROP or ALTER"));
         };
         Ok(Stmt::AlterTable(AlterTable { table, action }))
     }

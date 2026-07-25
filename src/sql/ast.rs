@@ -478,6 +478,14 @@ pub enum AlterAction<'a> {
     RenameColumn { from: &'a str, to: &'a str },
     AddColumn(ColumnDef<'a>),
     DropColumn(&'a str),
+    /// ALTER [COLUMN] col SET DEFAULT expr.
+    SetDefault { column: &'a str, value: &'a Expr<'a> },
+    /// ALTER [COLUMN] col DROP DEFAULT.
+    DropDefault { column: &'a str },
+    /// ALTER [COLUMN] col SET NOT NULL — validated against existing rows.
+    SetNotNull { column: &'a str },
+    /// ALTER [COLUMN] col DROP NOT NULL.
+    DropNotNull { column: &'a str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

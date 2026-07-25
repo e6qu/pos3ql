@@ -2421,6 +2421,43 @@ const MAX_TRUNCATE_TABLES: usize = 16;
 /// shape atomically. Two-phase in memory: all new row images are prepared
 /// first, then the definition and row map swap; a failure part-way leaves
 /// the table untouched (only heap bytes leak until compaction).
+/// Whether `ALTER COLUMN ... TYPE` may cast `from` to `to` without a `USING`
+/// clause — i.e. PostgreSQL has an assignment (or implicit) cast for the pair.
+/// Mirrors `pg_cast` (castcontext in {'a','i'}) over this engine's types, plus
+/// the I/O rule: any type casts *to* a string type as an assignment, but *from*
+/// a string type is explicit-only (needs USING).
+fn alter_type_auto_castable(from: ColType, to: ColType) -> bool {
+    use ColType::*;
+    if from == to {
+        return true;
+    }
+    let is_string = |t| matches!(t, Text | Varchar | Bpchar | Name);
+    // to-string: assignment via the output function; from-string: explicit.
+    if is_string(to) {
+        return true;
+    }
+    if is_string(from) {
+        return false;
+    }
+    let numeric = |t| matches!(t, Int2 | Int4 | Int8 | Float4 | Float8 | Numeric);
+    if numeric(from) && numeric(to) {
+        return true;
+    }
+    // The remaining assignment/implicit pairs among the date/time and json
+    // families, per pg_cast.
+    matches!(
+        (from, to),
+        (Date, Timestamp | Timestamptz)
+            | (Timestamp, Date | Time | Timestamptz)
+            | (Timestamptz, Date | Time | Timestamp | Timetz)
+            | (Time, Timetz | Interval)
+            | (Timetz, Time)
+            | (Interval, Time)
+            | (Json, Jsonb)
+            | (Jsonb, Json)
+    )
+}
+
 /// Scans a table's committed rows for a NULL in column `col`, for ALTER COLUMN
 /// SET NOT NULL. Errors on the first NULL, naming the column and relation as
 /// PostgreSQL does.
@@ -2541,6 +2578,8 @@ pub fn alter_table(
     let mut new_def = def;
     let mut added: Option<(usize, Datum)> = None; // (index, fill value)
     let mut dropped: Option<usize> = None;
+    // (column index, target type, target typmod, optional USING expression)
+    let mut retyped: Option<(usize, ColType, i32, Option<&Expr>)> = None;
     match &statement.action {
         AlterAction::SetSchema(_) => unreachable!("handled above"),
         AlterAction::RenameTable(new_name) => {
@@ -2672,6 +2711,32 @@ pub fn alter_table(
             }
             new_def.columns[i].not_null = false;
         }
+        AlterAction::AlterColumnType { column, type_name, type_mod, using } => {
+            let Some(i) = def.column_index(column) else {
+                return sql_fail(undefined_column(column));
+            };
+            let Some(target) = ColType::from_sql_name(type_name) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    type_name
+                ));
+            };
+            // Without USING, the stored value casts through the assignment
+            // cast; a cast that is explicit-only (e.g. text→int) is refused
+            // with PostgreSQL's 42804, telling the user to add USING.
+            if using.is_none() && !alter_type_auto_castable(def.columns[i].ctype, target) {
+                return sql_fail(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" cannot be cast automatically to type {}",
+                    column,
+                    target.name()
+                ));
+            }
+            new_def.columns[i].ctype = target;
+            new_def.columns[i].type_mod = *type_mod;
+            retyped = Some((i, target, *type_mod, *using));
+        }
     }
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
@@ -2691,7 +2756,7 @@ pub fn alter_table(
         return sql_fail(e);
     }
     scratch.clear();
-    let rewrite = added.is_some() || dropped.is_some();
+    let rewrite = added.is_some() || dropped.is_some() || retyped.is_some();
     // Collect (rowid, old committed loc).
     let mut row_count = 0usize;
     {
@@ -2744,6 +2809,27 @@ pub fn alter_table(
                             w += 1;
                         }
                     }
+                } else if let Some((index, target, typmod, using)) = retyped {
+                    out[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
+                    // USING is evaluated with the old row's columns in scope;
+                    // otherwise the old value itself is the cast source.
+                    let source = match using {
+                        Some(expr) => {
+                            let ctx = RowCtx { def: &def, values: &values[..def.n_columns] };
+                            match eval(expr, arena, crate::sql::eval::NO_PARAMS, &ctx) {
+                                Ok(v) => v,
+                                Err(e) => return sql_fail(e),
+                            }
+                        }
+                        None => values[index],
+                    };
+                    let new_val = match cast_to(source, target, arena)
+                        .and_then(|v| apply_typmod(v, target, typmod, arena))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return sql_fail(e),
+                    };
+                    out[index] = new_val;
                 }
                 let len = rowenc::encoded_len(&out[..n_out]);
                 let buffer = match arena.alloc_slice_with(len, |_| 0u8) {

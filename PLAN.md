@@ -989,9 +989,15 @@ refuses with 23502 (naming the column and relation) while a NULL is present,
 then is enforced on later DML; DROP NOT NULL is refused on a primary-key
 column (42P16). All changes journal as the existing DropTable+CreateTable
 shape swap, so they survive a kill -9 restart. Corpus `45_alter_column`
-matches PostgreSQL 18. Still to do (own PRs): `ALTER COLUMN TYPE` (needs a
-per-row cast rewrite — the row-rewrite path already exists for ADD/DROP
-COLUMN), `ADD`/`DROP CONSTRAINT`, and comma-separated multi-action lists.
+matches PostgreSQL 18. `ALTER COLUMN TYPE` followed (2026-07-25): `TYPE t`
+and `SET DATA TYPE t`, with the stored rows rewritten through the row-rewrite
+path — the value casts through the assignment cast (a `alter_type_auto_castable`
+mirroring `pg_cast` plus the to-string/from-string I/O rule, so an
+explicit-only cast such as text→int is refused with 42804 as PostgreSQL does),
+or, with `USING`, through an expression evaluated per row over the old
+columns; the type modifier is applied and the change survives a restart.
+Corpus `46_alter_column_type`. Still to do (own PRs): `ADD`/`DROP CONSTRAINT`
+and comma-separated multi-action lists.
 
 ### The order (dependency-driven)
 

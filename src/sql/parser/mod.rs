@@ -1376,6 +1376,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The tail of `ALTER [COLUMN] col [SET DATA] TYPE newtype [USING expr]`,
+    /// after the `TYPE` keyword.
+    fn alter_column_type(&mut self, column: &'a str) -> Result<AlterAction<'a>, ParseError> {
+        let (type_name, type_mod) = self.type_name_mod()?;
+        let using = if self.eat_ident("using")? {
+            Some(self.expression(0)?)
+        } else {
+            None
+        };
+        Ok(AlterAction::AlterColumnType { column, type_name, type_mod, using })
+    }
+
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         self.expect_ident("table")?;
@@ -1431,8 +1443,16 @@ impl<'a> Parser<'a> {
             // | DROP NOT NULL }.
             let _ = self.eat_ident("column")?;
             let column = self.col_ident("column name")?;
-            if self.eat_ident("set")? {
-                if self.eat_ident("default")? {
+            // `TYPE t` and `SET DATA TYPE t` are the same column-type change;
+            // `SET DEFAULT`/`SET NOT NULL` and `DROP DEFAULT`/`DROP NOT NULL`
+            // are the other four ALTER COLUMN forms.
+            if self.eat_ident("type")? {
+                self.alter_column_type(column)?
+            } else if self.eat_ident("set")? {
+                if self.eat_ident("data")? {
+                    self.expect_ident("type")?;
+                    self.alter_column_type(column)?
+                } else if self.eat_ident("default")? {
                     AlterAction::SetDefault { column, value: self.expression(0)? }
                 } else {
                     self.expect_ident("not")?;
@@ -1448,7 +1468,7 @@ impl<'a> Parser<'a> {
                     AlterAction::DropNotNull { column }
                 }
             } else {
-                return Err(self.unexpected("expected SET or DROP"));
+                return Err(self.unexpected("expected TYPE, SET or DROP"));
             }
         } else {
             return Err(self.unexpected("expected RENAME, ADD, DROP or ALTER"));

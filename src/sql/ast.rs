@@ -486,6 +486,15 @@ pub enum AlterAction<'a> {
     SetNotNull { column: &'a str },
     /// ALTER [COLUMN] col DROP NOT NULL.
     DropNotNull { column: &'a str },
+    /// ALTER [COLUMN] col [SET DATA] TYPE newtype [USING expr]. Without `using`
+    /// the stored value is cast through the assignment cast; with it, `using`
+    /// is evaluated per row (the old columns in scope) and cast to the type.
+    AlterColumnType {
+        column: &'a str,
+        type_name: &'a str,
+        type_mod: i32,
+        using: Option<&'a Expr<'a>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

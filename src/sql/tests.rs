@@ -1476,6 +1476,31 @@ fn alter_column_default_and_not_null() {
 }
 
 #[test]
+fn alter_column_type_rewrites_and_persists() {
+    let config = test_config("alter-column-type");
+    {
+        let mut b = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a int, b text)");
+        run_with(&mut e, &mut b, "INSERT INTO ct VALUES (1, 42, 'hello'), (2, 100, 'yo')");
+        // Assignment cast (int -> text) needs no USING.
+        run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN a TYPE text");
+        // Explicit-only cast without USING is refused (42804).
+        let bytes = run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN b TYPE int");
+        assert!(String::from_utf8_lossy(&bytes).contains("42804"), "expected cast-automatically error");
+        // USING evaluates over the old row.
+        run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN b TYPE int USING length(b)");
+        let bytes = run_with(&mut e, &mut b, "SELECT a, pg_typeof(a), b FROM ct ORDER BY id");
+        assert_eq!(data_rows(&bytes), ["42|text|5", "100|text|2"]);
+    }
+    // The rewritten shape and values survive a restart.
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    let bytes = run_with(&mut e, &mut b, "SELECT a, pg_typeof(b), b FROM ct ORDER BY id");
+    assert_eq!(data_rows(&bytes), ["42|integer|5", "100|integer|2"]);
+}
+
+#[test]
 fn joins_group_by_subqueries() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE d (id int, name text)");

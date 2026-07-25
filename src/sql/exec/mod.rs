@@ -1615,10 +1615,10 @@ pub fn copy_begin(
     }
     let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
     // Binary format speaks each type's real binary wire form. The types whose
-    // binary format is not yet emitted (arrays, ranges, multiranges, bit
-    // strings, records — they fall back to canonical text, which a binary
-    // consumer would misparse) are refused loudly rather than corrupt the
-    // stream. Their binary codec is a self-contained follow-up.
+    // binary format has no stored column representation — only anonymous
+    // `record` — are refused loudly rather than emit something a binary
+    // consumer would misparse. Every other column type, composites included,
+    // has a byte-exact binary send/recv codec.
     if fmt.binary {
         for &target in &targets[..n_targets] {
             let ctype = def.columns()[target].ctype;
@@ -1638,14 +1638,10 @@ pub fn copy_begin(
 /// format is emitted and decoded faithfully). The text-shortcut types are not
 /// yet covered.
 fn binary_copy_supported(ctype: ColType) -> bool {
-    !matches!(
-        ctype,
-        ColType::Array(_)
-            | ColType::Range(_)
-            | ColType::Multirange(_)
-            | ColType::Bit { .. }
-            | ColType::Record
-    )
+    // Arrays, ranges, multiranges and bit strings all have binary send/recv
+    // codecs. Record is anonymous-composite only (never a stored column type)
+    // and has no stable binary column representation, so it stays unsupported.
+    !matches!(ctype, ColType::Record)
 }
 
 /// One COPY FROM data line: text fields decode, coerce through each column's
@@ -1787,8 +1783,9 @@ pub fn copy_row_binary(
 /// Decodes one COPY-binary field into a datum of `ctype`, per PostgreSQL's
 /// per-type binary receive format. Reuses the extended-protocol binary decoder
 /// for the shared scalar types; handles the ones it does not (`smallint` as a
-/// true int2, `timetz`, and the text family) directly. The unsupported types
-/// are refused at [`copy_begin`], so they never reach here.
+/// true int2, `timetz`, the text family, and the composite array / range /
+/// multirange / bit formats) directly. Only anonymous `record` is refused at
+/// [`copy_begin`], so it never reaches here.
 fn decode_binary_field<'a>(
     ctype: ColType,
     bytes: &'a [u8],
@@ -1828,16 +1825,166 @@ fn decode_binary_field<'a>(
         ColType::Uuid => via(oids::UUID),
         ColType::Bytea => via(oids::BYTEA),
         ColType::Numeric => via(oids::NUMERIC),
-        ColType::Array(_)
-        | ColType::Range(_)
-        | ColType::Multirange(_)
-        | ColType::Bit { .. }
-        | ColType::Record => Err(sql_err!(
+        ColType::Array(element) => decode_binary_array(element, bytes, arena),
+        ColType::Range(kind) => decode_binary_range(kind, bytes, arena),
+        ColType::Multirange(kind) => decode_binary_multirange(kind, bytes, arena),
+        ColType::Bit { varying } => decode_binary_bit(varying, bytes, arena),
+        ColType::Record => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "COPY BINARY of type {} is not supported yet",
             ctype.name()
         )),
     }
+}
+
+/// Decodes the PostgreSQL binary array format: int32 ndim, int32 has-null,
+/// int32 element OID, then (for ndim > 0) one dim descriptor {count, lbound}
+/// and each element as int32 length (-1 = NULL) + its binary. Only the
+/// one-dimensional form this engine stores is accepted.
+fn decode_binary_array<'a>(
+    element: crate::sql::types::ArrElem,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary array");
+    let mut reader = crate::pg::wire::MsgIn::new(bytes);
+    let ndim = reader.i32().map_err(|_| bad())?;
+    let _has_null = reader.i32().map_err(|_| bad())?;
+    let _element_oid = reader.i32().map_err(|_| bad())?;
+    if ndim == 0 {
+        return Ok(Datum::Array {
+            element,
+            raw: crate::sql::array::build(&[], arena)?,
+        });
+    }
+    if ndim != 1 {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY BINARY of multi-dimensional arrays is not supported"
+        ));
+    }
+    let count = reader.i32().map_err(|_| bad())?;
+    let _lower_bound = reader.i32().map_err(|_| bad())?;
+    if !(0..=crate::sql::array::MAX_ELEMENTS as i32).contains(&count) {
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large"));
+    }
+    let element_type = element.to_coltype();
+    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    for slot in items.iter_mut().take(count as usize) {
+        let len = reader.i32().map_err(|_| bad())?;
+        if len < 0 {
+            *slot = Datum::Null;
+            continue;
+        }
+        let field = reader.take(len as usize).map_err(|_| bad())?;
+        *slot = decode_binary_field(element_type, field, arena)?;
+    }
+    Ok(Datum::Array {
+        element,
+        raw: crate::sql::array::build(&items[..count as usize], arena)?,
+    })
+}
+
+/// Decodes one PostgreSQL binary range body (flags byte + finite bounds) into a
+/// canonical `Datum::Range`. Shared by range and multirange decoding.
+fn decode_binary_range<'a>(
+    kind: crate::sql::types::RangeKind,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut reader = crate::pg::wire::MsgIn::new(bytes);
+    let text = decode_range_body(kind, &mut reader, arena)?;
+    Ok(Datum::Range { text, kind })
+}
+
+fn decode_range_body<'a>(
+    kind: crate::sql::types::RangeKind,
+    reader: &mut crate::pg::wire::MsgIn<'a>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary range");
+    let flags = reader.u8().map_err(|_| bad())?;
+    let mut parsed = crate::sql::range::Parsed {
+        empty: flags & 0x01 != 0,
+        lower: None,
+        upper: None,
+        lower_inc: flags & 0x02 != 0,
+        upper_inc: flags & 0x04 != 0,
+    };
+    if parsed.empty {
+        return crate::sql::range::canonical(&parsed, kind, arena);
+    }
+    let element_type = kind.elem_type();
+    let read_bound = |reader: &mut crate::pg::wire::MsgIn<'a>| -> Result<Option<&'a str>, SqlError> {
+        let len = reader.i32().map_err(|_| bad())?;
+        if len < 0 {
+            return Ok(None);
+        }
+        let field = reader.take(len as usize).map_err(|_| bad())?;
+        let datum = decode_binary_field(element_type, field, arena)?;
+        Ok(Some(arena.alloc_str_display(datum).map_err(|_| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "range bound exceeds the statement arena")
+        })?))
+    };
+    if flags & 0x08 == 0 {
+        parsed.lower = read_bound(reader)?;
+    }
+    if flags & 0x10 == 0 {
+        parsed.upper = read_bound(reader)?;
+    }
+    crate::sql::range::canonical(&parsed, kind, arena)
+}
+
+/// Decodes the PostgreSQL binary multirange format: int32 range count, then each
+/// range as int32 length + its range binary.
+fn decode_binary_multirange<'a>(
+    kind: crate::sql::types::RangeKind,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary multirange");
+    let mut reader = crate::pg::wire::MsgIn::new(bytes);
+    let count = reader.i32().map_err(|_| bad())?;
+    if !(0..=crate::sql::range::MAX_MULTIRANGE as i32).contains(&count) {
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many ranges"));
+    }
+    let mut ranges = [""; crate::sql::range::MAX_MULTIRANGE];
+    for slot in ranges.iter_mut().take(count as usize) {
+        let len = reader.i32().map_err(|_| bad())?;
+        let field = reader.take(len as usize).map_err(|_| bad())?;
+        let mut inner = crate::pg::wire::MsgIn::new(field);
+        *slot = decode_range_body(kind, &mut inner, arena)?;
+    }
+    let text = crate::sql::range::canonicalize_multirange(&mut ranges[..count as usize], kind, arena)?;
+    Ok(Datum::Multirange { text, kind })
+}
+
+/// Decodes the PostgreSQL binary bit-string format: int32 bit length, then
+/// ceil(len/8) bytes packed MSB-first, into a `0`/`1` string.
+fn decode_binary_bit<'a>(
+    varying: bool,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary bit string");
+    let mut reader = crate::pg::wire::MsgIn::new(bytes);
+    let bit_len = reader.i32().map_err(|_| bad())?;
+    if bit_len < 0 {
+        return Err(bad());
+    }
+    let bit_len = bit_len as usize;
+    let packed = reader.take(bit_len.div_ceil(8)).map_err(|_| bad())?;
+    let bits = arena
+        .alloc_slice_with(bit_len, |i| {
+            if packed[i / 8] & (0x80 >> (i % 8)) != 0 {
+                b'1'
+            } else {
+                b'0'
+            }
+        })
+        .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "bit string exceeds the statement arena"))?;
+    let bits = core::str::from_utf8(bits).map_err(|_| bad())?;
+    Ok(Datum::Bit { bits, varying })
 }
 
 /// COPY TO STDOUT: every visible row, targets in COPY order, each value in
@@ -1908,11 +2055,33 @@ pub fn copy_out(
             rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
             if fmt.binary {
                 // Each field is its value's binary form (int32 length + bytes,
-                // or -1 for NULL). No text rendering.
+                // or -1 for NULL). Ranges and multiranges are pre-parsed into
+                // arena datums here (fallible, once); every other type encodes
+                // arena-free. The emission closure then runs deterministically
+                // (it may run twice on the flush-and-retry path).
+                let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
+                for (i, plan) in plans.iter_mut().enumerate().take(setup.n_targets) {
+                    *plan = binary_field_plan(&values[setup.targets[i]], arena)?;
+                }
                 responder
                     .copy_binary_row(setup.n_targets, &|m| {
                         for i in 0..setup.n_targets {
-                            Responder::encode_value_binary(m, &values[setup.targets[i]]);
+                            match plans[i] {
+                                BinaryFieldPlan::Direct => {
+                                    Responder::encode_value_binary(m, &values[setup.targets[i]]);
+                                }
+                                BinaryFieldPlan::Range(f, l, u) => {
+                                    m.field(|m| encode_range_binary(m, f, l, u));
+                                }
+                                BinaryFieldPlan::Multirange(ranges) => {
+                                    m.field(|m| {
+                                        m.i32(ranges.len() as i32);
+                                        for &(f, l, u) in ranges {
+                                            m.field(|m| encode_range_binary(m, f, l, u));
+                                        }
+                                    });
+                                }
+                            }
                         }
                     })
                     .map_err(wire_to_sql)?;
@@ -1963,6 +2132,104 @@ pub fn copy_out(
 
 fn wire_to_sql(_: crate::pg::wire::WireFull) -> SqlError {
     sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "COPY output exceeds the send buffer")
+}
+
+/// A range's binary parts: the flags byte, and its two bound datums already
+/// parsed from the canonical text (`None` = infinite bound, or both `None` for
+/// an empty range).
+type RangeBinaryParts<'a> = (u8, Option<Datum<'a>>, Option<Datum<'a>>);
+
+/// Per-field plan for binary COPY output. Scalars, arrays and bit strings
+/// encode arena-free (`Direct`); ranges and multiranges are pre-parsed into
+/// arena datums up front so the retry-safe emission closure never allocates
+/// or fails.
+#[derive(Clone, Copy)]
+enum BinaryFieldPlan<'a> {
+    Direct,
+    Range(u8, Option<Datum<'a>>, Option<Datum<'a>>),
+    Multirange(&'a [RangeBinaryParts<'a>]),
+}
+
+fn binary_field_plan<'a>(
+    v: &Datum<'a>,
+    arena: &'a Arena,
+) -> Result<BinaryFieldPlan<'a>, SqlError> {
+    match v {
+        Datum::Range { text, kind } => {
+            let (flags, lower, upper) = parse_range_bounds(text, *kind, arena)?;
+            Ok(BinaryFieldPlan::Range(flags, lower, upper))
+        }
+        Datum::Multirange { text, kind } => {
+            let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
+            let n = crate::sql::range::split_components(text, &mut components)?;
+            let mut parts: [RangeBinaryParts; crate::sql::range::MAX_MULTIRANGE] =
+                [(0u8, None, None); crate::sql::range::MAX_MULTIRANGE];
+            for (slot, &component) in parts.iter_mut().zip(components.iter()).take(n) {
+                *slot = parse_range_bounds(component, *kind, arena)?;
+            }
+            let stored = arena.alloc_slice_copy(&parts[..n]).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "COPY BINARY multirange exceeds the statement arena"
+                )
+            })?;
+            Ok(BinaryFieldPlan::Multirange(stored))
+        }
+        _ => Ok(BinaryFieldPlan::Direct),
+    }
+}
+
+/// Parses a canonical range text into its PostgreSQL binary flags byte plus the
+/// two bound datums. Flags: `0x01` empty, `0x02` lower-inclusive, `0x04`
+/// upper-inclusive, `0x08` lower-infinite, `0x10` upper-infinite.
+fn parse_range_bounds<'a>(
+    text: &str,
+    kind: crate::sql::types::RangeKind,
+    arena: &'a Arena,
+) -> Result<RangeBinaryParts<'a>, SqlError> {
+    let parsed = crate::sql::range::parse(text)?;
+    if parsed.empty {
+        return Ok((0x01, None, None));
+    }
+    let mut flags = 0u8;
+    if parsed.lower_inc {
+        flags |= 0x02;
+    }
+    if parsed.upper_inc {
+        flags |= 0x04;
+    }
+    if parsed.lower.is_none() {
+        flags |= 0x08;
+    }
+    if parsed.upper.is_none() {
+        flags |= 0x10;
+    }
+    let lower = match parsed.lower {
+        Some(_) => Some(crate::sql::range::lower_datum(text, kind, arena)?),
+        None => None,
+    };
+    let upper = match parsed.upper {
+        Some(_) => Some(crate::sql::range::upper_datum(text, kind, arena)?),
+        None => None,
+    };
+    Ok((flags, lower, upper))
+}
+
+/// Writes a range's body (after the outer int32 length): the flags byte, then
+/// each finite bound as int32 length + binary via `encode_value_binary`.
+fn encode_range_binary(
+    m: &mut crate::pg::wire::MsgOut,
+    flags: u8,
+    lower: Option<Datum>,
+    upper: Option<Datum>,
+) {
+    m.u8(flags);
+    if let Some(datum) = lower {
+        Responder::encode_value_binary(m, &datum);
+    }
+    if let Some(datum) = upper {
+        Responder::encode_value_binary(m, &datum);
+    }
 }
 
 pub fn insert(

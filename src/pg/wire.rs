@@ -31,6 +31,7 @@ pub const MSG_DATA_ROW: u8 = b'D';
 pub const MSG_COMMAND_COMPLETE: u8 = b'C';
 pub const MSG_ERROR_RESPONSE: u8 = b'E';
 pub const MSG_NOTICE_RESPONSE: u8 = b'N';
+pub const MSG_NOTIFICATION_RESPONSE: u8 = b'A';
 pub const MSG_EMPTY_QUERY_RESPONSE: u8 = b'I';
 pub const MSG_NEGOTIATE_VERSION: u8 = b'v';
 pub const MSG_PARSE_COMPLETE: u8 = b'1';

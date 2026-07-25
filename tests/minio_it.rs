@@ -70,7 +70,7 @@ fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
     let mut guc = pos3ql::sql::guc::GucState::new();
     let mut resp = Responder::new(&mut buf);
     engine
-        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut cursors, &mut guc, &mut resp)
+        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut cursors, &mut guc, &mut resp, 1)
         .unwrap();
     String::from_utf8_lossy(buf.readable()).to_string()
 }

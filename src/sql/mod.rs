@@ -27,6 +27,7 @@ pub mod timezone;
 pub mod tzif;
 pub mod copy;
 pub mod cursor;
+pub mod notify;
 
 use crate::checkpoint::{CheckpointStep, Checkpointer, CheckpointSetupError};
 use crate::config::Config;
@@ -129,6 +130,13 @@ pub struct Engine {
     /// statement. This is the `work_mem` analogue.
     work: Arena,
     next_txid: u32,
+    /// LISTEN/NOTIFY registry and delivery outbox, shared across every
+    /// connection (see [`notify`]).
+    notify: notify::NotifyState,
+    /// The connection id whose message is currently being executed, set at each
+    /// `execute_simple`/`execute_extended` entry so LISTEN/UNLISTEN/NOTIFY can
+    /// stamp their buffered ops without threading the id through every arm.
+    current_conn_id: i32,
 }
 
 impl Engine {
@@ -216,6 +224,12 @@ impl Engine {
             )?,
             work: Arena::new(budget, "work_arena", config.work_arena_bytes)?,
             next_txid: 0,
+            notify: notify::NotifyState::new(
+                budget,
+                config.max_connections as usize * notify::CHANNELS_PER_CONN,
+                notify::OUTBOX,
+            )?,
+            current_conn_id: 0,
         })
     }
 
@@ -386,8 +400,27 @@ impl Engine {
                 DdlUndo::FkDropped { .. } => {}
             }
         }
+        // Past the durability point, so these fire iff the transaction really
+        // committed: apply its LISTEN/UNLISTEN to the shared registry and move
+        // its notifications into the delivery outbox. A pool-exhaustion here is
+        // a loud error reported to the client — like a post-commit upload
+        // failure, the data is committed regardless — never a silent drop.
+        let notify_result = self.flush_committed_notifications(txn);
         txn.clear();
-        upload_result
+        notify_result.and(upload_result)
+    }
+
+    /// Applies a committing transaction's buffered LISTEN/UNLISTEN to the shared
+    /// registry and moves its NOTIFYs into the delivery outbox. Called only past
+    /// the commit's durability point.
+    fn flush_committed_notifications(&mut self, txn: &TxnState) -> Result<(), SqlError> {
+        for &op in txn.pending_listen_ops() {
+            self.notify.apply(op)?;
+        }
+        for i in 0..txn.pending_notify_count() {
+            self.notify.enqueue(txn.pending_notification(i))?;
+        }
+        Ok(())
     }
 
     /// Discards every uncommitted change and journal byte of the
@@ -485,6 +518,7 @@ impl Engine {
         }
         txn.rewind_touched(sp.touched_mark);
         txn.rewind_ddl(sp.ddl_mark);
+        txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
         txn.rollback_savepoints_after(index);
         self.wal.truncate_to_mark(sp.wal_mark);
         txn.failed = sp.failed;
@@ -625,6 +659,33 @@ impl Engine {
         self.pending_copy.take()
     }
 
+    /// True if committed notifications await delivery. The server drains them
+    /// after each connection's message (see [`Engine::notifications`]).
+    pub fn has_notifications(&self) -> bool {
+        self.notify.has_pending()
+    }
+
+    /// The committed notifications awaiting delivery.
+    pub fn notifications(&self) -> &[notify::Notification] {
+        self.notify.outbox()
+    }
+
+    /// True if the connection is registered for the channel.
+    pub fn is_listening(&self, conn_id: i32, channel: &str) -> bool {
+        self.notify.is_listening(conn_id, channel)
+    }
+
+    /// Discards the delivered notifications (the server calls this after fanning
+    /// the outbox out to every listener).
+    pub fn clear_notifications(&mut self) {
+        self.notify.clear_outbox();
+    }
+
+    /// Drops a closing connection's LISTEN registrations.
+    pub fn drop_connection(&mut self, conn_id: i32) {
+        self.notify.drop_conn(conn_id);
+    }
+
     /// One complete COPY data line (no trailing newline).
     pub fn copy_row_line(
         &mut self,
@@ -734,7 +795,9 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         responder: &mut Responder,
+        conn_id: i32,
     ) -> Result<(), WireFull> {
+        self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => return report_parse_error(responder, &e),
@@ -813,7 +876,9 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         responder: &mut Responder,
+        conn_id: i32,
     ) -> Result<bool, WireFull> {
+        self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -1648,6 +1713,53 @@ impl Engine {
             // succeeds with its tag.
             Stmt::Analyze => {
                 responder.command_complete("ANALYZE")?;
+                Ok(Ok(()))
+            }
+            Stmt::Listen(channel) => {
+                let op = notify::ListenOp::Listen {
+                    conn_id: self.current_conn_id,
+                    channel: notify::channel(channel),
+                };
+                if let Err(e) = txn.buffer_listen_op(op) {
+                    return Ok(Err(e));
+                }
+                responder.command_complete("LISTEN")?;
+                Ok(Ok(()))
+            }
+            Stmt::Unlisten(channel) => {
+                let op = match channel {
+                    Some(name) => notify::ListenOp::Unlisten {
+                        conn_id: self.current_conn_id,
+                        channel: notify::channel(name),
+                    },
+                    None => notify::ListenOp::UnlistenAll {
+                        conn_id: self.current_conn_id,
+                    },
+                };
+                if let Err(e) = txn.buffer_listen_op(op) {
+                    return Ok(Err(e));
+                }
+                responder.command_complete("UNLISTEN")?;
+                Ok(Ok(()))
+            }
+            Stmt::Notify { channel, payload } => {
+                // Validate the payload length (PostgreSQL's 8000-byte limit)
+                // before buffering the raw text.
+                let payload = match payload {
+                    Some(text) => match notify::payload(text) {
+                        Ok(p) => p,
+                        Err(e) => return Ok(Err(e)),
+                    },
+                    None => notify::Payload::new(),
+                };
+                if let Err(e) = txn.buffer_notify(
+                    self.current_conn_id,
+                    notify::channel(channel),
+                    payload.as_str(),
+                ) {
+                    return Ok(Err(e));
+                }
+                responder.command_complete("NOTIFY")?;
                 Ok(Ok(()))
             }
             Stmt::AlterTable(a) => {

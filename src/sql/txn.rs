@@ -9,6 +9,7 @@
 
 use crate::sql::eval::sqlstate;
 use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::sql_err;
 use crate::storage::RowLoc;
@@ -27,6 +28,13 @@ pub struct Savepoint {
     pub touched_mark: usize,
     pub ddl_mark: usize,
     pub wal_mark: usize,
+    /// Pending-notification and pending-listen-op lengths (and the notification
+    /// payload-buffer offset) at savepoint time, so ROLLBACK TO discards the
+    /// notifications/registrations a rolled-back subtransaction produced, as
+    /// PostgreSQL does.
+    pub notify_mark: usize,
+    pub notify_payload_mark: usize,
+    pub listen_mark: usize,
     /// The `failed` flag at savepoint time, restored on ROLLBACK TO.
     pub failed: bool,
 }
@@ -59,6 +67,16 @@ pub struct TxnState {
     savepoints: FixedVec<Savepoint>,
     /// WAL buffer mark taken when the transaction started.
     pub wal_mark: usize,
+    /// NOTIFY raised in this transaction, delivered at commit (discarded on
+    /// rollback), each stamped with the raising connection's PID. Payload bytes
+    /// live in `notify_payloads`, referenced by offset/length so the entry pool
+    /// stays compact.
+    pending_notifies: FixedVec<crate::sql::notify::BufferedNotify>,
+    /// Backing bytes for `pending_notifies` payloads.
+    notify_payloads: FixedBuf,
+    /// LISTEN/UNLISTEN performed in this transaction, applied to the shared
+    /// registry at commit (discarded on rollback).
+    pending_listen_ops: FixedVec<crate::sql::notify::ListenOp>,
 }
 
 /// How to undo one DDL statement.
@@ -109,6 +127,21 @@ impl TxnState {
             ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
             savepoints: FixedVec::new(budget, "txn_savepoints", MAX_SAVEPOINTS)?,
             wal_mark: 0,
+            pending_notifies: FixedVec::new(
+                budget,
+                "txn_pending_notifies",
+                crate::sql::notify::PER_TXN,
+            )?,
+            notify_payloads: FixedBuf::new(
+                budget,
+                "txn_notify_payloads",
+                crate::sql::notify::PER_TXN_PAYLOAD_BYTES,
+            )?,
+            pending_listen_ops: FixedVec::new(
+                budget,
+                "txn_pending_listen_ops",
+                crate::sql::notify::LISTEN_OPS_PER_TXN,
+            )?,
         })
     }
 
@@ -148,6 +181,104 @@ impl TxnState {
         &self.touched
     }
 
+    /// Buffers a NOTIFY, collapsing an identical (channel, payload) already
+    /// buffered in this transaction (PostgreSQL deduplicates within a
+    /// transaction). The payload is copied into the companion byte buffer.
+    pub fn buffer_notify(
+        &mut self,
+        pid: i32,
+        channel: crate::sql::notify::Channel,
+        payload: &str,
+    ) -> Result<(), SqlError> {
+        let bytes = self.notify_payloads.readable();
+        let duplicate = self.pending_notifies.as_slice().iter().any(|existing| {
+            existing.pid == pid
+                && existing.channel.as_str() == channel.as_str()
+                && &bytes[existing.payload_offset..existing.payload_offset + existing.payload_len]
+                    == payload.as_bytes()
+        });
+        if duplicate {
+            return Ok(());
+        }
+        let payload_offset = self.notify_payloads.mark();
+        if !self.notify_payloads.append(payload.as_bytes()) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction's notification payloads exceed {} bytes (txn_notify_payloads)",
+                self.notify_payloads.capacity()
+            ));
+        }
+        self.pending_notifies
+            .push(crate::sql::notify::BufferedNotify {
+                pid,
+                channel,
+                payload_offset,
+                payload_len: payload.len(),
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "transaction raises more than {} notifications (txn_pending_notifies)",
+                    self.pending_notifies.capacity()
+                )
+            })
+    }
+
+    /// Buffers a LISTEN/UNLISTEN to apply at commit.
+    pub fn buffer_listen_op(
+        &mut self,
+        op: crate::sql::notify::ListenOp,
+    ) -> Result<(), SqlError> {
+        self.pending_listen_ops.push(op).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction performs more than {} LISTEN/UNLISTEN operations (txn_pending_listen_ops)",
+                self.pending_listen_ops.capacity()
+            )
+        })
+    }
+
+    pub fn pending_notify_count(&self) -> usize {
+        self.pending_notifies.len()
+    }
+
+    /// Reconstructs the `i`th buffered notification (payload from the companion
+    /// buffer) for delivery at commit.
+    pub fn pending_notification(&self, i: usize) -> crate::sql::notify::Notification {
+        let entry = self.pending_notifies.as_slice()[i];
+        let bytes = &self.notify_payloads.readable()
+            [entry.payload_offset..entry.payload_offset + entry.payload_len];
+        crate::sql::notify::Notification::from_bytes(entry.pid, entry.channel, bytes)
+    }
+
+    pub fn pending_listen_ops(&self) -> &[crate::sql::notify::ListenOp] {
+        &self.pending_listen_ops
+    }
+
+    /// Discards this transaction's buffered notifications and listen ops (at
+    /// commit after they are applied, and at rollback).
+    pub fn clear_pending_notifications(&mut self) {
+        self.pending_notifies.clear();
+        self.notify_payloads.clear();
+        self.pending_listen_ops.clear();
+    }
+
+    /// Rewinds the notification buffers to a savepoint's marks (ROLLBACK TO).
+    pub fn rewind_notifications(
+        &mut self,
+        notify_mark: usize,
+        payload_mark: usize,
+        listen_mark: usize,
+    ) {
+        while self.pending_notifies.len() > notify_mark {
+            self.pending_notifies.pop();
+        }
+        self.notify_payloads.truncate_to(payload_mark);
+        while self.pending_listen_ops.len() > listen_mark {
+            self.pending_listen_ops.pop();
+        }
+    }
+
     /// Establishes a savepoint at the current undo position. A duplicate name
     /// is allowed (PostgreSQL shadows the older one).
     pub fn savepoint(&mut self, name: &str, wal_mark: usize) -> Result<(), SqlError> {
@@ -160,6 +291,9 @@ impl TxnState {
             touched_mark: self.touched.len(),
             ddl_mark: self.ddl.len(),
             wal_mark,
+            notify_mark: self.pending_notifies.len(),
+            notify_payload_mark: self.notify_payloads.mark(),
+            listen_mark: self.pending_listen_ops.len(),
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
@@ -229,5 +363,9 @@ impl TxnState {
         self.touched.clear();
         self.ddl.clear();
         self.savepoints.clear();
+        // Commit flushes these before clearing; rollback drops them here.
+        self.pending_notifies.clear();
+        self.notify_payloads.clear();
+        self.pending_listen_ops.clear();
     }
 }

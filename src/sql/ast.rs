@@ -107,6 +107,13 @@ pub enum Stmt<'a> {
     /// works from live table state, not collected statistics, so there is no
     /// statistics artifact to build and none is client-observable.
     Analyze,
+    /// LISTEN channel — register interest; delivered notifications arrive as
+    /// asynchronous NotificationResponse messages.
+    Listen(&'a str),
+    /// UNLISTEN channel, or UNLISTEN * to drop every registration.
+    Unlisten(Option<&'a str>),
+    /// NOTIFY channel [, payload] — raise a notification (delivered at commit).
+    Notify { channel: &'a str, payload: Option<&'a str> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

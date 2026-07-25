@@ -189,6 +189,30 @@ impl Conn {
         !self.send.is_empty()
     }
 
+    /// The connection's id (the backend PID reported in BackendKeyData and in
+    /// NotificationResponse).
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+
+    /// Appends an asynchronous NotificationResponse ('A': int32 PID, channel,
+    /// payload) to the send buffer. Returns false if it did not fit, leaving
+    /// the buffer's queued messages intact; the caller then closes the
+    /// connection rather than emit a truncated message.
+    pub fn queue_notification(&mut self, pid: i32, channel: &str, payload: &str) -> bool {
+        let mark = self.send.mark();
+        let mut message = wire::MsgOut::begin(&mut self.send, wire::MSG_NOTIFICATION_RESPONSE);
+        message.i32(pid);
+        message.cstr(channel);
+        message.cstr(payload);
+        if message.finish().is_ok() {
+            true
+        } else {
+            self.send.truncate_to(mark);
+            false
+        }
+    }
+
     pub fn on_readable(
         &mut self,
         engine: &mut Engine,
@@ -1212,6 +1236,7 @@ impl Conn {
                     &mut self.cursors,
                     &mut self.guc,
                     &mut responder,
+                    self.id,
                 )
             } else {
                 let mut responder = Responder::for_execute(&mut self.send, rfmt);
@@ -1224,6 +1249,7 @@ impl Conn {
                     &mut self.cursors,
                     &mut self.guc,
                     &mut responder,
+                    self.id,
                 )
             };
             engine.maybe_checkpoint();
@@ -1358,7 +1384,7 @@ impl Conn {
             if let Some(fd) = fd {
                 responder = responder.with_flush(fd);
             }
-            engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.cursors, &mut self.guc, &mut responder)
+            engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.cursors, &mut self.guc, &mut responder, self.id)
         };
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.set_nonblocking(true);

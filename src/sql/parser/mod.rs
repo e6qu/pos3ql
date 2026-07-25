@@ -1451,6 +1451,11 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("rename")? {
             if self.eat_ident("to")? {
                 AlterAction::RenameTable(self.col_ident("new table name")?)
+            } else if self.eat_ident("constraint")? {
+                let from = self.col_ident("constraint name")?;
+                self.expect_ident("to")?;
+                let to = self.col_ident("new constraint name")?;
+                AlterAction::RenameConstraint { from, to }
             } else {
                 self.expect_ident("column")?;
                 let from = self.col_ident("column name")?;

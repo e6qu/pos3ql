@@ -508,6 +508,8 @@ pub enum AlterAction<'a> {
     AddConstraint(TableConstraint<'a>),
     /// ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name.
     DropConstraint { name: &'a str, if_exists: bool },
+    /// ALTER TABLE ... RENAME CONSTRAINT old TO new.
+    RenameConstraint { from: &'a str, to: &'a str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

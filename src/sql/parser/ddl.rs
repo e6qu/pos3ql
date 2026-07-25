@@ -422,7 +422,7 @@ impl<'a> Parser<'a> {
     }
 
     /// A table-level PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY constraint.
-    fn table_constraint(&mut self, name: Option<&'a str>) -> Result<TableConstraint<'a>, ParseError> {
+    pub(super) fn table_constraint(&mut self, name: Option<&'a str>) -> Result<TableConstraint<'a>, ParseError> {
         if self.eat_ident("primary")? {
             self.expect_ident("key")?;
             let columns = self.column_name_list()?;

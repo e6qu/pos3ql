@@ -495,6 +495,11 @@ pub enum AlterAction<'a> {
         type_mod: i32,
         using: Option<&'a Expr<'a>>,
     },
+    /// ALTER TABLE ... ADD [CONSTRAINT name] <table constraint>. Existing rows
+    /// are validated against the new constraint before it is attached.
+    AddConstraint(TableConstraint<'a>),
+    /// ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name.
+    DropConstraint { name: &'a str, if_exists: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

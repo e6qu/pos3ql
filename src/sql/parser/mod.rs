@@ -1406,6 +1406,23 @@ impl<'a> Parser<'a> {
                 AlterAction::RenameColumn { from, to }
             }
         } else if self.eat_ident("add")? {
+            // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
+            if self.eat_ident("constraint")? {
+                let cname = self.col_ident("constraint name")?;
+                return Ok(Stmt::AlterTable(AlterTable {
+                    table,
+                    action: AlterAction::AddConstraint(self.table_constraint(Some(cname))?),
+                }));
+            }
+            if matches!(
+                self.peeked,
+                Tok::Ident("primary") | Tok::Ident("unique") | Tok::Ident("check") | Tok::Ident("foreign")
+            ) {
+                return Ok(Stmt::AlterTable(AlterTable {
+                    table,
+                    action: AlterAction::AddConstraint(self.table_constraint(None)?),
+                }));
+            }
             let _ = self.eat_ident("column")?;
             let name = self.col_ident("column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
@@ -1436,8 +1453,21 @@ impl<'a> Parser<'a> {
                 default,
             })
         } else if self.eat_ident("drop")? {
-            let _ = self.eat_ident("column")?;
-            AlterAction::DropColumn(self.col_ident("column name")?)
+            if self.eat_ident("constraint")? {
+                let if_exists = self.eat_ident("if")? && {
+                    self.expect_ident("exists")?;
+                    true
+                };
+                let name = self.col_ident("constraint name")?;
+                // CASCADE/RESTRICT: this engine tracks no cross-object
+                // dependencies on a constraint, so both are accepted and the
+                // drop is unconditional.
+                let _ = self.eat_ident("cascade")? || self.eat_ident("restrict")?;
+                AlterAction::DropConstraint { name, if_exists }
+            } else {
+                let _ = self.eat_ident("column")?;
+                AlterAction::DropColumn(self.col_ident("column name")?)
+            }
         } else if self.eat_ident("alter")? {
             // ALTER [COLUMN] col { SET DEFAULT e | DROP DEFAULT | SET NOT NULL
             // | DROP NOT NULL }.

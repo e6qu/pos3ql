@@ -76,14 +76,24 @@ pub fn check_unique(
                     ));
                 }
                 let c = &def.columns()[i];
-                let kind = if c.primary { "pkey" } else { "key" };
-                return Err(sql_err!(
-                    crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
-                    "duplicate key value violates unique constraint \"{}_{}_{}\"",
-                    def.name.as_str(),
-                    c.name.as_str(),
-                    kind
-                ));
+                // PostgreSQL's auto-names: a primary key is `<table>_pkey`
+                // whatever column carries it; a unique column is
+                // `<table>_<column>_key` — the same names the catalog
+                // synthesizes for these constraints' indexes.
+                return Err(if c.primary {
+                    sql_err!(
+                        crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
+                        "duplicate key value violates unique constraint \"{}_pkey\"",
+                        def.name.as_str()
+                    )
+                } else {
+                    sql_err!(
+                        crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
+                        "duplicate key value violates unique constraint \"{}_{}_key\"",
+                        def.name.as_str(),
+                        c.name.as_str()
+                    )
+                });
             }
         }
         Ok(ControlFlow::Continue(()))

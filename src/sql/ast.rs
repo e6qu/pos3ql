@@ -72,6 +72,9 @@ pub enum Stmt<'a> {
     ExecutePrepared { name: &'a str, args: &'a [&'a Expr<'a>] },
     /// DEALLOCATE name | ALL (None = ALL).
     Deallocate(Option<&'a str>),
+    /// COPY table [(columns)] FROM STDIN / TO STDOUT — the bulk-data
+    /// subprotocol, text format.
+    Copy(CopyStmt<'a>),
     /// A set-operation query (UNION / INTERSECT / EXCEPT). A lone SELECT stays
     /// `Select` above; this variant appears only when a set operator is present.
     SetQuery(SetQuery<'a>),
@@ -403,6 +406,15 @@ pub struct ColumnDef<'a> {
     pub primary: bool,
     /// DEFAULT expression (constants only are accepted at execution).
     pub default: Option<&'a Expr<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CopyStmt<'a> {
+    pub table: QualName<'a>,
+    /// Empty means "all columns in table order".
+    pub columns: &'a [&'a str],
+    /// `TO STDOUT` when true; `FROM STDIN` otherwise.
+    pub to: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

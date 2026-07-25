@@ -12,7 +12,10 @@ on:
 jobs:
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # run.sh runs in full on these runners (docker + MinIO work) and takes
+    # ~26 minutes by itself; the ceiling covers it with headroom rather than
+    # cancelling a slow-but-healthy sweep at the finish line.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

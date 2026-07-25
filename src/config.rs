@@ -115,6 +115,9 @@ pub struct Config {
     pub s3_tls_ca_file: String,
     /// Byte budget for the isolated TLS component's allocations.
     pub tls_pool_bytes: usize,
+    /// Per-connection staging for one COPY FROM data row (rows may split
+    /// across CopyData messages). A row larger than this fails loudly.
+    pub copy_line_bytes: usize,
 }
 
 impl Config {
@@ -163,6 +166,7 @@ impl Config {
             s3_tls: false,
             s3_tls_ca_file: String::new(),
             tls_pool_bytes: 4 * MIB,
+            copy_line_bytes: 256 * KIB,
         }
     }
 
@@ -287,6 +291,7 @@ impl Config {
                 }
                 "s3_tls_ca_file" => config.s3_tls_ca_file = value.to_string(),
                 "tls_pool_bytes" => config.tls_pool_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "copy_line_bytes" => config.copy_line_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
@@ -310,7 +315,8 @@ impl Config {
     /// reported separately by the caller. `server_bytes` and `tables_bytes`
     /// cover machinery sized by the caller (reactor buffers, table maps).
     pub fn memory_plan(&self, server_bytes: usize, tables_bytes: usize) -> MemoryPlan {
-        let per_connection = self.conn_recv_buffer_bytes
+        let per_connection = self.copy_line_bytes
+            + self.conn_recv_buffer_bytes
             + self.conn_send_buffer_bytes
             + self.sql_arena_bytes
             + self.max_prepared * self.prepared_bytes
@@ -512,11 +518,12 @@ sql_arena_bytes = 4096
         c.block_cache_bytes = 2000;
         c.max_cursors = 1;
         c.cursor_bytes = 64;
+        c.copy_line_bytes = 50;
         let plan = c.memory_plan(500, 250);
-        // 100+200+300 + 2*30 + 2*(20+40) + cursor pool + 10*12 per connection.
+        // 50+100+200+300 + 2*30 + 2*(20+40) + cursor pool per connection.
         let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
-        assert_eq!(plan.connections, (900 + cursor_pool) * 10);
-        assert_eq!(plan.total(), (900 + cursor_pool) * 10 + 1000 + 2000 + 500 + 250);
+        assert_eq!(plan.connections, (950 + cursor_pool) * 10);
+        assert_eq!(plan.total(), (950 + cursor_pool) * 10 + 1000 + 2000 + 500 + 250);
     }
 
     #[test]

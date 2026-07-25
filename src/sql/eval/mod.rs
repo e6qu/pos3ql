@@ -114,6 +114,7 @@ pub mod sqlstate {
     pub const INVALID_ARGUMENT_FOR_WIDTH_BUCKET: &str = "2201G";
     pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET: &str = "2201X";
     pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+    pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
     pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
     pub const STRING_DATA_LENGTH_MISMATCH: &str = "22026";
     pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";

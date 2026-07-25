@@ -2659,3 +2659,29 @@ fn correlated_in_subquery() {
     );
     assert_eq!(data_rows(&bytes), ["1", "3"]);
 }
+
+#[test]
+fn copy_options_beyond_default_text_are_refused() {
+    // The engine speaks COPY's text format with default delimiters — what
+    // psql and pg_dump emit. Every other option must refuse loudly rather
+    // than mis-read a data stream.
+    let (mut engine, mut budget) = test_engine();
+    let ok = run_with(&mut engine, &mut budget, "CREATE TABLE c (a int)");
+    assert!(!message_types(&ok).contains(&b'E'));
+    for statement in [
+        "COPY c TO STDOUT (FORMAT csv)",
+        "COPY c TO STDOUT (FORMAT binary)",
+        "COPY c TO STDOUT (DELIMITER ',')",
+        "COPY c TO STDOUT (HEADER true)",
+    ] {
+        let out = run_with(&mut engine, &mut budget, statement);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("0A000"), "{statement}: {text}");
+    }
+    // The supported spelling stays accepted.
+    let out = run_with(&mut engine, &mut budget, "COPY c TO STDOUT (FORMAT text)");
+    assert!(!message_types(&out).contains(&b'E'), "{:?}", String::from_utf8_lossy(&out));
+    // COPY FROM STDIN in a multi-statement string has nowhere to stream.
+    let out = run_with(&mut engine, &mut budget, "COPY c FROM STDIN; SELECT 1");
+    assert!(String::from_utf8_lossy(&out).contains("0A000"));
+}

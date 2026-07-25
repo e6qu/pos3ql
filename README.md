@@ -53,6 +53,9 @@ Working single-node database:
   non-recursive CTEs, updatable views, arbitrary-precision NUMERIC, casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
   introspection, PostgreSQL lexical rules, and SQLSTATE-correct errors.
+- COPY FROM STDIN / TO STDOUT in PostgreSQL's text format — psql `\copy`
+  and pg_dump-style inline data streams work, with each type's input and
+  output functions and full constraint enforcement.
 - Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED snapshot isolation,
   transactional DDL, and fail-fast (`40001`) write-conflict detection.
 - Durability: CRC-checksummed WAL with F_FULLFSYNC (kill -9 safe); CHECKPOINT

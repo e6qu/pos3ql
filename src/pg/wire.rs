@@ -42,6 +42,9 @@ pub const MSG_PORTAL_SUSPENDED: u8 = b's';
 
 // Frontend message type bytes.
 pub const FMSG_QUERY: u8 = b'Q';
+pub const FMSG_COPY_DATA: u8 = b'd';
+pub const FMSG_COPY_DONE: u8 = b'c';
+pub const FMSG_COPY_FAIL: u8 = b'f';
 pub const FMSG_TERMINATE: u8 = b'X';
 pub const FMSG_PARSE: u8 = b'P';
 pub const FMSG_BIND: u8 = b'B';

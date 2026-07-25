@@ -1467,6 +1467,177 @@ pub fn drop_index(
     sql_ok()
 }
 
+/// COPY's per-statement setup: the resolved table and target columns, in
+/// COPY's column order. Held by the connection across CopyData messages.
+#[derive(Clone, Copy)]
+pub struct CopySetup {
+    pub table_index: usize,
+    pub targets: [usize; MAX_COLUMNS],
+    pub n_targets: usize,
+}
+
+/// Resolves a COPY statement's table and column list.
+pub fn copy_begin(
+    storage: &Storage,
+    statement: &crate::sql::ast::CopyStmt,
+    txid: u32,
+) -> Result<CopySetup, SqlError> {
+    let table_index = resolve_dml_table(storage, &statement.table, txid)?;
+    let def = &storage.table(table_index).def;
+    let mut targets = [0usize; MAX_COLUMNS];
+    let n_targets = if statement.columns.is_empty() {
+        for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
+            *t = i;
+        }
+        def.n_columns
+    } else {
+        for (i, name) in statement.columns.iter().enumerate() {
+            let Some(col) = def.column_index(name) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    name,
+                    statement.table.name
+                ));
+            };
+            targets[i] = col;
+        }
+        statement.columns.len()
+    };
+    Ok(CopySetup { table_index, targets, n_targets })
+}
+
+/// One COPY FROM data line: text fields decode, coerce through each column's
+/// input semantics, and store through the same row core INSERT uses —
+/// defaults, sequences, NOT NULL, uniqueness, CHECK and foreign keys all
+/// enforced identically.
+pub fn copy_row(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    setup: &CopySetup,
+    line: &[u8],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let def = storage.table(setup.table_index).def;
+    let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let n_fields = crate::sql::copy::decode_row(line, arena, &mut fields[..setup.n_targets])?;
+    if n_fields < setup.n_targets {
+        return Err(sql_err!(
+            sqlstate::BAD_COPY_FILE_FORMAT,
+            "missing data for column \"{}\"",
+            def.columns()[setup.targets[n_fields]].name.as_str()
+        ));
+    }
+    let checks = parse_checks(&def, arena)?;
+    let mut values = [Datum::Null; MAX_COLUMNS];
+    for (i, col) in def.columns().iter().enumerate() {
+        if let Some(d) = &col.default_value {
+            values[i] = d.as_datum();
+        }
+    }
+    let mut explicit = [false; MAX_COLUMNS];
+    for (i, field) in fields.iter().enumerate().take(setup.n_targets) {
+        let col_index = setup.targets[i];
+        let col = &def.columns()[col_index];
+        values[col_index] = match field {
+            None => Datum::Null,
+            Some(text) => coerce(Datum::Text(text), col, arena)?,
+        };
+        explicit[col_index] = true;
+    }
+    fill_auto_increment(storage, setup.table_index, &def, &mut values, &explicit)?;
+    check_not_null(&def, &values)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    enforce_row_constraints(
+        storage,
+        setup.table_index,
+        &def,
+        &schema[..def.n_columns],
+        &values[..def.n_columns],
+        None,
+        txn.txid,
+        &checks,
+        arena,
+        &[],
+    )?;
+    store_row(storage, txn, setup.table_index, None, &values[..def.n_columns])
+}
+
+/// COPY TO STDOUT: every visible row, targets in COPY order, each value in
+/// its wire text form with COPY's escapes. Returns the row count for the
+/// command tag.
+pub fn copy_out(
+    storage: &Storage,
+    txid: u32,
+    setup: &CopySetup,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<u64, SqlError> {
+    let def = storage.table(setup.table_index).def;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    responder.copy_out_response(setup.n_targets).map_err(wire_to_sql)?;
+    // Rowid order is insertion order (rowids are monotonic), which is the
+    // order PostgreSQL's COPY TO emits for a freshly-loaded table. Snapshot
+    // the visible tokens first, sort, then stream.
+    let mut visible = 0usize;
+    storage.for_each_row_state(setup.table_index, &mut |_, state| {
+        if state.visible_to(txid).is_some() {
+            visible += 1;
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    let tokens = arena
+        .alloc_slice_with(visible, |_| (0u64, crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 })))
+        .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "COPY TO snapshot exceeds the statement arena"))?;
+    let mut fill = 0usize;
+    storage.for_each_row_state(setup.table_index, &mut |rowid, state| {
+        if let Some(home) = state.visible_to(txid) {
+            tokens[fill] = (rowid, home);
+            fill += 1;
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    tokens.sort_unstable_by_key(|(rowid, _)| *rowid);
+    let mut count = 0u64;
+    for &(rowid, home) in tokens.iter() {
+        storage.with_row_bytes(setup.table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
+            // Render each target into the arena first (fallible), so the
+            // wire write below is a deterministic, retry-safe emission.
+            let render = responder.render_context();
+            let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            for (i, texts_slot) in texts.iter_mut().enumerate().take(setup.n_targets) {
+                // The wire-text output function, exactly as a SELECT would
+                // render it — styled timestamps, GUC-honoring bytea, `t`
+                // for booleans — then COPY's escapes on top below.
+                *texts_slot =
+                    Responder::datum_wire_text(&values[setup.targets[i]], render, arena)?;
+            }
+            responder
+                .copy_data_row(&|out| {
+                    for (i, text) in texts.iter().enumerate().take(setup.n_targets) {
+                        if i > 0 {
+                            out(b"\t");
+                        }
+                        crate::sql::copy::encode_field(out, *text);
+                    }
+                })
+                .map_err(wire_to_sql)?;
+            Ok(())
+        })?;
+        count += 1;
+    }
+    responder.copy_done().map_err(wire_to_sql)?;
+    Ok(count)
+}
+
+fn wire_to_sql(_: crate::pg::wire::WireFull) -> SqlError {
+    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "COPY output exceeds the send buffer")
+}
+
 pub fn insert(
     storage: &mut Storage,
     txn: &mut TxnState,

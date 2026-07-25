@@ -24,6 +24,7 @@ pub mod range;
 pub mod to_char;
 pub mod timezone;
 pub mod tzif;
+pub mod copy;
 pub mod cursor;
 
 use crate::checkpoint::{CheckpointStep, Checkpointer, CheckpointSetupError};
@@ -91,6 +92,10 @@ pub struct Engine {
     storage: Storage,
     wal: Wal,
     ckpt: Option<Checkpointer>,
+    /// A COPY FROM STDIN the last statement started: the connection takes
+    /// it, switches into copy-in mode, and feeds data lines back through
+    /// [`Engine::copy_row_line`] until CopyDone.
+    pending_copy: Option<exec::CopySetup>,
     wal_upload: bool,
     /// When set, a commit blocks until its WAL batch is uploaded (RPO=0 to
     /// S3). Otherwise the upload is drained off the commit path.
@@ -183,6 +188,7 @@ impl Engine {
             storage,
             wal,
             ckpt,
+            pending_copy: None,
             wal_upload: config.wal_upload && config.s3_on,
             wal_upload_sync: config.wal_upload_sync,
             wal_upload_backpressure: backpressure,
@@ -598,6 +604,44 @@ impl Engine {
     /// the trigger). The event loop keeps beating pending work between
     /// events, so an idle server still finishes what a trigger started and
     /// compacts what its lists owe.
+    /// The COPY FROM the last statement started, if any; the connection
+    /// takes it and enters copy-in mode.
+    pub fn take_pending_copy(&mut self) -> Option<exec::CopySetup> {
+        self.pending_copy.take()
+    }
+
+    /// One complete COPY data line (no trailing newline).
+    pub fn copy_row_line(
+        &mut self,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        arena: &Arena,
+        line: &[u8],
+    ) -> Result<(), SqlError> {
+        exec::copy_row(&mut self.storage, txn, setup, line, arena)
+    }
+
+    /// Ends a successful COPY FROM: an implicit transaction commits here
+    /// (this was the statement's end); an explicit one stays open, exactly
+    /// as INSERT inside BEGIN would.
+    pub fn copy_finish(&mut self, txn: &mut TxnState) -> Result<(), SqlError> {
+        if txn.mode == TxnMode::Implicit {
+            return self.commit_txn(txn);
+        }
+        Ok(())
+    }
+
+    /// Abandons a failed COPY FROM: an implicit transaction rolls back
+    /// outright; an explicit one is marked failed, as any errored statement
+    /// leaves it.
+    pub fn copy_abort(&mut self, txn: &mut TxnState) {
+        if txn.mode == TxnMode::Implicit {
+            self.rollback_txn(txn);
+        } else {
+            txn.failed = true;
+        }
+    }
+
     pub fn checkpoint_work_pending(&self) -> bool {
         self.ckpt
             .as_ref()
@@ -681,6 +725,18 @@ impl Engine {
         loop {
             match parser.next_stmt() {
                 Ok(Some(statement)) => {
+                    if self.pending_copy.take().is_some() {
+                        // COPY FROM STDIN takes over the connection; a
+                        // statement after it in the same string has nowhere
+                        // to run.
+                        self.copy_abort(txn);
+                        let e = sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "COPY FROM STDIN must be the last statement in a query string"
+                        );
+                        responder.error(e.sqlstate, e.message.as_str())?;
+                        return Ok(());
+                    }
                     executed_any = true;
                     emit_parse_warnings(&mut parser, responder)?;
                     if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder)? {
@@ -707,8 +763,10 @@ impl Engine {
         if !executed_any {
             responder.empty_query_response()?;
         }
-        // Implicit transactions commit at end of message.
+        // Implicit transactions commit at end of message — except a COPY
+        // FROM in flight, whose statement does not end until CopyDone.
         if txn.mode == TxnMode::Implicit
+            && self.pending_copy.is_none()
             && let Err(e) = self.commit_txn(txn) {
                 responder.error(e.sqlstate, e.message.as_str())?;
             }
@@ -1503,6 +1561,31 @@ impl Engine {
             }
             Stmt::Show(name) => self.show(name, guc, responder),
             Stmt::ShowAll => self.show_all(guc, responder),
+            Stmt::Copy(c) => {
+                let setup = match exec::copy_begin(&self.storage, c, txn.txid) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(Err(e)),
+                };
+                if c.to {
+                    match exec::copy_out(&self.storage, txn.txid, &setup, arena, responder) {
+                        Ok(count) => {
+                            responder
+                                .command_complete(crate::stack_format!(32, "COPY {count}").as_str())?;
+                            Ok(Ok(()))
+                        }
+                        Err(e) => Ok(Err(e)),
+                    }
+                } else {
+                    // COPY FROM STDIN: the statement's work has only begun —
+                    // the connection takes over, streaming CopyData into
+                    // copy_row_line under this same (implicit or explicit)
+                    // transaction, and the command tag waits for CopyDone.
+                    self.ensure_txn(txn, txn.mode);
+                    responder.copy_in_response(setup.n_targets)?;
+                    self.pending_copy = Some(setup);
+                    Ok(Ok(()))
+                }
+            }
             Stmt::Checkpoint => match self.checkpoint() {
                 Ok(_) => {
                     responder.command_complete("CHECKPOINT")?;

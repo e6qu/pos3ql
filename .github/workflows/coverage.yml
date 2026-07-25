@@ -5,9 +5,12 @@
 # instruments that binary too, which is what takes the figure to ~80%.
 #
 # The external suite is sharded across parallel jobs so that no job runs past
-# 15 minutes: each shard measures its slice strictly, exports an lcov
+# 15 minutes: each coverage shard measures its slice strictly, exports an lcov
 # tracefile, and the merge job unions the tracefiles and holds the floor over
-# the whole. Shard percentages alone are meaningless and never compared.
+# the whole. Shard percentages alone are meaningless and never compared. The
+# crash-torture shards are correctness-only (runtest:*): they kill -9 every
+# server, which never flushes a profile, so they contribute no coverage and
+# stay out of the merge — they gate the workflow by running and passing.
 name: coverage
 on:
   push:
@@ -37,8 +40,11 @@ jobs:
           - { name: sql, shard: "sql" }
           - { name: wire-durability, shard: "run:proto,dur" }
           - { name: spill, shard: "run:overlay,ingest" }
-          - { name: torture-a, shard: "run:torture", torture_seed: 20260723 }
-          - { name: torture-b, shard: "run:torture", torture_seed: 20260725 }
+          # Torture is a correctness shard, not a coverage one: it kill -9's
+          # every server, and SIGKILL never flushes a coverage profile, so it
+          # produces no tracefile and stays out of the merge (runtest:*).
+          - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }
+          - { name: torture-b, shard: "runtest:torture", torture_seed: 20260725 }
           - { name: tls-spilldiff, shard: "run:tls,spilldiff" }
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +78,9 @@ jobs:
         with:
           name: lcov-${{ matrix.name }}
           path: coverage-*.lcov
+          # The runtest:* (torture) shards write no tracefile by design; let
+          # their upload find nothing rather than error.
+          if-no-files-found: ignore
 
   merge-and-gate:
     needs: shard

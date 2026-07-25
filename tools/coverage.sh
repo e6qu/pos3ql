@@ -37,11 +37,18 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || {
     echo "FAIL: cargo-llvm-cov is not installed (cargo install cargo-llvm-cov)"
     exit 1
 }
-if [ -n "$SHARD" ] && [ -z "$LCOV_OUT" ]; then
-    echo "FAIL: COVERAGE_SHARD is set but COVERAGE_LCOV is not; a shard's"
-    echo "      floor-less percentage would vanish without a tracefile to merge"
-    exit 1
-fi
+# Coverage-producing shards need a tracefile to merge; a runtest:* shard does
+# not (see its arm below) and is exempt.
+case "$SHARD" in
+sql | run:*)
+    if [ -z "$LCOV_OUT" ]; then
+        echo "FAIL: COVERAGE_SHARD=$SHARD is set but COVERAGE_LCOV is not; a"
+        echo "      shard's floor-less percentage would vanish without a"
+        echo "      tracefile to merge"
+        exit 1
+    fi
+    ;;
+esac
 
 eval "$(cargo llvm-cov show-env --sh)"
 # `cargo llvm-cov clean` shells out to `cargo clean`, which refuses to touch a
@@ -90,6 +97,28 @@ write_lcov() {
     echo "wrote $LCOV_OUT"
 }
 
+# Run run.sh for a set of groups, strictly: stream its output into the job log
+# as it runs (a shard killed at its CI timeout would otherwise die with
+# everything buffered in a file nobody sees — no step times, no culprit), fail
+# the shard on any failing step, and refuse to pass a shard that measured
+# nothing (an environment gap turning every step into a SKIP). The status file
+# carries the exit code across the tee pipe (POSIX sh has no pipefail).
+run_groups_strict() {
+    groups=$1
+    echo "=== external suite, groups: $groups ==="
+    { POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$groups" \
+        zsh tests/external/run.sh 2>&1; echo $? > "$TMP/run.status"; } | tee "$TMP/run.log"
+    if [ "$(cat "$TMP/run.status")" != "0" ]; then
+        echo "FAIL: tests/external/run.sh (groups $groups); its FAIL lines:"
+        grep '^FAIL' "$TMP/run.log" || true
+        exit 1
+    fi
+    if ! grep -q '^PASS' "$TMP/run.log"; then
+        echo "FAIL: the shard produced no PASS lines; nothing was measured"
+        exit 1
+    fi
+}
+
 case "$SHARD" in
 "")
     if [ -n "$POS3QL_VENV" ] && [ -x "$PGBIN/pg_ctl" ]; then
@@ -135,30 +164,21 @@ sql)
     write_lcov
     ;;
 run:*)
-    GROUPS_SELECTED=${SHARD#run:}
-    echo "=== external suite, groups: $GROUPS_SELECTED ==="
-    # Stream the suite's output into the job log as it runs: a shard that
-    # hits its CI timeout would otherwise be killed with everything buffered
-    # in a file nobody ever sees — no step times, no culprit. The status
-    # file carries the exit code across the tee pipe (POSIX sh has no
-    # pipefail).
-    { POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$GROUPS_SELECTED" \
-        zsh tests/external/run.sh 2>&1; echo $? > "$TMP/run.status"; } | tee "$TMP/run.log"
-    if [ "$(cat "$TMP/run.status")" != "0" ]; then
-        echo "FAIL: tests/external/run.sh (groups $GROUPS_SELECTED); its FAIL lines:"
-        grep '^FAIL' "$TMP/run.log" || true
-        exit 1
-    fi
-    # A shard that ran nothing (an environment gap turning every step into a
-    # SKIP) must not pass as an empty success.
-    if ! grep -q '^PASS' "$TMP/run.log"; then
-        echo "FAIL: the shard produced no PASS lines; nothing was measured"
-        exit 1
-    fi
+    run_groups_strict "${SHARD#run:}"
     write_lcov
     ;;
+runtest:*)
+    # A correctness-only shard: it runs run.sh groups strictly but produces no
+    # coverage, so it writes no tracefile and is left out of the merge. This is
+    # for crash torture, which kill -9's every server it starts — SIGKILL never
+    # runs the profiler's atexit flush, so a torture shard yields zero .profraw
+    # and has nothing to report. It has never contributed coverage (the old
+    # serial job got none from it either); its value is that it runs and passes.
+    run_groups_strict "${SHARD#runtest:}"
+    echo "test-only shard: no coverage to write (servers are kill -9'd)"
+    ;;
 *)
-    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected sql or run:<groups>)"
+    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected sql, run:<groups> or runtest:<groups>)"
     exit 1
     ;;
 esac

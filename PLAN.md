@@ -915,7 +915,11 @@ that actually matters — a duplicate of a key long evicted from the overlay
 is still caught against its spilled row. The crash-torture shard, still ~15
 minutes at 12 rounds on the instrumented binary, is split across two seeds
 at half depth each (`POS3QL_TORTURE_ROUNDS`/`POS3QL_TORTURE_SEED`), which
-also widens the random coverage.
+also widens the random coverage. Torture is a correctness shard, not a
+coverage one: it kill -9's every server it starts, and SIGKILL never runs the
+profiler's atexit flush, so a torture shard yields no `.profraw` and stays out
+of the coverage merge (`runtest:*`) — it earns its place by running and
+passing, which for the whole of its prior life (B-168) it did neither.
 
 ### The order (dependency-driven)
 

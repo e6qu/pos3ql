@@ -19,6 +19,30 @@ use super::super::{
     ColumnLookup, EvalHooks, SqlError,
 };
 
+/// floor/ceil/round/trunc on an f64, shared by the float8 and (widened) real
+/// arms. PostgreSQL's `round(double precision)` ties to even.
+fn round_f64(v: f64, mode: numeric::RoundMode) -> f64 {
+    use numeric::RoundMode;
+    match mode {
+        RoundMode::Floor => v.floor(),
+        RoundMode::Ceil => v.ceil(),
+        RoundMode::Trunc => v.trunc(),
+        RoundMode::HalfAwayZero => v.round_ties_even(),
+    }
+}
+
+/// `sign(double precision)`: +1/-1/0, with 0 for both signed zeroes (f32/f64
+/// `signum` returns ±1 for ±0, which is wrong here).
+fn float_sign(v: f64) -> f64 {
+    if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 /// Handles the numeric/mathematical family. Returns `None` if `name` is not one
 /// of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -107,6 +131,7 @@ pub(crate) fn dispatch<'a>(
                         .checked_abs()
                         .map(Datum::Int8)
                         .ok_or_else(|| overflow("bigint")),
+                    Datum::Float4(v) => Ok(Datum::Float4(v.abs())),
                     Datum::Float8(v) => Ok(Datum::Float8(v.abs())),
                     Datum::Numeric(n) => Ok(Datum::Numeric(Numeric {
                         sign: match n.sign {
@@ -161,12 +186,10 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int2(v) => Ok(Datum::Float8(v as f64)),
                     Datum::Int4(v) => Ok(Datum::Float8(v as f64)),
                     Datum::Int8(v) => Ok(Datum::Float8(v as f64)),
-                    Datum::Float8(v) => Ok(Datum::Float8(match mode {
-                        RoundMode::Floor => v.floor(),
-                        RoundMode::Ceil => v.ceil(),
-                        RoundMode::Trunc => v.trunc(),
-                        RoundMode::HalfAwayZero => v.round_ties_even(),
-                    })),
+                    // real has no dedicated overload; it widens to double
+                    // precision, like the integer arms above.
+                    Datum::Float4(v) => Ok(Datum::Float8(round_f64(f64::from(v), mode))),
+                    Datum::Float8(v) => Ok(Datum::Float8(round_f64(v, mode))),
                     Datum::Numeric(v) => Ok(Datum::Numeric(v.round_scale(0, mode, arena)?)),
                     other => Err(type_mismatch(name, &other)),
                 }
@@ -178,13 +201,8 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int2(v) => Ok(Datum::Float8(v.signum() as f64)),
                     Datum::Int4(v) => Ok(Datum::Float8(v.signum() as f64)),
                     Datum::Int8(v) => Ok(Datum::Float8(v.signum() as f64)),
-                    Datum::Float8(v) => Ok(Datum::Float8(if v > 0.0 {
-                        1.0
-                    } else if v < 0.0 {
-                        -1.0
-                    } else {
-                        0.0
-                    })),
+                    Datum::Float4(v) => Ok(Datum::Float8(float_sign(f64::from(v)))),
+                    Datum::Float8(v) => Ok(Datum::Float8(float_sign(v))),
                     Datum::Numeric(n) => {
                         let s = if n.is_zero() {
                             "0"

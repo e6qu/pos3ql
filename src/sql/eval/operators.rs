@@ -16,8 +16,8 @@ use crate::sql::types::ColType;
 use super::{
     arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
     division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
-    jsonb_delete, jsonb_delete_path, like_match, num_factor, overflow, parse_bool, parse_uuid,
-    sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits, SqlError,
+    jsonb_delete, jsonb_delete_path, like_match, num_factor, out_of_range, overflow, parse_bool,
+    parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits, SqlError,
 };
 
 /// An unknown-type literal facing an array operand takes the array's type, the
@@ -507,6 +507,14 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
                 .parse()
                 .map_err(|_| bad_text(s, "double precision"))?,
         ),
+        Datum::Float4(_) => {
+            let t = s.trim();
+            let x: f32 = t.parse().map_err(|_| bad_text(s, "real"))?;
+            if x.is_infinite() && !super::cast::is_infinity_text(t) {
+                return Err(out_of_range(t, "real"));
+            }
+            Datum::Float4(x)
+        }
         Datum::Bool(_) => Datum::Bool(parse_bool(s)?),
         Datum::Date(_) => Datum::Date(datetime::parse_date(s)?),
         Datum::Timestamp(_) => Datum::Timestamp(datetime::parse_timestamp(s, false)?),
@@ -702,10 +710,12 @@ pub(crate) fn arithmetic<'a>(
         _ => {}
     }
     // PostgreSQL numeric-promotion: int operator int -> int; if either side is
-    // numeric (and neither is float8) -> numeric; if either is float8 ->
-    // float8.
+    // numeric (and neither is a float) -> numeric; real operator real -> real
+    // (single precision); any other float pairing -> float8 (real mixed with
+    // int/float8/numeric all widen to double precision).
     let either_numeric = matches!(l, Datum::Numeric(_)) || matches!(r, Datum::Numeric(_));
-    let either_float = matches!(l, Datum::Float8(_)) || matches!(r, Datum::Float8(_));
+    let either_float =
+        matches!(l, Datum::Float8(_) | Datum::Float4(_)) || matches!(r, Datum::Float8(_) | Datum::Float4(_));
     // Integer operator integer stays integral.
     if let (Some(a), Some(b)) = (as_i64(&l), as_i64(&r)) {
         let out = match operator {
@@ -751,6 +761,23 @@ pub(crate) fn arithmetic<'a>(
             type_name_of(&l),
             type_name_of(&r)
         ));
+    }
+    // real operator real stays single precision (f32 arithmetic). Any other
+    // float pairing falls through to the double-precision path below.
+    if let (Datum::Float4(a), Datum::Float4(b)) = (l, r) {
+        let out = match operator {
+            BinaryOp::Add => a + b,
+            BinaryOp::Sub => a - b,
+            BinaryOp::Mul => a * b,
+            BinaryOp::Div => {
+                if b == 0.0 {
+                    return Err(division_by_zero());
+                }
+                a / b
+            }
+            _ => unreachable!("Mod on floats rejected above"),
+        };
+        return Ok(Datum::Float4(out));
     }
     if let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) {
         let out = match operator {
@@ -997,6 +1024,7 @@ pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Re
             .checked_neg()
             .map(Datum::Int8)
             .ok_or_else(|| overflow("bigint")),
+        (UnaryOp::Neg, Datum::Float4(x)) => Ok(Datum::Float4(-x)),
         (UnaryOp::Neg, Datum::Float8(x)) => Ok(Datum::Float8(-x)),
         (UnaryOp::Neg, Datum::Numeric(n)) => Ok(Datum::Numeric(Numeric {
             // Negating zero stays positive (no negative zero).

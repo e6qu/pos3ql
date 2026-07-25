@@ -70,6 +70,10 @@ pub(crate) struct AggState<'a> {
     count: u64,
     sum_int: i128,
     sum_float: f64,
+    // `sum(real)` accumulates in single precision, matching PostgreSQL's
+    // float4 sum (so a running total loses the same low bits it does there);
+    // avg/variance over real still fold into the f64 accumulators below.
+    sum_float4: f32,
     sum_numeric: Option<crate::sql::numeric::Numeric<'a>>,
     // Statistical-aggregate accumulators (all in f64). `sum_float` holds Σx (the
     // second argument for the two-argument regression/covariance aggregates).
@@ -120,6 +124,7 @@ enum ArgKind {
     Int4,
     Int8,
     Numeric,
+    Float4,
     Float,
 }
 
@@ -211,6 +216,7 @@ impl Default for AggState<'_> {
             count: 0,
             sum_int: 0,
             sum_float: 0.0,
+            sum_float4: 0.0,
             sum_numeric: None,
             sum_sq: 0.0,
             sum_y: 0.0,
@@ -244,6 +250,7 @@ fn agg_f64(d: &Datum) -> Option<f64> {
     match d {
         Datum::Int4(v) => Some(*v as f64),
         Datum::Int8(v) => Some(*v as f64),
+        Datum::Float4(v) => Some(f64::from(*v)),
         Datum::Float8(v) => Some(*v),
         Datum::Numeric(n) => Some(n.to_f64()),
         _ => None,
@@ -426,6 +433,7 @@ impl<'a> AggState<'a> {
             {
                 self.sum_float = match eval_full(fraction, arena, params, row, hooks)? {
                     Datum::Float8(f) => f,
+                    Datum::Float4(f) => f64::from(f),
                     Datum::Numeric(n) => n.to_f64(),
                     Datum::Int2(v) => f64::from(v),
                     Datum::Int4(v) => f64::from(v),
@@ -499,6 +507,16 @@ impl<'a> AggState<'a> {
                     self.arg_kind = self.arg_kind.max(ArgKind::Numeric);
                     let running = self.sum_numeric.unwrap_or(crate::sql::numeric::Numeric::ZERO);
                     self.sum_numeric = Some(crate::sql::numeric::add(&running, &n, arena)?);
+                }
+                // sum(real) -> real, accumulated in single precision; avg(real)
+                // -> double precision, accumulated in the f64 running sum.
+                Datum::Float4(x) => {
+                    self.arg_kind = ArgKind::Float4;
+                    if self.kind == AggKind::Sum {
+                        self.sum_float4 += x;
+                    } else {
+                        self.sum_float += f64::from(x);
+                    }
                 }
                 Datum::Float8(x) => {
                     self.arg_kind = ArgKind::Float;
@@ -583,6 +601,15 @@ impl<'a> AggState<'a> {
                     Datum::Numeric(n) => {
                         self.arg_kind = self.arg_kind.max(ArgKind::Numeric);
                         Some(n)
+                    }
+                    // variance/stddev over real yields double precision, folding
+                    // in f64 exactly as a float8 input does.
+                    Datum::Float4(x) => {
+                        self.arg_kind = ArgKind::Float;
+                        let x = f64::from(x);
+                        self.sum_float += x;
+                        self.sum_sq += x * x;
+                        None
                     }
                     Datum::Float8(x) => {
                         self.arg_kind = ArgKind::Float;
@@ -1049,6 +1076,7 @@ impl<'a> AggState<'a> {
             // SUM result type: int4->int8, int8->numeric, numeric->numeric,
             // float8->float8 (PostgreSQL's aggregate signatures).
             AggKind::Sum => match self.arg_kind {
+                ArgKind::Float4 => Datum::Float4(self.sum_float4),
                 ArgKind::Float => Datum::Float8(self.sum_float),
                 ArgKind::Int4 => Datum::Int8(
                     i64::try_from(self.sum_int)
@@ -1062,7 +1090,7 @@ impl<'a> AggState<'a> {
             },
             // AVG: numeric for int/int8/numeric, float8 for float8.
             AggKind::Avg => match self.arg_kind {
-                ArgKind::Float => Datum::Float8(self.sum_float / self.count as f64),
+                ArgKind::Float4 | ArgKind::Float => Datum::Float8(self.sum_float / self.count as f64),
                 ArgKind::Int4 | ArgKind::Int8 => {
                     let sum = Numeric::from_i128(self.sum_int, arena)?;
                     let cnt = Numeric::from_i64(self.count as i64, arena)?;

@@ -76,17 +76,43 @@ pub fn cast_to<'a>(
                 Datum::Int8(to_i64_for_cast(&v, "bigint")?)
             }
         }
-        // real/float4 collapse to float8 storage: full precision is retained so
-        // text output stays shortest round-trip (true 4-byte float4 rounding
-        // would need a dedicated Datum to render correctly).
-        ColType::Float8 | ColType::Float4 => match v {
+        ColType::Float8 => match v {
             Datum::Int4(x) => Datum::Float8(f64::from(x)),
             Datum::Int8(x) => Datum::Float8(x as f64),
+            Datum::Float4(x) => Datum::Float8(f64::from(x)),
             Datum::Float8(_) => v,
             Datum::Numeric(n) => Datum::Float8(n.to_f64()),
             Datum::Text(s) => Datum::Float8(s.trim().parse().map_err(|_| bad_text(s, "double precision"))?),
             _ => return Err(cast_unsupported(&v, "double precision")),
         },
+        // real/float4 rounds every input through single precision. A finite
+        // value that rounds to infinity is out of range, as in PostgreSQL —
+        // which names the value differently for the three source shapes.
+        ColType::Float4 => {
+            let f = match v {
+                Datum::Float4(_) => return Ok(v),
+                Datum::Int4(x) => x as f32,
+                Datum::Int8(x) => x as f32,
+                Datum::Float8(x) => finite_to_f32(x)
+                    .ok_or_else(|| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "value out of range: overflow"))?,
+                Datum::Numeric(n) => match finite_to_f32(n.to_f64()) {
+                    Some(f) => f,
+                    None => return Err(float_out_of_range(cast_to_text(Datum::Numeric(n), arena)?, "real")),
+                },
+                Datum::Text(s) => {
+                    let t = s.trim();
+                    let x: f32 = t.parse().map_err(|_| bad_text(s, "real"))?;
+                    // Rust parses an out-of-range magnitude to infinity; only a
+                    // literal infinity spelling is a legitimate infinite result.
+                    if x.is_infinite() && !is_infinity_text(t) {
+                        return Err(float_out_of_range(t, "real"));
+                    }
+                    x
+                }
+                _ => return Err(cast_unsupported(&v, "real")),
+            };
+            Datum::Float4(f)
+        }
         ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
         ColType::Name => {
             // PostgreSQL truncates name input to NAMEDATALEN-1 = 63 bytes,
@@ -218,6 +244,11 @@ pub fn cast_to<'a>(
             Datum::Int8(x) => Datum::Numeric(Numeric::from_i64(x, arena)?),
             Datum::Float8(x) => {
                 // float8 -> numeric via the shortest round-trip decimal.
+                let text = crate::stack_format!(64, "{}", x);
+                Datum::Numeric(Numeric::parse(text.as_str(), arena)?)
+            }
+            Datum::Float4(x) => {
+                // real -> numeric via the shortest single-precision decimal.
                 let text = crate::stack_format!(64, "{}", x);
                 Datum::Numeric(Numeric::parse(text.as_str(), arena)?)
             }
@@ -419,6 +450,48 @@ pub(crate) fn cast_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str
     }
 }
 
+/// PostgreSQL's float input functions report an out-of-range magnitude without
+/// the `value ` prefix that the integer input functions use — `"3.5e38" is out
+/// of range for type real`, not `value "3.5e38" …`.
+fn float_out_of_range(value: &str, target: &'static str) -> SqlError {
+    sql_err!(
+        sqlstate::NUMERIC_OUT_OF_RANGE,
+        "\"{}\" is out of range for type {}",
+        value,
+        target
+    )
+}
+
+/// Rounds an f64 to f32. Returns `None` only when a *finite* input rounds to
+/// infinity (out of range); a genuine ±inf or NaN input passes through.
+fn finite_to_f32(x: f64) -> Option<f32> {
+    let f = x as f32;
+    if x.is_finite() && f.is_infinite() {
+        None
+    } else {
+        Some(f)
+    }
+}
+
+/// Whether a trimmed float-text is an infinity spelling (so a parsed infinity
+/// is legitimate rather than an out-of-range magnitude). PostgreSQL accepts
+/// `inf`/`infinity` with an optional sign, case-insensitively.
+pub(crate) fn is_infinity_text(t: &str) -> bool {
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    body.eq_ignore_ascii_case("inf") || body.eq_ignore_ascii_case("infinity")
+}
+
+/// Rounds a float to the nearest i64, ties to even, as PostgreSQL's float→int
+/// casts do. Wrapped in `Ok` at the call sites via `?`.
+fn float_to_i64(x: f64, target: &'static str) -> Result<i64, SqlError> {
+    let rounded = x.round_ties_even();
+    if rounded >= i64::MIN as f64 && rounded <= i64::MAX as f64 {
+        Ok(rounded as i64)
+    } else {
+        Err(overflow(target))
+    }
+}
+
 fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
     if let Datum::Numeric(n) = v {
         return n.to_i64().map_err(|_| overflow(target));
@@ -428,15 +501,11 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
         Datum::Int4(x) => Ok(i64::from(*x)),
         Datum::Int8(x) => Ok(*x),
         Datum::Bool(b) => Ok(i64::from(*b)),
-        Datum::Float8(x) => {
-            // PostgreSQL rounds half away from zero.
-            let rounded = x.round();
-            if rounded >= i64::MIN as f64 && rounded <= i64::MAX as f64 {
-                Ok(rounded as i64)
-            } else {
-                Err(overflow(target))
-            }
-        }
+        // PostgreSQL rounds a float to the nearest integer, ties to even
+        // (`rint`): 0.5→0, 2.5→2, 3.5→4. real widens to f64 first, which is
+        // exact, so the two floats share one rounding path.
+        Datum::Float8(x) => float_to_i64(*x, target),
+        Datum::Float4(x) => float_to_i64(f64::from(*x), target),
         Datum::Text(s) => parse_int_literal(s).ok_or_else(|| bad_text(s, target)),
         Datum::Null => unreachable!("null handled by caller"),
         other => Err(cast_unsupported(other, target)),

@@ -225,8 +225,15 @@ pub(crate) fn dispatch<'a>(
                 }
                 // A float8 input keeps its own sign bit even when the value rounds
                 // to zero (covers -0.0 and small negatives) — PostgreSQL behavior.
-                let float_negative = matches!(v, Datum::Float8(x) if x.is_sign_negative());
-                let float_source = if let Datum::Float8(x) = v { Some(x) } else { None };
+                // real widens to double precision for to_char, so it shares the
+                // float8 sign-bit and NaN/Infinity handling.
+                let float_negative = matches!(v, Datum::Float8(x) if x.is_sign_negative())
+                    || matches!(v, Datum::Float4(x) if x.is_sign_negative());
+                let float_source = match v {
+                    Datum::Float8(x) => Some(x),
+                    Datum::Float4(x) => Some(f64::from(x)),
+                    _ => None,
+                };
                 // NaN/Infinity have no numeric form; the formatter reads them
                 // from `float_source` (and fills with `#`, as PostgreSQL).
                 let n = match float_source {

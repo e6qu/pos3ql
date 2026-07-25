@@ -1086,19 +1086,11 @@ fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ColType::Bytea => "U",
         _ => "S",
     };
-    // `int2`/`float4` report `int4`/`float8` on the wire (their `oid()`), but in
-    // the catalog they need their own distinct OIDs so a join on `atttypid` does
-    // not match two `pg_type` rows.
-    let catalog_oid = |t: &ColType| match t {
-        ColType::Int2 => super::types::oid::INT2,
-        ColType::Float4 => super::types::oid::FLOAT4,
-        _ => t.oid(),
-    };
     let mut out: [&[Datum]; 32] = [&[]; 32];
     for (i, t) in types.iter().enumerate() {
         out[i] = row(
             &[
-                Datum::Int4(catalog_oid(t)),
+                Datum::Int4(t.oid()),
                 text(t.internal_name(), arena)?,
                 Datum::Int4(i32::from(t.typlen())),
                 Datum::Int4(0), // typcollation: none

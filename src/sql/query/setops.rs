@@ -178,7 +178,14 @@ fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     if a == b {
         return Some(a);
     }
-    let numeric = |t| matches!(t, ColType::Int4 | ColType::Int8 | ColType::Float8 | ColType::Numeric);
+    // The full numeric tower — omitting int2 or real here left `smallint UNION
+    // integer` and `real UNION double precision` failing to unify.
+    let numeric = |t| {
+        matches!(
+            t,
+            ColType::Int2 | ColType::Int4 | ColType::Int8 | ColType::Float4 | ColType::Float8 | ColType::Numeric
+        )
+    };
     if numeric(a) && numeric(b) {
         return Some(exec::unify_numeric_tower(a, b));
     }

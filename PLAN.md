@@ -942,6 +942,24 @@ carried comfortably by the differential corpora alone (~80% on their own),
 with wire-durability and spilldiff adding the durability, WAL and forced-spill
 paths on top.
 
+### real/float4 as a genuine type (2026-07-25, B-167)
+
+`real` was the last of the P14 "distinct types" still faked as its wider
+sibling — stored, sent, and printed as `double precision`, so every value
+outside float8's fixed-notation window came out wrong. It is now a real
+`Datum::Float4(f32)` on the smallint playbook (B-126): OID 700, typlen 4,
+4-byte wire, input rounded through `f32`, `float4out` output (shortest f32
+digits, fixed notation for decimal exponent in [-4, 6)), single-precision
+`real op real` arithmetic widening to double precision when mixed,
+`sum(real)` accumulated in `f32` while avg/variance fold to f64, and typed
+`abs`/rounding/`greatest`/`least`/UNION/`real[]` (OID 1021) and JSON output.
+On disk it keeps the historical 8-byte layout and narrows at decode, so no
+data migrates. Corpus `44_float4` pins the surface against PostgreSQL 18.
+The sweep also turned up four Boyscout fixes (float→int now ties to even;
+`float8 % float8` rejected at plan time; smallint/real no longer JSON-quoted;
+smallint/real UNION unifies) and one honest open item, B-170 (shortest-float
+tie-breaking, shared with float8, deferred to its own Ryu-style formatter).
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

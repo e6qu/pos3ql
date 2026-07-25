@@ -217,7 +217,8 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         1005 => ColType::Array(crate::sql::types::ArrElem::Int2),
         1007 => ColType::Array(crate::sql::types::ArrElem::Int4),
         1016 => ColType::Array(crate::sql::types::ArrElem::Int8),
-        1021 | 1022 => ColType::Array(crate::sql::types::ArrElem::Float8),
+        1021 => ColType::Array(crate::sql::types::ArrElem::Float4),
+        1022 => ColType::Array(crate::sql::types::ArrElem::Float8),
         1009 | 1002 => ColType::Array(crate::sql::types::ArrElem::Text),
         1015 => ColType::Array(crate::sql::types::ArrElem::Varchar),
         1014 => ColType::Array(crate::sql::types::ArrElem::Bpchar),
@@ -266,7 +267,7 @@ fn array_promoted(array_oid: Option<i32>, elem_oid: Option<i32>) -> (i32, i16) {
 pub(crate) fn unify_numeric_tower(a: ColType, b: ColType) -> ColType {
     use ColType::*;
     let rank = |t: ColType| match t {
-        Int2 => 1, Int4 => 2, Int8 => 3, Numeric => 4, Float8 => 5, _ => 0,
+        Int2 => 1, Int4 => 2, Int8 => 3, Numeric => 4, Float4 => 5, Float8 => 6, _ => 0,
     };
     let (ra, rb) = (rank(a), rank(b));
     if ra > 0 && rb > 0 {
@@ -1081,7 +1082,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
                 Add | Sub | Mul | Div | Mod => {
                     let numeric = |o: i32| {
-                        matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT8)
+                        matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
                     };
                     let int_like = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
                     // Date arithmetic: date - date -> int4; date +/- int -> date;
@@ -1134,16 +1135,26 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     }
                     let l_ok = lo == oid::UNKNOWN || numeric(lo);
                     let r_ok = ro == oid::UNKNOWN || numeric(ro);
-                    if (!l_ok || !r_ok)
+                    // PostgreSQL defines no modulo for the floating types, so
+                    // `real % …` and `float8 % …` are undefined even between two
+                    // otherwise-numeric operands.
+                    let is_float = |o: i32| matches!(o, oid::FLOAT4 | oid::FLOAT8);
+                    let mod_on_float = matches!(operator, Mod) && (is_float(lo) || is_float(ro));
+                    if (!l_ok || !r_ok || mod_on_float)
                         && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro)) {
                             let sym = match operator {
                                 Add => "+", Sub => "-", Mul => "*", Div => "/", _ => "%",
                             };
                             return Err(operator_undefined(a, sym, b));
                         }
-                    // Promotion: float8 > numeric > int8 > int4; unknown is
-                    // absorbed by the concrete side.
+                    // Promotion: float8 > real > numeric > int8 > int4; unknown
+                    // is absorbed by the concrete side. real op real stays real;
+                    // real mixed with int/numeric widens to double precision.
                     if lo == oid::FLOAT8 || ro == oid::FLOAT8 {
+                        of(ColType::Float8)
+                    } else if lo == oid::FLOAT4 && ro == oid::FLOAT4 {
+                        of(ColType::Float4)
+                    } else if lo == oid::FLOAT4 || ro == oid::FLOAT4 {
                         of(ColType::Float8)
                     } else if lo == oid::NUMERIC || ro == oid::NUMERIC {
                         of(ColType::Numeric)
@@ -1315,6 +1326,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 match a {
                     Some(oid::INT2 | oid::INT4) if *name == "sum" => of(ColType::Int8),
                     Some(oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC) => of(ColType::Numeric),
+                    // sum(real) stays real; avg(real) widens to double precision.
+                    Some(oid::FLOAT4) if *name == "sum" => of(ColType::Float4),
+                    Some(oid::FLOAT4) => of(ColType::Float8),
                     Some(oid::FLOAT8) => of(ColType::Float8),
                     Some(oid::UNKNOWN) | None => of(ColType::Numeric),
                     Some(other) => return Err(agg_undefined(name, other)),
@@ -1353,13 +1367,15 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             // promotion in `greatest`/`least`.
             "greatest" | "least" => {
                 let rank = |o: i32| {
-                    if o == oid::FLOAT8 || o == oid::FLOAT4 {
+                    if o == oid::FLOAT8 {
+                        5
+                    } else if o == oid::FLOAT4 {
                         4
                     } else if o == oid::NUMERIC {
                         3
                     } else if o == oid::INT8 {
                         2
-                    } else if o == oid::INT4 {
+                    } else if o == oid::INT2 || o == oid::INT4 {
                         1
                     } else {
                         0

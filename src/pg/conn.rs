@@ -1373,7 +1373,7 @@ fn decode_binary_param<'a>(
         }
         oids::FLOAT4 => {
             let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
-            Ok(Datum::Float8(f64::from(f32::from_be_bytes(b))))
+            Ok(Datum::Float4(f32::from_be_bytes(b)))
         }
         oids::FLOAT8 => {
             let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;

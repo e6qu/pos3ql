@@ -38,6 +38,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Null => 0,
         Datum::Bool(_) => 1,
         Datum::Int2(_) => 2,
+        Datum::Float4(_) => 4,
         Datum::Int4(_) | Datum::Date(_) => 4,
         Datum::Int8(_)
         | Datum::Float8(_)
@@ -118,6 +119,11 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 4;
             out[1..9].copy_from_slice(&x.to_bits().to_le_bytes());
             9
+        }
+        Datum::Float4(x) => {
+            out[0] = 23;
+            out[1..5].copy_from_slice(&x.to_bits().to_le_bytes());
+            5
         }
         Datum::Bpchar(str_value) => {
             out[0] = 21;
@@ -283,6 +289,12 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 bytes[at..at + 8].try_into().unwrap(),
             ))),
             8,
+        ),
+        23 => (
+            Datum::Float4(f32::from_bits(u32::from_le_bytes(
+                bytes[at..at + 4].try_into().unwrap(),
+            ))),
+            4,
         ),
         5 => {
             let len =

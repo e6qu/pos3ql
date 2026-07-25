@@ -24,7 +24,9 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Null => 0,
             Datum::Bool(_) => 1,
             Datum::Int2(_) | Datum::Int4(_) | Datum::Date(_) => 4,
-            Datum::Int8(_) | Datum::Float8(_) | Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Time(_) => 8,
+            // float4 keeps the historical 8-byte float8 layout (see the decode
+            // side); the schema narrows it back to f32.
+            Datum::Int8(_) | Datum::Float4(_) | Datum::Float8(_) | Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Time(_) => 8,
             Datum::Timetz(..) => 12,
             Datum::Interval(_) => 16,
             Datum::Uuid(_) => 16,
@@ -75,6 +77,12 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             }
             Datum::Float8(x) => {
                 rest[..8].copy_from_slice(&x.to_le_bytes());
+                take = 8;
+            }
+            // Widened to f64 for the historical 8-byte layout; the f32 value is
+            // exactly representable, so decode narrows it back losslessly.
+            Datum::Float4(x) => {
+                rest[..8].copy_from_slice(&(*x as f64).to_le_bytes());
                 take = 8;
             }
             Datum::Text(s) | Datum::Bpchar(s) => {
@@ -200,7 +208,14 @@ pub(crate) fn decode<'a>(
             }
             ColType::Float8 | ColType::Float4 => {
                 let b = bytes.get(at..at + 8).ok_or_else(corrupt)?;
-                out[i] = Datum::Float8(f64::from_le_bytes(b.try_into().unwrap()));
+                let x = f64::from_le_bytes(b.try_into().unwrap());
+                // The 8-byte layout is historical; the schema narrows. A stored
+                // float4 was rounded to f32 at write, so this cast is lossless.
+                out[i] = if matches!(schema[i], ColType::Float4) {
+                    Datum::Float4(x as f32)
+                } else {
+                    Datum::Float8(x)
+                };
                 at += 8;
             }
             ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {

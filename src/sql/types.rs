@@ -57,8 +57,9 @@ pub enum ColType {
     Int2,
     Int4,
     Int8,
-    /// `real`/`float4`. Values are rounded to single precision; stored and
-    /// sent as float8 (OID/width) since there is no 4-byte float Datum.
+    /// `real`/`float4`. Its own [`Datum::Float4`] (f32); reports OID 700 and
+    /// typlen 4. On disk it keeps the historical 8-byte float8 layout
+    /// (`storage()` is Float8) and narrows to f32 at decode by schema.
     Float4,
     Float8,
     Text,
@@ -170,12 +171,10 @@ impl ColType {
     pub fn oid(self) -> i32 {
         match self {
             Self::Bool => oid::BOOL,
-            // float4 reports the float8 OID so the binary payload width
-            // matches the f64 storage; int2 has its own datum and real OID.
             Self::Int2 => oid::INT2,
             Self::Int4 => oid::INT4,
             Self::Int8 => oid::INT8,
-            Self::Float4 => oid::FLOAT8,
+            Self::Float4 => oid::FLOAT4,
             Self::Float8 => oid::FLOAT8,
             Self::Text => oid::TEXT,
             Self::Name => oid::NAME,
@@ -205,8 +204,8 @@ impl ColType {
         match self {
             Self::Bool => 1,
             Self::Int2 => 2,
-            Self::Int4 | Self::Date => 4,
-            Self::Int8 | Self::Float4 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
+            Self::Int4 | Self::Date | Self::Float4 => 4,
+            Self::Int8 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
             Self::Timetz => 12,
             Self::Interval => 16,
             Self::Uuid => 16,
@@ -382,6 +381,7 @@ pub enum ArrElem {
     Timestamp,
     Timestamptz,
     Int2,
+    Float4,
     Time,
     Timetz,
     Interval,
@@ -410,6 +410,7 @@ impl ArrElem {
             ArrElem::Timestamp => "timestamp[]",
             ArrElem::Timestamptz => "timestamp with time zone[]",
             ArrElem::Int2 => "smallint[]",
+            ArrElem::Float4 => "real[]",
             ArrElem::Time => "time without time zone[]",
             ArrElem::Timetz => "time with time zone[]",
             ArrElem::Interval => "interval[]",
@@ -439,6 +440,7 @@ impl ArrElem {
             Datum::Int2(_) => ArrElem::Int2,
             Datum::Int4(_) => ArrElem::Int4,
             Datum::Int8(_) => ArrElem::Int8,
+            Datum::Float4(_) => ArrElem::Float4,
             Datum::Float8(_) => ArrElem::Float8,
             Datum::Text(_) => ArrElem::Text,
             Datum::Bpchar(_) => ArrElem::Bpchar,
@@ -465,6 +467,8 @@ impl ArrElem {
             ColType::Varchar => return Some(ArrElem::Varchar),
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
+            // real keeps its identity — storage() would fold it to float8.
+            ColType::Float4 => return Some(ArrElem::Float4),
             _ => {}
         }
         Some(match c.storage() {
@@ -501,6 +505,7 @@ impl ArrElem {
             ArrElem::Timestamp => ColType::Timestamp,
             ArrElem::Timestamptz => ColType::Timestamptz,
             ArrElem::Int2 => ColType::Int2,
+            ArrElem::Float4 => ColType::Float4,
             ArrElem::Time => ColType::Time,
             ArrElem::Timetz => ColType::Timetz,
             ArrElem::Interval => ColType::Interval,
@@ -527,6 +532,7 @@ impl ArrElem {
             ArrElem::Timestamp => 1115,
             ArrElem::Timestamptz => 1185,
             ArrElem::Int2 => 1005,
+            ArrElem::Float4 => 1021,
             ArrElem::Time => 1183,
             ArrElem::Timetz => 1270,
             ArrElem::Interval => 1187,
@@ -562,6 +568,7 @@ impl ArrElem {
             ArrElem::Varchar => 17,
             ArrElem::Bpchar => 18,
             ArrElem::Name => 19,
+            ArrElem::Float4 => 20,
         }
     }
 
@@ -587,6 +594,7 @@ impl ArrElem {
             17 => ArrElem::Varchar,
             18 => ArrElem::Bpchar,
             19 => ArrElem::Name,
+            20 => ArrElem::Float4,
             _ => return None,
         })
     }
@@ -833,6 +841,11 @@ pub enum Datum<'a> {
     Int2(i16),
     Int4(i32),
     Int8(i64),
+    /// `real`/`float4`. The width is the type: an f32 holds exactly what
+    /// PostgreSQL's real does, so casts round through it and arithmetic between
+    /// two reals stays single precision. Stored rows keep the historical
+    /// 8-byte float8 layout; decode narrows by schema.
+    Float4(f32),
     Float8(f64),
     Text(&'a str),
     /// A `char(n)` value, blank-padded to its declared width. The padding is
@@ -903,6 +916,7 @@ impl<'a> Datum<'a> {
             Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
             Datum::Int8(_) => oid::INT8,
+            Datum::Float4(_) => oid::FLOAT4,
             Datum::Float8(_) => oid::FLOAT8,
             Datum::Text(_) => oid::TEXT,
             Datum::Bpchar(_) => oid::BPCHAR,
@@ -940,11 +954,35 @@ fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
     if v.is_nan() {
         return f.write_str("NaN");
     }
-    // `{:e}` is the shortest round-trip form; reformat it under
-    // PostgreSQL's notation rule.
+    // `{:e}` is the shortest round-trip form; reformat it under PostgreSQL's
+    // notation rule. float8out uses fixed notation for decimal exponents in
+    // [-4, 15).
     let mut sci = crate::util::StackStr::<64>::new();
     let _ = write!(sci, "{v:e}");
-    let text = sci.as_str();
+    write_pg_float_notation(f, sci.as_str(), 15)
+}
+
+/// `real`/float4 output. Identical to float8 output but over the f32's own
+/// shortest round-trip digits and PostgreSQL's narrower float4out window:
+/// fixed notation for decimal exponents in [-4, 6), scientific otherwise.
+fn write_pg_float4(f: &mut fmt::Formatter<'_>, v: f32) -> fmt::Result {
+    if v.is_infinite() {
+        return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    if v.is_nan() {
+        return f.write_str("NaN");
+    }
+    let mut sci = crate::util::StackStr::<64>::new();
+    let _ = write!(sci, "{v:e}");
+    write_pg_float_notation(f, sci.as_str(), 6)
+}
+
+/// Reformats a Rust `{:e}` (shortest round-trip) rendering under PostgreSQL's
+/// float output rule: fixed notation when the decimal exponent is in
+/// `[-4, upper)`, otherwise `d.ddde±XX` with a signed, ≥2-digit exponent. The
+/// `upper` bound is the only thing that differs between float8 (15) and float4
+/// (6). Infinities and NaN are handled by the callers.
+fn write_pg_float_notation(f: &mut fmt::Formatter<'_>, text: &str, upper: i32) -> fmt::Result {
     let (mantissa, exp_text) = text.split_once('e').expect("LowerExp always has an exponent");
     let exp: i32 = exp_text.parse().expect("LowerExp exponent is an integer");
     let (sign, mantissa) = match mantissa.strip_prefix('-') {
@@ -956,7 +994,7 @@ fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
         None => (mantissa, ""),
     };
     debug_assert_eq!(head.len(), 1, "LowerExp mantissa has one leading digit");
-    if (-4..15).contains(&exp) {
+    if (-4..upper).contains(&exp) {
         f.write_str(sign)?;
         if exp < 0 {
             // 0.000ddd…
@@ -1007,6 +1045,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Int2(v) => write!(f, "{v}"),
             Datum::Int4(v) => write!(f, "{v}"),
             Datum::Int8(v) => write!(f, "{v}"),
+            Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
             // The output function emits the padding — psql shows `hi   `.
             Datum::Text(s) | Datum::Bpchar(s) => f.write_str(s),
@@ -1265,6 +1304,34 @@ mod tests {
         assert_eq!(Datum::Float8(2.5).to_string(), "2.5");
         assert_eq!(Datum::Float8(f64::INFINITY).to_string(), "Infinity");
         assert_eq!(Datum::Text("hi").to_string(), "hi");
+        // real/float4 output: shortest f32 digits, PostgreSQL's float4out
+        // notation window ([-4, 6) fixed, scientific otherwise). The values
+        // that render differently from float8 are the point.
+        assert_eq!(Datum::Float4(12345678.0).to_string(), "1.2345678e+07");
+        assert_eq!(Datum::Float4(1234567.0).to_string(), "1.234567e+06");
+        assert_eq!(Datum::Float4(123456.0).to_string(), "123456");
+        assert_eq!(Datum::Float4(1000000.0).to_string(), "1e+06");
+        assert_eq!(Datum::Float4(0.1).to_string(), "0.1");
+        assert_eq!(Datum::Float4(0.0001).to_string(), "0.0001");
+        assert_eq!(Datum::Float4(1e-5).to_string(), "1e-05");
+        assert_eq!(Datum::Float4(-0.0).to_string(), "-0");
+        assert_eq!(Datum::Float4(f32::INFINITY).to_string(), "Infinity");
+        assert_eq!(Datum::Float4(f32::NAN).to_string(), "NaN");
+    }
+
+    #[test]
+    fn float4_survives_the_row_encoding() {
+        // real keeps the historical 8-byte float8 layout and narrows back to
+        // f32 at decode by schema — the value round-trips exactly.
+        use crate::storage::rowenc;
+        let values = [Datum::Float4(0.1_f32), Datum::Float4(16777216.0)];
+        let len = rowenc::encoded_len(&values);
+        let mut buf = [0u8; 48];
+        rowenc::encode(&values, &mut buf[..len]);
+        let mut out = [Datum::Null; 2];
+        rowenc::decode(&buf[..len], &[ColType::Float4, ColType::Float4], &mut out).unwrap();
+        assert_eq!(out[0], Datum::Float4(0.1_f32));
+        assert_eq!(out[1], Datum::Float4(16777216.0));
     }
 
     #[test]

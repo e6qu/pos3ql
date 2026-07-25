@@ -272,30 +272,31 @@ impl<'b> Responder<'b> {
         })
     }
 
-    /// CopyInResponse / CopyOutResponse: text overall format, every column
-    /// text — the only formats this engine's COPY speaks.
-    pub fn copy_in_response(&mut self, n_columns: usize) -> Result<(), WireFull> {
-        self.copy_response(b'G', n_columns)
+    /// CopyInResponse / CopyOutResponse. `binary` selects PostgreSQL's format
+    /// code (1 = binary, 0 = text/CSV) for the overall message and every column.
+    pub fn copy_in_response(&mut self, n_columns: usize, binary: bool) -> Result<(), WireFull> {
+        self.copy_response(b'G', n_columns, binary)
     }
 
-    pub fn copy_out_response(&mut self, n_columns: usize) -> Result<(), WireFull> {
-        self.copy_response(b'H', n_columns)
+    pub fn copy_out_response(&mut self, n_columns: usize, binary: bool) -> Result<(), WireFull> {
+        self.copy_response(b'H', n_columns, binary)
     }
 
-    fn copy_response(&mut self, kind: u8, n_columns: usize) -> Result<(), WireFull> {
+    fn copy_response(&mut self, kind: u8, n_columns: usize, binary: bool) -> Result<(), WireFull> {
+        let format = u8::from(binary);
         self.with_retry(|buffer| {
             let mut m = MsgOut::begin(buffer, kind);
-            m.u8(0); // overall format: text
+            m.u8(format);
             m.i16(n_columns as i16);
             for _ in 0..n_columns {
-                m.i16(0);
+                m.i16(i16::from(format));
             }
             m.finish()
         })
     }
 
-    /// One CopyData row: `write` emits the escaped fields and separators;
-    /// the trailing newline is appended here. `write` may run twice (the
+    /// One text/CSV CopyData row: `write` emits the fields and separators; the
+    /// trailing newline is appended here. `write` may run twice (the
     /// flush-and-retry path), so it must be deterministic.
     pub fn copy_data_row(&mut self, write: &CopyRowWriter<'_>) -> Result<(), WireFull> {
         self.with_retry(|buffer| {
@@ -304,6 +305,44 @@ impl<'b> Responder<'b> {
                 m.bytes(bytes);
             });
             m.bytes(b"\n");
+            m.finish()
+        })
+    }
+
+    /// The binary COPY file header: the 11-byte signature, an int32 flags word,
+    /// and an int32 header-extension length (both zero). One CopyData message.
+    pub fn copy_binary_header(&mut self) -> Result<(), WireFull> {
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, b'd');
+            m.bytes(b"PGCOPY\n\xff\r\n\0");
+            m.i32(0);
+            m.i32(0);
+            m.finish()
+        })
+    }
+
+    /// One binary CopyData row: the int16 field count, then `write` emits each
+    /// field as its int32 length (or -1 for NULL) followed by the value's binary
+    /// bytes (via [`Self::encode_value_binary`]). `write` may run twice on the
+    /// flush-and-retry path, so it must be deterministic.
+    pub fn copy_binary_row(
+        &mut self,
+        n_fields: usize,
+        write: &dyn Fn(&mut MsgOut),
+    ) -> Result<(), WireFull> {
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, b'd');
+            m.i16(n_fields as i16);
+            write(&mut m);
+            m.finish()
+        })
+    }
+
+    /// The binary COPY trailer: an int16 field count of -1. One CopyData message.
+    pub fn copy_binary_trailer(&mut self) -> Result<(), WireFull> {
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, b'd');
+            m.i16(-1);
             m.finish()
         })
     }
@@ -519,8 +558,9 @@ impl<'b> Responder<'b> {
 
     /// Binary wire representations, per PostgreSQL's send functions:
     /// network byte order, dates as days and timestamps as microseconds
-    /// since 2000-01-01.
-    fn encode_value_binary(m: &mut MsgOut, v: &Datum) {
+    /// since 2000-01-01. Writes the int32 length prefix (or -1 for NULL) then
+    /// the value bytes, so it doubles as a COPY-binary field writer.
+    pub(crate) fn encode_value_binary(m: &mut MsgOut, v: &Datum) {
         {
             match v {
                 Datum::Null => {

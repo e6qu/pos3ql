@@ -651,12 +651,15 @@ impl Conn {
     }
 
     fn copy_data_chunk(&mut self, engine: &mut Engine, total: usize) {
-        let copy = self.copy.as_mut().expect("in copy-in mode");
         // Stage the chunk; a row larger than the staging buffer is the
         // COPY's first error (drained like any other).
-        {
+        let overflowed = {
             let payload = &self.recv.readable()[5..total];
-            if !self.copy_buf.append(payload) && copy.failed.is_none() {
+            !self.copy_buf.append(payload)
+        };
+        if overflowed {
+            let copy = self.copy.as_mut().expect("in copy-in mode");
+            if copy.failed.is_none() {
                 copy.failed = Some(crate::sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "COPY row exceeds copy_line_bytes ({})",
@@ -664,6 +667,12 @@ impl Conn {
                 ));
             }
         }
+        // Binary framing is length-based, not line-based.
+        if self.copy.as_ref().expect("in copy-in mode").setup.fmt.binary {
+            self.copy_binary_chunk(engine);
+            return;
+        }
+        let copy = self.copy.as_mut().expect("in copy-in mode");
         let csv = copy.setup.fmt.csv;
         let (quote, escape) = (copy.setup.fmt.quote, copy.setup.fmt.escape);
         loop {
@@ -709,9 +718,88 @@ impl Conn {
         }
     }
 
+    /// COPY FROM BINARY: consume the file header once, then decode each
+    /// length-framed row until the -1 trailer. A row spanning several CopyData
+    /// chunks is assembled in `copy_buf` before it is decoded.
+    fn copy_binary_chunk(&mut self, engine: &mut Engine) {
+        use crate::sql::copy::{binary_frame, binary_header, BinaryFrame, BinaryHeader};
+        let copy = self.copy.as_mut().expect("in copy-in mode");
+        if copy.binary_header_pending {
+            match binary_header(self.copy_buf.readable()) {
+                BinaryHeader::Incomplete => {
+                    if self.copy_buf.len() == self.copy_buf.capacity() && copy.failed.is_none() {
+                        copy.failed = Some(crate::sql_err!(
+                            sqlstate::BAD_COPY_FILE_FORMAT,
+                            "COPY binary header exceeds the buffer"
+                        ));
+                    }
+                    return;
+                }
+                BinaryHeader::Bad => {
+                    if copy.failed.is_none() {
+                        copy.failed = Some(crate::sql_err!(
+                            sqlstate::BAD_COPY_FILE_FORMAT,
+                            "COPY file signature not recognized"
+                        ));
+                    }
+                    copy.binary_header_pending = false;
+                    self.copy_buf.clear();
+                    return;
+                }
+                BinaryHeader::Done(len) => {
+                    copy.binary_header_pending = false;
+                    self.copy_buf.consume(len);
+                }
+            }
+        }
+        loop {
+            match binary_frame(self.copy_buf.readable()) {
+                BinaryFrame::Incomplete => {
+                    if self.copy_buf.len() == self.copy_buf.capacity() && copy.failed.is_none() {
+                        copy.failed = Some(crate::sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "COPY binary row exceeds copy_line_bytes ({})",
+                            self.copy_buf.capacity()
+                        ));
+                    }
+                    return;
+                }
+                BinaryFrame::Bad => {
+                    if copy.failed.is_none() {
+                        copy.failed = Some(crate::sql_err!(
+                            sqlstate::BAD_COPY_FILE_FORMAT,
+                            "malformed COPY binary field length"
+                        ));
+                    }
+                    self.copy_buf.clear();
+                    return;
+                }
+                BinaryFrame::Trailer => {
+                    copy.end_seen = true;
+                    self.copy_buf.consume(2);
+                }
+                BinaryFrame::Row(len) => {
+                    self.arena.reset();
+                    if !copy.end_seen && copy.failed.is_none() {
+                        let row = &self.copy_buf.readable()[..len];
+                        match engine.copy_row_binary(&copy.setup, &mut self.txn, &self.arena, row) {
+                            Ok(()) => copy.count += 1,
+                            Err(e) => copy.failed = Some(e),
+                        }
+                    }
+                    self.copy_buf.consume(len);
+                }
+            }
+        }
+    }
+
     fn copy_finish(&mut self, engine: &mut Engine) -> Step {
-        // A final line without a trailing newline is still a line.
-        if !self.copy_buf.is_empty() {
+        // Binary rows are fully consumed as they complete in copy_binary_chunk;
+        // any leftover at CopyDone is a truncated stream, but the count already
+        // reflects the rows that landed, so nothing more is decoded here.
+        let binary = self.copy.as_ref().expect("in copy-in mode").setup.fmt.binary;
+        // A final line without a trailing newline is still a line (text/CSV).
+        if !binary && !self.copy_buf.is_empty() {
             let copy = self.copy.as_mut().expect("in copy-in mode");
             self.arena.reset();
             let line = self.copy_buf.readable();
@@ -1287,12 +1375,14 @@ impl Conn {
                 // for CopyDone.
                 if let Some(setup) = engine.take_pending_copy() {
                     let header_pending = setup.fmt.header;
+                    let binary_header_pending = setup.fmt.binary;
                     self.copy = Some(CopyInProgress {
                         setup,
                         count: 0,
                         failed: None,
                         end_seen: false,
                         header_pending,
+                        binary_header_pending,
                     });
                     self.copy_buf.clear();
                     self.recv.consume(total);
@@ -1358,6 +1448,8 @@ struct CopyInProgress {
     end_seen: bool,
     /// CSV/text HEADER: the first data line is column names to skip, not a row.
     header_pending: bool,
+    /// Binary format: the file header (signature + flags) is still to consume.
+    binary_header_pending: bool,
 }
 
 fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {
@@ -1368,7 +1460,7 @@ fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wir
 /// Decodes a binary-format parameter using its declared type OID
 /// (network byte order per the protocol's binary representations). `arena`
 /// backs the values (e.g. NUMERIC) that need it.
-fn decode_binary_param<'a>(
+pub(crate) fn decode_binary_param<'a>(
     oid: i32,
     bytes: &'a [u8],
     arena: &'a crate::mem::arena::Arena,

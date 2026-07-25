@@ -183,6 +183,90 @@ pub fn is_end_marker(line: &[u8]) -> bool {
     line == b"\\."
 }
 
+/// The binary COPY file signature.
+pub const BINARY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+
+/// Result of trying to consume the binary COPY header from a buffer.
+pub enum BinaryHeader {
+    /// Not enough bytes yet.
+    Incomplete,
+    /// The signature is wrong — a loud error.
+    Bad,
+    /// Header consumed; this many bytes to skip (signature + flags + extension).
+    Done(usize),
+}
+
+/// Validates and measures the binary COPY header (11-byte signature, int32 flags,
+/// int32 header-extension length, then that many extension bytes).
+pub fn binary_header(buf: &[u8]) -> BinaryHeader {
+    let fixed = BINARY_SIGNATURE.len() + 8;
+    if buf.len() < fixed {
+        return BinaryHeader::Incomplete;
+    }
+    if &buf[..BINARY_SIGNATURE.len()] != BINARY_SIGNATURE {
+        return BinaryHeader::Bad;
+    }
+    let ext_at = BINARY_SIGNATURE.len() + 4;
+    let ext_len = i32::from_be_bytes([buf[ext_at], buf[ext_at + 1], buf[ext_at + 2], buf[ext_at + 3]]);
+    if ext_len < 0 {
+        return BinaryHeader::Bad;
+    }
+    let total = fixed + ext_len as usize;
+    if buf.len() < total {
+        BinaryHeader::Incomplete
+    } else {
+        BinaryHeader::Done(total)
+    }
+}
+
+/// One binary COPY frame at the front of `buf`.
+pub enum BinaryFrame {
+    /// A full row: this many bytes (the int16 field count and all fields).
+    Row(usize),
+    /// The end-of-data trailer (an int16 field count of -1): 2 bytes.
+    Trailer,
+    /// Not enough bytes buffered yet.
+    Incomplete,
+    /// A malformed field length.
+    Bad,
+}
+
+/// Measures the first complete binary COPY frame in `buf` without consuming it,
+/// so a row that spans several CopyData chunks is assembled before it is
+/// decoded.
+pub fn binary_frame(buf: &[u8]) -> BinaryFrame {
+    if buf.len() < 2 {
+        return BinaryFrame::Incomplete;
+    }
+    let count = i16::from_be_bytes([buf[0], buf[1]]);
+    if count == -1 {
+        return BinaryFrame::Trailer;
+    }
+    if count < 0 {
+        return BinaryFrame::Bad;
+    }
+    let mut at = 2usize;
+    for _ in 0..count {
+        if buf.len() < at + 4 {
+            return BinaryFrame::Incomplete;
+        }
+        let flen = i32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+        at += 4;
+        if flen == -1 {
+            continue; // NULL field, no bytes
+        }
+        if flen < 0 {
+            return BinaryFrame::Bad;
+        }
+        let end = at + flen as usize;
+        if buf.len() < end {
+            return BinaryFrame::Incomplete;
+        }
+        at = end;
+    }
+    BinaryFrame::Row(at)
+}
+
 /// Appends one CSV field. NULL is the (unquoted) null string; a value is quoted
 /// when forced, when it equals the null string, or when it contains the
 /// delimiter, the quote, or a newline/CR. Inside a quoted field the quote and
@@ -517,6 +601,43 @@ mod tests {
         assert_eq!(encode_csv(Some("NA"), "NA", false), "\"NA\"");
         // FORCE_QUOTE quotes an otherwise-plain value.
         assert_eq!(encode_csv(Some("plain"), "", true), "\"plain\"");
+    }
+
+    #[test]
+    fn binary_header_validates_signature() {
+        assert!(matches!(binary_header(b"PGCOPY"), BinaryHeader::Incomplete));
+        // Signature + int32 flags + int32 extension-length (0) = 19 bytes.
+        let mut good = BINARY_SIGNATURE.to_vec();
+        good.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(binary_header(&good), BinaryHeader::Done(19)));
+        // A wrong signature is a loud error.
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        assert!(matches!(binary_header(&bad), BinaryHeader::Bad));
+        // A header extension extends the consumed length.
+        let mut ext = BINARY_SIGNATURE.to_vec();
+        ext.extend_from_slice(&[0, 0, 0, 0]); // flags
+        ext.extend_from_slice(&3i32.to_be_bytes()); // extension length
+        ext.extend_from_slice(&[1, 2, 3]); // extension
+        assert!(matches!(binary_header(&ext), BinaryHeader::Done(22)));
+    }
+
+    #[test]
+    fn binary_frame_measures_rows_and_trailer() {
+        // Two fields: a 4-byte int and a NULL (-1).
+        let mut row = 2i16.to_be_bytes().to_vec();
+        row.extend_from_slice(&4i32.to_be_bytes());
+        row.extend_from_slice(&42i32.to_be_bytes());
+        row.extend_from_slice(&(-1i32).to_be_bytes());
+        assert!(matches!(binary_frame(&row), BinaryFrame::Row(14)));
+        // Truncated by one byte is incomplete.
+        assert!(matches!(binary_frame(&row[..row.len() - 1]), BinaryFrame::Incomplete));
+        // The -1 field count is the trailer.
+        assert!(matches!(binary_frame(&(-1i16).to_be_bytes()), BinaryFrame::Trailer));
+        // A negative field length is malformed.
+        let mut bad = 1i16.to_be_bytes().to_vec();
+        bad.extend_from_slice(&(-2i32).to_be_bytes());
+        assert!(matches!(binary_frame(&bad), BinaryFrame::Bad));
     }
 
     #[test]

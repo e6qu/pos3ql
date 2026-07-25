@@ -3022,13 +3022,14 @@ fn correlated_in_subquery() {
 }
 
 #[test]
-fn copy_csv_options_supported_binary_refused() {
-    // The engine speaks COPY's text and CSV formats with their options; binary
-    // and CSV-only options misused in text mode still refuse loudly rather than
-    // mis-read a data stream.
+fn copy_formats_and_unsupported() {
+    // The engine speaks COPY's text, CSV and binary formats. CSV-only options
+    // misused in text mode, and binary of a type whose binary codec is not yet
+    // emitted, refuse loudly rather than mis-read or corrupt a stream.
     let (mut engine, mut budget) = test_engine();
-    let ok = run_with(&mut engine, &mut budget, "CREATE TABLE c (a int)");
+    let ok = run_with(&mut engine, &mut budget, "CREATE TABLE c (a int, b text)");
     assert!(!message_types(&ok).contains(&b'E'));
+    run_with(&mut engine, &mut budget, "INSERT INTO c VALUES (1, 'x')");
     for statement in [
         "COPY c TO STDOUT (FORMAT csv)",
         "COPY c TO STDOUT (FORMAT csv, DELIMITER ';', NULL 'x', HEADER, QUOTE '#')",
@@ -3042,9 +3043,19 @@ fn copy_csv_options_supported_binary_refused() {
             String::from_utf8_lossy(&out)
         );
     }
+    // Binary of a scalar table now succeeds and emits the PGCOPY signature.
+    let out = run_with(&mut engine, &mut budget, "COPY c TO STDOUT (FORMAT binary)");
+    assert!(!message_types(&out).contains(&b'E'), "{:?}", String::from_utf8_lossy(&out));
+    assert!(
+        out.windows(6).any(|w| w == b"PGCOPY"),
+        "binary output should carry the signature"
+    );
+    // Binary of an array column, and a CSV-only option in text mode, refuse.
+    run_with(&mut engine, &mut budget, "CREATE TABLE arr (a int[])");
     for statement in [
-        "COPY c TO STDOUT (FORMAT binary)",
+        "COPY arr TO STDOUT (FORMAT binary)",
         "COPY c TO STDOUT (FORMAT text, QUOTE '#')",
+        "COPY c TO STDOUT (FORMAT binary, HEADER)",
     ] {
         let out = run_with(&mut engine, &mut budget, statement);
         let text = String::from_utf8_lossy(&out).to_string();

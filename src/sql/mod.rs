@@ -636,6 +636,17 @@ impl Engine {
         exec::copy_row(&mut self.storage, txn, setup, line, arena)
     }
 
+    /// One complete COPY FROM binary row (int16 field count + fields).
+    pub fn copy_row_binary(
+        &mut self,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        arena: &Arena,
+        row: &[u8],
+    ) -> Result<(), SqlError> {
+        exec::copy_row_binary(&mut self.storage, txn, setup, row, arena)
+    }
+
     /// Ends a successful COPY FROM: an implicit transaction commits here
     /// (this was the statement's end); an explicit one stays open, exactly
     /// as INSERT inside BEGIN would.
@@ -1604,7 +1615,7 @@ impl Engine {
                     // copy_row_line under this same (implicit or explicit)
                     // transaction, and the command tag waits for CopyDone.
                     self.ensure_txn(txn, txn.mode);
-                    responder.copy_in_response(setup.n_targets)?;
+                    responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
                     self.pending_copy = Some(setup);
                     Ok(Ok(()))
                 }

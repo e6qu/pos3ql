@@ -1207,14 +1207,26 @@ INFO progress this engine does not emit).
    string; the quote and escape characters double inside), and a CSV input row
    is found quote-aware in the connection layer so a newline inside a quoted
    field spans CopyData chunks rather than splitting the row. Corpus
-   `51_copy_csv` runs it against real PostgreSQL 18. **Binary format is the one
-   remaining COPY gap, refused loudly (0A000):** a faithful COPY BINARY needs a
-   per-type binary send/recv codec matching PostgreSQL's exact formats for every
-   type (the extended-protocol binary path shortcuts range/bit/multirange to
-   text), which is a genuinely large, self-contained follow-up rather than a
-   quick option. The extended-protocol COPY flow is likewise refused pending its
-   own wiring. The pg_dump round-trip milestone stays open pending the catalog
-   surface pg_dump itself queries.
+   `51_copy_csv` runs it against real PostgreSQL 18. **Binary format followed
+   (2026-07-25):** `FORMAT binary` both directions — the `PGCOPY\n\377\r\n\0`
+   file signature, per-row int16 field count, per-field int32 length (or -1 for
+   NULL), the -1 trailer, and CopyIn/CopyOutResponse's format code — with a
+   quote-free, length-based copy-in state machine that assembles a row spanning
+   several CopyData chunks before decoding it. Every column of the scalar /
+   numeric / temporal / uuid / bytea / json tower encodes and decodes byte-exact
+   against PostgreSQL (including the ones the extended-protocol path already got
+   right — `smallint` as a true int2, `timetz`'s westward zone flip, numeric's
+   base-10000 groups, interval, timestamptz). The types whose real binary wire
+   format is not yet emitted — arrays, ranges, multiranges, bit strings (the
+   extended-protocol binary path shortcuts them to canonical text, which a
+   binary consumer would misparse) — are refused loudly (0A000) rather than
+   corrupt the stream; their binary codec is a self-contained follow-up. Binary
+   data is not line-oriented, so it cannot be fed through a psql `-f` corpus;
+   `tests/external/copy_binary_diff.py` drives both engines over the wire with
+   psycopg and checks TO-binary byte-identity plus FROM-binary round-trips in
+   both directions, wired into the CI differential. The extended-protocol COPY
+   flow is likewise refused pending its own wiring. The pg_dump round-trip
+   milestone stays open pending the catalog surface pg_dump itself queries.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;

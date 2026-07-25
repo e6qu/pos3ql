@@ -16,7 +16,13 @@ and quick start · [PLAN.md](PLAN.md) — roadmap · [BUGS.md](BUGS.md) — know
   something broken.
 - **Do not file-and-forget.** A BUGS.md entry is not a substitute for a fix. Track a bug
   only when it is genuinely intractable right now (and say *why* it is intractable, not
-  merely "narrow" or "out of scope").
+  merely "narrow" or "out of scope"). **BUGS.md is not a backlog or a to-do list** — it is
+  reserved for bugs that cannot be fixed now, each carrying its explicit reason. Filing a
+  fixable bug as `open` instead of fixing it is the failure mode this rule exists to stop,
+  and it is enforced mechanically: `tools/check-bugs.sh` (run with `zsh`, wired into CI)
+  fails if any `open` row lacks an intractability justification or reads as a deferral
+  ("its own PR", "follow-up", "fresh session", …). If your instinct is to write a new
+  `B-NNN`, that is the signal to write the fix instead.
 - **Do not triage by relevance.** "Narrow," "pre-existing," "not the primary ask," and
   "tangent" are banned as reasons to skip a fix. The only legitimate reasons to defer are
   genuine intractability or a true blocker — and those get stated loudly.
@@ -57,3 +63,9 @@ These reinforce, and are subordinate to, the Boyscout Rule.
   cross-linked from every doc.
 - **Commits:** PRs are squash-merged, so one commit per PR is fine; don't make fine-grained
   commits inside a PR.
+- **Batch big; no micro-PRs, no deferrals.** Prefer one large, complete PR over a chain of
+  small ones. Do all the related work — the feature, its Boyscout fixes, the incidental bugs
+  you trip over, and the docs (`PLAN.md`, `BUGS.md`, `AGENTS.md`, `README.md`,
+  `docs/`) — in the *same* PR. "Its own follow-up PR", "scoped to a corpus", and "a fresh
+  session can pick this up" are deferrals; per the Boyscout Rule they are banned unless the
+  work is genuinely intractable or a true blocker, stated loudly. Finish the whole chunk.

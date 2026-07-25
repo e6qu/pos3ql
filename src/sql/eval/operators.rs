@@ -331,6 +331,116 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
     compare_datums_as("=", l, r)
 }
 
+/// Hashes a key tuple for the value index (the uniqueness/foreign-key probe
+/// accelerator). The hash MUST agree with [`compare_datums`] equality — equal
+/// values hash equal — so the index never misses a true collision; unequal
+/// values that happen to share a hash are only false positives, re-verified by
+/// the caller against the actual row. Types whose canonical form is subtle
+/// (numeric, interval, timetz, ranges, arrays, non-jsonb json) hash to a
+/// per-type constant: correct, but every value collides, so a column of that
+/// type falls back to a full verify scan; the common key types (integers, text,
+/// char, uuid, dates/times, bytea, bit, jsonb, float) hash precisely. Writes are
+/// little-endian so the hash is identical across platforms (the simulator
+/// replays bit-for-bit).
+pub fn hash_key(values: &[Datum], columns: &[u16]) -> u64 {
+    use core::hash::Hasher as _;
+    let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
+    for &col in columns {
+        hash_datum(&values[col as usize], &mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
+    use core::hash::Hasher as _;
+    // Canonical float bits: -0.0 and 0.0 are equal, and PostgreSQL's btree
+    // treats every NaN as equal to every other, so both collapse to one form.
+    let canon_float = |f: f64| -> u64 {
+        if f == 0.0 {
+            0
+        } else if f.is_nan() {
+            f64::NAN.to_bits()
+        } else {
+            f.to_bits()
+        }
+    };
+    // A per-variant tag keeps distinct types from aliasing in a multi-column
+    // key. Types that compare equal across representations share a tag on
+    // purpose (an int is an int at any width; text and blank-stripped char
+    // compare equal; a timestamp and timestamptz denote the same instant).
+    match datum {
+        Datum::Null => hasher.write(&[0]),
+        Datum::Bool(b) => hasher.write(&[1, *b as u8]),
+        Datum::Int2(v) => {
+            hasher.write(&[2]);
+            hasher.write(&(*v as i64).to_le_bytes());
+        }
+        Datum::Int4(v) => {
+            hasher.write(&[2]);
+            hasher.write(&(*v as i64).to_le_bytes());
+        }
+        Datum::Int8(v) => {
+            hasher.write(&[2]);
+            hasher.write(&v.to_le_bytes());
+        }
+        Datum::Float4(f) => {
+            hasher.write(&[3]);
+            hasher.write(&canon_float(*f as f64).to_le_bytes());
+        }
+        Datum::Float8(f) => {
+            hasher.write(&[3]);
+            hasher.write(&canon_float(*f).to_le_bytes());
+        }
+        Datum::Text(s) => {
+            hasher.write(&[4]);
+            hasher.write(s.as_bytes());
+        }
+        Datum::Bpchar(s) => {
+            hasher.write(&[4]);
+            hasher.write(s.trim_end_matches(' ').as_bytes());
+        }
+        Datum::Date(v) => {
+            hasher.write(&[5]);
+            hasher.write(&(*v as i64).to_le_bytes());
+        }
+        Datum::Timestamp(v) | Datum::Timestamptz(v) => {
+            hasher.write(&[6]);
+            hasher.write(&v.to_le_bytes());
+        }
+        Datum::Time(v) => {
+            hasher.write(&[7]);
+            hasher.write(&v.to_le_bytes());
+        }
+        Datum::Uuid(b) => {
+            hasher.write(&[8]);
+            hasher.write(b);
+        }
+        Datum::Bytea(b) => {
+            hasher.write(&[9]);
+            hasher.write(b);
+        }
+        Datum::Bit { bits, .. } => {
+            hasher.write(&[10]);
+            hasher.write(bits.as_bytes());
+        }
+        Datum::Json { text, jsonb: true } => {
+            hasher.write(&[11]);
+            hasher.write(text.as_bytes());
+        }
+        // Subtle-canonical or non-comparable types: one constant per type. Every
+        // value collides, so the caller verifies each candidate — correct, just
+        // not accelerated for these column types.
+        Datum::Numeric(_) => hasher.write(&[20]),
+        Datum::Interval(_) => hasher.write(&[21]),
+        Datum::Timetz(..) => hasher.write(&[22]),
+        Datum::Range { .. } => hasher.write(&[23]),
+        Datum::Multirange { .. } => hasher.write(&[24]),
+        Datum::Array { .. } => hasher.write(&[25]),
+        Datum::Record(_) => hasher.write(&[26]),
+        Datum::Json { jsonb: false, .. } => hasher.write(&[27]),
+    }
+}
+
 /// [`compare_datums`], reporting an undefined comparison under the operator the
 /// query actually wrote — `true < 1` is `boolean < integer`, not `boolean =
 /// integer`.
@@ -1250,4 +1360,41 @@ pub(crate) fn logic<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Resul
         _ => unreachable!(),
     };
     Ok(out.map_or(Datum::Null, Datum::Bool))
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+    use crate::sql::types::Datum;
+
+    fn h(d: Datum) -> u64 {
+        hash_key(&[d], &[0])
+    }
+
+    #[test]
+    fn hash_agrees_with_equality() {
+        // -0.0 and 0.0 are equal and must hash equal (float canonicalization).
+        assert_eq!(h(Datum::Float8(0.0)), h(Datum::Float8(-0.0)));
+        assert_eq!(h(Datum::Float4(0.0)), h(Datum::Float4(-0.0)));
+        // Integer widths of the same value hash equal.
+        assert_eq!(h(Datum::Int2(5)), h(Datum::Int4(5)));
+        assert_eq!(h(Datum::Int4(5)), h(Datum::Int8(5)));
+        // A blank-padded char equals its stripped form and the same text.
+        assert_eq!(h(Datum::Bpchar("a")), h(Datum::Bpchar("a   ")));
+        assert_eq!(h(Datum::Text("a")), h(Datum::Bpchar("a  ")));
+        // Distinct values differ (not required for correctness, but the point
+        // of the index is that the common types separate).
+        assert_ne!(h(Datum::Int4(5)), h(Datum::Int4(6)));
+        assert_ne!(h(Datum::Text("a")), h(Datum::Text("b")));
+        // The load-bearing invariant, cross-checked against compare_datums:
+        // equal values hash equal, so the index never misses a true collision.
+        for (a, b) in [
+            (Datum::Float8(0.0), Datum::Float8(-0.0)),
+            (Datum::Bpchar("a"), Datum::Bpchar("a  ")),
+            (Datum::Text("a"), Datum::Bpchar("a ")),
+        ] {
+            assert!(compare_datums(&a, &b).unwrap().is_eq(), "{a:?} == {b:?}");
+            assert_eq!(h(a), h(b));
+        }
+    }
 }

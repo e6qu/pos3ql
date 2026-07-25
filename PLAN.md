@@ -912,7 +912,10 @@ constraint was pure cost. Rewritten to earn it: the scale table drops the
 constraint (the overlay/spill read path is what it exercises, now ~17 s),
 and a separate bounded 1500-row `PRIMARY KEY` table asserts the property
 that actually matters — a duplicate of a key long evicted from the overlay
-is still caught against its spilled row. The crash-torture shard, still ~15
+is still caught against its spilled row. **(B-169 fixed 2026-07-25:** a
+per-constraint in-RAM value index turns that probe into a hash seek, so the
+scale table carries a `PRIMARY KEY` again and the spill-boundary check runs at
+5000 rows — see B-169 and Stage E gap 4 below.**)** The crash-torture shard, still ~15
 minutes at 12 rounds on the instrumented binary, is split across two seeds
 at half depth each (`POS3QL_TORTURE_ROUNDS`/`POS3QL_TORTURE_SEED`), which
 also widens the random coverage. Torture is a correctness shard, not a
@@ -1018,7 +1021,19 @@ UNIQUE/PK flag has no stored name to rename). Corpus `49_rename_constraint`.
 A related pre-existing gap surfaced and is noted for its own PR: CHECK
 constraints auto-name as `<table>_check` rather than PostgreSQL's
 `<table>_<column>_check` for column-level checks (and lack the numeric
-disambiguation suffix). Still to do: comma-separated multi-action lists.
+disambiguation suffix). **All three follow-ups landed 2026-07-25** —
+single-column-key naming (an explicitly named single-column UNIQUE/PK is now a
+first-class named key; an unnamed one materializes on RENAME; `DROP NOT NULL` on
+a PK column is refused whichever form it takes; `find_conflict` now consults the
+table-level keys too, closing a multi-column-UNIQUE ON CONFLICT gap; corpus
+`differential_exact/03_named_constraints`), CHECK auto-naming
+(`<table>_<column>_check` for a one-column predicate, `<table>_check` otherwise,
+with numeric disambiguation; corpus `differential_exact/02_check_naming`), and
+comma-separated multi-action `ALTER TABLE` (applied in PostgreSQL's fixed pass
+order, atomic — all row content validated against the transformed images before
+any journaling, which also closed a latent mid-rewrite-cast atomicity gap and a
+NOT-NULL-over-a-spilled-table check that read the evicted overlay; corpus
+`50_alter_multi`).
 
 ### VACUUM and ANALYZE (2026-07-25)
 
@@ -1122,17 +1137,27 @@ INFO progress this engine does not emit).
    smallest still giving ~10 bits per key, so a small SST no longer pays
    128 KiB for a handful of rows. (Stage C's own "remaining: multi-block index and sized filter" is
    thereby closed.)
-   **Deferral, stated loudly (2026-07-25): the secondary-index LSM forest
-   waits.** Uniqueness and foreign keys are *correct* today — enforced by
-   full scans through the seam — so the forest is an acceleration, not a
-   gap, and its two honest prerequisites belong to later steps: a
-   value-keyed index LSM needs multiset merge semantics (a tombstone for
-   one `(value, rowid)` pair must not shadow another row with the same
-   value — different laws than the rowid trees), and its read-side payoff
-   needs the planner cost model that only arrives with Stage I. Bulk loads
-   into uniquely-constrained tables are meanwhile quadratic (correct,
-   loud in wall-clock rather than in wrongness); the forest lands with
-   Stage I's planner work, designed once against its real consumer.
+   **Uniqueness enforcement is now indexed (B-169, fixed 2026-07-25).** The
+   quadratic per-insert probe is gone: each PRIMARY KEY / UNIQUE constraint
+   carries a per-constraint in-RAM value index (`mem::value_index`), a
+   `value_hash → rowid` open-addressing multimap maintained at the single
+   `commit_row` choke point (drop the old committed value's key, add the new)
+   and rebuilt once at startup after replay. A uniqueness probe over committed
+   rows is a hash seek that yields candidate rowids, each re-verified against the
+   authoritative row bytes and MVCC state (a 64-bit hash collision is only a
+   false positive); pending images (the 40001 path) are covered by a bounded
+   scan of the resident overlay, which never evicts a pending row. The hash
+   agrees with `compare_datums` equality. The cost is a static cap — a
+   constrained table holds at most `value_index_rows` committed rows, a loud
+   error past it — the honest price of an in-RAM index. **Still deferred (the
+   full persistent secondary-index LSM forest, "Design B"):** a value-keyed
+   index persisted in the SSTs would lift that cap and let a *constrained* table
+   spill unboundedly, but it needs multiset merge semantics (a tombstone for one
+   `(value, rowid)` pair must not shadow another row with the same value) and its
+   read-side payoff needs the Stage I planner cost model — it lands there,
+   designed once against its real consumer. A `CREATE UNIQUE INDEX` keeps its
+   full-scan enforcement for now (a separate feature from the constraints B-169
+   names).
 
    *Earlier (same day):* **the choke points went in first** — the first half of the
    two-PR shape this step takes (the query.rs-split playbook: mechanical

@@ -10,6 +10,7 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
+use crate::util::StackStr;
 use crate::storage::{
     ColumnMeta, RowHome, SqlName, Storage, TableDef, MAX_COLUMNS,
 };
@@ -484,6 +485,16 @@ fn find_conflict(
                 };
                 for (i, c) in def.columns().iter().enumerate() {
                     if c.unique && eq(&values[i], &other[i]) {
+                        return Ok(true);
+                    }
+                }
+                // Table-level keys, including the single-column ones that carry
+                // an explicit name (so they live here rather than on a flag).
+                for uk in def.uniques() {
+                    let cols = uk.columns();
+                    if !cols.iter().any(|&c| values[c as usize].is_null())
+                        && cols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
+                    {
                         return Ok(true);
                     }
                 }
@@ -2550,43 +2561,53 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
     false
 }
 
-/// Scans a table's committed rows for a NULL in column `col`, for ALTER COLUMN
-/// SET NOT NULL. Errors on the first NULL, naming the column and relation as
-/// PostgreSQL does.
-fn ensure_column_not_null(
-    storage: &Storage,
-    table_slot: usize,
-    def: &TableDef,
-    col: usize,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    def.schema(&mut schema);
-    let schema = &schema[..def.n_columns];
-    let mut has_null = false;
-    storage.for_each_row_state(table_slot, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        let Some(home) = state.committed else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let bytes = storage.row_bytes(table_slot, rowid, home, arena)?;
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(bytes, schema, &mut values)?;
-        if values[col].is_null() {
-            has_null = true;
-            return Ok(ControlFlow::Break(()));
+/// If two rewritten rows `a` and `b` collide on a uniqueness constraint of
+/// `new_def` — a single-column UNIQUE/PRIMARY KEY flag or a multi-column key,
+/// with every key column non-NULL and equal — returns the constraint's
+/// PostgreSQL name. Used to validate a uniqueness constraint added alongside an
+/// ALTER row rewrite, against the transformed images, before anything is
+/// journaled (a NULL in any key column makes the rows distinct).
+fn rewritten_dup_name(new_def: &TableDef, a: &[Datum], b: &[Datum]) -> Option<StackStr<128>> {
+    use core::fmt::Write as _;
+    let eq = |i: usize| {
+        !a[i].is_null()
+            && !b[i].is_null()
+            && compare_datums(&a[i], &b[i]).map(|o| o.is_eq()).unwrap_or(false)
+    };
+    for (i, c) in new_def.columns().iter().enumerate() {
+        if c.unique && eq(i) {
+            let mut name = StackStr::<128>::new();
+            if c.primary {
+                let _ = write!(name, "{}_pkey", new_def.name.as_str());
+            } else {
+                let _ = write!(name, "{}_{}_key", new_def.name.as_str(), c.name.as_str());
+            }
+            return Some(name);
         }
-        Ok(ControlFlow::Continue(()))
-    })?;
-    if has_null {
-        return Err(sql_err!(
-            sqlstate::NOT_NULL_VIOLATION,
-            "column \"{}\" of relation \"{}\" contains null values",
-            def.columns[col].name.as_str(),
-            def.name.as_str()
-        ));
     }
-    Ok(())
+    for uk in new_def.uniques() {
+        if uk.columns().iter().all(|&col| eq(col as usize)) {
+            let mut name = StackStr::<128>::new();
+            let _ = write!(name, "{}", uk.name.as_str());
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// How each column of a rewritten row is produced from the old row, composed
+/// across every subcommand of one ALTER TABLE so a single rewrite pass applies
+/// all of them.
+#[derive(Clone, Copy)]
+enum ColSource<'a> {
+    /// Copy the old row's column at this original index unchanged.
+    Keep(usize),
+    /// Cast the old row's column (or a USING expression over the old row) to a
+    /// new type; `orig` is the source column's original index.
+    Cast { orig: usize, target: ColType, type_mod: i32, using: Option<&'a Expr<'a>> },
+    /// A column added by this statement; its value is the new column's default
+    /// (or NULL). The index is into the *new* definition.
+    FillDefault(usize),
 }
 
 pub fn alter_table(
@@ -2624,8 +2645,10 @@ pub fn alter_table(
     }
 
     // SET SCHEMA is a definition-only move with its own journal record — no
-    // row images change, and inbound foreign keys follow the table.
-    if let AlterAction::SetSchema(new_schema) = &statement.action {
+    // row images change, and inbound foreign keys follow the table. It is a
+    // standalone form (never combined), so it is the whole action list.
+    if let [AlterAction::SetSchema(new_schema)] = statement.actions {
+        let new_schema = *new_schema;
         let Some(_) = storage.find_schema(new_schema) else {
             return sql_fail(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
@@ -2633,7 +2656,7 @@ pub fn alter_table(
                 new_schema
             ));
         };
-        if *new_schema == def.schema.as_str() {
+        if new_schema == def.schema.as_str() {
             // Already there: PostgreSQL treats this as a no-op success.
             responder.command_complete("ALTER TABLE")?;
             return sql_ok();
@@ -2666,275 +2689,11 @@ pub fn alter_table(
         return sql_ok();
     }
 
-    // Build the new definition and the per-row transform.
-    let mut new_def = def;
-    let mut added: Option<(usize, Datum)> = None; // (index, fill value)
-    let mut dropped: Option<usize> = None;
-    // (column index, target type, target typmod, optional USING expression)
-    let mut retyped: Option<(usize, ColType, i32, Option<&Expr>)> = None;
-    match &statement.action {
-        AlterAction::SetSchema(_) => unreachable!("handled above"),
-        AlterAction::RenameTable(new_name) => {
-            if storage.find_table(def.schema.as_str(), new_name).is_some() {
-                return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_TABLE,
-                    "relation \"{}\" already exists",
-                    new_name
-                ));
-            }
-            new_def.name = match SqlName::parse(new_name) {
-                Ok(n) => n,
-                Err(e) => return sql_fail(e),
-            };
-        }
-        AlterAction::RenameColumn { from, to } => {
-            let Some(i) = def.column_index(from) else {
-                return sql_fail(undefined_column(from));
-            };
-            if def.column_index(to).is_some() {
-                return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", to));
-            }
-            new_def.columns[i].name = match SqlName::parse(to) {
-                Ok(n) => n,
-                Err(e) => return sql_fail(e),
-            };
-        }
-        AlterAction::AddColumn(c) => {
-            if def.column_index(c.name).is_some() {
-                return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", c.name));
-            }
-            if def.n_columns == MAX_COLUMNS {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "tables can have at most {} columns",
-                    MAX_COLUMNS
-                ));
-            }
-            let meta = match build_column(c, arena) {
-                Ok(m) => m,
-                Err(e) => return sql_fail(e),
-            };
-            let fill = Datum::Null;
-            let _ = fill;
-            new_def.columns[def.n_columns] = meta;
-            new_def.n_columns += 1;
-            let index = def.n_columns;
-            // NOT NULL without a default over a non-empty table is a
-            // constraint violation, as in PostgreSQL.
-            let has_rows = !storage.table(table_index).rows.is_empty();
-            let fill_value = match &new_def.columns[index].default_value {
-                Some(d) => d.as_datum(),
-                None if meta.not_null && has_rows => {
-                    return sql_fail(sql_err!(
-                        sqlstate::NOT_NULL_VIOLATION,
-                        "column \"{}\" of relation \"{}\" contains null values",
-                        c.name,
-                        statement.table.name
-                    ))
-                }
-                None => Datum::Null,
-            };
-            added = Some((index, fill_value));
-        }
-        AlterAction::DropColumn(name) => {
-            let Some(i) = def.column_index(name) else {
-                return sql_fail(undefined_column(name));
-            };
-            if def.n_columns == 1 {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot drop the only column of a table"
-                ));
-            }
-            for j in i..def.n_columns - 1 {
-                new_def.columns[j] = def.columns[j + 1];
-            }
-            new_def.n_columns -= 1;
-            dropped = Some(i);
-        }
-        AlterAction::SetDefault { column, value } => {
-            let Some(i) = def.column_index(column) else {
-                return sql_fail(undefined_column(column));
-            };
-            let ctype = def.columns[i].ctype;
-            let type_mod = def.columns[i].type_mod;
-            // The default is a constant expression, cast to the column's type
-            // and stored as its owned value — the same path CREATE TABLE uses.
-            let owned = match eval(value, arena, crate::sql::eval::NO_PARAMS, &NoColumns)
-                .map_err(|_| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "DEFAULT must be a constant expression"))
-                .and_then(|v| cast_to(v, ctype, arena))
-                .and_then(|v| apply_typmod(v, ctype, type_mod, arena))
-                .and_then(|v| crate::storage::OwnedDatum::from_datum(&v))
-            {
-                Ok(od) => od,
-                Err(e) => return sql_fail(e),
-            };
-            new_def.columns[i].default_value = Some(owned);
-        }
-        AlterAction::DropDefault { column } => {
-            let Some(i) = def.column_index(column) else {
-                return sql_fail(undefined_column(column));
-            };
-            new_def.columns[i].default_value = None;
-            // Dropping a serial column's default detaches its auto-increment.
-            new_def.columns[i].auto_increment = false;
-        }
-        AlterAction::SetNotNull { column } => {
-            let Some(i) = def.column_index(column) else {
-                return sql_fail(undefined_column(column));
-            };
-            // Reject if any existing row holds NULL in this column, naming the
-            // column and relation as PostgreSQL does.
-            if let Err(e) = ensure_column_not_null(storage, table_index, &def, i, arena) {
-                return sql_fail(e);
-            }
-            new_def.columns[i].not_null = true;
-        }
-        AlterAction::DropNotNull { column } => {
-            let Some(i) = def.column_index(column) else {
-                return sql_fail(undefined_column(column));
-            };
-            if def.columns[i].primary {
-                return sql_fail(sql_err!(
-                    sqlstate::INVALID_TABLE_DEFINITION,
-                    "column \"{}\" is in a primary key",
-                    column
-                ));
-            }
-            new_def.columns[i].not_null = false;
-        }
-        AlterAction::AlterColumnType { column, type_name, type_mod, using } => {
-            let Some(i) = def.column_index(column) else {
-                return sql_fail(undefined_column(column));
-            };
-            let Some(target) = ColType::from_sql_name(type_name) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    type_name
-                ));
-            };
-            // Without USING, the stored value casts through the assignment
-            // cast; a cast that is explicit-only (e.g. text→int) is refused
-            // with PostgreSQL's 42804, telling the user to add USING.
-            if using.is_none() && !alter_type_auto_castable(def.columns[i].ctype, target) {
-                return sql_fail(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "column \"{}\" cannot be cast automatically to type {}",
-                    column,
-                    target.name()
-                ));
-            }
-            new_def.columns[i].ctype = target;
-            new_def.columns[i].type_mod = *type_mod;
-            retyped = Some((i, target, *type_mod, *using));
-        }
-        AlterAction::AddConstraint(constraint) => {
-            // Build the constraint into the new definition (u32::MAX sees all
-            // committed catalog, e.g. an FK's parent), then validate every
-            // committed row against the whole new constraint set — the added
-            // one is the only one that can fail. No row rewrite is needed.
-            if let Err(e) = crate::sql::exec::ddl::attach_constraints(
-                storage,
-                &mut new_def,
-                core::slice::from_ref(constraint),
-                u32::MAX,
-                arena,
-            ) {
-                return sql_fail(e);
-            }
-            if let Err(e) = validate_all_rows(storage, table_index, &new_def, arena) {
-                return sql_fail(e);
-            }
-        }
-        AlterAction::DropConstraint { name, if_exists } => {
-            if !drop_named_constraint(&mut new_def, name) {
-                if !*if_exists {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "constraint \"{}\" of relation \"{}\" does not exist",
-                        name,
-                        def.name.as_str()
-                    ));
-                }
-                // IF EXISTS: PostgreSQL emits a skip notice (SQLSTATE 00000).
-                responder.notice(
-                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(
-                        160,
-                        "constraint \"{}\" of relation \"{}\" does not exist, skipping",
-                        name,
-                        def.name.as_str()
-                    )
-                    .as_str(),
-                )?;
-            }
-        }
-        AlterAction::RenameConstraint { from, to } => {
-            // The new name must be free among this table's constraints.
-            let taken = new_def.checks[..new_def.n_checks].iter().any(|c| c.name.as_str() == *to)
-                || new_def.uniques[..new_def.n_uniques].iter().any(|k| k.name.as_str() == *to)
-                || new_def.fkeys[..new_def.n_fkeys].iter().any(|f| f.name.as_str() == *to);
-            if taken {
-                return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "constraint \"{}\" for relation \"{}\" already exists",
-                    to,
-                    def.name.as_str()
-                ));
-            }
-            let new_name = match SqlName::parse(to) {
-                Ok(n) => n,
-                Err(e) => return sql_fail(e),
-            };
-            let renamed = new_def.checks[..new_def.n_checks]
-                .iter_mut()
-                .find(|c| c.name.as_str() == *from)
-                .map(|c| c.name = new_name)
-                .or_else(|| {
-                    new_def.uniques[..new_def.n_uniques]
-                        .iter_mut()
-                        .find(|k| k.name.as_str() == *from)
-                        .map(|k| k.name = new_name)
-                })
-                .or_else(|| {
-                    new_def.fkeys[..new_def.n_fkeys]
-                        .iter_mut()
-                        .find(|f| f.name.as_str() == *from)
-                        .map(|f| f.name = new_name)
-                })
-                .is_some();
-            if !renamed {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "constraint \"{}\" for table \"{}\" does not exist",
-                    from,
-                    def.name.as_str()
-                ));
-            }
-        }
-    }
-
-    let mut old_schema = [ColType::Bool; MAX_COLUMNS];
-    def.schema(&mut old_schema);
-    let old_schema = &old_schema[..def.n_columns];
-
-    // Phase 1: journal the shape change and prepare every rewritten row.
-    let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(
-        lsn,
-        &WalOp::DropTable { schema: def.schema.as_str(), name: def.name.as_str() },
-    ) {
-        return sql_fail(e);
-    }
-    let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::CreateTable(new_def)) {
-        return sql_fail(e);
-    }
+    // Collect every committed row up front: the row count decides whether an
+    // added NOT NULL column needs a fill (a spilled table has rows even when
+    // the overlay map has evicted them, so `rows.is_empty()` cannot answer
+    // this), and the same list drives the rewrite below.
     scratch.clear();
-    let rewrite = added.is_some() || dropped.is_some() || retyped.is_some();
-    // Collect (rowid, old committed loc).
-    let mut row_count = 0usize;
     {
         let mut overflow = false;
         let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
@@ -2946,7 +2705,6 @@ pub fn alter_table(
                 overflow = true;
                 return Ok(ControlFlow::Break(()));
             }
-            row_count += 1;
             Ok(ControlFlow::Continue(()))
         });
         if overflow {
@@ -2957,57 +2715,376 @@ pub fn alter_table(
             ));
         }
     }
-    let _ = row_count;
+    let has_rows = !scratch.is_empty();
+
+    // Build the new definition and the composed per-column rewrite source.
+    // Names resolve against the running definition, so an ADD CONSTRAINT can
+    // reference a column ADDed earlier in the pass-ordered list.
+    let mut new_def = def;
+    let mut source = [ColSource::Keep(0usize); MAX_COLUMNS];
+    for (i, s) in source.iter_mut().enumerate().take(def.n_columns) {
+        *s = ColSource::Keep(i);
+    }
+    let mut added_any = false;
+    let mut dropped_any = false;
+    let mut retyped_any = false;
+    let mut has_added_unique = false;
+
+    for action in statement.actions {
+        match action {
+            AlterAction::SetSchema(_) => unreachable!("SET SCHEMA is a standalone action"),
+            AlterAction::RenameTable(new_name) => {
+                if storage.find_table(def.schema.as_str(), new_name).is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_TABLE,
+                        "relation \"{}\" already exists",
+                        new_name
+                    ));
+                }
+                new_def.name = match SqlName::parse(new_name) {
+                    Ok(n) => n,
+                    Err(e) => return sql_fail(e),
+                };
+            }
+            AlterAction::RenameColumn { from, to } => {
+                let Some(i) = new_def.column_index(from) else {
+                    return sql_fail(undefined_column(from));
+                };
+                if new_def.column_index(to).is_some() {
+                    return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", to));
+                }
+                new_def.columns[i].name = match SqlName::parse(to) {
+                    Ok(n) => n,
+                    Err(e) => return sql_fail(e),
+                };
+            }
+            AlterAction::AddColumn(c) => {
+                if new_def.column_index(c.name).is_some() {
+                    return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", c.name));
+                }
+                if new_def.n_columns == MAX_COLUMNS {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "tables can have at most {} columns",
+                        MAX_COLUMNS
+                    ));
+                }
+                let meta = match build_column(c, arena) {
+                    Ok(m) => m,
+                    Err(e) => return sql_fail(e),
+                };
+                // NOT NULL without a default over a non-empty table is a
+                // constraint violation, as in PostgreSQL.
+                if meta.default_value.is_none() && meta.not_null && has_rows {
+                    return sql_fail(sql_err!(
+                        sqlstate::NOT_NULL_VIOLATION,
+                        "column \"{}\" of relation \"{}\" contains null values",
+                        c.name,
+                        statement.table.name
+                    ));
+                }
+                let index = new_def.n_columns;
+                new_def.columns[index] = meta;
+                new_def.n_columns += 1;
+                source[index] = ColSource::FillDefault(index);
+                added_any = true;
+            }
+            AlterAction::DropColumn(name) => {
+                let Some(i) = new_def.column_index(name) else {
+                    return sql_fail(undefined_column(name));
+                };
+                if new_def.n_columns == 1 {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot drop the only column of a table"
+                    ));
+                }
+                for j in i..new_def.n_columns - 1 {
+                    new_def.columns[j] = new_def.columns[j + 1];
+                    source[j] = source[j + 1];
+                }
+                new_def.n_columns -= 1;
+                dropped_any = true;
+            }
+            AlterAction::SetDefault { column, value } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                let ctype = new_def.columns[i].ctype;
+                let type_mod = new_def.columns[i].type_mod;
+                // The default is a constant expression, cast to the column's
+                // type and stored as its owned value — CREATE TABLE's path.
+                let owned = match eval(value, arena, crate::sql::eval::NO_PARAMS, &NoColumns)
+                    .map_err(|_| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "DEFAULT must be a constant expression"))
+                    .and_then(|v| cast_to(v, ctype, arena))
+                    .and_then(|v| apply_typmod(v, ctype, type_mod, arena))
+                    .and_then(|v| crate::storage::OwnedDatum::from_datum(&v))
+                {
+                    Ok(od) => od,
+                    Err(e) => return sql_fail(e),
+                };
+                new_def.columns[i].default_value = Some(owned);
+            }
+            AlterAction::DropDefault { column } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                new_def.columns[i].default_value = None;
+                // Dropping a serial column's default detaches its auto-increment.
+                new_def.columns[i].auto_increment = false;
+            }
+            AlterAction::SetNotNull { column } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                // A NULL is caught by the content validation below, against the
+                // rewritten image so it composes with a type change in the same
+                // statement.
+                new_def.columns[i].not_null = true;
+            }
+            AlterAction::DropNotNull { column } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                // A primary key implies NOT NULL, whether it rides a column flag
+                // or an explicitly named single-/multi-column key.
+                let in_primary_key = new_def.columns[i].primary
+                    || new_def.uniques[..new_def.n_uniques]
+                        .iter()
+                        .any(|k| k.is_primary && k.columns().contains(&(i as u16)));
+                if in_primary_key {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "column \"{}\" is in a primary key",
+                        column
+                    ));
+                }
+                new_def.columns[i].not_null = false;
+            }
+            AlterAction::AlterColumnType { column, type_name, type_mod, using } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                let Some(target) = ColType::from_sql_name(type_name) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        type_name
+                    ));
+                };
+                // Without USING, the stored value casts through the assignment
+                // cast; a cast that is explicit-only (e.g. text→int) is refused
+                // with PostgreSQL's 42804, telling the user to add USING.
+                if using.is_none() && !alter_type_auto_castable(new_def.columns[i].ctype, target) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "column \"{}\" cannot be cast automatically to type {}",
+                        column,
+                        target.name()
+                    ));
+                }
+                // Compose with whatever already produces this column: a kept or
+                // cast original column becomes a (re)cast of its original index;
+                // a column added in this same statement re-casts its default.
+                match source[i] {
+                    ColSource::Keep(orig) | ColSource::Cast { orig, .. } => {
+                        source[i] = ColSource::Cast { orig, target, type_mod: *type_mod, using: *using };
+                        retyped_any = true;
+                    }
+                    ColSource::FillDefault(fi) => {
+                        if let Some(od) = new_def.columns[fi].default_value.as_ref() {
+                            match cast_to(od.as_datum(), target, arena)
+                                .and_then(|v| apply_typmod(v, target, *type_mod, arena))
+                                .and_then(|v| crate::storage::OwnedDatum::from_datum(&v))
+                            {
+                                Ok(od) => new_def.columns[fi].default_value = Some(od),
+                                Err(e) => return sql_fail(e),
+                            }
+                        }
+                    }
+                }
+                new_def.columns[i].ctype = target;
+                new_def.columns[i].type_mod = *type_mod;
+            }
+            AlterAction::AddConstraint(constraint) => {
+                // Build the constraint into the new definition (u32::MAX sees
+                // all committed catalog, e.g. an FK's parent). CHECK/NOT NULL/FK
+                // are validated per rewritten image below; an added uniqueness
+                // constraint is validated across the rewritten images before
+                // anything is journaled.
+                if let Err(e) = crate::sql::exec::ddl::attach_constraints(
+                    storage,
+                    &mut new_def,
+                    core::slice::from_ref(constraint),
+                    u32::MAX,
+                    arena,
+                ) {
+                    return sql_fail(e);
+                }
+                if matches!(
+                    constraint,
+                    crate::sql::ast::TableConstraint::PrimaryKey { .. }
+                        | crate::sql::ast::TableConstraint::Unique { .. }
+                ) {
+                    has_added_unique = true;
+                }
+            }
+            AlterAction::DropConstraint { name, if_exists } => {
+                if !drop_named_constraint(&mut new_def, name) {
+                    if !*if_exists {
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "constraint \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            def.name.as_str()
+                        ));
+                    }
+                    // IF EXISTS: PostgreSQL emits a skip notice (SQLSTATE 00000).
+                    responder.notice(
+                        crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(
+                            160,
+                            "constraint \"{}\" of relation \"{}\" does not exist, skipping",
+                            name,
+                            def.name.as_str()
+                        )
+                        .as_str(),
+                    )?;
+                }
+            }
+            AlterAction::RenameConstraint { from, to } => {
+                // The new name must be free among this table's constraints.
+                let taken = new_def.checks[..new_def.n_checks].iter().any(|c| c.name.as_str() == *to)
+                    || new_def.uniques[..new_def.n_uniques].iter().any(|k| k.name.as_str() == *to)
+                    || new_def.fkeys[..new_def.n_fkeys].iter().any(|f| f.name.as_str() == *to);
+                if taken {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "constraint \"{}\" for relation \"{}\" already exists",
+                        to,
+                        def.name.as_str()
+                    ));
+                }
+                let new_name = match SqlName::parse(to) {
+                    Ok(n) => n,
+                    Err(e) => return sql_fail(e),
+                };
+                let renamed = new_def.checks[..new_def.n_checks]
+                    .iter_mut()
+                    .find(|c| c.name.as_str() == *from)
+                    .map(|c| c.name = new_name)
+                    .or_else(|| {
+                        new_def.uniques[..new_def.n_uniques]
+                            .iter_mut()
+                            .find(|k| k.name.as_str() == *from)
+                            .map(|k| k.name = new_name)
+                    })
+                    .or_else(|| {
+                        new_def.fkeys[..new_def.n_fkeys]
+                            .iter_mut()
+                            .find(|f| f.name.as_str() == *from)
+                            .map(|f| f.name = new_name)
+                    })
+                    .is_some();
+                // A single-column key on a column flag has a synthesized name;
+                // renaming it materializes the flag into a named key.
+                if !renamed {
+                    match rename_flag_key(&mut new_def, from, new_name) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return sql_fail(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "constraint \"{}\" for table \"{}\" does not exist",
+                                from,
+                                def.name.as_str()
+                            ))
+                        }
+                        Err(e) => return sql_fail(e),
+                    }
+                }
+            }
+        }
+    }
+
+    let has_rewrite = added_any || dropped_any || retyped_any;
+
+    let mut old_schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut old_schema);
+    let old_schema = &old_schema[..def.n_columns];
+
+    let mut new_schema = [ColType::Bool; MAX_COLUMNS];
+    new_def.schema(&mut new_schema);
+    let new_schema = &new_schema[..new_def.n_columns];
+
+    // When no row image changes (rename / constraint / default / drop-not-null /
+    // set-not-null over an unchanged column), the new definition — including its
+    // uniqueness — is validated against the stored rows, before anything is
+    // journaled. A rewrite validates each transformed image instead, below.
+    if !has_rewrite
+        && let Err(e) = validate_all_rows(storage, table_index, &new_def, arena)
+    {
+        return sql_fail(e);
+    }
+
+    // Phase 1: build every rewritten image and validate its content
+    // (NOT NULL / CHECK / foreign keys), all before any journaling, so a
+    // failure — a cast error included — leaves the table untouched.
+    let checks = match parse_checks(&new_def, arena) {
+        Ok(c) => c,
+        Err(e) => return sql_fail(e),
+    };
     for i in 0..scratch.len() {
         let (rowid, old_home) = scratch[i];
-        let new_loc = if rewrite {
-            // Build the new image in the statement arena so the heap
-            // borrow (decoded text refs) ends before the heap append.
+        let new_loc = if has_rewrite {
+            // Build the new image in the statement arena so the heap borrow
+            // (decoded text refs) ends before the heap append.
             let new_bytes: &[u8] = {
                 let old_bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
                     Ok(b) => b,
                     Err(e) => return sql_fail(e),
                 };
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                if let Err(e) = rowenc::decode(old_bytes, old_schema, &mut values) {
+                let mut old_values = [Datum::Null; MAX_COLUMNS];
+                if let Err(e) = rowenc::decode(old_bytes, old_schema, &mut old_values) {
                     return sql_fail(e);
                 }
                 let mut out = [Datum::Null; MAX_COLUMNS];
-                let n_out = new_def.n_columns;
-                if let Some((index, ref fill)) = added {
-                    out[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
-                    out[index] = *fill;
-                } else if let Some(d) = dropped {
-                    let mut w = 0;
-                    for (j, v) in values[..def.n_columns].iter().enumerate() {
-                        if j != d {
-                            out[w] = *v;
-                            w += 1;
-                        }
-                    }
-                } else if let Some((index, target, typmod, using)) = retyped {
-                    out[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
-                    // USING is evaluated with the old row's columns in scope;
-                    // otherwise the old value itself is the cast source.
-                    let source = match using {
-                        Some(expr) => {
-                            let ctx = RowCtx { def: &def, values: &values[..def.n_columns] };
-                            match eval(expr, arena, crate::sql::eval::NO_PARAMS, &ctx) {
+                for c in 0..new_def.n_columns {
+                    out[c] = match source[c] {
+                        ColSource::Keep(orig) => old_values[orig],
+                        ColSource::Cast { orig, target, type_mod, using } => {
+                            // USING is evaluated with the old row's columns in
+                            // scope; otherwise the old value is the cast source.
+                            let cast_source = match using {
+                                Some(expr) => {
+                                    let ctx = RowCtx { def: &def, values: &old_values[..def.n_columns] };
+                                    match eval(expr, arena, crate::sql::eval::NO_PARAMS, &ctx) {
+                                        Ok(v) => v,
+                                        Err(e) => return sql_fail(e),
+                                    }
+                                }
+                                None => old_values[orig],
+                            };
+                            match cast_to(cast_source, target, arena)
+                                .and_then(|v| apply_typmod(v, target, type_mod, arena))
+                            {
                                 Ok(v) => v,
                                 Err(e) => return sql_fail(e),
                             }
                         }
-                        None => values[index],
+                        ColSource::FillDefault(fi) => new_def.columns[fi]
+                            .default_value
+                            .as_ref()
+                            .map(|d| d.as_datum())
+                            .unwrap_or(Datum::Null),
                     };
-                    let new_val = match cast_to(source, target, arena)
-                        .and_then(|v| apply_typmod(v, target, typmod, arena))
-                    {
-                        Ok(v) => v,
-                        Err(e) => return sql_fail(e),
-                    };
-                    out[index] = new_val;
                 }
-                let len = rowenc::encoded_len(&out[..n_out]);
+                let values = &out[..new_def.n_columns];
+                if let Err(e) = crate::sql::exec::constraints::check_row_content(
+                    storage, &new_def, values, &checks, arena, &[], u32::MAX,
+                ) {
+                    return sql_fail(e);
+                }
+                let len = rowenc::encoded_len(values);
                 let buffer = match arena.alloc_slice_with(len, |_| 0u8) {
                     Ok(b) => b,
                     Err(_) => {
@@ -3017,7 +3094,7 @@ pub fn alter_table(
                         ))
                     }
                 };
-                rowenc::encode(&out[..n_out], buffer);
+                rowenc::encode(values, buffer);
                 &*buffer
             };
             let (loc, slice) = match storage.heap.append(new_bytes.len()) {
@@ -3055,6 +3132,61 @@ pub fn alter_table(
                 }
             }
         };
+        scratch[i] = (rowid, RowHome::Heap(new_loc));
+    }
+
+    // A uniqueness constraint added alongside a rewrite is validated across the
+    // transformed images now in the heap, before journaling — a cross-row check
+    // that cannot run against the stored (still old) rows. NULLs are distinct.
+    if has_rewrite && has_added_unique {
+        for a in 0..scratch.len() {
+            let RowHome::Heap(la) = scratch[a].1 else { unreachable!() };
+            let abytes = storage.heap.get(la);
+            let mut avals = [Datum::Null; MAX_COLUMNS];
+            if let Err(e) = rowenc::decode(abytes, new_schema, &mut avals) {
+                return sql_fail(e);
+            }
+            for b in (a + 1)..scratch.len() {
+                let RowHome::Heap(lb) = scratch[b].1 else { unreachable!() };
+                let bbytes = storage.heap.get(lb);
+                let mut bvals = [Datum::Null; MAX_COLUMNS];
+                if let Err(e) = rowenc::decode(bbytes, new_schema, &mut bvals) {
+                    return sql_fail(e);
+                }
+                if let Some(name) = rewritten_dup_name(
+                    &new_def,
+                    &avals[..new_def.n_columns],
+                    &bvals[..new_def.n_columns],
+                ) {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNIQUE_VIOLATION,
+                        "duplicate key value violates unique constraint \"{}\"",
+                        name.as_str()
+                    ));
+                }
+            }
+        }
+    }
+
+    // Phase 2: journal the shape change and the re-homed rows. Every fallible
+    // content step is already done; only WAL append can fail here, and it does
+    // so before any in-memory swap.
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(
+        lsn,
+        &WalOp::DropTable { schema: def.schema.as_str(), name: def.name.as_str() },
+    ) {
+        return sql_fail(e);
+    }
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(lsn, &WalOp::CreateTable(new_def)) {
+        return sql_fail(e);
+    }
+    for i in 0..scratch.len() {
+        let (rowid, new_home) = scratch[i];
+        let RowHome::Heap(new_loc) = new_home else {
+            unreachable!("phase 1 re-homes every row to the heap");
+        };
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
             lsn,
@@ -3067,12 +3199,10 @@ pub fn alter_table(
         ) {
             return sql_fail(e);
         }
-        scratch[i] = (rowid, RowHome::Heap(new_loc));
     }
 
-    // Phase 2: swap in memory. Nothing below can fail. Every row now has a
-    // heap image (the rewrite or the spilled-row copy above), so the old
-    // spill SST no longer serves this table.
+    // Phase 3: swap in memory. Nothing here can fail. Every row now has a heap
+    // image, so the old spill SST no longer serves this table.
     storage.set_table_def(table_index, new_def);
     for i in 0..scratch.len() {
         let (rowid, new_home) = scratch[i];
@@ -3084,6 +3214,12 @@ pub fn alter_table(
         state.committed = Some(new_home);
     }
     storage.set_spill_list(table_index, &[]);
+    // The column layout and/or constraint set changed and the rows were rehomed
+    // outside the per-row commit path, so rebuild this table's value indexes
+    // from the new committed image.
+    if let Err(e) = storage.refresh_enforcers(table_index) {
+        return sql_fail(e);
+    }
     responder.command_complete("ALTER TABLE")?;
     sql_ok()
 }
@@ -3094,6 +3230,41 @@ fn undefined_column(name: &str) -> SqlError {
         "column \"{}\" does not exist",
         name
     )
+}
+
+/// Renames a single-column UNIQUE/PRIMARY KEY that rides a column flag: when
+/// `from` is the flag's synthesized name (`<table>_pkey` / `<table>_<col>_key`),
+/// clears the flag and adds a named key with `new_name` so the constraint keeps
+/// its new name. Returns whether a flag key matched.
+fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<bool, SqlError> {
+    for i in 0..def.n_columns {
+        let col = def.columns[i];
+        if !(col.unique || col.primary) {
+            continue;
+        }
+        let synthesized = if col.primary {
+            stack_format!(128, "{}_pkey", def.name.as_str())
+        } else {
+            stack_format!(128, "{}_{}_key", def.name.as_str(), col.name.as_str())
+        };
+        if synthesized.as_str() == from {
+            let was_primary = col.primary;
+            def.columns[i].unique = false;
+            def.columns[i].primary = false;
+            let mut indices = [0u16; crate::storage::MAX_INDEX_COLS];
+            indices[0] = i as u16;
+            crate::sql::exec::ddl::add_unique_key(
+                def,
+                Some(new_name.as_str()),
+                if was_primary { "pkey" } else { "key" },
+                &indices,
+                1,
+                was_primary,
+            )?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -> Result<u64, SqlError> {

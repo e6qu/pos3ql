@@ -9,17 +9,214 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
-use crate::sql::eval::{compare_datums, eval, sqlstate, SqlError};
+use crate::sql::eval::{compare_datums, eval, hash_key, sqlstate, SqlError};
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{rowenc, Storage, TableDef, MAX_COLUMNS};
+use crate::storage::{rowenc, RowHome, Storage, TableDef, MAX_COLUMNS};
 
 use super::{check_not_null, RowCtx};
 
-/// Unique/PK enforcement: `values[col]` must not equal that column in any
-/// other visible row. Committed conflicts are 23505; a conflicting
-/// uncommitted row from another transaction fails fast with 40001.
+/// Names a uniqueness constraint for its 23505 message: a single-column flag
+/// synthesizes PostgreSQL's `<table>_pkey` / `<table>_<column>_key`, while a
+/// table-level key or index carries its stored name.
+enum ConstraintName<'a> {
+    PrimaryFlag,
+    UniqueFlag(&'a str),
+    Named(&'a str),
+}
+
+fn unique_violation(def: &TableDef, name: &ConstraintName) -> SqlError {
+    match name {
+        ConstraintName::PrimaryFlag => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"{}_pkey\"",
+            def.name.as_str()
+        ),
+        ConstraintName::UniqueFlag(column) => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"{}_{}_key\"",
+            def.name.as_str(),
+            column
+        ),
+        ConstraintName::Named(constraint) => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"{}\"",
+            constraint
+        ),
+    }
+}
+
+/// Whether the row `rowid`'s committed image has an all-non-NULL key over
+/// `columns` equal to `values` — the verification of an index probe candidate
+/// (and of a full-scan candidate) against the authoritative row bytes.
+fn committed_key_matches(
+    storage: &Storage,
+    table_index: usize,
+    schema: &[ColType],
+    columns: &[u16],
+    values: &[Datum],
+    rowid: u64,
+) -> Result<bool, SqlError> {
+    let Some(state) = storage.row_state(table_index, rowid)? else {
+        return Ok(false);
+    };
+    let Some(home) = state.committed else {
+        return Ok(false);
+    };
+    storage.with_row_bytes(table_index, rowid, home, |bytes| {
+        let mut other = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, schema, &mut other)?;
+        Ok(key_equal(columns, values, &other))
+    })
+}
+
+/// Whether every key column is non-NULL and equal between a candidate `values`
+/// tuple and a decoded `other` row (SQL treats a NULL key as distinct).
+fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> bool {
+    columns.iter().all(|&c| {
+        let i = c as usize;
+        !other[i].is_null()
+            && compare_datums(&values[i], &other[i]).map(|o| o.is_eq()).unwrap_or(false)
+    })
+}
+
+/// The shared uniqueness enforcement for one key (a single-column flag, a
+/// table-level key, or a unique index). Committed collisions raise 23505; a
+/// collision against another transaction's pending image raises 40001. The
+/// committed side is served by the value index when the table carries an
+/// enforcer for these columns (B-169's O(1) probe), falling back to a full scan
+/// otherwise; the pending side is always a bounded scan of the resident overlay
+/// (pending rows are never evicted). A NULL in any key column makes the
+/// candidate distinct.
+#[allow(clippy::too_many_arguments)]
+fn enforce_key_uniqueness(
+    storage: &Storage,
+    table_index: usize,
+    def: &TableDef,
+    schema: &[ColType],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    columns: &[u16],
+    name: &ConstraintName,
+) -> Result<(), SqlError> {
+    if columns.iter().any(|&c| values[c as usize].is_null()) {
+        return Ok(());
+    }
+
+    // A new key (an insert, not an update of the same row) past the enforcer's
+    // committed-row cap is a loud error: an in-RAM value index cannot grow.
+    if self_rowid.is_none() && storage.enforcer_at_capacity(table_index, columns) {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "table \"{}\" has reached its value-index row limit ({}); raise value_index_rows",
+            def.name.as_str(),
+            storage.value_index_cap()
+        ));
+    }
+
+    let hash = hash_key(values, columns);
+    let mut result: Result<(), SqlError> = Ok(());
+    let served = storage.probe_unique(table_index, columns, hash, |rowid| {
+        if result.is_err() || Some(rowid) == self_rowid {
+            return;
+        }
+        match committed_key_matches(storage, table_index, schema, columns, values, rowid) {
+            Ok(true) => result = Err(unique_violation(def, name)),
+            Ok(false) => {}
+            Err(e) => result = Err(e),
+        }
+    });
+    result?;
+    if !served {
+        committed_scan_uniqueness(storage, table_index, schema, columns, values, self_rowid, def, name)?;
+    }
+    pending_scan_uniqueness(storage, table_index, schema, columns, values, self_rowid, txid, def, name)
+}
+
+/// The committed-image fallback when a table has no value index for `columns`
+/// (an unindexed unique index, or before an enforcer is built): a full scan of
+/// committed rows, matching the value index's verdict.
+#[allow(clippy::too_many_arguments)]
+fn committed_scan_uniqueness(
+    storage: &Storage,
+    table_index: usize,
+    schema: &[ColType],
+    columns: &[u16],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    def: &TableDef,
+    name: &ConstraintName,
+) -> Result<(), SqlError> {
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        if Some(rowid) == self_rowid {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let Some(home) = state.committed else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            Ok(key_equal(columns, values, &other))
+        })?;
+        if matched {
+            return Err(unique_violation(def, name));
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(())
+}
+
+/// Checks a candidate against every resident pending image — the writes not yet
+/// committed. All pending rows stay in the overlay map (eviction only drops
+/// committed-spilled, pending-free entries), so this scan is bounded by the
+/// overlay, never the spilled dataset. A pending collision from another
+/// transaction is 40001; from this one, 23505.
+#[allow(clippy::too_many_arguments)]
+fn pending_scan_uniqueness(
+    storage: &Storage,
+    table_index: usize,
+    schema: &[ColType],
+    columns: &[u16],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    def: &TableDef,
+    name: &ConstraintName,
+) -> Result<(), SqlError> {
+    for (&rowid, state) in storage.table(table_index).rows.iter() {
+        if Some(rowid) == self_rowid {
+            continue;
+        }
+        let Some(pending) = state.pending else {
+            continue;
+        };
+        let Some(loc) = pending.loc else {
+            continue; // a pending delete has no key
+        };
+        let matched = storage.with_row_bytes(table_index, rowid, RowHome::Heap(loc), |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            Ok(key_equal(columns, values, &other))
+        })?;
+        if matched {
+            if pending.txid != txid {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "could not serialize access due to concurrent update"
+                ));
+            }
+            return Err(unique_violation(def, name));
+        }
+    }
+    Ok(())
+}
+
+/// Unique/PK enforcement for the single-column column flags: each `unique`
+/// column's value must not equal that column in any other visible row.
 pub fn check_unique(
     storage: &Storage,
     table_index: usize,
@@ -29,75 +226,27 @@ pub fn check_unique(
     self_rowid: Option<u64>,
     txid: u32,
 ) -> Result<(), SqlError> {
-    let any_unique = def.columns().iter().any(|c| c.unique);
-    if !any_unique {
-        return Ok(());
+    for (i, column) in def.columns().iter().enumerate() {
+        if !column.unique {
+            continue;
+        }
+        let name = if column.primary {
+            ConstraintName::PrimaryFlag
+        } else {
+            ConstraintName::UniqueFlag(column.name.as_str())
+        };
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            &[i as u16],
+            &name,
+        )?;
     }
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        if Some(rowid) == self_rowid {
-            return Ok(ControlFlow::Continue(()));
-        }
-        // Check both the committed image and any pending image: a commit
-        // of either would collide.
-        for (home, pending_of) in [
-            (state.committed, None),
-            (
-                state.pending.and_then(|p| p.loc).map(crate::storage::RowHome::Heap),
-                state.pending.map(|p| p.txid),
-            ),
-        ] {
-            let Some(home) = home else { continue };
-            // The decoded datums borrow the fetched bytes, so the comparison
-            // runs inside the fetch; only the colliding column index escapes.
-            let collision = storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut other = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut other)?;
-                for (i, c) in def.columns().iter().enumerate() {
-                    if !c.unique || values[i].is_null() || other[i].is_null() {
-                        continue;
-                    }
-                    if compare_datums(&values[i], &other[i])
-                        .map(|o| o.is_eq())
-                        .unwrap_or(false)
-                    {
-                        return Ok(Some(i));
-                    }
-                }
-                Ok(None)
-            })?;
-            if let Some(i) = collision {
-                if let Some(owner) = pending_of
-                    && owner != txid
-                {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                        "could not serialize access due to concurrent update"
-                    ));
-                }
-                let c = &def.columns()[i];
-                // PostgreSQL's auto-names: a primary key is `<table>_pkey`
-                // whatever column carries it; a unique column is
-                // `<table>_<column>_key` — the same names the catalog
-                // synthesizes for these constraints' indexes.
-                return Err(if c.primary {
-                    sql_err!(
-                        crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
-                        "duplicate key value violates unique constraint \"{}_pkey\"",
-                        def.name.as_str()
-                    )
-                } else {
-                    sql_err!(
-                        crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
-                        "duplicate key value violates unique constraint \"{}_{}_key\"",
-                        def.name.as_str(),
-                        c.name.as_str()
-                    )
-                });
-            }
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
     Ok(())
 }
 
@@ -120,8 +269,9 @@ pub fn check_all_unique(
 /// Enforces every UNIQUE index on the table: a candidate row conflicts if some
 /// other visible row has an equal, all-non-NULL tuple over the index columns
 /// (23505; a conflicting uncommitted row from another transaction is 40001).
-/// SQL treats NULLs as distinct, so a candidate with any NULL index column is
-/// never a conflict.
+/// A unique index carries no value index (B-169 scopes those to the PRIMARY KEY
+/// / UNIQUE constraints), so this always takes the full-scan fallback inside
+/// [`enforce_key_uniqueness`].
 #[allow(clippy::too_many_arguments)]
 pub fn check_unique_indexes(
     storage: &Storage,
@@ -134,15 +284,23 @@ pub fn check_unique_indexes(
 ) -> Result<(), SqlError> {
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         let icols = &index.columns[..index.n_cols];
-        tuple_uniqueness(
-            storage, table_index, schema, icols, values, self_rowid, txid, index.name.as_str(),
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            icols,
+            &ConstraintName::Named(index.name.as_str()),
         )?;
     }
     Ok(())
 }
 
 /// Enforces multi-column PRIMARY KEY / UNIQUE table constraints (single-column
-/// ones ride the column flags via [`check_unique`]).
+/// ones ride the column flags via [`check_unique`]), served by the value index.
 #[allow(clippy::too_many_arguments)]
 fn check_unique_keys(
     storage: &Storage,
@@ -154,73 +312,18 @@ fn check_unique_keys(
     txid: u32,
 ) -> Result<(), SqlError> {
     for uk in def.uniques() {
-        tuple_uniqueness(
-            storage, table_index, schema, uk.columns(), values, self_rowid, txid, uk.name.as_str(),
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            uk.columns(),
+            &ConstraintName::Named(uk.name.as_str()),
         )?;
     }
-    Ok(())
-}
-
-/// A candidate row conflicts if some other visible row has an equal,
-/// all-non-NULL tuple over `columns` (23505; 40001 if the conflicting row is
-/// another transaction's uncommitted write). A NULL in any key column of the
-/// candidate makes it distinct, never a conflict.
-#[allow(clippy::too_many_arguments)]
-fn tuple_uniqueness(
-    storage: &Storage,
-    table_index: usize,
-    schema: &[ColType],
-    columns: &[u16],
-    values: &[Datum],
-    self_rowid: Option<u64>,
-    txid: u32,
-    constraint_name: &str,
-) -> Result<(), SqlError> {
-    if columns.iter().any(|&c| values[c as usize].is_null()) {
-        return Ok(());
-    }
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        if Some(rowid) == self_rowid {
-            return Ok(ControlFlow::Continue(()));
-        }
-        for (home, pending_of) in [
-            (state.committed, None),
-            (
-                state.pending.and_then(|p| p.loc).map(crate::storage::RowHome::Heap),
-                state.pending.map(|p| p.txid),
-            ),
-        ] {
-            let Some(home) = home else { continue };
-            let all_eq = storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut other = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut other)?;
-                Ok(columns.iter().all(|&c| {
-                    let column_index = c as usize;
-                    !other[column_index].is_null()
-                        && compare_datums(&values[column_index], &other[column_index])
-                            .map(|o| o.is_eq())
-                            .unwrap_or(false)
-                }))
-            })?;
-            if all_eq {
-                if let Some(owner) = pending_of
-                    && owner != txid
-                {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                        "could not serialize access due to concurrent update"
-                    ));
-                }
-                return Err(sql_err!(
-                    crate::sql::eval::sqlstate::UNIQUE_VIOLATION,
-                    "duplicate key value violates unique constraint \"{}\"",
-                    constraint_name
-                ));
-            }
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
     Ok(())
 }
 
@@ -252,6 +355,28 @@ pub(crate) fn enforce_row_constraints(
     params: &[Datum],
 ) -> Result<(), SqlError> {
     check_all_unique(storage, table_index, def, schema, values, self_rowid, txid)?;
+    check_row_checks(def, checks, values, arena, params)?;
+    check_fk_child(storage, def, values, txid)?;
+    Ok(())
+}
+
+/// Validates a candidate row's *content* — NOT NULL, CHECK, and outbound
+/// foreign keys — without the uniqueness scan. ALTER's row rewrite uses this to
+/// validate freshly transformed images before any of them is journaled: the
+/// uniqueness of a rewritten column against the other rewritten rows can't be
+/// judged against storage (which still holds the old images), so it is checked
+/// separately once the new images are in place.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_row_content(
+    storage: &Storage,
+    def: &TableDef,
+    values: &[Datum],
+    checks: &ParsedChecks,
+    arena: &Arena,
+    params: &[Datum],
+    txid: u32,
+) -> Result<(), SqlError> {
+    check_not_null(def, values)?;
     check_row_checks(def, checks, values, arena, params)?;
     check_fk_child(storage, def, values, txid)?;
     Ok(())

@@ -124,8 +124,8 @@ use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build
 mod constraints;
 pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
 use constraints::{
-    apply_fk_parent_actions, enforce_row_constraints, parse_checks, referenced_key_changed,
-    table_is_referenced, ParsedChecks, MAX_FK_CASCADE_DEPTH,
+    apply_fk_parent_actions, enforce_row_constraints, parse_checks, parse_defaults,
+    referenced_key_changed, table_is_referenced, ParsedChecks, MAX_FK_CASCADE_DEPTH,
 };
 
 pub fn create_table(
@@ -1313,6 +1313,7 @@ pub fn create_table_as(
             primary: false,
             auto_increment: false,
             default_value: None,
+            default_expr: None,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -3101,6 +3102,10 @@ pub fn insert(
             }
         }
 
+        let default_exprs = match parse_defaults(&def, arena) {
+            Ok(d) => d,
+            Err(e) => return sql_fail(e),
+        };
         let mut inserted = 0u64;
         for bytes in rows_bytes.iter() {
             let n_src = bytes[0] as usize;
@@ -3113,11 +3118,6 @@ pub fn insert(
                 return sql_fail(sql_err!(sqlstate::SYNTAX_ERROR, "{}", msg));
             }
             let mut values = [Datum::Null; MAX_COLUMNS];
-            for (i, col) in def.columns().iter().enumerate() {
-                if let Some(d) = &col.default_value {
-                    values[i] = d.as_datum();
-                }
-            }
             let mut explicit = [false; MAX_COLUMNS];
             for i in 0..n_src {
                 let v = decode_projected_pub(bytes, i);
@@ -3127,6 +3127,37 @@ pub fn insert(
                     Err(e) => return sql_fail(e),
                 }
                 explicit[targets[i]] = true;
+            }
+            // Defaults for columns the query does not supply: a folded constant,
+            // or a per-row DEFAULT expression (evaluated under a scoped sequence
+            // evaluator, so a `nextval` default advances once per inserted row).
+            {
+                let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let hooks =
+                    super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+                for (i, col) in def.columns().iter().enumerate() {
+                    if explicit[i] {
+                        continue;
+                    }
+                    if let Some(d) = &col.default_value {
+                        values[i] = d.as_datum();
+                    } else if let Some(expr) = default_exprs[i] {
+                        let v = match super::eval::eval_full(
+                            expr,
+                            arena,
+                            crate::sql::eval::NO_PARAMS,
+                            &NoColumns,
+                            &hooks,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return sql_fail(e),
+                        };
+                        match coerce(v, col, arena) {
+                            Ok(v) => values[i] = v,
+                            Err(e) => return sql_fail(e),
+                        }
+                    }
+                }
             }
             if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
                 return sql_fail(e);
@@ -3174,6 +3205,12 @@ pub fn insert(
         return sql_ok();
     }
 
+    // Non-constant DEFAULT expressions (now(), nextval(...), …), re-parsed once
+    // and evaluated per row below.
+    let default_exprs = match parse_defaults(&def, arena) {
+        Ok(d) => d,
+        Err(e) => return sql_fail(e),
+    };
     let mut inserted = 0u64;
     for row_exprs in statement.rows {
         if row_exprs.len() > n_targets {
@@ -3182,24 +3219,25 @@ pub fn insert(
                 "INSERT has more expressions than target columns"
             ));
         }
-        // Every column starts at its default; explicit values overwrite.
-        // The datums borrow `def`, which outlives the row.
+        // A column is "explicit" when the row supplies a non-DEFAULT value for
+        // it; only the others take their default (so a supplied value does not
+        // waste a `nextval`). The datums borrow `def`, which outlives the row.
         let mut values = [Datum::Null; MAX_COLUMNS];
-        for (i, col) in def.columns().iter().enumerate() {
-            if let Some(d) = &col.default_value {
-                values[i] = d.as_datum();
+        let mut explicit = [false; MAX_COLUMNS];
+        for (i, expression) in row_exprs.iter().enumerate() {
+            if !matches!(expression, Expr::DefaultMarker) {
+                explicit[targets[i]] = true;
             }
         }
-        let mut explicit = [false; MAX_COLUMNS];
         {
-            // A per-row sequence evaluator (`nextval`/`setval` in the VALUES
-            // list advance once per row). Scoped so its shared `&storage` borrow
-            // ends before the row is written mutably below.
+            // A per-row sequence evaluator (`nextval`/`setval` in a VALUES item
+            // or a DEFAULT expression advance once per row). Scoped so its shared
+            // `&storage` borrow ends before the row is written mutably below.
             let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
             let hooks = super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
             for (i, expression) in row_exprs.iter().enumerate() {
                 if matches!(expression, Expr::DefaultMarker) {
-                    continue; // keep the default already in place
+                    continue; // filled from the default below
                 }
                 let v = match super::eval::eval_full(expression, arena, params, &NoColumns, &hooks) {
                     Ok(v) => v,
@@ -3210,7 +3248,30 @@ pub fn insert(
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
-                explicit[targets[i]] = true;
+            }
+            // Defaults for the columns the row did not set explicitly.
+            for (i, col) in def.columns().iter().enumerate() {
+                if explicit[i] {
+                    continue;
+                }
+                if let Some(d) = &col.default_value {
+                    values[i] = d.as_datum();
+                } else if let Some(expr) = default_exprs[i] {
+                    let v = match super::eval::eval_full(
+                        expr,
+                        arena,
+                        crate::sql::eval::NO_PARAMS,
+                        &NoColumns,
+                        &hooks,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => return sql_fail(e),
+                    };
+                    match coerce(v, col, arena) {
+                        Ok(v) => values[i] = v,
+                        Err(e) => return sql_fail(e),
+                    }
+                }
             }
         }
         if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
@@ -3992,12 +4053,14 @@ enum ColSource<'a> {
     FillDefault(usize),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
     scratch: &mut FixedVec<(u64, RowHome)>,
     statement: &AlterTable,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     // ALTER runs autocommitted, so resolution sees only the committed
@@ -4188,30 +4251,28 @@ pub fn alter_table(
                 new_def.n_columns -= 1;
                 dropped_any = true;
             }
-            AlterAction::SetDefault { column, value } => {
+            AlterAction::SetDefault { column, value, value_text } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
                 let ctype = new_def.columns[i].ctype;
                 let type_mod = new_def.columns[i].type_mod;
-                // The default is a constant expression, cast to the column's
-                // type and stored as its owned value — CREATE TABLE's path.
-                let owned = match eval(value, arena, crate::sql::eval::NO_PARAMS, &NoColumns)
-                    .map_err(|_| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "DEFAULT must be a constant expression"))
-                    .and_then(|v| cast_to(v, ctype, arena))
-                    .and_then(|v| apply_typmod(v, ctype, type_mod, arena))
-                    .and_then(|v| crate::storage::OwnedDatum::from_datum(&v))
-                {
-                    Ok(od) => od,
-                    Err(e) => return sql_fail(e),
-                };
-                new_def.columns[i].default_value = Some(owned);
+                // A literal-only default folds to a constant; a call-bearing one
+                // is stored as text and evaluated per row — CREATE TABLE's path.
+                let (default_value, default_expr) =
+                    match ddl::resolve_default(Some(value), Some(value_text), ctype, type_mod, arena) {
+                        Ok(d) => d,
+                        Err(e) => return sql_fail(e),
+                    };
+                new_def.columns[i].default_value = default_value;
+                new_def.columns[i].default_expr = default_expr;
             }
             AlterAction::DropDefault { column } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
                 new_def.columns[i].default_value = None;
+                new_def.columns[i].default_expr = None;
                 // Dropping a serial column's default detaches its auto-increment.
                 new_def.columns[i].auto_increment = false;
             }
@@ -4415,6 +4476,13 @@ pub fn alter_table(
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };
+    // Non-constant DEFAULTs of columns added by this ALTER: each existing row is
+    // backfilled by evaluating the default, so a `nextval` default consumes a
+    // value per existing row, exactly as PostgreSQL rewrites the table.
+    let new_defaults = match parse_defaults(&new_def, arena) {
+        Ok(d) => d,
+        Err(e) => return sql_fail(e),
+    };
     for i in 0..scratch.len() {
         let (rowid, old_home) = scratch[i];
         let new_loc = if has_rewrite {
@@ -4453,11 +4521,40 @@ pub fn alter_table(
                                 Err(e) => return sql_fail(e),
                             }
                         }
-                        ColSource::FillDefault(fi) => new_def.columns[fi]
-                            .default_value
-                            .as_ref()
-                            .map(|d| d.as_datum())
-                            .unwrap_or(Datum::Null),
+                        ColSource::FillDefault(fi) => {
+                            if let Some(d) = new_def.columns[fi].default_value.as_ref() {
+                                d.as_datum()
+                            } else if let Some(expr) = new_defaults[fi] {
+                                // Evaluate the non-constant default for this row
+                                // (advancing a `nextval` default once per row),
+                                // scoped so the borrow ends before the append.
+                                let seq = crate::sql::sequence::SeqEval::new(
+                                    storage,
+                                    seq_session,
+                                    u32::MAX,
+                                );
+                                let hooks = super::eval::EvalHooks {
+                                    sequences: Some(&seq),
+                                    ..super::eval::NO_HOOKS
+                                };
+                                let v = match super::eval::eval_full(
+                                    expr,
+                                    arena,
+                                    crate::sql::eval::NO_PARAMS,
+                                    &NoColumns,
+                                    &hooks,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => return sql_fail(e),
+                                };
+                                match coerce(v, &new_def.columns[fi], arena) {
+                                    Ok(v) => v,
+                                    Err(e) => return sql_fail(e),
+                                }
+                            } else {
+                                Datum::Null
+                            }
+                        }
                     };
                 }
                 let values = &out[..new_def.n_columns];

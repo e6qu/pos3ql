@@ -339,6 +339,24 @@ pub(crate) fn parse_checks<'a>(def: &'a TableDef, arena: &'a Arena) -> Result<Pa
     Ok(out)
 }
 
+/// A column's non-constant DEFAULT, re-parsed once per statement (indexed by
+/// column). `None` where the column has no default or a folded constant one.
+pub(crate) type ParsedDefaults<'a> = [Option<&'a Expr<'a>>; MAX_COLUMNS];
+
+/// Re-parses every stored non-constant DEFAULT expression once per statement.
+pub(crate) fn parse_defaults<'a>(
+    def: &'a TableDef,
+    arena: &'a Arena,
+) -> Result<ParsedDefaults<'a>, SqlError> {
+    let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
+    for (i, c) in def.columns().iter().enumerate() {
+        if let Some(text) = &c.default_expr {
+            out[i] = Some(crate::sql::parser::parse_expr(text.as_str(), arena)?);
+        }
+    }
+    Ok(out)
+}
+
 /// Enforces unique keys, CHECK predicates, and outbound foreign keys for one
 /// candidate row about to be stored.
 #[allow(clippy::too_many_arguments)]

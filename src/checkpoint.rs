@@ -816,7 +816,15 @@ impl Checkpointer {
                     let default_hex = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("col default missing"))?;
-                    let name = rest_of(line, 5)?;
+                    let dexpr_hex = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("col default_expr missing"))?;
+                    let default_expr = if dexpr_hex == "0" {
+                        None
+                    } else {
+                        Some(crate::util::StackStr::from_str(&decode_hex_name(dexpr_hex)?))
+                    };
+                    let name = rest_of(line, 6)?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -830,6 +838,7 @@ impl Checkpointer {
                         primary: not_null & 4 != 0,
                         auto_increment: not_null & 8 != 0,
                         default_value: default_from_hex(default_hex)?,
+                        default_expr,
                     };
                     *seen += 1;
                 }
@@ -1599,7 +1608,21 @@ Ok(CheckpointStep::Published { lsn })
                 )?;
             }
             for c in table.def.columns() {
+                use core::fmt::Write as _;
                 let default_hex = default_to_hex(&c.default_value);
+                // Non-constant DEFAULT text, hex-encoded (`0` sentinel = none),
+                // placed before the name (which may itself contain spaces).
+                let mut dexpr_hex = StackStr::<{ 2 * crate::storage::DEFAULT_EXPR_MAX + 1 }>::new();
+                match &c.default_expr {
+                    Some(e) => {
+                        for b in e.as_str().as_bytes() {
+                            let _ = write!(dexpr_hex, "{b:02x}");
+                        }
+                    }
+                    None => {
+                        let _ = write!(dexpr_hex, "0");
+                    }
+                }
                 let flags = u8::from(c.not_null)
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
@@ -1607,11 +1630,12 @@ Ok(CheckpointStep::Published { lsn })
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col {} {} {} {} {}",
+                        "col {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.type_mod,
                         default_hex.as_str(),
+                        dexpr_hex.as_str(),
                         c.name.as_str()
                     ),
                 )?;
@@ -2411,6 +2435,7 @@ fn empty_column() -> ColumnMeta {
         primary: false,
         auto_increment: false,
         default_value: None,
+        default_expr: None,
     }
 }
 

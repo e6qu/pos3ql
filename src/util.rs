@@ -27,6 +27,14 @@ impl<const N: usize> StackStr<N> {
         }
     }
 
+    /// Builds a `StackStr` from `s`, writing it in full. `is_truncated()` is set
+    /// if `s` did not fit.
+    pub fn from_str(s: &str) -> Self {
+        let mut out = Self::new();
+        let _ = core::fmt::Write::write_str(&mut out, s);
+        out
+    }
+
     pub fn as_str(&self) -> &str {
         // Only whole UTF-8 sequences are ever appended.
         unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.len]) }

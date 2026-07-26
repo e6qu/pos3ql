@@ -11,6 +11,7 @@ use crate::mem::arena::Arena;
 use crate::sql::ast::{ColumnDef, Expr, FkAction, QualName, TableConstraint};
 use crate::sql::eval::{cast_to, eval, sqlstate, NoColumns, SqlError};
 use crate::sql::types::ColType;
+use crate::util::StackStr;
 use crate::storage::{
     CheckConstraint, ColumnMeta, ForeignKey, OwnedDatum, SqlName, Storage, TableDef, UniqueKey,
     MAX_COLUMNS, MAX_INDEX_COLS,
@@ -56,6 +57,7 @@ fn empty_meta() -> ColumnMeta {
         primary: false,
         auto_increment: false,
         default_value: None,
+        default_expr: None,
     }
 }
 
@@ -69,20 +71,8 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
             c.type_name
         ));
     };
-    let default_value = match c.default {
-        None => None,
-        Some(expression) => {
-            let v = eval(expression, arena, crate::sql::eval::NO_PARAMS, &NoColumns).map_err(|_| {
-                sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "DEFAULT must be a constant expression"
-                )
-            })?;
-            let v = cast_to(v, ctype, arena)?;
-            let v = apply_typmod(v, ctype, c.type_mod, arena)?;
-            Some(OwnedDatum::from_datum(&v)?)
-        }
-    };
+    let (default_value, default_expr) =
+        resolve_default(c.default, c.default_text, ctype, c.type_mod, arena)?;
     // serial/bigserial/smallserial are int4/int8/int2 with an auto-increment
     // default and an implicit NOT NULL.
     let auto_increment = matches!(
@@ -98,7 +88,43 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
         primary: c.primary,
         auto_increment,
         default_value,
+        default_expr,
     })
+}
+
+/// Resolves a column DEFAULT into either a folded constant (`default_value`, for
+/// a literal-only expression — the fast insert path) or its raw source text
+/// (`default_expr`, re-evaluated per inserted row — for anything with a function
+/// call, so `now()`/`nextval(...)` behave as PostgreSQL requires). Exactly one
+/// of the two is `Some` when a default is present.
+pub(super) fn resolve_default(
+    default: Option<&Expr>,
+    default_text: Option<&str>,
+    ctype: ColType,
+    type_mod: i32,
+    arena: &Arena,
+) -> Result<(Option<OwnedDatum>, Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>), SqlError> {
+    let Some(expression) = default else {
+        return Ok((None, None));
+    };
+    // A literal-only default folds to a constant now; anything volatile or
+    // stable (any function call) is kept as text and evaluated at insert time.
+    if !expression.contains_call() {
+        let v = eval(expression, arena, crate::sql::eval::NO_PARAMS, &NoColumns)?;
+        let v = cast_to(v, ctype, arena)?;
+        let v = apply_typmod(v, ctype, type_mod, arena)?;
+        return Ok((Some(OwnedDatum::from_datum(&v)?), None));
+    }
+    let text = default_text.unwrap_or("");
+    let stored = StackStr::from_str(text);
+    if stored.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "DEFAULT expression exceeds {} bytes",
+            crate::storage::DEFAULT_EXPR_MAX
+        ));
+    }
+    Ok((None, Some(stored)))
 }
 
 fn fk_action_of(a: FkAction) -> crate::storage::FkAction {

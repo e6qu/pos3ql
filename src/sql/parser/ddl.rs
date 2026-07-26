@@ -453,7 +453,7 @@ impl<'a> Parser<'a> {
             // Otherwise it is a column definition whose name we already read.
             pending_first_col = Some(first_ident);
         }
-        let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None }; MAX_LIST];
+        let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None, default_text: None }; MAX_LIST];
         let mut n = 0;
         let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
         let mut n_cons = 0;
@@ -525,6 +525,7 @@ impl<'a> Parser<'a> {
             let mut unique = false;
             let mut primary = false;
             let mut default = None;
+            let mut default_text = None;
             loop {
                 // Column-level constraints may carry their own CONSTRAINT name.
                 let col_cons_name = if self.eat_ident("constraint")? {
@@ -538,7 +539,9 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("null")? {
                     not_null = false;
                 } else if self.eat_ident("default")? {
+                    let start = self.peek_at;
                     default = Some(self.expression(0)?);
+                    default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("unique")? {
                     // An explicitly named single-column UNIQUE desugars to a
                     // table constraint so the name is retained; an unnamed one
@@ -599,7 +602,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            columns[n] = ColumnDef { name: col_name, type_name, type_mod, not_null, unique, primary, default };
+            columns[n] = ColumnDef { name: col_name, type_name, type_mod, not_null, unique, primary, default, default_text };
             n += 1;
             if !self.eat_op(",")? {
                 break;

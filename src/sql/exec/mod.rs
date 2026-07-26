@@ -3118,6 +3118,475 @@ fn reject_generated_write(def: &TableDef, column: usize) -> Result<(), SqlError>
     Ok(())
 }
 
+/// A two-table column lookup for MERGE's ON / WHEN-condition / SET expressions:
+/// a qualified name resolves to the target or source half; an unqualified name
+/// searches both (ambiguous if in both, 42702).
+struct MergeLookup<'d, 'v> {
+    target_def: &'d TableDef,
+    target_alias: &'d str,
+    target: &'v [Datum<'v>],
+    source_def: &'d TableDef,
+    source_alias: &'d str,
+    source: &'v [Datum<'v>],
+}
+
+impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        match qualifier {
+            Some(q) if q == self.target_alias => self
+                .target_def
+                .column_index(name)
+                .map(|i| self.target[i])
+                .ok_or_else(|| undefined_column(name)),
+            Some(q) if q == self.source_alias => self
+                .source_def
+                .column_index(name)
+                .map(|i| self.source[i])
+                .ok_or_else(|| undefined_column(name)),
+            Some(q) => Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                q
+            )),
+            None => match (
+                self.target_def.column_index(name),
+                self.source_def.column_index(name),
+            ) {
+                (Some(_), Some(_)) => Err(sql_err!(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    "column reference \"{}\" is ambiguous",
+                    name
+                )),
+                (Some(i), None) => Ok(self.target[i]),
+                (None, Some(i)) => Ok(self.source[i]),
+                (None, None) => Err(undefined_column(name)),
+            },
+        }
+    }
+}
+
+/// `MERGE INTO target USING source ON cond WHEN ...`. Source-driven: each source
+/// row is matched against the target on `cond`; a match applies the first
+/// satisfied WHEN MATCHED clause, a miss the first WHEN NOT MATCHED clause. A
+/// target row affected twice is a cardinality error (21000).
+#[allow(clippy::too_many_arguments)]
+pub fn merge(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    _scratch: &mut FixedVec<(u64, RowHome)>,
+    statement: &crate::sql::ast::Merge,
+    arena: &Arena,
+    params: &[Datum],
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::MergeAction;
+    let target_qual = crate::sql::ast::QualName {
+        schema: statement.target.schema,
+        name: statement.target.name,
+    };
+    let table_index = match resolve_dml_table(storage, &target_qual, txn.txid) {
+        Ok(i) => i,
+        Err(e) => return sql_fail(e),
+    };
+    let def = storage.table(table_index).def;
+    let target_alias = statement.target_alias.unwrap_or(statement.target.name);
+    let source_alias = statement
+        .source
+        .alias
+        .unwrap_or(if statement.source.table.is_empty() { "" } else { statement.source.table });
+
+    // Materialize the source as `SELECT * FROM <source>`: its column set (a
+    // synthesized def) and its rows.
+    let source_from = crate::sql::ast::FromClause { base: statement.source, joins: &[] };
+    let star = match arena.alloc_slice_copy(&[SelectItem::Wildcard]) {
+        Ok(s) => &*s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let source_select = crate::sql::ast::Select {
+        items: star,
+        distinct: false,
+        distinct_on: &[],
+        from: Some(source_from),
+        where_clause: None,
+        group_by: &[],
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with: &[],
+        set_body: None,
+    };
+    // Copy the synthesized def out of the borrow (it is tied to `storage`),
+    // so the write path below can borrow storage mutably.
+    let source_def = match super::query::synth_derived_def(
+        storage,
+        &source_select,
+        source_alias,
+        statement.source.col_alias,
+        txn.txid,
+        arena,
+    ) {
+        Ok(d) => *d,
+        Err(e) => return sql_fail(e),
+    };
+    let source_def = &source_def;
+    // Pass 1: count source rows. Pass 2: encode each to arena bytes.
+    let mut n_source = 0usize;
+    if let Err(e) = super::query::select_into_rows(
+        storage, txn.txid, &source_select, arena, params, None, None, &mut |_| {
+            n_source += 1;
+            Ok(())
+        },
+    ) {
+        return sql_fail(e);
+    }
+    let empty: &[u8] = &[];
+    let source_rows: &mut [&[u8]] = match arena.alloc_slice_with(n_source, |_| empty) {
+        Ok(r) => r,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    {
+        let mut at = 0usize;
+        if let Err(e) = super::query::select_into_rows(
+            storage, txn.txid, &source_select, arena, params, None, None, &mut |vals| {
+                source_rows[at] = encode_projected_pub(vals, arena)?;
+                at += 1;
+                Ok(())
+            },
+        ) {
+            return sql_fail(e);
+        }
+    }
+
+    // Collect the target rows once (rowid + decoded values), plus an affected
+    // flag per row for the cardinality check.
+    let mut target_schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut target_schema);
+    let target_schema = &target_schema[..def.n_columns];
+    let n_target = match storage.visible_row_count(table_index, txn.txid) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    let target_ids: &mut [u64] = match arena.alloc_slice_with(n_target, |_| 0u64) {
+        Ok(s) => s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let target_vals: &mut [&[Datum]] = match arena.alloc_slice_with(n_target, |_| &[][..]) {
+        Ok(s) => s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let affected: &mut [bool] = match arena.alloc_slice_with(n_target, |_| false) {
+        Ok(s) => s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    {
+        use core::ops::ControlFlow;
+        // Snapshot rowid + home first (the closure cannot borrow the arena while
+        // `storage` is borrowed), then decode.
+        let placeholder = crate::storage::RowHome::Spilled { len: 0, sst: 0 };
+        let ids: &mut [u64] = target_ids;
+        let hms: &mut [crate::storage::RowHome] =
+            match arena.alloc_slice_with(n_target, |_| placeholder) {
+                Ok(s) => s,
+                Err(_) => return sql_fail(super::query::arena_full_pub()),
+            };
+        let mut k = 0usize;
+        if let Err(e) = storage.for_each_row_state(table_index, &mut |rowid, state| {
+            if let Some(home) = state.visible_to(txn.txid)
+                && k < ids.len()
+            {
+                ids[k] = rowid;
+                hms[k] = home;
+                k += 1;
+            }
+            Ok(ControlFlow::Continue(()))
+        }) {
+            return sql_fail(e);
+        }
+        for j in 0..k {
+            let fetched = match storage.row_bytes(table_index, ids[j], hms[j], arena) {
+                Ok(b) => b,
+                Err(e) => return sql_fail(e),
+            };
+            // Copy into the arena so the decoded datums do not borrow storage
+            // (the write path below borrows it mutably).
+            let bytes = match arena.alloc_slice_copy(fetched) {
+                Ok(b) => &*b,
+                Err(_) => return sql_fail(super::query::arena_full_pub()),
+            };
+            let mut vals = [Datum::Null; MAX_COLUMNS];
+            if let Err(e) = rowenc::decode(bytes, target_schema, &mut vals) {
+                return sql_fail(e);
+            }
+            let owned = match arena.alloc_slice_copy(&vals[..def.n_columns]) {
+                Ok(v) => &*v,
+                Err(_) => return sql_fail(super::query::arena_full_pub()),
+            };
+            target_vals[j] = owned;
+        }
+    }
+
+    let checks = match parse_checks(&def, arena) {
+        Ok(c) => c,
+        Err(e) => return sql_fail(e),
+    };
+    let generated = match parse_generated(&def, arena) {
+        Ok(g) => g,
+        Err(e) => return sql_fail(e),
+    };
+    let defaults = match parse_defaults(&def, arena) {
+        Ok(d) => d,
+        Err(e) => return sql_fail(e),
+    };
+
+    let mut affected_count = 0u64;
+    for sbytes in source_rows.iter() {
+        let n_src_cols = sbytes[0] as usize;
+        let mut sv = [Datum::Null; MAX_COLUMNS];
+        for (c, slot) in sv.iter_mut().enumerate().take(n_src_cols) {
+            *slot = decode_projected_pub(sbytes, c);
+        }
+        let sv = &sv[..source_def.n_columns.min(n_src_cols)];
+        let mut matched = false;
+        for j in 0..n_target {
+            let lookup = MergeLookup {
+                target_def: &def,
+                target_alias,
+                target: target_vals[j],
+                source_def,
+                source_alias,
+                source: sv,
+            };
+            match eval(statement.on, arena, params, &lookup) {
+                Ok(Datum::Bool(true)) => {}
+                Ok(_) => continue,
+                Err(e) => return sql_fail(e),
+            }
+            matched = true;
+            // First satisfied WHEN MATCHED clause.
+            for when in statement.whens.iter().filter(|w| w.matched) {
+                if let Some(cond) = when.cond {
+                    match eval(cond, arena, params, &lookup) {
+                        Ok(Datum::Bool(true)) => {}
+                        Ok(_) => continue,
+                        Err(e) => return sql_fail(e),
+                    }
+                }
+                match &when.action {
+                    MergeAction::DoNothing => {}
+                    MergeAction::Delete => {
+                        if affected[j] {
+                            return sql_fail(merge_cardinality());
+                        }
+                        affected[j] = true;
+                        match storage.write_pending(table_index, target_ids[j], txn.txid, None) {
+                            Ok(prior) => {
+                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior) {
+                                    return sql_fail(e);
+                                }
+                            }
+                            Err(e) => return sql_fail(e),
+                        }
+                        affected_count += 1;
+                    }
+                    MergeAction::Update(assignments) => {
+                        if affected[j] {
+                            return sql_fail(merge_cardinality());
+                        }
+                        let mut new_values = [Datum::Null; MAX_COLUMNS];
+                        new_values[..def.n_columns].copy_from_slice(target_vals[j]);
+                        for (name, expression) in assignments.iter() {
+                            let Some(ci) = def.column_index(name) else {
+                                return sql_fail(undefined_column(name));
+                            };
+                            let v = match eval(expression, arena, params, &lookup) {
+                                Ok(v) => v,
+                                Err(e) => return sql_fail(e),
+                            };
+                            match coerce(v, &def.columns()[ci], arena) {
+                                Ok(v) => new_values[ci] = v,
+                                Err(e) => return sql_fail(e),
+                            }
+                        }
+                        if let Err(e) = compute_generated(&def, &generated, &mut new_values, arena) {
+                            return sql_fail(e);
+                        }
+                        if let Err(e) = check_not_null(&def, &new_values) {
+                            return sql_fail(e);
+                        }
+                        if let Err(e) = enforce_row_constraints(
+                            storage, table_index, &def, target_schema,
+                            &new_values[..def.n_columns], Some(target_ids[j]), txn.txid,
+                            &checks, arena, params,
+                        ) {
+                            return sql_fail(e);
+                        }
+                        let len = rowenc::encoded_len(&new_values[..def.n_columns]);
+                        let out = match arena.alloc_slice_with(len, |_| 0u8) {
+                            Ok(o) => o,
+                            Err(_) => return sql_fail(super::query::arena_full_pub()),
+                        };
+                        rowenc::encode(&new_values[..def.n_columns], out);
+                        let (loc, slice) = match storage.heap.append(out.len()) {
+                            Ok(x) => x,
+                            Err(e) => return sql_fail(e),
+                        };
+                        slice.copy_from_slice(out);
+                        match storage.write_pending(table_index, target_ids[j], txn.txid, Some(loc)) {
+                            Ok(prior) => {
+                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior) {
+                                    storage.restore_pending(table_index, target_ids[j], txn.txid, prior);
+                                    return sql_fail(e);
+                                }
+                            }
+                            Err(e) => return sql_fail(e),
+                        }
+                        affected[j] = true;
+                        affected_count += 1;
+                    }
+                    MergeAction::Insert { .. } => {
+                        return sql_fail(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "INSERT is not allowed in a WHEN MATCHED clause"
+                        ));
+                    }
+                }
+                break;
+            }
+        }
+        if !matched {
+            // First satisfied WHEN NOT MATCHED clause (source columns only).
+            let source_ctx = RowCtx { def: source_def, values: sv };
+            for when in statement.whens.iter().filter(|w| !w.matched) {
+                if let Some(cond) = when.cond {
+                    match eval(cond, arena, params, &source_ctx) {
+                        Ok(Datum::Bool(true)) => {}
+                        Ok(_) => continue,
+                        Err(e) => return sql_fail(e),
+                    }
+                }
+                match &when.action {
+                    MergeAction::DoNothing => {}
+                    MergeAction::Insert { columns, values, default_values } => {
+                        if let Err(e) = merge_insert(
+                            storage, txn, table_index, &def, columns, values, *default_values,
+                            &source_ctx, &generated, &defaults, seq_session, arena, params, &checks,
+                        ) {
+                            return sql_fail(e);
+                        }
+                        affected_count += 1;
+                    }
+                    _ => {
+                        return sql_fail(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "only INSERT / DO NOTHING is allowed in a WHEN NOT MATCHED clause"
+                        ));
+                    }
+                }
+                break;
+            }
+        }
+    }
+    responder.command_complete(stack_format!(32, "MERGE {}", affected_count).as_str())?;
+    sql_ok()
+}
+
+/// The 21000 error PostgreSQL raises when a MERGE would affect a target row a
+/// second time.
+fn merge_cardinality() -> SqlError {
+    sql_err!(
+        sqlstate::CARDINALITY_VIOLATION,
+        "MERGE command cannot affect row a second time"
+    )
+}
+
+/// Applies a MERGE `WHEN NOT MATCHED THEN INSERT`: builds the row from the
+/// clause (values evaluated with the source row in scope), fills defaults and
+/// generated columns, and stores it.
+#[allow(clippy::too_many_arguments)]
+fn merge_insert(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    table_index: usize,
+    def: &TableDef,
+    columns: &[&str],
+    values: &[&Expr],
+    default_values: bool,
+    source_ctx: &RowCtx,
+    generated: &constraints::ParsedDefaults,
+    defaults: &constraints::ParsedDefaults,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &Arena,
+    params: &[Datum],
+    checks: &ParsedChecks,
+) -> Result<(), SqlError> {
+    // Target columns for the supplied values: the named list, or all columns.
+    let mut targets = [0usize; MAX_COLUMNS];
+    let n_targets = if columns.is_empty() {
+        for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
+            *t = i;
+        }
+        def.n_columns
+    } else {
+        for (i, name) in columns.iter().enumerate() {
+            let Some(ci) = def.column_index(name) else {
+                return Err(undefined_column(name));
+            };
+            targets[i] = ci;
+        }
+        columns.len()
+    };
+    let mut row = [Datum::Null; MAX_COLUMNS];
+    let mut explicit = [false; MAX_COLUMNS];
+    if !default_values {
+        if values.len() != n_targets {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "MERGE INSERT has {} expressions but {} target columns",
+                values.len(),
+                n_targets
+            ));
+        }
+        let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+        let hooks = super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+        for (i, expression) in values.iter().enumerate() {
+            reject_generated_write(def, targets[i])?;
+            let v = super::eval::eval_full(expression, arena, params, source_ctx, &hooks)?;
+            row[targets[i]] = coerce(v, &def.columns()[targets[i]], arena)?;
+            explicit[targets[i]] = true;
+        }
+    }
+    // Defaults + auto-increment + generated for the unset columns.
+    {
+        let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+        let hooks = super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+        for (i, col) in def.columns().iter().enumerate() {
+            if explicit[i] {
+                continue;
+            }
+            if let Some(d) = &col.default_value {
+                row[i] = d.as_datum();
+            } else if let Some(expr) = defaults[i] {
+                let v = super::eval::eval_full(expr, arena, crate::sql::eval::NO_PARAMS, &NoColumns, &hooks)?;
+                row[i] = coerce(v, col, arena)?;
+            }
+        }
+    }
+    fill_auto_increment(storage, table_index, def, &mut row, &explicit)?;
+    let mut row_arr = row;
+    compute_generated(def, generated, &mut row_arr, arena)?;
+    check_not_null(def, &row_arr)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    enforce_row_constraints(
+        storage, table_index, def, &schema[..def.n_columns],
+        &row_arr[..def.n_columns], None, txn.txid, checks, arena, params,
+    )?;
+    store_row(storage, txn, table_index, None, &row_arr[..def.n_columns])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn insert(
     storage: &mut Storage,

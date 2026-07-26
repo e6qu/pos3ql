@@ -300,7 +300,7 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
 /// Synthesizes a `TableDef` for a derived table (`FROM (SELECT ...) exposed`)
 /// from the subquery's output column names and inferred types. Schema only —
 /// no rows are produced, so it needs neither a txid nor bound parameters.
-pub(super) fn synth_derived_def<'a>(
+pub(crate) fn synth_derived_def<'a>(
     storage: &'a Storage,
     sub: &'a Select<'a>,
     exposed: &'a str,

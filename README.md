@@ -50,8 +50,8 @@ Working single-node database:
 - SQL: DDL (CREATE/DROP TABLE, CREATE TABLE AS, CREATE/DROP VIEW,
   CREATE/REFRESH/DROP MATERIALIZED VIEW, CREATE/ALTER/DROP SEQUENCE
   (nextval/currval/lastval/setval), CREATE/DROP INDEX),
-  INSERT/SELECT/UPDATE/DELETE with WHERE / ORDER BY (PostgreSQL null ordering)
-  / LIMIT, joins, GROUP BY and aggregates, subqueries (correlated + EXISTS),
+  INSERT/SELECT/UPDATE/DELETE/MERGE with WHERE / ORDER BY (PostgreSQL null
+  ordering) / LIMIT, joins, GROUP BY and aggregates, subqueries (correlated + EXISTS),
   non-recursive CTEs, updatable views, constant and expression column DEFAULTs
   (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row), generated columns
   (`GENERATED ALWAYS AS (expr) STORED`), identity columns

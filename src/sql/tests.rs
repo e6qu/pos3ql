@@ -1704,6 +1704,34 @@ fn identity_survives_restart() {
 }
 
 #[test]
+fn merge_statement() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE tgt (id int PRIMARY KEY, v text, n int)");
+    run_with(&mut e, &mut b, "INSERT INTO tgt VALUES (1,'a',10),(2,'b',20),(3,'c',30)");
+    run_with(&mut e, &mut b, "CREATE TABLE src (id int, v text)");
+    run_with(&mut e, &mut b, "INSERT INTO src VALUES (2,'B'),(3,'C'),(4,'D'),(5,'E')");
+    let out = run_with(&mut e, &mut b,
+        "MERGE INTO tgt t USING src s ON t.id = s.id \
+         WHEN MATCHED AND s.id = 3 THEN DELETE \
+         WHEN MATCHED THEN UPDATE SET v = s.v, n = t.n + 1 \
+         WHEN NOT MATCHED AND s.id = 5 THEN DO NOTHING \
+         WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, s.v, 0)");
+    assert!(String::from_utf8_lossy(&out).contains("MERGE 3"));
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id, v, n FROM tgt ORDER BY id")),
+        ["1|a|10", "2|B|21", "4|D|0"]
+    );
+    // Cardinality: a target row matched by two source rows → 21000.
+    run_with(&mut e, &mut b, "INSERT INTO src VALUES (2,'dup')");
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b,
+        "MERGE INTO tgt t USING src s ON t.id=s.id WHEN MATCHED THEN UPDATE SET v=s.v"))
+        .contains("21000"));
+    // VALUES source.
+    run_with(&mut e, &mut b, "MERGE INTO tgt t USING (VALUES (10,'x')) s(id,v) ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,v,n) VALUES (s.id, s.v, 99)");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT v, n FROM tgt WHERE id=10")), ["x|99"]);
+}
+
+#[test]
 fn sql_surface_batch() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE s (id int, name text DEFAULT 'x', qty int DEFAULT 3)");

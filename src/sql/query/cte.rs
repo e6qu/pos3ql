@@ -191,6 +191,7 @@ fn wrap_set_tree_with<'a>(
         order_by: &[],
         limit: None,
         offset: None,
+        with_ties: false,
         with,
         set_body: Some(tree),
     };
@@ -394,6 +395,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         order_by: &[],
         limit: None,
         offset: None,
+        with_ties: false,
         with: &[],
         set_body: Some(tree),
     };
@@ -609,6 +611,7 @@ fn subst_select<'a>(
         order_by,
         limit: opt_subst(s.limit, context, arena)?,
         offset: opt_subst(s.offset, context, arena)?,
+        with_ties: s.with_ties,
         with: &[],
         set_body,
     };

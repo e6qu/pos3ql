@@ -1039,6 +1039,20 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   variants + WAL/manifest default codec). Verified byte-for-byte against
   PostgreSQL 18 (corpus `60_network`), with restart-durability unit tests and a
   `run.sh` crash-recovery assertion. No known gaps.
+- **`FETCH FIRST` / `OFFSET FETCH` + `WITH TIES`** — done: the SQL-standard
+  spelling of LIMIT/OFFSET (`FETCH { FIRST | NEXT } [count] { ROW | ROWS }
+  { ONLY | WITH TIES }`, the count defaulting to 1), and the `WITH TIES`
+  modifier — after the row limit, also return every row tying with the last on
+  the `ORDER BY` keys. Parsed as part of the `ORDER BY`/`LIMIT`/`OFFSET` tail
+  (with a `with_ties` flag on `Select`/`SetQuery`); `WITH TIES` without
+  `ORDER BY` is 42601, as PostgreSQL requires. The tie extension runs at every
+  sorted-and-limited execution path — plain (`materialized_select`), grouped
+  (`grouped_select`), set-operation (`set_query`), and the FROM-less
+  set-returning path — sharing one `extend_ties` helper that walks past the
+  limit while the hidden ORDER BY key columns (the set-op path compares its
+  output columns) still tie, NULLs equal. Verified byte-for-byte against
+  PostgreSQL 18 (corpus `61_fetch_ties`), covering every path plus multi-key
+  ties and OFFSET composition.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

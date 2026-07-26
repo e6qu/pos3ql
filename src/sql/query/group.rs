@@ -564,11 +564,15 @@ pub(super) fn grouped_select<'a>(
         Ok(x) => x,
         Err(e) => return sql_fail(e),
     };
+    let start = (offset as usize).min(out_rows.len());
+    let mut end = offset.saturating_add(limit).min(out_rows.len() as u64) as usize;
+    // FETCH FIRST ... WITH TIES: extend past the limit while rows tie with the
+    // last on the ORDER BY keys (hidden columns after `width`).
+    if statement.with_ties && limit > 0 {
+        end = super::materialize::extend_ties(out_rows, width, statement.order_by.len(), end);
+    }
     let mut emitted = 0u64;
-    for row in out_rows.iter().skip(offset as usize) {
-        if emitted >= limit {
-            break;
-        }
+    for row in &out_rows[start..end] {
         let mut out = [Datum::Null; MAX_PROJ];
         for (i, slot) in out.iter_mut().take(width).enumerate() {
             *slot = crate::sql::exec::decode_projected_pub(row, i);

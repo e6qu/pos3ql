@@ -793,6 +793,7 @@ impl<'a> Parser<'a> {
             order_by: &[],
             limit: None,
             offset: None,
+            with_ties: false,
             with: &[],
             set_body: None,
         })
@@ -845,9 +846,11 @@ impl<'a> Parser<'a> {
 
     /// Trailing ORDER BY / LIMIT / OFFSET (any may be absent).
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     fn order_limit(
         &mut self,
-    ) -> Result<(&'a [OrderBy<'a>], Option<&'a Expr<'a>>, Option<&'a Expr<'a>>), ParseError> {
+    ) -> Result<(&'a [OrderBy<'a>], Option<&'a Expr<'a>>, Option<&'a Expr<'a>>, bool), ParseError>
+    {
         let mut order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false }; MAX_LIST];
         let mut n_order = 0;
         if self.eat_ident("order")? {
@@ -886,6 +889,7 @@ impl<'a> Parser<'a> {
         // LIMIT and OFFSET accept either order, as in PostgreSQL.
         let mut limit = None;
         let mut offset = None;
+        let mut with_ties = false;
         loop {
             if limit.is_none() && self.eat_ident("limit")? {
                 // `LIMIT ALL` is the standard spelling of "no limit"; it leaves
@@ -898,11 +902,35 @@ impl<'a> Parser<'a> {
                 offset = Some(self.expression(0)?);
                 // Accept the noise words ROW/ROWS.
                 let _ = self.eat_ident("rows")? || self.eat_ident("row")?;
+            } else if limit.is_none() && self.eat_ident("fetch")? {
+                // `FETCH { FIRST | NEXT } [count] { ROW | ROWS } { ONLY | WITH
+                // TIES }` — the SQL-standard spelling of LIMIT. The count
+                // defaults to 1 when omitted.
+                if !self.eat_ident("first")? {
+                    self.expect_ident("next")?;
+                }
+                if self.eat_ident("row")? || self.eat_ident("rows")? {
+                    limit = Some(&Expr::Int(1));
+                } else {
+                    limit = Some(self.expression(0)?);
+                    if !(self.eat_ident("rows")? || self.eat_ident("row")?) {
+                        return Err(self.err_here("expected ROW or ROWS after FETCH count"));
+                    }
+                }
+                if self.eat_ident("with")? {
+                    self.expect_ident("ties")?;
+                    with_ties = true;
+                } else {
+                    self.expect_ident("only")?;
+                }
             } else {
                 break;
             }
         }
-        Ok((order_by, limit, offset))
+        if with_ties && order_by.is_empty() {
+            return Err(self.err_here("WITH TIES cannot be specified without ORDER BY clause"));
+        }
+        Ok((order_by, limit, offset, with_ties))
     }
 
     /// A subquery body: a set-operation tree of SELECTs, then the trailing
@@ -914,13 +942,14 @@ impl<'a> Parser<'a> {
         // nested SELECT's named windows stop being visible.
         let enclosing_windows = (self.windows, self.n_windows);
         let body = self.set_union()?;
-        let (order_by, limit, offset) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties) = self.order_limit()?;
         (self.windows, self.n_windows) = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
             sel.order_by = order_by;
             sel.limit = limit;
             sel.offset = offset;
+            sel.with_ties = with_ties;
             return Ok(sel);
         }
         Ok(Select {
@@ -935,6 +964,7 @@ impl<'a> Parser<'a> {
             order_by,
             limit,
             offset,
+            with_ties,
             with: &[],
             set_body: Some(body),
         })
@@ -961,6 +991,7 @@ impl<'a> Parser<'a> {
                 order_by: &[],
                 limit: None,
                 offset: None,
+                with_ties: false,
                 with: &[],
                 set_body: None,
             })
@@ -1005,16 +1036,17 @@ impl<'a> Parser<'a> {
     fn query(&mut self) -> Result<Stmt<'a>, ParseError> {
         let enclosing_windows = (self.windows, self.n_windows);
         let body = self.set_union()?;
-        let (order_by, limit, offset) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties) = self.order_limit()?;
         (self.windows, self.n_windows) = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
             sel.order_by = order_by;
             sel.limit = limit;
             sel.offset = offset;
+            sel.with_ties = with_ties;
             return Ok(Stmt::Select(sel));
         }
-        Ok(Stmt::SetQuery(SetQuery { with: &[], body, order_by, limit, offset }))
+        Ok(Stmt::SetQuery(SetQuery { with: &[], body, order_by, limit, offset, with_ties }))
     }
 
     /// UNION / EXCEPT level (lowest precedence, left-associative).
@@ -1054,7 +1086,7 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let enclosing_windows = (self.windows, self.n_windows);
             let inner = self.set_union()?;
-            let (order_by, limit, offset) = self.order_limit()?;
+            let (order_by, limit, offset, with_ties) = self.order_limit()?;
             (self.windows, self.n_windows) = enclosing_windows;
             self.expect_op(")")?;
             if order_by.is_empty() && limit.is_none() && offset.is_none() {
@@ -1066,6 +1098,7 @@ impl<'a> Parser<'a> {
                     sel.order_by = order_by;
                     sel.limit = limit;
                     sel.offset = offset;
+                    sel.with_ties = with_ties;
                     sel
                 }
                 op => Select {
@@ -1080,6 +1113,7 @@ impl<'a> Parser<'a> {
                     order_by,
                     limit,
                     offset,
+                    with_ties,
                     with: &[],
                     set_body: Some(op),
                 },
@@ -1130,6 +1164,7 @@ impl<'a> Parser<'a> {
                     order_by: &[],
                     limit: None,
                     offset: None,
+                    with_ties: false,
                     with: &[],
                     set_body: None,
                 };

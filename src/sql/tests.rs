@@ -2450,6 +2450,36 @@ fn network_operators_match_postgres() {
 }
 
 #[test]
+fn fetch_first_and_with_ties() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE ft (id int, v int)");
+    run_with(&mut e, &mut b, "INSERT INTO ft VALUES (1,10),(2,10),(3,20),(4,20),(5,30),(6,30)");
+    // FETCH FIRST n ROWS ONLY == LIMIT n.
+    let bytes = run_with(&mut e, &mut b, "SELECT id FROM ft ORDER BY id FETCH FIRST 2 ROWS ONLY");
+    assert_eq!(data_rows(&bytes), ["1", "2"]);
+    // FETCH FIRST ROW ONLY (count defaults to 1).
+    let bytes = run_with(&mut e, &mut b, "SELECT id FROM ft ORDER BY id FETCH FIRST ROW ONLY");
+    assert_eq!(data_rows(&bytes), ["1"]);
+    // OFFSET ... FETCH NEXT.
+    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft ORDER BY v OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY");
+    assert_eq!(data_rows(&bytes), ["10", "20"]);
+    // WITH TIES: the first row plus every row tying on the ORDER BY key.
+    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES");
+    assert_eq!(data_rows(&bytes), ["10", "10"]);
+    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft ORDER BY v FETCH FIRST 3 ROWS WITH TIES");
+    assert_eq!(data_rows(&bytes), ["10", "10", "20", "20"]);
+    // WITH TIES requires ORDER BY (42601).
+    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft FETCH FIRST 2 ROWS WITH TIES");
+    assert!(String::from_utf8_lossy(&bytes).contains("42601"), "{}", String::from_utf8_lossy(&bytes));
+    // WITH TIES over a grouped/aggregate query.
+    let bytes = run_with(&mut e, &mut b, "SELECT v, count(*) FROM ft GROUP BY v ORDER BY count(*) FETCH FIRST 1 ROWS WITH TIES");
+    assert_eq!(data_rows(&bytes), ["10|2", "20|2", "30|2"]);
+    // WITH TIES over a UNION.
+    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft UNION ALL SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES");
+    assert_eq!(data_rows(&bytes), ["10", "10", "10", "10"]);
+}
+
+#[test]
 fn drop_table_frees_the_name() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int)");

@@ -3357,6 +3357,7 @@ pub fn merge(
         order_by: &[],
         limit: None,
         offset: None,
+        with_ties: false,
         with: &[],
         set_body: None,
     };

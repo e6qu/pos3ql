@@ -885,9 +885,21 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   builds an ordinary backing table — no new persistence, it round-trips like any
   table — then the two-pass `INSERT ... SELECT` populate loop fills it; the tag
   is `SELECT <count>`. Verified byte-for-byte against PostgreSQL (corpus
-  `52_create_table_as`). Materialized views are the natural next step: the same
-  populate over a table that also stores its query text (a `ViewDef`-style
-  definition) and REFRESHes, reported as relkind `m`.
+  `52_create_table_as`).
+- **Materialized views** — done: `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name
+  [(cols)] AS <query> [WITH [NO] DATA]`, `REFRESH MATERIALIZED VIEW`, `DROP
+  MATERIALIZED VIEW`. A matview is an ordinary backing table (its rows, populated
+  by the CREATE TABLE AS path) plus a new parallel `MatviewDef` catalog holding
+  the defining query and populated flag — mirroring the `ViewDef` machinery, so
+  the backing table needs no codec change and there is no dual-entry name
+  collision (a new catalog `create_table_in` does not check). SELECT reads the
+  backing table; REFRESH truncates it and re-runs the stored query; the catalog
+  reports relkind `m` and lists it in `pg_matviews`; `DROP TABLE` on it is
+  refused with 42809. The `MatviewDef` is durable through both a new
+  `CreateMatview`/`DropMatview`/`SetMatviewPopulated` WAL op set (kinds 14–16)
+  and an `mv2` checkpoint manifest line; `SetMatviewPopulated` makes REFRESH /
+  WITH NO DATA state survive pure WAL replay. Verified byte-for-byte against
+  PostgreSQL (corpus `53_materialized_view`) and by a WAL-replay restart test.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

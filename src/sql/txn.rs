@@ -96,6 +96,10 @@ pub enum DdlUndo {
     /// DROP VIEW at this slot (or the superseded view of an OR REPLACE) —
     /// undo by reviving it.
     ViewDropped(u32),
+    /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
+    MatviewCreated(u32),
+    /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.
+    MatviewDropped(u32),
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.

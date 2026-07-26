@@ -40,6 +40,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_tables"
                 | "pg_indexes"
                 | "pg_views"
+                | "pg_matviews"
                 | "pg_roles"
                 | "pg_database"
                 | "pg_am"
@@ -309,6 +310,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
+        (false, "pg_matviews") => pg_matviews(storage, arena),
         (false, "pg_views") | (false, "pg_roles") | (false, "pg_database") => {
             empty_like(name, storage, arena)
         }
@@ -699,12 +701,22 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         let toid = table_oid(storage, slot);
         let has_index = indexes[..n_idx].iter().flatten().any(|i| i.table_oid == toid);
         let n_checks = table.def.n_checks as i32;
+        // A table that has a matching matview catalog entry is a materialized
+        // view (relkind 'm'), not an ordinary table ('r').
+        let relkind = if storage
+            .find_matview(table.def.schema.as_str(), table.def.name.as_str(), 0)
+            .is_some()
+        {
+            "m"
+        } else {
+            "r"
+        };
         out[n] = row(
             &[
                 Datum::Int4(toid),
                 text(table.def.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, table.def.schema.as_str())),
-                text("r", arena)?, // relkind: ordinary table
+                text(relkind, arena)?, // relkind: ordinary table 'r' / matview 'm'
                 Datum::Int4(table.def.n_columns as i32),
                 Datum::Float8(table.rows.len() as f64),
                 Datum::Int4(0), // relpages
@@ -1237,6 +1249,60 @@ fn pg_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, 
                         crate::sql::eval::funcs::system::session_user_owned().as_str(),
                     )
                     .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &out[..n], arena)
+}
+
+fn pg_matviews<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_matviews",
+        &[
+            ("schemaname", ColType::Text),
+            ("matviewname", ColType::Text),
+            ("matviewowner", ColType::Text),
+            ("ispopulated", ColType::Bool),
+            ("definition", ColType::Text),
+        ],
+    );
+    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let mut n = 0;
+    for mv in storage.live_matviews() {
+        if n == out.len() {
+            break;
+        }
+        out[n] = row(
+            &[
+                text(
+                    arena
+                        .alloc_str(mv.schema.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                text(
+                    arena
+                        .alloc_str(mv.name.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                text(
+                    arena
+                        .alloc_str(
+                            crate::sql::eval::funcs::system::session_user_owned().as_str(),
+                        )
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                Datum::Bool(mv.populated),
+                text(
+                    arena
+                        .alloc_str(mv.sql.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
             ],

@@ -1396,6 +1396,54 @@ fn views_survive_restart() {
 }
 
 #[test]
+fn matview_survives_restart() {
+    // A materialized view's rows (its backing table) and its defining query
+    // (the matview catalog) are both journaled, so they survive a WAL-replay
+    // restart — and REFRESH still works afterward.
+    let config = test_config("matview_restart");
+    {
+        let mut budget = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut budget).unwrap();
+        run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
+        run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
+        run_with(&mut e, &mut budget, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE v > 15");
+        e.commit_wal();
+    }
+    let mut budget = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut budget).unwrap();
+    // The materialized rows survived the restart.
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut budget, "SELECT id FROM mv ORDER BY id")),
+        ["2", "3"]
+    );
+    // It is reported as a materialized view (relkind 'm'), not a table.
+    assert!(String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut budget,
+        "SELECT relkind FROM pg_class WHERE relname = 'mv'"
+    ))
+    .contains('m'));
+    // DROP TABLE is refused (42809).
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "DROP TABLE mv"))
+        .contains("42809"));
+    // A base change is invisible until REFRESH, which the stored query drives.
+    run_with(&mut e, &mut budget, "INSERT INTO t VALUES (4,40)");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut budget, "SELECT id FROM mv ORDER BY id")),
+        ["2", "3"]
+    );
+    run_with(&mut e, &mut budget, "REFRESH MATERIALIZED VIEW mv");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut budget, "SELECT id FROM mv ORDER BY id")),
+        ["2", "3", "4"]
+    );
+    // DROP MATERIALIZED VIEW removes it.
+    run_with(&mut e, &mut budget, "DROP MATERIALIZED VIEW mv");
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "SELECT * FROM mv"))
+        .contains("42P01"));
+}
+
+#[test]
 fn sql_surface_batch() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE s (id int, name text DEFAULT 'x', qty int DEFAULT 3)");

@@ -667,6 +667,31 @@ impl ViewDef {
     }
 }
 
+/// A materialized view's catalog entry: like a [`ViewDef`], but its rows live in
+/// a same-named backing table (an ordinary [`Table`]). This entry stores only
+/// the defining query (re-run by REFRESH) and whether it has been populated.
+#[derive(Clone)]
+pub struct MatviewDef {
+    pub created_at: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub sql: StackStr<VIEW_SQL_MAX>,
+    pub creation_path: StackStr<128>,
+    /// False after `WITH NO DATA` until the first REFRESH.
+    pub populated: bool,
+    pub live: bool,
+    pub pending: Option<PendingDdl>,
+}
+
+impl MatviewDef {
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(p) if p.txid == txid => p.creating,
+            _ => self.live,
+        }
+    }
+}
+
 /// Maximum columns in an index key.
 pub(crate) const MAX_INDEX_COLS: usize = 8;
 
@@ -788,6 +813,7 @@ pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
     views: FixedVec<ViewDef>,
+    matviews: FixedVec<MatviewDef>,
     indexes: FixedVec<IndexDef>,
     schemas: FixedVec<SchemaDef>,
     /// The running statement's effective search path (see [`PathContext`]).
@@ -917,6 +943,7 @@ impl Storage {
             * (size_of::<Table>()
                 + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                 + size_of::<ViewDef>()
+                + size_of::<MatviewDef>()
                 + size_of::<IndexDef>())
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + ValueIndexPool::budget_bytes(
@@ -978,6 +1005,21 @@ impl Storage {
                 })
                 .expect("sized to max_tables");
         }
+        let mut matviews = FixedVec::new(budget, "matviews", config.max_tables)?;
+        for _ in 0..config.max_tables {
+            matviews
+                .push(MatviewDef {
+                    created_at: 0,
+                    schema: SqlName::parse("").expect("empty name fits"),
+                    name: SqlName::parse("").expect("empty name fits"),
+                    sql: StackStr::new(),
+                    creation_path: StackStr::new(),
+                    populated: false,
+                    live: false,
+                    pending: None,
+                })
+                .expect("sized to max_tables");
+        }
         let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
         for i in 0..MAX_SCHEMAS {
             schemas
@@ -1020,6 +1062,7 @@ impl Storage {
             heap,
             tables,
             views,
+            matviews,
             indexes,
             schemas,
             path: PathContext::public_only(),
@@ -2710,6 +2753,139 @@ impl Storage {
         self.views.iter().find(|v| {
             v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
         })
+    }
+
+    // --- Materialized-view catalog (parallel to views; data lives in a
+    // same-named backing Table, so these hold only the defining query). ---
+
+    /// Committed materialized views, for checkpoint serialization.
+    pub fn live_matviews(&self) -> impl Iterator<Item = &MatviewDef> {
+        self.matviews.iter().filter(|m| m.live)
+    }
+
+    pub(crate) fn matview(&self, slot: usize) -> &MatviewDef {
+        &self.matviews[slot]
+    }
+
+    pub fn find_matview(&self, schema: &str, name: &str, txid: u32) -> Option<&MatviewDef> {
+        self.matviews.iter().find(|m| {
+            m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
+        })
+    }
+
+    /// The slot of a materialized view visible to `txid`, for later mutation
+    /// (REFRESH marks it populated).
+    pub fn matview_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.matviews.iter().position(|m| {
+            m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
+        })
+    }
+
+    pub fn set_matview_populated(&mut self, slot: usize, populated: bool) {
+        self.matviews[slot].populated = populated;
+    }
+
+    /// Registers a materialized view as an uncommitted CREATE owned by `txid`.
+    /// Unlike `create_view`, the name-vs-table collision is owned by the backing
+    /// table's own creation, so no `find_table`/`or_replace` handling is needed.
+    pub fn create_matview(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        sql: StackStr<VIEW_SQL_MAX>,
+        creation_path: StackStr<128>,
+        populated: bool,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if self.matviews.iter().any(|m| {
+            m.schema.as_str() == schema.as_str()
+                && m.name.as_str() == name.as_str()
+                && matches!(m.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name.as_str()
+            ));
+        }
+        let Some(new) = self
+            .matviews
+            .iter()
+            .position(|m| !m.live && m.pending.is_none())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many materialized views (limit {})",
+                self.matviews.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.matviews[new] = MatviewDef {
+            created_at: self.catalog_seq,
+            schema,
+            name,
+            sql,
+            creation_path,
+            populated,
+            live: false,
+            pending: Some(PendingDdl { txid, creating: true }),
+        };
+        Ok(new)
+    }
+
+    pub fn drop_matview(&mut self, schema: &str, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+        if self.matviews.iter().any(|m| {
+            m.schema.as_str() == schema
+                && m.name.as_str() == name
+                && matches!(m.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name
+            ));
+        }
+        let Some(i) = self.matviews.iter().position(|m| {
+            m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
+        }) else {
+            return Ok(None);
+        };
+        self.pending_drop_matview(i, txid);
+        Ok(Some(i))
+    }
+
+    fn pending_drop_matview(&mut self, slot: usize, txid: u32) {
+        let m = &mut self.matviews[slot];
+        if matches!(m.pending, Some(p) if p.txid == txid && p.creating) {
+            m.live = false;
+            m.pending = None;
+        } else {
+            m.pending = Some(PendingDdl { txid, creating: false });
+        }
+    }
+
+    pub fn commit_matview_create(&mut self, slot: usize) {
+        self.matviews[slot].live = true;
+        self.matviews[slot].pending = None;
+    }
+
+    pub fn commit_matview_drop(&mut self, slot: usize) {
+        self.matviews[slot].live = false;
+        self.matviews[slot].pending = None;
+    }
+
+    pub fn rollback_matview_create(&mut self, slot: usize) {
+        self.matviews[slot].live = false;
+        self.matviews[slot].pending = None;
+    }
+
+    pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
+        let m = &mut self.matviews[slot];
+        if m.live {
+            m.pending = None;
+        } else if matches!(m.pending, Some(p) if p.txid == txid) {
+            m.pending = Some(PendingDdl { txid, creating: true });
+        }
     }
 
     /// Registers a view as an uncommitted CREATE owned by `txid` (other

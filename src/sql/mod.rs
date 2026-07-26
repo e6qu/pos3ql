@@ -386,6 +386,12 @@ impl Engine {
                 }
                 DdlUndo::ViewCreated(slot) => self.storage.commit_view_create(*slot as usize),
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
+                DdlUndo::MatviewCreated(slot) => {
+                    self.storage.commit_matview_create(*slot as usize)
+                }
+                DdlUndo::MatviewDropped(slot) => {
+                    self.storage.commit_matview_drop(*slot as usize)
+                }
                 DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
@@ -448,6 +454,10 @@ impl Engine {
                 DdlUndo::ViewDropped(slot) => {
                     self.storage.rollback_view_drop(slot as usize, txn.txid)
                 }
+                DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
+                DdlUndo::MatviewDropped(slot) => {
+                    self.storage.rollback_matview_drop(slot as usize, txn.txid)
+                }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
                     self.storage.rollback_index_drop(slot as usize, txn.txid)
@@ -495,6 +505,10 @@ impl Engine {
                 DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
                 DdlUndo::ViewDropped(slot) => {
                     self.storage.rollback_view_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
+                DdlUndo::MatviewDropped(slot) => {
+                    self.storage.rollback_matview_drop(slot as usize, txn.txid)
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
@@ -1322,7 +1336,7 @@ impl Engine {
             Stmt::DropView { names, if_exists } => {
                 exec::drop_view(&mut self.storage, &mut self.wal, txn, names, *if_exists, responder)
             }
-            Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists } => {
+            Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists, materialized } => {
                 exec::create_table_as(
                     &mut self.storage,
                     &mut self.wal,
@@ -1332,11 +1346,30 @@ impl Engine {
                     sql,
                     *with_data,
                     *if_not_exists,
+                    *materialized,
+                    guc.search_path(),
                     arena,
                     params,
                     responder,
                 )
             }
+            Stmt::RefreshMaterializedView { name } => exec::refresh_materialized_view(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                arena,
+                params,
+                responder,
+            ),
+            Stmt::DropMaterializedView { names, if_exists } => exec::drop_materialized_view(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                responder,
+            ),
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
                 &mut self.storage,
                 &mut self.wal,
@@ -2228,6 +2261,32 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropView { schema, name } => {
             if let Some(slot) = storage.drop_view(schema, name, 0)? {
                 storage.commit_view_drop(slot);
+            }
+        }
+        WalOp::CreateMatview { schema, name, sql, path, populated } => {
+            use core::fmt::Write;
+            let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+            let _ = write!(buffer, "{sql}");
+            let mut creation_path = crate::util::StackStr::<128>::new();
+            let _ = write!(creation_path, "{path}");
+            let slot = storage.create_matview(
+                crate::storage::SqlName::parse(schema)?,
+                crate::storage::SqlName::parse(name)?,
+                buffer,
+                creation_path,
+                populated,
+                0,
+            )?;
+            storage.commit_matview_create(slot);
+        }
+        WalOp::DropMatview { schema, name } => {
+            if let Some(slot) = storage.drop_matview(schema, name, 0)? {
+                storage.commit_matview_drop(slot);
+            }
+        }
+        WalOp::SetMatviewPopulated { schema, name, populated } => {
+            if let Some(slot) = storage.matview_slot(schema, name, 0) {
+                storage.set_matview_populated(slot, populated);
             }
         }
         WalOp::CreateIndex { schema, name, table, columns, n_cols, unique } => {

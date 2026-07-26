@@ -93,6 +93,9 @@ fn empty_meta() -> ColumnMeta {
         default_value: None,
         default_expr: None,
         is_generated: false,
+        is_identity: false,
+        identity_always: false,
+        auto_increment_step: 1,
     }
 }
 
@@ -122,11 +125,27 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
         (dv, de, false)
     };
     // serial/bigserial/smallserial are int4/int8/int2 with an auto-increment
-    // default and an implicit NOT NULL.
-    let auto_increment = matches!(
+    // default and an implicit NOT NULL. A GENERATED ... AS IDENTITY column is
+    // also auto-increment, but tracked distinctly (attidentity) and with its own
+    // step; both imply NOT NULL.
+    let serial = matches!(
         c.type_name,
         "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2"
     );
+    let (is_identity, identity_always, auto_increment_step) = match c.identity {
+        Some(spec) => {
+            if is_generated {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "column \"{}\" cannot be both an identity and a generated column",
+                    c.name
+                ));
+            }
+            (true, spec.always, spec.increment.unwrap_or(1))
+        }
+        None => (false, false, 1),
+    };
+    let auto_increment = serial || is_identity;
     Ok(ColumnMeta {
         name: SqlName::parse(c.name)?,
         ctype,
@@ -138,7 +157,16 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
         default_value,
         default_expr,
         is_generated,
+        is_identity,
+        identity_always,
+        auto_increment_step,
     })
+}
+
+/// The `START WITH` value of a `GENERATED ... AS IDENTITY` column definition, if
+/// any — applied to the column's initial counter after the table is created.
+pub(super) fn identity_start(c: &ColumnDef) -> Option<i64> {
+    c.identity.and_then(|spec| spec.start)
 }
 
 /// Validates a `GENERATED ALWAYS AS (expr) STORED` expression and returns its

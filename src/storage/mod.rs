@@ -210,6 +210,13 @@ pub struct ColumnMeta {
     /// `'s'`), computed from the row rather than defaulted — the two never
     /// coexist on one column.
     pub is_generated: bool,
+    /// A `GENERATED ... AS IDENTITY` column (also `auto_increment`): distinguishes
+    /// it from a bare `serial` for `pg_attribute.attidentity`.
+    pub is_identity: bool,
+    /// `GENERATED ALWAYS AS IDENTITY` (reject explicit inserts) vs `BY DEFAULT`.
+    pub identity_always: bool,
+    /// The auto-increment step: 1 for `serial`, or the identity `INCREMENT BY`.
+    pub auto_increment_step: i64,
 }
 
 /// Maximum stored length of a non-constant DEFAULT expression's source text.
@@ -229,6 +236,9 @@ impl ColumnMeta {
         default_value: None,
         default_expr: None,
         is_generated: false,
+        is_identity: false,
+        identity_always: false,
+        auto_increment_step: 1,
     };
 }
 
@@ -1176,6 +1186,9 @@ impl Storage {
                             default_value: None,
                             default_expr: None,
                             is_generated: false,
+                            is_identity: false,
+                            identity_always: false,
+                            auto_increment_step: 1,
                         }; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
@@ -3769,6 +3782,9 @@ mod tests {
                 default_value: None,
                 default_expr: None,
                 is_generated: false,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
             }; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
@@ -3785,6 +3801,9 @@ mod tests {
                 default_value: None,
                 default_expr: None,
                 is_generated: false,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
             };
         }
         def

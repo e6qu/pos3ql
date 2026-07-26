@@ -1472,6 +1472,7 @@ impl Engine {
                             select: i.select,
                             on_conflict: i.on_conflict,
                             returning: i.returning,
+                            overriding: i.overriding,
                         }) {
                             Ok(ni) => &*ni,
                             Err(_) => return Ok(Err(query::arena_full_pub())),

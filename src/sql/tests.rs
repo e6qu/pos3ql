@@ -2262,6 +2262,102 @@ fn datetime_uuid_bytea_types() {
 }
 
 #[test]
+fn comment_roundtrip_and_removal() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE ct (id int PRIMARY KEY, a text)");
+    run_with(&mut e, &mut b, "CREATE SCHEMA cs");
+    run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'the table'");
+    run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.a IS 'col a'");
+    run_with(&mut e, &mut b, "COMMENT ON SCHEMA cs IS 'the schema'");
+
+    let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+    assert_eq!(data_rows(&bytes), ["the table"]);
+    let bytes = run_with(&mut e, &mut b, "SELECT col_description('ct'::regclass, 2)");
+    assert_eq!(data_rows(&bytes), ["col a"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT description FROM pg_description WHERE description LIKE 'the %' OR description = 'col a' ORDER BY description",
+    );
+    assert_eq!(data_rows(&bytes), ["col a", "the schema", "the table"]);
+
+    // Overwrite is last-write-wins; IS NULL removes.
+    run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'renamed'");
+    let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+    assert_eq!(data_rows(&bytes), ["renamed"]);
+    run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS NULL");
+    let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+    assert_eq!(data_rows(&bytes), ["NULL"]);
+}
+
+#[test]
+fn comment_errors_match_postgres() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE ct (a int)");
+    run_with(&mut e, &mut b, "CREATE VIEW cv AS SELECT a FROM ct");
+    // Missing relation, wrong kind, missing column, missing schema.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE nope IS 'x'")).contains("42P01"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE cv IS 'x'")).contains("42809"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON VIEW ct IS 'x'")).contains("42809"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.nope IS 'x'")).contains("42703"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON SCHEMA nope IS 'x'")).contains("3F000"));
+}
+
+#[test]
+fn comment_rolls_back() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    run_txn(&mut e, &mut b, &mut t, "CREATE TABLE ct (a int)");
+    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS 'committed'");
+    // A rolled-back overwrite restores the committed comment.
+    run_txn(&mut e, &mut b, &mut t, "BEGIN");
+    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS 'doomed'");
+    run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
+    let bytes = run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT obj_description('ct'::regclass)");
+    assert_eq!(data_rows(&bytes), ["committed"]);
+    // A rolled-back fresh comment leaves none.
+    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS NULL");
+    run_txn(&mut e, &mut b, &mut t, "BEGIN");
+    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS 'doomed'");
+    run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
+    let bytes = run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT obj_description('ct'::regclass)");
+    assert_eq!(data_rows(&bytes), ["NULL"]);
+}
+
+#[test]
+fn comment_survives_restart_and_drop_clears_it() {
+    let config = test_config("comment-durable");
+    {
+        let mut b = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a text)");
+        run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'durable'");
+        run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.a IS 'durable col'");
+    }
+    // The comment survives WAL replay.
+    {
+        let mut b = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+        assert_eq!(data_rows(&bytes), ["durable"]);
+        let bytes = run_with(&mut e, &mut b, "SELECT col_description('ct'::regclass, 2)");
+        assert_eq!(data_rows(&bytes), ["durable col"]);
+        // Dropping the table clears its comments; the freed name carries none.
+        run_with(&mut e, &mut b, "DROP TABLE ct");
+        run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a text)");
+        let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+        assert_eq!(data_rows(&bytes), ["NULL"]);
+    }
+    // The drop's comment removal is itself durable across another restart.
+    {
+        let mut b = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+        assert_eq!(data_rows(&bytes), ["NULL"]);
+    }
+}
+
+#[test]
 fn drop_table_frees_the_name() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int)");

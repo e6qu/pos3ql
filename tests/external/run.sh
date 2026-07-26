@@ -212,7 +212,9 @@ step "durability: kill -9, restart, data intact"
   -c "CREATE SCHEMA crashy_ns" \
   -c "CREATE TABLE crashy_ns.t (a int)" \
   -c "INSERT INTO crashy_ns.t VALUES (7)" \
-  -c "CREATE VIEW crashy_ns.v AS SELECT a FROM crashy_ns.t"
+  -c "CREATE VIEW crashy_ns.v AS SELECT a FROM crashy_ns.t" \
+  -c "COMMENT ON TABLE crashy IS 'crash-comment'" \
+  -c "COMMENT ON COLUMN crashy.v IS 'crash-col'"
 # With asynchronous wal_upload, a commit is durable on local disk immediately
 # but its S3 upload drains just after; a trailing query plus a short pause lets
 # that drain reach MinIO before the abrupt kill, so the later disk-wipe steps
@@ -252,6 +254,11 @@ vals=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT a,b,c F
   || bad "array values after restart: '$vals'"
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(*) FROM crashy" 2>&1)
 [[ "$out" == "2" ]] && ok "kill -9 recovery" || bad "kill -9 recovery: '$out'"
+# Object comments survive the crash: the journal replays the COMMENT records.
+cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
+  -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
+[[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive restart" \
+  || bad "comments after restart: '$cmt'"
 
 step "async WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WAL"
 # wal_upload = on with the asynchronous drain stated (wal_upload_sync = off —
@@ -335,6 +342,11 @@ ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
   -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v)" 2>&1)
 [[ "$ns" == "1|7" ]] && ok "schema objects survive a cold start" \
   || bad "schema objects after cold start: '$ns'"
+# Object comments rebuild from the manifest alone (the `cmt` line), wiped disk.
+cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
+  -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
+[[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive a cold start" \
+  || bad "comments after cold start: '$cmt'"
 
 fi # dur
 

@@ -1271,6 +1271,144 @@ pub fn create_view(
     sql_ok()
 }
 
+/// `COMMENT ON <object> IS { 'text' | NULL }`. Resolves and kind-checks the
+/// object, applies the comment as this transaction's uncommitted overlay, and
+/// journals it (promoted on commit, discarded on rollback — like other DDL).
+pub fn comment(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    target: &super::ast::CommentTarget,
+    text: Option<&str>,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::storage::{CommentClass, StoredRelKind};
+    use super::ast::CommentTarget;
+
+    let txid = txn.txid;
+    // Resolve the target to a comment key `(class, schema, name, subid)`,
+    // matching PostgreSQL's resolution and its error wording.
+    let (class, schema, name, subid) = match *target {
+        CommentTarget::Relation { kind, name: rel } => {
+            let Some((schema, actual)) = storage.classify_relation(rel.schema, rel.name, txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    rel.name
+                ));
+            };
+            let ok = matches!(
+                (kind, actual),
+                (super::ast::CommentRelKind::Table, StoredRelKind::Table)
+                    | (super::ast::CommentRelKind::View, StoredRelKind::View)
+                    | (super::ast::CommentRelKind::MaterializedView, StoredRelKind::Matview)
+                    | (super::ast::CommentRelKind::Index, StoredRelKind::Index)
+                    | (super::ast::CommentRelKind::Sequence, StoredRelKind::Sequence)
+            );
+            if !ok {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a{} {}",
+                    rel.name,
+                    if kind.noun().starts_with(['a', 'e', 'i', 'o', 'u']) { "n" } else { "" },
+                    kind.noun()
+                ));
+            }
+            let stored = match SqlName::parse(rel.name) {
+                Ok(n) => n,
+                Err(e) => return sql_fail(e),
+            };
+            (CommentClass::Relation, schema, stored, 0u32)
+        }
+        CommentTarget::Column { relation, column } => {
+            let Some((schema, actual)) =
+                storage.classify_relation(relation.schema, relation.name, txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    relation.name
+                ));
+            };
+            if !matches!(actual, StoredRelKind::Table | StoredRelKind::Matview) {
+                // Column comments on views/sequences/indexes need the
+                // relation's column list resolved from its body, which our
+                // stored catalog does not carry for non-tables.
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COMMENT ON COLUMN is supported only for tables and materialized views"
+                ));
+            }
+            let slot = storage
+                .find_visible(schema.as_str(), relation.name, txid)
+                .expect("classified relation resolves to a table slot");
+            let Some(attnum) = storage.column_number(slot, column) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column,
+                    relation.name
+                ));
+            };
+            let stored = match SqlName::parse(relation.name) {
+                Ok(n) => n,
+                Err(e) => return sql_fail(e),
+            };
+            (CommentClass::Relation, schema, stored, attnum)
+        }
+        CommentTarget::Schema(schema_name) => {
+            if storage.find_schema_visible(schema_name, txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema_name
+                ));
+            }
+            let stored = match SqlName::parse(schema_name) {
+                Ok(n) => n,
+                Err(e) => return sql_fail(e),
+            };
+            (CommentClass::Schema, SqlName::EMPTY, stored, 0u32)
+        }
+    };
+
+    let stored_text = match text {
+        Some(t) => match crate::storage::comment_stackstr(t) {
+            Ok(s) => Some(s),
+            Err(e) => return sql_fail(e),
+        },
+        None => None,
+    };
+
+    let (slot, prior) =
+        match storage.set_comment(class, schema, name, subid, stored_text, txid) {
+            Ok(v) => v,
+            Err(e) => return sql_fail(e),
+        };
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(
+        lsn,
+        &WalOp::Comment {
+            class: class.to_u8(),
+            schema: schema.as_str(),
+            name: name.as_str(),
+            subid,
+            text,
+        },
+    ) {
+        // The journal rejected the record; undo the in-memory overlay.
+        storage.restore_comment_pending(slot, prior);
+        return sql_fail(e);
+    }
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::CommentSet { slot: slot as u32, prior }) {
+        storage.restore_comment_pending(slot, prior);
+        return sql_fail(e);
+    }
+    responder.command_complete("COMMENT")?;
+    sql_ok()
+}
+
 /// CREATE TABLE ... AS <query> [WITH [NO] DATA]: build a table from the query's
 /// output schema, then populate it by running the query once.
 #[allow(clippy::too_many_arguments)]
@@ -2074,7 +2212,7 @@ pub fn drop_view(
             }
         } else if if_exists {
             responder.notice(
-                crate::sql::eval::sqlstate::UNDEFINED_TABLE,
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(128, "view \"{}\" does not exist, skipping", name.name).as_str(),
             )?;
         } else {
@@ -2270,7 +2408,7 @@ pub fn drop_index(
             }
         } else if if_exists {
             responder.notice(
-                crate::sql::eval::sqlstate::UNDEFINED_TABLE,
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(128, "index \"{}\" does not exist, skipping", name.name).as_str(),
             )?;
         } else {

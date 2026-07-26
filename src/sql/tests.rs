@@ -2358,6 +2358,98 @@ fn comment_survives_restart_and_drop_clears_it() {
 }
 
 #[test]
+fn network_types_roundtrip_and_order() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE net (a inet, c cidr, m macaddr, m8 macaddr8)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO net VALUES ('10.0.0.1/8','192.168.0.0/24','08:00:2b:01:02:03','08:00:2b:01:02:03:04:05'), \
+         ('2001:db8::1', '10.0.0.0/8', '08-00-2b-01-02-04', '08:00:2b:01:02:03')",
+    );
+    let bytes = run_with(&mut e, &mut b, "SELECT a, c, m, m8 FROM net ORDER BY a");
+    assert_eq!(
+        data_rows(&bytes),
+        [
+            "10.0.0.1/8|192.168.0.0/24|08:00:2b:01:02:03|08:00:2b:01:02:03:04:05",
+            "2001:db8::1|10.0.0.0/8|08:00:2b:01:02:04|08:00:2b:ff:fe:01:02:03",
+        ]
+    );
+    // Casts and pg_typeof.
+    let bytes = run_with(&mut e, &mut b, "SELECT '192.168.1.5/24'::inet::cidr, pg_typeof('10.0.0.1'::inet)");
+    assert_eq!(data_rows(&bytes), ["192.168.1.0/24|inet"]);
+    // A bad literal errors 22P02.
+    let bytes = run_with(&mut e, &mut b, "SELECT '999.1.1.1'::inet");
+    assert!(String::from_utf8_lossy(&bytes).contains("22P02"), "{}", String::from_utf8_lossy(&bytes));
+}
+
+#[test]
+fn network_functions_match_postgres() {
+    let (mut e, mut b) = test_engine();
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT family('192.168.1.5/24'::inet), host('192.168.1.5/24'::inet), masklen('192.168.1.5/24'::inet), \
+                broadcast('192.168.1.5/24'::inet), netmask('192.168.1.5/24'::inet), hostmask('192.168.1.5/24'::inet), \
+                network('192.168.1.5/24'::inet), abbrev('10.1.0.0/16'::cidr), abbrev('192.168.1.5/24'::inet), \
+                set_masklen('192.168.1.5/24'::inet, 16), inet_same_family('1.2.3.4'::inet, '::1'::inet), \
+                inet_merge('192.168.1.5/24'::inet, '192.168.2.5/24'::inet), \
+                trunc('08:00:2b:01:02:03'::macaddr), trunc('08:00:2b:01:02:03:04:05'::macaddr8), \
+                macaddr8_set7bit('00:00:2b:01:02:03:04:05'::macaddr8)",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["4|192.168.1.5|24|192.168.1.255/24|255.255.255.0|0.0.0.255|192.168.1.0/24|10.1/16|192.168.1.5/24|192.168.1.5/16|f|192.168.0.0/22|08:00:2b:00:00:00|08:00:2b:00:00:00:00:00|02:00:2b:01:02:03:04:05"]
+    );
+}
+
+#[test]
+fn network_types_survive_restart() {
+    let config = test_config("network-durable");
+    {
+        let mut b = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run_with(&mut e, &mut b, "CREATE TABLE nd (a inet, c cidr, m macaddr, m8 macaddr8)");
+        run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO nd VALUES ('2001:db8::1/64','10.0.0.0/8','08:00:2b:01:02:03','08:00:2b:ff:fe:01:02:03')",
+        );
+    }
+    // The values survive WAL replay byte-for-byte (the rowenc codec).
+    let mut b = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut b).unwrap();
+    let bytes = run_with(&mut e, &mut b, "SELECT a, c, m, m8 FROM nd");
+    assert_eq!(
+        data_rows(&bytes),
+        ["2001:db8::1/64|10.0.0.0/8|08:00:2b:01:02:03|08:00:2b:ff:fe:01:02:03"]
+    );
+}
+
+#[test]
+fn network_operators_match_postgres() {
+    let (mut e, mut b) = test_engine();
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT '192.168.1.5'::inet << '192.168.1.0/24'::inet, \
+                '192.168.1.5'::inet <<= '192.168.1.5/32'::inet, \
+                '192.168.1.0/24'::inet >> '192.168.1.5'::inet, \
+                '192.168.1.0/24'::cidr && '192.168.1.128/25'::cidr, \
+                ~ '192.168.1.5'::inet, \
+                '192.168.1.5'::inet & '0.0.0.255'::inet, \
+                '192.168.1.0'::inet | '0.0.0.5'::inet, \
+                '192.168.1.5'::inet + 10, \
+                '192.168.1.5'::inet - 10, \
+                '192.168.1.20'::inet - '192.168.1.5'::inet",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["t|t|t|t|63.87.254.250|0.0.0.5|192.168.1.5|192.168.1.15|192.168.0.251|15"]
+    );
+}
+
+#[test]
 fn drop_table_frees_the_name() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int)");

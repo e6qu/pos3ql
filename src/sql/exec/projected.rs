@@ -48,6 +48,9 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Timetz(..) => 12,
         Datum::Interval(_) => 16,
         Datum::Uuid(_) => 16,
+        Datum::Inet(_) | Datum::Cidr(_) => 18,
+        Datum::Macaddr(_) => 6,
+        Datum::Macaddr8(_) => 8,
         Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::Array { raw, .. } => 6 + raw.len(),
@@ -188,6 +191,23 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 9;
             out[1..17].copy_from_slice(b);
             17
+        }
+        Datum::Inet(net) | Datum::Cidr(net) => {
+            out[0] = if matches!(v, Datum::Cidr(_)) { 25 } else { 24 };
+            out[1] = net.family;
+            out[2] = net.bits;
+            out[3..19].copy_from_slice(&net.addr);
+            19
+        }
+        Datum::Macaddr(b) => {
+            out[0] = 26;
+            out[1..7].copy_from_slice(b);
+            7
+        }
+        Datum::Macaddr8(b) => {
+            out[0] = 27;
+            out[1..9].copy_from_slice(b);
+            9
         }
         Datum::Bytea(b) => {
             out[0] = 10;
@@ -417,6 +437,17 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             ),
             12,
         ),
+        24 | 25 => {
+            let net = crate::sql::net::NetAddr {
+                family: bytes[at],
+                bits: bytes[at + 1],
+                addr: bytes[at + 2..at + 18].try_into().unwrap(),
+            };
+            let d = if tag == 25 { Datum::Cidr(net) } else { Datum::Inet(net) };
+            (d, 18)
+        }
+        26 => (Datum::Macaddr(bytes[at..at + 6].try_into().unwrap()), 6),
+        27 => (Datum::Macaddr8(bytes[at..at + 8].try_into().unwrap()), 8),
         _ => unreachable!("tags are exhaustive"),
     }
 }

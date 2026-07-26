@@ -30,6 +30,10 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Timetz(..) => 12,
             Datum::Interval(_) => 16,
             Datum::Uuid(_) => 16,
+            // family(1) + mask bits(1) + 16 address bytes.
+            Datum::Inet(_) | Datum::Cidr(_) => 18,
+            Datum::Macaddr(_) => 6,
+            Datum::Macaddr8(_) => 8,
             Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
             Datum::Json { text, .. } | Datum::Range { text, .. } | Datum::Multirange { text, .. } => 4 + text.len(),
             // 4-byte payload length, 1 flag byte (varying), then the bit chars.
@@ -124,6 +128,20 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             Datum::Uuid(b) => {
                 rest[..16].copy_from_slice(b);
                 take = 16;
+            }
+            Datum::Inet(net) | Datum::Cidr(net) => {
+                rest[0] = net.family;
+                rest[1] = net.bits;
+                rest[2..18].copy_from_slice(&net.addr);
+                take = 18;
+            }
+            Datum::Macaddr(b) => {
+                rest[..6].copy_from_slice(b);
+                take = 6;
+            }
+            Datum::Macaddr8(b) => {
+                rest[..8].copy_from_slice(b);
+                take = 8;
             }
             Datum::Bytea(b) => {
                 rest[..4].copy_from_slice(&(b.len() as u32).to_le_bytes());
@@ -331,6 +349,30 @@ pub(crate) fn decode<'a>(
                 let b = bytes.get(at..at + 16).ok_or_else(corrupt)?;
                 out[i] = Datum::Uuid(b.try_into().unwrap());
                 at += 16;
+            }
+            ColType::Inet | ColType::Cidr => {
+                let b = bytes.get(at..at + 18).ok_or_else(corrupt)?;
+                let net = crate::sql::net::NetAddr {
+                    family: b[0],
+                    bits: b[1],
+                    addr: b[2..18].try_into().unwrap(),
+                };
+                out[i] = if matches!(schema[i], ColType::Cidr) {
+                    Datum::Cidr(net)
+                } else {
+                    Datum::Inet(net)
+                };
+                at += 18;
+            }
+            ColType::Macaddr => {
+                let b = bytes.get(at..at + 6).ok_or_else(corrupt)?;
+                out[i] = Datum::Macaddr(b.try_into().unwrap());
+                at += 6;
+            }
+            ColType::Macaddr8 => {
+                let b = bytes.get(at..at + 8).ok_or_else(corrupt)?;
+                out[i] = Datum::Macaddr8(b.try_into().unwrap());
+                at += 8;
             }
             ColType::Bytea => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;

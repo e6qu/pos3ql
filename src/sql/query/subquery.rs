@@ -615,6 +615,10 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Range(kind) => Datum::Range { text: "empty", kind },
         ColType::Bit { varying } => Datum::Bit { bits: "", varying },
         ColType::Multirange(kind) => Datum::Multirange { text: "{}", kind },
+        ColType::Inet => Datum::Inet(crate::sql::net::NetAddr { family: 4, bits: 32, addr: [0; 16] }),
+        ColType::Cidr => Datum::Cidr(crate::sql::net::NetAddr { family: 4, bits: 32, addr: [0; 16] }),
+        ColType::Macaddr => Datum::Macaddr([0; 6]),
+        ColType::Macaddr8 => Datum::Macaddr8([0; 8]),
     }
 }
 

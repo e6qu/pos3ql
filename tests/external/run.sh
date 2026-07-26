@@ -204,8 +204,8 @@ step "durability: kill -9, restart, data intact"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
   -c "CREATE TABLE crashy (id int, v text)" \
   -c "INSERT INTO crashy VALUES (1,'pre-crash'),(2,'also here')" \
-  -c "CREATE TABLE crashy_types (a int[], b bool[], c text[], m tsmultirange, r int4range)" \
-  -c "INSERT INTO crashy_types VALUES ('{1,2}','{t,f}','{x}','{[2020-01-01,2020-02-01)}','[1,5)')" \
+  -c "CREATE TABLE crashy_types (a int[], b bool[], c text[], m tsmultirange, r int4range, ip inet, mac macaddr)" \
+  -c "INSERT INTO crashy_types VALUES ('{1,2}','{t,f}','{x}','{[2020-01-01,2020-02-01)}','[1,5)','2001:db8::1/64','08:00:2b:01:02:03')" \
   -c "CREATE TABLE crashy_seq (id serial, v int)" \
   -c "INSERT INTO crashy_seq(v) VALUES (1),(2),(3)" \
   -c "TRUNCATE crashy_seq" \
@@ -252,6 +252,10 @@ ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
 vals=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT a,b,c FROM crashy_types" 2>&1)
 [[ "$vals" == "{1,2}|{t,f}|{x}" ]] && ok "array values survive restart" \
   || bad "array values after restart: '$vals'"
+# Network address values survive the crash (the inet/macaddr row codec).
+net=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT ip, mac FROM crashy_types" 2>&1)
+[[ "$net" == "2001:db8::1/64|08:00:2b:01:02:03" ]] && ok "network values survive restart" \
+  || bad "network values after restart: '$net'"
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(*) FROM crashy" 2>&1)
 [[ "$out" == "2" ]] && ok "kill -9 recovery" || bad "kill -9 recovery: '$out'"
 # Object comments survive the crash: the journal replays the COMMENT records.

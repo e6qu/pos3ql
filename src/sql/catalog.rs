@@ -1284,6 +1284,10 @@ fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ColType::Time,
         ColType::Timetz,
         ColType::Interval,
+        ColType::Inet,
+        ColType::Cidr,
+        ColType::Macaddr,
+        ColType::Macaddr8,
     ];
     let category = |t: &ColType| match t {
         ColType::Bool => "B",
@@ -1293,6 +1297,8 @@ fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ColType::Interval => "T",
         ColType::Uuid => "U",
         ColType::Bytea => "U",
+        // Network address types are PostgreSQL typcategory 'I'.
+        ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
         _ => "S",
     };
     let mut out: [&[Datum]; 32] = [&[]; 32];

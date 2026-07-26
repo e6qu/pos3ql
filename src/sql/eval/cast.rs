@@ -283,6 +283,52 @@ pub fn cast_to<'a>(
             }
             _ => return Err(cast_unsupported(&v, kind.multirange_name())),
         },
+        ColType::Inet => match v {
+            Datum::Inet(_) => v,
+            // cidr -> inet keeps the same address and mask.
+            Datum::Cidr(n) => Datum::Inet(n),
+            Datum::Text(s) => {
+                Datum::Inet(crate::sql::net::parse_inet(s).ok_or_else(|| bad_text(s, "inet"))?)
+            }
+            _ => return Err(cast_unsupported(&v, "inet")),
+        },
+        ColType::Cidr => match v {
+            Datum::Cidr(_) => v,
+            // inet -> cidr drops the host bits (PostgreSQL zeroes them).
+            Datum::Inet(n) => Datum::Cidr(n.to_network()),
+            Datum::Text(s) => {
+                Datum::Cidr(crate::sql::net::parse_cidr(s).ok_or_else(|| bad_text(s, "cidr"))?)
+            }
+            _ => return Err(cast_unsupported(&v, "cidr")),
+        },
+        ColType::Macaddr => match v {
+            Datum::Macaddr(_) => v,
+            // macaddr8 -> macaddr requires the EUI-64 ff:fe marker, else errors.
+            Datum::Macaddr8(b) => {
+                if b[3] != 0xff || b[4] != 0xfe {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_TEXT_REPRESENTATION,
+                        "macaddr8 data out of range to convert to macaddr"
+                    ));
+                }
+                Datum::Macaddr([b[0], b[1], b[2], b[5], b[6], b[7]])
+            }
+            Datum::Text(s) => {
+                Datum::Macaddr(crate::sql::net::parse_macaddr(s).ok_or_else(|| bad_text(s, "macaddr"))?)
+            }
+            _ => return Err(cast_unsupported(&v, "macaddr")),
+        },
+        ColType::Macaddr8 => match v {
+            Datum::Macaddr8(_) => v,
+            // macaddr -> macaddr8 widens through EUI-64 (insert ff:fe).
+            Datum::Macaddr(b) => {
+                Datum::Macaddr8([b[0], b[1], b[2], 0xff, 0xfe, b[3], b[4], b[5]])
+            }
+            Datum::Text(s) => Datum::Macaddr8(
+                crate::sql::net::parse_macaddr8(s).ok_or_else(|| bad_text(s, "macaddr8"))?,
+            ),
+            _ => return Err(cast_unsupported(&v, "macaddr8")),
+        },
     };
     Ok(out)
 }

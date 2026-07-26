@@ -199,6 +199,10 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::JSONB => ColType::Jsonb,
         oid::UUID => ColType::Uuid,
         oid::BYTEA => ColType::Bytea,
+        oid::INET => ColType::Inet,
+        oid::CIDR => ColType::Cidr,
+        oid::MACADDR => ColType::Macaddr,
+        oid::MACADDR8 => ColType::Macaddr8,
         oid::INT4MULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Int4),
         oid::INT8MULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Int8),
         oid::NUMMULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Num),
@@ -234,6 +238,10 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         1001 => ColType::Array(crate::sql::types::ArrElem::Bytea),
         199 => ColType::Array(crate::sql::types::ArrElem::Json),
         3807 => ColType::Array(crate::sql::types::ArrElem::Jsonb),
+        oid::INET_ARRAY => ColType::Array(crate::sql::types::ArrElem::Inet),
+        oid::CIDR_ARRAY => ColType::Array(crate::sql::types::ArrElem::Cidr),
+        oid::MACADDR_ARRAY => ColType::Array(crate::sql::types::ArrElem::Macaddr),
+        oid::MACADDR8_ARRAY => ColType::Array(crate::sql::types::ArrElem::Macaddr8),
         3904 => ColType::Range(crate::sql::types::RangeKind::Int4),
         3926 => ColType::Range(crate::sql::types::RangeKind::Int8),
         3906 => ColType::Range(crate::sql::types::RangeKind::Num),
@@ -894,6 +902,10 @@ fn is_multirange_oid(oid: i32) -> bool {
     matches!(coltype_of_oid(oid), Some(ColType::Multirange(_)))
 }
 
+fn is_network_oid(oid: i32) -> bool {
+    matches!(oid, crate::sql::types::oid::INET | crate::sql::types::oid::CIDR)
+}
+
 fn comparable(a: ColType, b: ColType) -> bool {
     use ColType::*;
     // `json` has no equality operator in PostgreSQL — two documents that differ
@@ -1010,6 +1022,14 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
                     of(ColType::Bool)
                 }
+                // Network containment predicates.
+                NetContainedEq | NetContainsEq => of(ColType::Bool),
+                Shl | Shr if is_network_oid(lo) || is_network_oid(ro) => of(ColType::Bool),
+                // `inet & inet` / `inet | inet` return inet.
+                BitAnd | BitOr if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
+                // `inet - inet` is int8; `inet ± integer` is inet.
+                Sub if is_network_oid(lo) && is_network_oid(ro) => of(ColType::Int8),
+                Add | Sub if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
                 // Multirange set operators (`+`/`-`/`*`) return a multirange of
                 // the same subtype.
                 Add | Sub | Mul if is_multirange_oid(lo) || is_multirange_oid(ro) => {
@@ -1269,6 +1289,13 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
                 of(ColType::Int4)
             }
+            // Network address functions.
+            "family" | "masklen" => of(ColType::Int4),
+            "host" | "abbrev" => of(ColType::Text),
+            "broadcast" | "netmask" | "hostmask" | "set_masklen" => of(ColType::Inet),
+            "network" | "inet_merge" => of(ColType::Cidr),
+            "inet_same_family" => of(ColType::Bool),
+            "macaddr8_set7bit" => of(ColType::Macaddr8),
             "array_dims" => of(ColType::Text),
             "array_to_json" => of(ColType::Json),
             // Array-manipulation functions keep the array argument's type, but
@@ -1474,7 +1501,13 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     of(ColType::Numeric)
                 } else {
                     let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                    if a == Some(oid::NUMERIC) { of(ColType::Numeric) } else { of(ColType::Float8) }
+                    match a {
+                        // trunc(macaddr)/trunc(macaddr8) keep their type.
+                        Some(oid::MACADDR) if *name == "trunc" => of(ColType::Macaddr),
+                        Some(oid::MACADDR8) if *name == "trunc" => of(ColType::Macaddr8),
+                        Some(oid::NUMERIC) => of(ColType::Numeric),
+                        _ => of(ColType::Float8),
+                    }
                 }
             }
             "mod" | "gcd" | "lcm" => {

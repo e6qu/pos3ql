@@ -1012,6 +1012,33 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   a *column* comment on a plain view, sequence or index (rather than a table or
   materialized view) is a loud `0A000`, since resolving those columns needs the
   view/relation body described — the same describe-path entanglement LATERAL hit.
+- **Network address types** — done: `inet`, `cidr`, `macaddr`, `macaddr8`, a full
+  type family in the mould of ranges/multiranges/bit-strings. A `NetAddr` (family
+  4/6, mask bits, 16 address bytes) backs `inet`/`cidr`; MACs are fixed 6/8-byte
+  arrays. **Text I/O** matches PostgreSQL exactly: IPv4 dotted-quad and canonical
+  RFC 5952 IPv6 (lowercase, longest-zero-run `::` compression, `::ffff:1.2.3.4`
+  v4-mapped tail), the family-default mask (`/32`, `/128`) omitted for `inet` and
+  always shown for `cidr`, `cidr` abbreviation dropping trailing zero octets, MAC
+  as lowercase colon hex, and `macaddr8` EUI-64 widening (`ff:fe` inserted into a
+  six-byte input). `cidr` rejects host bits set right of the mask (22P02);
+  bad literals are 22P02. **Casts**: text↔each type, `inet`↔`cidr` (the latter
+  clears host bits), `macaddr`↔`macaddr8` (EUI-64, with the ff:fe check on the way
+  back). **Ordering** is PostgreSQL `network_cmp` (family, then address, then
+  mask), so `ORDER BY`/`DISTINCT`/`GROUP BY` all work; comparison, hashing and the
+  sort/projected encodings carry the new tags. **Operators**: `<< <<= >> >>= &&`
+  (containment/overlap — `<<=`/`>>=` are new lexer tokens and `BinaryOp` variants),
+  `~ & |` (bitwise over the address), and `+`/`-` (`inet ± int`, and `inet - inet`
+  → `int8` distance, with big-endian carry/borrow over the family width and loud
+  overflow). **Functions**: `family`, `host`, `masklen`, `set_masklen`,
+  `broadcast`, `netmask`, `hostmask`, `network`, `abbrev`, `inet_same_family`,
+  `inet_merge`, plus the MAC `trunc` (folded into the numeric `trunc`) and
+  `macaddr8_set7bit`. Durable through the row codec (fixed 18/6/8-byte layouts),
+  the schema-carried `ColType::code` (new codes 43/44/45/47, clear of the retired
+  20..=40 band — guarded by the B-095 round-trip test), the binary wire send/recv,
+  `pg_type` (typcategory `I`), and constant column defaults (new `OwnedDatum`
+  variants + WAL/manifest default codec). Verified byte-for-byte against
+  PostgreSQL 18 (corpus `60_network`), with restart-durability unit tests and a
+  `run.sh` crash-recovery assertion. No known gaps.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

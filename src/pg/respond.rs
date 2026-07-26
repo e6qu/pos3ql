@@ -697,6 +697,28 @@ impl<'b> Responder<'b> {
                     m.i32(16);
                     m.bytes(b);
                 }
+                Datum::Inet(net) | Datum::Cidr(net) => {
+                    // PostgreSQL `inet`/`cidr` send: family (2 = v4, 3 = v6),
+                    // mask bits, is_cidr flag, address byte count, then the
+                    // address bytes.
+                    let nb = net.addr_len() as u8;
+                    let family = if net.family == 4 { 2u8 } else { 3u8 };
+                    let is_cidr = u8::from(matches!(v, Datum::Cidr(_)));
+                    m.i32(4 + i32::from(nb));
+                    m.u8(family);
+                    m.u8(net.bits);
+                    m.u8(is_cidr);
+                    m.u8(nb);
+                    m.bytes(&net.addr[..nb as usize]);
+                }
+                Datum::Macaddr(b) => {
+                    m.i32(6);
+                    m.bytes(b);
+                }
+                Datum::Macaddr8(b) => {
+                    m.i32(8);
+                    m.bytes(b);
+                }
                 Datum::Array { element, raw } => {
                     // int32 ndim (0 for empty, else 1 — arrays are strictly
                     // one-dimensional here), int32 has-null flag, int32 element

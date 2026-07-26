@@ -3,6 +3,7 @@
 use core::fmt;
 use core::fmt::Write as _;
 
+use super::net::NetAddr;
 use super::numeric::Numeric;
 
 /// OIDs from PostgreSQL's `pg_type` (stable, documented catalog values).
@@ -34,6 +35,15 @@ pub mod oid {
     pub const VARBIT: i32 = 1562;
     pub const BIT_ARRAY: i32 = 1561;
     pub const VARBIT_ARRAY: i32 = 1563;
+    // Network address types.
+    pub const INET: i32 = 869;
+    pub const CIDR: i32 = 650;
+    pub const MACADDR: i32 = 829;
+    pub const MACADDR8: i32 = 774;
+    pub const INET_ARRAY: i32 = 1041;
+    pub const CIDR_ARRAY: i32 = 651;
+    pub const MACADDR_ARRAY: i32 = 1040;
+    pub const MACADDR8_ARRAY: i32 = 775;
     // Multirange type OIDs (PostgreSQL 14+).
     pub const INT4MULTIRANGE: i32 = 4451;
     pub const NUMMULTIRANGE: i32 = 4532;
@@ -99,6 +109,16 @@ pub enum ColType {
     Bit { varying: bool },
     /// A multirange type (int4multirange/…), stored as canonical text.
     Multirange(RangeKind),
+    /// `inet`: a host or network IPv4/IPv6 address with a mask length. Host
+    /// bits are allowed and preserved.
+    Inet,
+    /// `cidr`: an IPv4/IPv6 network. Like `inet` but rejects bits set to the
+    /// right of the mask and always prints the mask length.
+    Cidr,
+    /// `macaddr`: a six-byte MAC address.
+    Macaddr,
+    /// `macaddr8`: an eight-byte (EUI-64) MAC address.
+    Macaddr8,
     /// An anonymous composite (`ROW(...)`, a whole-row reference, a record
     /// SRF) carried through a derived table's columns. Transient only: a real
     /// table column can never have this type (DDL refuses records), so it has
@@ -164,6 +184,10 @@ impl ColType {
             "numeric" | "decimal" | "dec" => Self::Numeric,
             "bit" => Self::Bit { varying: false },
             "varbit" | "bit varying" => Self::Bit { varying: true },
+            "inet" => Self::Inet,
+            "cidr" => Self::Cidr,
+            "macaddr" => Self::Macaddr,
+            "macaddr8" => Self::Macaddr8,
             _ => return None,
         })
     }
@@ -196,6 +220,10 @@ impl ColType {
             Self::Bit { varying: false } => oid::BIT,
             Self::Bit { varying: true } => oid::VARBIT,
             Self::Multirange(k) => k.multirange_oid(),
+            Self::Inet => oid::INET,
+            Self::Cidr => oid::CIDR,
+            Self::Macaddr => oid::MACADDR,
+            Self::Macaddr8 => oid::MACADDR8,
             Self::Record => oid::RECORD,
         }
     }
@@ -229,6 +257,10 @@ impl ColType {
             oid::NUMERIC => Some(Self::Numeric),
             oid::BIT => Some(Self::Bit { varying: false }),
             oid::VARBIT => Some(Self::Bit { varying: true }),
+            oid::INET => Some(Self::Inet),
+            oid::CIDR => Some(Self::Cidr),
+            oid::MACADDR => Some(Self::Macaddr),
+            oid::MACADDR8 => Some(Self::Macaddr8),
             _ => None,
         };
         if scalar.is_some() {
@@ -256,7 +288,7 @@ impl ColType {
             ArrElem::Float8, ArrElem::Text, ArrElem::Name, ArrElem::Varchar, ArrElem::Bpchar,
             ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz, ArrElem::Time, ArrElem::Timetz,
             ArrElem::Interval, ArrElem::Json, ArrElem::Jsonb, ArrElem::Uuid, ArrElem::Bytea,
-            ArrElem::Numeric,
+            ArrElem::Numeric, ArrElem::Inet, ArrElem::Cidr, ArrElem::Macaddr, ArrElem::Macaddr8,
         ] {
             if type_oid == element.array_oid() {
                 return Some(Self::Array(element));
@@ -276,9 +308,12 @@ impl ColType {
             Self::Timetz => 12,
             Self::Interval => 16,
             Self::Uuid => 16,
+            Self::Macaddr => 6,
+            Self::Macaddr8 => 8,
             Self::Name => 64,
             Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
+            Self::Inet | Self::Cidr => -1,
             Self::Record => -1,
         }
     }
@@ -322,6 +357,10 @@ impl ColType {
             Self::Bit { varying: false } => "bit",
             Self::Bit { varying: true } => "varbit",
             Self::Multirange(k) => k.multirange_name(),
+            Self::Inet => "inet",
+            Self::Cidr => "cidr",
+            Self::Macaddr => "macaddr",
+            Self::Macaddr8 => "macaddr8",
             Self::Record => "record",
         }
     }
@@ -354,6 +393,10 @@ impl ColType {
             Self::Bit { varying: false } => "bit",
             Self::Bit { varying: true } => "bit varying",
             Self::Multirange(k) => k.multirange_name(),
+            Self::Inet => "inet",
+            Self::Cidr => "cidr",
+            Self::Macaddr => "macaddr",
+            Self::Macaddr8 => "macaddr8",
             Self::Record => "record",
         }
     }
@@ -387,6 +430,10 @@ impl ColType {
             Self::Bit { varying: false } => 26,
             Self::Bit { varying: true } => 27,
             Self::Name => 42,
+            Self::Inet => 43,
+            Self::Cidr => 44,
+            Self::Macaddr => 45,
+            Self::Macaddr8 => 47,
             Self::Multirange(k) => MULTIRANGE_CODE_BASE + k.code(),
             Self::Array(e) => ARRAY_CODE_BASE + e.code(),
             // Records are transient (never a stored column); the code is a
@@ -422,6 +469,10 @@ impl ColType {
             26 => Self::Bit { varying: false },
             27 => Self::Bit { varying: true },
             42 => Self::Name,
+            43 => Self::Inet,
+            44 => Self::Cidr,
+            45 => Self::Macaddr,
+            47 => Self::Macaddr8,
             c if (RANGE_CODE_BASE..RANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
                 Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE))
             }
@@ -459,6 +510,10 @@ pub enum ArrElem {
     Varchar,
     Bpchar,
     Name,
+    Inet,
+    Cidr,
+    Macaddr,
+    Macaddr8,
 }
 
 impl ArrElem {
@@ -488,6 +543,10 @@ impl ArrElem {
             ArrElem::Varchar => "character varying[]",
             ArrElem::Bpchar => "character[]",
             ArrElem::Name => "name[]",
+            ArrElem::Inet => "inet[]",
+            ArrElem::Cidr => "cidr[]",
+            ArrElem::Macaddr => "macaddr[]",
+            ArrElem::Macaddr8 => "macaddr8[]",
         }
     }
 
@@ -522,6 +581,10 @@ impl ArrElem {
             Datum::Bytea(_) => ArrElem::Bytea,
             Datum::Json { jsonb: false, .. } => ArrElem::Json,
             Datum::Json { jsonb: true, .. } => ArrElem::Jsonb,
+            Datum::Inet(_) => ArrElem::Inet,
+            Datum::Cidr(_) => ArrElem::Cidr,
+            Datum::Macaddr(_) => ArrElem::Macaddr,
+            Datum::Macaddr8(_) => ArrElem::Macaddr8,
             _ => return None,
         })
     }
@@ -556,6 +619,10 @@ impl ArrElem {
             ColType::Bytea => ArrElem::Bytea,
             ColType::Json => ArrElem::Json,
             ColType::Jsonb => ArrElem::Jsonb,
+            ColType::Inet => ArrElem::Inet,
+            ColType::Cidr => ArrElem::Cidr,
+            ColType::Macaddr => ArrElem::Macaddr,
+            ColType::Macaddr8 => ArrElem::Macaddr8,
             _ => return None,
         })
     }
@@ -583,6 +650,10 @@ impl ArrElem {
             ArrElem::Varchar => ColType::Varchar,
             ArrElem::Bpchar => ColType::Bpchar,
             ArrElem::Name => ColType::Name,
+            ArrElem::Inet => ColType::Inet,
+            ArrElem::Cidr => ColType::Cidr,
+            ArrElem::Macaddr => ColType::Macaddr,
+            ArrElem::Macaddr8 => ColType::Macaddr8,
         }
     }
 
@@ -610,6 +681,10 @@ impl ArrElem {
             ArrElem::Varchar => 1015,
             ArrElem::Bpchar => 1014,
             ArrElem::Name => 1003,
+            ArrElem::Inet => oid::INET_ARRAY,
+            ArrElem::Cidr => oid::CIDR_ARRAY,
+            ArrElem::Macaddr => oid::MACADDR_ARRAY,
+            ArrElem::Macaddr8 => oid::MACADDR8_ARRAY,
         }
     }
 
@@ -636,6 +711,10 @@ impl ArrElem {
             ArrElem::Bpchar => 18,
             ArrElem::Name => 19,
             ArrElem::Float4 => 20,
+            ArrElem::Inet => 21,
+            ArrElem::Cidr => 22,
+            ArrElem::Macaddr => 23,
+            ArrElem::Macaddr8 => 24,
         }
     }
 
@@ -662,6 +741,10 @@ impl ArrElem {
             18 => ArrElem::Bpchar,
             19 => ArrElem::Name,
             20 => ArrElem::Float4,
+            21 => ArrElem::Inet,
+            22 => ArrElem::Cidr,
+            23 => ArrElem::Macaddr,
+            24 => ArrElem::Macaddr8,
             _ => return None,
         })
     }
@@ -955,6 +1038,14 @@ pub enum Datum<'a> {
     Bit { bits: &'a str, varying: bool },
     /// A multirange value in canonical text form (e.g. `{[1,3),[5,7)}`, `{}`).
     Multirange { text: &'a str, kind: RangeKind },
+    /// An `inet` address (host bits preserved).
+    Inet(NetAddr),
+    /// A `cidr` network (always prints its mask length).
+    Cidr(NetAddr),
+    /// A six-byte `macaddr`.
+    Macaddr([u8; 6]),
+    /// An eight-byte `macaddr8`.
+    Macaddr8([u8; 8]),
     /// A composite/record value: each field's name (for `row_to_json` etc.),
     /// its type OID (for JSON/typed output), and its value. Records are
     /// transient — produced by `t.*`, a bare table reference, or `ROW(...)` —
@@ -1003,6 +1094,10 @@ impl<'a> Datum<'a> {
             Datum::Bit { varying: false, .. } => oid::BIT,
             Datum::Bit { varying: true, .. } => oid::VARBIT,
             Datum::Multirange { kind, .. } => kind.multirange_oid(),
+            Datum::Inet(_) => oid::INET,
+            Datum::Cidr(_) => oid::CIDR,
+            Datum::Macaddr(_) => oid::MACADDR,
+            Datum::Macaddr8(_) => oid::MACADDR8,
         }
     }
 }
@@ -1169,6 +1264,10 @@ impl fmt::Display for Datum<'_> {
                 Ok(())
             }
             Datum::Numeric(n) => write!(f, "{n}"),
+            Datum::Inet(net) => super::net::format_addr(net, false, f),
+            Datum::Cidr(net) => super::net::format_addr(net, true, f),
+            Datum::Macaddr(bytes) => super::net::format_mac(bytes, f),
+            Datum::Macaddr8(bytes) => super::net::format_mac(bytes, f),
             Datum::Record(fields) => {
                 f.write_char('(')?;
                 for (i, field) in fields.iter().enumerate() {
@@ -1435,6 +1534,7 @@ mod tests {
             ColType::Date, ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Timetz,
             ColType::Interval, ColType::Json, ColType::Jsonb, ColType::Uuid, ColType::Bytea,
             ColType::Numeric, ColType::Bit { varying: false }, ColType::Bit { varying: true },
+            ColType::Inet, ColType::Cidr, ColType::Macaddr, ColType::Macaddr8,
         ];
         for k in [RangeKind::Int4, RangeKind::Int8, RangeKind::Num, RangeKind::Date, RangeKind::Ts, RangeKind::Tstz] {
             types.push(ColType::Range(k));
@@ -1445,7 +1545,7 @@ mod tests {
             ArrElem::Float8, ArrElem::Text, ArrElem::Name, ArrElem::Varchar, ArrElem::Bpchar,
             ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz, ArrElem::Time, ArrElem::Timetz,
             ArrElem::Interval, ArrElem::Json, ArrElem::Jsonb, ArrElem::Uuid, ArrElem::Bytea,
-            ArrElem::Numeric,
+            ArrElem::Numeric, ArrElem::Inet, ArrElem::Cidr, ArrElem::Macaddr, ArrElem::Macaddr8,
         ] {
             types.push(ColType::Array(e));
         }
@@ -1474,13 +1574,15 @@ mod code_roundtrip_tests {
             ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Timetz, ColType::Interval,
             ColType::Json, ColType::Jsonb, ColType::Uuid, ColType::Bytea, ColType::Numeric,
             ColType::Bit { varying: false }, ColType::Bit { varying: true },
+            ColType::Inet, ColType::Cidr, ColType::Macaddr, ColType::Macaddr8,
         ];
         for k in [RangeKind::Int4, RangeKind::Int8, RangeKind::Num, RangeKind::Date, RangeKind::Ts, RangeKind::Tstz] {
             types.push(ColType::Range(k));
             types.push(ColType::Multirange(k));
         }
         for e in [ArrElem::Bool, ArrElem::Int4, ArrElem::Int8, ArrElem::Float8, ArrElem::Text,
-                  ArrElem::Numeric, ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz] {
+                  ArrElem::Numeric, ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz,
+                  ArrElem::Inet, ArrElem::Cidr, ArrElem::Macaddr, ArrElem::Macaddr8] {
             types.push(ColType::Array(e));
         }
         // The layout this replaced could emit any code in 20..=40; a moved

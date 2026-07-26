@@ -81,6 +81,10 @@ pub enum OwnedDatum {
     Float8(f64),
     Text { len: u8, bytes: [u8; MAX_DEFAULT_TEXT] },
     Numeric { sign: u8, weight: i16, dscale: u16, nbytes: u8, digits: [u8; MAX_DEFAULT_TEXT] },
+    Inet(crate::sql::net::NetAddr),
+    Cidr(crate::sql::net::NetAddr),
+    Macaddr([u8; 6]),
+    Macaddr8([u8; 8]),
 }
 
 pub(crate) const MAX_DEFAULT_TEXT: usize = 48;
@@ -122,6 +126,10 @@ impl OwnedDatum {
                     "defaults of this type are not supported yet (store as text)"
                 ))
             }
+            Datum::Inet(n) => Self::Inet(*n),
+            Datum::Cidr(n) => Self::Cidr(*n),
+            Datum::Macaddr(b) => Self::Macaddr(*b),
+            Datum::Macaddr8(b) => Self::Macaddr8(*b),
             Datum::Numeric(n) => {
                 if n.digits.len() > MAX_DEFAULT_TEXT {
                     return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "numeric default too large"));
@@ -178,6 +186,10 @@ impl OwnedDatum {
                     digits: &digits[..*nbytes as usize],
                 })
             }
+            Self::Inet(n) => Datum::Inet(*n),
+            Self::Cidr(n) => Datum::Cidr(*n),
+            Self::Macaddr(b) => Datum::Macaddr(*b),
+            Self::Macaddr8(b) => Datum::Macaddr8(*b),
         }
     }
 }

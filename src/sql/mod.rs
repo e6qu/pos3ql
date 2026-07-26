@@ -1530,6 +1530,16 @@ impl Engine {
                 };
                 exec::delete(&mut self.storage, txn, &mut self.scratch, d, arena, params, responder)
             }
+            Stmt::Merge(m) => exec::merge(
+                &mut self.storage,
+                txn,
+                &mut self.scratch,
+                m,
+                arena,
+                params,
+                guc.seq_session(),
+                responder,
+            ),
             Stmt::Truncate { tables, restart_identity, cascade } => {
                 exec::truncate(&mut self.storage, txn, tables, *restart_identity, *cascade, responder)
             }

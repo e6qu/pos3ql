@@ -971,6 +971,22 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   and `CYCLE` in the options are rejected loudly (they would need per-column
   sequence machinery) rather than silently dropped. Verified byte-for-byte
   against PostgreSQL (corpus `57_identity`) and a WAL-replay restart test.
+- **MERGE** — done: `MERGE INTO target [AS alias] USING source [AS alias] ON
+  cond` with `WHEN [NOT] MATCHED [AND cond] THEN { UPDATE SET | DELETE | INSERT |
+  DO NOTHING }` clauses. Source-driven, as PostgreSQL specifies: the source
+  (a table, subquery, or `(VALUES ...)`) is materialized via the same path as
+  `INSERT ... SELECT`, and each source row is matched against a one-time
+  snapshot of the target on `cond`; a match runs the first WHEN MATCHED clause
+  whose AND-condition holds, a miss the first WHEN NOT MATCHED clause. A
+  `MergeLookup` gives ON/WHEN/SET expressions both tables in scope (qualified
+  names to each half, unqualified searched in both — 42702 if ambiguous); INSERT
+  values see only the source. A per-target-row affected flag enforces the
+  cardinality rule (21000 when a target row would be affected a second time),
+  and UPDATE/DELETE/INSERT reuse the existing row ops (constraints, generated
+  columns, identity/defaults, and the sequence hook all apply). The tag is
+  `MERGE <count>`. It is a *new* statement path, so nothing about SELECT/INSERT/
+  UPDATE/DELETE changed. Verified byte-for-byte against PostgreSQL (corpus
+  `58_merge`).
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

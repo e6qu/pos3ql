@@ -25,6 +25,7 @@ pub enum Stmt<'a> {
     Insert(Insert<'a>),
     Update(Update<'a>),
     Delete(Delete<'a>),
+    Merge(Merge<'a>),
     Begin,
     Commit,
     Rollback,
@@ -686,6 +687,41 @@ pub struct Delete<'a> {
     pub using: Option<&'a FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub returning: &'a [SelectItem<'a>],
+}
+
+/// `MERGE INTO target [AS alias] USING source [AS alias] ON cond WHEN ...`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Merge<'a> {
+    pub target: QualName<'a>,
+    /// Correlation name for the target (defaults to its table name).
+    pub target_alias: Option<&'a str>,
+    /// The data source: a table, subquery, or `(VALUES ...)`.
+    pub source: TableRef<'a>,
+    pub on: &'a Expr<'a>,
+    pub whens: &'a [MergeWhen<'a>],
+}
+
+/// One `WHEN [NOT] MATCHED [AND cond] THEN action` clause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MergeWhen<'a> {
+    pub matched: bool,
+    /// The `AND cond` refinement (None = always applies).
+    pub cond: Option<&'a Expr<'a>>,
+    pub action: MergeAction<'a>,
+}
+
+/// A MERGE clause's action.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MergeAction<'a> {
+    /// `UPDATE SET col = expr, ...` (WHEN MATCHED only).
+    Update(&'a [(&'a str, &'a Expr<'a>)]),
+    /// `DELETE` (WHEN MATCHED only).
+    Delete,
+    /// `INSERT [(cols)] VALUES (exprs)` or `INSERT DEFAULT VALUES` (WHEN NOT
+    /// MATCHED only). Empty `values` means DEFAULT VALUES.
+    Insert { columns: &'a [&'a str], values: &'a [&'a Expr<'a>], default_values: bool },
+    /// `DO NOTHING`.
+    DoNothing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

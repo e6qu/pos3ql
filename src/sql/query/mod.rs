@@ -52,7 +52,8 @@ mod aggregate;
 use aggregate::{fold_aggregates, AggState};
 
 mod srf;
-use srf::{find_srf, srf_count, srf_max_count, synth_derived_def, table_func_def, table_func_rows};
+use srf::{find_srf, srf_count, srf_max_count, table_func_def, table_func_rows};
+pub(crate) use srf::synth_derived_def;
 
 mod group;
 use group::{grouped_rows, grouped_select};

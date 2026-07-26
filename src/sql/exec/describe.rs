@@ -1209,7 +1209,11 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             match ColType::from_sql_name(type_name) {
                 Some(t) => of(t),
-                None => return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", type_name)),
+                // A non-base type name may be a user-defined enum, which this
+                // catalog-free inference cannot resolve to an OID. Report it as
+                // unknown here; the eval-time Cast resolves the actual enum
+                // value (or errors on a genuinely missing type).
+                None => (oid::UNKNOWN, -2),
             }
         }
         Expr::IsNull { .. } => of(ColType::Bool),

@@ -80,6 +80,12 @@ pub enum Stmt<'a> {
     AlterDomain { name: QualName<'a>, action: AlterDomainAction<'a> },
     /// DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropDomain { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
+    /// CREATE TYPE name AS ENUM ('label', ...).
+    CreateEnum { name: QualName<'a>, labels: &'a [&'a str] },
+    /// ALTER TYPE name <action> (enum ADD VALUE / RENAME).
+    AlterType { name: QualName<'a>, action: AlterTypeAction<'a> },
+    /// DROP TYPE [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+    DropType { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
     /// CREATE [UNIQUE] INDEX name ON table (col, ...).
     CreateIndex {
         name: &'a str,
@@ -545,6 +551,17 @@ pub enum AlterDomainAction<'a> {
     DropNotNull,
     SetDefault(&'a str),
     DropDefault,
+}
+
+/// One `ALTER TYPE` action on an enum type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlterTypeAction<'a> {
+    /// ADD VALUE [IF NOT EXISTS] 'label' [ {BEFORE|AFTER} 'existing' ].
+    AddValue { label: &'a str, if_not_exists: bool, before: Option<&'a str>, after: Option<&'a str> },
+    /// RENAME TO new_name (renames the type itself, not a value).
+    RenameTo(&'a str),
+    /// RENAME VALUE 'old' TO 'new' — rejected (values are stored inline).
+    RenameValue { from: &'a str, to: &'a str },
 }
 
 /// Referential action for a foreign key's ON DELETE / ON UPDATE.

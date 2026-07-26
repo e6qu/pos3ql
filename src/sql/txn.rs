@@ -109,6 +109,10 @@ pub enum DdlUndo {
     DomainCreated(u32),
     /// DROP DOMAIN at this slot — undo by reviving it.
     DomainDropped(u32),
+    /// CREATE TYPE (enum) at this slot — undo by dropping it.
+    EnumCreated(u32),
+    /// DROP TYPE (enum) at this slot — undo by reviving it.
+    EnumDropped(u32),
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.

@@ -1646,6 +1646,21 @@ impl<'a> Parser<'a> {
         Ok(bytes[0])
     }
 
+    /// A required single-quoted string literal (e.g. an enum label).
+    pub(super) fn str_literal(&mut self, what: &'static str) -> Result<&'a str, ParseError> {
+        match self.peeked {
+            Tok::Str(s) => {
+                self.advance()?;
+                Ok(s)
+            }
+            _ => Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "expected {} as a quoted string literal", what),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+            }),
+        }
+    }
+
     /// A string-literal option value.
     fn copy_string(&mut self, what: &'static str) -> Result<&'a str, ParseError> {
         match self.peeked {
@@ -1811,6 +1826,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("domain")? {
             return self.alter_domain();
+        }
+        if self.eat_ident("type")? {
+            return self.alter_type();
         }
         self.expect_ident("table")?;
         let table = self.qual_name("table name")?;

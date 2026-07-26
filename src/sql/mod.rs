@@ -435,6 +435,8 @@ impl Engine {
                 DdlUndo::DomainDropped(slot) => {
                     self.storage.commit_domain_drop(*slot as usize)
                 }
+                DdlUndo::EnumCreated(slot) => self.storage.commit_enum_create(*slot as usize),
+                DdlUndo::EnumDropped(slot) => self.storage.commit_enum_drop(*slot as usize),
                 DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
@@ -518,6 +520,10 @@ impl Engine {
                 DdlUndo::DomainDropped(slot) => {
                     self.storage.rollback_domain_drop(slot as usize, txn.txid)
                 }
+                DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
+                DdlUndo::EnumDropped(slot) => {
+                    self.storage.rollback_enum_drop(slot as usize, txn.txid)
+                }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
                     self.storage.rollback_index_drop(slot as usize, txn.txid)
@@ -584,6 +590,10 @@ impl Engine {
                 }
                 DdlUndo::DomainDropped(slot) => {
                     self.storage.rollback_domain_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
+                DdlUndo::EnumDropped(slot) => {
+                    self.storage.rollback_enum_drop(slot as usize, txn.txid)
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
@@ -1488,6 +1498,21 @@ impl Engine {
                 responder,
             ),
             Stmt::DropDomain { names, if_exists, cascade } => exec::drop_domain(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
+            Stmt::CreateEnum { name, labels } => {
+                exec::create_enum(&mut self.storage, &mut self.wal, txn, name, labels, responder)
+            }
+            Stmt::AlterType { name, action } => {
+                exec::alter_type(&mut self.storage, &mut self.wal, txn, name, action, responder)
+            }
+            Stmt::DropType { names, if_exists, cascade } => exec::drop_enum(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2492,6 +2517,21 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropDomain { schema, name } => {
             if let Some(slot) = storage.drop_domain(schema, name, 0)? {
                 storage.commit_domain_drop(slot);
+            }
+        }
+        WalOp::CreateEnum(def) => {
+            // An ALTER ... ADD VALUE replays as a redefinition: redefine in
+            // place if the enum exists, else create it committed (txid 0).
+            let spec = crate::storage::EnumSpec { members: def.members, n_members: def.n_members };
+            if let Some(slot) = storage.enum_slot(def.schema.as_str(), def.name.as_str(), 0) {
+                storage.alter_enum(slot, spec);
+            } else {
+                storage.create_enum(def.schema, def.name, spec, 0)?;
+            }
+        }
+        WalOp::DropEnum { schema, name } => {
+            if let Some(slot) = storage.drop_enum(schema, name, 0)? {
+                storage.commit_enum_drop(slot);
             }
         }
         WalOp::Comment { class, schema, name, subid, text } => {

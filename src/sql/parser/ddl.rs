@@ -10,7 +10,7 @@ use super::{
     ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, QualName,
     Stmt, TableConstraint, Tok, MAX_LIST,
 };
-use crate::sql::ast::{AlterDomainAction, CreateDomain, DomainCheck};
+use crate::sql::ast::{AlterDomainAction, AlterTypeAction, CreateDomain, DomainCheck};
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
 
@@ -51,6 +51,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("domain")? {
             return self.create_domain();
+        }
+        if self.eat_ident("type")? {
+            return self.create_type();
         }
         self.create_table()
     }
@@ -208,6 +211,89 @@ impl<'a> Parser<'a> {
             false
         };
         Ok(Stmt::DropDomain { names, if_exists, cascade })
+    }
+
+    /// `CREATE TYPE name AS ENUM ('label', ...)` ("create type" consumed). Only
+    /// the ENUM kind is supported; composite/range/base types are a loud gap.
+    pub(super) fn create_type(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("type name")?;
+        self.expect_ident("as")?;
+        if !self.eat_ident("enum")? {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "only CREATE TYPE ... AS ENUM is supported"
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
+        self.expect_op("(")?;
+        let mut labels = [""; MAX_LIST];
+        let mut n = 0;
+        if self.peeked != Tok::Op(")") {
+            loop {
+                if n == MAX_LIST {
+                    return Err(self.limit("enum labels", MAX_LIST));
+                }
+                labels[n] = self.str_literal("enum label")?;
+                n += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+        }
+        self.expect_op(")")?;
+        Ok(Stmt::CreateEnum { name, labels: self.arena_slice(&labels[..n])? })
+    }
+
+    /// `ALTER TYPE name <action>` ("alter type" consumed).
+    pub(super) fn alter_type(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("type name")?;
+        let action = if self.eat_ident("add")? {
+            self.expect_ident("value")?;
+            let if_not_exists = if self.eat_ident("if")? {
+                self.expect_ident("not")?;
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let label = self.str_literal("enum label")?;
+            let (before, after) = if self.eat_ident("before")? {
+                (Some(self.str_literal("enum label")?), None)
+            } else if self.eat_ident("after")? {
+                (None, Some(self.str_literal("enum label")?))
+            } else {
+                (None, None)
+            };
+            AlterTypeAction::AddValue { label, if_not_exists, before, after }
+        } else if self.eat_ident("rename")? {
+            if self.eat_ident("value")? {
+                let from = self.str_literal("enum label")?;
+                self.expect_ident("to")?;
+                let to = self.str_literal("enum label")?;
+                AlterTypeAction::RenameValue { from, to }
+            } else {
+                self.expect_ident("to")?;
+                AlterTypeAction::RenameTo(self.col_ident("new type name")?)
+            }
+        } else {
+            return Err(self.err_here("expected ADD VALUE or RENAME after ALTER TYPE"));
+        };
+        Ok(Stmt::AlterType { name, action })
+    }
+
+    /// `DROP TYPE [IF EXISTS] name [, ...] [CASCADE|RESTRICT]` ("type" consumed).
+    pub(super) fn drop_type(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let (names, if_exists) = self.drop_targets("type name")?;
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropType { names, if_exists, cascade })
     }
 
     /// `ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]]` ("alter
@@ -513,6 +599,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("domain")? {
             return self.drop_domain();
+        }
+        if self.eat_ident("type")? {
+            return self.drop_type();
         }
         self.drop_table()
     }

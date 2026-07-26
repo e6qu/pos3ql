@@ -452,6 +452,13 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[30]);
             hasher.write(b);
         }
+        // Enum values are equal iff the same member; the label uniquely
+        // identifies a member within a type, and cross-type comparison is
+        // rejected at plan time, so hashing by label is consistent with `=`.
+        Datum::Enum { label, .. } => {
+            hasher.write(&[31]);
+            hasher.write(label.as_bytes());
+        }
     }
 }
 
@@ -541,6 +548,12 @@ pub(crate) fn compare_datums_as(
         }
         (Datum::Macaddr(a), Datum::Macaddr(b)) => a.cmp(b),
         (Datum::Macaddr8(a), Datum::Macaddr8(b)) => a.cmp(b),
+        // Enum values order by their member sort key (PostgreSQL's
+        // enumsortorder), never by label text. The planner rejects comparing
+        // two different enum types, so equal sorts here mean equal members.
+        (Datum::Enum { sort: a, .. }, Datum::Enum { sort: b, .. }) => {
+            a.partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
         // Intervals compare by canonical microsecond value (PostgreSQL's
         // interval_cmp_value: months count as 30 days, days as 24 hours), so
         // `1 month` = `30 days` = `720 hours`.

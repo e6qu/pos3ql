@@ -56,6 +56,13 @@ pub mod oid {
     pub const UNKNOWN: i32 = 705;
     /// Anonymous composite / record type.
     pub const RECORD: i32 = 2249;
+    /// Base OID for user-defined enum types, synthesized as `FIRST_ENUM + slot`.
+    /// Kept clear of the domain range (`FIRST_DOMAIN_OID = 110_000`).
+    pub const FIRST_ENUM: i32 = 120_000;
+    /// The synthesized OID of the enum type in catalog `slot`.
+    pub fn enum_oid(slot: u16) -> i32 {
+        FIRST_ENUM + slot as i32
+    }
 }
 
 /// Column types the engine stores. A deliberately small, growing set.
@@ -124,6 +131,14 @@ pub enum ColType {
     /// table column can never have this type (DDL refuses records), so it has
     /// no on-disk presence.
     Record,
+    /// A user-defined enum type (`CREATE TYPE ... AS ENUM`). The `u16` is the
+    /// slot of its [`crate::storage::EnumDef`] in the catalog — a runtime
+    /// identity only. A column of an enum type persists the enum's *name* (in
+    /// [`crate::storage::ColumnMeta::domain`], resolved back to a slot on load),
+    /// because slots are not stable across restart. A stored enum *value*
+    /// carries its own label and sort key inline, so [`from_code`](Self::from_code)
+    /// need not recover the slot to decode a row.
+    Enum(u16),
 }
 
 /// Base storage codes for the parameterized type families. They must stay far
@@ -225,6 +240,7 @@ impl ColType {
             Self::Macaddr => oid::MACADDR,
             Self::Macaddr8 => oid::MACADDR8,
             Self::Record => oid::RECORD,
+            Self::Enum(slot) => oid::enum_oid(slot),
         }
     }
 
@@ -294,6 +310,11 @@ impl ColType {
                 return Some(Self::Array(element));
             }
         }
+        // User-defined enum types occupy a synthesized OID band.
+        if type_oid >= oid::FIRST_ENUM && type_oid < oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32
+        {
+            return Some(Self::Enum((type_oid - oid::FIRST_ENUM) as u16));
+        }
         // Bit-string arrays have no array-element type here, so they (and any
         // other unmodeled OID) fall through unsupported.
         None
@@ -315,6 +336,8 @@ impl ColType {
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
             Self::Inet | Self::Cidr => -1,
             Self::Record => -1,
+            // PostgreSQL enums are a fixed 4-byte OID on the wire.
+            Self::Enum(_) => 4,
         }
     }
 
@@ -362,6 +385,9 @@ impl ColType {
             Self::Macaddr => "macaddr",
             Self::Macaddr8 => "macaddr8",
             Self::Record => "record",
+            // The real enum name is dynamic (per catalog slot); callers that
+            // must title a column after the enum resolve it via the catalog.
+            Self::Enum(_) => "enum",
         }
     }
 
@@ -398,6 +424,7 @@ impl ColType {
             Self::Macaddr => "macaddr",
             Self::Macaddr8 => "macaddr8",
             Self::Record => "record",
+            Self::Enum(_) => "enum",
         }
     }
 
@@ -440,8 +467,16 @@ impl ColType {
             // loud sentinel with no `from_code` inverse, so any leak into the
             // persistence layer fails visibly at reload.
             Self::Record => 46,
+            // The code marks "an enum column"; *which* enum is carried
+            // alongside as the type name (slots are not stable across restart),
+            // and a stored enum value carries its own label + sort inline.
+            Self::Enum(_) => 54,
         }
     }
+
+    /// The catalog slot placed in [`ColType::Enum`] by [`from_code`](Self::from_code)
+    /// before the real slot is resolved from the persisted type name.
+    pub const ENUM_SLOT_UNRESOLVED: u16 = u16::MAX;
 
     /// Inverse of [`ColType::code`]; `None` for an unknown or corrupt code.
     pub fn from_code(code: u8) -> Option<Self> {
@@ -473,6 +508,9 @@ impl ColType {
             44 => Self::Cidr,
             45 => Self::Macaddr,
             47 => Self::Macaddr8,
+            // An enum column: the concrete slot is resolved from the persisted
+            // type name after decode (see the column codec's name handling).
+            54 => Self::Enum(Self::ENUM_SLOT_UNRESOLVED),
             c if (RANGE_CODE_BASE..RANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
                 Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE))
             }
@@ -1051,6 +1089,13 @@ pub enum Datum<'a> {
     /// transient — produced by `t.*`, a bare table reference, or `ROW(...)` —
     /// never stored in a column.
     Record(&'a [RecordField<'a>]),
+    /// A user-defined enum value. `slot` identifies the enum type (for OID /
+    /// `pg_typeof`); `sort` is the member's sort key, by which enum values
+    /// order (PostgreSQL orders by `enumsortorder`, not label text); `label`
+    /// is the member's text, used for output and equality. All three are
+    /// carried inline so a value is self-describing — decode needs no catalog
+    /// and [`compare_datums`](super::eval::operators::compare_datums) stays pure.
+    Enum { slot: u16, sort: f64, label: &'a str },
 }
 
 /// One field of a [`Datum::Record`].
@@ -1098,6 +1143,7 @@ impl<'a> Datum<'a> {
             Datum::Cidr(_) => oid::CIDR,
             Datum::Macaddr(_) => oid::MACADDR,
             Datum::Macaddr8(_) => oid::MACADDR8,
+            Datum::Enum { slot, .. } => oid::enum_oid(*slot),
         }
     }
 }
@@ -1264,6 +1310,7 @@ impl fmt::Display for Datum<'_> {
                 Ok(())
             }
             Datum::Numeric(n) => write!(f, "{n}"),
+            Datum::Enum { label, .. } => f.write_str(label),
             Datum::Inet(net) => super::net::format_addr(net, false, f),
             Datum::Cidr(net) => super::net::format_addr(net, true, f),
             Datum::Macaddr(bytes) => super::net::format_mac(bytes, f),

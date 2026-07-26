@@ -1240,6 +1240,40 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("enm") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let hexstr = |w: Option<&str>, what: &'static str| -> Result<String, CheckpointSetupError> {
+                        match w.ok_or(CheckpointSetupError::Corrupt(what))? {
+                            "0" => Ok(String::new()),
+                            h => decode_hex_name(h),
+                        }
+                    };
+                    let schema = hexstr(words.next(), "enm schema missing")?;
+                    let name = hexstr(words.next(), "enm name missing")?;
+                    let n_members: usize = parse_field(words.next(), "enm nmembers")?;
+                    if n_members > crate::storage::MAX_ENUM_LABELS {
+                        return Err(CheckpointSetupError::Corrupt("too many enum labels"));
+                    }
+                    let mut members =
+                        [crate::storage::EnumMember::EMPTY; crate::storage::MAX_ENUM_LABELS];
+                    for member in members.iter_mut().take(n_members) {
+                        let label = hexstr(words.next(), "enm label missing")?;
+                        let sort_bits: u64 = parse_field(words.next(), "enm sort")?;
+                        *member = crate::storage::EnumMember {
+                            label: sql_name(&label)?,
+                            sort: f64::from_bits(sort_bits),
+                        };
+                    }
+                    let spec = crate::storage::EnumSpec { members, n_members };
+                    storage
+                        .create_enum(sql_name(&schema)?, sql_name(&name)?, spec, 0)
+                        .map_err(|e| {
+                            CheckpointSetupError::S3(format!(
+                                "manifest enum rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("cmt") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let class: u8 = parse_field(words.next(), "cmt class")?;
@@ -1668,6 +1702,34 @@ Ok(CheckpointStep::Published { lsn })
                 let _ = write!(hex, "{b:02x}");
             }
             write_manifest(&mut self.manifest_buf, format_args!("nsp {}", hex.as_str()))?;
+        }
+        // Enum types: `enm <hex-schema> <hex-name> <n-members> [<hex-label>
+        // <sort-bits>]...`. Written before tables so an enum-typed column
+        // resolves its type slot when its table is rebuilt on load. The sort
+        // key is emitted as its exact f64 bit pattern.
+        for (_, e) in storage.live_enums() {
+            use core::fmt::Write;
+            let mut line = StackStr::<10_240>::new();
+            let hex = |line: &mut StackStr<10_240>, s: &str| {
+                if s.is_empty() {
+                    let _ = write!(line, "0");
+                } else {
+                    for b in s.as_bytes() {
+                        let _ = write!(line, "{b:02x}");
+                    }
+                }
+            };
+            let _ = write!(line, "enm ");
+            hex(&mut line, e.schema.as_str());
+            let _ = write!(line, " ");
+            hex(&mut line, e.name.as_str());
+            let _ = write!(line, " {}", e.n_members);
+            for m in e.members() {
+                let _ = write!(line, " ");
+                hex(&mut line, m.label.as_str());
+                let _ = write!(line, " {}", m.sort.to_bits());
+            }
+            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
         }
         for slot in 0..storage.table_count() {
             let table = storage.table(slot);

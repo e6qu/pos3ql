@@ -2530,6 +2530,65 @@ fn domains_survive_restart() {
 }
 
 #[test]
+fn enums_order_and_enforce() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
+    run_with(&mut e, &mut b, "CREATE TABLE et (id int, m mood)");
+    run_with(&mut e, &mut b, "INSERT INTO et VALUES (1,'happy'),(2,'sad'),(3,'ok')");
+    // Ordering follows definition order, not label text.
+    let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
+    assert_eq!(data_rows(&bytes), ["2", "3", "1"]);
+    // pg_typeof reports the enum; comparison uses the sort order.
+    let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(m) FROM et WHERE id = 1");
+    assert_eq!(data_rows(&bytes), ["mood"]);
+    let bytes = run_with(&mut e, &mut b, "SELECT id FROM et WHERE m > 'sad' ORDER BY id");
+    assert_eq!(data_rows(&bytes), ["1", "3"]);
+    // An invalid label is 22P02, on write and on cast.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO et VALUES (9,'nope')")).contains("22P02"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT 'nope'::mood")).contains("22P02"));
+    // ADD VALUE BEFORE inserts between neighbours; the new order is respected.
+    run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'");
+    run_with(&mut e, &mut b, "INSERT INTO et VALUES (4,'meh')");
+    let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
+    assert_eq!(data_rows(&bytes), ["2", "4", "3", "1"]);
+    // A duplicate label errors 42710; IF NOT EXISTS is a no-op.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'ok'")).contains("42710"));
+    // DROP RESTRICT fails while a column depends on the enum.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
+    // RENAME VALUE is a loud, documented gap.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'")).contains("0A000"));
+}
+
+#[test]
+fn enums_survive_restart() {
+    let config = test_config("enum-durable");
+    {
+        let mut b = Budget::new(1 << 25);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
+        run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'");
+        run_with(&mut e, &mut b, "CREATE TABLE et (id int, m mood)");
+        run_with(&mut e, &mut b, "INSERT INTO et VALUES (1,'happy'),(2,'meh'),(3,'sad')");
+        e.commit_wal();
+    }
+    // WAL replay: the enum, its added value, ordering, and column identity survive.
+    {
+        let mut b = Budget::new(1 << 25);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
+        assert_eq!(data_rows(&bytes), ["3", "2", "1"]);
+        let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(m) FROM et WHERE id = 1");
+        assert_eq!(data_rows(&bytes), ["mood"]);
+        // Still enforces its labels after replay.
+        assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO et VALUES (9,'bogus')")).contains("22P02"));
+        // The added value is usable.
+        run_with(&mut e, &mut b, "INSERT INTO et VALUES (4,'ok')");
+        let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
+        assert_eq!(data_rows(&bytes), ["3", "2", "4", "1"]);
+    }
+}
+
+#[test]
 fn drop_table_frees_the_name() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int)");

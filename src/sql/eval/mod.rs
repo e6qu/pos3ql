@@ -91,6 +91,7 @@ pub mod sqlstate {
     pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
     pub const UNDEFINED_OBJECT: &str = "42704";
     pub const DATATYPE_MISMATCH: &str = "42804";
+    pub const CANNOT_COERCE: &str = "42846";
     pub const DIVISION_BY_ZERO: &str = "22012";
     pub const NUMERIC_OUT_OF_RANGE: &str = "22003";
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
@@ -369,6 +370,23 @@ pub trait CatalogAccess {
         subid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
+    /// The name of the enum type in catalog `slot`, for `pg_typeof` on an enum
+    /// value. `None` if the slot holds no live enum.
+    fn enum_name<'a>(&self, _slot: u16, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// The sort key of `label` in the enum type at `slot`, resolving a text
+    /// literal against an enum in a comparison. `None` if the slot holds no
+    /// live enum or the label is not a member.
+    fn enum_label_sort(&self, _slot: u16, _label: &str) -> Option<f64> {
+        None
+    }
+    /// The catalog slot of the (possibly schema-qualified) enum type named
+    /// `type_name`, or `None` if no such live enum is visible — used to
+    /// resolve `value::enumtype` casts, which base-type name lookup cannot.
+    fn enum_slot_of_name(&self, _type_name: &str) -> Option<u16> {
+        None
+    }
 }
 
 /// Pre-evaluated (uncorrelated) subquery results.
@@ -420,9 +438,15 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
     use super::ast::BinaryOp;
     if expression.is_constant() {
         // A fully-constant subtree folds eagerly; its error surfaces here.
-        return Ok(match eval(expression, arena, NO_PARAMS, &NoColumns)? {
-            Datum::Bool(b) => Some(b),
-            _ => None,
+        return Ok(match eval(expression, arena, NO_PARAMS, &NoColumns) {
+            Ok(Datum::Bool(b)) => Some(b),
+            Ok(_) => None,
+            // A cast to a user-defined type (enum) cannot fold without the
+            // catalog, which this plan-time check does not carry; defer to
+            // runtime, which resolves and validates it (a genuinely missing
+            // type or bad enum label re-surfaces there).
+            Err(e) if e.sqlstate == sqlstate::UNDEFINED_OBJECT => None,
+            Err(e) => return Err(e),
         });
     }
     match expression {
@@ -720,7 +744,13 @@ pub fn eval_full<'a>(
             // Track which side is an "unknown" literal (a string literal or a
             // parameter): only those coerce to the other operand's type, as
             // PostgreSQL does. A real text value never coerces to a number.
-            binary(operator, l, r, is_unknown_literal(left), is_unknown_literal(right), arena)
+            let l_unknown = is_unknown_literal(left);
+            let r_unknown = is_unknown_literal(right);
+            // An enum operand meeting an unknown text literal resolves the
+            // literal to a member of the enum's type (the generic coercion has
+            // no catalog to look up labels). A non-member is 22P02.
+            let (l, r) = coerce_enum_literal(l, r, l_unknown, r_unknown, hooks, arena)?;
+            binary(operator, l, r, l_unknown, r_unknown, arena)
         }
         Expr::Cast { operand, type_name, type_mod } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
@@ -760,7 +790,18 @@ pub fn eval_full<'a>(
             // renders as the number and OID 0 as `-`, as PostgreSQL has it.
             if type_name.eq_ignore_ascii_case("regtype") {
                 match text_view(v) {
-                    Datum::Text(name) => return regtype_of_name(name),
+                    Datum::Text(name) => {
+                        // A known enum type name renders as itself (like a base
+                        // type's regtype), rather than erroring as "unknown".
+                        if let Some(cat) = hooks.catalog
+                            && cat.enum_slot_of_name(name.trim()).is_some()
+                        {
+                            return Ok(Datum::Text(
+                                arena.alloc_str(name.trim()).map_err(|_| arena_full())?,
+                            ));
+                        }
+                        return regtype_of_name(name);
+                    }
                     Datum::Int4(x) => return regtype_of_oid(x as i64, arena),
                     Datum::Int8(x) => return regtype_of_oid(x, arena),
                     _ => {}
@@ -784,6 +825,42 @@ pub fn eval_full<'a>(
                     _ => unreachable!(),
                 };
                 return Ok(Datum::Bit { bits: int_to_bits(value, n, arena)?, varying });
+            }
+            // Cast to a user-defined enum type: base-type name lookup does not
+            // know enums, so resolve the type name to its catalog slot and
+            // coerce the value to a member (validating the label, 22P02).
+            if ColType::from_sql_name(type_name).is_none()
+                && let Some(cat) = hooks.catalog
+                && let Some(slot) = cat.enum_slot_of_name(type_name)
+            {
+                if v.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let label = match text_view(v) {
+                    Datum::Text(s) => s,
+                    Datum::Enum { label, .. } => label,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::CANNOT_COERCE,
+                            "cannot cast type {} to {}",
+                            type_name_of(&v),
+                            type_name
+                        ))
+                    }
+                };
+                let Some(sort) = cat.enum_label_sort(slot, label) else {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_TEXT_REPRESENTATION,
+                        "invalid input value for enum {}: \"{}\"",
+                        type_name,
+                        label
+                    ));
+                };
+                return Ok(Datum::Enum {
+                    slot,
+                    sort,
+                    label: arena.alloc_str(label).map_err(|_| arena_full())?,
+                });
             }
             let v = cast(v, type_name, arena)?;
             // `::numeric(p,s)` / `::varchar(n)`: enforce the modifier on the
@@ -2866,6 +2943,42 @@ pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
     type_name_of(d)
 }
 
+/// When an enum value is compared with an unknown text literal, resolves the
+/// literal to a member of the enum's type (catalog-aware). PostgreSQL reports a
+/// non-member as 22P02. Non-enum pairs and already-typed operands pass through.
+fn coerce_enum_literal<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    l_unknown: bool,
+    r_unknown: bool,
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a Arena,
+) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
+    let resolve = |slot: u16, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
+        let label = match text {
+            Datum::Text(s) => s,
+            Datum::Bpchar(s) => s.trim_end_matches(' '),
+            _ => return Ok(text),
+        };
+        let cat = hooks.catalog.ok_or_else(|| {
+            sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid input value for enum: \"{}\"", label)
+        })?;
+        let Some(sort) = cat.enum_label_sort(slot, label) else {
+            return Err(sql_err!(
+                sqlstate::INVALID_TEXT_REPRESENTATION,
+                "invalid input value for enum: \"{}\"",
+                label
+            ));
+        };
+        Ok(Datum::Enum { slot, sort, label: arena.alloc_str(label).map_err(|_| arena_full())? })
+    };
+    match (l, r) {
+        (Datum::Enum { slot, .. }, _) if r_unknown => Ok((l, resolve(slot, r)?)),
+        (_, Datum::Enum { slot, .. }) if l_unknown => Ok((resolve(slot, l)?, r)),
+        _ => Ok((l, r)),
+    }
+}
+
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Array { element, .. } => element.array_name(),
@@ -2898,6 +3011,9 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Macaddr(_) => "macaddr",
         Datum::Macaddr8(_) => "macaddr8",
         Datum::Record(_) => "record",
+        // The real enum type name is dynamic; this fallback is used only in
+        // error messages where the catalog is not in scope.
+        Datum::Enum { .. } => "enum",
     }
 }
 

@@ -1653,6 +1653,8 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "localtimestamp" => of(ColType::Timestamp),
             "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
             | "clock_timestamp" => of(ColType::Timestamptz),
+            // Sequence functions return bigint.
+            "nextval" | "currval" | "lastval" | "setval" => of(ColType::Int8),
             "date_trunc" => {
                 // Returns the timestamp type of its second argument.
                 let a = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);

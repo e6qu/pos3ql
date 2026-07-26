@@ -327,7 +327,7 @@ pub(super) fn groups_for_mask<'a>(
             group: Some((statement.group_by, &key_vals[..n_keys], mask)),
             aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
             subs: group_subs,
-        windows: None, catalog: None, srf_index: None };
+        windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
         let schema = ScopeSchema(scope);
         if let Some(h) = statement.having {
             match eval_full(h, arena, params, &schema, &group_hooks)? {

@@ -281,7 +281,7 @@ pub(crate) fn materialized_rows<'a>(
                     correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
                 )?;
                 row_hooks_owned =
-                    EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None };
+                    EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
                 if let Some(w) = statement.where_clause
                     && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                         return Ok(true);
@@ -334,7 +334,7 @@ pub(crate) fn materialized_rows<'a>(
                         correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
                     )?;
                     row_hooks_owned =
-                        EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None };
+                        EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
                     if let Some(w) = statement.where_clause
                         && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                             return Ok(true);

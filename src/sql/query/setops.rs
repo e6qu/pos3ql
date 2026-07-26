@@ -313,7 +313,7 @@ fn eval_set_leaf<'a>(
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     // Pass 1: count the rows. Pass 2: coerce to the target types and encode.
     let mut count = 0usize;
-    select_into_rows(storage, txid, s, arena, params, None, &mut |_| {
+    select_into_rows(storage, txid, s, arena, params, None, None, &mut |_| {
         count += 1;
         Ok(())
     })?;
@@ -321,7 +321,7 @@ fn eval_set_leaf<'a>(
     let rows = arena.alloc_slice_with(count, |_| empty).map_err(|_| arena_full())?;
     let n = target.len();
     let mut at = 0usize;
-    select_into_rows(storage, txid, s, arena, params, None, &mut |vals| {
+    select_into_rows(storage, txid, s, arena, params, None, None, &mut |vals| {
         if vals.len() != n {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,

@@ -59,6 +59,20 @@ pub enum Stmt<'a> {
     RefreshMaterializedView { name: QualName<'a> },
     /// DROP MATERIALIZED VIEW [IF EXISTS] name.
     DropMaterializedView { names: &'a [QualName<'a>], if_exists: bool },
+    /// CREATE SEQUENCE [IF NOT EXISTS] name [options].
+    CreateSequence {
+        name: QualName<'a>,
+        if_not_exists: bool,
+        options: SeqOptions<'a>,
+    },
+    /// ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]].
+    AlterSequence {
+        name: QualName<'a>,
+        if_exists: bool,
+        options: SeqOptions<'a>,
+    },
+    /// DROP SEQUENCE [IF EXISTS] name [, ...].
+    DropSequence { names: &'a [QualName<'a>], if_exists: bool },
     /// CREATE [UNIQUE] INDEX name ON table (col, ...).
     CreateIndex {
         name: &'a str,
@@ -405,6 +419,47 @@ pub enum TableConstraint<'a> {
         on_delete: FkAction,
         on_update: FkAction,
     },
+}
+
+/// A MIN/MAXVALUE option, three-valued so ALTER SEQUENCE can tell "left alone"
+/// (`Unset`) from "reset to the type default" (`NoBound`) from an explicit value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqBound {
+    Unset,
+    NoBound,
+    Value(i64),
+}
+
+/// Parsed CREATE/ALTER SEQUENCE options, each `None`/`Unset` when the clause was
+/// omitted. The executor computes defaults and validates; for ALTER an omitted
+/// option keeps the sequence's current setting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeqOptions<'a> {
+    /// AS <type> — the raw type name (`smallint`/`integer`/`bigint` and aliases).
+    pub data_type: Option<&'a str>,
+    pub increment: Option<i64>,
+    pub min_value: SeqBound,
+    pub max_value: SeqBound,
+    pub start: Option<i64>,
+    pub cache: Option<i64>,
+    /// Some(true) = CYCLE, Some(false) = NO CYCLE, None = unspecified.
+    pub cycle: Option<bool>,
+    /// None = no RESTART clause; Some(None) = RESTART (to start value);
+    /// Some(Some(n)) = RESTART WITH n. (ALTER only.)
+    pub restart: Option<Option<i64>>,
+}
+
+impl<'a> SeqOptions<'a> {
+    pub const EMPTY: SeqOptions<'a> = SeqOptions {
+        data_type: None,
+        increment: None,
+        min_value: SeqBound::Unset,
+        max_value: SeqBound::Unset,
+        start: None,
+        cache: None,
+        cycle: None,
+        restart: None,
+    };
 }
 
 /// Referential action for a foreign key's ON DELETE / ON UPDATE.
@@ -793,6 +848,14 @@ impl Expr<'_> {
     pub fn is_constant(&self) -> bool {
         /// Set-returning functions expand to multiple rows and are never a
         /// foldable constant.
+        /// Volatile sequence functions: never a foldable constant (they have
+        /// side effects and must reach the sequence engine).
+        fn is_sequence_function(name: &str) -> bool {
+            name.eq_ignore_ascii_case("nextval")
+                || name.eq_ignore_ascii_case("currval")
+                || name.eq_ignore_ascii_case("lastval")
+                || name.eq_ignore_ascii_case("setval")
+        }
         fn is_set_returning(name: &str) -> bool {
             name.eq_ignore_ascii_case("unnest")
                 || name.eq_ignore_ascii_case("generate_series")
@@ -837,12 +900,15 @@ impl Expr<'_> {
                     && whens.iter().all(|(c, r)| c.is_constant() && r.is_constant())
                     && otherwise.map(|e| e.is_constant()).unwrap_or(true)
             }
-            // Aggregates, window functions, and set-returning functions are
-            // never constant; other calls are constant when their arguments are.
+            // Aggregates, window functions, set-returning functions, and the
+            // side-effecting sequence functions are never constant (the last
+            // must reach the sequence engine, not be folded at plan time); other
+            // calls are constant when their arguments are.
             Expr::Call { name, args, over, .. } => {
                 over.is_none()
                     && !self.is_aggregate()
                     && !is_set_returning(name)
+                    && !is_sequence_function(name)
                     && args.iter().all(|a| a.is_constant())
             }
             Expr::Array(items) => items.iter().all(|e| e.is_constant()),

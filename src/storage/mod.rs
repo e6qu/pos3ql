@@ -7,6 +7,7 @@
 
 pub(crate) mod rowenc;
 
+use core::cell::Cell;
 use core::hash::{Hash, Hasher};
 
 use crate::config::Config;
@@ -692,6 +693,189 @@ impl MatviewDef {
     }
 }
 
+/// The most sequences the catalog holds. A compile-time cap (not config-driven)
+/// so a session's `currval` bag ([`crate::sql::guc::GucState`]) can be a fixed
+/// inline array keyed by slot; exhausting it is a loud error, never growth.
+pub(crate) const MAX_SEQUENCES: usize = 64;
+
+/// A sequence's declared integer type: it sets the default MIN/MAXVALUE and the
+/// `pg_sequence.seqtypid` the catalog reports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeqType {
+    Smallint,
+    Integer,
+    Bigint,
+}
+
+impl SeqType {
+    /// The type's representable range, bounding explicit MIN/MAXVALUE.
+    pub fn bounds(self) -> (i64, i64) {
+        match self {
+            SeqType::Smallint => (i16::MIN as i64, i16::MAX as i64),
+            SeqType::Integer => (i32::MIN as i64, i32::MAX as i64),
+            SeqType::Bigint => (i64::MIN, i64::MAX),
+        }
+    }
+
+    /// `pg_type` OID (`int2`/`int4`/`int8`), for `pg_sequence.seqtypid`.
+    pub fn oid(self) -> i32 {
+        match self {
+            SeqType::Smallint => 21,
+            SeqType::Integer => 23,
+            SeqType::Bigint => 20,
+        }
+    }
+
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            SeqType::Smallint => "smallint",
+            SeqType::Integer => "integer",
+            SeqType::Bigint => "bigint",
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            SeqType::Smallint => 0,
+            SeqType::Integer => 1,
+            SeqType::Bigint => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> SeqType {
+        match v {
+            0 => SeqType::Smallint,
+            1 => SeqType::Integer,
+            _ => SeqType::Bigint,
+        }
+    }
+}
+
+/// A named sequence generator. Its *existence* (`live`/`pending`) is
+/// transactional catalog state, mirroring [`ViewDef`]; its *value* state
+/// (`last_value`/`is_called`/`dirty`) is deliberately **not** — a `nextval`
+/// advance survives `ROLLBACK`, exactly as PostgreSQL leaves gaps. Those three
+/// fields are [`Cell`]s so `nextval`/`setval` can advance the generator through
+/// a shared `&Storage` borrow (the pure expression evaluator never holds
+/// `&mut`), allocation-free.
+#[derive(Clone)]
+pub struct SequenceDef {
+    pub created_at: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub data_type: SeqType,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub start_value: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    /// The last value handed out (meaningful only when `is_called`); on CREATE /
+    /// RESTART it holds the start value with `is_called == false`, so the first
+    /// `nextval` returns it unchanged (PostgreSQL's `setval(seq, start, false)`).
+    pub last_value: Cell<i64>,
+    pub is_called: Cell<bool>,
+    /// The value state changed since it was last journaled; `commit_txn` writes a
+    /// `SequenceAdvance` and clears it, regardless of whether the surrounding
+    /// transaction committed (advances are non-transactional).
+    pub dirty: Cell<bool>,
+    pub live: bool,
+    pub pending: Option<PendingDdl>,
+}
+
+/// The tunable parameters of a sequence, computed and validated by the executor
+/// from the CREATE/ALTER options, then handed to storage. Kept apart from the
+/// live value state ([`SequenceDef`]'s `Cell` fields).
+#[derive(Clone, Copy)]
+pub struct SeqSpec {
+    pub data_type: SeqType,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub start_value: i64,
+    pub cache: i64,
+    pub cycle: bool,
+}
+
+impl SequenceDef {
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(p) if p.txid == txid => p.creating,
+            _ => self.live,
+        }
+    }
+
+    /// Advances the generator and returns the next value, or the 2200H overflow
+    /// error when a non-cycling sequence runs off its bound. Mutates value state
+    /// through the `Cell` fields (a `&Storage` borrow is all the caller holds).
+    pub fn next_value(&self) -> Result<i64, SqlError> {
+        if !self.is_called.get() {
+            // First call after CREATE/RESTART yields the start value unchanged.
+            self.is_called.set(true);
+            self.dirty.set(true);
+            return Ok(self.last_value.get());
+        }
+        let current = self.last_value.get();
+        let next = current.checked_add(self.increment);
+        let value = if self.increment > 0 {
+            match next {
+                Some(n) if n <= self.max_value => n,
+                _ if self.cycle => self.min_value,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
+                        "nextval: reached maximum value of sequence \"{}\" ({})",
+                        self.name.as_str(),
+                        self.max_value
+                    ))
+                }
+            }
+        } else {
+            match next {
+                Some(n) if n >= self.min_value => n,
+                _ if self.cycle => self.max_value,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
+                        "nextval: reached minimum value of sequence \"{}\" ({})",
+                        self.name.as_str(),
+                        self.min_value
+                    ))
+                }
+            }
+        };
+        self.last_value.set(value);
+        self.dirty.set(true);
+        Ok(value)
+    }
+
+    /// Validates a `setval` target is within `[min, max]` (22003), without
+    /// moving the generator.
+    pub fn check_setval(&self, value: i64) -> Result<(), SqlError> {
+        if value < self.min_value || value > self.max_value {
+            return Err(sql_err!(
+                sqlstate::NUMERIC_OUT_OF_RANGE,
+                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                value,
+                self.name.as_str(),
+                self.min_value,
+                self.max_value
+            ));
+        }
+        Ok(())
+    }
+
+    /// `setval`: positions the generator, validating the value is in range
+    /// (22003). `is_called == false` makes the next `nextval` return `value`.
+    pub fn set_value(&self, value: i64, is_called: bool) -> Result<i64, SqlError> {
+        self.check_setval(value)?;
+        self.last_value.set(value);
+        self.is_called.set(is_called);
+        self.dirty.set(true);
+        Ok(value)
+    }
+}
+
 /// Maximum columns in an index key.
 pub(crate) const MAX_INDEX_COLS: usize = 8;
 
@@ -814,6 +998,7 @@ pub struct Storage {
     tables: FixedVec<Table>,
     views: FixedVec<ViewDef>,
     matviews: FixedVec<MatviewDef>,
+    sequences: FixedVec<SequenceDef>,
     indexes: FixedVec<IndexDef>,
     schemas: FixedVec<SchemaDef>,
     /// The running statement's effective search path (see [`PathContext`]).
@@ -946,6 +1131,7 @@ impl Storage {
                 + size_of::<MatviewDef>()
                 + size_of::<IndexDef>())
             + MAX_SCHEMAS * size_of::<SchemaDef>()
+            + MAX_SEQUENCES * size_of::<SequenceDef>()
             + ValueIndexPool::budget_bytes(
                 config.max_value_indexes,
                 config.value_index_rows + config.table_rows,
@@ -1020,6 +1206,28 @@ impl Storage {
                 })
                 .expect("sized to max_tables");
         }
+        let mut sequences = FixedVec::new(budget, "sequences", MAX_SEQUENCES)?;
+        for _ in 0..MAX_SEQUENCES {
+            sequences
+                .push(SequenceDef {
+                    created_at: 0,
+                    schema: SqlName::EMPTY,
+                    name: SqlName::EMPTY,
+                    data_type: SeqType::Bigint,
+                    increment: 1,
+                    min_value: 1,
+                    max_value: i64::MAX,
+                    start_value: 1,
+                    cache: 1,
+                    cycle: false,
+                    last_value: Cell::new(1),
+                    is_called: Cell::new(false),
+                    dirty: Cell::new(false),
+                    live: false,
+                    pending: None,
+                })
+                .expect("sized to MAX_SEQUENCES");
+        }
         let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
         for i in 0..MAX_SCHEMAS {
             schemas
@@ -1063,6 +1271,7 @@ impl Storage {
             tables,
             views,
             matviews,
+            sequences,
             indexes,
             schemas,
             path: PathContext::public_only(),
@@ -2885,6 +3094,208 @@ impl Storage {
             m.pending = None;
         } else if matches!(m.pending, Some(p) if p.txid == txid) {
             m.pending = Some(PendingDdl { txid, creating: true });
+        }
+    }
+
+    // --- Sequences -------------------------------------------------------
+
+    pub fn live_sequences(&self) -> impl Iterator<Item = &SequenceDef> {
+        self.sequences.iter().filter(|s| s.live)
+    }
+
+    pub fn sequences_with_slots(&self) -> impl Iterator<Item = (usize, &SequenceDef)> {
+        self.sequences.iter().enumerate().filter(|(_, s)| s.live)
+    }
+
+    pub(crate) fn sequence(&self, slot: usize) -> &SequenceDef {
+        &self.sequences[slot]
+    }
+
+    pub(crate) fn sequence_count(&self) -> usize {
+        self.sequences.len()
+    }
+
+    pub fn find_sequence(&self, schema: &str, name: &str, txid: u32) -> Option<&SequenceDef> {
+        self.sequences.iter().find(|s| {
+            s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name
+        })
+    }
+
+    pub fn sequence_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.sequences.iter().position(|s| {
+            s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name
+        })
+    }
+
+    /// Resolves a (possibly unqualified) sequence name to its slot: a qualifier
+    /// names the schema directly, otherwise the search path is walked, matching
+    /// [`Self::resolve_relation`].
+    pub fn sequence_on_path(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        if let Some(schema) = qualifier {
+            return self.sequence_slot(schema, name, txid);
+        }
+        for entry in self.path.entries() {
+            if let PathEntry::Schema(slot) = entry {
+                let schema_name = self.schemas[*slot as usize].name;
+                if let Some(found) = self.sequence_slot(schema_name.as_str(), name, txid) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether a relation of this name is visible to `txid` in `schema` — a
+    /// table (including a matview's backing table), view, or sequence. Sequences
+    /// share PostgreSQL's relation namespace, so CREATE SEQUENCE collides with
+    /// any of them (42P07).
+    pub fn relation_name_taken(&self, schema: &str, name: &str, txid: u32) -> bool {
+        self.relation_in(schema, name, txid).is_some()
+            || self.find_sequence(schema, name, txid).is_some()
+    }
+
+    /// Registers a sequence as an uncommitted CREATE owned by `txid`. The caller
+    /// has already validated options and checked the name is free.
+    pub fn create_sequence(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        spec: SeqSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if self.sequences.iter().any(|s| {
+            s.schema.as_str() == schema.as_str()
+                && s.name.as_str() == name.as_str()
+                && matches!(s.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name.as_str()
+            ));
+        }
+        let Some(new) = self
+            .sequences
+            .iter()
+            .position(|s| !s.live && s.pending.is_none())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many sequences (limit {})",
+                self.sequences.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.sequences[new] = SequenceDef {
+            created_at: self.catalog_seq,
+            schema,
+            name,
+            data_type: spec.data_type,
+            increment: spec.increment,
+            min_value: spec.min_value,
+            max_value: spec.max_value,
+            start_value: spec.start_value,
+            cache: spec.cache,
+            cycle: spec.cycle,
+            last_value: Cell::new(spec.start_value),
+            is_called: Cell::new(false),
+            dirty: Cell::new(false),
+            live: false,
+            pending: Some(PendingDdl { txid, creating: true }),
+        };
+        Ok(new)
+    }
+
+    /// Replaces a live sequence's parameters in place (ALTER SEQUENCE). Value
+    /// state (last_value/is_called) is untouched unless `restart` is given.
+    pub fn alter_sequence(&mut self, slot: usize, spec: SeqSpec, restart: Option<i64>) {
+        let s = &mut self.sequences[slot];
+        s.data_type = spec.data_type;
+        s.increment = spec.increment;
+        s.min_value = spec.min_value;
+        s.max_value = spec.max_value;
+        s.start_value = spec.start_value;
+        s.cache = spec.cache;
+        s.cycle = spec.cycle;
+        if let Some(r) = restart {
+            s.last_value.set(r);
+            s.is_called.set(false);
+            s.dirty.set(true);
+        }
+    }
+
+    pub fn drop_sequence(
+        &mut self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        if self.sequences.iter().any(|s| {
+            s.schema.as_str() == schema
+                && s.name.as_str() == name
+                && matches!(s.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name
+            ));
+        }
+        let Some(i) = self.sequences.iter().position(|s| {
+            s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name
+        }) else {
+            return Ok(None);
+        };
+        let s = &mut self.sequences[i];
+        if matches!(s.pending, Some(p) if p.txid == txid && p.creating) {
+            s.live = false;
+            s.pending = None;
+        } else {
+            s.pending = Some(PendingDdl { txid, creating: false });
+        }
+        Ok(Some(i))
+    }
+
+    pub fn commit_sequence_create(&mut self, slot: usize) {
+        self.sequences[slot].live = true;
+        self.sequences[slot].pending = None;
+    }
+
+    pub fn commit_sequence_drop(&mut self, slot: usize) {
+        self.sequences[slot].live = false;
+        self.sequences[slot].pending = None;
+    }
+
+    pub fn rollback_sequence_create(&mut self, slot: usize) {
+        self.sequences[slot].live = false;
+        self.sequences[slot].pending = None;
+    }
+
+    pub fn rollback_sequence_drop(&mut self, slot: usize, txid: u32) {
+        let s = &mut self.sequences[slot];
+        if s.live {
+            s.pending = None;
+        } else if matches!(s.pending, Some(p) if p.txid == txid) {
+            s.pending = Some(PendingDdl { txid, creating: true });
+        }
+    }
+
+    /// Applies a replayed/absolute `SequenceAdvance`: set value state directly,
+    /// without marking dirty (replay must not re-journal).
+    pub fn apply_sequence_advance(&mut self, schema: &str, name: &str, last: i64, is_called: bool) {
+        if let Some(i) = self.sequences.iter().position(|s| {
+            (s.live || s.pending.is_some())
+                && s.schema.as_str() == schema
+                && s.name.as_str() == name
+        }) {
+            self.sequences[i].last_value.set(last);
+            self.sequences[i].is_called.set(is_called);
+            self.sequences[i].dirty.set(false);
         }
     }
 

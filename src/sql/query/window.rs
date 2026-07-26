@@ -1125,6 +1125,7 @@ pub(crate) fn project_window_rows<'a>(
             subs,
             windows: Some((win_ptrs, &wv[..win_nodes.len()])),
             catalog: hooks.catalog, srf_index: hooks.srf_index,
+            sequences: hooks.sequences,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
         let np =

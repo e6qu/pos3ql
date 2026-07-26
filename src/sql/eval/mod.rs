@@ -97,6 +97,7 @@ pub mod sqlstate {
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+    pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
@@ -309,6 +310,22 @@ pub struct EvalHooks<'h, 'a> {
     /// The current 1-based expansion index of a set-returning function
     /// (`_pg_expandarray`) in the projection; `None` outside such expansion.
     pub srf_index: Option<usize>,
+    /// Sequence side-effects for `nextval`/`currval`/`lastval`/`setval`. `None`
+    /// in contexts where a sequence function cannot appear (catalog synthesis,
+    /// constraint checks); the volatile functions error `0A000`-style if called
+    /// without it. A trait object with interior mutability so evaluation stays
+    /// `&`-only while advancing the generator.
+    pub sequences: Option<&'h dyn SequenceAccess>,
+}
+
+/// The side-effecting sequence functions, abstracted so `eval` need not depend
+/// on `Storage`. The implementor advances/reads generators (through `Cell`
+/// interior mutability) and the session's `currval`/`lastval` state.
+pub trait SequenceAccess {
+    fn nextval(&self, name: &str) -> Result<i64, SqlError>;
+    fn currval(&self, name: &str) -> Result<i64, SqlError>;
+    fn lastval(&self) -> Result<i64, SqlError>;
+    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -351,7 +368,7 @@ pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     group: None,
     aggs: None,
     subs: None,
-    windows: None, catalog: None, srf_index: None };
+    windows: None, catalog: None, srf_index: None, sequences: None };
 
 pub fn eval<'a>(
     expression: &Expr<'a>,
@@ -1315,6 +1332,64 @@ fn call<'a>(
             sqlstate::GROUPING_ERROR,
             "aggregate functions are not allowed here"
         )),
+        // Sequence functions: side-effecting, so they run through the
+        // `hooks.sequences` bridge (interior-mutable) rather than as pure eval.
+        "nextval" | "currval" | "setval" => {
+            let engine = hooks.sequences.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "{}() cannot be used in this context",
+                    name
+                )
+            })?;
+            let seq_name = match args::text_arg(name, args, 0, arena, params, row, hooks)? {
+                Some(s) => s,
+                None => return Ok(Datum::Null),
+            };
+            let result = match name {
+                "nextval" => {
+                    arity(1)?;
+                    engine.nextval(seq_name)?
+                }
+                "currval" => {
+                    arity(1)?;
+                    engine.currval(seq_name)?
+                }
+                _ => {
+                    if args.len() != 2 && args.len() != 3 || star {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function setval(...) with {} arguments does not exist",
+                            args.len()
+                        ));
+                    }
+                    let value = match args::int_arg(name, args, 1, arena, params, row, hooks)? {
+                        Some(v) => v,
+                        None => return Ok(Datum::Null),
+                    };
+                    let is_called = if args.len() == 3 {
+                        match args::bool_arg(name, args, 2, arena, params, row, hooks)? {
+                            Some(b) => b,
+                            None => return Ok(Datum::Null),
+                        }
+                    } else {
+                        true
+                    };
+                    engine.setval(seq_name, value, is_called)?
+                }
+            };
+            Ok(Datum::Int8(result))
+        }
+        "lastval" => {
+            arity(0)?;
+            let engine = hooks.sequences.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "lastval() cannot be used in this context"
+                )
+            })?;
+            Ok(Datum::Int8(engine.lastval()?))
+        }
         // Set-returning functions: during expansion `hooks.srf_index` (1-based)
         // selects which element/value this output row carries.
         "unnest" => {

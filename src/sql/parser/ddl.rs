@@ -45,6 +45,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("schema")? {
             return self.create_schema();
         }
+        if self.eat_ident("sequence")? {
+            return self.create_sequence();
+        }
         self.create_table()
     }
 
@@ -70,6 +73,119 @@ impl<'a> Parser<'a> {
             true
         };
         Ok(Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists, materialized })
+    }
+
+    /// `CREATE SEQUENCE [IF NOT EXISTS] name [options]` ("create sequence"
+    /// consumed).
+    fn create_sequence(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.qual_name("sequence name")?;
+        let options = self.seq_options(false)?;
+        Ok(Stmt::CreateSequence { name, if_not_exists, options })
+    }
+
+    /// `ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]]` ("alter
+    /// sequence" consumed).
+    pub(super) fn alter_sequence(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.qual_name("sequence name")?;
+        let options = self.seq_options(true)?;
+        Ok(Stmt::AlterSequence { name, if_exists, options })
+    }
+
+    /// The shared CREATE/ALTER SEQUENCE option list. `allow_restart` enables the
+    /// ALTER-only `RESTART [WITH n]` clause.
+    fn seq_options(
+        &mut self,
+        allow_restart: bool,
+    ) -> Result<crate::sql::ast::SeqOptions<'a>, ParseError> {
+        use crate::sql::ast::{SeqBound, SeqOptions};
+        let mut o = SeqOptions::EMPTY;
+        loop {
+            if self.eat_ident("as")? {
+                o.data_type = Some(self.any_ident("sequence data type")?);
+            } else if self.eat_ident("increment")? {
+                let _ = self.eat_ident("by")?;
+                o.increment = Some(self.seq_int()?);
+            } else if self.eat_ident("minvalue")? {
+                o.min_value = SeqBound::Value(self.seq_int()?);
+            } else if self.eat_ident("maxvalue")? {
+                o.max_value = SeqBound::Value(self.seq_int()?);
+            } else if self.eat_ident("start")? {
+                let _ = self.eat_ident("with")?;
+                o.start = Some(self.seq_int()?);
+            } else if self.eat_ident("cache")? {
+                o.cache = Some(self.seq_int()?);
+            } else if self.eat_ident("cycle")? {
+                o.cycle = Some(true);
+            } else if self.eat_ident("no")? {
+                if self.eat_ident("minvalue")? {
+                    o.min_value = SeqBound::NoBound;
+                } else if self.eat_ident("maxvalue")? {
+                    o.max_value = SeqBound::NoBound;
+                } else {
+                    self.expect_ident("cycle")?;
+                    o.cycle = Some(false);
+                }
+            } else if self.eat_ident("owned")? {
+                // OWNED BY { table.column | NONE } — sequence ownership links a
+                // sequence to a column's lifetime. This engine models no such
+                // link, so the clause is parsed and dropped.
+                self.expect_ident("by")?;
+                if !self.eat_ident("none")? {
+                    let _ = self.col_ident("owner column")?;
+                    while self.eat_op(".")? {
+                        let _ = self.col_ident("owner column")?;
+                    }
+                }
+            } else if allow_restart && self.eat_ident("restart")? {
+                // RESTART [WITH] n, or bare RESTART (reposition to the start).
+                let value = if self.eat_ident("with")?
+                    || matches!(self.peeked, Tok::Num(_))
+                    || self.peeked == Tok::Op("-")
+                {
+                    Some(self.seq_int()?)
+                } else {
+                    None
+                };
+                o.restart = Some(value);
+            } else {
+                break;
+            }
+        }
+        Ok(o)
+    }
+
+    /// A signed integer literal for a sequence option. Parses through `i128` so
+    /// `MINVALUE -9223372036854775808` (i64::MIN) is representable.
+    fn seq_int(&mut self) -> Result<i64, ParseError> {
+        let negative = self.eat_op("-")?;
+        if !negative {
+            let _ = self.eat_op("+")?;
+        }
+        match self.peeked {
+            Tok::Num(text) => {
+                let magnitude: i128 = text
+                    .parse()
+                    .map_err(|_| self.unexpected("expected an integer"))?;
+                self.advance()?;
+                let value = if negative { -magnitude } else { magnitude };
+                i64::try_from(value)
+                    .map_err(|_| self.unexpected("sequence option value out of range for bigint"))
+            }
+            _ => Err(self.unexpected("expected an integer")),
+        }
     }
 
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] AS <query>
@@ -224,6 +340,10 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("schema")? {
             return self.drop_schema();
+        }
+        if self.eat_ident("sequence")? {
+            let (names, if_exists) = self.drop_targets("sequence name")?;
+            return Ok(Stmt::DropSequence { names, if_exists });
         }
         self.drop_table()
     }

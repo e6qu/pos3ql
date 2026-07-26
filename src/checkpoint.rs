@@ -1123,6 +1123,50 @@ impl Checkpointer {
                         })?;
                     storage.commit_matview_create(slot);
                 }
+                Some("sq2") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let read_hex = |w: Option<&str>, what: &'static str| {
+                        w.ok_or(CheckpointSetupError::Corrupt(what))
+                            .and_then(decode_hex_name)
+                    };
+                    let schema = read_hex(words.next(), "sq2 schema missing")?;
+                    let name = read_hex(words.next(), "sq2 name missing")?;
+                    let data_type: u8 = parse_field(words.next(), "sq2 type")?;
+                    let increment: i64 = parse_field(words.next(), "sq2 increment")?;
+                    let min_value: i64 = parse_field(words.next(), "sq2 min")?;
+                    let max_value: i64 = parse_field(words.next(), "sq2 max")?;
+                    let start_value: i64 = parse_field(words.next(), "sq2 start")?;
+                    let cache: i64 = parse_field(words.next(), "sq2 cache")?;
+                    let cycle: u8 = parse_field(words.next(), "sq2 cycle")?;
+                    let last_value: i64 = parse_field(words.next(), "sq2 last")?;
+                    let is_called: u8 = parse_field(words.next(), "sq2 is_called")?;
+                    let slot = storage
+                        .create_sequence(
+                            sql_name(&schema)?,
+                            sql_name(&name)?,
+                            crate::storage::SeqSpec {
+                                data_type: crate::storage::SeqType::from_u8(data_type),
+                                increment,
+                                min_value,
+                                max_value,
+                                start_value,
+                                cache,
+                                cycle: cycle != 0,
+                            },
+                            0,
+                        )
+                        .map_err(|e| {
+                            CheckpointSetupError::S3(format!(
+                                "manifest sequence rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_sequence_create(slot);
+                    let seq = storage.sequence(slot);
+                    seq.last_value.set(last_value);
+                    seq.is_called.set(is_called != 0);
+                    seq.dirty.set(false);
+                }
                 Some("idx") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let unique: u8 = parse_field(words.next(), "idx unique")?;
@@ -1793,6 +1837,37 @@ Ok(CheckpointStep::Published { lsn })
                     hpath.as_str(),
                     hname.as_str(),
                     u8::from(mv.populated)
+                ),
+            )?;
+        }
+        // Sequences: hex schema/name, then the numeric parameters and the live
+        // value state (`last_value`, `is_called`). A sequence stores no rows, so
+        // this line is its whole durable form.
+        for seq in storage.live_sequences() {
+            use core::fmt::Write;
+            let mut hschema = StackStr::<130>::new();
+            for b in seq.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{b:02x}");
+            }
+            let mut hname = StackStr::<130>::new();
+            for b in seq.name.as_str().as_bytes() {
+                let _ = write!(hname, "{b:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "sq2 {} {} {} {} {} {} {} {} {} {} {}",
+                    hschema.as_str(),
+                    hname.as_str(),
+                    seq.data_type.to_u8(),
+                    seq.increment,
+                    seq.min_value,
+                    seq.max_value,
+                    seq.start_value,
+                    seq.cache,
+                    u8::from(seq.cycle),
+                    seq.last_value.get(),
+                    u8::from(seq.is_called.get()),
                 ),
             )?;
         }

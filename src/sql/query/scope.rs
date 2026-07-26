@@ -225,7 +225,7 @@ impl<'d> QueryScope<'d> {
         let mut store: *mut &[u8] = core::ptr::null_mut();
         let mut len = 0usize;
         let mut cap = 0usize;
-        select_into_rows(storage, txid, sub, arena, params, None, &mut |vals| {
+        select_into_rows(storage, txid, sub, arena, params, None, None, &mut |vals| {
             let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
             if len == cap {
                 let new_cap = if cap == 0 { 8 } else { cap * 2 };

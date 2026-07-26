@@ -12,7 +12,7 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::util::StackStr;
 use crate::storage::{
-    ColumnMeta, RowHome, SqlName, Storage, TableDef, MAX_COLUMNS,
+    ColumnMeta, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef, MAX_COLUMNS,
 };
 use super::txn::TxnState;
 use crate::storage::rowenc;
@@ -684,6 +684,15 @@ pub fn drop_table(
                 schema
             ));
         }
+        // A sequence is a relation, but not a table: DROP TABLE on it is a type
+        // error (42809), which IF EXISTS does not suppress.
+        if storage.sequence_on_path(name.schema, name.name, txn.txid).is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a table",
+                name.name
+            ));
+        }
         match storage.resolve_relation(name.schema, name.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(index))
                 if storage
@@ -1341,7 +1350,7 @@ pub fn create_table_as(
         };
         let mut rows = 0usize;
         if let Err(e) = super::query::select_into_rows(
-            storage, txn.txid, sel, arena, params, None, &mut |_| {
+            storage, txn.txid, sel, arena, params, None, None, &mut |_| {
                 rows += 1;
                 Ok(())
             },
@@ -1360,7 +1369,7 @@ pub fn create_table_as(
         };
         let mut at = 0usize;
         if let Err(e) = super::query::select_into_rows(
-            storage, txn.txid, sel, arena, params, None, &mut |vals| {
+            storage, txn.txid, sel, arena, params, None, None, &mut |vals| {
                 rows_bytes[at] = encode_projected_pub(vals, arena)?;
                 at += 1;
                 Ok(())
@@ -1499,7 +1508,7 @@ pub fn refresh_materialized_view(
     };
     let mut rows = 0usize;
     if let Err(e) = super::query::select_into_rows(
-        storage, txn.txid, sel, arena, params, None, &mut |_| {
+        storage, txn.txid, sel, arena, params, None, None, &mut |_| {
             rows += 1;
             Ok(())
         },
@@ -1518,7 +1527,7 @@ pub fn refresh_materialized_view(
     };
     let mut at = 0usize;
     if let Err(e) = super::query::select_into_rows(
-        storage, txn.txid, sel, arena, params, None, &mut |vals| {
+        storage, txn.txid, sel, arena, params, None, None, &mut |vals| {
             rows_bytes[at] = encode_projected_pub(vals, arena)?;
             at += 1;
             Ok(())
@@ -1633,6 +1642,359 @@ pub fn drop_materialized_view(
     }
     responder.command_complete("DROP MATERIALIZED VIEW")?;
     sql_ok()
+}
+
+/// Maps an `AS <type>` name to a [`SeqType`]; unknown types are rejected exactly
+/// as PostgreSQL rejects them.
+fn seq_type_of(name: &str) -> Result<SeqType, SqlError> {
+    match name {
+        "smallint" | "int2" => Ok(SeqType::Smallint),
+        "integer" | "int" | "int4" => Ok(SeqType::Integer),
+        "bigint" | "int8" => Ok(SeqType::Bigint),
+        _ => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "sequence type must be smallint, integer, or bigint"
+        )),
+    }
+}
+
+/// Computes and validates a [`SeqSpec`] from parsed options, against real
+/// PostgreSQL's rules and SQLSTATEs. `base` is the current spec for ALTER (an
+/// omitted option keeps its current value); `None` for CREATE (omitted options
+/// take their defaults). Returns the spec and any RESTART target.
+fn resolve_seq_spec(
+    options: &crate::sql::ast::SeqOptions,
+    base: Option<SeqSpec>,
+) -> Result<(SeqSpec, Option<i64>), SqlError> {
+    use crate::sql::ast::SeqBound;
+    let data_type = match options.data_type {
+        Some(n) => seq_type_of(n)?,
+        None => base.map(|b| b.data_type).unwrap_or(SeqType::Bigint),
+    };
+    let increment = options
+        .increment
+        .or(base.map(|b| b.increment))
+        .unwrap_or(1);
+    if increment == 0 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "INCREMENT must not be zero"
+        ));
+    }
+    let ascending = increment > 0;
+    let (type_min, type_max) = data_type.bounds();
+    let default_min = if ascending { 1 } else { type_min };
+    let default_max = if ascending { type_max } else { -1 };
+    let min_value = match options.min_value {
+        SeqBound::Value(v) => {
+            if v < type_min || v > type_max {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "MINVALUE ({}) is out of range for sequence data type {}",
+                    v,
+                    data_type.sql_name()
+                ));
+            }
+            v
+        }
+        SeqBound::NoBound => default_min,
+        SeqBound::Unset => base.map(|b| b.min_value).unwrap_or(default_min),
+    };
+    let max_value = match options.max_value {
+        SeqBound::Value(v) => {
+            if v < type_min || v > type_max {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "MAXVALUE ({}) is out of range for sequence data type {}",
+                    v,
+                    data_type.sql_name()
+                ));
+            }
+            v
+        }
+        SeqBound::NoBound => default_max,
+        SeqBound::Unset => base.map(|b| b.max_value).unwrap_or(default_max),
+    };
+    if min_value >= max_value {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "MINVALUE ({}) must be less than MAXVALUE ({})",
+            min_value,
+            max_value
+        ));
+    }
+    let default_start = if ascending { min_value } else { max_value };
+    let start_value = options
+        .start
+        .or(base.map(|b| b.start_value))
+        .unwrap_or(default_start);
+    if start_value < min_value {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "START value ({}) cannot be less than MINVALUE ({})",
+            start_value,
+            min_value
+        ));
+    }
+    if start_value > max_value {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "START value ({}) cannot be greater than MAXVALUE ({})",
+            start_value,
+            max_value
+        ));
+    }
+    let cache = options.cache.or(base.map(|b| b.cache)).unwrap_or(1);
+    if cache < 1 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "CACHE ({}) must be greater than zero",
+            cache
+        ));
+    }
+    let cycle = options.cycle.or(base.map(|b| b.cycle)).unwrap_or(false);
+    // RESTART [WITH n]: n defaults to the (new) start value; validate it is in
+    // range, matching PostgreSQL.
+    let restart = match options.restart {
+        None => None,
+        Some(explicit) => {
+            let target = explicit.unwrap_or(start_value);
+            if target < min_value || target > max_value {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "RESTART value ({}) cannot be less than MINVALUE ({})",
+                    target,
+                    min_value
+                ));
+            }
+            Some(target)
+        }
+    };
+    Ok((
+        SeqSpec { data_type, increment, min_value, max_value, start_value, cache, cycle },
+        restart,
+    ))
+}
+
+/// CREATE SEQUENCE [IF NOT EXISTS].
+pub fn create_sequence(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName,
+    if_not_exists: bool,
+    options: &crate::sql::ast::SeqOptions,
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    if storage.relation_name_taken(schema.as_str(), name.name, txn.txid) {
+        if if_not_exists {
+            responder.notice(
+                sqlstate::DUPLICATE_TABLE,
+                stack_format!(128, "relation \"{}\" already exists, skipping", name.name).as_str(),
+            )?;
+            responder.command_complete("CREATE SEQUENCE")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_TABLE,
+            "relation \"{}\" already exists",
+            name.name
+        ));
+    }
+    let (spec, _) = match resolve_seq_spec(options, None) {
+        Ok(v) => v,
+        Err(e) => return sql_fail(e),
+    };
+    let sqlname = match SqlName::parse(name.name) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    let slot = match storage.create_sequence(schema, sqlname, spec, txn.txid) {
+        Ok(slot) => slot,
+        Err(e) => return sql_fail(e),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(
+        lsn,
+        &WalOp::CreateSequence {
+            schema: schema.as_str(),
+            name: name.name,
+            data_type: spec.data_type.to_u8(),
+            increment: spec.increment,
+            min_value: spec.min_value,
+            max_value: spec.max_value,
+            start_value: spec.start_value,
+            cache: spec.cache,
+            cycle: spec.cycle,
+        },
+    ) {
+        storage.rollback_sequence_create(slot);
+        return sql_fail(e);
+    }
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SequenceCreated(slot as u32)) {
+        return sql_fail(e);
+    }
+    responder.command_complete("CREATE SEQUENCE")?;
+    sql_ok()
+}
+
+/// ALTER SEQUENCE [IF EXISTS] — redefine parameters (and optionally RESTART).
+pub fn alter_sequence(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName,
+    if_exists: bool,
+    options: &crate::sql::ast::SeqOptions,
+    responder: &mut Responder,
+) -> Outcome {
+    let slot = match resolve_sequence(storage, name, txn.txid) {
+        Ok(Some(slot)) => slot,
+        Ok(None) if if_exists => {
+            responder.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "sequence \"{}\" does not exist, skipping", name.name).as_str(),
+            )?;
+            responder.command_complete("ALTER SEQUENCE")?;
+            return sql_ok();
+        }
+        Ok(None) => return sql_fail(undefined_kind("sequence", name.name)),
+        Err(e) => return sql_fail(e),
+    };
+    let base = {
+        let s = storage.sequence(slot);
+        SeqSpec {
+            data_type: s.data_type,
+            increment: s.increment,
+            min_value: s.min_value,
+            max_value: s.max_value,
+            start_value: s.start_value,
+            cache: s.cache,
+            cycle: s.cycle,
+        }
+    };
+    let (spec, restart) = match resolve_seq_spec(options, Some(base)) {
+        Ok(v) => v,
+        Err(e) => return sql_fail(e),
+    };
+    storage.alter_sequence(slot, spec, restart);
+    let (schema, sname) = {
+        let s = storage.sequence(slot);
+        (s.schema, s.name)
+    };
+    // The redefinition journals as a CreateSequence (absolute parameters).
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(
+        lsn,
+        &WalOp::CreateSequence {
+            schema: schema.as_str(),
+            name: sname.as_str(),
+            data_type: spec.data_type.to_u8(),
+            increment: spec.increment,
+            min_value: spec.min_value,
+            max_value: spec.max_value,
+            start_value: spec.start_value,
+            cache: spec.cache,
+            cycle: spec.cycle,
+        },
+    ) {
+        return sql_fail(e);
+    }
+    // A RESTART changed value state; journal the absolute advance too.
+    if restart.is_some() {
+        let s = storage.sequence(slot);
+        let (last, is_called) = (s.last_value.get(), s.is_called.get());
+        s.dirty.set(false);
+        let lsn = storage.bump_lsn();
+        if let Err(e) = wal.append(
+            lsn,
+            &WalOp::SequenceAdvance {
+                schema: schema.as_str(),
+                name: sname.as_str(),
+                last,
+                is_called,
+            },
+        ) {
+            return sql_fail(e);
+        }
+    }
+    responder.command_complete("ALTER SEQUENCE")?;
+    sql_ok()
+}
+
+/// DROP SEQUENCE [IF EXISTS].
+pub fn drop_sequence(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[crate::sql::ast::QualName],
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let slot = match resolve_sequence(storage, name, txn.txid) {
+            Ok(Some(slot)) => slot,
+            Ok(None) if if_exists => {
+                responder.notice(
+                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "sequence \"{}\" does not exist, skipping", name.name)
+                        .as_str(),
+                )?;
+                continue;
+            }
+            Ok(None) => return sql_fail(undefined_kind("sequence", name.name)),
+            Err(e) => return sql_fail(e),
+        };
+        let (schema, sname) = {
+            let s = storage.sequence(slot);
+            (s.schema, s.name)
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(e) = wal.append(
+            lsn,
+            &WalOp::DropSequence { schema: schema.as_str(), name: sname.as_str() },
+        ) {
+            return sql_fail(e);
+        }
+        match storage.drop_sequence(schema.as_str(), sname.as_str(), txn.txid) {
+            Ok(Some(slot)) => {
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32)) {
+                    return sql_fail(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return sql_fail(e),
+        }
+    }
+    responder.command_complete("DROP SEQUENCE")?;
+    sql_ok()
+}
+
+/// Resolves a name to a live sequence slot. A relation that exists but is not a
+/// sequence is a type error (42809); a missing relation is `Ok(None)` so the
+/// caller can apply IF EXISTS.
+fn resolve_sequence(
+    storage: &Storage,
+    name: &QualName,
+    txid: u32,
+) -> Result<Option<usize>, SqlError> {
+    // A qualifier names the schema directly; otherwise search the path.
+    if let Some(slot) = storage.sequence_on_path(name.schema, name.name, txid) {
+        return Ok(Some(slot));
+    }
+    // Not a sequence: distinguish a wrong-type relation (42809) from absence.
+    if storage.resolve_relation(name.schema, name.name, txid).is_some() {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a sequence",
+            name.name
+        ));
+    }
+    Ok(None)
 }
 
 /// DROP VIEW [IF EXISTS].
@@ -2647,12 +3009,14 @@ fn encode_range_binary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert(
     storage: &mut Storage,
     txn: &mut TxnState,
     statement: &Insert,
     arena: &Arena,
     params: &[Datum],
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
@@ -2700,15 +3064,20 @@ pub fn insert(
     // (reading storage immutably), then insert them (mutably) — the source may
     // read the very table being written, so the two phases must not overlap.
     if let Some(sel) = statement.select {
-        // Pass 1: count.
+        // Pass 1: count. A "dry" sequence evaluator resolves names (so errors
+        // still surface) but does not advance any generator — the real advance
+        // happens once, in the encoding pass.
         let mut count = 0usize;
-        if let Err(e) = super::query::select_into_rows(
-            storage, txn.txid, sel, arena, params, None, &mut |_| {
-                count += 1;
-                Ok(())
-            },
-        ) {
-            return sql_fail(e);
+        {
+            let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
+            if let Err(e) = super::query::select_into_rows(
+                storage, txn.txid, sel, arena, params, None, Some(&dry), &mut |_| {
+                    count += 1;
+                    Ok(())
+                },
+            ) {
+                return sql_fail(e);
+            }
         }
         // Pass 2: encode each projected row to self-describing arena bytes.
         let empty: &[u8] = &[];
@@ -2725,8 +3094,11 @@ pub fn insert(
             at += 1;
             Ok(())
         };
-        if let Err(e) = super::query::select_into_rows(storage, txn.txid, sel, arena, params, None, &mut fill) {
-            return sql_fail(e);
+        {
+            let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+            if let Err(e) = super::query::select_into_rows(storage, txn.txid, sel, arena, params, None, Some(&live), &mut fill) {
+                return sql_fail(e);
+            }
         }
 
         let mut inserted = 0u64;
@@ -2819,20 +3191,27 @@ pub fn insert(
             }
         }
         let mut explicit = [false; MAX_COLUMNS];
-        for (i, expression) in row_exprs.iter().enumerate() {
-            if matches!(expression, Expr::DefaultMarker) {
-                continue; // keep the default already in place
+        {
+            // A per-row sequence evaluator (`nextval`/`setval` in the VALUES
+            // list advance once per row). Scoped so its shared `&storage` borrow
+            // ends before the row is written mutably below.
+            let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+            let hooks = super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+            for (i, expression) in row_exprs.iter().enumerate() {
+                if matches!(expression, Expr::DefaultMarker) {
+                    continue; // keep the default already in place
+                }
+                let v = match super::eval::eval_full(expression, arena, params, &NoColumns, &hooks) {
+                    Ok(v) => v,
+                    Err(e) => return sql_fail(e),
+                };
+                let col = &def.columns()[targets[i]];
+                match coerce(v, col, arena) {
+                    Ok(v) => values[targets[i]] = v,
+                    Err(e) => return sql_fail(e),
+                }
+                explicit[targets[i]] = true;
             }
-            let v = match eval(expression, arena, params, &NoColumns) {
-                Ok(v) => v,
-                Err(e) => return sql_fail(e),
-            };
-            let col = &def.columns()[targets[i]];
-            match coerce(v, col, arena) {
-                Ok(v) => values[targets[i]] = v,
-                Err(e) => return sql_fail(e),
-            }
-            explicit[targets[i]] = true;
         }
         if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
             return sql_fail(e);
@@ -2937,6 +3316,7 @@ fn emit_projected(
     Ok(Ok(()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -2944,6 +3324,7 @@ pub fn update(
     statement: &Update,
     arena: &Arena,
     params: &[Datum],
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
@@ -2983,7 +3364,7 @@ pub fn update(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
+    let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: None };
     let collect = if let Some(from) = statement.from {
         collect_join_matches(storage, table_index, &def, schema, from, statement.where_clause, arena, params, txn.txid, scratch)
     } else {
@@ -3051,8 +3432,14 @@ pub fn update(
                     return sql_fail(e);
                 }
             } else {
+                // `nextval`/`setval` in a SET expression advance once per updated
+                // row; a scoped sequence evaluator (shared `&storage`) supplies
+                // them and is dropped before the row is written back mutably.
+                let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let hooks =
+                    super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
                 for (a, (_, expression)) in statement.assignments.iter().enumerate() {
-                    let v = match eval(expression, arena, params, &context) {
+                    let v = match super::eval::eval_full(expression, arena, params, &context, &hooks) {
                         Ok(v) => v,
                         Err(e) => return sql_fail(e),
                     };
@@ -3194,7 +3581,7 @@ pub fn delete(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
+    let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: None };
     let collect = if let Some(using) = statement.using {
         collect_join_matches(storage, table_index, &def, schema, using, statement.where_clause, arena, params, txn.txid, scratch)
     } else {

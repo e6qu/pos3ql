@@ -1767,6 +1767,9 @@ impl<'a> Parser<'a> {
 
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
+        if self.eat_ident("sequence")? {
+            return self.alter_sequence();
+        }
         self.expect_ident("table")?;
         let table = self.qual_name("table name")?;
         // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not

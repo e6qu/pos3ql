@@ -214,7 +214,10 @@ step "durability: kill -9, restart, data intact"
   -c "INSERT INTO crashy_ns.t VALUES (7)" \
   -c "CREATE VIEW crashy_ns.v AS SELECT a FROM crashy_ns.t" \
   -c "COMMENT ON TABLE crashy IS 'crash-comment'" \
-  -c "COMMENT ON COLUMN crashy.v IS 'crash-col'"
+  -c "COMMENT ON COLUMN crashy.v IS 'crash-col'" \
+  -c "CREATE DOMAIN crashy_pos AS int CHECK (VALUE > 0)" \
+  -c "CREATE TABLE crashy_dom (n crashy_pos)" \
+  -c "INSERT INTO crashy_dom VALUES (42)"
 # With asynchronous wal_upload, a commit is durable on local disk immediately
 # but its S3 upload drains just after; a trailing query plus a short pause lets
 # that drain reach MinIO before the abrupt kill, so the later disk-wipe steps
@@ -258,6 +261,16 @@ net=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT ip, mac 
   || bad "network values after restart: '$net'"
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(*) FROM crashy" 2>&1)
 [[ "$out" == "2" ]] && ok "kill -9 recovery" || bad "kill -9 recovery: '$out'"
+# A domain and its column identity + constraints survive the crash: the journal
+# replays CREATE DOMAIN, and the domain still enforces and reports its name.
+dom=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
+  -c "SELECT pg_typeof(n), n FROM crashy_dom" 2>&1)
+# The domain's CHECK still enforces after replay (psql default verbosity prints
+# the message, not the SQLSTATE, so match the message).
+dom_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -q \
+  -c "INSERT INTO crashy_dom VALUES (-1)" 2>&1 | grep -c 'violates check constraint')
+[[ "$dom" == "crashy_pos|42" && "$dom_bad" -ge 1 ]] && ok "domains survive restart" \
+  || bad "domains after restart: '$dom' / '$dom_bad'"
 # Object comments survive the crash: the journal replays the COMMENT records.
 cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
   -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
@@ -351,6 +364,11 @@ cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
   -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
 [[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive a cold start" \
   || bad "comments after cold start: '$cmt'"
+# Domains rebuild from the manifest `dom` line alone (wiped disk).
+dom=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
+  -c "SELECT pg_typeof(n), n FROM crashy_dom" 2>&1)
+[[ "$dom" == "crashy_pos|42" ]] && ok "domains survive a cold start" \
+  || bad "domains after cold start: '$dom'"
 
 fi # dur
 

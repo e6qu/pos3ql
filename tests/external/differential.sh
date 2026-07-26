@@ -99,6 +99,7 @@ normalize() {
     -e '/^TABLE NAME:/d' \
     -e '/^COLUMN NAME:/d' \
     -e '/^CONSTRAINT NAME:/d' \
+    -e '/^DATATYPE NAME:/d' \
     -e '/^NOTICE:/d' \
     -e '/^WARNING:/d'
 }
@@ -132,7 +133,7 @@ normalize_exact() {
     -e 's/^ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
     -e '/^LINE [0-9]+:/d' \
     -e '/^ *\^ *$/d' \
-    -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|NOTICE|WARNING):/d'
+    -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
 }
 
 run_exact() { # port name file

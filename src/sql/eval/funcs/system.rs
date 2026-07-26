@@ -350,6 +350,15 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_typeof" => {
                 arity(1)?;
+                // A bare column of a domain type reports the domain name (an
+                // expression over it un-domains to the base, handled below).
+                if let crate::sql::ast::Expr::Column { qualifier, name } = args[0]
+                    && let Some(dname) = row.column_domain(*qualifier, name)
+                {
+                    return Ok(Datum::Text(
+                        arena.alloc_str(dname.as_str()).map_err(|_| arena_full())?,
+                    ));
+                }
                 let v = eval_full(args[0], arena, params, row, hooks)?;
                 // PostgreSQL's pg_typeof reports the argument's *static* type —
                 // `current_user` is `name` though the value is plain text. The

@@ -20,7 +20,13 @@ use crate::sql_err;
 
 use super::apply_typmod;
 
-pub(super) fn build_def(name: &str, columns: &[ColumnDef], arena: &Arena) -> Result<TableDef, SqlError> {
+pub(super) fn build_def(
+    name: &str,
+    columns: &[ColumnDef],
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<TableDef, SqlError> {
     if columns.len() > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -42,7 +48,7 @@ pub(super) fn build_def(name: &str, columns: &[ColumnDef], arena: &Arena) -> Res
                 c.name
             ));
         }
-        def.columns[i] = build_column(c, arena)?;
+        def.columns[i] = build_column(c, storage, txid, arena)?;
     }
     // A generation expression may not reference another generated column (42P17);
     // needs the full column set, so check once the table is assembled.
@@ -96,18 +102,33 @@ fn empty_meta() -> ColumnMeta {
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,
+        domain: None,
     }
 }
 
 /// Resolves one column definition, evaluating its DEFAULT (which must be a
 /// constant) and coercing it to the column type.
-pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, SqlError> {
-    let Some(ctype) = ColType::from_sql_name(c.type_name) else {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "type \"{}\" does not exist",
-            c.type_name
-        ));
+pub(super) fn build_column(
+    c: &ColumnDef,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<ColumnMeta, SqlError> {
+    // A base type resolves statically; an unknown name falls back to the
+    // domain catalog, whose column inherits the domain's base type and typmod
+    // and carries the domain identity for pg_typeof / constraint enforcement.
+    let (ctype, type_mod, domain, domain_default) = match ColType::from_sql_name(c.type_name) {
+        Some(ct) => (ct, c.type_mod, None, None),
+        None => match storage.find_domain(c.type_name, txid) {
+            Some(d) => (d.base, d.base_type_mod, Some(d.name), d.default_expr),
+            None => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    c.type_name
+                ))
+            }
+        },
     };
     // A GENERATED column stores its expression in `default_expr` with the
     // `is_generated` flag; it cannot also carry a DEFAULT.
@@ -121,8 +142,14 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
         }
         (None, Some(resolve_generated(gtext, arena)?), true)
     } else {
-        let (dv, de) = resolve_default(c.default, c.default_text, ctype, c.type_mod, arena)?;
-        (dv, de, false)
+        let (dv, de) = resolve_default(c.default, c.default_text, ctype, type_mod, arena)?;
+        // A domain-typed column with no column-level DEFAULT inherits the
+        // domain's DEFAULT (baked in at creation, re-evaluated per insert).
+        if dv.is_none() && de.is_none() {
+            (None, domain_default, false)
+        } else {
+            (dv, de, false)
+        }
     };
     // serial/bigserial/smallserial are int4/int8/int2 with an auto-increment
     // default and an implicit NOT NULL. A GENERATED ... AS IDENTITY column is
@@ -149,7 +176,7 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
     Ok(ColumnMeta {
         name: SqlName::parse(c.name)?,
         ctype,
-        type_mod: c.type_mod,
+        type_mod,
         not_null: c.not_null || auto_increment,
         unique: c.unique,
         primary: c.primary,
@@ -160,6 +187,7 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
         is_identity,
         identity_always,
         auto_increment_step,
+        domain,
     })
 }
 

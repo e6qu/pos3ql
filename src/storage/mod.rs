@@ -229,6 +229,11 @@ pub struct ColumnMeta {
     pub identity_always: bool,
     /// The auto-increment step: 1 for `serial`, or the identity `INCREMENT BY`.
     pub auto_increment_step: i64,
+    /// When the column was declared with a domain type, the domain's name (its
+    /// `ctype`/`type_mod` are the domain's base). Reported by `pg_typeof` and
+    /// RowDescription, and its NOT NULL / CHECK constraints are enforced on
+    /// write. `None` for an ordinary base-typed column.
+    pub domain: Option<SqlName>,
 }
 
 /// Maximum stored length of a non-constant DEFAULT expression's source text.
@@ -251,6 +256,7 @@ impl ColumnMeta {
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,
+        domain: None,
     };
 }
 
@@ -739,6 +745,74 @@ impl MatviewDef {
 /// inline array keyed by slot; exhausting it is a loud error, never growth.
 pub(crate) const MAX_SEQUENCES: usize = 64;
 
+/// How many domain types may exist at once, and how many CHECK constraints a
+/// single domain may carry. Bounded conservatively: a `DomainDef` inlines its
+/// CHECK predicate text, so the catalog's static footprint is
+/// `MAX_DOMAINS * MAX_DOMAIN_CHECKS * CHECK_SQL_MAX`.
+pub(crate) const MAX_DOMAINS: usize = 32;
+pub(crate) const MAX_DOMAIN_CHECKS: usize = 4;
+
+/// A `CREATE DOMAIN` type: a base type (with its typmod) plus optional
+/// `NOT NULL`, `DEFAULT` and `CHECK (VALUE ...)` constraints, enforced when a
+/// value is coerced into a column of the domain (or cast to it). Its
+/// *existence* is transactional catalog state, mirroring [`SequenceDef`];
+/// a domain carries no per-value state.
+#[derive(Debug, Clone, Copy)]
+pub struct DomainDef {
+    pub created_at: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub base: ColType,
+    /// The base type's atttypmod (e.g. `varchar(5)` → 9), applied to a value
+    /// before the domain's own constraints.
+    pub base_type_mod: i32,
+    pub not_null: bool,
+    pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
+    pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
+    pub n_checks: usize,
+    pub live: bool,
+    pub pending: Option<PendingDdl>,
+}
+
+impl DomainDef {
+    pub(crate) const EMPTY: Self = DomainDef {
+        created_at: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        base: ColType::Bool,
+        base_type_mod: -1,
+        not_null: false,
+        default_expr: None,
+        checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+        n_checks: 0,
+        live: false,
+        pending: None,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(p) if p.txid == txid => p.creating,
+            _ => self.live,
+        }
+    }
+
+    pub fn checks(&self) -> &[CheckConstraint] {
+        &self.checks[..self.n_checks]
+    }
+}
+
+/// The validated parameters of a `CREATE DOMAIN` / `ALTER DOMAIN`, computed by
+/// the executor and handed to storage (apart from the `live`/`pending` state).
+#[derive(Clone, Copy)]
+pub struct DomainSpec {
+    pub base: ColType,
+    pub base_type_mod: i32,
+    pub not_null: bool,
+    pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
+    pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
+    pub n_checks: usize,
+}
+
 /// A sequence's declared integer type: it sets the default MIN/MAXVALUE and the
 /// `pg_sequence.seqtypid` the catalog reports.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1156,6 +1230,7 @@ pub struct Storage {
     views: FixedVec<ViewDef>,
     matviews: FixedVec<MatviewDef>,
     sequences: FixedVec<SequenceDef>,
+    domains: FixedVec<DomainDef>,
     indexes: FixedVec<IndexDef>,
     schemas: FixedVec<SchemaDef>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
@@ -1292,6 +1367,7 @@ impl Storage {
                 + size_of::<IndexDef>())
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
+            + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + ValueIndexPool::budget_bytes(
                 config.max_value_indexes,
@@ -1321,6 +1397,7 @@ impl Storage {
                             is_identity: false,
                             identity_always: false,
                             auto_increment_step: 1,
+                            domain: None,
                         }; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
@@ -1394,6 +1471,10 @@ impl Storage {
                 })
                 .expect("sized to MAX_SEQUENCES");
         }
+        let mut domains = FixedVec::new(budget, "domains", MAX_DOMAINS)?;
+        for _ in 0..MAX_DOMAINS {
+            domains.push(DomainDef::EMPTY).expect("sized to MAX_DOMAINS");
+        }
         let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
         for i in 0..MAX_SCHEMAS {
             schemas
@@ -1442,6 +1523,7 @@ impl Storage {
             views,
             matviews,
             sequences,
+            domains,
             indexes,
             schemas,
             comments,
@@ -3724,6 +3806,205 @@ impl Storage {
         }
     }
 
+    // --- Domains (`CREATE DOMAIN`) ---------------------------------------
+
+    /// Resolves a (possibly schema-qualified) domain type name to its
+    /// definition, visible to `txid`, searching the current path when
+    /// unqualified.
+    pub fn find_domain(&self, type_name: &str, txid: u32) -> Option<&DomainDef> {
+        let (qualifier, name) = match type_name.split_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, type_name),
+        };
+        self.find_domain_slot(qualifier, name, txid).map(|slot| &self.domains[slot])
+    }
+
+    fn find_domain_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
+        if let Some(schema) = qualifier {
+            return self.domains.iter().position(|d| {
+                d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
+            });
+        }
+        for entry in self.path.entries() {
+            if let PathEntry::Schema(slot) = entry {
+                let schema = self.schemas[*slot as usize].name;
+                if let Some(i) = self.domains.iter().position(|d| {
+                    d.visible_to(txid)
+                        && d.schema.as_str() == schema.as_str()
+                        && d.name.as_str() == name
+                }) {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolves a (possibly qualified) domain type name to its slot on the
+    /// current path, visible to `txid`.
+    pub fn resolve_domain_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
+        let (qualifier, name) = match type_name.split_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, type_name),
+        };
+        self.find_domain_slot(qualifier, name, txid)
+    }
+
+    /// The definition of a domain named `name` (any schema) visible to `txid` —
+    /// for enforcing a column's domain constraints, where the column stores
+    /// only the domain's name.
+    pub fn domain_by_name(&self, name: &str, txid: u32) -> Option<&DomainDef> {
+        self.domains
+            .iter()
+            .find(|d| d.visible_to(txid) && d.name.as_str() == name)
+    }
+
+    /// The domain named `(schema, name)` visible to `txid`, by slot.
+    pub fn domain_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.domains.iter().position(|d| {
+            d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
+        })
+    }
+
+    pub fn domain(&self, slot: usize) -> &DomainDef {
+        &self.domains[slot]
+    }
+
+    /// Committed domains carrying their slot indices, for the checkpoint and
+    /// `pg_type`.
+    pub fn live_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
+        self.domains.iter().enumerate().filter(|(_, d)| d.live)
+    }
+
+    /// Whether any table column (in any table) is declared with this domain —
+    /// the dependency that makes `DROP DOMAIN ... RESTRICT` fail.
+    pub fn domain_in_use(&self, schema: &str, name: &str) -> Option<(SqlName, SqlName)> {
+        for table in self.tables.iter().filter(|t| t.live) {
+            if table.def.schema.as_str() != schema {
+                continue;
+            }
+            for col in table.def.columns() {
+                if col.domain.is_some_and(|d| d.as_str() == name) {
+                    return Some((table.def.name, col.name));
+                }
+            }
+        }
+        None
+    }
+
+    /// Registers a domain as an uncommitted CREATE owned by `txid` (or, for
+    /// replay/checkpoint with `txid == 0`, committed directly). The caller has
+    /// validated the base type and constraints and checked the name is free.
+    pub fn create_domain(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        spec: DomainSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if self.domains.iter().any(|d| {
+            d.schema.as_str() == schema.as_str()
+                && d.name.as_str() == name.as_str()
+                && matches!(d.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name.as_str()
+            ));
+        }
+        let Some(new) = self.domains.iter().position(|d| !d.live && d.pending.is_none()) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many domains (limit {})",
+                self.domains.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        let pending = (txid != 0).then_some(PendingDdl { txid, creating: true });
+        self.domains[new] = DomainDef {
+            created_at: self.catalog_seq,
+            schema,
+            name,
+            base: spec.base,
+            base_type_mod: spec.base_type_mod,
+            not_null: spec.not_null,
+            default_expr: spec.default_expr,
+            checks: spec.checks,
+            n_checks: spec.n_checks,
+            live: txid == 0,
+            pending,
+        };
+        Ok(new)
+    }
+
+    /// Replaces a live domain's spec in place (ALTER DOMAIN).
+    pub fn alter_domain(&mut self, slot: usize, spec: DomainSpec) {
+        let d = &mut self.domains[slot];
+        d.base = spec.base;
+        d.base_type_mod = spec.base_type_mod;
+        d.not_null = spec.not_null;
+        d.default_expr = spec.default_expr;
+        d.checks = spec.checks;
+        d.n_checks = spec.n_checks;
+    }
+
+    pub fn drop_domain(
+        &mut self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        if self.domains.iter().any(|d| {
+            d.schema.as_str() == schema
+                && d.name.as_str() == name
+                && matches!(d.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name
+            ));
+        }
+        let Some(i) = self.domains.iter().position(|d| {
+            d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
+        }) else {
+            return Ok(None);
+        };
+        let d = &mut self.domains[i];
+        if matches!(d.pending, Some(p) if p.txid == txid && p.creating) {
+            d.live = false;
+            d.pending = None;
+        } else {
+            d.pending = Some(PendingDdl { txid, creating: false });
+        }
+        Ok(Some(i))
+    }
+
+    pub fn commit_domain_create(&mut self, slot: usize) {
+        self.domains[slot].live = true;
+        self.domains[slot].pending = None;
+    }
+
+    pub fn commit_domain_drop(&mut self, slot: usize) {
+        self.domains[slot].live = false;
+        self.domains[slot].pending = None;
+    }
+
+    pub fn rollback_domain_create(&mut self, slot: usize) {
+        self.domains[slot].live = false;
+        self.domains[slot].pending = None;
+    }
+
+    pub fn rollback_domain_drop(&mut self, slot: usize, txid: u32) {
+        let d = &mut self.domains[slot];
+        if d.live {
+            d.pending = None;
+        } else if matches!(d.pending, Some(p) if p.txid == txid) {
+            d.pending = Some(PendingDdl { txid, creating: true });
+        }
+    }
+
     /// Registers a view as an uncommitted CREATE owned by `txid` (other
     /// transactions keep seeing the committed catalog until commit).
     /// `or_replace` marks an existing visible view pending-dropped. Returns
@@ -4180,6 +4461,7 @@ mod tests {
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
+                domain: None,
             }; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
@@ -4199,6 +4481,7 @@ mod tests {
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
+                domain: None,
             };
         }
         def

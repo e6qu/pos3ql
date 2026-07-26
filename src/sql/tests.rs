@@ -1183,7 +1183,7 @@ fn named_timezone_dst_rendering() {
 #[test]
 fn commit_makes_writes_visible_and_durable() {
     let config = test_config("txn-durable");
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     {
         let mut e = Engine::new(&config, &mut b).unwrap();
         let mut t = TxnState::new(&mut b, 256).unwrap();
@@ -1191,7 +1191,7 @@ fn commit_makes_writes_visible_and_durable() {
         run_txn(&mut e, &mut b, &mut t, "BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT");
         run_txn(&mut e, &mut b, &mut t, "BEGIN; INSERT INTO t VALUES (3); ROLLBACK");
     }
-    let mut b2 = Budget::new(1 << 24);
+    let mut b2 = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b2).unwrap();
     let mut t = TxnState::new(&mut b2, 256).unwrap();
     let out = run_txn(&mut e, &mut b2, &mut t, "SELECT id FROM t ORDER BY id");
@@ -1343,7 +1343,7 @@ fn ddl_rolls_back_with_implicit_transaction() {
 fn data_survives_engine_restart() {
     let config = test_config("restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v text)");
         run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')");
@@ -1353,7 +1353,7 @@ fn data_survives_engine_restart() {
         run_with(&mut e, &mut budget, "DROP TABLE gone");
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     let bytes = run_with(&mut e, &mut budget, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1|a", "2|B"]);
@@ -1371,14 +1371,14 @@ fn indexes_survive_restart() {
     // WAL-replay restart.
     let config = test_config("idx_restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (a int, b int)");
         run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1),(1,2)");
         run_with(&mut e, &mut budget, "CREATE UNIQUE INDEX u ON t(a,b)");
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The UNIQUE index survived: a conflicting insert is rejected.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1)"))
@@ -1394,7 +1394,7 @@ fn views_survive_restart() {
     // View definitions are journaled, so they survive a WAL-replay restart.
     let config = test_config("view_restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
         run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
@@ -1403,7 +1403,7 @@ fn views_survive_restart() {
         run_with(&mut e, &mut budget, "DROP VIEW gone");
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The surviving view still expands and queries.
     assert_eq!(
@@ -1422,14 +1422,14 @@ fn matview_survives_restart() {
     // restart — and REFRESH still works afterward.
     let config = test_config("matview_restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
         run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
         run_with(&mut e, &mut budget, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE v > 15");
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The materialized rows survived the restart.
     assert_eq!(
@@ -1510,14 +1510,14 @@ fn sequence_basics() {
 fn sequence_survives_restart() {
     let config = test_config("sequence_restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE SEQUENCE s START 10 INCREMENT 5 MAXVALUE 100 CYCLE");
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 10
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 15
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // Value state (last=15, is_called) survived replay: the next value is 20.
     assert_eq!(data_rows(&run_with(&mut e, &mut budget, "SELECT nextval('s')")), ["20"]);
@@ -1567,14 +1567,14 @@ fn expression_defaults() {
 fn expression_default_survives_restart() {
     let config = test_config("default_expr_restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE SEQUENCE s");
         run_with(&mut e, &mut budget, "CREATE TABLE t (id bigint DEFAULT nextval('s'), v int)");
         run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (10)");
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The default expression survived replay: the next insert still assigns
     // nextval (continuing the sequence).
@@ -1633,13 +1633,13 @@ fn generated_columns() {
 fn generated_column_survives_restart() {
     let config = test_config("generated_restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE g (a int, c int GENERATED ALWAYS AS (a + 1) STORED)");
         run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (10)");
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The generation expression survived replay: a new insert still computes it.
     run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (20)");
@@ -1690,13 +1690,13 @@ fn identity_columns() {
 fn identity_survives_restart() {
     let config = test_config("identity_restart");
     {
-        let mut budget = Budget::new(1 << 24);
+        let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE ic (id int GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5), v text)");
         run_with(&mut e, &mut budget, "INSERT INTO ic (v) VALUES ('a')");
         e.commit_wal();
     }
-    let mut budget = Budget::new(1 << 24);
+    let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The identity step (5) and counter survived replay: next value is 15.
     run_with(&mut e, &mut budget, "INSERT INTO ic (v) VALUES ('b')");
@@ -1783,14 +1783,14 @@ fn sql_surface_batch() {
 fn altered_table_survives_restart() {
     let config = test_config("alter-durable");
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE a (id int, v text)");
         run_with(&mut e, &mut b, "INSERT INTO a VALUES (1, 'one')");
         run_with(&mut e, &mut b, "ALTER TABLE a ADD COLUMN n int DEFAULT 42");
         run_with(&mut e, &mut b, "ALTER TABLE a RENAME TO b");
     }
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT id, v, n FROM b");
     assert_eq!(data_rows(&bytes), ["1|one|42"]);
@@ -1799,7 +1799,7 @@ fn altered_table_survives_restart() {
 #[test]
 fn alter_column_default_and_not_null() {
     let config = test_config("alter-column");
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE ac (id int, a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO ac VALUES (1, NULL, 'x')");
@@ -1832,7 +1832,7 @@ fn alter_column_default_and_not_null() {
 fn alter_column_type_rewrites_and_persists() {
     let config = test_config("alter-column-type");
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a int, b text)");
         run_with(&mut e, &mut b, "INSERT INTO ct VALUES (1, 42, 'hello'), (2, 100, 'yo')");
@@ -1847,7 +1847,7 @@ fn alter_column_type_rewrites_and_persists() {
         assert_eq!(data_rows(&bytes), ["42|text|5", "100|text|2"]);
     }
     // The rewritten shape and values survive a restart.
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT a, pg_typeof(b), b FROM ct ORDER BY id");
     assert_eq!(data_rows(&bytes), ["42|integer|5", "100|integer|2"]);
@@ -1857,7 +1857,7 @@ fn alter_column_type_rewrites_and_persists() {
 fn alter_add_drop_constraint() {
     let config = test_config("alter-constraint");
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ch (id int, a int, b int)");
         run_with(&mut e, &mut b, "INSERT INTO ch VALUES (1, 5, 10), (2, 7, 20)");
@@ -1879,7 +1879,7 @@ fn alter_add_drop_constraint() {
         assert!(String::from_utf8_lossy(&bytes).contains("42704"), "expected undefined constraint");
     }
     // The CHECK constraint survives a restart and stays enforced.
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (6, -5, 60)");
     assert!(String::from_utf8_lossy(&bytes).contains("23514"), "check survives restart");
@@ -1890,7 +1890,7 @@ fn alter_add_drop_constraint() {
 #[test]
 fn alter_rename_constraint() {
     let config = test_config("rename-constraint");
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE rc (id int, a int, b int)");
     run_with(&mut e, &mut b, "ALTER TABLE rc ADD CONSTRAINT ck0 CHECK (a > 0)");
@@ -1913,7 +1913,7 @@ fn alter_rename_constraint() {
 #[test]
 fn check_constraint_auto_naming() {
     let config = test_config("check-naming");
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     // Four unnamed CHECKs: a>0 and a<100 and a<>50 each reference only `a`, so
     // they collide on cn_a_check and disambiguate to cn_a_check / cn_a_check1 /
@@ -1978,7 +1978,7 @@ fn value_index_matches_uniqueness_oracle() {
     };
 
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run(&mut e, "CREATE TABLE t (k int UNIQUE, v int)");
         for _ in 0..800 {
@@ -2017,7 +2017,7 @@ fn value_index_matches_uniqueness_oracle() {
     }
 
     // Restart: the index is gone and must be rebuilt from the replayed rows.
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut Budget::new(1 << 20), "SELECT count(*) FROM t");
     assert_eq!(data_rows(&bytes), [format!("{}", present.len())]);
@@ -2036,7 +2036,7 @@ fn value_index_matches_uniqueness_oracle() {
 #[test]
 fn named_single_column_key_retains_name() {
     let config = test_config("named-single-key");
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     // An explicit name on a single-column UNIQUE is kept: the violation names it
     // and DROP CONSTRAINT finds it.
@@ -2070,7 +2070,7 @@ fn named_single_column_key_retains_name() {
 #[test]
 fn alter_table_multi_action() {
     let config = test_config("alter-multi");
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE m (a int)");
     run_with(&mut e, &mut b, "INSERT INTO m VALUES (1), (2), (3)");
@@ -2126,7 +2126,7 @@ fn alter_table_multi_action() {
 #[test]
 fn vacuum_and_analyze() {
     let config = test_config("vacuum");
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE vt (a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO vt VALUES (1, 'x'), (2, 'y')");
@@ -2235,7 +2235,7 @@ fn joins_group_by_subqueries() {
 fn datetime_uuid_bytea_types() {
     let config = test_config("types-durable");
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ev (d date, t timestamptz, u uuid, raw bytea)");
         run_with(
@@ -2253,7 +2253,7 @@ fn datetime_uuid_bytea_types() {
         assert_eq!(data_rows(&bytes), ["1"]);
     }
     // Types survive WAL replay.
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT u FROM ev");
     assert_eq!(data_rows(&bytes), ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"]);
@@ -2328,7 +2328,7 @@ fn comment_rolls_back() {
 fn comment_survives_restart_and_drop_clears_it() {
     let config = test_config("comment-durable");
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a text)");
         run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'durable'");
@@ -2336,7 +2336,7 @@ fn comment_survives_restart_and_drop_clears_it() {
     }
     // The comment survives WAL replay.
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
         assert_eq!(data_rows(&bytes), ["durable"]);
@@ -2350,7 +2350,7 @@ fn comment_survives_restart_and_drop_clears_it() {
     }
     // The drop's comment removal is itself durable across another restart.
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
         assert_eq!(data_rows(&bytes), ["NULL"]);
@@ -2407,7 +2407,7 @@ fn network_functions_match_postgres() {
 fn network_types_survive_restart() {
     let config = test_config("network-durable");
     {
-        let mut b = Budget::new(1 << 24);
+        let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE nd (a inet, c cidr, m macaddr, m8 macaddr8)");
         run_with(
@@ -2417,7 +2417,7 @@ fn network_types_survive_restart() {
         );
     }
     // The values survive WAL replay byte-for-byte (the rowenc codec).
-    let mut b = Budget::new(1 << 24);
+    let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT a, c, m, m8 FROM nd");
     assert_eq!(
@@ -2477,6 +2477,56 @@ fn fetch_first_and_with_ties() {
     // WITH TIES over a UNION.
     let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft UNION ALL SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES");
     assert_eq!(data_rows(&bytes), ["10", "10", "10", "10"]);
+}
+
+#[test]
+fn domains_enforce_and_report() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE DOMAIN posint AS int CHECK (VALUE > 0)");
+    run_with(&mut e, &mut b, "CREATE DOMAIN email AS text NOT NULL CHECK (VALUE LIKE '%@%')");
+    run_with(&mut e, &mut b, "CREATE TABLE dt (id posint DEFAULT 1, addr email)");
+    run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, 'a@b.com')");
+    run_with(&mut e, &mut b, "INSERT INTO dt (addr) VALUES ('x@y.com')"); // id defaults to 1
+    // pg_typeof: the domain on a bare column, the base through an expression.
+    let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(id), pg_typeof(addr), pg_typeof(id + 1) FROM dt WHERE id = 5");
+    assert_eq!(data_rows(&bytes), ["posint|email|integer"]);
+    let bytes = run_with(&mut e, &mut b, "SELECT id, addr FROM dt ORDER BY id");
+    assert_eq!(data_rows(&bytes), ["1|x@y.com", "5|a@b.com"]);
+    // Constraint violations.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (-1, 'a@b.com')")).contains("23514"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, 'bad')")).contains("23514"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, NULL)")).contains("23502"));
+    // DROP RESTRICT fails with a dependent column.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP DOMAIN posint")).contains("2BP01"));
+    // Unknown type name.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad (a nope)")).contains("42704"));
+}
+
+#[test]
+fn domains_survive_restart() {
+    let config = test_config("domain-durable");
+    {
+        let mut b = Budget::new(1 << 25);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run_with(&mut e, &mut b, "CREATE DOMAIN posint AS int NOT NULL CHECK (VALUE > 0) CHECK (VALUE < 100)");
+        run_with(&mut e, &mut b, "CREATE TABLE dt (a posint DEFAULT 7)");
+        run_with(&mut e, &mut b, "INSERT INTO dt VALUES (42)");
+        e.commit_wal();
+    }
+    // WAL replay: the domain and its column identity survive.
+    {
+        let mut b = Budget::new(1 << 25);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(a), a FROM dt");
+        assert_eq!(data_rows(&bytes), ["posint|42"]);
+        // The domain still enforces after replay.
+        assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (0)")).contains("23514"));
+        assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (NULL)")).contains("23502"));
+        // The domain default is baked into the column.
+        run_with(&mut e, &mut b, "INSERT INTO dt DEFAULT VALUES");
+        let bytes = run_with(&mut e, &mut b, "SELECT a FROM dt ORDER BY a");
+        assert_eq!(data_rows(&bytes), ["7", "42"]);
+    }
 }
 
 #[test]

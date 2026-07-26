@@ -1053,6 +1053,33 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   output columns) still tie, NULLs equal. Verified byte-for-byte against
   PostgreSQL 18 (corpus `61_fetch_ties`), covering every path plus multi-key
   ties and OFFSET composition.
+- **`CREATE DOMAIN`** — done (scalar domains): a user-defined type is a base type
+  plus optional `NOT NULL` / `DEFAULT` / `CHECK (VALUE ...)` constraints. This is
+  the engine's first user-defined type and its first catalog-aware type
+  resolution. A domain adds **no** `Datum`/`ColType` variant — a domain value is a
+  plain base-type value — so the comparison/storage/wire pipeline is untouched; a
+  domain is (a) a new `DomainDef` catalog (transactional MVCC + WAL + a `dom`
+  checkpoint line, mirroring the sequence catalog), (b) an `Option<SqlName>` on
+  `ColumnMeta` carrying the domain's name (durable through the column codec — bit 7
+  of the per-column WAL flags, a new checkpoint `col` field), and (c) constraint
+  enforcement reusing the CHECK machinery. Column-type resolution became
+  catalog-aware: an unknown type name falls back to the domain catalog (threading
+  `&Storage`/`txid` into `build_column`), yielding the domain's base type + typmod
+  and its identity. On write/cast a value is base-coerced (a `varchar(5)` domain's
+  `22001` applies first) then checked — `NOT NULL` is `23502` "domain X does not
+  allow null values", each `CHECK` is `23514` naming the violated constraint
+  (unnamed CHECKs get PostgreSQL's `<domain>_check` names); a column omitted on
+  INSERT inherits the domain's DEFAULT. `pg_typeof` reports the domain on a bare
+  column and the base type through any expression (a new `column_domain` lookup
+  hook threaded through the scan scope); `pg_type` gains domain rows (`typtype`
+  'd', `typbasetype`, `typnotnull`, `typdefault`, own OID range). `ALTER DOMAIN`
+  (`ADD`/`DROP CONSTRAINT`, `SET`/`DROP NOT NULL`, `SET`/`DROP DEFAULT`, journaled
+  as a redefinition) and `DROP DOMAIN [CASCADE|RESTRICT]` (`2BP01` on a dependent
+  column). Verified byte-for-byte against PostgreSQL 18 (corpus `62_domains`),
+  with WAL-replay unit tests and a `run.sh` crash + cold-start assertion. Four
+  narrow behaviors are documented in BUGS.md (B-172): `value::domain` casts,
+  `ALTER` re-validating existing rows, domain arrays, and domain-over-domain —
+  each blocked on threading storage into a pure path or on a fixed-type change.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

@@ -105,6 +105,10 @@ pub enum DdlUndo {
     SequenceCreated(u32),
     /// DROP SEQUENCE at this slot — undo by reviving it.
     SequenceDropped(u32),
+    /// CREATE DOMAIN at this slot — undo by dropping it.
+    DomainCreated(u32),
+    /// DROP DOMAIN at this slot — undo by reviving it.
+    DomainDropped(u32),
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.

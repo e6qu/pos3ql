@@ -1809,6 +1809,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("sequence")? {
             return self.alter_sequence();
         }
+        if self.eat_ident("domain")? {
+            return self.alter_domain();
+        }
         self.expect_ident("table")?;
         let table = self.qual_name("table name")?;
         // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not

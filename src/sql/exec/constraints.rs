@@ -9,13 +9,71 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
-use crate::sql::eval::{compare_datums, eval, hash_key, sqlstate, SqlError};
+use crate::sql::eval::{compare_datums, eval, hash_key, sqlstate, ColumnLookup, SqlError};
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{rowenc, RowHome, Storage, TableDef, MAX_COLUMNS};
 
 use super::{check_not_null, RowCtx};
+
+/// A one-column lookup binding PostgreSQL's `VALUE` placeholder to a domain's
+/// candidate input, for evaluating that domain's CHECK predicates.
+struct ValueLookup<'v> {
+    value: Datum<'v>,
+}
+
+impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
+    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        if name.eq_ignore_ascii_case("value") {
+            Ok(self.value)
+        } else {
+            Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name))
+        }
+    }
+}
+
+/// Enforces every domain-typed column's NOT NULL and CHECK constraints against a
+/// candidate row: base coercion has already happened, so this only runs the
+/// domain's own rules, binding `VALUE` to each column's value.
+pub(crate) fn check_domain_constraints(
+    storage: &Storage,
+    def: &TableDef,
+    values: &[Datum],
+    txid: u32,
+    arena: &Arena,
+    params: &[Datum],
+) -> Result<(), SqlError> {
+    for (i, col) in def.columns().iter().enumerate() {
+        let Some(dname) = col.domain else { continue };
+        let Some(domain) = storage.domain_by_name(dname.as_str(), txid) else { continue };
+        let value = values.get(i).copied().unwrap_or(Datum::Null);
+        if value.is_null() {
+            if domain.not_null {
+                return Err(sql_err!(
+                    sqlstate::NOT_NULL_VIOLATION,
+                    "domain {} does not allow null values",
+                    dname.as_str()
+                ));
+            }
+            // NULL bypasses a domain's CHECK constraints (three-valued logic).
+            continue;
+        }
+        let context = ValueLookup { value };
+        for check in domain.checks() {
+            let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+            if matches!(eval(expression, arena, params, &context)?, Datum::Bool(false)) {
+                return Err(sql_err!(
+                    sqlstate::CHECK_VIOLATION,
+                    "value for domain {} violates check constraint \"{}\"",
+                    dname.as_str(),
+                    check.name.as_str()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Names a uniqueness constraint for its 23505 message: a single-column flag
 /// synthesizes PostgreSQL's `<table>_pkey` / `<table>_<column>_key`, while a
@@ -397,6 +455,7 @@ pub(crate) fn enforce_row_constraints(
 ) -> Result<(), SqlError> {
     check_all_unique(storage, table_index, def, schema, values, self_rowid, txid)?;
     check_row_checks(def, checks, values, arena, params)?;
+    check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;
     Ok(())
 }
@@ -419,6 +478,7 @@ pub(crate) fn check_row_content(
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
     check_row_checks(def, checks, values, arena, params)?;
+    check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;
     Ok(())
 }

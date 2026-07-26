@@ -53,6 +53,8 @@ const KIND_CREATE_SEQUENCE: u8 = 17;
 const KIND_DROP_SEQUENCE: u8 = 18;
 const KIND_SEQUENCE_ADVANCE: u8 = 19;
 const KIND_COMMENT: u8 = 20;
+const KIND_CREATE_DOMAIN: u8 = 21;
+const KIND_DROP_DOMAIN: u8 = 22;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -162,6 +164,15 @@ pub enum WalOp<'a> {
         cycle: bool,
     },
     DropSequence {
+        schema: &'a str,
+        name: &'a str,
+    },
+    /// CREATE DOMAIN (or ALTER DOMAIN — journaled absolutely, so an ALTER
+    /// replays as a redefinition). Carries the whole definition inline, like
+    /// [`WalOp::CreateTable`]; the value's `live`/`pending`/`created_at` are
+    /// not journaled (replay sets them).
+    CreateDomain(crate::storage::DomainDef),
+    DropDomain {
         schema: &'a str,
         name: &'a str,
     },
@@ -330,7 +341,7 @@ impl Wal {
                     u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_COMMENT).contains(&kind)
+                if !(KIND_CREATE..=KIND_DROP_DOMAIN).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -533,6 +544,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropSequence { .. } => KIND_DROP_SEQUENCE,
         WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
         WalOp::Comment { .. } => KIND_COMMENT,
+        WalOp::CreateDomain(_) => KIND_CREATE_DOMAIN,
+        WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
     }
 }
 
@@ -546,6 +559,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 n += 2 + c.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
                 // auto_increment_step (i64).
                 n += 8;
+                // Domain-typed column: the domain name (1-byte len + bytes).
+                if let Some(d) = &c.domain {
+                    n += 1 + d.as_str().len();
+                }
             }
             // uniques
             n += 1;
@@ -610,6 +627,16 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len() + 1 + schema.len() + 1 + 5 * 8 + 1
         }
         WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::CreateDomain(def) => {
+            let de = def.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
+            let mut n = 1 + def.name.as_str().len() + 1 + def.schema.as_str().len()
+                + 1 + 4 + 1 + 2 + de + 1;
+            for c in def.checks() {
+                n += 1 + c.name.as_str().len() + 2 + c.expression.as_str().len();
+            }
+            n
+        }
+        WalOp::DropDomain { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::SequenceAdvance { schema, name, .. } => {
             1 + name.len() + 1 + schema.len() + 8 + 1
         }
@@ -629,13 +656,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
             for c in def.columns() {
                 ok &= name_bytes(buffer, c.name.as_str());
+                // Bit 7 (the last free per-column flag bit) marks a domain-typed
+                // column, whose domain name is appended after the fixed fields.
                 let flags = u8::from(c.not_null)
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3)
                     | (u8::from(c.is_generated) << 4)
                     | (u8::from(c.is_identity) << 5)
-                    | (u8::from(c.identity_always) << 6);
+                    | (u8::from(c.identity_always) << 6)
+                    | (u8::from(c.domain.is_some()) << 7);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 ok &= append_default(buffer, &c.default_value);
@@ -643,6 +673,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&(de.len() as u16).to_le_bytes());
                 ok &= buffer.append(de.as_bytes());
                 ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
+                if let Some(d) = &c.domain {
+                    ok &= name_bytes(buffer, d.as_str());
+                }
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
             ok &= buffer.append(&[def.n_uniques as u8]);
@@ -780,6 +813,26 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::DropSequence { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
+        WalOp::CreateDomain(def) => {
+            let de = def.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
+            let mut ok = name_bytes(buffer, def.name.as_str())
+                && name_bytes(buffer, def.schema.as_str())
+                && buffer.append(&[def.base.code()])
+                && buffer.append(&def.base_type_mod.to_le_bytes())
+                && buffer.append(&[u8::from(def.not_null)])
+                && buffer.append(&(de.len() as u16).to_le_bytes())
+                && buffer.append(de.as_bytes())
+                && buffer.append(&[def.n_checks as u8]);
+            for c in def.checks() {
+                ok &= name_bytes(buffer, c.name.as_str())
+                    && buffer.append(&(c.expression.as_str().len() as u16).to_le_bytes())
+                    && buffer.append(c.expression.as_str().as_bytes());
+            }
+            ok
+        }
+        WalOp::DropDomain { schema, name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        }
         WalOp::SequenceAdvance { schema, name, last, is_called } => {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
@@ -849,6 +902,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     is_identity: false,
                     identity_always: false,
                     auto_increment_step: 1,
+                    domain: None,
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
                 ..TableDef::empty()
@@ -873,6 +927,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let auto_increment_step =
                     i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
                 at += 8;
+                // Bit 7 set (in a journal written by this build or later) means a
+                // domain name follows; older journals have it clear.
+                let domain = if meta[1] & 128 != 0 {
+                    Some(SqlName::parse(take_name(&mut at)?).ok()?)
+                } else {
+                    None
+                };
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
                     ctype: ColType::from_code(meta[0])?,
@@ -887,6 +948,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     is_identity: meta[1] & 32 != 0,
                     identity_always: meta[1] & 64 != 0,
                     auto_increment_step,
+                    domain,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -1176,6 +1238,58 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             (at == payload.len()).then_some(WalOp::Comment { class, schema, name, subid, text })
         }
+        KIND_CREATE_DOMAIN => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let base = crate::sql::types::ColType::from_code(*payload.get(at)?)?;
+            at += 1;
+            let base_type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
+            at += 4;
+            let not_null = *payload.get(at)? != 0;
+            at += 1;
+            let de_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+            at += 2;
+            let de = core::str::from_utf8(payload.get(at..at + de_len)?).ok()?;
+            at += de_len;
+            let default_expr = (de_len > 0).then(|| crate::util::StackStr::from_str(de));
+            let n_checks = *payload.get(at)? as usize;
+            at += 1;
+            if n_checks > crate::storage::MAX_DOMAIN_CHECKS {
+                return None;
+            }
+            let mut checks =
+                [crate::storage::CheckConstraint::EMPTY; crate::storage::MAX_DOMAIN_CHECKS];
+            for check in checks.iter_mut().take(n_checks) {
+                let cname = take_name(&mut at)?;
+                let elen =
+                    u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+                at += 2;
+                let expr = core::str::from_utf8(payload.get(at..at + elen)?).ok()?;
+                at += elen;
+                *check = crate::storage::CheckConstraint {
+                    name: SqlName::parse(cname).ok()?,
+                    expression: crate::util::StackStr::from_str(expr),
+                };
+            }
+            (at == payload.len()).then_some(WalOp::CreateDomain(crate::storage::DomainDef {
+                created_at: 0,
+                schema: SqlName::parse(schema).ok()?,
+                name: SqlName::parse(name).ok()?,
+                base,
+                base_type_mod,
+                not_null,
+                default_expr,
+                checks,
+                n_checks,
+                live: false,
+                pending: None,
+            }))
+        }
+        KIND_DROP_DOMAIN => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropDomain { schema, name })
+        }
         KIND_CREATE_SCHEMA => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CreateSchema(name))
@@ -1410,6 +1524,7 @@ mod tests {
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
+                domain: None,
             }; MAX_COLUMNS],
             n_columns: 2,
             ..TableDef::empty()
@@ -1428,6 +1543,7 @@ mod tests {
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
+            domain: None,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -1443,6 +1559,7 @@ mod tests {
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
+            domain: None,
         };
         // A multi-column UNIQUE, a CHECK, and a FOREIGN KEY, so the WAL
         // round-trip covers every constraint kind.

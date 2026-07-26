@@ -92,6 +92,15 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
             }
         self.def.column_index(name).map(|i| self.def.columns()[i].ctype)
     }
+
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+        if let Some(q) = qualifier
+            && q != self.def.name.as_str()
+        {
+            return None;
+        }
+        self.def.column_index(name).and_then(|i| self.def.columns()[i].domain)
+    }
 }
 
 type Outcome = Result<Result<(), SqlError>, WireFull>;
@@ -240,7 +249,7 @@ fn build_def_with_likes(
     arena: &Arena,
 ) -> Result<TableDef, SqlError> {
     if statement.likes.is_empty() {
-        return build_def(statement.name.name, statement.columns, arena);
+        return build_def(statement.name.name, statement.columns, storage, txid, arena);
     }
     let mut def = TableDef { name: SqlName::parse(statement.name.name)?, ..TableDef::empty() };
     let mut n = 0usize;
@@ -272,7 +281,7 @@ fn build_def_with_likes(
             }
         }
         if let Some(column) = statement.columns.get(position) {
-            push_column(&mut def, &mut n, build_column(column, arena)?)?;
+            push_column(&mut def, &mut n, build_column(column, storage, txid, arena)?)?;
         }
     }
     def.n_columns = n;
@@ -1480,6 +1489,7 @@ pub fn create_table_as(
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
+            domain: None,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -2138,6 +2148,335 @@ pub fn drop_sequence(
         }
     }
     responder.command_complete("DROP SEQUENCE")?;
+    sql_ok()
+}
+
+// --- CREATE / ALTER / DROP DOMAIN --------------------------------------------
+
+/// Copies domain text (a DEFAULT or CHECK source) into a fixed buffer, or a loud
+/// `PROGRAM_LIMIT_EXCEEDED` if it is longer than `N`.
+fn domain_text<const N: usize>(text: &str) -> Result<StackStr<N>, SqlError> {
+    use core::fmt::Write as _;
+    let mut out = StackStr::<N>::new();
+    let _ = write!(out, "{text}");
+    if out.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "domain constraint or default exceeds {} bytes",
+            N
+        ));
+    }
+    Ok(out)
+}
+
+/// Validates that a domain CHECK/DEFAULT expression parses and references no
+/// column other than `VALUE` (PostgreSQL's placeholder for the input value).
+fn validate_domain_expr(
+    text: &str,
+    allow_value: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let expr = crate::sql::parser::parse_expr(text, arena)?;
+    let mut bad: Option<SqlError> = None;
+    expr.for_each_column(&mut |name| {
+        if bad.is_some() {
+            return;
+        }
+        if !(allow_value && name.eq_ignore_ascii_case("value")) {
+            bad = Some(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name));
+        }
+    });
+    match bad {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Builds the validated [`DomainSpec`] from a base type, its typmod, and the
+/// domain's constraints; unnamed CHECKs get PostgreSQL-style `<domain>_check`
+/// names.
+#[allow(clippy::too_many_arguments)]
+fn build_domain_spec(
+    domain: &str,
+    base_type: &str,
+    base_type_mod: i32,
+    not_null: bool,
+    default_text: Option<&str>,
+    ast_checks: &[crate::sql::ast::DomainCheck],
+    arena: &Arena,
+) -> Result<crate::storage::DomainSpec, SqlError> {
+    let base = ColType::from_sql_name(base_type).ok_or_else(|| {
+        sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", base_type)
+    })?;
+    let default_expr = match default_text {
+        Some(t) => {
+            validate_domain_expr(t, false, arena)?;
+            Some(domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(t)?)
+        }
+        None => None,
+    };
+    let mut checks = [crate::storage::CheckConstraint::EMPTY; crate::storage::MAX_DOMAIN_CHECKS];
+    let mut n = 0;
+    for c in ast_checks {
+        if n == crate::storage::MAX_DOMAIN_CHECKS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a domain may have at most {} CHECK constraints",
+                crate::storage::MAX_DOMAIN_CHECKS
+            ));
+        }
+        validate_domain_expr(c.expression, true, arena)?;
+        let name = match c.name {
+            Some(nm) => SqlName::parse(nm)?,
+            None => generate_check_name(domain, &checks[..n])?,
+        };
+        checks[n] = crate::storage::CheckConstraint {
+            name,
+            expression: domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?,
+        };
+        n += 1;
+    }
+    Ok(crate::storage::DomainSpec { base, base_type_mod, not_null, default_expr, checks, n_checks: n })
+}
+
+/// PostgreSQL's unnamed-constraint naming for a domain CHECK: `<domain>_check`,
+/// then `<domain>_check1`, `<domain>_check2`, … avoiding names already used.
+fn generate_check_name(
+    domain: &str,
+    existing: &[crate::storage::CheckConstraint],
+) -> Result<SqlName, SqlError> {
+    for suffix in 0..1000usize {
+        let candidate = if suffix == 0 {
+            stack_format!(128, "{}_check", domain)
+        } else {
+            stack_format!(128, "{}_check{}", domain, suffix)
+        };
+        if !existing.iter().any(|c| c.name.as_str() == candidate.as_str()) {
+            return SqlName::parse(candidate.as_str());
+        }
+    }
+    Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cannot name domain CHECK constraint"))
+}
+
+pub fn create_domain(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    d: &crate::sql::ast::CreateDomain,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = match storage.creation_schema(d.name.schema, d.name.name, txn.txid) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    if storage.domain_slot(schema.as_str(), d.name.name, txn.txid).is_some() {
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "type \"{}\" already exists",
+            d.name.name
+        ));
+    }
+    let spec = match build_domain_spec(
+        d.name.name,
+        d.base_type,
+        d.base_type_mod,
+        d.not_null,
+        d.default_text,
+        d.checks,
+        arena,
+    ) {
+        Ok(s) => s,
+        Err(e) => return sql_fail(e),
+    };
+    let sqlname = match SqlName::parse(d.name.name) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    let slot = match storage.create_domain(schema, sqlname, spec, txn.txid) {
+        Ok(slot) => slot,
+        Err(e) => return sql_fail(e),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
+        storage.rollback_domain_create(slot);
+        return sql_fail(e);
+    }
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainCreated(slot as u32)) {
+        return sql_fail(e);
+    }
+    responder.command_complete("CREATE DOMAIN")?;
+    sql_ok()
+}
+
+pub fn drop_domain(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[QualName],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some(slot) = storage.resolve_domain_slot(name.name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "type \"{}\" does not exist, skipping", name.name).as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                name.name
+            ));
+        };
+        let (schema, dname) = {
+            let d = storage.domain(slot);
+            (d.schema, d.name)
+        };
+        // RESTRICT (the default) fails if any column depends on the domain.
+        if !cascade && storage.domain_in_use(schema.as_str(), dname.as_str()).is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop type {} because other objects depend on it",
+                dname.as_str()
+            ));
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(e) =
+            wal.append(lsn, &WalOp::DropDomain { schema: schema.as_str(), name: dname.as_str() })
+        {
+            return sql_fail(e);
+        }
+        match storage.drop_domain(schema.as_str(), dname.as_str(), txn.txid) {
+            Ok(Some(slot)) => {
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32)) {
+                    return sql_fail(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return sql_fail(e),
+        }
+    }
+    responder.command_complete("DROP DOMAIN")?;
+    sql_ok()
+}
+
+pub fn alter_domain(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName,
+    action: &crate::sql::ast::AlterDomainAction,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::AlterDomainAction as A;
+    let Some(slot) = storage.resolve_domain_slot(name.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "type \"{}\" does not exist",
+            name.name
+        ));
+    };
+    // Start from the current definition and apply the action.
+    let current = *storage.domain(slot);
+    let mut spec = crate::storage::DomainSpec {
+        base: current.base,
+        base_type_mod: current.base_type_mod,
+        not_null: current.not_null,
+        default_expr: current.default_expr,
+        checks: current.checks,
+        n_checks: current.n_checks,
+    };
+    match action {
+        // NOTE: ALTER DOMAIN SET NOT NULL / ADD CHECK do not re-validate
+        // existing rows here (PostgreSQL does). The constraint applies to
+        // subsequent writes; see BUGS.md.
+        A::SetNotNull => spec.not_null = true,
+        A::DropNotNull => spec.not_null = false,
+        A::SetDefault(text) => {
+            if let Err(e) = validate_domain_expr(text, false, arena) {
+                return sql_fail(e);
+            }
+            match domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(text) {
+                Ok(t) => spec.default_expr = Some(t),
+                Err(e) => return sql_fail(e),
+            }
+        }
+        A::DropDefault => spec.default_expr = None,
+        A::AddCheck(check) => {
+            if spec.n_checks == crate::storage::MAX_DOMAIN_CHECKS {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "a domain may have at most {} CHECK constraints",
+                    crate::storage::MAX_DOMAIN_CHECKS
+                ));
+            }
+            if let Err(e) = validate_domain_expr(check.expression, true, arena) {
+                return sql_fail(e);
+            }
+            let cname = match check.name {
+                Some(nm) => match SqlName::parse(nm) {
+                    Ok(n) => n,
+                    Err(e) => return sql_fail(e),
+                },
+                None => match generate_check_name(current.name.as_str(), &spec.checks[..spec.n_checks]) {
+                    Ok(n) => n,
+                    Err(e) => return sql_fail(e),
+                },
+            };
+            let expression = match domain_text::<{ crate::storage::CHECK_SQL_MAX }>(check.expression) {
+                Ok(t) => t,
+                Err(e) => return sql_fail(e),
+            };
+            spec.checks[spec.n_checks] = crate::storage::CheckConstraint { name: cname, expression };
+            spec.n_checks += 1;
+        }
+        A::DropConstraint { name: cname, if_exists } => {
+            let Some(pos) = spec.checks[..spec.n_checks].iter().position(|c| c.name.as_str() == *cname)
+            else {
+                if *if_exists {
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(128, "constraint \"{}\" of domain \"{}\" does not exist, skipping", cname, name.name).as_str(),
+                    )?;
+                    responder.command_complete("ALTER DOMAIN")?;
+                    return sql_ok();
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" of domain \"{}\" does not exist",
+                    cname,
+                    name.name
+                ));
+            };
+            for i in pos..spec.n_checks - 1 {
+                spec.checks[i] = spec.checks[i + 1];
+            }
+            spec.n_checks -= 1;
+            spec.checks[spec.n_checks] = crate::storage::CheckConstraint::EMPTY;
+        }
+    }
+    storage.alter_domain(slot, spec);
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
+        // Restore the pre-ALTER definition on a journal failure.
+        let restore = crate::storage::DomainSpec {
+            base: current.base,
+            base_type_mod: current.base_type_mod,
+            not_null: current.not_null,
+            default_expr: current.default_expr,
+            checks: current.checks,
+            n_checks: current.n_checks,
+        };
+        storage.alter_domain(slot, restore);
+        return sql_fail(e);
+    }
+    responder.command_complete("ALTER DOMAIN")?;
     sql_ok()
 }
 
@@ -5001,7 +5340,9 @@ pub fn alter_table(
                         MAX_COLUMNS
                     ));
                 }
-                let meta = match build_column(c, arena) {
+                // ALTER runs autocommitted, so a domain type resolves against
+                // the committed catalog (txid 0).
+                let meta = match build_column(c, &*storage, 0, arena) {
                     Ok(m) => m,
                     Err(e) => return sql_fail(e),
                 };

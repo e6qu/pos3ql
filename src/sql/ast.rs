@@ -74,6 +74,12 @@ pub enum Stmt<'a> {
     },
     /// DROP SEQUENCE [IF EXISTS] name [, ...].
     DropSequence { names: &'a [QualName<'a>], if_exists: bool },
+    /// CREATE DOMAIN name [AS] basetype [ constraint ... ].
+    CreateDomain(CreateDomain<'a>),
+    /// ALTER DOMAIN name <action>.
+    AlterDomain { name: QualName<'a>, action: AlterDomainAction<'a> },
+    /// DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+    DropDomain { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
     /// CREATE [UNIQUE] INDEX name ON table (col, ...).
     CreateIndex {
         name: &'a str,
@@ -507,6 +513,38 @@ impl<'a> SeqOptions<'a> {
         cycle: None,
         restart: None,
     };
+}
+
+/// A `CREATE DOMAIN name [AS] basetype[(typmod)] [constraint...]`. The base
+/// type name and its typmod are raw (resolved in exec); constraint predicate
+/// and default expressions are raw source text, re-parsed when enforced.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateDomain<'a> {
+    pub name: QualName<'a>,
+    pub base_type: &'a str,
+    pub base_type_mod: i32,
+    pub not_null: bool,
+    pub default_text: Option<&'a str>,
+    pub checks: &'a [DomainCheck<'a>],
+}
+
+/// One domain `[CONSTRAINT name] CHECK (expr)` — `name` is `None` when the
+/// constraint was written unnamed (the executor generates `<domain>_check`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DomainCheck<'a> {
+    pub name: Option<&'a str>,
+    pub expression: &'a str,
+}
+
+/// One `ALTER DOMAIN` action.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlterDomainAction<'a> {
+    AddCheck(DomainCheck<'a>),
+    DropConstraint { name: &'a str, if_exists: bool },
+    SetNotNull,
+    DropNotNull,
+    SetDefault(&'a str),
+    DropDefault,
 }
 
 /// Referential action for a foreign key's ON DELETE / ON UPDATE.

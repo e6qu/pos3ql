@@ -65,6 +65,16 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         Some(self.scope.output_type(entry))
     }
 
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<crate::storage::SqlName> {
+        match self.scope.find_column(qualifier, name).ok()? {
+            ResolvedColumn::Table(t, c) => {
+                self.scope.defs[t].and_then(|def| def.columns().get(c).and_then(|col| col.domain))
+            }
+            // A USING/NATURAL-merged column carries no single domain identity.
+            ResolvedColumn::Merged(_) => None,
+        }
+    }
+
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.scope.func_scalar_type(table).is_some()
     }
@@ -167,6 +177,11 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         self.inner
             .col_type(q, name)
             .or_else(|| self.outer.and_then(|o| o.col_type(q, name)))
+    }
+    fn column_domain(&self, q: Option<&str>, name: &str) -> Option<crate::storage::SqlName> {
+        self.inner
+            .column_domain(q, name)
+            .or_else(|| self.outer.and_then(|o| o.column_domain(q, name)))
     }
 
     /// Forwarded like the rest: a wrapper that answered this from the trait

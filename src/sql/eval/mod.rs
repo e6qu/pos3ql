@@ -224,6 +224,13 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The domain type name a bare column was declared with, if any — so
+    /// `pg_typeof(domain_col)` reports the domain rather than its base type.
+    /// Defaults to none (an ordinary base-typed column).
+    fn column_domain(&self, _qualifier: Option<&str>, _name: &str) -> Option<crate::storage::SqlName> {
+        None
+    }
+
     /// Whether a whole-row reference to `table` is a scalar (a
     /// set-returning-function scan's single output column) rather than a record.
     /// Defaults to false.

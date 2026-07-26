@@ -10,6 +10,7 @@ use super::{
     ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, QualName,
     Stmt, TableConstraint, Tok, MAX_LIST,
 };
+use crate::sql::ast::{AlterDomainAction, CreateDomain, DomainCheck};
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
 
@@ -47,6 +48,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("sequence")? {
             return self.create_sequence();
+        }
+        if self.eat_ident("domain")? {
+            return self.create_domain();
         }
         self.create_table()
     }
@@ -88,6 +92,122 @@ impl<'a> Parser<'a> {
         let name = self.qual_name("sequence name")?;
         let options = self.seq_options(false)?;
         Ok(Stmt::CreateSequence { name, if_not_exists, options })
+    }
+
+    /// `CREATE DOMAIN name [AS] basetype[(typmod)] [constraint...]` ("domain"
+    /// consumed). A constraint is `[CONSTRAINT c] { NOT NULL | NULL | CHECK
+    /// (expr) }` or `DEFAULT expr`.
+    fn create_domain(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("domain name")?;
+        let _ = self.eat_ident("as")?;
+        let (base_type, base_type_mod) = self.type_name_mod()?;
+        let mut not_null = false;
+        let mut default_text = None;
+        let mut checks = [DomainCheck { name: None, expression: "" }; MAX_LIST];
+        let mut n_checks = 0;
+        loop {
+            let cname = if self.eat_ident("constraint")? {
+                Some(self.col_ident("constraint name")?)
+            } else {
+                None
+            };
+            if self.eat_ident("not")? {
+                self.expect_ident("null")?;
+                not_null = true;
+            } else if self.eat_ident("null")? {
+                not_null = false;
+            } else if self.eat_ident("check")? {
+                if n_checks == MAX_LIST {
+                    return Err(self.limit("domain CHECK constraints", MAX_LIST));
+                }
+                checks[n_checks] = DomainCheck { name: cname, expression: self.check_text()? };
+                n_checks += 1;
+            } else if cname.is_none() && self.eat_ident("default")? {
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                default_text = Some(self.arena_str(self.text[start..self.peek_at].trim_end())?);
+            } else if cname.is_some() {
+                return Err(self.err_here("expected NOT NULL or CHECK after CONSTRAINT"));
+            } else {
+                break;
+            }
+        }
+        let checks = self.arena_slice(&checks[..n_checks])?;
+        Ok(Stmt::CreateDomain(CreateDomain {
+            name,
+            base_type,
+            base_type_mod,
+            not_null,
+            default_text,
+            checks,
+        }))
+    }
+
+    /// Captures the raw source text of a `CHECK (expr)` predicate (the paren
+    /// already implied by the caller having consumed `CHECK`).
+    fn check_text(&mut self) -> Result<&'a str, ParseError> {
+        self.expect_op("(")?;
+        let start = self.peek_at;
+        let _ = self.expression(0)?;
+        let text = self.arena_str(self.text[start..self.peek_at].trim_end())?;
+        self.expect_op(")")?;
+        Ok(text)
+    }
+
+    /// `ALTER DOMAIN name <action>` ("alter domain" consumed).
+    pub(super) fn alter_domain(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("domain name")?;
+        let action = if self.eat_ident("add")? {
+            let cname = if self.eat_ident("constraint")? {
+                Some(self.col_ident("constraint name")?)
+            } else {
+                None
+            };
+            self.expect_ident("check")?;
+            AlterDomainAction::AddCheck(DomainCheck { name: cname, expression: self.check_text()? })
+        } else if self.eat_ident("drop")? {
+            if self.eat_ident("constraint")? {
+                let if_exists = if self.eat_ident("if")? {
+                    self.expect_ident("exists")?;
+                    true
+                } else {
+                    false
+                };
+                AlterDomainAction::DropConstraint { name: self.col_ident("constraint name")?, if_exists }
+            } else if self.eat_ident("not")? {
+                self.expect_ident("null")?;
+                AlterDomainAction::DropNotNull
+            } else {
+                self.expect_ident("default")?;
+                AlterDomainAction::DropDefault
+            }
+        } else if self.eat_ident("set")? {
+            if self.eat_ident("not")? {
+                self.expect_ident("null")?;
+                AlterDomainAction::SetNotNull
+            } else {
+                self.expect_ident("default")?;
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                AlterDomainAction::SetDefault(self.arena_str(self.text[start..self.peek_at].trim_end())?)
+            }
+        } else {
+            return Err(self.err_here("expected ADD, DROP or SET after ALTER DOMAIN"));
+        };
+        Ok(Stmt::AlterDomain { name, action })
+    }
+
+    /// `DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE|RESTRICT]` ("domain"
+    /// consumed).
+    pub(super) fn drop_domain(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let (names, if_exists) = self.drop_targets("domain name")?;
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropDomain { names, if_exists, cascade })
     }
 
     /// `ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]]` ("alter
@@ -390,6 +510,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("sequence")? {
             let (names, if_exists) = self.drop_targets("sequence name")?;
             return Ok(Stmt::DropSequence { names, if_exists });
+        }
+        if self.eat_ident("domain")? {
+            return self.drop_domain();
         }
         self.drop_table()
     }

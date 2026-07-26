@@ -31,7 +31,11 @@ pub struct Config {
     /// Per-connection send buffer.
     pub conn_send_buffer_bytes: usize,
     /// Per-connection arena for parsing/planning one statement; reset after
-    /// every statement.
+    /// every statement. Sized to hold the working set of real driver
+    /// introspection queries: pgJDBC/ORM `DatabaseMetaData` calls join eight
+    /// or more `pg_catalog` relations at once, and each relation's `TableDef`
+    /// (a fixed 64-column array) is copied into this arena while the query is
+    /// planned, so a single such query legitimately draws several hundred KiB.
     pub sql_arena_bytes: usize,
     /// Shared execution arena for materializing a single query's rows
     /// (ORDER BY / DISTINCT / GROUP BY buffers). Single-threaded execution
@@ -150,7 +154,7 @@ impl Config {
             cluster: Vec::new(),
             conn_recv_buffer_bytes: 64 * KIB,
             conn_send_buffer_bytes: 64 * KIB,
-            sql_arena_bytes: 256 * KIB,
+            sql_arena_bytes: MIB,
             work_arena_bytes: 64 * MIB,
             max_prepared: 8,
             prepared_bytes: 8 * KIB,

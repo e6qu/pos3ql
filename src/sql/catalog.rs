@@ -87,7 +87,7 @@ pub fn synthesize<'a>(
         (false, "pg_attribute") => pg_attribute(storage, arena),
         (false, "pg_attrdef") => pg_attrdef(storage, arena),
         (false, "pg_collation") => pg_collation(arena),
-        (false, "pg_type") => pg_type(arena),
+        (false, "pg_type") => pg_type(storage, arena),
         (false, "pg_namespace") => pg_namespace(storage, arena),
         (false, "pg_tables") => pg_tables(storage, arena),
         (false, "pg_indexes") => pg_indexes(storage, arena),
@@ -359,6 +359,12 @@ fn sequence_oid(slot: usize) -> i32 {
 const FIRST_VIEW_OID: i32 = 100_000;
 fn view_oid(slot: usize) -> i32 {
     FIRST_VIEW_OID + slot as i32
+}
+
+/// Domains get their own OID range, above views.
+const FIRST_DOMAIN_OID: i32 = 110_000;
+fn domain_oid(slot: usize) -> i32 {
+    FIRST_DOMAIN_OID + slot as i32
 }
 
 /// One materialized index relation (implicit primary-key / unique index from a
@@ -764,6 +770,7 @@ fn def_of(name: &str, columns: &[(&str, ColType)]) -> TableDef {
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
+            domain: None,
         }; MAX_COLUMNS],
         n_columns: columns.len(),
         ..TableDef::empty()
@@ -1245,7 +1252,7 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     )
 }
 
-fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_type",
         &[
@@ -1301,7 +1308,8 @@ fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
         _ => "S",
     };
-    let mut out: [&[Datum]; 32] = [&[]; 32];
+    let mut out: [&[Datum]; 32 + crate::storage::MAX_DOMAINS] =
+        [&[]; 32 + crate::storage::MAX_DOMAINS];
     for (i, t) in types.iter().enumerate() {
         out[i] = row(
             &[
@@ -1325,7 +1333,36 @@ fn pg_type<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             arena,
         )?;
     }
-    finish(def, &out[..types.len()], arena)
+    let mut n = types.len();
+    // User-defined domains: typtype 'd', with their base type and constraints.
+    for (slot, d) in storage.live_domains() {
+        out[n] = row(
+            &[
+                Datum::Int4(domain_oid(slot)),
+                text(arena.alloc_str(d.name.as_str()).map_err(|_| arena_full())?, arena)?,
+                Datum::Int4(i32::from(d.base.typlen())),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, d.schema.as_str())),
+                text("d", arena)?,
+                text(category(&d.base), arena)?,
+                Datum::Int4(d.base.oid()),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(d.base_type_mod),
+                Datum::Bool(d.not_null),
+                match &d.default_expr {
+                    Some(e) => text(arena.alloc_str(e.as_str()).map_err(|_| arena_full())?, arena)?,
+                    None => Datum::Null,
+                },
+                text("", arena)?,
+                text("", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &out[..n], arena)
 }
 
 fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

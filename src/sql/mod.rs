@@ -429,6 +429,12 @@ impl Engine {
                 DdlUndo::SequenceDropped(slot) => {
                     self.storage.commit_sequence_drop(*slot as usize)
                 }
+                DdlUndo::DomainCreated(slot) => {
+                    self.storage.commit_domain_create(*slot as usize)
+                }
+                DdlUndo::DomainDropped(slot) => {
+                    self.storage.commit_domain_drop(*slot as usize)
+                }
                 DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
@@ -506,6 +512,12 @@ impl Engine {
                 DdlUndo::SequenceDropped(slot) => {
                     self.storage.rollback_sequence_drop(slot as usize, txn.txid)
                 }
+                DdlUndo::DomainCreated(slot) => {
+                    self.storage.rollback_domain_create(slot as usize)
+                }
+                DdlUndo::DomainDropped(slot) => {
+                    self.storage.rollback_domain_drop(slot as usize, txn.txid)
+                }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
                     self.storage.rollback_index_drop(slot as usize, txn.txid)
@@ -566,6 +578,12 @@ impl Engine {
                 }
                 DdlUndo::SequenceDropped(slot) => {
                     self.storage.rollback_sequence_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::DomainCreated(slot) => {
+                    self.storage.rollback_domain_create(slot as usize)
+                }
+                DdlUndo::DomainDropped(slot) => {
+                    self.storage.rollback_domain_drop(slot as usize, txn.txid)
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
@@ -1455,6 +1473,27 @@ impl Engine {
                 txn,
                 names,
                 *if_exists,
+                responder,
+            ),
+            Stmt::CreateDomain(d) => {
+                exec::create_domain(&mut self.storage, &mut self.wal, txn, d, arena, responder)
+            }
+            Stmt::AlterDomain { name, action } => exec::alter_domain(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                action,
+                arena,
+                responder,
+            ),
+            Stmt::DropDomain { names, if_exists, cascade } => exec::drop_domain(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
                 responder,
             ),
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
@@ -2432,6 +2471,28 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::SequenceAdvance { schema, name, last, is_called } => {
             storage.apply_sequence_advance(schema, name, last, is_called);
+        }
+        WalOp::CreateDomain(def) => {
+            // An ALTER replays as a redefinition: redefine in place if it
+            // exists, else create it committed (txid 0).
+            let spec = crate::storage::DomainSpec {
+                base: def.base,
+                base_type_mod: def.base_type_mod,
+                not_null: def.not_null,
+                default_expr: def.default_expr,
+                checks: def.checks,
+                n_checks: def.n_checks,
+            };
+            if let Some(slot) = storage.domain_slot(def.schema.as_str(), def.name.as_str(), 0) {
+                storage.alter_domain(slot, spec);
+            } else {
+                storage.create_domain(def.schema, def.name, spec, 0)?;
+            }
+        }
+        WalOp::DropDomain { schema, name } => {
+            if let Some(slot) = storage.drop_domain(schema, name, 0)? {
+                storage.commit_domain_drop(slot);
+            }
         }
         WalOp::Comment { class, schema, name, subid, text } => {
             let stored = text.map(crate::storage::comment_stackstr).transpose()?;

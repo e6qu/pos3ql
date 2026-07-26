@@ -1181,6 +1181,34 @@ impl Checkpointer {
                     seq.is_called.set(is_called != 0);
                     seq.dirty.set(false);
                 }
+                Some("cmt") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let class: u8 = parse_field(words.next(), "cmt class")?;
+                    let subid: u32 = parse_field(words.next(), "cmt subid")?;
+                    let read_hex = |w: Option<&str>, what: &'static str| {
+                        w.ok_or(CheckpointSetupError::Corrupt(what))
+                            .and_then(decode_hex_name)
+                    };
+                    let schema = read_hex(words.next(), "cmt schema missing")?;
+                    let name = read_hex(words.next(), "cmt name missing")?;
+                    let text = read_hex(words.next(), "cmt text missing")?;
+                    let stored = crate::storage::comment_stackstr(&text)
+                        .map_err(|_| CheckpointSetupError::Corrupt("cmt text too long"))?;
+                    storage
+                        .apply_comment(
+                            crate::storage::CommentClass::from_u8(class),
+                            sql_name(&schema)?,
+                            sql_name(&name)?,
+                            subid,
+                            Some(stored),
+                        )
+                        .map_err(|e| {
+                            CheckpointSetupError::S3(format!(
+                                "manifest comment rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("idx") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let unique: u8 = parse_field(words.next(), "idx unique")?;
@@ -1901,6 +1929,35 @@ Ok(CheckpointStep::Published { lsn })
                     u8::from(seq.cycle),
                     seq.last_value.get(),
                     u8::from(seq.is_called.get()),
+                ),
+            )?;
+        }
+        // Object comments: `cmt <class> <subid> <hex-schema> <hex-name>
+        // <hex-text>`. Only committed comments carrying text are written.
+        for comment in storage.live_comments() {
+            use core::fmt::Write;
+            let Some(text) = comment.live else { continue };
+            let mut hschema = StackStr::<130>::new();
+            for b in comment.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{b:02x}");
+            }
+            let mut hname = StackStr::<130>::new();
+            for b in comment.name.as_str().as_bytes() {
+                let _ = write!(hname, "{b:02x}");
+            }
+            let mut htext = StackStr::<{ crate::storage::COMMENT_MAX * 2 + 2 }>::new();
+            for b in text.as_str().as_bytes() {
+                let _ = write!(htext, "{b:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "cmt {} {} {} {} {}",
+                    comment.class.to_u8(),
+                    comment.subid,
+                    hschema.as_str(),
+                    hname.as_str(),
+                    htext.as_str(),
                 ),
             )?;
         }

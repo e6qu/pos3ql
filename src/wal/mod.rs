@@ -52,6 +52,7 @@ const KIND_SET_MATVIEW_POPULATED: u8 = 16;
 const KIND_CREATE_SEQUENCE: u8 = 17;
 const KIND_DROP_SEQUENCE: u8 = 18;
 const KIND_SEQUENCE_ADVANCE: u8 = 19;
+const KIND_COMMENT: u8 = 20;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -172,6 +173,18 @@ pub enum WalOp<'a> {
         name: &'a str,
         last: i64,
         is_called: bool,
+    },
+    /// A `COMMENT ON` set or removal. `class` is the [`CommentClass`]
+    /// discriminant; `subid` is 0 for a relation/schema or the column number;
+    /// `text == None` is a removal. Absolute, so replay is idempotent.
+    ///
+    /// [`CommentClass`]: crate::storage::CommentClass
+    Comment {
+        class: u8,
+        schema: &'a str,
+        name: &'a str,
+        subid: u32,
+        text: Option<&'a str>,
     },
 }
 
@@ -317,7 +330,7 @@ impl Wal {
                     u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_SEQUENCE_ADVANCE).contains(&kind)
+                if !(KIND_CREATE..=KIND_COMMENT).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -519,6 +532,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateSequence { .. } => KIND_CREATE_SEQUENCE,
         WalOp::DropSequence { .. } => KIND_DROP_SEQUENCE,
         WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
+        WalOp::Comment { .. } => KIND_COMMENT,
     }
 }
 
@@ -598,6 +612,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::SequenceAdvance { schema, name, .. } => {
             1 + name.len() + 1 + schema.len() + 8 + 1
+        }
+        WalOp::Comment { schema, name, text, .. } => {
+            1 + name.len() + 1 + schema.len() + 1 + 4 + 1 + text.map_or(0, |t| 2 + t.len())
         }
     }
 }
@@ -768,6 +785,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, schema)
                 && buffer.append(&last.to_le_bytes())
                 && buffer.append(&[u8::from(*is_called)])
+        }
+        WalOp::Comment { class, schema, name, subid, text } => {
+            let mut ok = name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[*class])
+                && buffer.append(&subid.to_le_bytes());
+            match text {
+                Some(t) => {
+                    ok &= buffer.append(&[1u8])
+                        && buffer.append(&(t.len() as u16).to_le_bytes())
+                        && buffer.append(t.as_bytes());
+                }
+                None => ok &= buffer.append(&[0u8]),
+            }
+            ok
         }
     }
 }
@@ -1124,6 +1156,26 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             (at == payload.len())
                 .then_some(WalOp::SequenceAdvance { schema, name, last, is_called })
         }
+        KIND_COMMENT => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let class = *payload.get(at)?;
+            at += 1;
+            let subid = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
+            at += 4;
+            let present = *payload.get(at)?;
+            at += 1;
+            let text = if present != 0 {
+                let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+                at += 2;
+                let raw = payload.get(at..at + len)?;
+                at += len;
+                Some(core::str::from_utf8(raw).ok()?)
+            } else {
+                None
+            };
+            (at == payload.len()).then_some(WalOp::Comment { class, schema, name, subid, text })
+        }
         KIND_CREATE_SCHEMA => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CreateSchema(name))
@@ -1439,12 +1491,28 @@ mod tests {
             )
             .unwrap();
             wal.append(7, &WalOp::DropSequence { schema: "public", name: "s" }).unwrap();
+            wal.append(
+                8,
+                &WalOp::Comment {
+                    class: 0,
+                    schema: "public",
+                    name: "t",
+                    subid: 2,
+                    text: Some("a column comment"),
+                },
+            )
+            .unwrap();
+            wal.append(
+                9,
+                &WalOp::Comment { class: 1, schema: "", name: "s", subid: 0, text: None },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 7);
+        assert_eq!(seen.len(), 9);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -1457,9 +1525,20 @@ mod tests {
         assert!(seen[4].contains("cycle: true") && seen[4].contains("increment: 2"), "seq params: {}", seen[4]);
         assert!(seen[5].contains("SequenceAdvance") && seen[5].contains("last: 42"), "seq advance: {}", seen[5]);
         assert!(seen[6].contains("DropSequence"), "seq drop: {}", seen[6]);
-        assert_eq!(wal.last_lsn(), 7);
+        // Comment ops survive the encode/replay round-trip (set and removal).
+        assert!(
+            seen[7].contains("Comment") && seen[7].contains("subid: 2") && seen[7].contains("a column comment"),
+            "comment set: {}",
+            seen[7]
+        );
+        assert!(
+            seen[8].contains("Comment") && seen[8].contains("text: None"),
+            "comment removal: {}",
+            seen[8]
+        );
+        assert_eq!(wal.last_lsn(), 9);
         // Appending continues after the replayed tail.
-        wal.append(8, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
+        wal.append(10, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
         wal.commit();
     }
 

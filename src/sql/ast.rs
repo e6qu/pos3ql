@@ -145,6 +145,43 @@ pub enum Stmt<'a> {
     Unlisten(Option<&'a str>),
     /// NOTIFY channel [, payload] — raise a notification (delivered at commit).
     Notify { channel: &'a str, payload: Option<&'a str> },
+    /// COMMENT ON <object> IS { 'text' | NULL }. `text: None` removes it.
+    Comment { target: CommentTarget<'a>, text: Option<&'a str> },
+}
+
+/// Which kind of relation a `COMMENT ON` names — PostgreSQL rejects a comment
+/// whose keyword does not match the object's actual kind (42809).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentRelKind {
+    Table,
+    View,
+    MaterializedView,
+    Index,
+    Sequence,
+}
+
+impl CommentRelKind {
+    /// The noun PostgreSQL uses in `"x" is not a <noun>`.
+    pub fn noun(self) -> &'static str {
+        match self {
+            CommentRelKind::Table => "table",
+            CommentRelKind::View => "view",
+            CommentRelKind::MaterializedView => "materialized view",
+            CommentRelKind::Index => "index",
+            CommentRelKind::Sequence => "sequence",
+        }
+    }
+}
+
+/// The object a COMMENT applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentTarget<'a> {
+    /// TABLE / VIEW / MATERIALIZED VIEW / INDEX / SEQUENCE name.
+    Relation { kind: CommentRelKind, name: QualName<'a> },
+    /// COLUMN table.column.
+    Column { relation: QualName<'a>, column: &'a str },
+    /// SCHEMA name.
+    Schema(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

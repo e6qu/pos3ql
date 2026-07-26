@@ -960,6 +960,122 @@ impl SchemaDef {
     }
 }
 
+/// How many distinct objects may carry a comment at once.
+pub(crate) const MAX_COMMENTS: usize = 64;
+
+/// Copies comment text into a fixed buffer, or a loud error if it is longer
+/// than [`COMMENT_MAX`] (never a silent truncation).
+pub(crate) fn comment_stackstr(text: &str) -> Result<StackStr<COMMENT_MAX>, SqlError> {
+    use core::fmt::Write;
+    let mut stored = StackStr::<COMMENT_MAX>::new();
+    let _ = write!(stored, "{text}");
+    if stored.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "comment exceeds {} bytes",
+            COMMENT_MAX
+        ));
+    }
+    Ok(stored)
+}
+
+/// The longest comment text we store. A longer `COMMENT ON` is a loud
+/// `PROGRAM_LIMIT_EXCEEDED`, never a silent truncation (static-memory rule).
+/// Sized so a `DdlUndo::CommentSet` (which carries a prior comment inline)
+/// stays within the transaction undo log's largest pre-existing entry.
+pub(crate) const COMMENT_MAX: usize = 192;
+
+/// Which catalog a comment's object lives in. `Relation` covers every
+/// `pg_class` object (table, view, materialized view, index, sequence — and a
+/// column, via a non-zero `subid`); `Schema` covers `pg_namespace`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommentClass {
+    Relation,
+    Schema,
+}
+
+impl CommentClass {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            CommentClass::Relation => 0,
+            CommentClass::Schema => 1,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => CommentClass::Schema,
+            _ => CommentClass::Relation,
+        }
+    }
+}
+
+/// The kind of a relation, for `COMMENT ON` kind-checking.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoredRelKind {
+    Table,
+    View,
+    Matview,
+    Index,
+    Sequence,
+}
+
+/// A transaction's uncommitted comment write overlaying the committed `live`
+/// text (catalog MVCC, mirroring `Table`'s row overlay): `text == None` is an
+/// uncommitted removal.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingComment {
+    pub txid: u32,
+    pub text: Option<StackStr<COMMENT_MAX>>,
+}
+
+/// A comment attached to a database object, keyed by `(class, schema, name,
+/// subid)` — restart-stable, since object OIDs derive from catalog slots but
+/// names do not. `subid` is 0 for a relation or schema and the 1-based column
+/// number for a column comment. `live` is the committed text (`None` once
+/// removed), `pending` the owning transaction's uncommitted overlay.
+#[derive(Clone, Copy, Debug)]
+pub struct CommentEntry {
+    pub used: bool,
+    pub class: CommentClass,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub subid: u32,
+    pub live: Option<StackStr<COMMENT_MAX>>,
+    pub pending: Option<PendingComment>,
+}
+
+impl CommentEntry {
+    fn empty() -> Self {
+        Self {
+            used: false,
+            class: CommentClass::Relation,
+            schema: SqlName::EMPTY,
+            name: SqlName::EMPTY,
+            subid: 0,
+            live: None,
+            pending: None,
+        }
+    }
+
+    fn matches(&self, class: CommentClass, schema: &str, name: &str, subid: u32) -> bool {
+        self.used
+            && self.class == class
+            && self.subid == subid
+            && self.name.as_str() == name
+            && self.schema.as_str() == schema
+    }
+
+    /// The text `txid` sees: its own uncommitted overlay when present, else the
+    /// committed value.
+    fn visible_text(&self, txid: u32) -> Option<&str> {
+        match &self.pending {
+            Some(p) if p.txid == txid => p.text.as_ref().map(StackStr::as_str),
+            _ => self.live.as_ref().map(StackStr::as_str),
+        }
+    }
+}
+
 /// One element of the effective search path: a live schema slot, or the
 /// implicit/explicit `pg_catalog` position.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1030,6 +1146,9 @@ pub struct Storage {
     sequences: FixedVec<SequenceDef>,
     indexes: FixedVec<IndexDef>,
     schemas: FixedVec<SchemaDef>,
+    /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
+    /// fixed slots reused as comments are added and removed.
+    comments: FixedVec<CommentEntry>,
     /// The running statement's effective search path (see [`PathContext`]).
     path: PathContext,
     /// Monotonic stamp for `created_at` fields.
@@ -1161,6 +1280,7 @@ impl Storage {
                 + size_of::<IndexDef>())
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
+            + MAX_COMMENTS * size_of::<CommentEntry>()
             + ValueIndexPool::budget_bytes(
                 config.max_value_indexes,
                 config.value_index_rows + config.table_rows,
@@ -1276,6 +1396,10 @@ impl Storage {
                 })
                 .expect("sized to MAX_SCHEMAS");
         }
+        let mut comments = FixedVec::new(budget, "comments", MAX_COMMENTS)?;
+        for _ in 0..MAX_COMMENTS {
+            comments.push(CommentEntry::empty()).expect("sized to MAX_COMMENTS");
+        }
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
         for _ in 0..config.max_tables {
             indexes
@@ -1308,6 +1432,7 @@ impl Storage {
             sequences,
             indexes,
             schemas,
+            comments,
             path: PathContext::public_only(),
             catalog_seq: 0,
             next_rowid: 1,
@@ -1353,6 +1478,181 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, n)| n.visible_to(txid))
+    }
+
+    // --- Object comments (`COMMENT ON ...`) ---
+
+    /// The comment text `txid` sees on this object, or `None` for none. Reads
+    /// the transaction's own uncommitted overlay when present, else committed.
+    pub fn comment_text(
+        &self,
+        class: CommentClass,
+        schema: &str,
+        name: &str,
+        subid: u32,
+        txid: u32,
+    ) -> Option<&str> {
+        self.comments
+            .iter()
+            .find(|c| c.matches(class, schema, name, subid))
+            .and_then(|c| c.visible_text(txid))
+    }
+
+    /// Committed comment entries carrying text, for the checkpoint and
+    /// `pg_description`.
+    pub fn live_comments(&self) -> impl Iterator<Item = &CommentEntry> {
+        self.comments.iter().filter(|c| c.used && c.live.is_some())
+    }
+
+    /// Comments `txid` can see (own uncommitted overlay, else committed) that
+    /// carry text, as `(class, schema, name, subid, text)` — for
+    /// `pg_description`, `obj_description` and `col_description`.
+    pub fn comments_visible(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (CommentClass, &str, &str, u32, &str)> {
+        self.comments.iter().filter_map(move |c| {
+            if !c.used {
+                return None;
+            }
+            c.visible_text(txid)
+                .map(|t| (c.class, c.schema.as_str(), c.name.as_str(), c.subid, t))
+        })
+    }
+
+    /// Sets (or, with `text == None`, removes) a comment as `txid`'s
+    /// uncommitted overlay. Returns the slot and the prior overlay, for the
+    /// transaction's undo log. A fresh key claims a free slot; exhausting the
+    /// slab is a loud error.
+    pub fn set_comment(
+        &mut self,
+        class: CommentClass,
+        schema: SqlName,
+        name: SqlName,
+        subid: u32,
+        text: Option<StackStr<COMMENT_MAX>>,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingComment>), SqlError> {
+        if let Some(slot) = self
+            .comments
+            .iter()
+            .position(|c| c.matches(class, schema.as_str(), name.as_str(), subid))
+        {
+            let prior = self.comments[slot].pending.take();
+            self.comments[slot].pending = Some(PendingComment { txid, text });
+            return Ok((slot, prior));
+        }
+        let Some(slot) = self.comments.iter().position(|c| !c.used) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many object comments (limit {})",
+                MAX_COMMENTS
+            ));
+        };
+        self.comments[slot] = CommentEntry {
+            used: true,
+            class,
+            schema,
+            name,
+            subid,
+            live: None,
+            pending: Some(PendingComment { txid, text }),
+        };
+        Ok((slot, None))
+    }
+
+    /// Rollback: restores the comment slot's prior uncommitted overlay,
+    /// freeing the slot if it now holds nothing.
+    pub fn restore_comment_pending(&mut self, slot: usize, prior: Option<PendingComment>) {
+        self.comments[slot].pending = prior;
+        self.reap_comment(slot);
+    }
+
+    /// Commit: promotes `txid`'s overlay to the committed value and returns the
+    /// object identity plus the new committed text, for journaling.
+    pub fn commit_comment(
+        &mut self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<(CommentClass, SqlName, SqlName, u32, Option<StackStr<COMMENT_MAX>>)> {
+        let entry = &mut self.comments[slot];
+        match entry.pending {
+            Some(p) if p.txid == txid => {
+                entry.pending = None;
+                entry.live = p.text;
+                let out = (entry.class, entry.schema, entry.name, entry.subid, entry.live);
+                self.reap_comment(slot);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Committed apply (journal replay and checkpoint load): sets the committed
+    /// text directly, with no transactional overlay.
+    pub fn apply_comment(
+        &mut self,
+        class: CommentClass,
+        schema: SqlName,
+        name: SqlName,
+        subid: u32,
+        text: Option<StackStr<COMMENT_MAX>>,
+    ) -> Result<(), SqlError> {
+        if let Some(slot) = self
+            .comments
+            .iter()
+            .position(|c| c.matches(class, schema.as_str(), name.as_str(), subid))
+        {
+            self.comments[slot].live = text;
+            self.reap_comment(slot);
+            return Ok(());
+        }
+        if text.is_none() {
+            return Ok(());
+        }
+        let Some(slot) = self.comments.iter().position(|c| !c.used) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many object comments (limit {})",
+                MAX_COMMENTS
+            ));
+        };
+        self.comments[slot] = CommentEntry {
+            used: true,
+            class,
+            schema,
+            name,
+            subid,
+            live: text,
+            pending: None,
+        };
+        Ok(())
+    }
+
+    /// Drops every comment on a relation (all columns and the relation itself)
+    /// or a schema, for when the object is dropped. Committed removal.
+    pub fn drop_object_comments(&mut self, class: CommentClass, schema: &str, name: &str) {
+        for slot in 0..self.comments.len() {
+            let c = &self.comments[slot];
+            if c.used
+                && c.class == class
+                && c.pending.is_none()
+                && c.name.as_str() == name
+                && c.schema.as_str() == schema
+            {
+                self.comments[slot].live = None;
+                self.reap_comment(slot);
+            }
+        }
+    }
+
+    /// Frees a comment slot that holds neither a committed value nor an
+    /// uncommitted overlay.
+    fn reap_comment(&mut self, slot: usize) {
+        let c = &mut self.comments[slot];
+        if c.live.is_none() && c.pending.is_none() {
+            *c = CommentEntry::empty();
+        }
     }
 
     /// Committed create (journal replay): the schema is immediately part of
@@ -1407,6 +1707,8 @@ impl Storage {
 
     /// Committed drop (journal replay).
     pub fn drop_schema(&mut self, slot: usize) {
+        let name = self.schemas[slot].name;
+        self.drop_object_comments(CommentClass::Schema, "", name.as_str());
         self.schemas[slot].live = false;
         self.schemas[slot].pending = None;
     }
@@ -1431,6 +1733,8 @@ impl Storage {
 
     /// Applies a committed DROP SCHEMA.
     pub fn commit_schema_drop(&mut self, slot: usize) {
+        let name = self.schemas[slot].name;
+        self.drop_object_comments(CommentClass::Schema, "", name.as_str());
         self.schemas[slot].live = false;
         self.schemas[slot].pending = None;
     }
@@ -1590,6 +1894,68 @@ impl Storage {
                 v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
             })
             .map(ResolvedRelation::View)
+    }
+
+    /// The kind of a relation named `name` in `schema` (visible to `txid`), or
+    /// `None` if no relation of that name exists there. A materialized view
+    /// shares its backing table's slot, so it is tested before a plain table.
+    pub fn relation_kind_in(&self, schema: &str, name: &str, txid: u32) -> Option<StoredRelKind> {
+        if self.find_matview(schema, name, txid).is_some() {
+            return Some(StoredRelKind::Matview);
+        }
+        if self.find_visible(schema, name, txid).is_some() {
+            return Some(StoredRelKind::Table);
+        }
+        if self.find_view(schema, name, txid).is_some() {
+            return Some(StoredRelKind::View);
+        }
+        if self.find_sequence(schema, name, txid).is_some() {
+            return Some(StoredRelKind::Sequence);
+        }
+        if self
+            .indexes
+            .iter()
+            .any(|i| i.visible_to(txid) && i.schema.as_str() == schema && i.name.as_str() == name)
+        {
+            return Some(StoredRelKind::Index);
+        }
+        None
+    }
+
+    /// Resolves a possibly-qualified relation name to `(schema, kind)` under the
+    /// current path, for `COMMENT ON`. PostgreSQL binds the name to the first
+    /// schema on the path that holds *any* relation of that name, then checks
+    /// the kind — so this returns that first match regardless of kind.
+    pub fn classify_relation(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<(SqlName, StoredRelKind)> {
+        if let Some(schema) = qualifier {
+            return self
+                .relation_kind_in(schema, name, txid)
+                .map(|k| (SqlName::parse(schema).unwrap_or(SqlName::EMPTY), k));
+        }
+        for entry in self.path.entries() {
+            if let PathEntry::Schema(slot) = entry {
+                let schema_name = self.schemas[*slot as usize].name;
+                if let Some(k) = self.relation_kind_in(schema_name.as_str(), name, txid) {
+                    return Some((schema_name, k));
+                }
+            }
+        }
+        None
+    }
+
+    /// The 1-based column number of `column` in the relation at `table_slot`, or
+    /// `None` if the relation has no such column.
+    pub fn column_number(&self, table_slot: usize, column: &str) -> Option<u32> {
+        let def = &self.tables[table_slot].def;
+        def.columns()
+            .iter()
+            .position(|c| c.name.as_str() == column)
+            .map(|i| i as u32 + 1)
     }
 
     /// The schema a new relation lands in: the qualifier if it names a
@@ -2929,6 +3295,8 @@ impl Storage {
     /// Committed drop (journal replay): rows are retained; the slot is freed at
     /// checkpoint.
     pub fn drop_table(&mut self, index: usize) {
+        let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
+        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.release_enforcers(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
@@ -2951,6 +3319,8 @@ impl Storage {
     /// Applies a committed DROP: the table leaves the image and its rows are
     /// reclaimed.
     pub fn commit_drop(&mut self, index: usize) {
+        let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
+        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.release_enforcers(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
@@ -2980,6 +3350,11 @@ impl Storage {
     /// Committed views as (name, SELECT text), for checkpoint serialization.
     pub fn live_views(&self) -> impl Iterator<Item = &ViewDef> {
         self.views.iter().filter(|v| v.live)
+    }
+
+    /// Committed views with their slot indices, for OID assignment.
+    pub fn views_with_slots(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
+        self.views.iter().enumerate().filter(|(_, v)| v.live)
     }
 
     pub(crate) fn view(&self, slot: usize) -> &ViewDef {
@@ -3113,6 +3488,8 @@ impl Storage {
     }
 
     pub fn commit_matview_drop(&mut self, slot: usize) {
+        let (schema, name) = (self.matviews[slot].schema, self.matviews[slot].name);
+        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.matviews[slot].live = false;
         self.matviews[slot].pending = None;
     }
@@ -3301,6 +3678,8 @@ impl Storage {
     }
 
     pub fn commit_sequence_drop(&mut self, slot: usize) {
+        let (schema, name) = (self.sequences[slot].schema, self.sequences[slot].name);
+        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.sequences[slot].live = false;
         self.sequences[slot].pending = None;
     }
@@ -3451,6 +3830,8 @@ impl Storage {
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
     pub fn commit_view_drop(&mut self, slot: usize) {
+        let (schema, name) = (self.views[slot].schema, self.views[slot].name);
+        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.views[slot].live = false;
         self.views[slot].pending = None;
     }
@@ -3606,6 +3987,8 @@ impl Storage {
 
     /// Promotes an uncommitted DROP INDEX into the committed catalog.
     pub fn commit_index_drop(&mut self, slot: usize) {
+        let (schema, name) = (self.indexes[slot].schema, self.indexes[slot].name);
+        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.indexes[slot].live = false;
         self.indexes[slot].pending = None;
     }

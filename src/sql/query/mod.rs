@@ -130,6 +130,7 @@ type Outcome = Result<Result<(), SqlError>, WireFull>;
 /// `pg_get_indexdef` can reconstruct an index's definition during evaluation.
 struct StorageCatalog<'s> {
     storage: &'s Storage,
+    txid: u32,
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_> {
@@ -150,6 +151,16 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
 
     fn reloid(&self, name: &str) -> Option<i32> {
         super::catalog::reloid_of_name(self.storage, name)
+    }
+
+    fn comment<'a>(
+        &self,
+        is_namespace: bool,
+        oid: i32,
+        subid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::comment_text_for(self.storage, self.txid, is_namespace, oid, subid, arena)
     }
 }
 
@@ -1194,7 +1205,7 @@ pub fn select_query<'a>(
         Err(e) => return sql_fail(e),
     };
     let correlated = outer_subs.correlated;
-    let catalog = StorageCatalog { storage };
+    let catalog = StorageCatalog { storage, txid };
     let hooks = EvalHooks {
         group: None,
         aggs: None,
@@ -1545,7 +1556,8 @@ pub fn constant_select<'a>(
         Err(e) => return sql_fail(e),
     };
     patch_subquery_column_types(statement.items, None, &subs, params, storage, txid, arena, &mut columns[..n]);
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
+    let catalog = StorageCatalog { storage, txid };
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: Some(&catalog), srf_index: None, sequences: seq };
 
     // Aggregates (or GROUP BY / HAVING) without FROM: PostgreSQL aggregates
     // over one virtual input row (zero when WHERE is false) and emits at most

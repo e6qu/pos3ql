@@ -440,6 +440,11 @@ impl Engine {
                 }
                 // The removal already happened in place; committing keeps it.
                 DdlUndo::FkDropped { .. } => {}
+                // Promote the uncommitted comment overlay to committed; its WAL
+                // record was journaled at exec time (like other DDL).
+                DdlUndo::CommentSet { slot, .. } => {
+                    self.storage.commit_comment(*slot as usize, txn.txid);
+                }
             }
         }
         // Past the durability point, so these fire iff the transaction really
@@ -518,6 +523,9 @@ impl Engine {
                 DdlUndo::FkDropped { table, fk } => {
                     self.storage.restore_fk(table as usize, fk)
                 }
+                DdlUndo::CommentSet { slot, prior } => {
+                    self.storage.restore_comment_pending(slot as usize, prior)
+                }
             }
         }
         self.wal.truncate_to_mark(txn.wal_mark);
@@ -575,6 +583,9 @@ impl Engine {
                 }
                 DdlUndo::FkDropped { table, fk } => {
                     self.storage.restore_fk(table as usize, fk)
+                }
+                DdlUndo::CommentSet { slot, prior } => {
+                    self.storage.restore_comment_pending(slot as usize, prior)
                 }
             }
         }
@@ -1540,6 +1551,9 @@ impl Engine {
                 guc.seq_session(),
                 responder,
             ),
+            Stmt::Comment { target, text } => {
+                exec::comment(&mut self.storage, &mut self.wal, txn, target, *text, responder)
+            }
             Stmt::Truncate { tables, restart_identity, cascade } => {
                 exec::truncate(&mut self.storage, txn, tables, *restart_identity, *cascade, responder)
             }
@@ -2417,6 +2431,16 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::SequenceAdvance { schema, name, last, is_called } => {
             storage.apply_sequence_advance(schema, name, last, is_called);
+        }
+        WalOp::Comment { class, schema, name, subid, text } => {
+            let stored = text.map(crate::storage::comment_stackstr).transpose()?;
+            storage.apply_comment(
+                crate::storage::CommentClass::from_u8(class),
+                crate::storage::SqlName::parse(schema)?,
+                crate::storage::SqlName::parse(name)?,
+                subid,
+                stored,
+            )?;
         }
         WalOp::CreateIndex { schema, name, table, columns, n_cols, unique } => {
             let slot = storage.create_index(

@@ -489,6 +489,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("update") => self.update(),
             Tok::Ident("delete") => self.delete(),
             Tok::Ident("merge") => self.merge(),
+            Tok::Ident("comment") => self.comment(),
             Tok::Ident("truncate") => self.truncate(),
             Tok::Ident("declare") => self.declare_cursor(),
             Tok::Ident("fetch") => self.fetch_cursor(false),
@@ -2327,6 +2328,67 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             Ok(MergeAction::Insert { columns, values: self.arena_slice(&vals[..v])?, default_values: false })
         }
+    }
+
+    /// `COMMENT ON <object> IS { 'text' | NULL }`.
+    fn comment(&mut self) -> Result<Stmt<'a>, ParseError> {
+        use crate::sql::ast::{CommentRelKind, CommentTarget};
+        self.expect_ident("comment")?;
+        self.expect_ident("on")?;
+        let target = if self.eat_ident("table")? {
+            CommentTarget::Relation {
+                kind: CommentRelKind::Table,
+                name: self.qual_name("table name")?,
+            }
+        } else if self.eat_ident("view")? {
+            CommentTarget::Relation {
+                kind: CommentRelKind::View,
+                name: self.qual_name("view name")?,
+            }
+        } else if self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            CommentTarget::Relation {
+                kind: CommentRelKind::MaterializedView,
+                name: self.qual_name("materialized view name")?,
+            }
+        } else if self.eat_ident("index")? {
+            CommentTarget::Relation {
+                kind: CommentRelKind::Index,
+                name: self.qual_name("index name")?,
+            }
+        } else if self.eat_ident("sequence")? {
+            CommentTarget::Relation {
+                kind: CommentRelKind::Sequence,
+                name: self.qual_name("sequence name")?,
+            }
+        } else if self.eat_ident("schema")? {
+            CommentTarget::Schema(self.col_ident("schema name")?)
+        } else if self.eat_ident("column")? {
+            // `[schema.]table.column`: the last dotted part is the column.
+            let first = self.col_ident("column reference")?;
+            self.expect_op(".")?;
+            let second = self.col_ident("column reference")?;
+            if self.eat_op(".")? {
+                let third = self.col_ident("column reference")?;
+                CommentTarget::Column {
+                    relation: QualName { schema: Some(first), name: second },
+                    column: third,
+                }
+            } else {
+                CommentTarget::Column { relation: QualName::bare(first), column: second }
+            }
+        } else {
+            return Err(self.err_here(
+                "COMMENT ON supports TABLE, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, or COLUMN",
+            ));
+        };
+        self.expect_ident("is")?;
+        let text = match self.expression(0)? {
+            Expr::Str(s) => Some(*s),
+            Expr::Null => None,
+            _ => return Err(self.err_here("COMMENT value must be a string literal or NULL")),
+        };
+        Ok(Stmt::Comment { target, text })
     }
 
     fn delete(&mut self) -> Result<Stmt<'a>, ParseError> {

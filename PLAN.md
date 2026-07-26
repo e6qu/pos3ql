@@ -987,6 +987,31 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   `MERGE <count>`. It is a *new* statement path, so nothing about SELECT/INSERT/
   UPDATE/DELETE changed. Verified byte-for-byte against PostgreSQL (corpus
   `58_merge`).
+- **COMMENT ON** — done: `COMMENT ON { TABLE | VIEW | MATERIALIZED VIEW | INDEX |
+  SEQUENCE } name IS { 'text' | NULL }`, `COMMENT ON COLUMN table.column IS ...`,
+  and `COMMENT ON SCHEMA name IS ...`; `IS NULL` removes the comment.
+  `obj_description(oid[, catalog])`, `col_description(oid, column)` and the
+  `pg_description` catalog read them back. A comment is stored in its own fixed
+  catalog keyed by `(class, schema, name, subid)` — restart-stable, since object
+  OIDs derive from catalog slots but names do not — with the same commit/rollback
+  MVCC overlay as a row (a transaction sees its own uncommitted comment, others
+  the committed one; a rolled-back `COMMENT` restores the prior text exactly,
+  savepoint-aware via a `DdlUndo::CommentSet` undo entry). Durable via a `Comment`
+  WAL record (set and removal) and a `cmt` checkpoint line; dropping an object
+  removes its comments through the same commit/replay drop paths, so a stale
+  comment can never reattach to a same-named new object. Object resolution
+  matches PostgreSQL's: the name binds to the first schema on the path holding
+  any relation of that name, then the keyword's kind is checked (42809 on a
+  mismatch, 42P01 for a missing relation, 42703 for a missing column, 3F000 for a
+  missing schema). `'seq'::regclass` now resolves a sequence too (a Boyscout fix
+  the sequence comments needed). Bounded loudly: at most `MAX_COMMENTS` comments,
+  each at most `COMMENT_MAX` bytes. Plain views gained a synthesized OID range so
+  `'view'::regclass` resolves and view comments surface through
+  `obj_description`/`pg_description`. Verified byte-for-byte against PostgreSQL
+  (corpus `59_comment`). One narrow limit is documented in BUGS.md (B-171):
+  a *column* comment on a plain view, sequence or index (rather than a table or
+  materialized view) is a loud `0A000`, since resolving those columns needs the
+  view/relation body described — the same describe-path entanglement LATERAL hit.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

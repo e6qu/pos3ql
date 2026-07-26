@@ -351,6 +351,17 @@ pub trait CatalogAccess {
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
     /// The OID of the relation named `name`, for `'relname'::regclass`.
     fn reloid(&self, name: &str) -> Option<i32>;
+    /// The comment text on the object with this OID and column `subid` (0 for
+    /// the object itself), or `None`. `is_namespace` selects a schema
+    /// (`pg_namespace`) rather than a `pg_class` relation. Backs
+    /// `obj_description`/`col_description`.
+    fn comment<'a>(
+        &self,
+        is_namespace: bool,
+        oid: i32,
+        subid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError>;
 }
 
 /// Pre-evaluated (uncorrelated) subquery results.

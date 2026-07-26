@@ -81,9 +81,9 @@ pub struct TxnState {
 
 /// How to undo one DDL statement.
 #[derive(Debug, Clone, Copy)]
-#[expect(
+#[allow(
     clippy::large_enum_variant,
-    reason = "FkDropped carries the removed ForeignKey inline (no heap after startup); the undo list is a small fixed pool"
+    reason = "FkDropped and CommentSet carry their payloads inline (no heap after startup); the undo list is a small fixed pool"
 )]
 pub enum DdlUndo {
     /// CREATE TABLE at this slot — undo by dropping it.
@@ -120,6 +120,10 @@ pub enum DdlUndo {
     /// DROP SCHEMA CASCADE severed an inbound foreign key on a surviving
     /// table — undo by restoring it.
     FkDropped { table: u32, fk: crate::storage::ForeignKey },
+    /// A `COMMENT ON` set or removed an object's comment — undo by restoring
+    /// the slot's prior uncommitted overlay. On commit, the overlay is
+    /// promoted and journaled.
+    CommentSet { slot: u32, prior: Option<crate::storage::PendingComment> },
 }
 
 /// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and

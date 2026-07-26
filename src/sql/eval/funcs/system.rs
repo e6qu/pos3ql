@@ -246,8 +246,48 @@ pub(crate) fn dispatch<'a>(
                 };
                 Ok(cat.constraint_def(oid, arena)?.map(Datum::Text).unwrap_or(Datum::Null))
             }
+            "obj_description" => {
+                // obj_description(objoid [, catalog]): the object's comment.
+                // A `pg_namespace` catalog selects a schema; anything else (the
+                // default) a `pg_class` relation.
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(v) => v,
+                    Datum::Int8(v) => v as i32,
+                    _ => return Ok(Datum::Null),
+                };
+                let is_namespace = if args.len() >= 2 {
+                    matches!(
+                        eval_full(args[1], arena, params, row, hooks)?,
+                        Datum::Text(t) if t == "pg_namespace"
+                    )
+                } else {
+                    false
+                };
+                Ok(cat.comment(is_namespace, oid, 0, arena)?.map(Datum::Text).unwrap_or(Datum::Null))
+            }
+            "col_description" => {
+                // col_description(objoid, objsubid): a column's comment.
+                arity(2)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(v) => v,
+                    Datum::Int8(v) => v as i32,
+                    _ => return Ok(Datum::Null),
+                };
+                let col = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Int4(v) => v,
+                    Datum::Int8(v) => v as i32,
+                    _ => return Ok(Datum::Null),
+                };
+                Ok(cat.comment(false, oid, col, arena)?.map(Datum::Text).unwrap_or(Datum::Null))
+            }
             "pg_get_expr" | "pg_get_viewdef"
-            | "pg_get_functiondef" | "col_description" | "obj_description"
+            | "pg_get_functiondef"
             | "shobj_description" | "pg_get_statisticsobjdef_columns" => {
                 // Definitions/comments we do not reconstruct render as empty/NULL,
                 // as PostgreSQL does for an absent comment.

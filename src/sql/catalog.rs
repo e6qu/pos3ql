@@ -25,6 +25,9 @@ pub struct SynthTable<'a> {
 const FIRST_USER_OID: i32 = 16384;
 const PUBLIC_NS_OID: i32 = 2200;
 const PG_CATALOG_NS_OID: i32 = 11;
+/// Well-known catalog OIDs, for `pg_description.classoid`.
+const PG_CLASS_OID: i32 = 1259;
+const PG_NAMESPACE_OID: i32 = 2615;
 
 pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
     match qualifier {
@@ -278,19 +281,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_description") => finish(
-            def_of(
-                "pg_description",
-                &[
-                    ("objoid", ColType::Int4),
-                    ("classoid", ColType::Int4),
-                    ("objsubid", ColType::Int4),
-                    ("description", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_description") => pg_description(storage, arena),
         (false, "pg_enum") => finish(
             def_of(
                 "pg_enum",
@@ -361,6 +352,13 @@ fn index_oid(slot: usize, pos: usize) -> i32 {
 const FIRST_SEQUENCE_OID: i32 = 95_000;
 fn sequence_oid(slot: usize) -> i32 {
     FIRST_SEQUENCE_OID + slot as i32
+}
+
+/// Plain views get OIDs from their own range so `'view'::regclass` resolves and
+/// their comments surface, even though a view is not yet a full `pg_class` row.
+const FIRST_VIEW_OID: i32 = 100_000;
+fn view_oid(slot: usize) -> i32 {
+    FIRST_VIEW_OID + slot as i32
 }
 
 /// One materialized index relation (implicit primary-key / unique index from a
@@ -444,8 +442,8 @@ fn stack_str_64(s: &str) -> StackStr<64> {
     out
 }
 
-/// The relation name for an OID, used to render `oid::regclass`. Resolves both
-/// ordinary tables and synthesized index relations.
+/// The relation name for an OID, used to render `oid::regclass`. Resolves
+/// ordinary tables, synthesized index relations, sequences and plain views.
 pub fn relname_text<'a>(
     storage: &Storage,
     oid: i32,
@@ -467,11 +465,26 @@ pub fn relname_text<'a>(
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
+    for (slot, seq) in storage.sequences_with_slots() {
+        if sequence_oid(slot) == oid {
+            let bytes =
+                arena.alloc_slice_copy(seq.name.as_str().as_bytes()).map_err(|_| arena_full())?;
+            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+        }
+    }
+    for (slot, view) in storage.views_with_slots() {
+        if view_oid(slot) == oid {
+            let bytes =
+                arena.alloc_slice_copy(view.name.as_str().as_bytes()).map_err(|_| arena_full())?;
+            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+        }
+    }
     Ok(None)
 }
 
 /// The OID of the relation named `name`, for `'relname'::regclass`. Resolves
-/// ordinary tables and synthesized index relations; `None` if no such relation.
+/// ordinary tables, synthesized index relations and sequences; `None` if no
+/// such relation.
 pub fn reloid_of_name(storage: &Storage, name: &str) -> Option<i32> {
     for (slot, table) in storage.live_tables() {
         if table.def.name.as_str() == name {
@@ -480,11 +493,115 @@ pub fn reloid_of_name(storage: &Storage, name: &str) -> Option<i32> {
     }
     let mut indices = [None; MAX_SYNTH_INDEXES];
     let n = collect_indexes(storage, &mut indices);
+    if let Some(info) = indices[..n].iter().flatten().find(|info| info.name.as_str() == name) {
+        return Some(info.oid);
+    }
+    if let Some((slot, _)) =
+        storage.sequences_with_slots().find(|(_, s)| s.name.as_str() == name)
+    {
+        return Some(sequence_oid(slot));
+    }
+    storage
+        .views_with_slots()
+        .find(|(_, v)| v.name.as_str() == name)
+        .map(|(slot, _)| view_oid(slot))
+}
+
+/// `pg_description`: one row per committed object comment, resolving each to
+/// its `(objoid, classoid, objsubid)`. A comment whose object no longer
+/// resolves to an OID is omitted, matching that its row would be dangling.
+fn pg_description<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_description",
+        &[
+            ("objoid", ColType::Int4),
+            ("classoid", ColType::Int4),
+            ("objsubid", ColType::Int4),
+            ("description", ColType::Text),
+        ],
+    );
+    let mut out: [&[Datum]; crate::storage::MAX_COMMENTS] = [&[]; crate::storage::MAX_COMMENTS];
+    let mut n = 0;
+    for (class, schema, name, subid, description) in storage.comments_visible(0) {
+        if n == out.len() {
+            break;
+        }
+        let (objoid, classoid) = match class {
+            crate::storage::CommentClass::Relation => match relation_oid_of(storage, schema, name) {
+                Some(oid) => (oid, PG_CLASS_OID),
+                None => continue,
+            },
+            crate::storage::CommentClass::Schema => (namespace_oid(storage, name), PG_NAMESPACE_OID),
+        };
+        out[n] = row(
+            &[
+                Datum::Int4(objoid),
+                Datum::Int4(classoid),
+                Datum::Int4(subid as i32),
+                text(description, arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &out[..n], arena)
+}
+
+/// The `pg_class` OID of a relation named `name` in `schema`: an ordinary
+/// table or materialized-view backing table, a sequence, a plain view, or an
+/// index.
+fn relation_oid_of(storage: &Storage, schema: &str, name: &str) -> Option<i32> {
+    if let Some(slot) = storage.find_table(schema, name) {
+        return Some(table_oid(storage, slot));
+    }
+    if let Some(slot) = storage.sequence_slot(schema, name, 0) {
+        return Some(sequence_oid(slot));
+    }
+    if let Some((slot, _)) = storage
+        .views_with_slots()
+        .find(|(_, v)| v.schema.as_str() == schema && v.name.as_str() == name)
+    {
+        return Some(view_oid(slot));
+    }
+    let mut indices = [None; MAX_SYNTH_INDEXES];
+    let n = collect_indexes(storage, &mut indices);
     indices[..n]
         .iter()
         .flatten()
-        .find(|info| info.name.as_str() == name)
+        .find(|info| {
+            info.name.as_str() == name
+                && storage.table(info.table_slot).def.schema.as_str() == schema
+        })
         .map(|info| info.oid)
+}
+
+/// The comment text `txid` sees on the object with this OID (and column
+/// `subid`), for `obj_description`/`col_description`. `is_namespace` selects a
+/// `pg_namespace` object (a schema) over a `pg_class` one.
+pub fn comment_text_for<'a>(
+    storage: &Storage,
+    txid: u32,
+    is_namespace: bool,
+    oid: i32,
+    subid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    for (class, schema, name, csub, text) in storage.comments_visible(txid) {
+        let hit = if is_namespace {
+            class == crate::storage::CommentClass::Schema
+                && subid == 0
+                && namespace_oid(storage, name) == oid
+        } else {
+            class == crate::storage::CommentClass::Relation
+                && csub as i32 == subid
+                && relation_oid_of(storage, schema, name) == Some(oid)
+        };
+        if hit {
+            let bytes = arena.alloc_slice_copy(text.as_bytes()).map_err(|_| arena_full())?;
+            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+        }
+    }
+    Ok(None)
 }
 
 /// One materialized foreign-key constraint.

@@ -103,3 +103,7 @@ DROP SEQUENCE nope;
 -- DROP removes it.
 DROP SEQUENCE s1;
 SELECT nextval('s1');
+
+-- Clean up leftover tables so later corpora (shared database) do not collide.
+DROP TABLE IF EXISTS items;
+DROP TABLE IF EXISTS t;

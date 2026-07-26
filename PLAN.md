@@ -918,9 +918,27 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   `CreateSequence`/`DropSequence`/`SequenceAdvance` WAL op set (kinds 17–19,
   advances journaled at commit like the serial machinery) and an `sq2` checkpoint
   manifest line. Verified byte-for-byte against PostgreSQL (corpus
-  `54_sequence`) and by a WAL-replay restart test. (`nextval` in a `DEFAULT`
-  expression still needs the general non-constant-DEFAULT feature, which is
-  separate; `SERIAL` keeps its own max-based counter.)
+  `54_sequence`) and by a WAL-replay restart test. (`SERIAL` keeps its own
+  max-based counter; a `DEFAULT nextval(...)` uses the expression-default path
+  below.)
+- **Non-constant column DEFAULTs** — done: a `DEFAULT` with a function call
+  (`now()`, `nextval(...)`, `gen_random_uuid()`, …) is kept as source text
+  (`ColumnMeta.default_expr`) and re-evaluated per inserted row, instead of being
+  folded once — which also fixes a latent bug where `DEFAULT now()` froze to the
+  CREATE-TABLE time. A literal-only default still folds to a constant
+  (`default_value`) for a fast insert; exactly one of the two is set. The fold
+  test is "contains no function call" (`Expr::contains_call`), so volatile *and*
+  stable functions are stored as text. Defaults are re-parsed once per statement
+  (like CHECK predicates) and evaluated with the sequence hook, only for columns
+  the row does not set explicitly (so a supplied value never wastes a `nextval`).
+  `ADD COLUMN ... DEFAULT nextval(...)` backfills existing rows by evaluating the
+  default per row, exactly as PostgreSQL rewrites the table; `ALTER COLUMN SET
+  DEFAULT` and `DROP DEFAULT` handle expressions too. Durable through an additive
+  `default_expr` field in the table column codec (WAL + `col` checkpoint line);
+  `pg_attribute.atthasdef` and `pg_attrdef` reflect it. Verified byte-for-byte
+  against PostgreSQL (corpus `55_default_expr`) and a WAL-replay restart test.
+  (The stored text is the raw source, so `pg_get_expr`/`\d` reconstruction is not
+  PostgreSQL's normalized form — a cosmetic gap, not a behavioral one.)
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

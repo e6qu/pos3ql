@@ -1845,6 +1845,7 @@ impl<'a> Parser<'a> {
             let mut not_null = false;
             let mut unique = false;
             let mut default = None;
+            let mut default_text = None;
             loop {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
@@ -1852,7 +1853,9 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("null")? {
                     not_null = false;
                 } else if self.eat_ident("default")? {
+                    let start = self.peek_at;
                     default = Some(self.expression(0)?);
+                    default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("unique")? {
                     unique = true;
                 } else {
@@ -1867,6 +1870,7 @@ impl<'a> Parser<'a> {
                 unique,
                 primary: false,
                 default,
+                default_text,
             }))
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {
@@ -1899,7 +1903,10 @@ impl<'a> Parser<'a> {
                     self.expect_ident("type")?;
                     self.alter_column_type(column)
                 } else if self.eat_ident("default")? {
-                    Ok(AlterAction::SetDefault { column, value: self.expression(0)? })
+                    let start = self.peek_at;
+                    let value = self.expression(0)?;
+                    let value_text = self.text[start..self.peek_at].trim_end();
+                    Ok(AlterAction::SetDefault { column, value, value_text })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;

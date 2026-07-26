@@ -490,8 +490,13 @@ pub struct ColumnDef<'a> {
     pub not_null: bool,
     pub unique: bool,
     pub primary: bool,
-    /// DEFAULT expression (constants only are accepted at execution).
+    /// DEFAULT expression. A literal-only default is folded to a constant at
+    /// execution; anything with a function call (`now()`, `nextval(...)`, …) is
+    /// stored as `default_text` and re-evaluated per inserted row.
     pub default: Option<&'a Expr<'a>>,
+    /// The raw source text of the DEFAULT expression, for storing non-constant
+    /// defaults and for `pg_get_expr` / `\d` reconstruction.
+    pub default_text: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -661,7 +666,7 @@ pub enum AlterAction<'a> {
     AddColumn(ColumnDef<'a>),
     DropColumn(&'a str),
     /// ALTER [COLUMN] col SET DEFAULT expr.
-    SetDefault { column: &'a str, value: &'a Expr<'a> },
+    SetDefault { column: &'a str, value: &'a Expr<'a>, value_text: &'a str },
     /// ALTER [COLUMN] col DROP DEFAULT.
     DropDefault { column: &'a str },
     /// ALTER [COLUMN] col SET NOT NULL — validated against existing rows.
@@ -915,6 +920,45 @@ impl Expr<'_> {
             Expr::Subscript { base, index } => base.is_constant() && index.is_constant(),
             Expr::Field { base, .. } => base.is_constant(),
             Expr::AnyAll { operand, array, .. } => operand.is_constant() && array.is_constant(),
+        }
+    }
+
+    /// Whether the expression tree contains a function call — the marker of a
+    /// non-constant DEFAULT (`now()`, `nextval(...)`, `random()`, …) that must be
+    /// evaluated per inserted row rather than folded once.
+    pub fn contains_call(&self) -> bool {
+        match self {
+            Expr::Call { .. } => true,
+            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
+            | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. } | Expr::Param(_) | Expr::DefaultMarker => false,
+            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
+                operand.contains_call()
+            }
+            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
+            | Expr::AnyAll { operand: left, array: right, .. } => {
+                left.contains_call() || right.contains_call()
+            }
+            Expr::InList { operand, list, .. } => {
+                operand.contains_call() || list.iter().any(|e| e.contains_call())
+            }
+            Expr::Between { operand, low, high, .. } => {
+                operand.contains_call() || low.contains_call() || high.contains_call()
+            }
+            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+                operand.contains_call() || pattern.contains_call()
+            }
+            Expr::Case { operand, whens, otherwise, .. } => {
+                operand.map(|o| o.contains_call()).unwrap_or(false)
+                    || whens.iter().any(|(c, r)| c.contains_call() || r.contains_call())
+                    || otherwise.map(|o| o.contains_call()).unwrap_or(false)
+            }
+            Expr::Array(items) => items.iter().any(|e| e.contains_call()),
+            // A subquery-bearing default is rejected elsewhere; treat it as
+            // non-foldable to be safe.
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => true,
         }
     }
 }

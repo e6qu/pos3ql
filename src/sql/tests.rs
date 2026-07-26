@@ -1529,6 +1529,63 @@ fn sequence_survives_restart() {
 }
 
 #[test]
+fn expression_defaults() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE SEQUENCE dseq");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE d (id bigint DEFAULT nextval('dseq'), n int DEFAULT 2 + 3, note text DEFAULT 'x')",
+    );
+    // A per-row DEFAULT nextval advances once per inserted row; a constant
+    // default folds; an explicit value does not advance the sequence.
+    run_with(&mut e, &mut b, "INSERT INTO d (note) VALUES ('a'), ('b')");
+    run_with(&mut e, &mut b, "INSERT INTO d DEFAULT VALUES");
+    run_with(&mut e, &mut b, "INSERT INTO d (id, note) VALUES (100, 'explicit')");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id, n, note FROM d ORDER BY id")),
+        ["1|5|a", "2|5|b", "3|5|x", "100|5|explicit"]
+    );
+    // DEFAULT now() is evaluated per insert, not folded to CREATE-TABLE time:
+    // two rows inserted after a fresh statement clock share the statement's now.
+    run_with(&mut e, &mut b, "CREATE TABLE t (ts timestamptz DEFAULT now(), v int)");
+    run_with(&mut e, &mut b, "INSERT INTO t (v) VALUES (1)");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT count(*) FROM t WHERE ts IS NOT NULL")),
+        ["1"]
+    );
+    // ALTER COLUMN SET DEFAULT with an expression, then ADD COLUMN with one.
+    run_with(&mut e, &mut b, "ALTER TABLE t ALTER COLUMN v SET DEFAULT nextval('dseq')");
+    run_with(&mut e, &mut b, "INSERT INTO t (v) VALUES (DEFAULT)");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT v FROM t ORDER BY v")),
+        ["1", "4"]
+    );
+}
+
+#[test]
+fn expression_default_survives_restart() {
+    let config = test_config("default_expr_restart");
+    {
+        let mut budget = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut budget).unwrap();
+        run_with(&mut e, &mut budget, "CREATE SEQUENCE s");
+        run_with(&mut e, &mut budget, "CREATE TABLE t (id bigint DEFAULT nextval('s'), v int)");
+        run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (10)");
+        e.commit_wal();
+    }
+    let mut budget = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut budget).unwrap();
+    // The default expression survived replay: the next insert still assigns
+    // nextval (continuing the sequence).
+    run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (20)");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut budget, "SELECT id, v FROM t ORDER BY v")),
+        ["1|10", "2|20"]
+    );
+}
+
+#[test]
 fn sql_surface_batch() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE s (id int, name text DEFAULT 'x', qty int DEFAULT 3)");

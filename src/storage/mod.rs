@@ -196,9 +196,21 @@ pub struct ColumnMeta {
     /// column is omitted (or DEFAULT) on INSERT, it is assigned one past the
     /// column's current maximum.
     pub auto_increment: bool,
-    /// DEFAULT value (constants only).
+    /// A DEFAULT that folds to a constant (a literal-only expression), stored as
+    /// its owned value for a fast insert. Non-constant defaults live in
+    /// `default_expr` instead; the two are mutually exclusive.
     pub default_value: Option<OwnedDatum>,
+    /// A non-constant DEFAULT — anything with a function call (`now()`,
+    /// `nextval(...)`, `gen_random_uuid()`, …) — kept as raw source text and
+    /// re-parsed + evaluated per inserted row. Also the source for
+    /// `pg_get_expr` / `\d`.
+    pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
 }
+
+/// Maximum stored length of a non-constant DEFAULT expression's source text.
+/// Ample for real defaults (`nextval('schema.seq')`, `now()`,
+/// `gen_random_uuid()`, …); a longer one is a loud error, never silent growth.
+pub(crate) const DEFAULT_EXPR_MAX: usize = 128;
 
 impl ColumnMeta {
     pub const EMPTY: Self = ColumnMeta {
@@ -210,6 +222,7 @@ impl ColumnMeta {
         primary: false,
         auto_increment: false,
         default_value: None,
+        default_expr: None,
     };
 }
 
@@ -1155,6 +1168,7 @@ impl Storage {
                             primary: false,
                             auto_increment: false,
                             default_value: None,
+                            default_expr: None,
                         }; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
@@ -3746,6 +3760,7 @@ mod tests {
                 primary: false,
                 auto_increment: false,
                 default_value: None,
+                default_expr: None,
             }; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
@@ -3760,6 +3775,7 @@ mod tests {
                 primary: false,
                 auto_increment: false,
                 default_value: None,
+                default_expr: None,
             };
         }
         def

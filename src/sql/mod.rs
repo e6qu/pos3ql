@@ -1936,6 +1936,7 @@ impl Engine {
                     &mut self.scratch,
                     a,
                     arena,
+                    guc.seq_session(),
                     responder,
                 )?;
                 match out {

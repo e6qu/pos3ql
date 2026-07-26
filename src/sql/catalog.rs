@@ -82,7 +82,7 @@ pub fn synthesize<'a>(
     match (info, name) {
         (false, "pg_class") => pg_class(storage, arena),
         (false, "pg_attribute") => pg_attribute(storage, arena),
-        (false, "pg_attrdef") => pg_attrdef(arena),
+        (false, "pg_attrdef") => pg_attrdef(storage, arena),
         (false, "pg_collation") => pg_collation(arena),
         (false, "pg_type") => pg_type(arena),
         (false, "pg_namespace") => pg_namespace(storage, arena),
@@ -642,6 +642,7 @@ fn def_of(name: &str, columns: &[(&str, ColType)]) -> TableDef {
             primary: false,
             auto_increment: false,
             default_value: None,
+            default_expr: None,
         }; MAX_COLUMNS],
         n_columns: columns.len(),
         ..TableDef::empty()
@@ -1049,7 +1050,7 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                     Datum::Bool(c.not_null),
                     Datum::Int4(i32::from(c.ctype.typlen())),
                     Datum::Int4(c.type_mod),
-                    Datum::Bool(c.default_value.is_some()),
+                    Datum::Bool(c.default_value.is_some() || c.default_expr.is_some()),
                     Datum::Int4(0), // attcollation: default (0)
                     text("", arena)?, // attidentity
                     text("", arena)?, // attgenerated
@@ -1064,21 +1065,43 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
     finish(def, &out[..n], arena)
 }
 
-fn pg_attrdef<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    // We do not reconstruct default expressions for \d, so this stays empty.
-    finish(
-        def_of(
-            "pg_attrdef",
-            &[
-                ("oid", ColType::Int4),
-                ("adrelid", ColType::Int4),
-                ("adnum", ColType::Int4),
-                ("adbin", ColType::Text),
-            ],
-        ),
-        &[],
-        arena,
-    )
+fn pg_attrdef<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_attrdef",
+        &[
+            ("oid", ColType::Int4),
+            ("adrelid", ColType::Int4),
+            ("adnum", ColType::Int4),
+            ("adbin", ColType::Text),
+        ],
+    );
+    // A row per column carrying a non-constant DEFAULT — the raw source text in
+    // `adbin`. (Folded constant defaults keep only their value; `adbin` here is
+    // the engine's source text, not PostgreSQL's serialized node tree.)
+    let mut out: [&[Datum]; 512] = [&[]; 512];
+    let mut n = 0;
+    for (slot, table) in storage.live_tables() {
+        let relid = table_oid(storage, slot);
+        for (ci, c) in table.def.columns().iter().enumerate() {
+            let Some(text_expr) = &c.default_expr else {
+                continue;
+            };
+            if n == out.len() {
+                break;
+            }
+            out[n] = row(
+                &[
+                    Datum::Int4(relid * 100 + ci as i32 + 1), // synthetic adbin oid
+                    Datum::Int4(relid),
+                    Datum::Int4(ci as i32 + 1),
+                    text(text_expr.as_str(), arena)?,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    finish(def, &out[..n], arena)
 }
 
 fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

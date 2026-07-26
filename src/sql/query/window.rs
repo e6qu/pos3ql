@@ -85,6 +85,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         order_by: &[],
         limit: None,
         offset: None,
+        with_ties: false,
         with: &[],
         set_body: None,
     };
@@ -160,6 +161,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             .map_err(|_| arena_full())?,
         limit: statement.limit,
         offset: statement.offset,
+        with_ties: statement.with_ties,
         with: &[],
         set_body: None,
     };

@@ -479,6 +479,40 @@ pub(crate) fn materialized_rows<'a>(
     Ok((rows, width, deferred))
 }
 
+/// Whether two sorted rows tie on their `n_order` hidden ORDER BY key columns
+/// (stored after `width`), with NULLs comparing equal — the `WITH TIES` peer
+/// test, independent of ASC/DESC.
+pub(crate) fn order_keys_equal(a: &[u8], b: &[u8], width: usize, n_order: usize) -> bool {
+    for k in 0..n_order {
+        let ka = crate::sql::exec::decode_projected_pub(a, width + k);
+        let kb = crate::sql::exec::decode_projected_pub(b, width + k);
+        let equal = match (ka.is_null(), kb.is_null()) {
+            (true, true) => true,
+            (false, false) => compare_datums(&ka, &kb).is_ok_and(|o| o.is_eq()),
+            _ => false,
+        };
+        if !equal {
+            return false;
+        }
+    }
+    true
+}
+
+/// Extends an exclusive limit window to include every following row that ties
+/// with `rows[window - 1]` on the ORDER BY keys (`FETCH FIRST ... WITH TIES`).
+/// A `window` at or past the end (or no ORDER BY) is returned clamped.
+pub(crate) fn extend_ties(rows: &[&[u8]], width: usize, n_order: usize, window: usize) -> usize {
+    if n_order == 0 || window == 0 || window >= rows.len() {
+        return window.min(rows.len());
+    }
+    let boundary = rows[window - 1];
+    let mut end = window;
+    while end < rows.len() && order_keys_equal(boundary, rows[end], width, n_order) {
+        end += 1;
+    }
+    end
+}
+
 /// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
 /// with LIMIT/OFFSET and emit.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
@@ -507,7 +541,13 @@ pub(crate) fn materialized_select<'a>(
     // OFFSET rows flow through PostgreSQL's projection before Limit discards
     // them, so deferred items are evaluated for them too (their errors
     // surface); only rows past the offset are emitted.
-    let window = offset.saturating_add(limit).min(usize::MAX as u64) as usize;
+    let mut window = offset.saturating_add(limit).min(usize::MAX as u64) as usize;
+    // FETCH FIRST ... WITH TIES: keep rows past the limit that tie with the
+    // last one on the ORDER BY keys (which ride as hidden columns after
+    // `width`). Only meaningful when a row was actually emitted (`limit > 0`).
+    if statement.with_ties && limit > 0 {
+        window = extend_ties(rows, width, statement.order_by.len(), window);
+    }
     for (index, row) in rows.iter().take(window).enumerate() {
         let mut out = [Datum::Null; MAX_PROJ];
         if let Err(e) = finalize_projected_row(

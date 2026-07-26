@@ -209,6 +209,9 @@ pub struct SetQuery<'a> {
     pub order_by: &'a [OrderBy<'a>],
     pub limit: Option<&'a Expr<'a>>,
     pub offset: Option<&'a Expr<'a>>,
+    /// `FETCH FIRST n ROWS WITH TIES`: after the limit, also keep rows tying
+    /// with the last one on the `ORDER BY` keys.
+    pub with_ties: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -231,6 +234,9 @@ pub struct Select<'a> {
     pub order_by: &'a [OrderBy<'a>],
     pub limit: Option<&'a Expr<'a>>,
     pub offset: Option<&'a Expr<'a>>,
+    /// `FETCH FIRST n ROWS WITH TIES`: after the limit, also keep rows tying
+    /// with the last one on the `ORDER BY` keys.
+    pub with_ties: bool,
     /// Non-recursive `WITH` common table expressions. Expanded into derived
     /// tables before execution; empty after expansion.
     pub with: &'a [Cte<'a>],

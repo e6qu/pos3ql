@@ -72,14 +72,19 @@ pub fn set_query<'a>(
     };
 
     responder.row_description(&columns[..n_cols])?;
+    let start = (offset as usize).min(rows.len());
+    let mut end = offset.saturating_add(limit).min(rows.len() as u64) as usize;
+    // FETCH FIRST ... WITH TIES: extend past the limit while rows tie with the
+    // last on the ORDER BY output columns (a set-operation ORDER BY names an
+    // output column, so ties compare those columns directly).
+    if q.with_ties && limit > 0 && end < rows.len() && end > start {
+        let boundary = rows[end - 1];
+        while end < rows.len() && set_rows_tie(boundary, rows[end], q.order_by, &columns[..n_cols]) {
+            end += 1;
+        }
+    }
     let mut emitted = 0u64;
-    for (i, row) in rows.iter().enumerate() {
-        if (i as u64) < offset {
-            continue;
-        }
-        if emitted >= limit {
-            break;
-        }
+    for row in &rows[start..end] {
         let mut out = [Datum::Null; MAX_PROJ];
         for (c, slot) in out[..n_cols].iter_mut().enumerate() {
             *slot = exec::decode_projected_pub(row, c);
@@ -426,6 +431,35 @@ fn combine_sets<'a>(
 /// Sorts combined set-operation rows by the trailing ORDER BY, which may
 /// reference an output column by 1-based position or by name (from the first
 /// leaf). Other ORDER BY expressions over a set operation are unsupported.
+/// Whether two set-operation output rows tie on every ORDER BY column (the
+/// `WITH TIES` peer test). The ORDER BY has already been validated by
+/// [`sort_set_rows`], so an unresolvable key conservatively counts as no tie.
+fn set_rows_tie(a: &[u8], b: &[u8], order_by: &[OrderBy], columns: &[ColDesc]) -> bool {
+    for ob in order_by {
+        let index = match ob.expression {
+            Expr::Int(n) if *n >= 1 && (*n as usize) <= columns.len() => (*n as usize) - 1,
+            Expr::Column { name, qualifier: None } => {
+                match columns.iter().position(|c| c.name == *name) {
+                    Some(i) => i,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        let va = exec::decode_projected_pub(a, index);
+        let vb = exec::decode_projected_pub(b, index);
+        let equal = match (va.is_null(), vb.is_null()) {
+            (true, true) => true,
+            (false, false) => compare_datums(&va, &vb).is_ok_and(|o| o.is_eq()),
+            _ => false,
+        };
+        if !equal {
+            return false;
+        }
+    }
+    true
+}
+
 fn sort_set_rows(
     arena: &Arena,
     rows: &mut [&[u8]],

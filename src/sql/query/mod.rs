@@ -1474,6 +1474,7 @@ fn over_one_row<'a>(
         order_by: &[],
         limit: None,
         offset: None,
+        with_ties: false,
         with: &[],
         set_body: None,
         ..inner
@@ -1784,9 +1785,14 @@ pub fn constant_select<'a>(
         Err(e) => return sql_fail(e),
     };
     let start = (offset as usize).min(out_rows.len());
-    let take = ((out_rows.len() - start) as u64).min(limit) as usize;
+    let mut end = offset.saturating_add(limit).min(out_rows.len() as u64) as usize;
+    // FETCH FIRST ... WITH TIES over a FROM-less SRF result: keep rows tying
+    // with the last on the ORDER BY keys (hidden columns after `width`).
+    if statement.with_ties && limit > 0 {
+        end = materialize::extend_ties(out_rows, width, statement.order_by.len(), end);
+    }
     let mut rows = 0u64;
-    for row in &out_rows[start..start + take] {
+    for row in &out_rows[start..end] {
         let mut values = [Datum::Null; MAX_PROJ];
         for (i, slot) in values.iter_mut().take(width).enumerate() {
             *slot = super::exec::decode_projected_pub(row, i);

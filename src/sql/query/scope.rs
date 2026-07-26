@@ -18,7 +18,8 @@ use crate::sql_err;
 use crate::storage::{ColumnMeta, SqlName, Storage, TableDef, MAX_COLUMNS};
 
 use super::{
-    arena_full, common_using_type, select_into_rows, synth_derived_def, table_func_def,
+    arena_full, common_using_type, select_into_rows, synth_derived_def, synth_derived_def_outer,
+    table_func_def,
     table_func_rows, MAX_JOIN_TABLES,
 };
 
@@ -59,6 +60,11 @@ pub struct QueryScope<'d> {
     /// self-describing-encoded. `None` marks a physical table (scanned from
     /// storage by `slots`).
     pub derived: [Option<&'d [&'d [u8]]>; MAX_JOIN_TABLES],
+    /// A `LATERAL` FROM item: its rows depend on the outer row, so they are
+    /// **not** pre-materialized (`derived` holds an empty placeholder). The
+    /// scan re-runs the item's body per outer row, resolving its outer column
+    /// references against the tables to its left.
+    pub lateral: [bool; MAX_JOIN_TABLES],
     /// Marks a set-returning-function scan (`FROM func(args)`), whose output row
     /// type is its single scalar column — so a whole-row reference to the table
     /// alias yields that scalar, not a one-field record (which is how a
@@ -88,6 +94,7 @@ impl<'d> QueryScope<'d> {
             defs: [None; MAX_JOIN_TABLES],
             slots: [0; MAX_JOIN_TABLES],
             derived: [None; MAX_JOIN_TABLES],
+            lateral: [false; MAX_JOIN_TABLES],
             func_scalar: [false; MAX_JOIN_TABLES],
             n: 0,
             merged: [MergedColumn {
@@ -218,6 +225,21 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
+        // A LATERAL subquery's def is typed against the tables to its left
+        // (a body may project an outer column); a plain derived table is typed
+        // on its own. Its rows are materialized per outer row by the scan, so
+        // register an empty placeholder here rather than running it now.
+        if tref.lateral {
+            let def_reference =
+                synth_derived_def_outer(storage, sub, exposed, tref.col_alias, txid, arena, Some(self))?;
+            self.names[self.n] = exposed;
+            self.defs[self.n] = Some(def_reference);
+            self.derived[self.n] = Some(&[]);
+            self.lateral[self.n] = true;
+            self.slots[self.n] = usize::MAX;
+            self.n += 1;
+            return Ok(());
+        }
         let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         // Materialize the subquery rows, self-describing-encoded, into a
         // doubling arena vector.
@@ -308,12 +330,17 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
+        let def_reference = if tref.lateral {
+            synth_derived_def_outer(storage, sub, exposed, tref.col_alias, txid, arena, Some(self))?
+        } else {
+            synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?
+        };
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
+        self.lateral[self.n] = tref.lateral;
         self.slots[self.n] = usize::MAX;
         self.n += 1;
         Ok(())
@@ -383,6 +410,19 @@ impl<'d> QueryScope<'d> {
                 "table name \"{}\" specified more than once",
                 exposed
             ));
+        }
+        // A LATERAL SRF (`LATERAL generate_series(1, t.n)`) evaluates its args
+        // against the outer row, so its rows are built per outer row by the
+        // scan — register an empty placeholder here.
+        if tref.lateral {
+            self.names[self.n] = exposed;
+            self.defs[self.n] = Some(def_reference);
+            self.derived[self.n] = Some(&[]);
+            self.lateral[self.n] = true;
+            self.func_scalar[self.n] = true;
+            self.slots[self.n] = usize::MAX;
+            self.n += 1;
+            return Ok(());
         }
         let mut rows: &'a [&'a [u8]] =
             if materialize { table_func_rows(tref, arena, params)? } else { &[] };

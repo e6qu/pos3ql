@@ -1212,6 +1212,10 @@ impl<'a> Parser<'a> {
     }
 
     fn table_ref(&mut self) -> Result<TableRef<'a>, ParseError> {
+        // `LATERAL` may precede a subquery or a function FROM item, letting it
+        // reference the FROM items to its left. It applies to whichever kind of
+        // item follows, so it is captured here and stamped on the result.
+        let lateral = self.eat_ident("lateral")?;
         // Derived table: `(SELECT ...) [AS] alias`. PostgreSQL requires the
         // alias, so a missing one is a syntax error.
         if self.peeked == Tok::Op("(") {
@@ -1242,6 +1246,7 @@ impl<'a> Parser<'a> {
                 col_alias,
                 cte: None,
                 with_ordinality: false,
+                lateral,
             });
         }
         let first = self.col_ident("table name")?;
@@ -1309,6 +1314,7 @@ impl<'a> Parser<'a> {
             col_alias,
             cte: None,
             with_ordinality,
+            lateral,
         })
     }
 
@@ -1339,7 +1345,7 @@ impl<'a> Parser<'a> {
     fn from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
         let base = self.table_ref()?;
         let dummy = Join {
-            table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None, cte: None, with_ordinality: false },
+            table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None, cte: None, with_ordinality: false, lateral: false },
             kind: JoinKind::Inner,
             on: None,
             using_columns: None,

@@ -311,6 +311,9 @@ pub struct TableRef<'a> {
     /// `func(args) WITH ORDINALITY`: append a 1-based `bigint` ordinality column
     /// to a table function's output. Only valid on a table-function FROM item.
     pub with_ordinality: bool,
+    /// `LATERAL (subquery)` / `LATERAL func(...)`: the FROM item may reference
+    /// columns of the FROM items to its left, and is re-evaluated per outer row.
+    pub lateral: bool,
 }
 
 /// Upper bound on `USING (c1, ...)` column-list length (and thus on merged

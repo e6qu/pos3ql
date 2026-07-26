@@ -2589,6 +2589,37 @@ fn enums_survive_restart() {
 }
 
 #[test]
+fn lateral_joins() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE lt (id int, n int)");
+    run_with(&mut e, &mut b, "INSERT INTO lt VALUES (1,2),(2,3),(3,0)");
+    run_with(&mut e, &mut b, "CREATE TABLE lu (tid int, v text)");
+    run_with(&mut e, &mut b, "INSERT INTO lu VALUES (1,'a'),(1,'b'),(2,'c')");
+    // A FROM-less lateral body projects an outer expression per row.
+    let bytes = run_with(&mut e, &mut b, "SELECT id, d FROM lt, LATERAL (SELECT lt.n*2 AS d) s ORDER BY id");
+    assert_eq!(data_rows(&bytes), ["1|4", "2|6", "3|0"]);
+    // CROSS JOIN LATERAL over a correlated subquery (correlation in WHERE);
+    // rows with no match drop out.
+    let bytes = run_with(&mut e, &mut b, "SELECT t.id, s.v FROM lt t CROSS JOIN LATERAL (SELECT v FROM lu WHERE lu.tid=t.id) s ORDER BY t.id, s.v");
+    assert_eq!(data_rows(&bytes), ["1|a", "1|b", "2|c"]);
+    // LEFT JOIN LATERAL preserves a left row whose lateral side is empty.
+    let bytes = run_with(&mut e, &mut b, "SELECT t.id, s.v FROM lt t LEFT JOIN LATERAL (SELECT v FROM lu WHERE lu.tid=t.id) s ON true ORDER BY t.id, s.v");
+    assert_eq!(data_rows(&bytes), ["1|a", "1|b", "2|c", "3|NULL"]);
+    // An aggregate inside the lateral body — one row per outer row, 0 for none.
+    let bytes = run_with(&mut e, &mut b, "SELECT t.id, s.c FROM lt t, LATERAL (SELECT count(*) AS c FROM lu WHERE lu.tid=t.id) s ORDER BY t.id");
+    assert_eq!(data_rows(&bytes), ["1|2", "2|1", "3|0"]);
+    // A set-returning function taking an outer argument; an empty series (n=0)
+    // contributes no rows.
+    let bytes = run_with(&mut e, &mut b, "SELECT id, g FROM lt, LATERAL generate_series(1, lt.n) g ORDER BY id, g");
+    assert_eq!(data_rows(&bytes), ["1|1", "1|2", "2|1", "2|2", "2|3"]);
+    // Two lateral items, the second referencing the first's output.
+    let bytes = run_with(&mut e, &mut b, "SELECT t.id, a.g, b.d FROM lt t, LATERAL generate_series(1,t.n) a(g), LATERAL (SELECT a.g*10 AS d) b ORDER BY t.id, a.g");
+    assert_eq!(data_rows(&bytes), ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]);
+    // RIGHT JOIN LATERAL is rejected loudly.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT 1) s ON true")).contains("0A000"));
+}
+
+#[test]
 fn drop_table_frees_the_name() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int)");

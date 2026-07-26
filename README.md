@@ -53,7 +53,9 @@ Working single-node database:
   TABLE/VIEW/MATERIALIZED VIEW/INDEX/SEQUENCE/COLUMN/SCHEMA read back through
   obj_description/col_description/pg_description),
   INSERT/SELECT/UPDATE/DELETE/MERGE with WHERE / ORDER BY (PostgreSQL null
-  ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, joins, GROUP BY and aggregates, subqueries (correlated + EXISTS),
+  ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, joins (including
+  `LATERAL` subqueries and set-returning functions), GROUP BY and aggregates,
+  subqueries (correlated + EXISTS),
   non-recursive CTEs, updatable views, constant and expression column DEFAULTs
   (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row), generated columns
   (`GENERATED ALWAYS AS (expr) STORED`), identity columns

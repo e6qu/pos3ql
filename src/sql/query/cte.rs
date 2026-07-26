@@ -688,6 +688,7 @@ fn subst_tableref<'a>(
             col_alias: t.col_alias,
             cte: Some(m),
             with_ordinality: false,
+            lateral: false,
         });
     }
     // An unqualified name matching a CTE becomes a derived table over the
@@ -709,6 +710,7 @@ fn subst_tableref<'a>(
             col_alias: renames,
             cte: None,
             with_ordinality: false,
+            lateral: false,
         });
     }
     // A name resolving to a view (not shadowed by a CTE, and not out-resolved
@@ -759,6 +761,7 @@ fn subst_tableref<'a>(
             col_alias: None,
             cte: None,
             with_ordinality: false,
+            lateral: false,
         });
     }
     // Inside a view body, pin a table reference to the schema it resolved to

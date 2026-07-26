@@ -880,6 +880,14 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   through the shape swap, and a type change rewrites every stored row through
   the shared `ColSource` plan. Remaining ALTER surface (owner/tablespace/storage
   parameters) is properties this engine does not model.
+- **CREATE TABLE AS** — done: `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS
+  <query> [WITH [NO] DATA]`. The query's output schema (via `describe_query`)
+  builds an ordinary backing table — no new persistence, it round-trips like any
+  table — then the two-pass `INSERT ... SELECT` populate loop fills it; the tag
+  is `SELECT <count>`. Verified byte-for-byte against PostgreSQL (corpus
+  `52_create_table_as`). Materialized views are the natural next step: the same
+  populate over a table that also stores its query text (a `ViewDef`-style
+  definition) and REFRESHes, reported as relkind `m`.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

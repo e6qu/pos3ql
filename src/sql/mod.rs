@@ -1322,6 +1322,21 @@ impl Engine {
             Stmt::DropView { names, if_exists } => {
                 exec::drop_view(&mut self.storage, &mut self.wal, txn, names, *if_exists, responder)
             }
+            Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists } => {
+                exec::create_table_as(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    name,
+                    columns,
+                    sql,
+                    *with_data,
+                    *if_not_exists,
+                    arena,
+                    params,
+                    responder,
+                )
+            }
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
                 &mut self.storage,
                 &mut self.wal,

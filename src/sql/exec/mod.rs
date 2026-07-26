@@ -1220,6 +1220,153 @@ pub fn create_view(
     sql_ok()
 }
 
+/// CREATE TABLE ... AS <query> [WITH [NO] DATA]: build a table from the query's
+/// output schema, then populate it by running the query once.
+#[allow(clippy::too_many_arguments)]
+pub fn create_table_as(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &crate::sql::ast::QualName,
+    rename: &[&str],
+    sql: &str,
+    with_data: bool,
+    if_not_exists: bool,
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::storage::{ColumnMeta, SqlName, TableDef};
+    // Resolve the query's output columns without running it.
+    let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+    let n_cols = match super::query::describe_query(sql, storage, txn.txid, arena, &mut columns) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    if !rename.is_empty() && rename.len() != n_cols {
+        return sql_fail(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "CREATE TABLE AS specifies too {} column names",
+            if rename.len() > n_cols { "many" } else { "few" }
+        ));
+    }
+    // Build the backing table's definition from those columns.
+    let mut def = TableDef::empty();
+    def.schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+        Ok(s) => s,
+        Err(e) => return sql_fail(e),
+    };
+    def.name = match SqlName::parse(name.name) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    def.n_columns = n_cols;
+    for i in 0..n_cols {
+        let Some(ctype) = coltype_of_oid(columns[i].type_oid) else {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "CREATE TABLE AS cannot materialize column {} (type oid {})",
+                i + 1,
+                columns[i].type_oid
+            ));
+        };
+        let col_name = if rename.is_empty() { columns[i].name } else { rename[i] };
+        let parsed = match SqlName::parse(col_name) {
+            Ok(n) => n,
+            Err(e) => return sql_fail(e),
+        };
+        def.columns[i] = ColumnMeta {
+            name: parsed,
+            ctype,
+            type_mod: columns[i].type_mod,
+            not_null: false,
+            unique: false,
+            primary: false,
+            auto_increment: false,
+            default_value: None,
+        };
+    }
+    // Create the empty table, journaled — exactly as CREATE TABLE does.
+    let table_index = match storage.create_table_in(def, txn.txid) {
+        Ok(slot) => {
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(lsn, &WalOp::CreateTable(def)) {
+                storage.rollback_create(slot);
+                return sql_fail(e);
+            }
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Created(slot as u32)) {
+                storage.rollback_create(slot);
+                return sql_fail(e);
+            }
+            slot
+        }
+        Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && if_not_exists => {
+            responder.notice(
+                sqlstate::DUPLICATE_TABLE,
+                stack_format!(128, "relation \"{}\" already exists, skipping", name.name).as_str(),
+            )?;
+            responder.command_complete("CREATE TABLE AS")?;
+            return sql_ok();
+        }
+        Err(e) => return sql_fail(e),
+    };
+    // Populate, unless WITH NO DATA. Two passes: materialize the query's rows
+    // into the arena (reading storage immutably), then store them (mutably) —
+    // the source could reference another table, so the phases must not overlap.
+    let mut count = 0u64;
+    if with_data {
+        let sel = match crate::sql::parser::parse_query(sql, arena) {
+            Ok(s) => s,
+            Err(e) => return sql_fail(e),
+        };
+        let mut rows = 0usize;
+        if let Err(e) = super::query::select_into_rows(
+            storage, txn.txid, sel, arena, params, None, &mut |_| {
+                rows += 1;
+                Ok(())
+            },
+        ) {
+            return sql_fail(e);
+        }
+        let empty: &[u8] = &[];
+        let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(rows, |_| empty) {
+            Ok(r) => r,
+            Err(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "CREATE TABLE AS result exceeds the statement arena"
+                ))
+            }
+        };
+        let mut at = 0usize;
+        if let Err(e) = super::query::select_into_rows(
+            storage, txn.txid, sel, arena, params, None, &mut |vals| {
+                rows_bytes[at] = encode_projected_pub(vals, arena)?;
+                at += 1;
+                Ok(())
+            },
+        ) {
+            return sql_fail(e);
+        }
+        for bytes in rows_bytes.iter() {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
+                let v = decode_projected_pub(bytes, i);
+                match coerce(v, &def.columns()[i], arena) {
+                    Ok(v) => *slot = v,
+                    Err(e) => return sql_fail(e),
+                }
+            }
+            if let Err(e) = store_row(storage, txn, table_index, None, &values[..n_cols]) {
+                return sql_fail(e);
+            }
+            count += 1;
+        }
+    }
+    responder.command_complete(stack_format!(32, "SELECT {count}").as_str())?;
+    sql_ok()
+}
+
 /// DROP VIEW [IF EXISTS].
 pub fn drop_view(
     storage: &mut Storage,

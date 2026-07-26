@@ -652,20 +652,61 @@ pub fn validate_view<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
-    let sel = super::parser::parse_view_select(sql, arena)?;
-    let sel = expand_ctes(sel, storage, txid, arena)?;
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    // A view's referents are validated as visible now (committed catalog).
+    describe_query(sql, storage, 0, arena, &mut columns)?;
+    let _ = txid;
+    Ok(())
+}
+
+/// Resolves a query's output columns (name / type OID / typmod) without running
+/// it — for CREATE VIEW validation and for building a CREATE TABLE AS backing
+/// table. Returns the column count written into `out`.
+pub fn describe_query<'a>(
+    sql: &'a str,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    let sel = super::parser::parse_query(sql, arena)?;
+    let sel = expand_ctes(sel, storage, txid, arena)?;
+    describe_select(sel, storage, txid, arena, out)
+}
+
+fn describe_select<'a>(
+    sel: &'a crate::sql::ast::Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    // A set-operation's output columns come from its leftmost SELECT branch.
+    if let Some(body) = sel.set_body {
+        return describe_set_tree(body, storage, txid, arena, out);
+    }
     match &sel.from {
         Some(from) => {
-            // Committed catalog: a view's referents are validated as visible now.
-            let scope = QueryScope::resolve_schema(storage, from, 0, arena)?;
-            describe_scope_items(sel.items, &scope, &mut columns)?;
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+            describe_scope_items(sel.items, &scope, out)
         }
-        None => {
-            describe_items(sel.items, None, &mut columns)?;
+        None => describe_items(sel.items, None, out),
+    }
+}
+
+fn describe_set_tree<'a>(
+    tree: &'a crate::sql::ast::SetTree<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    match tree {
+        crate::sql::ast::SetTree::Select(s) => describe_select(s, storage, txid, arena, out),
+        crate::sql::ast::SetTree::Op { left, .. } => {
+            describe_set_tree(left, storage, txid, arena, out)
         }
     }
-    Ok(())
 }
 
 /// Walks an expression tree collecting aggregate call nodes. A windowed call

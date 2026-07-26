@@ -100,6 +100,11 @@ pub enum DdlUndo {
     MatviewCreated(u32),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.
     MatviewDropped(u32),
+    /// CREATE SEQUENCE at this slot — undo by dropping it. (Its *value* state is
+    /// not transactional; only existence rolls back.)
+    SequenceCreated(u32),
+    /// DROP SEQUENCE at this slot — undo by reviving it.
+    SequenceDropped(u32),
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.

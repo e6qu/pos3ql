@@ -900,6 +900,27 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   and an `mv2` checkpoint manifest line; `SetMatviewPopulated` makes REFRESH /
   WITH NO DATA state survive pure WAL replay. Verified byte-for-byte against
   PostgreSQL (corpus `53_materialized_view`) and by a WAL-replay restart test.
+- **Sequences** — done: `CREATE SEQUENCE [IF NOT EXISTS] name [AS type]
+  [INCREMENT] [MIN/MAXVALUE] [START] [CACHE] [[NO] CYCLE]`, `ALTER SEQUENCE`
+  (redefine + `RESTART`), `DROP SEQUENCE`, and the functions `nextval` /
+  `currval` / `lastval` / `setval`. A sequence is a first-class relation
+  (relkind `S`, listed in `pg_sequences` / `pg_sequence`) backed by a parallel
+  `SequenceDef` catalog, mirroring the `ViewDef` machinery. Its *existence* is
+  transactional catalog MVCC (with `DdlUndo`); its *value* state
+  (`last_value`/`is_called`) is deliberately **not** — an advance survives
+  `ROLLBACK`, exactly as PostgreSQL leaves gaps — carried in `Cell` fields so the
+  pure `&`-only expression evaluator can advance a generator through a
+  `SequenceAccess` hook on `EvalHooks`. `currval`/`lastval` are per-connection
+  session state on `GucState`, `created_at`-stamped so a reused catalog slot
+  cannot leak a dropped sequence's value. `nextval` fires per row in `SELECT`,
+  `INSERT`, and `UPDATE ... SET` (the `INSERT ... SELECT` counting pass uses a
+  *dry* evaluator so the advance happens exactly once). Durable through a new
+  `CreateSequence`/`DropSequence`/`SequenceAdvance` WAL op set (kinds 17–19,
+  advances journaled at commit like the serial machinery) and an `sq2` checkpoint
+  manifest line. Verified byte-for-byte against PostgreSQL (corpus
+  `54_sequence`) and by a WAL-replay restart test. (`nextval` in a `DEFAULT`
+  expression still needs the general non-constant-DEFAULT feature, which is
+  separate; `SERIAL` keeps its own max-based counter.)
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

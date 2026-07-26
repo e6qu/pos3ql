@@ -296,7 +296,7 @@ fn subquery_exists<'a>(
         // Grouped/DISTINCT EXISTS: the row-source executor already handles
         // grouping, HAVING, and DISTINCT — existence is whether it emits.
         let mut found = false;
-        select_into_rows(storage, txid, select, arena, params, outer, &mut |_| {
+        select_into_rows(storage, txid, select, arena, params, outer, None, &mut |_| {
             found = true;
             Ok(())
         })?;
@@ -328,7 +328,7 @@ fn subquery_exists<'a>(
         depth - 1,
         outer,
     )?;
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&inner_subs) , windows: None, catalog: None, srf_index: None };
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&inner_subs) , windows: None, catalog: None, srf_index: None, sequences: None };
 
     let Some(from) = &select.from else {
         // FROM-less: an aggregate query yields its one output row even over
@@ -685,14 +685,14 @@ fn run_subquery<'a>(
         // handles grouping, HAVING, DISTINCT, and windows; collect its single
         // output column.
         let mut count = 0usize;
-        select_into_rows(storage, txid, select, arena, params, outer, &mut |_| {
+        select_into_rows(storage, txid, select, arena, params, outer, None, &mut |_| {
             count += 1;
             Ok(())
         })?;
         let out = arena.alloc_slice_with(count, |_| Datum::Null).map_err(|_| arena_full())?;
         let mut at = 0usize;
         let mut any_null = false;
-        select_into_rows(storage, txid, select, arena, params, outer, &mut |vals| {
+        select_into_rows(storage, txid, select, arena, params, outer, None, &mut |vals| {
             if vals.len() != 1 {
                 return Err(sql_err!(sqlstate::SYNTAX_ERROR, "subquery must return only one column"));
             }
@@ -726,7 +726,7 @@ fn run_subquery<'a>(
         group: None,
         aggs: None,
         subs: Some(&inner_subs),
-        windows: None, catalog: None, srf_index: None };
+        windows: None, catalog: None, srf_index: None, sequences: None };
 
     let Some(from) = &select.from else {
         if wildcard {
@@ -811,7 +811,7 @@ fn run_subquery<'a>(
             group: None,
             aggs: Some((&*ptrs, agg_values)),
             subs: hooks.subs,
-        windows: None, catalog: None, srf_index: None };
+        windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
         let schema = ScopeSchema(&scope);
         let base = Chained { inner: &schema, outer };
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;

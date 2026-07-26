@@ -28,6 +28,7 @@ pub mod tzif;
 pub mod copy;
 pub mod cursor;
 pub mod notify;
+pub mod sequence;
 
 use crate::checkpoint::{CheckpointStep, Checkpointer, CheckpointSetupError};
 use crate::config::Config;
@@ -337,6 +338,35 @@ impl Engine {
             }
             self.storage.table_mut(i).serial_dirty = false;
         }
+        // Journal sequence advances (this transaction's or ones a rolled-back
+        // transaction left dirty). Absolute positions, like serial advances, and
+        // deliberately non-transactional: a `nextval` in a rolled-back
+        // transaction still consumes its number, matching PostgreSQL's gaps.
+        for i in 0..self.storage.sequence_count() {
+            let seq = self.storage.sequence(i);
+            if !seq.live || !seq.dirty.get() {
+                continue;
+            }
+            let schema = seq.schema;
+            let name = seq.name;
+            let last = seq.last_value.get();
+            let is_called = seq.is_called.get();
+            let lsn = self.storage.lsn() + 1;
+            if let Err(e) = self.wal.append(
+                lsn,
+                &WalOp::SequenceAdvance {
+                    schema: schema.as_str(),
+                    name: name.as_str(),
+                    last,
+                    is_called,
+                },
+            ) {
+                self.rollback_txn(txn);
+                return Err(e);
+            }
+            self.storage.set_lsn(lsn);
+            self.storage.sequence(i).dirty.set(false);
+        }
         // One fsync per transaction, before any promotion: this is the
         // durability point — and the point of no return. A restart replays
         // everything past it, so from here the transaction commits in this
@@ -391,6 +421,12 @@ impl Engine {
                 }
                 DdlUndo::MatviewDropped(slot) => {
                     self.storage.commit_matview_drop(*slot as usize)
+                }
+                DdlUndo::SequenceCreated(slot) => {
+                    self.storage.commit_sequence_create(*slot as usize)
+                }
+                DdlUndo::SequenceDropped(slot) => {
+                    self.storage.commit_sequence_drop(*slot as usize)
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
@@ -458,6 +494,12 @@ impl Engine {
                 DdlUndo::MatviewDropped(slot) => {
                     self.storage.rollback_matview_drop(slot as usize, txn.txid)
                 }
+                DdlUndo::SequenceCreated(slot) => {
+                    self.storage.rollback_sequence_create(slot as usize)
+                }
+                DdlUndo::SequenceDropped(slot) => {
+                    self.storage.rollback_sequence_drop(slot as usize, txn.txid)
+                }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
                     self.storage.rollback_index_drop(slot as usize, txn.txid)
@@ -509,6 +551,12 @@ impl Engine {
                 DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
                 DdlUndo::MatviewDropped(slot) => {
                     self.storage.rollback_matview_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::SequenceCreated(slot) => {
+                    self.storage.rollback_sequence_create(slot as usize)
+                }
+                DdlUndo::SequenceDropped(slot) => {
+                    self.storage.rollback_sequence_drop(slot as usize, txn.txid)
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
@@ -1307,10 +1355,11 @@ impl Engine {
                 // the parsed AST (`s`, `params`) lives in the per-connection
                 // arena, which outlives it — so the work arena can be reset
                 // per statement while the AST persists across the message.
+                let seq = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 if s.from.is_none() {
-                    query::constant_select(&self.storage, txn.txid, s, &self.work, params, responder)
+                    query::constant_select(&self.storage, txn.txid, s, &self.work, params, Some(&seq), responder)
                 } else {
-                    query::select_query(&self.storage, txn.txid, s, &self.work, params, responder)
+                    query::select_query(&self.storage, txn.txid, s, &self.work, params, Some(&seq), responder)
                 }
             }
             Stmt::SetQuery(q) => {
@@ -1370,6 +1419,32 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
+            Stmt::CreateSequence { name, if_not_exists, options } => exec::create_sequence(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *if_not_exists,
+                options,
+                responder,
+            ),
+            Stmt::AlterSequence { name, if_exists, options } => exec::alter_sequence(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *if_exists,
+                options,
+                responder,
+            ),
+            Stmt::DropSequence { names, if_exists } => exec::drop_sequence(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                responder,
+            ),
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
                 &mut self.storage,
                 &mut self.wal,
@@ -1405,7 +1480,7 @@ impl Engine {
                     Ok(None) => i,
                     Err(e) => return Ok(Err(e)),
                 };
-                exec::insert(&mut self.storage, txn, i, arena, params, responder)
+                exec::insert(&mut self.storage, txn, i, arena, params, guc.seq_session(), responder)
             }
             Stmt::Update(u) => {
                 let u = match query::resolve_view_for_dml(&self.storage, u.table, txn.txid, arena) {
@@ -1429,7 +1504,7 @@ impl Engine {
                     Ok(None) => u,
                     Err(e) => return Ok(Err(e)),
                 };
-                exec::update(&mut self.storage, txn, &mut self.scratch, u, arena, params, responder)
+                exec::update(&mut self.storage, txn, &mut self.scratch, u, arena, params, guc.seq_session(), responder)
             }
             Stmt::Delete(d) => {
                 let d = match query::resolve_view_for_dml(&self.storage, d.table, txn.txid, arena) {
@@ -1545,12 +1620,12 @@ impl Engine {
                             if sel.from.is_none() {
                                 query::constant_select(
                                     &self.storage, txn.txid, sel, &self.work, params,
-                                    &mut capture,
+                                    None, &mut capture,
                                 )
                             } else {
                                 query::select_query(
                                     &self.storage, txn.txid, sel, &self.work, params,
-                                    &mut capture,
+                                    None, &mut capture,
                                 )
                             }
                         }
@@ -2288,6 +2363,48 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             if let Some(slot) = storage.matview_slot(schema, name, 0) {
                 storage.set_matview_populated(slot, populated);
             }
+        }
+        WalOp::CreateSequence {
+            schema,
+            name,
+            data_type,
+            increment,
+            min_value,
+            max_value,
+            start_value,
+            cache,
+            cycle,
+        } => {
+            let spec = crate::storage::SeqSpec {
+                data_type: crate::storage::SeqType::from_u8(data_type),
+                increment,
+                min_value,
+                max_value,
+                start_value,
+                cache,
+                cycle,
+            };
+            // An ALTER replays as CreateSequence: if the sequence already exists,
+            // redefine it in place; otherwise create it.
+            if let Some(slot) = storage.sequence_slot(schema, name, 0) {
+                storage.alter_sequence(slot, spec, None);
+            } else {
+                let slot = storage.create_sequence(
+                    crate::storage::SqlName::parse(schema)?,
+                    crate::storage::SqlName::parse(name)?,
+                    spec,
+                    0,
+                )?;
+                storage.commit_sequence_create(slot);
+            }
+        }
+        WalOp::DropSequence { schema, name } => {
+            if let Some(slot) = storage.drop_sequence(schema, name, 0)? {
+                storage.commit_sequence_drop(slot);
+            }
+        }
+        WalOp::SequenceAdvance { schema, name, last, is_called } => {
+            storage.apply_sequence_advance(schema, name, last, is_called);
         }
         WalOp::CreateIndex { schema, name, table, columns, n_cols, unique } => {
             let slot = storage.create_index(

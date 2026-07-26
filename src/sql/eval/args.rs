@@ -91,6 +91,24 @@ pub(crate) fn int_arg<'a>(
     }
 }
 
+/// Evaluates `args[i]` as a boolean (None = SQL NULL).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bool_arg<'a>(
+    name: &str,
+    args: &[&Expr<'a>],
+    i: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<bool>, SqlError> {
+    match eval_full(args[i], arena, params, row, hooks)? {
+        Datum::Null => Ok(None),
+        Datum::Bool(b) => Ok(Some(b)),
+        other => Err(type_mismatch(name, &other)),
+    }
+}
+
 /// Evaluates `args[i]` and converts a numeric value to f64 (None = SQL NULL).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn num_f64<'a>(

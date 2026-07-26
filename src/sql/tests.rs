@@ -1218,6 +1218,26 @@ fn implicit_transaction_rolls_back_whole_message() {
     assert_eq!(rows, ["0"], "inserts before the error must be undone");
 }
 
+/// Like `run_with`, but the caller supplies the session `GucState` so it
+/// persists across statements — needed for session-scoped state (currval,
+/// lastval), which a fresh `GucState` per call would reset.
+fn run_session(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    guc: &mut GucState,
+    sql_text: &str,
+) -> Vec<u8> {
+    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(budget, 1024).unwrap();
+    let mut pool = test_pool(budget);
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), guc, &mut responder, 1)
+        .unwrap();
+    buffer.readable().to_vec()
+}
+
 fn run_with_txn_bytes(
     engine: &mut Engine,
     budget: &mut Budget,
@@ -1441,6 +1461,71 @@ fn matview_survives_restart() {
     run_with(&mut e, &mut budget, "DROP MATERIALIZED VIEW mv");
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "SELECT * FROM mv"))
         .contains("42P01"));
+}
+
+#[test]
+fn sequence_basics() {
+    let (mut e, mut b) = test_engine();
+    // A persistent session GucState so currval/lastval survive across statements.
+    let mut g = GucState::new();
+    run_session(&mut e, &mut b, &mut g, "CREATE SEQUENCE s START 5 INCREMENT 2");
+    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")), ["5"]);
+    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")), ["7"]);
+    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")), ["7"]);
+    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT lastval()")), ["7"]);
+    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT setval('s', 100)")), ["100"]);
+    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")), ["100"]);
+    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")), ["102"]);
+    // relkind 'S' in pg_class; pg_sequences lists it.
+    assert!(String::from_utf8_lossy(&run_with(
+        &mut e, &mut b, "SELECT relkind FROM pg_class WHERE relname='s'"
+    ))
+    .contains('S'));
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT last_value FROM pg_sequences WHERE sequencename='s'")),
+        ["102"]
+    );
+    // INSERT ... VALUES(nextval) advances once per row.
+    run_with(&mut e, &mut b, "CREATE TABLE t (id bigint)");
+    run_with(&mut e, &mut b, "CREATE SEQUENCE q");
+    run_with(&mut e, &mut b, "INSERT INTO t VALUES (nextval('q')), (nextval('q')), (nextval('q'))");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id FROM t ORDER BY id")), ["1", "2", "3"]);
+    // UPDATE SET = nextval advances once per updated row.
+    run_with(&mut e, &mut b, "UPDATE t SET id = nextval('q')");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id FROM t ORDER BY id")), ["4", "5", "6"]);
+    // currval is undefined before the first nextval in a session (55000).
+    run_with(&mut e, &mut b, "CREATE SEQUENCE u");
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT currval('u')")).contains("55000"));
+    // Overflow on a non-cycling sequence (2200H).
+    run_with(&mut e, &mut b, "CREATE SEQUENCE o MAXVALUE 2 NO CYCLE");
+    run_with(&mut e, &mut b, "SELECT nextval('o')");
+    run_with(&mut e, &mut b, "SELECT nextval('o')");
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('o')")).contains("2200H"));
+    // DROP SEQUENCE removes it.
+    run_with(&mut e, &mut b, "DROP SEQUENCE s");
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('s')")).contains("42P01"));
+}
+
+#[test]
+fn sequence_survives_restart() {
+    let config = test_config("sequence_restart");
+    {
+        let mut budget = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut budget).unwrap();
+        run_with(&mut e, &mut budget, "CREATE SEQUENCE s START 10 INCREMENT 5 MAXVALUE 100 CYCLE");
+        run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 10
+        run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 15
+        e.commit_wal();
+    }
+    let mut budget = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut budget).unwrap();
+    // Value state (last=15, is_called) survived replay: the next value is 20.
+    assert_eq!(data_rows(&run_with(&mut e, &mut budget, "SELECT nextval('s')")), ["20"]);
+    // Parameters survived too (increment 5, cycle).
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut budget, "SELECT increment_by, cycle FROM pg_sequences WHERE sequencename='s'")),
+        ["5|t"]
+    );
 }
 
 #[test]

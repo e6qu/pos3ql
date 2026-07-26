@@ -7,9 +7,11 @@
 //! the accepted set widens here.
 
 use crate::sql::eval::sqlstate;
+use core::cell::Cell;
 use core::fmt::Write;
 
 use crate::sql_err;
+use crate::storage::MAX_SEQUENCES;
 use crate::util::StackStr;
 
 use super::datetime::{DateFormat, DateStyle, FieldOrder};
@@ -103,6 +105,52 @@ impl Default for RenderContext {
     }
 }
 
+/// A connection's `currval`/`lastval` state: per-sequence last-`nextval` values,
+/// plus the session-wide `lastval`. It is session-scoped and *not* transactional
+/// — a `nextval` in a rolled-back transaction still defines `currval`, matching
+/// PostgreSQL. `Cell`s let the pure expression evaluator record advances through
+/// a shared borrow. Each slot carries the sequence's `created_at` stamp so a
+/// reused catalog slot cannot leak a dropped sequence's value.
+pub struct SeqSession {
+    /// Per-slot `(created_at, value)`; `created_at == 0` means undefined.
+    currvals: [Cell<(u64, i64)>; MAX_SEQUENCES],
+    /// `(defined, value)` for `lastval` — the last `nextval` of any sequence.
+    lastval: Cell<(bool, i64)>,
+}
+
+impl SeqSession {
+    const fn new() -> Self {
+        SeqSession {
+            currvals: [const { Cell::new((0u64, 0i64)) }; MAX_SEQUENCES],
+            lastval: Cell::new((false, 0)),
+        }
+    }
+
+    /// Records a `nextval`: defines both this sequence's `currval` and `lastval`.
+    pub fn record_nextval(&self, slot: usize, created_at: u64, value: i64) {
+        self.currvals[slot].set((created_at, value));
+        self.lastval.set((true, value));
+    }
+
+    /// Records a `setval`: defines this sequence's `currval` only (PostgreSQL
+    /// does not let `setval` define `lastval`).
+    pub fn record_setval(&self, slot: usize, created_at: u64, value: i64) {
+        self.currvals[slot].set((created_at, value));
+    }
+
+    /// This sequence's `currval` in this session, if `nextval`/`setval` has
+    /// defined it (the stamp must still match the live sequence).
+    pub fn currval(&self, slot: usize, created_at: u64) -> Option<i64> {
+        let (stamp, value) = self.currvals[slot].get();
+        (stamp != 0 && stamp == created_at).then_some(value)
+    }
+
+    pub fn lastval(&self) -> Option<i64> {
+        let (defined, value) = self.lastval.get();
+        defined.then_some(value)
+    }
+}
+
 pub struct GucState {
     datestyle: StackStr<48>,
     timezone: StackStr<64>,
@@ -124,6 +172,8 @@ pub struct GucState {
     row_security: StackStr<4>,
     /// bytea_output = escape (false = hex, the default).
     bytea_escape: bool,
+    /// This connection's `currval`/`lastval` state.
+    seq_session: SeqSession,
 }
 
 impl Default for GucState {
@@ -148,6 +198,7 @@ impl GucState {
             statement_timeout: StackStr::new(),
             row_security: StackStr::new(),
             bytea_escape: false,
+            seq_session: SeqSession::new(),
         };
         let _ = write!(g.datestyle, "ISO, MDY");
         let _ = write!(g.timezone, "UTC");
@@ -164,6 +215,10 @@ impl GucState {
     /// The current statement_timeout in milliseconds (0 = disabled).
     pub fn search_path(&self) -> &str {
         self.search_path.as_str()
+    }
+
+    pub fn seq_session(&self) -> &SeqSession {
+        &self.seq_session
     }
 
     pub fn session_user(&self) -> &str {

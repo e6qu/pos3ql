@@ -41,6 +41,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_indexes"
                 | "pg_views"
                 | "pg_matviews"
+                | "pg_sequences"
+                | "pg_sequence"
                 | "pg_roles"
                 | "pg_database"
                 | "pg_am"
@@ -311,6 +313,8 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_matviews") => pg_matviews(storage, arena),
+        (false, "pg_sequences") => pg_sequences(storage, arena),
+        (false, "pg_sequence") => pg_sequence(storage, arena),
         (false, "pg_views") | (false, "pg_roles") | (false, "pg_database") => {
             empty_like(name, storage, arena)
         }
@@ -351,6 +355,12 @@ const FIRST_INDEX_OID: i32 = 90_000;
 const MAX_INDEXES_PER_TABLE: i32 = 64;
 fn index_oid(slot: usize, pos: usize) -> i32 {
     FIRST_INDEX_OID + slot as i32 * MAX_INDEXES_PER_TABLE + pos as i32
+}
+
+/// Sequence relations get OIDs from their own range, above the index range.
+const FIRST_SEQUENCE_OID: i32 = 95_000;
+fn sequence_oid(slot: usize) -> i32 {
+    FIRST_SEQUENCE_OID + slot as i32
 }
 
 /// One materialized index relation (implicit primary-key / unique index from a
@@ -771,6 +781,40 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 Datum::Int4(0),
                 text("p", arena)?,
                 text("d", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    // Sequences are relations of kind 'S', each with its own OID range so
+    // psql's `\d`/`\dm` and pg_get_serial_sequence-style joins resolve.
+    for (slot, seq) in storage.sequences_with_slots() {
+        if n == out.len() {
+            break;
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(sequence_oid(slot)),
+                text(seq.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, seq.schema.as_str())),
+                text("S", arena)?, // relkind: sequence
+                Datum::Int4(1),    // a sequence has one row of state
+                Datum::Float8(1.0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(10),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?, // relreplident: nothing (sequences)
             ],
             arena,
         )?;
@@ -1305,6 +1349,98 @@ fn pg_matviews<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &out[..n], arena)
+}
+
+fn pg_sequences<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_sequences",
+        &[
+            ("schemaname", ColType::Text),
+            ("sequencename", ColType::Text),
+            ("sequenceowner", ColType::Text),
+            ("data_type", ColType::Text),
+            ("start_value", ColType::Int8),
+            ("min_value", ColType::Int8),
+            ("max_value", ColType::Int8),
+            ("increment_by", ColType::Int8),
+            ("cycle", ColType::Bool),
+            ("cache_size", ColType::Int8),
+            ("last_value", ColType::Int8),
+        ],
+    );
+    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let mut n = 0;
+    for seq in storage.live_sequences() {
+        if n == out.len() {
+            break;
+        }
+        // last_value is NULL until the sequence has been advanced at least once,
+        // exactly as PostgreSQL reports it.
+        let last_value = if seq.is_called.get() {
+            Datum::Int8(seq.last_value.get())
+        } else {
+            Datum::Null
+        };
+        out[n] = row(
+            &[
+                text(seq.schema.as_str(), arena)?,
+                text(seq.name.as_str(), arena)?,
+                text(
+                    crate::sql::eval::funcs::system::session_user_owned().as_str(),
+                    arena,
+                )?,
+                text(seq.data_type.sql_name(), arena)?,
+                Datum::Int8(seq.start_value),
+                Datum::Int8(seq.min_value),
+                Datum::Int8(seq.max_value),
+                Datum::Int8(seq.increment),
+                Datum::Bool(seq.cycle),
+                Datum::Int8(seq.cache),
+                last_value,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &out[..n], arena)
+}
+
+fn pg_sequence<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_sequence",
+        &[
+            ("seqrelid", ColType::Int4),
+            ("seqtypid", ColType::Int4),
+            ("seqstart", ColType::Int8),
+            ("seqincrement", ColType::Int8),
+            ("seqmax", ColType::Int8),
+            ("seqmin", ColType::Int8),
+            ("seqcache", ColType::Int8),
+            ("seqcycle", ColType::Bool),
+        ],
+    );
+    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let mut n = 0;
+    for (slot, seq) in storage.sequences_with_slots() {
+        if n == out.len() {
+            break;
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(sequence_oid(slot)),
+                Datum::Int4(seq.data_type.oid()),
+                Datum::Int8(seq.start_value),
+                Datum::Int8(seq.increment),
+                Datum::Int8(seq.max_value),
+                Datum::Int8(seq.min_value),
+                Datum::Int8(seq.cache),
+                Datum::Bool(seq.cycle),
             ],
             arena,
         )?;

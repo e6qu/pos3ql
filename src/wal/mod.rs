@@ -49,6 +49,9 @@ const KIND_DROP_FK: u8 = 13;
 const KIND_CREATE_MATVIEW: u8 = 14;
 const KIND_DROP_MATVIEW: u8 = 15;
 const KIND_SET_MATVIEW_POPULATED: u8 = 16;
+const KIND_CREATE_SEQUENCE: u8 = 17;
+const KIND_DROP_SEQUENCE: u8 = 18;
+const KIND_SEQUENCE_ADVANCE: u8 = 19;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -142,6 +145,33 @@ pub enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         populated: bool,
+    },
+    /// CREATE SEQUENCE (or ALTER SEQUENCE — the full parameter set is journaled
+    /// absolutely, so an ALTER replays as a redefinition). `data_type` is the
+    /// `SeqType` discriminant.
+    CreateSequence {
+        schema: &'a str,
+        name: &'a str,
+        data_type: u8,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        start_value: i64,
+        cache: i64,
+        cycle: bool,
+    },
+    DropSequence {
+        schema: &'a str,
+        name: &'a str,
+    },
+    /// A `nextval`/`setval`/`RESTART` advance: the absolute value state, so
+    /// replay is idempotent. Advances are non-transactional (they survive
+    /// ROLLBACK), matching PostgreSQL's sequence gaps.
+    SequenceAdvance {
+        schema: &'a str,
+        name: &'a str,
+        last: i64,
+        is_called: bool,
     },
 }
 
@@ -287,7 +317,7 @@ impl Wal {
                     u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_SET_MATVIEW_POPULATED).contains(&kind)
+                if !(KIND_CREATE..=KIND_SEQUENCE_ADVANCE).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -486,6 +516,9 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateMatview { .. } => KIND_CREATE_MATVIEW,
         WalOp::DropMatview { .. } => KIND_DROP_MATVIEW,
         WalOp::SetMatviewPopulated { .. } => KIND_SET_MATVIEW_POPULATED,
+        WalOp::CreateSequence { .. } => KIND_CREATE_SEQUENCE,
+        WalOp::DropSequence { .. } => KIND_DROP_SEQUENCE,
+        WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
     }
 }
 
@@ -552,6 +585,15 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropMatview { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::SetMatviewPopulated { schema, name, .. } => {
             1 + name.len() + 1 + schema.len() + 1
+        }
+        WalOp::CreateSequence { schema, name, .. } => {
+            // name, schema, then 1 (data_type) + 5×8 (increment/min/max/start/
+            // cache) + 1 (cycle).
+            1 + name.len() + 1 + schema.len() + 1 + 5 * 8 + 1
+        }
+        WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::SequenceAdvance { schema, name, .. } => {
+            1 + name.len() + 1 + schema.len() + 8 + 1
         }
     }
 }
@@ -685,6 +727,36 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&[u8::from(*populated)])
+        }
+        WalOp::CreateSequence {
+            schema,
+            name,
+            data_type,
+            increment,
+            min_value,
+            max_value,
+            start_value,
+            cache,
+            cycle,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[*data_type])
+                && buffer.append(&increment.to_le_bytes())
+                && buffer.append(&min_value.to_le_bytes())
+                && buffer.append(&max_value.to_le_bytes())
+                && buffer.append(&start_value.to_le_bytes())
+                && buffer.append(&cache.to_le_bytes())
+                && buffer.append(&[u8::from(*cycle)])
+        }
+        WalOp::DropSequence { schema, name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        }
+        WalOp::SequenceAdvance { schema, name, last, is_called } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&last.to_le_bytes())
+                && buffer.append(&[u8::from(*is_called)])
         }
     }
 }
@@ -974,6 +1046,50 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
             (at == payload.len()).then_some(WalOp::SequenceSet { schema, table, column, last })
         }
+        KIND_CREATE_SEQUENCE => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let data_type = *payload.get(at)?;
+            at += 1;
+            let take_i64 = |at: &mut usize| -> Option<i64> {
+                let v = i64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().unwrap());
+                *at += 8;
+                Some(v)
+            };
+            let increment = take_i64(&mut at)?;
+            let min_value = take_i64(&mut at)?;
+            let max_value = take_i64(&mut at)?;
+            let start_value = take_i64(&mut at)?;
+            let cache = take_i64(&mut at)?;
+            let cycle = *payload.get(at)? != 0;
+            at += 1;
+            (at == payload.len()).then_some(WalOp::CreateSequence {
+                schema,
+                name,
+                data_type,
+                increment,
+                min_value,
+                max_value,
+                start_value,
+                cache,
+                cycle,
+            })
+        }
+        KIND_DROP_SEQUENCE => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropSequence { schema, name })
+        }
+        KIND_SEQUENCE_ADVANCE => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
+            at += 8;
+            let is_called = *payload.get(at)? != 0;
+            at += 1;
+            (at == payload.len())
+                .then_some(WalOp::SequenceAdvance { schema, name, last, is_called })
+        }
         KIND_CREATE_SCHEMA => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CreateSchema(name))
@@ -1248,12 +1364,38 @@ mod tests {
             .unwrap();
             wal.append(3, &WalOp::Delete { schema: "public", table: "t", rowid: 1 }).unwrap();
             wal.append(4, &WalOp::DropTable { schema: "public", name: "t" }).unwrap();
+            wal.append(
+                5,
+                &WalOp::CreateSequence {
+                    schema: "public",
+                    name: "s",
+                    data_type: 1,
+                    increment: 2,
+                    min_value: 1,
+                    max_value: 100,
+                    start_value: 5,
+                    cache: 1,
+                    cycle: true,
+                },
+            )
+            .unwrap();
+            wal.append(
+                6,
+                &WalOp::SequenceAdvance {
+                    schema: "public",
+                    name: "s",
+                    last: 42,
+                    is_called: true,
+                },
+            )
+            .unwrap();
+            wal.append(7, &WalOp::DropSequence { schema: "public", name: "s" }).unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 4);
+        assert_eq!(seen.len(), 7);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -1261,9 +1403,14 @@ mod tests {
         assert!(seen[0].contains("t_id_fkey") && seen[0].contains("parent"), "fkey: {}", seen[0]);
         assert!(seen[1].contains("rowid: 1"));
         assert!(seen[3].starts_with("4:DropTable"));
-        assert_eq!(wal.last_lsn(), 4);
+        // Sequence ops survive the encode/replay round-trip.
+        assert!(seen[4].contains("CreateSequence"), "seq create: {}", seen[4]);
+        assert!(seen[4].contains("cycle: true") && seen[4].contains("increment: 2"), "seq params: {}", seen[4]);
+        assert!(seen[5].contains("SequenceAdvance") && seen[5].contains("last: 42"), "seq advance: {}", seen[5]);
+        assert!(seen[6].contains("DropSequence"), "seq drop: {}", seen[6]);
+        assert_eq!(wal.last_lsn(), 7);
         // Appending continues after the replayed tail.
-        wal.append(5, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
+        wal.append(8, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
         wal.commit();
     }
 

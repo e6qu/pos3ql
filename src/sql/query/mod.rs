@@ -22,7 +22,8 @@ use super::ast::{
     WindowFrame,
 };
 use super::eval::{
-    compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError, SubqueryValues,
+    compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SequenceAccess, SqlError,
+    SubqueryValues,
 };
 use super::exec::{describe_items, MAX_PROJ};
 use super::types::{ColDesc, ColType, Datum};
@@ -1113,6 +1114,7 @@ pub fn select_query<'a>(
     statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    seq: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
     let from = statement.from.as_ref().expect("FROM-less handled by caller");
@@ -1147,7 +1149,7 @@ pub fn select_query<'a>(
                 Ok(r) => r,
                 Err(e) => return sql_fail(e),
             };
-            return select_query(storage, txid, rewritten, arena, params, responder);
+            return select_query(storage, txid, rewritten, arena, params, seq, responder);
         }
     }
     // Catalog relations (pg_catalog / information_schema) are synthesized and
@@ -1198,6 +1200,7 @@ pub fn select_query<'a>(
         subs: Some(&outer_subs.base),
         windows: None,
         catalog: Some(&catalog), srf_index: None,
+        sequences: seq,
     };
 
     // Plan-time type analysis: validate operator/aggregate types across every
@@ -1373,7 +1376,7 @@ pub fn select_query<'a>(
                         &mut sc, &mut ls,
                     )?;
                     row_hooks_owned =
-                        EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None };
+                        EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
                     &row_hooks_owned
                 };
                 if !correlated.is_empty()
@@ -1490,6 +1493,7 @@ pub fn constant_select<'a>(
     statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    seq: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
     if let Err(e) = check_select_constants(statement, arena) {
@@ -1511,7 +1515,7 @@ pub fn constant_select<'a>(
     }
     if n_win > 0 {
         return match over_one_row(statement, arena) {
-            Ok(wrapped) => select_query(storage, txid, wrapped, arena, params, responder),
+            Ok(wrapped) => select_query(storage, txid, wrapped, arena, params, seq, responder),
             Err(e) => sql_fail(e),
         };
     }
@@ -1540,7 +1544,7 @@ pub fn constant_select<'a>(
         Err(e) => return sql_fail(e),
     };
     patch_subquery_column_types(statement.items, None, &subs, params, storage, txid, arena, &mut columns[..n]);
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
 
     // Aggregates (or GROUP BY / HAVING) without FROM: PostgreSQL aggregates
     // over one virtual input row (zero when WHERE is false) and emits at most
@@ -1573,7 +1577,7 @@ pub fn constant_select<'a>(
                 Ok(r) => r,
                 Err(e) => return sql_fail(e),
             };
-            return select_query(storage, txid, rewritten, arena, params, responder);
+            return select_query(storage, txid, rewritten, arena, params, seq, responder);
         }
         responder.row_description(&columns[..n])?;
         let hook_data =
@@ -1795,6 +1799,7 @@ pub fn select_into_rows<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
+    seq: Option<&dyn SequenceAccess>,
     emit: &mut dyn FnMut(&[Datum<'a>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if let Some(tree) = statement.set_body {
@@ -1829,7 +1834,7 @@ pub fn select_into_rows<'a>(
     // rewrite to the two-level form first.
     if (!statement.group_by.is_empty() || n_aggs > 0) && find_srf(statement.items).is_some() {
         let rewritten = rewrite_grouped_windows(statement, storage, txid, arena)?;
-        return select_into_rows(storage, txid, rewritten, arena, params, outer, emit);
+        return select_into_rows(storage, txid, rewritten, arena, params, outer, seq, emit);
     }
     if !statement.group_by.is_empty() || n_aggs > 0 {
         let Some(from) = &statement.from else {
@@ -1847,6 +1852,7 @@ pub fn select_into_rows<'a>(
             let hooks = EvalHooks {
                 group: None,
                 aggs: None,
+                sequences: seq,
                 subs: Some(&subs),
                 windows: None,
                 catalog: None,
@@ -1893,7 +1899,7 @@ pub fn select_into_rows<'a>(
             }
         }
         let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
-        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: None, srf_index: None };
+        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: None, srf_index: None, sequences: seq };
         let (rows, width) = grouped_rows(
             storage, &scope, from, txid, statement, &agg_nodes[..n_aggs], arena, params, &hooks,
             outer_subs.correlated, outer,
@@ -1932,13 +1938,13 @@ pub fn select_into_rows<'a>(
         }
         if n_win > 0 {
             let wrapped = over_one_row(statement, arena)?;
-            return select_into_rows(storage, txid, wrapped, arena, params, outer, emit);
+            return select_into_rows(storage, txid, wrapped, arena, params, outer, seq, emit);
         }
         // FROM-less: one row (or zero, when WHERE is false), unless a
         // set-returning function in the list expands it to several.
         let subs =
             prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
-        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
+        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
         let srf_call = find_srf(statement.items);
         let count = srf_max_count(statement.items, arena, params, &super::eval::NoColumns, &hooks)?;
         for k in 1..=count {
@@ -1977,7 +1983,7 @@ pub fn select_into_rows<'a>(
     let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
     let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
     let correlated = outer_subs.correlated;
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: None, srf_index: None };
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: None, srf_index: None, sequences: seq };
 
     // Window functions (`OVER (...)`) in the projection: materialize the rows
     // with each window value computed, then emit. ORDER BY/LIMIT are handled by
@@ -2004,7 +2010,7 @@ pub fn select_into_rows<'a>(
         }
         if !statement.group_by.is_empty() || statement.having.is_some() || n_grouped_aggs > 0 {
             let rewritten = rewrite_grouped_windows(statement, storage, txid, arena)?;
-            return select_into_rows(storage, txid, rewritten, arena, params, outer, emit);
+            return select_into_rows(storage, txid, rewritten, arena, params, outer, seq, emit);
         }
         let (proj_rows, sort_keys) = project_window_rows(
             storage, txid, statement, from, &scope, &win_nodes[..n_win], &hooks, correlated,
@@ -2090,7 +2096,7 @@ pub fn select_into_rows<'a>(
                 row_subs = merge_correlated(
                     correlated, &outer_subs.base, row, storage, txid, arena, params, &mut sc, &mut ls,
                 )?;
-                row_hooks_owned = EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None };
+                row_hooks_owned = EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
                 if let Some(w) = statement.where_clause
                     && !where_passes(w, arena, params, row, &row_hooks_owned)? {
                         return Ok(true);
@@ -2486,7 +2492,7 @@ pub fn first_from_match<'a>(
 ) -> Result<bool, SqlError> {
     let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
     let subs = subquery_hooks(&[where_clause], storage, txid, arena, params)?;
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None };
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: None };
     let mut found = false;
     scan_source(
         storage,

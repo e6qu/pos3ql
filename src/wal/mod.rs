@@ -613,7 +613,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 let flags = u8::from(c.not_null)
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
-                    | (u8::from(c.auto_increment) << 3);
+                    | (u8::from(c.auto_increment) << 3)
+                    | (u8::from(c.is_generated) << 4);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 ok &= append_default(buffer, &c.default_value);
@@ -807,6 +808,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     auto_increment: false,
                     default_value: None,
                     default_expr: None,
+                    is_generated: false,
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
                 ..TableDef::empty()
@@ -838,6 +840,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     auto_increment: meta[1] & 8 != 0,
                     default_value,
                     default_expr,
+                    is_generated: meta[1] & 16 != 0,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -1297,6 +1300,7 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 default_expr: None,
+                is_generated: false,
             }; MAX_COLUMNS],
             n_columns: 2,
             ..TableDef::empty()
@@ -1311,6 +1315,7 @@ mod tests {
             auto_increment: false,
             default_value: None,
             default_expr: None,
+            is_generated: false,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -1322,6 +1327,7 @@ mod tests {
             auto_increment: false,
             default_value: Some(OwnedDatum::Int4(7)),
             default_expr: None,
+            is_generated: false,
         };
         // A multi-column UNIQUE, a CHECK, and a FOREIGN KEY, so the WAL
         // round-trip covers every constraint kind.

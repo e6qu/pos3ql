@@ -344,13 +344,36 @@ pub(crate) fn parse_checks<'a>(def: &'a TableDef, arena: &'a Arena) -> Result<Pa
 pub(crate) type ParsedDefaults<'a> = [Option<&'a Expr<'a>>; MAX_COLUMNS];
 
 /// Re-parses every stored non-constant DEFAULT expression once per statement.
+/// Generated columns (whose `default_expr` is a generation expression) are
+/// excluded — they are computed from the row by [`parse_generated`], not
+/// defaulted.
 pub(crate) fn parse_defaults<'a>(
     def: &'a TableDef,
     arena: &'a Arena,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
     for (i, c) in def.columns().iter().enumerate() {
+        if c.is_generated {
+            continue;
+        }
         if let Some(text) = &c.default_expr {
+            out[i] = Some(crate::sql::parser::parse_expr(text.as_str(), arena)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Re-parses every `GENERATED ALWAYS AS (expr) STORED` expression once per
+/// statement (indexed by column); `None` for non-generated columns. Evaluated
+/// against the row's other columns after they are filled.
+pub(crate) fn parse_generated<'a>(
+    def: &'a TableDef,
+    arena: &'a Arena,
+) -> Result<ParsedDefaults<'a>, SqlError> {
+    let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
+    for (i, c) in def.columns().iter().enumerate() {
+        if c.is_generated {
+            let text = c.default_expr.as_ref().expect("generated column has expr");
             out[i] = Some(crate::sql::parser::parse_expr(text.as_str(), arena)?);
         }
     }

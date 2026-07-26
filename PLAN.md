@@ -939,6 +939,23 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   against PostgreSQL (corpus `55_default_expr`) and a WAL-replay restart test.
   (The stored text is the raw source, so `pg_get_expr`/`\d` reconstruction is not
   PostgreSQL's normalized form — a cosmetic gap, not a behavioral one.)
+- **Generated columns** — done: `GENERATED ALWAYS AS (expr) STORED`, computed
+  from the row's other columns at insert/update. The generation expression
+  reuses the `default_expr` slot with an `is_generated` flag (they never coexist,
+  so no extra per-column storage), packed into the column codec's existing flags
+  byte (bit 4) for WAL + checkpoint. It is validated at CREATE/ADD against
+  PostgreSQL's rules: immutable only (42P17 for `now()`/`nextval(...)`/…, via an
+  inverse whitelist of volatile/stable functions), no reference to another
+  generated column (42P17), no subquery (0A000). At DML the column is recomputed
+  from the finished row (after defaults, once other columns are set), never
+  writable — an explicit non-DEFAULT `INSERT` value is 428C9 and an `UPDATE`
+  to anything but `DEFAULT` is 428C9; a dependency change reflows it. `ADD
+  COLUMN ... GENERATED` backfills existing rows per row, like PostgreSQL's table
+  rewrite. `pg_attribute.attgenerated` reports `'s'`. A Boyscout fix on the way:
+  `LIKE` copied generated columns unconditionally (and conflated `INCLUDING
+  GENERATED` with `IDENTITY`); it now copies a generated column as plain unless
+  `INCLUDING GENERATED`, matching PostgreSQL. Verified byte-for-byte against
+  PostgreSQL (corpus `56_generated`) and a WAL-replay restart test.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

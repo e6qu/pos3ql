@@ -125,7 +125,8 @@ mod constraints;
 pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
 use constraints::{
     apply_fk_parent_actions, enforce_row_constraints, parse_checks, parse_defaults,
-    referenced_key_changed, table_is_referenced, ParsedChecks, MAX_FK_CASCADE_DEPTH,
+    parse_generated, referenced_key_changed, table_is_referenced, ParsedChecks,
+    MAX_FK_CASCADE_DEPTH,
 };
 
 pub fn create_table(
@@ -237,6 +238,9 @@ fn build_def_with_likes(
                 let mut copied = *column;
                 if !like.defaults {
                     copied.default_value = None;
+                    if !copied.is_generated {
+                        copied.default_expr = None;
+                    }
                 }
                 if !like.indexes {
                     copied.unique = false;
@@ -244,6 +248,12 @@ fn build_def_with_likes(
                 }
                 if !like.identity {
                     copied.auto_increment = false;
+                }
+                // Without INCLUDING GENERATED a generated column is copied as a
+                // plain column (its generation expression is dropped).
+                if !like.generated && copied.is_generated {
+                    copied.is_generated = false;
+                    copied.default_expr = None;
                 }
                 push_column(&mut def, &mut n, copied)?;
             }
@@ -1314,6 +1324,7 @@ pub fn create_table_as(
             auto_increment: false,
             default_value: None,
             default_expr: None,
+            is_generated: false,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -3010,6 +3021,43 @@ fn encode_range_binary(
     }
 }
 
+/// Computes every `GENERATED ALWAYS AS (expr) STORED` column from the row's
+/// already-filled other columns, writing the result into `values`. A generated
+/// column never references another generated column (enforced at CREATE), so a
+/// snapshot of the row before this pass supplies every dependency.
+fn compute_generated<'a>(
+    def: &TableDef,
+    generated: &constraints::ParsedDefaults<'a>,
+    values: &mut [Datum<'a>; MAX_COLUMNS],
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if !generated.iter().any(|g| g.is_some()) {
+        return Ok(());
+    }
+    let snapshot: [Datum<'a>; MAX_COLUMNS] = *values;
+    let context = RowCtx { def, values: &snapshot[..def.n_columns] };
+    for (i, g) in generated.iter().enumerate() {
+        if let Some(expr) = g {
+            let v = eval(expr, arena, crate::sql::eval::NO_PARAMS, &context)?;
+            values[i] = coerce(v, &def.columns()[i], arena)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects an explicit non-`DEFAULT` value written to a generated column (428C9),
+/// the error PostgreSQL raises for `INSERT`/`UPDATE` on such a column.
+fn reject_generated_write(def: &TableDef, column: usize) -> Result<(), SqlError> {
+    if def.columns()[column].is_generated {
+        return Err(sql_err!(
+            sqlstate::GENERATED_ALWAYS,
+            "cannot insert a non-DEFAULT value into column \"{}\"",
+            def.columns()[column].name.as_str()
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn insert(
     storage: &mut Storage,
@@ -3106,6 +3154,10 @@ pub fn insert(
             Ok(d) => d,
             Err(e) => return sql_fail(e),
         };
+        let generated_exprs = match parse_generated(&def, arena) {
+            Ok(g) => g,
+            Err(e) => return sql_fail(e),
+        };
         let mut inserted = 0u64;
         for bytes in rows_bytes.iter() {
             let n_src = bytes[0] as usize;
@@ -3120,6 +3172,10 @@ pub fn insert(
             let mut values = [Datum::Null; MAX_COLUMNS];
             let mut explicit = [false; MAX_COLUMNS];
             for i in 0..n_src {
+                // A generated column cannot be a target of INSERT ... SELECT.
+                if let Err(e) = reject_generated_write(&def, targets[i]) {
+                    return sql_fail(e);
+                }
                 let v = decode_projected_pub(bytes, i);
                 let col = &def.columns()[targets[i]];
                 match coerce(v, col, arena) {
@@ -3160,6 +3216,9 @@ pub fn insert(
                 }
             }
             if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
+                return sql_fail(e);
+            }
+            if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, arena) {
                 return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &values) {
@@ -3205,10 +3264,14 @@ pub fn insert(
         return sql_ok();
     }
 
-    // Non-constant DEFAULT expressions (now(), nextval(...), …), re-parsed once
-    // and evaluated per row below.
+    // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED
+    // expressions, re-parsed once and evaluated per row below.
     let default_exprs = match parse_defaults(&def, arena) {
         Ok(d) => d,
+        Err(e) => return sql_fail(e),
+    };
+    let generated_exprs = match parse_generated(&def, arena) {
+        Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
     let mut inserted = 0u64;
@@ -3226,6 +3289,10 @@ pub fn insert(
         let mut explicit = [false; MAX_COLUMNS];
         for (i, expression) in row_exprs.iter().enumerate() {
             if !matches!(expression, Expr::DefaultMarker) {
+                // A generated column rejects any explicit non-DEFAULT value.
+                if let Err(e) = reject_generated_write(&def, targets[i]) {
+                    return sql_fail(e);
+                }
                 explicit[targets[i]] = true;
             }
         }
@@ -3275,6 +3342,10 @@ pub fn insert(
             }
         }
         if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
+            return sql_fail(e);
+        }
+        // Generated columns are computed last, from the now-filled row.
+        if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, arena) {
             return sql_fail(e);
         }
         if let Err(e) = check_not_null(&def, &values) {
@@ -3414,6 +3485,20 @@ pub fn update(
         };
         targets[i] = col;
     }
+    // A generated column can only be updated to DEFAULT (which recomputes it).
+    for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+        if def.columns()[targets[a]].is_generated && !matches!(expression, Expr::DefaultMarker) {
+            return sql_fail(sql_err!(
+                sqlstate::GENERATED_ALWAYS,
+                "column \"{}\" can only be updated to DEFAULT",
+                def.columns()[targets[a]].name.as_str()
+            ));
+        }
+    }
+    let generated_exprs = match parse_generated(&def, arena) {
+        Ok(g) => g,
+        Err(e) => return sql_fail(e),
+    };
 
     let subs = match super::query::subquery_hooks(
         &[statement.where_clause],
@@ -3479,6 +3564,11 @@ pub fn update(
                     storage, from, txn.txid, statement.where_clause, arena, params, &context,
                     &mut |combined| {
                         for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                            // A generated target's `= DEFAULT` is a no-op here; it
+                            // is recomputed from the finished row below.
+                            if def.columns()[targets[a]].is_generated {
+                                continue;
+                            }
                             let v = eval(expression, arena, params, &combined)?;
                             new_values[targets[a]] = coerce(v, &def.columns()[targets[a]], arena)?;
                         }
@@ -3500,6 +3590,9 @@ pub fn update(
                 let hooks =
                     super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
                 for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                    if def.columns()[targets[a]].is_generated {
+                        continue; // recomputed from the finished row below
+                    }
                     let v = match super::eval::eval_full(expression, arena, params, &context, &hooks) {
                         Ok(v) => v,
                         Err(e) => return sql_fail(e),
@@ -3510,6 +3603,11 @@ pub fn update(
                         Err(e) => return sql_fail(e),
                     }
                 }
+            }
+            // Every generated column is recomputed from the updated row (a change
+            // to any dependency must flow through).
+            if let Err(e) = compute_generated(&def, &generated_exprs, &mut new_values, arena) {
+                return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &new_values) {
                 return sql_fail(e);
@@ -4483,6 +4581,12 @@ pub fn alter_table(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    // Generated columns are recomputed for every rewritten row — an ADD COLUMN
+    // of a generated column backfills, and a type change of a dependency reflows.
+    let new_generated = match parse_generated(&new_def, arena) {
+        Ok(g) => g,
+        Err(e) => return sql_fail(e),
+    };
     for i in 0..scratch.len() {
         let (rowid, old_home) = scratch[i];
         let new_loc = if has_rewrite {
@@ -4556,6 +4660,9 @@ pub fn alter_table(
                             }
                         }
                     };
+                }
+                if let Err(e) = compute_generated(&new_def, &new_generated, &mut out, arena) {
+                    return sql_fail(e);
                 }
                 let values = &out[..new_def.n_columns];
                 if let Err(e) = crate::sql::exec::constraints::check_row_content(

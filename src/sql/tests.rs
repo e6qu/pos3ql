@@ -1586,6 +1586,70 @@ fn expression_default_survives_restart() {
 }
 
 #[test]
+fn generated_columns() {
+    let (mut e, mut b) = test_engine();
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE g (a int, b int, c int GENERATED ALWAYS AS (a + b) STORED, \
+         label text GENERATED ALWAYS AS (a::text || '-' || b::text) STORED)",
+    );
+    run_with(&mut e, &mut b, "INSERT INTO g (a, b) VALUES (2, 3), (10, 20)");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT a, b, c, label FROM g ORDER BY a")),
+        ["2|3|5|2-3", "10|20|30|10-20"]
+    );
+    // Cannot insert a non-DEFAULT value into a generated column (428C9).
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO g (a, b, c) VALUES (1, 1, 5)"))
+        .contains("428C9"));
+    // DEFAULT is allowed and recomputes.
+    run_with(&mut e, &mut b, "INSERT INTO g (a, b, c) VALUES (1, 1, DEFAULT)");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 1")), ["2"]);
+    // UPDATE of a dependency recomputes; direct update rejected except DEFAULT.
+    run_with(&mut e, &mut b, "UPDATE g SET b = 100 WHERE a = 2");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 2")), ["102"]);
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "UPDATE g SET c = 99 WHERE a = 10"))
+        .contains("428C9"));
+    run_with(&mut e, &mut b, "UPDATE g SET c = DEFAULT WHERE a = 10");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 10")), ["30"]);
+    // attgenerated is 's'.
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT attgenerated FROM pg_attribute WHERE attrelid='g'::regclass AND attname='c'")),
+        ["s"]
+    );
+    // Restrictions.
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad1 (a int, x int GENERATED ALWAYS AS (now()) STORED)"))
+        .contains("42P17"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad2 (a int, x int GENERATED ALWAYS AS (a) STORED, y int GENERATED ALWAYS AS (x) STORED)"))
+        .contains("42P17"));
+    // ADD COLUMN generated backfills existing rows.
+    run_with(&mut e, &mut b, "CREATE TABLE h (a int)");
+    run_with(&mut e, &mut b, "INSERT INTO h VALUES (5), (7)");
+    run_with(&mut e, &mut b, "ALTER TABLE h ADD COLUMN d int GENERATED ALWAYS AS (a * 10) STORED");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT a, d FROM h ORDER BY a")), ["5|50", "7|70"]);
+}
+
+#[test]
+fn generated_column_survives_restart() {
+    let config = test_config("generated_restart");
+    {
+        let mut budget = Budget::new(1 << 24);
+        let mut e = Engine::new(&config, &mut budget).unwrap();
+        run_with(&mut e, &mut budget, "CREATE TABLE g (a int, c int GENERATED ALWAYS AS (a + 1) STORED)");
+        run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (10)");
+        e.commit_wal();
+    }
+    let mut budget = Budget::new(1 << 24);
+    let mut e = Engine::new(&config, &mut budget).unwrap();
+    // The generation expression survived replay: a new insert still computes it.
+    run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (20)");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut budget, "SELECT a, c FROM g ORDER BY a")),
+        ["10|11", "20|21"]
+    );
+}
+
+#[test]
 fn sql_surface_batch() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE s (id int, name text DEFAULT 'x', qty int DEFAULT 3)");

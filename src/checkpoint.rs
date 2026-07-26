@@ -839,6 +839,7 @@ impl Checkpointer {
                         auto_increment: not_null & 8 != 0,
                         default_value: default_from_hex(default_hex)?,
                         default_expr,
+                        is_generated: not_null & 16 != 0,
                     };
                     *seen += 1;
                 }
@@ -1626,7 +1627,8 @@ Ok(CheckpointStep::Published { lsn })
                 let flags = u8::from(c.not_null)
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
-                    | (u8::from(c.auto_increment) << 3);
+                    | (u8::from(c.auto_increment) << 3)
+                    | (u8::from(c.is_generated) << 4);
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
@@ -2436,6 +2438,7 @@ fn empty_column() -> ColumnMeta {
         auto_increment: false,
         default_value: None,
         default_expr: None,
+        is_generated: false,
     }
 }
 

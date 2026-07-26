@@ -200,11 +200,16 @@ pub struct ColumnMeta {
     /// its owned value for a fast insert. Non-constant defaults live in
     /// `default_expr` instead; the two are mutually exclusive.
     pub default_value: Option<OwnedDatum>,
-    /// A non-constant DEFAULT — anything with a function call (`now()`,
-    /// `nextval(...)`, `gen_random_uuid()`, …) — kept as raw source text and
-    /// re-parsed + evaluated per inserted row. Also the source for
-    /// `pg_get_expr` / `\d`.
+    /// Either a non-constant DEFAULT — anything with a function call (`now()`,
+    /// `nextval(...)`, `gen_random_uuid()`, …) — or, when `is_generated`, the
+    /// `GENERATED ALWAYS AS (expr) STORED` expression. Kept as raw source text
+    /// and re-parsed + evaluated per row (against the row's other columns, for a
+    /// generated column). Also the source for `pg_get_expr` / `\d`.
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
+    /// When set, `default_expr` is a `STORED` generation expression (attgenerated
+    /// `'s'`), computed from the row rather than defaulted — the two never
+    /// coexist on one column.
+    pub is_generated: bool,
 }
 
 /// Maximum stored length of a non-constant DEFAULT expression's source text.
@@ -223,6 +228,7 @@ impl ColumnMeta {
         auto_increment: false,
         default_value: None,
         default_expr: None,
+        is_generated: false,
     };
 }
 
@@ -1169,6 +1175,7 @@ impl Storage {
                             auto_increment: false,
                             default_value: None,
                             default_expr: None,
+                            is_generated: false,
                         }; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
@@ -3761,6 +3768,7 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 default_expr: None,
+                is_generated: false,
             }; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
@@ -3776,6 +3784,7 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 default_expr: None,
+                is_generated: false,
             };
         }
         def

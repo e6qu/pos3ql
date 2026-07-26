@@ -1846,6 +1846,7 @@ impl<'a> Parser<'a> {
             let mut unique = false;
             let mut default = None;
             let mut default_text = None;
+            let mut generated_text = None;
             loop {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
@@ -1856,6 +1857,8 @@ impl<'a> Parser<'a> {
                     let start = self.peek_at;
                     default = Some(self.expression(0)?);
                     default_text = Some(self.text[start..self.peek_at].trim_end());
+                } else if self.eat_ident("generated")? {
+                    generated_text = Some(self.generated_clause()?);
                 } else if self.eat_ident("unique")? {
                     unique = true;
                 } else {
@@ -1871,6 +1874,7 @@ impl<'a> Parser<'a> {
                 primary: false,
                 default,
                 default_text,
+                generated_text,
             }))
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {

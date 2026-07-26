@@ -44,7 +44,41 @@ pub(super) fn build_def(name: &str, columns: &[ColumnDef], arena: &Arena) -> Res
         }
         def.columns[i] = build_column(c, arena)?;
     }
+    // A generation expression may not reference another generated column (42P17);
+    // needs the full column set, so check once the table is assembled.
+    validate_generated_refs(&def, arena)?;
     Ok(def)
+}
+
+/// Enforces that no `GENERATED` column's expression references another generated
+/// column (or itself) — PostgreSQL's `check_nested_generated` rule (42P17).
+pub(super) fn validate_generated_refs(def: &TableDef, arena: &Arena) -> Result<(), SqlError> {
+    for c in def.columns() {
+        if !c.is_generated {
+            continue;
+        }
+        let text = c.default_expr.as_ref().expect("generated column has expr text");
+        let expression = crate::sql::parser::parse_expr(text.as_str(), arena)?;
+        let mut offending: Option<SqlError> = None;
+        expression.for_each_column(&mut |name| {
+            if offending.is_some() {
+                return;
+            }
+            if let Some(referenced) = def.columns().iter().find(|col| col.name.as_str() == name)
+                && referenced.is_generated
+            {
+                offending = Some(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "cannot use generated column \"{}\" in column generation expression",
+                    name
+                ));
+            }
+        });
+        if let Some(e) = offending {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 fn empty_meta() -> ColumnMeta {
@@ -58,6 +92,7 @@ fn empty_meta() -> ColumnMeta {
         auto_increment: false,
         default_value: None,
         default_expr: None,
+        is_generated: false,
     }
 }
 
@@ -71,8 +106,21 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
             c.type_name
         ));
     };
-    let (default_value, default_expr) =
-        resolve_default(c.default, c.default_text, ctype, c.type_mod, arena)?;
+    // A GENERATED column stores its expression in `default_expr` with the
+    // `is_generated` flag; it cannot also carry a DEFAULT.
+    let (default_value, default_expr, is_generated) = if let Some(gtext) = c.generated_text {
+        if c.default.is_some() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "both default and generation expression specified for column \"{}\"",
+                c.name
+            ));
+        }
+        (None, Some(resolve_generated(gtext, arena)?), true)
+    } else {
+        let (dv, de) = resolve_default(c.default, c.default_text, ctype, c.type_mod, arena)?;
+        (dv, de, false)
+    };
     // serial/bigserial/smallserial are int4/int8/int2 with an auto-increment
     // default and an implicit NOT NULL.
     let auto_increment = matches!(
@@ -89,7 +137,41 @@ pub(super) fn build_column(c: &ColumnDef, arena: &Arena) -> Result<ColumnMeta, S
         auto_increment,
         default_value,
         default_expr,
+        is_generated,
     })
+}
+
+/// Validates a `GENERATED ALWAYS AS (expr) STORED` expression and returns its
+/// stored text: the expression must be immutable (42P17) and free of subqueries
+/// (0A000). The no-reference-to-another-generated-column rule needs the full
+/// column list and is checked once the table is assembled.
+pub(super) fn resolve_generated(
+    text: &str,
+    arena: &Arena,
+) -> Result<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>, SqlError> {
+    let expression = crate::sql::parser::parse_expr(text, arena)?;
+    if expression.contains_subquery() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use subquery in column generation expression"
+        ));
+    }
+    if let Some(name) = expression.contains_nonimmutable_function() {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "generation expression is not immutable (uses {}())",
+            name
+        ));
+    }
+    let stored = StackStr::from_str(text);
+    if stored.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "generation expression exceeds {} bytes",
+            crate::storage::DEFAULT_EXPR_MAX
+        ));
+    }
+    Ok(stored)
 }
 
 /// Resolves a column DEFAULT into either a folded constant (`default_value`, for

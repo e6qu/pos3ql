@@ -261,27 +261,34 @@ impl<'a> Parser<'a> {
         }
         self.expect_op("(")?;
         // A `(` is either column definitions or — for `CREATE TABLE ... AS` — a
-        // column-name list. Read the first identifier and peek: a name list has
-        // it immediately followed by `,` or `)`, a definition by a type.
-        let first_ident = self.col_ident("column name")?;
-        if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
-            let mut list = [""; MAX_LIST];
-            list[0] = first_ident;
-            let mut m = 1;
-            while self.eat_op(",")? {
-                if m == MAX_LIST {
-                    return Err(self.limit("column list", MAX_LIST));
+        // column-name list. Only a plain identifier (not LIKE, CONSTRAINT, or a
+        // table-constraint keyword) can begin a name list, so peek there: a name
+        // list has that identifier immediately followed by `,` or `)`; a column
+        // definition has a type after it.
+        let mut pending_first_col = None;
+        if matches!(self.peeked, Tok::Ident(w)
+            if !matches!(w, "like" | "constraint" | "primary" | "unique" | "check" | "foreign"))
+        {
+            let first_ident = self.col_ident("column name")?;
+            if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+                let mut list = [""; MAX_LIST];
+                list[0] = first_ident;
+                let mut m = 1;
+                while self.eat_op(",")? {
+                    if m == MAX_LIST {
+                        return Err(self.limit("column list", MAX_LIST));
+                    }
+                    list[m] = self.col_ident("column name")?;
+                    m += 1;
                 }
-                list[m] = self.col_ident("column name")?;
-                m += 1;
+                self.expect_op(")")?;
+                self.expect_ident("as")?;
+                let cols = self.arena_slice(&list[..m])?;
+                return self.create_table_as(name, cols, if_not_exists);
             }
-            self.expect_op(")")?;
-            self.expect_ident("as")?;
-            let cols = self.arena_slice(&list[..m])?;
-            return self.create_table_as(name, cols, if_not_exists);
+            // Otherwise it is a column definition whose name we already read.
+            pending_first_col = Some(first_ident);
         }
-        // Otherwise it is a column definition whose name we already read.
-        let mut pending_first_col = Some(first_ident);
         let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None }; MAX_LIST];
         let mut n = 0;
         let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];

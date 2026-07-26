@@ -422,6 +422,7 @@ pub(super) fn synth_derived_def<'a>(
         auto_increment: false,
         default_value: None,
         default_expr: None,
+        is_generated: false,
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {
@@ -498,6 +499,7 @@ pub(super) fn table_func_def<'a>(
         auto_increment: false,
         default_value: None,
         default_expr: None,
+        is_generated: false,
     };
     // Each supported function's output columns: `key`/`value` for the `each`
     // family (two columns), a single column named per the function otherwise.

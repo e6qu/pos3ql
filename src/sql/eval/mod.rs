@@ -149,6 +149,8 @@ pub mod sqlstate {
     pub const INVALID_ROW_COUNT_IN_LIMIT_CLAUSE: &str = "2201W";
     pub const INVALID_SAVEPOINT_SPECIFICATION: &str = "3B001";
     pub const INVALID_TABLE_DEFINITION: &str = "42P16";
+    pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
+    pub const GENERATED_ALWAYS: &str = "428C9";
     pub const INVALID_USE_OF_ESCAPE_CHARACTER: &str = "2200C";
     pub const LOCK_NOT_AVAILABLE: &str = "55P03";
     pub const NAME_TOO_LONG: &str = "42622";

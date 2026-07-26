@@ -387,8 +387,11 @@ pub struct LikeClause<'a> {
     pub constraints: bool,
     /// `INCLUDING INDEXES` — PRIMARY KEY, UNIQUE, and secondary indexes.
     pub indexes: bool,
-    /// `INCLUDING IDENTITY` or `GENERATED` — the auto-increment flag.
+    /// `INCLUDING IDENTITY` — the auto-increment flag.
     pub identity: bool,
+    /// `INCLUDING GENERATED` — the STORED generation expression; without it a
+    /// generated column is copied as a plain column.
+    pub generated: bool,
 }
 
 /// A table-level constraint, or a column-level CHECK/REFERENCES desugared to
@@ -497,6 +500,9 @@ pub struct ColumnDef<'a> {
     /// The raw source text of the DEFAULT expression, for storing non-constant
     /// defaults and for `pg_get_expr` / `\d` reconstruction.
     pub default_text: Option<&'a str>,
+    /// `GENERATED ALWAYS AS (expr) STORED`: the raw source text of the generation
+    /// expression, computed from the row's other columns at insert/update.
+    pub generated_text: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -959,6 +965,157 @@ impl Expr<'_> {
             // non-foldable to be safe.
             Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
             | Expr::ArraySubquery(_) => true,
+        }
+    }
+
+    /// Whether the expression tree contains a subquery — disallowed in a column
+    /// generation expression (0A000).
+    pub fn contains_subquery(&self) -> bool {
+        match self {
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => true,
+            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
+            | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. } | Expr::Param(_) | Expr::DefaultMarker => false,
+            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
+                operand.contains_subquery()
+            }
+            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
+            | Expr::AnyAll { operand: left, array: right, .. } => {
+                left.contains_subquery() || right.contains_subquery()
+            }
+            Expr::Call { args, .. } => args.iter().any(|a| a.contains_subquery()),
+            Expr::InList { operand, list, .. } => {
+                operand.contains_subquery() || list.iter().any(|e| e.contains_subquery())
+            }
+            Expr::Between { operand, low, high, .. } => {
+                operand.contains_subquery()
+                    || low.contains_subquery()
+                    || high.contains_subquery()
+            }
+            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+                operand.contains_subquery() || pattern.contains_subquery()
+            }
+            Expr::Case { operand, whens, otherwise, .. } => {
+                operand.map(|o| o.contains_subquery()).unwrap_or(false)
+                    || whens
+                        .iter()
+                        .any(|(c, r)| c.contains_subquery() || r.contains_subquery())
+                    || otherwise.map(|o| o.contains_subquery()).unwrap_or(false)
+            }
+            Expr::Array(items) => items.iter().any(|e| e.contains_subquery()),
+        }
+    }
+
+    /// Whether the tree calls a volatile or stable function — one whose value can
+    /// vary across rows or statements (`now`, `random`, `nextval`, `current_user`,
+    /// …). Such a function is disallowed in a column generation expression
+    /// (PostgreSQL requires immutability, 42P17). Every other function is treated
+    /// as immutable.
+    pub fn contains_nonimmutable_function(&self) -> Option<&str> {
+        fn is_nonimmutable(name: &str) -> bool {
+            const NAMES: &[&str] = &[
+                "now", "current_timestamp", "current_date", "current_time", "localtime",
+                "localtimestamp", "statement_timestamp", "transaction_timestamp",
+                "clock_timestamp", "timeofday", "random", "random_normal", "nextval", "currval",
+                "lastval", "setval", "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
+                "current_user", "session_user", "user", "current_role", "current_schema",
+                "current_database", "current_catalog", "pg_backend_pid", "txid_current",
+                "pg_current_xact_id",
+            ];
+            NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
+        }
+        match self {
+            Expr::Call { name, args, .. } => {
+                if is_nonimmutable(name) {
+                    return Some(name);
+                }
+                args.iter().find_map(|a| a.contains_nonimmutable_function())
+            }
+            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
+            | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. } | Expr::Param(_) | Expr::DefaultMarker
+            | Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => None,
+            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
+                operand.contains_nonimmutable_function()
+            }
+            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
+            | Expr::AnyAll { operand: left, array: right, .. } => left
+                .contains_nonimmutable_function()
+                .or_else(|| right.contains_nonimmutable_function()),
+            Expr::InList { operand, list, .. } => operand
+                .contains_nonimmutable_function()
+                .or_else(|| list.iter().find_map(|e| e.contains_nonimmutable_function())),
+            Expr::Between { operand, low, high, .. } => operand
+                .contains_nonimmutable_function()
+                .or_else(|| low.contains_nonimmutable_function())
+                .or_else(|| high.contains_nonimmutable_function()),
+            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => operand
+                .contains_nonimmutable_function()
+                .or_else(|| pattern.contains_nonimmutable_function()),
+            Expr::Case { operand, whens, otherwise, .. } => operand
+                .and_then(|o| o.contains_nonimmutable_function())
+                .or_else(|| {
+                    whens.iter().find_map(|(c, r)| {
+                        c.contains_nonimmutable_function()
+                            .or_else(|| r.contains_nonimmutable_function())
+                    })
+                })
+                .or_else(|| otherwise.and_then(|o| o.contains_nonimmutable_function())),
+            Expr::Array(items) => {
+                items.iter().find_map(|e| e.contains_nonimmutable_function())
+            }
+        }
+    }
+
+    /// Visits every column reference in the tree (by unqualified name), for
+    /// validating a generation expression's dependencies.
+    pub fn for_each_column(&self, f: &mut dyn FnMut(&str)) {
+        match self {
+            Expr::Column { name, .. } => f(name),
+            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
+            | Expr::Str(_) | Expr::BitLit(_) | Expr::WholeRow(_) | Expr::SchemaColumn { .. }
+            | Expr::Param(_) | Expr::DefaultMarker | Expr::Subquery(_)
+            | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {}
+            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
+                operand.for_each_column(f)
+            }
+            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
+            | Expr::AnyAll { operand: left, array: right, .. } => {
+                left.for_each_column(f);
+                right.for_each_column(f);
+            }
+            Expr::Call { args, .. } => args.iter().for_each(|a| a.for_each_column(f)),
+            Expr::InList { operand, list, .. } => {
+                operand.for_each_column(f);
+                list.iter().for_each(|e| e.for_each_column(f));
+            }
+            Expr::Between { operand, low, high, .. } => {
+                operand.for_each_column(f);
+                low.for_each_column(f);
+                high.for_each_column(f);
+            }
+            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+                operand.for_each_column(f);
+                pattern.for_each_column(f);
+            }
+            Expr::Case { operand, whens, otherwise, .. } => {
+                if let Some(o) = operand {
+                    o.for_each_column(f);
+                }
+                for (c, r) in *whens {
+                    c.for_each_column(f);
+                    r.for_each_column(f);
+                }
+                if let Some(o) = otherwise {
+                    o.for_each_column(f);
+                }
+            }
+            Expr::Array(items) => items.iter().for_each(|e| e.for_each_column(f)),
         }
     }
 }

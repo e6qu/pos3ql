@@ -188,6 +188,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The tail of a `GENERATED` column clause ("generated" consumed): either
+    /// `ALWAYS AS (expr) STORED` (returns the raw expression text) or one of the
+    /// IDENTITY forms, which this engine does not yet model (a loud error).
+    pub(super) fn generated_clause(&mut self) -> Result<&'a str, ParseError> {
+        if self.eat_ident("always")? {
+            self.expect_ident("as")?;
+            if self.eat_op("(")? {
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                let text = self.text[start..self.peek_at].trim_end();
+                self.expect_op(")")?;
+                self.expect_ident("stored")?;
+                return Ok(text);
+            }
+            self.expect_ident("identity")?;
+        } else {
+            self.expect_ident("by")?;
+            self.expect_ident("default")?;
+            self.expect_ident("as")?;
+            self.expect_ident("identity")?;
+        }
+        Err(self.err_here("GENERATED ... AS IDENTITY is not supported"))
+    }
+
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] AS <query>
     /// [WITH [NO] DATA]` ("create materialized view" consumed). A `(` here is
     /// always a column-name list (a materialized view has no column defs).
@@ -453,12 +477,12 @@ impl<'a> Parser<'a> {
             // Otherwise it is a column definition whose name we already read.
             pending_first_col = Some(first_ident);
         }
-        let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None, default_text: None }; MAX_LIST];
+        let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None, default_text: None, generated_text: None }; MAX_LIST];
         let mut n = 0;
         let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
         let mut n_cons = 0;
         let mut likes =
-            [LikeClause { at: 0, source: QualName::bare(""), defaults: false, constraints: false, indexes: false, identity: false };
+            [LikeClause { at: 0, source: QualName::bare(""), defaults: false, constraints: false, indexes: false, identity: false, generated: false };
                 MAX_LIST];
         let mut n_likes = 0;
         loop {
@@ -526,6 +550,7 @@ impl<'a> Parser<'a> {
             let mut primary = false;
             let mut default = None;
             let mut default_text = None;
+            let mut generated_text = None;
             loop {
                 // Column-level constraints may carry their own CONSTRAINT name.
                 let col_cons_name = if self.eat_ident("constraint")? {
@@ -596,13 +621,15 @@ impl<'a> Parser<'a> {
                     cons[n_cons] = c;
                     n_cons += 1;
                     continue;
+                } else if self.eat_ident("generated")? {
+                    generated_text = Some(self.generated_clause()?);
                 } else if col_cons_name.is_some() {
                     return Err(self.err_here("expected a column constraint after CONSTRAINT name"));
                 } else {
                     break;
                 }
             }
-            columns[n] = ColumnDef { name: col_name, type_name, type_mod, not_null, unique, primary, default, default_text };
+            columns[n] = ColumnDef { name: col_name, type_name, type_mod, not_null, unique, primary, default, default_text, generated_text };
             n += 1;
             if !self.eat_op(",")? {
                 break;
@@ -620,7 +647,7 @@ impl<'a> Parser<'a> {
     fn like_clause(&mut self, at: usize) -> Result<LikeClause<'a>, ParseError> {
         let source = self.qual_name("source table name")?;
         let mut clause =
-            LikeClause { at, source, defaults: false, constraints: false, indexes: false, identity: false };
+            LikeClause { at, source, defaults: false, constraints: false, indexes: false, identity: false, generated: false };
         loop {
             let including = if self.eat_ident("including")? {
                 true
@@ -636,12 +663,14 @@ impl<'a> Parser<'a> {
                 Tok::Ident("defaults") => clause.defaults = including,
                 Tok::Ident("constraints") => clause.constraints = including,
                 Tok::Ident("indexes") => clause.indexes = including,
-                Tok::Ident("identity" | "generated") => clause.identity = including,
+                Tok::Ident("identity") => clause.identity = including,
+                Tok::Ident("generated") => clause.generated = including,
                 Tok::Ident("all") => {
                     clause.defaults = including;
                     clause.constraints = including;
                     clause.indexes = including;
                     clause.identity = including;
+                    clause.generated = including;
                 }
                 Tok::Ident(other @ ("comments" | "compression" | "statistics" | "storage")) => {
                     return Err(ParseError {

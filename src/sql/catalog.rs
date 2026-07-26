@@ -643,6 +643,7 @@ fn def_of(name: &str, columns: &[(&str, ColType)]) -> TableDef {
             auto_increment: false,
             default_value: None,
             default_expr: None,
+            is_generated: false,
         }; MAX_COLUMNS],
         n_columns: columns.len(),
         ..TableDef::empty()
@@ -1053,7 +1054,7 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                     Datum::Bool(c.default_value.is_some() || c.default_expr.is_some()),
                     Datum::Int4(0), // attcollation: default (0)
                     text("", arena)?, // attidentity
-                    text("", arena)?, // attgenerated
+                    text(if c.is_generated { "s" } else { "" }, arena)?, // attgenerated
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i as i32 + 1),
                 ],

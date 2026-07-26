@@ -53,8 +53,8 @@ Working single-node database:
   INSERT/SELECT/UPDATE/DELETE with WHERE / ORDER BY (PostgreSQL null ordering)
   / LIMIT, joins, GROUP BY and aggregates, subqueries (correlated + EXISTS),
   non-recursive CTEs, updatable views, constant and expression column DEFAULTs
-  (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row),
-  arbitrary-precision NUMERIC, casts and
+  (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row), generated columns
+  (`GENERATED ALWAYS AS (expr) STORED`), arbitrary-precision NUMERIC, casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
   introspection, PostgreSQL lexical rules, and SQLSTATE-correct errors.
 - COPY FROM STDIN / TO STDOUT in PostgreSQL's text, CSV, and binary formats —

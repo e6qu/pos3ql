@@ -1324,6 +1324,9 @@ fn call<'a>(
     if let Some(result) = funcs::array::dispatch(name, args, star, arena, params, row, hooks) {
         return result;
     }
+    if let Some(result) = funcs::net::dispatch(name, args, star, arena, params, row, hooks) {
+        return result;
+    }
     if let Some(result) = funcs::range::dispatch(name, args, star, arena, params, row, hooks) {
         return result;
     }
@@ -2883,6 +2886,10 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Bit { varying: false, .. } => "bit",
         Datum::Bit { varying: true, .. } => "bit varying",
         Datum::Multirange { kind, .. } => kind.multirange_name(),
+        Datum::Inet(_) => "inet",
+        Datum::Cidr(_) => "cidr",
+        Datum::Macaddr(_) => "macaddr",
+        Datum::Macaddr8(_) => "macaddr8",
         Datum::Record(_) => "record",
     }
 }

@@ -1397,6 +1397,8 @@ impl<'a> Parser<'a> {
             Tok::Op("#") => Some(BinaryOp::BitXor),
             Tok::Op("<<") => Some(BinaryOp::Shl),
             Tok::Op(">>") => Some(BinaryOp::Shr),
+            Tok::Op("<<=") => Some(BinaryOp::NetContainedEq),
+            Tok::Op(">>=") => Some(BinaryOp::NetContainsEq),
             Tok::Op("^") => Some(BinaryOp::Pow),
             Tok::Op("@>") => Some(BinaryOp::Contains),
             Tok::Op("<@") => Some(BinaryOp::ContainedBy),

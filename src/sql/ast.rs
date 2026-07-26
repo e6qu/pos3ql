@@ -1310,6 +1310,10 @@ pub enum BinaryOp {
     NotRightOf,
     NotLeftOf,
     Adjacent,
+    /// `<<=` network "is contained within or equals", `>>=` network "contains
+    /// or equals". (`<<`/`>>` reuse `Shl`/`Shr`, dispatched on network operands.)
+    NetContainedEq,
+    NetContainsEq,
     /// Pattern match, used only as the operator of a quantified `LIKE ANY/ALL`
     /// (`ILike` is the case-insensitive form). Plain `x LIKE y` uses `Expr::Like`.
     Like,
@@ -1327,6 +1331,7 @@ impl BinaryOp {
             // Containment/overlap/adjacency operators bind like comparisons.
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
+            Self::NetContainedEq | Self::NetContainsEq => 4,
             Self::Like | Self::ILike => 4,
             Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll => 4,
             Self::Concat => 5,

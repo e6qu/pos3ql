@@ -15,6 +15,7 @@ pub(super) mod datetime;
 pub(super) mod json;
 pub(super) mod math;
 pub(super) mod misc;
+pub(super) mod net;
 pub(super) mod range;
 pub(super) mod regex;
 pub(super) mod string;

@@ -10,6 +10,7 @@ pub mod guc;
 pub mod json;
 pub mod lexer;
 pub mod md5;
+pub mod net;
 pub mod numeric;
 pub mod parser;
 pub mod regex;

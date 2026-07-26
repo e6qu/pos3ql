@@ -1679,6 +1679,33 @@ pub(crate) fn decode_binary_param<'a>(
                 .map(Datum::Numeric)
                 .map_err(|_| "binary numeric out of range")
         }
+        oids::INET | oids::CIDR => {
+            // family (2 = v4, 3 = v6), mask bits, is_cidr flag, address byte
+            // count, then the address bytes.
+            if bytes.len() < 4 {
+                return Err("truncated binary inet/cidr parameter");
+            }
+            let nb = bytes[3] as usize;
+            if (nb != 4 && nb != 16) || bytes.len() != 4 + nb {
+                return Err("malformed binary inet/cidr parameter");
+            }
+            let mut addr = [0u8; 16];
+            addr[..nb].copy_from_slice(&bytes[4..4 + nb]);
+            let net = crate::sql::net::NetAddr {
+                family: if bytes[0] == 2 { 4 } else { 6 },
+                bits: bytes[1],
+                addr,
+            };
+            Ok(if oid == oids::CIDR { Datum::Cidr(net) } else { Datum::Inet(net) })
+        }
+        oids::MACADDR => {
+            let b: [u8; 6] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Macaddr(b))
+        }
+        oids::MACADDR8 => {
+            let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Macaddr8(b))
+        }
         // Composite types (arrays, ranges, multiranges, bit strings) share the
         // COPY-binary receive codec, driven by the column type the OID names.
         _ => match crate::sql::types::ColType::from_oid(oid) {

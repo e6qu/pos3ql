@@ -1209,6 +1209,9 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::Float8(_)) => 8,
         Some(OwnedDatum::Text { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Numeric { nbytes, .. }) => 6 + *nbytes as usize,
+        Some(OwnedDatum::Inet(_)) | Some(OwnedDatum::Cidr(_)) => 18,
+        Some(OwnedDatum::Macaddr(_)) => 6,
+        Some(OwnedDatum::Macaddr8(_)) => 8,
     }
 }
 
@@ -1267,6 +1270,23 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[7..7 + *nbytes as usize].copy_from_slice(&digits[..*nbytes as usize]);
             7 + *nbytes as usize
         }
+        Some(OwnedDatum::Inet(n)) | Some(OwnedDatum::Cidr(n)) => {
+            out[0] = if matches!(d, Some(OwnedDatum::Cidr(_))) { 9 } else { 8 };
+            out[1] = n.family;
+            out[2] = n.bits;
+            out[3..19].copy_from_slice(&n.addr);
+            19
+        }
+        Some(OwnedDatum::Macaddr(b)) => {
+            out[0] = 10;
+            out[1..7].copy_from_slice(b);
+            7
+        }
+        Some(OwnedDatum::Macaddr8(b)) => {
+            out[0] = 11;
+            out[1..9].copy_from_slice(b);
+            9
+        }
     }
 }
 
@@ -1324,6 +1344,26 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let mut digits = [0u8; crate::storage::MAX_DEFAULT_TEXT];
             digits[..nbytes].copy_from_slice(raw);
             Some(OwnedDatum::Numeric { sign, weight, dscale, nbytes: nbytes as u8, digits })
+        }
+        8 | 9 => {
+            let b = payload.get(*at..*at + 18)?;
+            *at += 18;
+            let net = crate::sql::net::NetAddr {
+                family: b[0],
+                bits: b[1],
+                addr: b[2..18].try_into().unwrap(),
+            };
+            Some(if tag == 9 { OwnedDatum::Cidr(net) } else { OwnedDatum::Inet(net) })
+        }
+        10 => {
+            let b = payload.get(*at..*at + 6)?;
+            *at += 6;
+            Some(OwnedDatum::Macaddr(b.try_into().unwrap()))
+        }
+        11 => {
+            let b = payload.get(*at..*at + 8)?;
+            *at += 8;
+            Some(OwnedDatum::Macaddr8(b.try_into().unwrap()))
         }
         _ => return None,
     })

@@ -391,6 +391,10 @@ pub(crate) fn dispatch<'a>(
                     Datum::Bit { varying: false, .. } => "bit",
                     Datum::Bit { varying: true, .. } => "bit varying",
                     Datum::Multirange { kind, .. } => kind.multirange_name(),
+                    Datum::Inet(_) => "inet",
+                    Datum::Cidr(_) => "cidr",
+                    Datum::Macaddr(_) => "macaddr",
+                    Datum::Macaddr8(_) => "macaddr8",
                     Datum::Record(_) => "record",
                 }))
             }

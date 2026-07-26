@@ -191,6 +191,16 @@ pub(crate) fn dispatch<'a>(
                     Datum::Float4(v) => Ok(Datum::Float8(round_f64(f64::from(v), mode))),
                     Datum::Float8(v) => Ok(Datum::Float8(round_f64(v, mode))),
                     Datum::Numeric(v) => Ok(Datum::Numeric(v.round_scale(0, mode, arena)?)),
+                    // trunc(macaddr)/trunc(macaddr8): zero the trailing bytes
+                    // (the last 3 / last 5), keeping the OUI.
+                    Datum::Macaddr(mut b) if name == "trunc" => {
+                        b[3..].fill(0);
+                        Ok(Datum::Macaddr(b))
+                    }
+                    Datum::Macaddr8(mut b) if name == "trunc" => {
+                        b[3..].fill(0);
+                        Ok(Datum::Macaddr8(b))
+                    }
                     other => Err(type_mismatch(name, &other)),
                 }
             }

@@ -58,14 +58,15 @@ Working single-node database:
   (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row), generated columns
   (`GENERATED ALWAYS AS (expr) STORED`), identity columns
   (`GENERATED ALWAYS/BY DEFAULT AS IDENTITY`), arbitrary-precision NUMERIC,
-  casts and
+  network address types (`inet`/`cidr`/`macaddr`/`macaddr8` with their operators
+  and functions), casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
   introspection, PostgreSQL lexical rules, and SQLSTATE-correct errors.
 - COPY FROM STDIN / TO STDOUT in PostgreSQL's text, CSV, and binary formats —
   psql `\copy` and pg_dump-style inline data streams work, with each type's
   input and output functions and full constraint enforcement. The binary format
   is byte-exact against PostgreSQL for the whole type surface, composites
-  included (arrays, ranges, multiranges, bit strings).
+  included (arrays, ranges, multiranges, bit strings, network addresses).
 - Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED snapshot isolation,
   transactional DDL, and fail-fast (`40001`) write-conflict detection.
 - LISTEN / NOTIFY: `LISTEN`/`UNLISTEN`/`NOTIFY channel[, payload]` with

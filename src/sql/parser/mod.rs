@@ -238,6 +238,29 @@ pub fn parse_view_select<'a>(
     }
 }
 
+/// Parses a query body — a SELECT, a set-operation tree (UNION/INTERSECT/
+/// EXCEPT), or a VALUES list — into a `Select` (a genuine set-operation lands
+/// in `set_body`). Unlike [`parse_view_select`], this accepts the full query
+/// surface, for CREATE TABLE AS and materialized-view style bodies.
+pub fn parse_query<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, super::eval::SqlError> {
+    let to_sql = |m: &str| super::eval::SqlError {
+        sqlstate: super::eval::sqlstate::SYNTAX_ERROR,
+        message: crate::stack_format!(192, "invalid query: {}", m),
+    };
+    let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
+    let sel = parser.select().map_err(|e| to_sql(e.message.as_str()))?;
+    if parser.peeked != Tok::Eof {
+        return Err(to_sql("trailing tokens after query"));
+    }
+    arena.alloc(sel).map(|r| &*r).map_err(|_| super::eval::SqlError {
+        sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        message: crate::stack_format!(192, "query too large for SQL arena"),
+    })
+}
+
 /// Parses a single scalar expression (e.g. a stored CHECK predicate) into the
 /// arena. The whole input must be one expression.
 pub fn parse_expr<'a>(
@@ -456,7 +479,7 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         match self.peeked {
-            Tok::Ident("select") | Tok::Op("(") => self.query(),
+            Tok::Ident("select") | Tok::Ident("values") | Tok::Op("(") => self.query(),
             Tok::Ident("with") => self.with_query(),
             Tok::Ident("create") => self.create(),
             Tok::Ident("drop") => self.drop_stmt(),
@@ -1069,7 +1092,15 @@ impl<'a> Parser<'a> {
                     if n == MAX_LIST {
                         return Err(self.limit("VALUES columns", MAX_LIST));
                     }
-                    items[n] = SelectItem::Expr { expression: self.expression(0)?, alias: None };
+                    // A VALUES column with no outer alias is named `columnN`,
+                    // as PostgreSQL names it (a UNION-ALL takes its output names
+                    // from the first branch, so naming every row is harmless).
+                    let expression = self.expression(0)?;
+                    let alias = self
+                        .arena
+                        .alloc_str_display(format_args!("column{}", n + 1))
+                        .map_err(|_| self.err_here("VALUES too large"))?;
+                    items[n] = SelectItem::Expr { expression, alias: Some(alias) };
                     n += 1;
                     if !self.eat_op(",")? {
                         break;

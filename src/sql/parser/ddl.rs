@@ -44,6 +44,29 @@ impl<'a> Parser<'a> {
         self.create_table()
     }
 
+    /// The shared tail of `CREATE TABLE ... AS`: capture the SELECT text
+    /// (validated now, re-run to populate the new table), then an optional
+    /// `WITH [NO] DATA`.
+    fn create_table_as(
+        &mut self,
+        name: QualName<'a>,
+        columns: &'a [&'a str],
+        if_not_exists: bool,
+    ) -> Result<Stmt<'a>, ParseError> {
+        let start = self.peek_at;
+        let _ = self.query()?;
+        let end = self.peek_at;
+        let sql = self.text[start..end].trim();
+        let with_data = if self.eat_ident("with")? {
+            let no = self.eat_ident("no")?;
+            self.expect_ident("data")?;
+            !no
+        } else {
+            true
+        };
+        Ok(Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists })
+    }
+
     /// CREATE SCHEMA [IF NOT EXISTS] { name [AUTHORIZATION role] |
     /// AUTHORIZATION role } [schema_element ...] ("create schema" consumed).
     /// The only role this engine has is the session's bootstrap user; naming
@@ -232,7 +255,33 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.qual_name("table name")?;
+        // `CREATE TABLE name AS <query>` — no explicit column list.
+        if self.eat_ident("as")? {
+            return self.create_table_as(name, &[], if_not_exists);
+        }
         self.expect_op("(")?;
+        // A `(` is either column definitions or — for `CREATE TABLE ... AS` — a
+        // column-name list. Read the first identifier and peek: a name list has
+        // it immediately followed by `,` or `)`, a definition by a type.
+        let first_ident = self.col_ident("column name")?;
+        if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+            let mut list = [""; MAX_LIST];
+            list[0] = first_ident;
+            let mut m = 1;
+            while self.eat_op(",")? {
+                if m == MAX_LIST {
+                    return Err(self.limit("column list", MAX_LIST));
+                }
+                list[m] = self.col_ident("column name")?;
+                m += 1;
+            }
+            self.expect_op(")")?;
+            self.expect_ident("as")?;
+            let cols = self.arena_slice(&list[..m])?;
+            return self.create_table_as(name, cols, if_not_exists);
+        }
+        // Otherwise it is a column definition whose name we already read.
+        let mut pending_first_col = Some(first_ident);
         let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None }; MAX_LIST];
         let mut n = 0;
         let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
@@ -245,46 +294,53 @@ impl<'a> Parser<'a> {
             if n == MAX_LIST {
                 return Err(self.limit("column list", MAX_LIST));
             }
-            // `LIKE source [INCLUDING ...]` copies another table's columns in
-            // at this position; the catalog is only consulted when it runs.
-            if self.eat_ident("like")? {
-                if n_likes == MAX_LIST {
-                    return Err(self.limit("LIKE clauses", MAX_LIST));
-                }
-                likes[n_likes] = self.like_clause(n)?;
-                n_likes += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
-                continue;
-            }
-            // An optional CONSTRAINT <name> prefixes a table- or column-level
-            // constraint; it names the following constraint.
-            let cons_name = if self.eat_ident("constraint")? {
-                Some(self.col_ident("constraint name")?)
+            // The first column's name was pre-read to tell a definition list
+            // from a `CREATE TABLE ... AS` column-name list; use it, skipping the
+            // LIKE / constraint forms it cannot be.
+            let col_name = if let Some(pre_read) = pending_first_col.take() {
+                pre_read
             } else {
-                None
+                // `LIKE source [INCLUDING ...]` copies another table's columns in
+                // at this position; the catalog is only consulted when it runs.
+                if self.eat_ident("like")? {
+                    if n_likes == MAX_LIST {
+                        return Err(self.limit("LIKE clauses", MAX_LIST));
+                    }
+                    likes[n_likes] = self.like_clause(n)?;
+                    n_likes += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                    continue;
+                }
+                // An optional CONSTRAINT <name> prefixes a table- or column-level
+                // constraint; it names the following constraint.
+                let cons_name = if self.eat_ident("constraint")? {
+                    Some(self.col_ident("constraint name")?)
+                } else {
+                    None
+                };
+                // Table-level constraints: PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY.
+                if matches!(
+                    self.peeked,
+                    Tok::Ident("primary") | Tok::Ident("unique") | Tok::Ident("check") | Tok::Ident("foreign")
+                ) {
+                    let c = self.table_constraint(cons_name)?;
+                    if n_cons == MAX_LIST {
+                        return Err(self.limit("constraint list", MAX_LIST));
+                    }
+                    cons[n_cons] = c;
+                    n_cons += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                    continue;
+                }
+                if cons_name.is_some() {
+                    return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
+                }
+                self.col_ident("column name")?
             };
-            // Table-level constraints: PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY.
-            if matches!(
-                self.peeked,
-                Tok::Ident("primary") | Tok::Ident("unique") | Tok::Ident("check") | Tok::Ident("foreign")
-            ) {
-                let c = self.table_constraint(cons_name)?;
-                if n_cons == MAX_LIST {
-                    return Err(self.limit("constraint list", MAX_LIST));
-                }
-                cons[n_cons] = c;
-                n_cons += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
-                continue;
-            }
-            if cons_name.is_some() {
-                return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
-            }
-            let col_name = self.col_ident("column name")?;
             let warnings_before = self.n_warnings;
             let (type_name, type_mod) = self.type_name_mod()?;
             // PostgreSQL resolves a column definition's type twice, so a

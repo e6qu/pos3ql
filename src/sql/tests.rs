@@ -3130,3 +3130,41 @@ fn listen_notify_engine_semantics() {
     run_as(&mut engine, &mut budget, 3, "BEGIN; LISTEN c; ROLLBACK");
     assert!(!engine.is_listening(3, "c"));
 }
+
+#[test]
+fn create_table_as_builds_and_populates() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE TABLE src (id int, name text)");
+    run_with(&mut engine, &mut budget, "INSERT INTO src VALUES (1,'a'),(2,'b'),(3,'c')");
+
+    // Basic CTAS: the command tag is SELECT <count>, and the rows land.
+    let out = run_with(&mut engine, &mut budget, "CREATE TABLE t AS SELECT id, name FROM src WHERE id > 1");
+    assert!(String::from_utf8_lossy(&out).contains("SELECT 2"), "{:?}", String::from_utf8_lossy(&out));
+    let out = run_with(&mut engine, &mut budget, "SELECT id FROM t ORDER BY id");
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("ERROR") && s.contains('2') && s.contains('3'));
+
+    // WITH NO DATA creates the table empty.
+    run_with(&mut engine, &mut budget, "CREATE TABLE e AS SELECT id FROM src WITH NO DATA");
+    let out = run_with(&mut engine, &mut budget, "SELECT count(*) FROM e");
+    assert!(String::from_utf8_lossy(&out).contains('0'));
+
+    // A column-name list renames the query's output columns.
+    run_with(&mut engine, &mut budget, "CREATE TABLE r (x, y) AS SELECT id, name FROM src");
+    let out = run_with(&mut engine, &mut budget, "SELECT x, y FROM r ORDER BY x");
+    assert!(!String::from_utf8_lossy(&out).contains("ERROR"), "{:?}", String::from_utf8_lossy(&out));
+
+    // IF NOT EXISTS skips the second create, keeping the first table's data.
+    run_with(&mut engine, &mut budget, "CREATE TABLE IF NOT EXISTS n AS SELECT 1 AS v");
+    run_with(&mut engine, &mut budget, "CREATE TABLE IF NOT EXISTS n AS SELECT 2 AS v");
+    let out = run_with(&mut engine, &mut budget, "SELECT v FROM n");
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains('1') && !s.contains('2'), "{s:?}");
+
+    // The created table is ordinary: a later INSERT works and enforces types.
+    run_with(&mut engine, &mut budget, "INSERT INTO t VALUES (5, 'e')");
+    let out = run_with(&mut engine, &mut budget, "SELECT count(*) FROM t");
+    assert!(String::from_utf8_lossy(&out).contains('3'));
+    let out = run_with(&mut engine, &mut budget, "INSERT INTO t VALUES ('bad', 'x')");
+    assert!(String::from_utf8_lossy(&out).contains("22P02"));
+}

@@ -1011,7 +1011,19 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   (corpus `59_comment`). One narrow limit is documented in BUGS.md (B-171):
   a *column* comment on a plain view, sequence or index (rather than a table or
   materialized view) is a loud `0A000`, since resolving those columns needs the
-  view/relation body described — the same describe-path entanglement LATERAL hit.
+  view/relation body described (a describe-path entanglement).
+- **LATERAL joins** — done: a FROM item (`, LATERAL (...)`, `CROSS`/`INNER`/`LEFT
+  JOIN LATERAL`) may reference the columns of the items to its left and is
+  re-run per outer row. A lateral subquery or set-returning function defers
+  materialization: the scan (`scan_source`/`level`) assembles the outer row
+  from the tables bound at shallower depths and resolves the body against it,
+  reusing the correlated-subquery machinery (`Chained`, `scan_source`'s and
+  `select_into_rows`'s `outer` parameter). A FROM-less lateral projection
+  (`SELECT t.a*2`) types and evaluates against the outer scope; a lateral body
+  with its own FROM correlates through its WHERE/ON. Any lateral entry pins the
+  join to FROM order (a lateral item can't precede a table it references), and a
+  `RIGHT`/`FULL JOIN LATERAL` is rejected loudly, as PostgreSQL does. Verified
+  byte-for-byte against PostgreSQL (corpus `64_lateral`) plus a unit test.
 - **Network address types** — done: `inet`, `cidr`, `macaddr`, `macaddr8`, a full
   type family in the mould of ranges/multiranges/bit-strings. A `NetAddr` (family
   4/6, mask bits, 16 address bytes) backs `inet`/`cidr`; MACs are fixed 6/8-byte

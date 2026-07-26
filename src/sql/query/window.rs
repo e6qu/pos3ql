@@ -142,6 +142,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             col_alias: None,
             cte: None,
             with_ordinality: false,
+            lateral: false,
         },
         joins: &[],
     };

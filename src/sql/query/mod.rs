@@ -53,7 +53,7 @@ use aggregate::{fold_aggregates, AggState};
 
 mod srf;
 use srf::{find_srf, srf_count, srf_max_count, table_func_def, table_func_rows};
-pub(crate) use srf::synth_derived_def;
+pub(crate) use srf::{synth_derived_def, synth_derived_def_outer, table_func_rows_outer};
 
 mod group;
 use group::{grouped_rows, grouped_select};
@@ -1510,6 +1510,7 @@ fn over_one_row<'a>(
             col_alias: None,
             cte: None,
             with_ordinality: false,
+            lateral: false,
         },
         joins: &[],
     };
@@ -1979,13 +1980,16 @@ pub fn select_into_rows<'a>(
             let wrapped = over_one_row(statement, arena)?;
             return select_into_rows(storage, txid, wrapped, arena, params, outer, seq, emit);
         }
+        // A FROM-less body may still reference an outer row when it is a LATERAL
+        // item (`LATERAL (SELECT t.a * 2)`); resolve against that outer scope.
+        let cols: &dyn ColumnLookup = outer.unwrap_or(&super::eval::NoColumns);
         // FROM-less: one row (or zero, when WHERE is false), unless a
         // set-returning function in the list expands it to several.
         let subs =
             prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
         let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
         let srf_call = find_srf(statement.items);
-        let count = srf_max_count(statement.items, arena, params, &super::eval::NoColumns, &hooks)?;
+        let count = srf_max_count(statement.items, arena, params, &cols, &hooks)?;
         for k in 1..=count {
             let khooks = if srf_call.is_some() {
                 EvalHooks { srf_index: Some(k), ..hooks }
@@ -1993,7 +1997,7 @@ pub fn select_into_rows<'a>(
                 hooks
             };
             if let Some(w) = statement.where_clause
-                && !where_passes(w, arena, params, &super::eval::NoColumns, &khooks)?
+                && !where_passes(w, arena, params, &cols, &khooks)?
             {
                 continue;
             }
@@ -2002,11 +2006,11 @@ pub fn select_into_rows<'a>(
             for item in statement.items {
                 match item {
                     SelectItem::Expr { expression, .. } => {
-                        vals[n] = eval_full(expression, arena, params, &super::eval::NoColumns, &khooks)?;
+                        vals[n] = eval_full(expression, arena, params, &cols, &khooks)?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
-                        for field in super::eval::record_star_expand(base, arena, params, &super::eval::NoColumns, &khooks)? {
+                        for field in super::eval::record_star_expand(base, arena, params, &cols, &khooks)? {
                             vals[n] = field.value;
                             n += 1;
                         }
@@ -2121,7 +2125,7 @@ pub fn select_into_rows<'a>(
     // source row into one output row per array element.
     let srf_call = find_srf(statement.items);
     scan_source(
-        storage, &scope, from, txid, where_in_scan, arena, params, &hooks, None,
+        storage, &scope, from, txid, where_in_scan, arena, params, &hooks, outer,
         &mut |row| {
             let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
                 [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];

@@ -194,6 +194,53 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     }
 }
 
+/// Materializes a `LATERAL` FROM item's rows for one outer row: its body sees
+/// `outer` (the tables to its left) as an outer scope. A subquery re-runs
+/// through the ordinary executor; a set-returning function evaluates its
+/// arguments against the outer row. Rows are projected-encoded into `arena`.
+fn materialize_lateral<'a, C: ColumnLookup<'a>>(
+    storage: &'a Storage,
+    txid: u32,
+    tref: &'a crate::sql::ast::TableRef<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: &C,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    if let Some(sub) = tref.subquery {
+        const EMPTY: &[u8] = &[];
+        let mut store: *mut &[u8] = core::ptr::null_mut();
+        let mut len = 0usize;
+        let mut cap = 0usize;
+        super::select_into_rows(storage, txid, sub, arena, params, Some(outer), None, &mut |vals| {
+            let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
+            if len == cap {
+                let new_cap = if cap == 0 { 8 } else { cap * 2 };
+                let fresh: &mut [&[u8]] =
+                    arena.alloc_slice_with(new_cap, |_| EMPTY).map_err(|_| arena_full())?;
+                if len > 0 {
+                    let old = unsafe { core::slice::from_raw_parts(store, len) };
+                    fresh[..len].copy_from_slice(old);
+                }
+                store = fresh.as_mut_ptr();
+                cap = new_cap;
+            }
+            unsafe { store.add(len).write(enc) };
+            len += 1;
+            Ok(())
+        })?;
+        return Ok(if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(store, len) } });
+    }
+    if tref.func_args.is_some() {
+        // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
+        // arguments against the outer row.
+        return super::table_func_rows_outer(tref, arena, params, outer);
+    }
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "LATERAL is supported only for a subquery or a set-returning function"
+    ))
+}
+
 /// Enumerates source rows (visibility-filtered, ON conditions applied,
 /// WHERE applied), calling `f` per row. `f` returns false to stop early.
 #[allow(clippy::too_many_arguments)]
@@ -339,9 +386,34 @@ pub(crate) fn scan_source<'a>(
             }
             Ok(true)
         };
-        // Derived tables scan their materialized rows; physical tables scan the
-        // visibility-filtered heap.
-        if let Some(rows) = scope.derived[order[depth]] {
+        // A LATERAL FROM item is re-run per outer row: assemble the row bound by
+        // the tables to its left, resolve the item's body against it, and iterate
+        // the resulting rows like a derived table's.
+        if scope.lateral[order[depth]] {
+            let t = order[depth];
+            let tref = if t == 0 { &from.base } else { &from.joins[t - 1].table };
+            let mut obuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
+            let outer_row = assemble(scope, bound, order, depth, &mut obuf, arena)?;
+            let chained = Chained { inner: &outer_row, outer };
+            let rows = materialize_lateral(storage, txid, tref, arena, params, &chained)?;
+            for (index, bytes) in rows.iter().enumerate() {
+                check_timeout()?;
+                bound[order[depth]] = Some(bytes);
+                if !on_matches(bound)? || !passes_pushdown(bound)? {
+                    continue;
+                }
+                matched_any = true;
+                if let Some(m) = matched[depth] {
+                    m[index].set(true);
+                }
+                if !level(
+                    storage, scope, from, txid, where_clause, arena, params, hooks,
+                    outer, depth + 1, bound, matched, pushdown, order, f,
+                )? {
+                    return Ok(false);
+                }
+            }
+        } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
                 bound[order[depth]] = Some(bytes);
@@ -494,10 +566,26 @@ pub(crate) fn scan_source<'a>(
         .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross));
     // Cost-based execution order: only cross joins (no ON clause, no nullable
     // side) may be reordered freely — an explicit JOIN ... ON's condition is tied
-    // to its position. Everything else keeps FROM order (identity).
+    // to its position. Everything else keeps FROM order (identity). A LATERAL
+    // item depends on the tables to its left, so any lateral entry also pins the
+    // order to FROM order (reordering could bind a dependency after it).
+    let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
+    // A LATERAL item references the tables to its left, so it cannot be the
+    // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
+    for j in from.joins {
+        if j.table.lateral && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a LATERAL item cannot be on the right side of a RIGHT or FULL join"
+            ));
+        }
+    }
     let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
-    let order: [usize; MAX_JOIN_TABLES] =
-        if all_cross { join_order(scope, where_clause) } else { core::array::from_fn(|i| i) };
+    let order: [usize; MAX_JOIN_TABLES] = if all_cross && !any_lateral {
+        join_order(scope, where_clause)
+    } else {
+        core::array::from_fn(|i| i)
+    };
     let mut inv_order = [0usize; MAX_JOIN_TABLES];
     for (pos, &t) in order.iter().enumerate() {
         inv_order[t] = pos;

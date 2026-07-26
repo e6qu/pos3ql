@@ -308,6 +308,23 @@ pub(crate) fn synth_derived_def<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a TableDef, SqlError> {
+    synth_derived_def_outer(storage, sub, exposed, col_alias, txid, arena, None)
+}
+
+/// [`synth_derived_def`] with an optional outer scope, for a `LATERAL` body: a
+/// FROM-less lateral projection (`SELECT t.a * 2`) types its columns against the
+/// tables to the item's left. A lateral body with its own FROM is typed from
+/// that FROM (its outer references are correlation in WHERE/ON, not in the
+/// projected column types).
+pub(crate) fn synth_derived_def_outer<'a>(
+    storage: &'a Storage,
+    sub: &'a Select<'a>,
+    exposed: &'a str,
+    col_alias: Option<&'a [&'a str]>,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&QueryScope<'a>>,
+) -> Result<&'a TableDef, SqlError> {
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n_cols = match sub.set_body {
         Some(tree) => describe_set_body(storage, tree, txid, &mut descriptors, arena)?,
@@ -367,6 +384,11 @@ pub(crate) fn synth_derived_def<'a>(
                     }
                 }
                 n
+            }
+            // A FROM-less lateral body types its projection against the outer
+            // scope (`SELECT t.a * 2` sees the enclosing `t`).
+            None if outer.is_some() => {
+                describe_scope_items(sub.items, outer.expect("checked"), &mut descriptors)?
             }
             None => {
                 let n = describe_items(sub.items, None, &mut descriptors)?;
@@ -620,6 +642,17 @@ pub(super) fn table_func_rows<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
+    table_func_rows_outer(tref, arena, params, &crate::sql::eval::NoColumns)
+}
+
+/// [`table_func_rows`] evaluating the function's arguments against `columns` — an
+/// outer row, for a `LATERAL func(outer.col)`.
+pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
+    tref: &'a TableRef<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+) -> Result<&'a [&'a [u8]], SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
     // json_each / jsonb_each[_text]: one (key, value) row per object member.
     if is_json_each_name(tref.table) {
@@ -627,7 +660,7 @@ pub(super) fn table_func_rows<'a>(
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
         let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?) {
+        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -654,7 +687,7 @@ pub(super) fn table_func_rows<'a>(
             ));
         }
         let evaluate = |i: usize| {
-            crate::sql::eval::eval(args[i], arena, params, &crate::sql::eval::NoColumns)
+            crate::sql::eval::eval(args[i], arena, params, columns)
                 .map(crate::sql::eval::text_view)
         };
         let source = match evaluate(0)? {
@@ -696,15 +729,15 @@ pub(super) fn table_func_rows<'a>(
             return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "regexp_split_to_table(...) argument count"));
         }
         let (src, pat) = match (
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?),
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, &crate::sql::eval::NoColumns)?),
+            crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?),
+            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?),
         ) {
             (Datum::Text(s), Datum::Text(p)) => (s, p),
             (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
             (a, _) => return Err(crate::sql::eval::type_mismatch_pub("regexp_split_to_table", &a)),
         };
         let case_insensitive = if args.len() == 3 {
-            match crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, &crate::sql::eval::NoColumns)?) {
+            match crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, columns)?) {
                 Datum::Text(f) => crate::sql::eval::regexp_flags(f)?.1,
                 Datum::Null => return Ok(&[]),
                 _ => false,
@@ -726,12 +759,12 @@ pub(super) fn table_func_rows<'a>(
         if args.len() != 2 {
             return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "generate_subscripts(...) argument count"));
         }
-        let raw = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?) {
+        let raw = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
             Datum::Array { raw, .. } => raw,
             Datum::Null => return Ok(&[]),
             a => return Err(crate::sql::eval::type_mismatch_pub("generate_subscripts", &a)),
         };
-        let dim = match crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, &crate::sql::eval::NoColumns)?) {
+        let dim = match crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?) {
             Datum::Int4(v) => v as i64,
             Datum::Int8(v) => v,
             Datum::Null => return Ok(&[]),
@@ -751,13 +784,13 @@ pub(super) fn table_func_rows<'a>(
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "regexp_matches(...) argument count"));
         }
-        let string = crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?);
-        let pattern = crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, &crate::sql::eval::NoColumns)?);
+        let string = crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
+        let pattern = crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?);
         let (Datum::Text(string), Datum::Text(pattern)) = (string, pattern) else {
             return Ok(&[]);
         };
         let flags = if args.len() == 3 {
-            match crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, &crate::sql::eval::NoColumns)?) {
+            match crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, columns)?) {
                 Datum::Text(f) => f,
                 Datum::Null => return Ok(&[]),
                 _ => "",
@@ -814,7 +847,7 @@ pub(super) fn table_func_rows<'a>(
         || tref.table.eq_ignore_ascii_case("json_object_keys")
     {
         let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?) {
+        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -853,7 +886,7 @@ pub(super) fn table_func_rows<'a>(
             || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
         let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
             || tref.table.eq_ignore_ascii_case("json_array_elements_text");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?) {
+        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -904,7 +937,7 @@ pub(super) fn table_func_rows<'a>(
     }
     // unnest(array): one row per element.
     if tref.table.eq_ignore_ascii_case("unnest") {
-        let (element, raw) = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?) {
+        let (element, raw) = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
             Datum::Array { element, raw } => (element, raw),
             Datum::Null => return Ok(&[]),
             _ => return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "unnest requires an array argument")),
@@ -925,19 +958,19 @@ pub(super) fn table_func_rows<'a>(
         ));
     }
     // Temporal series: a date/timestamp start with an interval step.
-    let start_val = crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, &crate::sql::eval::NoColumns)?);
+    let start_val = crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
     if let Some((base, kind)) = crate::sql::eval::timestamp_series_start(&start_val) {
         if args.len() != 3 {
             return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "generate_series over timestamps requires a step"));
         }
         // Coerce bare string literals for the stop and step (function resolution).
         let stop_val = crate::sql::eval::cast_to(
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, &crate::sql::eval::NoColumns)?),
+            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?),
             kind.coltype(),
             arena,
         )?;
         let step_val = crate::sql::eval::cast_to(
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, &crate::sql::eval::NoColumns)?),
+            crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, columns)?),
             ColType::Interval,
             arena,
         )?;
@@ -960,7 +993,7 @@ pub(super) fn table_func_rows<'a>(
         return Ok(&[]);
     }
     let as_i64 = |e: &'a Expr<'a>| -> Result<i64, SqlError> {
-        match crate::sql::eval::eval(e, arena, params, &crate::sql::eval::NoColumns)? {
+        match crate::sql::eval::eval(e, arena, params, columns)? {
             Datum::Int4(v) => Ok(v as i64),
             Datum::Int8(v) => Ok(v),
             _ => Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "generate_series requires integer arguments")),

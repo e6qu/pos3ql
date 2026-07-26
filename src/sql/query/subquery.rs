@@ -619,6 +619,9 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Cidr => Datum::Cidr(crate::sql::net::NetAddr { family: 4, bits: 32, addr: [0; 16] }),
         ColType::Macaddr => Datum::Macaddr([0; 6]),
         ColType::Macaddr8 => Datum::Macaddr8([0; 8]),
+        // A witness carries only the type; the empty label is never compared or
+        // output (an empty/all-NULL set produces no rows).
+        ColType::Enum(slot) => Datum::Enum { slot, sort: 0.0, label: "" },
     }
 }
 

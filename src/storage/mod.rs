@@ -85,6 +85,7 @@ pub enum OwnedDatum {
     Cidr(crate::sql::net::NetAddr),
     Macaddr([u8; 6]),
     Macaddr8([u8; 8]),
+    Enum { slot: u16, sort: f64, len: u8, bytes: [u8; MAX_DEFAULT_TEXT] },
 }
 
 pub(crate) const MAX_DEFAULT_TEXT: usize = 48;
@@ -130,6 +131,18 @@ impl OwnedDatum {
             Datum::Cidr(n) => Self::Cidr(*n),
             Datum::Macaddr(b) => Self::Macaddr(*b),
             Datum::Macaddr8(b) => Self::Macaddr8(*b),
+            Datum::Enum { slot, sort, label } => {
+                if label.len() > MAX_DEFAULT_TEXT {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "enum defaults are limited to {} bytes",
+                        MAX_DEFAULT_TEXT
+                    ));
+                }
+                let mut bytes = [0u8; MAX_DEFAULT_TEXT];
+                bytes[..label.len()].copy_from_slice(label.as_bytes());
+                Self::Enum { slot: *slot, sort: *sort, len: label.len() as u8, bytes }
+            }
             Datum::Numeric(n) => {
                 if n.digits.len() > MAX_DEFAULT_TEXT {
                     return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "numeric default too large"));
@@ -190,6 +203,11 @@ impl OwnedDatum {
             Self::Cidr(n) => Datum::Cidr(*n),
             Self::Macaddr(b) => Datum::Macaddr(*b),
             Self::Macaddr8(b) => Datum::Macaddr8(*b),
+            Self::Enum { slot, sort, len, bytes } => Datum::Enum {
+                slot: *slot,
+                sort: *sort,
+                label: core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
+            },
         }
     }
 }
@@ -813,6 +831,77 @@ pub struct DomainSpec {
     pub n_checks: usize,
 }
 
+/// How many enum types may exist at once, and how many labels a single enum
+/// may carry. Bounded conservatively: an `EnumDef` inlines its label array, so
+/// the catalog's static footprint is `MAX_ENUMS * MAX_ENUM_LABELS * size_of::<EnumMember>()`.
+pub(crate) const MAX_ENUMS: usize = 32;
+pub(crate) const MAX_ENUM_LABELS: usize = 64;
+
+/// One member of an enum type: a label plus its sort key. Ordering among enum
+/// values is by `sort` (PostgreSQL's `pg_enum.enumsortorder`), *not* by label
+/// text, so `ALTER TYPE ... ADD VALUE ... BEFORE/AFTER` inserts a value between
+/// two others by choosing a fractional sort key without renumbering the rest.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumMember {
+    pub label: SqlName,
+    pub sort: f64,
+}
+
+impl EnumMember {
+    pub(crate) const EMPTY: Self = EnumMember { label: SqlName::EMPTY, sort: 0.0 };
+}
+
+/// A `CREATE TYPE ... AS ENUM (...)` type: an ordered set of string labels. Its
+/// *existence* and label set are transactional catalog state, mirroring
+/// [`DomainDef`]; an enum value stored in a column carries its own label and
+/// sort key inline, so decoding a row needs no catalog lookup.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumDef {
+    pub created_at: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub members: [EnumMember; MAX_ENUM_LABELS],
+    pub n_members: usize,
+    pub live: bool,
+    pub pending: Option<PendingDdl>,
+}
+
+impl EnumDef {
+    pub(crate) const EMPTY: Self = EnumDef {
+        created_at: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        members: [EnumMember::EMPTY; MAX_ENUM_LABELS],
+        n_members: 0,
+        live: false,
+        pending: None,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(p) if p.txid == txid => p.creating,
+            _ => self.live,
+        }
+    }
+
+    pub fn members(&self) -> &[EnumMember] {
+        &self.members[..self.n_members]
+    }
+
+    /// The sort key of a label, or `None` if the label is not a member.
+    pub fn sort_of(&self, label: &str) -> Option<f64> {
+        self.members().iter().find(|m| m.label.as_str() == label).map(|m| m.sort)
+    }
+}
+
+/// The validated parameters of a `CREATE TYPE ... AS ENUM` / `ALTER TYPE`,
+/// computed by the executor and handed to storage (apart from `live`/`pending`).
+#[derive(Clone, Copy)]
+pub struct EnumSpec {
+    pub members: [EnumMember; MAX_ENUM_LABELS],
+    pub n_members: usize,
+}
+
 /// A sequence's declared integer type: it sets the default MIN/MAXVALUE and the
 /// `pg_sequence.seqtypid` the catalog reports.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1231,6 +1320,7 @@ pub struct Storage {
     matviews: FixedVec<MatviewDef>,
     sequences: FixedVec<SequenceDef>,
     domains: FixedVec<DomainDef>,
+    enums: FixedVec<EnumDef>,
     indexes: FixedVec<IndexDef>,
     schemas: FixedVec<SchemaDef>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
@@ -1368,6 +1458,7 @@ impl Storage {
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
+            + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + ValueIndexPool::budget_bytes(
                 config.max_value_indexes,
@@ -1475,6 +1566,10 @@ impl Storage {
         for _ in 0..MAX_DOMAINS {
             domains.push(DomainDef::EMPTY).expect("sized to MAX_DOMAINS");
         }
+        let mut enums = FixedVec::new(budget, "enums", MAX_ENUMS)?;
+        for _ in 0..MAX_ENUMS {
+            enums.push(EnumDef::EMPTY).expect("sized to MAX_ENUMS");
+        }
         let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
         for i in 0..MAX_SCHEMAS {
             schemas
@@ -1524,6 +1619,7 @@ impl Storage {
             matviews,
             sequences,
             domains,
+            enums,
             indexes,
             schemas,
             comments,
@@ -3335,7 +3431,30 @@ impl Storage {
 
     /// Committed create (journal replay): the table is immediately part of the
     /// durable image.
-    pub fn create_table(&mut self, def: TableDef) -> Result<usize, SqlError> {
+    /// Binds any reloaded enum column (`Enum(ENUM_SLOT_UNRESOLVED)` carrying the
+    /// enum name in `domain`) to its live catalog slot. A no-op for a freshly
+    /// built def, whose enum columns already hold a resolved slot.
+    fn bind_enum_columns(&self, def: &mut TableDef) -> Result<(), SqlError> {
+        for i in 0..def.n_columns {
+            let col = &def.columns[i];
+            if col.ctype == ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED) {
+                let name = col.domain.ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "reloaded enum column has no type name")
+                })?;
+                let slot = self.enum_slot_by_name(name.as_str(), 0).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "enum type \"{}\" for a reloaded column does not exist",
+                        name.as_str()
+                    )
+                })?;
+                def.columns[i].ctype = ColType::Enum(slot as u16);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
         if self.find_table(def.schema.as_str(), def.name.as_str()).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
@@ -3343,6 +3462,10 @@ impl Storage {
                 def.name.as_str()
             ));
         }
+        // A reloaded enum column decodes as `Enum(ENUM_SLOT_UNRESOLVED)` plus the
+        // enum's name (in `domain`); bind it to the live catalog slot now that
+        // the enum has itself been loaded (WAL/checkpoint order guarantees it).
+        self.bind_enum_columns(&mut def)?;
         let slot = self.alloc_table(def, None)?;
         // Build the (empty) enforcers now; replay repopulates them once its rows
         // are applied (see the rebuild in Engine startup).
@@ -4002,6 +4125,187 @@ impl Storage {
             d.pending = None;
         } else if matches!(d.pending, Some(p) if p.txid == txid) {
             d.pending = Some(PendingDdl { txid, creating: true });
+        }
+    }
+
+    // --- Enum types (CREATE TYPE ... AS ENUM) ---
+
+    /// The slot of a (possibly schema-qualified) enum type name, visible to
+    /// `txid`, searching the current path when unqualified.
+    fn find_enum_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
+        if let Some(schema) = qualifier {
+            return self.enums.iter().position(|e| {
+                e.visible_to(txid) && e.schema.as_str() == schema && e.name.as_str() == name
+            });
+        }
+        for entry in self.path.entries() {
+            if let PathEntry::Schema(slot) = entry {
+                let schema = self.schemas[*slot as usize].name;
+                if let Some(i) = self.enums.iter().position(|e| {
+                    e.visible_to(txid)
+                        && e.schema.as_str() == schema.as_str()
+                        && e.name.as_str() == name
+                }) {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolves a (possibly qualified) enum type name to its slot on the current
+    /// path, visible to `txid`.
+    pub fn resolve_enum_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
+        let (qualifier, name) = match type_name.split_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, type_name),
+        };
+        self.find_enum_slot(qualifier, name, txid)
+    }
+
+    /// The definition of an enum named `name` (any schema) visible to `txid` —
+    /// for resolving a column whose stored type identity is only the enum name.
+    pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<&EnumDef> {
+        self.enums.iter().find(|e| e.visible_to(txid) && e.name.as_str() == name)
+    }
+
+    /// The slot of an enum named `name` (any schema) visible to `txid`.
+    pub fn enum_slot_by_name(&self, name: &str, txid: u32) -> Option<usize> {
+        self.enums.iter().position(|e| e.visible_to(txid) && e.name.as_str() == name)
+    }
+
+    /// The enum named `(schema, name)` visible to `txid`, by slot.
+    pub fn enum_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.enums.iter().position(|e| {
+            e.visible_to(txid) && e.schema.as_str() == schema && e.name.as_str() == name
+        })
+    }
+
+    pub fn enum_def(&self, slot: usize) -> &EnumDef {
+        &self.enums[slot]
+    }
+
+    /// Committed enums carrying their slot indices, for the checkpoint,
+    /// `pg_type` and `pg_enum`.
+    pub fn live_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
+        self.enums.iter().enumerate().filter(|(_, e)| e.live)
+    }
+
+    /// Whether any table column (in any table) is declared with this enum —
+    /// the dependency that makes `DROP TYPE ... RESTRICT` fail.
+    pub fn enum_in_use(&self, slot: usize) -> Option<(SqlName, SqlName)> {
+        for table in self.tables.iter().filter(|t| t.live) {
+            for col in table.def.columns() {
+                if matches!(col.ctype, ColType::Enum(s) if s as usize == slot) {
+                    return Some((table.def.name, col.name));
+                }
+            }
+        }
+        None
+    }
+
+    /// Registers an enum as an uncommitted CREATE owned by `txid` (or, for
+    /// replay/checkpoint with `txid == 0`, committed directly). The caller has
+    /// validated the labels and checked the name is free.
+    pub fn create_enum(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        spec: EnumSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if self.enums.iter().any(|e| {
+            e.schema.as_str() == schema.as_str()
+                && e.name.as_str() == name.as_str()
+                && matches!(e.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name.as_str()
+            ));
+        }
+        let Some(new) = self.enums.iter().position(|e| !e.live && e.pending.is_none()) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many enum types (limit {})",
+                self.enums.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        let pending = (txid != 0).then_some(PendingDdl { txid, creating: true });
+        self.enums[new] = EnumDef {
+            created_at: self.catalog_seq,
+            schema,
+            name,
+            members: spec.members,
+            n_members: spec.n_members,
+            live: txid == 0,
+            pending,
+        };
+        Ok(new)
+    }
+
+    /// Replaces a live enum's members in place (ALTER TYPE ... ADD VALUE).
+    pub fn alter_enum(&mut self, slot: usize, spec: EnumSpec) {
+        let e = &mut self.enums[slot];
+        e.members = spec.members;
+        e.n_members = spec.n_members;
+    }
+
+    pub fn drop_enum(
+        &mut self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        if self.enums.iter().any(|e| {
+            e.schema.as_str() == schema
+                && e.name.as_str() == name
+                && matches!(e.pending, Some(p) if p.txid != txid)
+        }) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
+                name
+            ));
+        }
+        let Some(i) = self.enums.iter().position(|e| {
+            e.visible_to(txid) && e.schema.as_str() == schema && e.name.as_str() == name
+        }) else {
+            return Ok(None);
+        };
+        let e = &mut self.enums[i];
+        if matches!(e.pending, Some(p) if p.txid == txid && p.creating) {
+            e.live = false;
+            e.pending = None;
+        } else {
+            e.pending = Some(PendingDdl { txid, creating: false });
+        }
+        Ok(Some(i))
+    }
+
+    pub fn commit_enum_create(&mut self, slot: usize) {
+        self.enums[slot].live = true;
+        self.enums[slot].pending = None;
+    }
+
+    pub fn commit_enum_drop(&mut self, slot: usize) {
+        self.enums[slot].live = false;
+        self.enums[slot].pending = None;
+    }
+
+    pub fn rollback_enum_create(&mut self, slot: usize) {
+        self.enums[slot].live = false;
+        self.enums[slot].pending = None;
+    }
+
+    pub fn rollback_enum_drop(&mut self, slot: usize, txid: u32) {
+        let e = &mut self.enums[slot];
+        if e.live {
+            e.pending = None;
+        } else if matches!(e.pending, Some(p) if p.txid == txid) {
+            e.pending = Some(PendingDdl { txid, creating: true });
         }
     }
 

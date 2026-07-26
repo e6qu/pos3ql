@@ -59,6 +59,9 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Range { text, .. } => 5 + text.len(),
         Datum::Bit { bits, .. } => 5 + bits.len(),
         Datum::Multirange { text, .. } => 5 + text.len(),
+        // Projected values are schema-less, so an enum carries its slot too:
+        // slot(2) + sort(8) + 4-byte label length + label bytes.
+        Datum::Enum { label, .. } => 14 + label.len(),
         // A record stores its rendered text (the arena-free decode returns
         // that, keeping comparators and output unchanged) followed by a
         // structural tail — field names, OIDs, nested tagged values — that
@@ -248,6 +251,14 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[2..6].copy_from_slice(&(text.len() as u32).to_le_bytes());
             out[6..6 + text.len()].copy_from_slice(text.as_bytes());
             6 + text.len()
+        }
+        Datum::Enum { slot, sort, label } => {
+            out[0] = 28;
+            out[1..3].copy_from_slice(&slot.to_le_bytes());
+            out[3..11].copy_from_slice(&sort.to_le_bytes());
+            out[11..15].copy_from_slice(&(label.len() as u32).to_le_bytes());
+            out[15..15 + label.len()].copy_from_slice(label.as_bytes());
+            15 + label.len()
         }
         Datum::Record(fields) => {
             use core::fmt::Write as _;
@@ -448,6 +459,14 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         }
         26 => (Datum::Macaddr(bytes[at..at + 6].try_into().unwrap()), 6),
         27 => (Datum::Macaddr8(bytes[at..at + 8].try_into().unwrap()), 8),
+        28 => {
+            let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+            let sort = f64::from_le_bytes(bytes[at + 2..at + 10].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[at + 10..at + 14].try_into().unwrap()) as usize;
+            let label = core::str::from_utf8(&bytes[at + 14..at + 14 + len])
+                .expect("projected enum label is valid UTF-8");
+            (Datum::Enum { slot, sort, label }, 14 + len)
+        }
         _ => unreachable!("tags are exhaustive"),
     }
 }

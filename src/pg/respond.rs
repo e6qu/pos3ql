@@ -719,6 +719,11 @@ impl<'b> Responder<'b> {
                     m.i32(8);
                     m.bytes(b);
                 }
+                Datum::Enum { label, .. } => {
+                    // PostgreSQL `enum_send` emits the label text verbatim.
+                    m.i32(label.len() as i32);
+                    m.bytes(label.as_bytes());
+                }
                 Datum::Array { element, raw } => {
                     // int32 ndim (0 for empty, else 1 — arrays are strictly
                     // one-dimensional here), int32 has-null flag, int32 element

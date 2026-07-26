@@ -1080,6 +1080,28 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   narrow behaviors are documented in BUGS.md (B-172): `value::domain` casts,
   `ALTER` re-validating existing rows, domain arrays, and domain-over-domain —
   each blocked on threading storage into a pure path or on a fixed-type change.
+- **`CREATE TYPE ... AS ENUM`** — done (scalar enums): the engine's first
+  user-defined *value* type. Unlike a domain, an enum is its own type with its
+  own OID and an ordered label set, so it adds a `ColType::Enum(slot)` and a
+  `Datum::Enum { slot, sort, label }`. The value is stored inline as its
+  `(sort-key, label)` — a deliberate choice so `compare_datums` stays pure
+  (enums order by the member's sort key, PostgreSQL's `enumsortorder`, never by
+  label text) and row decode stays catalog-free. It is (a) a new `EnumDef`
+  catalog (transactional MVCC + WAL `CreateEnum`/`DropEnum` + an `enm`
+  checkpoint line, mirroring the domain catalog); (b) a slot in the column's
+  `ColType`, persisted as the enum *name* (reusing `ColumnMeta`'s user-type-name
+  field) and re-bound to a live slot on load, since slots are not stable across
+  restart. Column-type resolution falls back through the enum catalog after the
+  domain catalog. A write coerces text→member (invalid label is `22P02`);
+  comparison against an unknown literal resolves it to a member; `pg_typeof`
+  reports the enum, `pg_type` gains `typtype` 'e' rows and `pg_enum` lists the
+  members. `ALTER TYPE ... ADD VALUE [IF NOT EXISTS] [BEFORE|AFTER]` (fractional
+  sort keys, journaled as a redefinition) and `DROP TYPE [CASCADE|RESTRICT]`
+  (`2BP01` on a dependent column). Verified byte-for-byte against PostgreSQL 18
+  (corpus `63_enums`), with WAL-replay unit tests and a `run.sh` crash +
+  cold-start assertion. Four narrow behaviors are documented in BUGS.md (B-173):
+  `RENAME VALUE`, `RENAME TO`, enum arrays, and `COPY BINARY` of an enum — each
+  by-design against the inline-value or catalog-free-codec invariants.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

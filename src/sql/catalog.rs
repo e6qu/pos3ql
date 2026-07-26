@@ -282,19 +282,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_description") => pg_description(storage, arena),
-        (false, "pg_enum") => finish(
-            def_of(
-                "pg_enum",
-                &[
-                    ("oid", ColType::Int4),
-                    ("enumtypid", ColType::Int4),
-                    ("enumsortorder", ColType::Float8),
-                    ("enumlabel", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_enum") => pg_enum(storage, arena),
         (false, "pg_range") => finish(
             def_of(
                 "pg_range",
@@ -1252,6 +1240,38 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     )
 }
 
+fn pg_enum<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_enum",
+        &[
+            ("oid", ColType::Int4),
+            ("enumtypid", ColType::Int4),
+            ("enumsortorder", ColType::Float8),
+            ("enumlabel", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = crate::storage::MAX_ENUMS * crate::storage::MAX_ENUM_LABELS;
+    let mut out: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut n = 0;
+    for (slot, e) in storage.live_enums() {
+        let typid = crate::sql::types::oid::enum_oid(slot as u16);
+        for (i, m) in e.members().iter().enumerate() {
+            out[n] = row(
+                &[
+                    // A stable, unique synthetic OID per member.
+                    Datum::Int4(typid * 1000 + i as i32),
+                    Datum::Int4(typid),
+                    Datum::Float8(m.sort),
+                    text(arena.alloc_str(m.label.as_str()).map_err(|_| arena_full())?, arena)?,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    finish(def, &out[..n], arena)
+}
+
 fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_type",
@@ -1308,8 +1328,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
         ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
         _ => "S",
     };
-    let mut out: [&[Datum]; 32 + crate::storage::MAX_DOMAINS] =
-        [&[]; 32 + crate::storage::MAX_DOMAINS];
+    let mut out: [&[Datum]; 32 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS] =
+        [&[]; 32 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS];
     for (i, t) in types.iter().enumerate() {
         out[i] = row(
             &[
@@ -1355,6 +1375,31 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                     Some(e) => text(arena.alloc_str(e.as_str()).map_err(|_| arena_full())?, arena)?,
                     None => Datum::Null,
                 },
+                text("", arena)?,
+                text("", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    // User-defined enum types: typtype 'e', typcategory 'E', no base type.
+    for (slot, e) in storage.live_enums() {
+        out[n] = row(
+            &[
+                Datum::Int4(crate::sql::types::oid::enum_oid(slot as u16)),
+                text(arena.alloc_str(e.name.as_str()).map_err(|_| arena_full())?, arena)?,
+                Datum::Int4(4), // typlen: enums are a 4-byte oid on the wire
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, e.schema.as_str())),
+                text("e", arena)?,
+                text("E", arena)?,
+                Datum::Int4(0), // typbasetype
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
                 text("", arena)?,
                 text("", arena)?,
             ],

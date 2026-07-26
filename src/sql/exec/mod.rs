@@ -643,7 +643,7 @@ fn handle_conflict(
                 ));
             };
             let v = eval(expression, arena, params, &context)?;
-            new_values[target] = coerce(v, &def.columns()[target], arena)?;
+            new_values[target] = coerce(v, &def.columns()[target], storage, arena)?;
         }
         check_not_null(def, &new_values)?;
         enforce_row_constraints(
@@ -1558,7 +1558,7 @@ pub fn create_table_as(
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
                 let v = decode_projected_pub(bytes, i);
-                match coerce(v, &def.columns()[i], arena) {
+                match coerce(v, &def.columns()[i], storage, arena) {
                     Ok(v) => *slot = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -1717,7 +1717,7 @@ pub fn refresh_materialized_view(
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (i, slot_v) in values.iter_mut().enumerate().take(n_cols) {
             let v = decode_projected_pub(bytes, i);
-            match coerce(v, &def.columns()[i], arena) {
+            match coerce(v, &def.columns()[i], storage, arena) {
                 Ok(v) => *slot_v = v,
                 Err(e) => return sql_fail(e),
             }
@@ -2480,6 +2480,256 @@ pub fn alter_domain(
     sql_ok()
 }
 
+/// Builds an [`EnumSpec`] from a `CREATE TYPE ... AS ENUM` label list: rejects
+/// duplicates (42710) and over-long labels, and assigns each member a 1-based
+/// sort key (PostgreSQL's `enumsortorder`).
+fn build_enum_spec(labels: &[&str]) -> Result<crate::storage::EnumSpec, SqlError> {
+    if labels.len() > crate::storage::MAX_ENUM_LABELS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "an enum type may have at most {} labels",
+            crate::storage::MAX_ENUM_LABELS
+        ));
+    }
+    let mut members = [crate::storage::EnumMember::EMPTY; crate::storage::MAX_ENUM_LABELS];
+    for (i, &label) in labels.iter().enumerate() {
+        if labels[..i].contains(&label) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "enum label \"{}\" specified more than once",
+                label
+            ));
+        }
+        members[i] = crate::storage::EnumMember { label: SqlName::parse(label)?, sort: (i + 1) as f64 };
+    }
+    Ok(crate::storage::EnumSpec { members, n_members: labels.len() })
+}
+
+pub fn create_enum(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName,
+    labels: &[&str],
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    // Types share a namespace: reject a name already taken by a domain or enum.
+    if storage.enum_slot(schema.as_str(), name.name, txn.txid).is_some()
+        || storage.domain_slot(schema.as_str(), name.name, txn.txid).is_some()
+    {
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "type \"{}\" already exists",
+            name.name
+        ));
+    }
+    let spec = match build_enum_spec(labels) {
+        Ok(s) => s,
+        Err(e) => return sql_fail(e),
+    };
+    let sqlname = match SqlName::parse(name.name) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
+    let slot = match storage.create_enum(schema, sqlname, spec, txn.txid) {
+        Ok(slot) => slot,
+        Err(e) => return sql_fail(e),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
+        storage.rollback_enum_create(slot);
+        return sql_fail(e);
+    }
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumCreated(slot as u32)) {
+        return sql_fail(e);
+    }
+    responder.command_complete("CREATE TYPE")?;
+    sql_ok()
+}
+
+pub fn drop_enum(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[QualName],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some(slot) = storage.resolve_enum_slot(name.name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "type \"{}\" does not exist, skipping", name.name).as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                name.name
+            ));
+        };
+        let (schema, ename) = {
+            let e = storage.enum_def(slot);
+            (e.schema, e.name)
+        };
+        // RESTRICT (the default) fails if any column is of this enum type.
+        if !cascade && storage.enum_in_use(slot).is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop type {} because other objects depend on it",
+                ename.as_str()
+            ));
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(e) =
+            wal.append(lsn, &WalOp::DropEnum { schema: schema.as_str(), name: ename.as_str() })
+        {
+            return sql_fail(e);
+        }
+        match storage.drop_enum(schema.as_str(), ename.as_str(), txn.txid) {
+            Ok(Some(slot)) => {
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot as u32)) {
+                    return sql_fail(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return sql_fail(e),
+        }
+    }
+    responder.command_complete("DROP TYPE")?;
+    sql_ok()
+}
+
+pub fn alter_type(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName,
+    action: &crate::sql::ast::AlterTypeAction,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::AlterTypeAction as A;
+    let Some(slot) = storage.resolve_enum_slot(name.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "type \"{}\" does not exist",
+            name.name
+        ));
+    };
+    match action {
+        A::AddValue { label, if_not_exists, before, after } => {
+            let current = *storage.enum_def(slot);
+            if current.sort_of(label).is_some() {
+                if *if_not_exists {
+                    responder.notice(
+                        sqlstate::DUPLICATE_OBJECT,
+                        stack_format!(128, "enum label \"{}\" already exists, skipping", label).as_str(),
+                    )?;
+                    responder.command_complete("ALTER TYPE")?;
+                    return sql_ok();
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "enum label \"{}\" already exists",
+                    label
+                ));
+            }
+            if current.n_members >= crate::storage::MAX_ENUM_LABELS {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "an enum type may have at most {} labels",
+                    crate::storage::MAX_ENUM_LABELS
+                ));
+            }
+            let sort = match compute_add_value_sort(&current, before.as_deref(), after.as_deref()) {
+                Ok(s) => s,
+                Err(e) => return sql_fail(e),
+            };
+            let new_label = match SqlName::parse(label) {
+                Ok(n) => n,
+                Err(e) => return sql_fail(e),
+            };
+            let mut spec = crate::storage::EnumSpec {
+                members: current.members,
+                n_members: current.n_members,
+            };
+            spec.members[spec.n_members] = crate::storage::EnumMember { label: new_label, sort };
+            spec.n_members += 1;
+            storage.alter_enum(slot, spec);
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
+                storage.alter_enum(slot, crate::storage::EnumSpec {
+                    members: current.members,
+                    n_members: current.n_members,
+                });
+                return sql_fail(e);
+            }
+        }
+        A::RenameTo(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "ALTER TYPE ... RENAME TO is not supported: enum-typed columns store the \
+                 type name, so a rename would require rewriting every dependent column"
+            ))
+        }
+        A::RenameValue { .. } => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "ALTER TYPE ... RENAME VALUE is not supported: enum values are stored inline, \
+                 so a rename would require rewriting every stored row"
+            ))
+        }
+    }
+    responder.command_complete("ALTER TYPE")?;
+    sql_ok()
+}
+
+/// The sort key for a new enum member: appended past the current maximum, or —
+/// with BEFORE/AFTER — midway between the named neighbour and its adjacent
+/// member (fractional, so existing members and stored rows are undisturbed).
+fn compute_add_value_sort(
+    def: &crate::storage::EnumDef,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<f64, SqlError> {
+    let members = def.members();
+    let neighbour = before.or(after);
+    let Some(pivot) = neighbour else {
+        // Append: one past the current maximum sort (or 1.0 for an empty enum).
+        let max = members.iter().map(|m| m.sort).fold(f64::NEG_INFINITY, f64::max);
+        return Ok(if members.is_empty() { 1.0 } else { max + 1.0 });
+    };
+    let Some(pivot_sort) = def.sort_of(pivot) else {
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "\"{}\" is not an existing enum label",
+            pivot
+        ));
+    };
+    // Sorted neighbours around the pivot bound the fractional insertion.
+    let mut sorts: [f64; crate::storage::MAX_ENUM_LABELS] = [0.0; crate::storage::MAX_ENUM_LABELS];
+    for (i, m) in members.iter().enumerate() {
+        sorts[i] = m.sort;
+    }
+    sorts[..members.len()].sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pos = sorts[..members.len()].iter().position(|&s| s == pivot_sort).unwrap();
+    let new_sort = if before.is_some() {
+        let lower = if pos == 0 { pivot_sort - 1.0 } else { sorts[pos - 1] };
+        (lower + pivot_sort) / 2.0
+    } else {
+        let upper = if pos + 1 == members.len() { pivot_sort + 1.0 } else { sorts[pos + 1] };
+        (pivot_sort + upper) / 2.0
+    };
+    Ok(new_sort)
+}
+
 /// Resolves a name to a live sequence slot. A relation that exists but is not a
 /// sequence is a type error (42809); a missing relation is `Ok(None)` so the
 /// caller can apply IF EXISTS.
@@ -2976,7 +3226,7 @@ pub fn copy_row(
         let col = &def.columns()[col_index];
         values[col_index] = match field {
             None => Datum::Null,
-            Some(text) => coerce(Datum::Text(text), col, arena)?,
+            Some(text) => coerce(Datum::Text(text), col, storage, arena)?,
         };
         explicit[col_index] = true;
     }
@@ -3040,7 +3290,7 @@ pub fn copy_row_binary(
             let field = &row[at..at + flen as usize];
             at += flen as usize;
             let decoded = decode_binary_field(col.ctype, field, arena)?;
-            coerce(decoded, &col, arena)?
+            coerce(decoded, &col, storage, arena)?
         };
         explicit[col_index] = true;
     }
@@ -3120,6 +3370,13 @@ pub(crate) fn decode_binary_field<'a>(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "COPY BINARY of type {} is not supported yet",
             ctype.name()
+        )),
+        // An enum's binary field is its label, but resolving the label to a
+        // member's sort key needs the catalog, which this codec does not carry.
+        // COPY (text) of enum columns works; binary is a loud gap.
+        ColType::Enum(_) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY BINARY of an enum type is not supported yet (use COPY text format)"
         )),
     }
 }
@@ -3527,6 +3784,7 @@ fn compute_generated<'a>(
     def: &TableDef,
     generated: &constraints::ParsedDefaults<'a>,
     values: &mut [Datum<'a>; MAX_COLUMNS],
+    storage: &Storage,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     if !generated.iter().any(|g| g.is_some()) {
@@ -3537,7 +3795,7 @@ fn compute_generated<'a>(
     for (i, g) in generated.iter().enumerate() {
         if let Some(expr) = g {
             let v = eval(expr, arena, crate::sql::eval::NO_PARAMS, &context)?;
-            values[i] = coerce(v, &def.columns()[i], arena)?;
+            values[i] = coerce(v, &def.columns()[i], storage, arena)?;
         }
     }
     Ok(())
@@ -3887,12 +4145,12 @@ pub fn merge(
                                 Ok(v) => v,
                                 Err(e) => return sql_fail(e),
                             };
-                            match coerce(v, &def.columns()[ci], arena) {
+                            match coerce(v, &def.columns()[ci], storage, arena) {
                                 Ok(v) => new_values[ci] = v,
                                 Err(e) => return sql_fail(e),
                             }
                         }
-                        if let Err(e) = compute_generated(&def, &generated, &mut new_values, arena) {
+                        if let Err(e) = compute_generated(&def, &generated, &mut new_values, storage, arena) {
                             return sql_fail(e);
                         }
                         if let Err(e) = check_not_null(&def, &new_values) {
@@ -4036,7 +4294,7 @@ fn merge_insert(
         for (i, expression) in values.iter().enumerate() {
             reject_generated_write(def, targets[i])?;
             let v = super::eval::eval_full(expression, arena, params, source_ctx, &hooks)?;
-            row[targets[i]] = coerce(v, &def.columns()[targets[i]], arena)?;
+            row[targets[i]] = coerce(v, &def.columns()[targets[i]], storage, arena)?;
             explicit[targets[i]] = true;
         }
     }
@@ -4052,13 +4310,13 @@ fn merge_insert(
                 row[i] = d.as_datum();
             } else if let Some(expr) = defaults[i] {
                 let v = super::eval::eval_full(expr, arena, crate::sql::eval::NO_PARAMS, &NoColumns, &hooks)?;
-                row[i] = coerce(v, col, arena)?;
+                row[i] = coerce(v, col, storage, arena)?;
             }
         }
     }
     fill_auto_increment(storage, table_index, def, &mut row, &explicit)?;
     let mut row_arr = row;
-    compute_generated(def, generated, &mut row_arr, arena)?;
+    compute_generated(def, generated, &mut row_arr, storage, arena)?;
     check_not_null(def, &row_arr)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -4195,7 +4453,7 @@ pub fn insert(
                 }
                 let v = decode_projected_pub(bytes, i);
                 let col = &def.columns()[targets[i]];
-                match coerce(v, col, arena) {
+                match coerce(v, col, storage, arena) {
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -4225,7 +4483,7 @@ pub fn insert(
                             Ok(v) => v,
                             Err(e) => return sql_fail(e),
                         };
-                        match coerce(v, col, arena) {
+                        match coerce(v, col, storage, arena) {
                             Ok(v) => values[i] = v,
                             Err(e) => return sql_fail(e),
                         }
@@ -4235,7 +4493,7 @@ pub fn insert(
             if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
                 return sql_fail(e);
             }
-            if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, arena) {
+            if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, storage, arena) {
                 return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &values) {
@@ -4335,7 +4593,7 @@ pub fn insert(
                     Err(e) => return sql_fail(e),
                 };
                 let col = &def.columns()[targets[i]];
-                match coerce(v, col, arena) {
+                match coerce(v, col, storage, arena) {
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -4358,7 +4616,7 @@ pub fn insert(
                         Ok(v) => v,
                         Err(e) => return sql_fail(e),
                     };
-                    match coerce(v, col, arena) {
+                    match coerce(v, col, storage, arena) {
                         Ok(v) => values[i] = v,
                         Err(e) => return sql_fail(e),
                     }
@@ -4369,7 +4627,7 @@ pub fn insert(
             return sql_fail(e);
         }
         // Generated columns are computed last, from the now-filled row.
-        if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, arena) {
+        if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, storage, arena) {
             return sql_fail(e);
         }
         if let Err(e) = check_not_null(&def, &values) {
@@ -4594,7 +4852,7 @@ pub fn update(
                                 continue;
                             }
                             let v = eval(expression, arena, params, &combined)?;
-                            new_values[targets[a]] = coerce(v, &def.columns()[targets[a]], arena)?;
+                            new_values[targets[a]] = coerce(v, &def.columns()[targets[a]], storage, arena)?;
                         }
                         Ok(())
                     },
@@ -4622,7 +4880,7 @@ pub fn update(
                         Err(e) => return sql_fail(e),
                     };
                     let col = &def.columns()[targets[a]];
-                    match coerce(v, col, arena) {
+                    match coerce(v, col, storage, arena) {
                         Ok(v) => new_values[targets[a]] = v,
                         Err(e) => return sql_fail(e),
                     }
@@ -4630,7 +4888,7 @@ pub fn update(
             }
             // Every generated column is recomputed from the updated row (a change
             // to any dependency must flow through).
-            if let Err(e) = compute_generated(&def, &generated_exprs, &mut new_values, arena) {
+            if let Err(e) = compute_generated(&def, &generated_exprs, &mut new_values, storage, arena) {
                 return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &new_values) {
@@ -5742,7 +6000,7 @@ pub fn alter_table(
                                     Ok(v) => v,
                                     Err(e) => return sql_fail(e),
                                 };
-                                match coerce(v, &new_def.columns[fi], arena) {
+                                match coerce(v, &new_def.columns[fi], storage, arena) {
                                     Ok(v) => v,
                                     Err(e) => return sql_fail(e),
                                 }
@@ -5752,7 +6010,7 @@ pub fn alter_table(
                         }
                     };
                 }
-                if let Err(e) = compute_generated(&new_def, &new_generated, &mut out, arena) {
+                if let Err(e) = compute_generated(&new_def, &new_generated, &mut out, storage, arena) {
                     return sql_fail(e);
                 }
                 let values = &out[..new_def.n_columns];
@@ -6179,7 +6437,17 @@ fn store_row(
     Ok(())
 }
 
-fn coerce<'a>(v: Datum<'a>, col: &ColumnMeta, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn coerce<'a>(
+    v: Datum<'a>,
+    col: &ColumnMeta,
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    // An enum column resolves a text (or already-typed enum) value to a member
+    // of its type, validating the label against the catalog (22P02 otherwise).
+    if let ColType::Enum(slot) = col.ctype {
+        return coerce_enum_value(v, slot, storage, arena);
+    }
     let v = cast_to(v, col.ctype, arena).map_err(|e| {
         // Data errors (out of range, bad input syntax — class 22) keep their
         // specific message; only a genuine type mismatch is rewritten with the
@@ -6196,6 +6464,45 @@ fn coerce<'a>(v: Datum<'a>, col: &ColumnMeta, arena: &'a Arena) -> Result<Datum<
         }
     })?;
     apply_typmod(v, col.ctype, col.type_mod, arena)
+}
+
+/// Coerces a value into an enum column: a NULL passes through; a text or
+/// already-typed enum value must name a member of the enum at `slot`, else
+/// PostgreSQL's 22P02 `invalid input value for enum <type>: "..."`.
+fn coerce_enum_value<'a>(
+    v: Datum<'a>,
+    slot: u16,
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if v.is_null() {
+        return Ok(Datum::Null);
+    }
+    let def = storage.enum_def(slot as usize);
+    let label = match v {
+        Datum::Enum { label, .. } | Datum::Text(label) => label,
+        Datum::Bpchar(s) => s.trim_end_matches(' '),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "column is of type {} but expression is of incompatible type",
+                def.name.as_str()
+            ))
+        }
+    };
+    let Some(sort) = def.sort_of(label) else {
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "invalid input value for enum {}: \"{}\"",
+            def.name.as_str(),
+            label
+        ));
+    };
+    Ok(Datum::Enum {
+        slot,
+        sort,
+        label: arena.alloc_str(label).map_err(|_| super::query::arena_full_pub())?,
+    })
 }
 
 /// Applies a type modifier to an explicit cast result. Differs from column

@@ -327,7 +327,9 @@ pub(super) fn groups_for_mask<'a>(
             group: Some((statement.group_by, &key_vals[..n_keys], mask)),
             aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
             subs: group_subs,
-        windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
+        // Carry the catalog so a grouped projection resolves catalog-backed
+        // output (e.g. `pg_typeof` of an enum group key names the enum type).
+        windows: None, catalog: hooks.catalog, srf_index: None, sequences: hooks.sequences };
         let schema = ScopeSchema(scope);
         if let Some(h) = statement.having {
             match eval_full(h, arena, params, &schema, &group_hooks)? {

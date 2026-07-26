@@ -60,7 +60,9 @@ Working single-node database:
   (`GENERATED ALWAYS/BY DEFAULT AS IDENTITY`), arbitrary-precision NUMERIC,
   network address types (`inet`/`cidr`/`macaddr`/`macaddr8` with their operators
   and functions), user-defined domains (`CREATE DOMAIN` with NOT NULL / DEFAULT /
-  CHECK, enforced on write), casts and
+  CHECK, enforced on write), user-defined enum types (`CREATE TYPE ... AS ENUM`
+  with `ALTER TYPE ... ADD VALUE`, ordered by definition order and reflected in
+  `pg_type`/`pg_enum`), casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
   introspection, PostgreSQL lexical rules, and SQLSTATE-correct errors.
 - COPY FROM STDIN / TO STDOUT in PostgreSQL's text, CSV, and binary formats —

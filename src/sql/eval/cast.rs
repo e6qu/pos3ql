@@ -47,6 +47,14 @@ pub fn cast_to<'a>(
             Datum::Record(_) => v,
             _ => return Err(cast_unsupported(&v, "record")),
         },
+        // A value-level cast to an enum: only an already-typed enum value can be
+        // produced here. Coercing text to an enum member needs the catalog to
+        // validate the label, so it is intercepted in the eval Cast path before
+        // this function is reached (see `Expr::Cast`).
+        ColType::Enum(_) => match v {
+            Datum::Enum { .. } => v,
+            _ => return Err(cast_unsupported(&v, "enum")),
+        },
         ColType::Bool => match v {
             Datum::Bool(_) => v,
             Datum::Int4(x) => Datum::Bool(x != 0),

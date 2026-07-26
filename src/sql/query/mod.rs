@@ -162,6 +162,26 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     ) -> Result<Option<&'a str>, SqlError> {
         super::catalog::comment_text_for(self.storage, self.txid, is_namespace, oid, subid, arena)
     }
+
+    fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        let def = self.storage.enum_def(slot as usize);
+        if !def.visible_to(self.txid) {
+            return Ok(None);
+        }
+        Ok(Some(arena.alloc_str(def.name.as_str()).map_err(|_| arena_full())?))
+    }
+
+    fn enum_label_sort(&self, slot: u16, label: &str) -> Option<f64> {
+        let def = self.storage.enum_def(slot as usize);
+        if !def.visible_to(self.txid) {
+            return None;
+        }
+        def.sort_of(label)
+    }
+
+    fn enum_slot_of_name(&self, type_name: &str) -> Option<u16> {
+        self.storage.resolve_enum_slot(type_name, self.txid).map(|s| s as u16)
+    }
 }
 
 fn sql_ok() -> Outcome {

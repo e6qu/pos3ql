@@ -117,17 +117,29 @@ pub(super) fn build_column(
     // A base type resolves statically; an unknown name falls back to the
     // domain catalog, whose column inherits the domain's base type and typmod
     // and carries the domain identity for pg_typeof / constraint enforcement.
+    // A base type resolves statically; an unknown name falls back to the
+    // domain catalog (base type + identity) then the enum catalog (its own
+    // `ColType::Enum` plus the enum name, carried in `domain`, so the column's
+    // type persists as a name that reloads to the right slot).
     let (ctype, type_mod, domain, domain_default) = match ColType::from_sql_name(c.type_name) {
         Some(ct) => (ct, c.type_mod, None, None),
         None => match storage.find_domain(c.type_name, txid) {
             Some(d) => (d.base, d.base_type_mod, Some(d.name), d.default_expr),
-            None => {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    c.type_name
-                ))
-            }
+            None => match storage.resolve_enum_slot(c.type_name, txid) {
+                Some(slot) => (
+                    ColType::Enum(slot as u16),
+                    -1,
+                    Some(storage.enum_def(slot).name),
+                    None,
+                ),
+                None => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        c.type_name
+                    ))
+                }
+            },
         },
     };
     // A GENERATED column stores its expression in `default_expr` with the

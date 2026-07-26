@@ -374,6 +374,13 @@ pub(crate) fn dispatch<'a>(
                         return Ok(Datum::Text(name));
                     }
                 }
+                // An enum value reports its type name, resolved from the slot.
+                if let Datum::Enum { slot, .. } = v
+                    && let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.enum_name(slot, arena)?
+                {
+                    return Ok(Datum::Text(name));
+                }
                 Ok(Datum::Text(match v {
                     Datum::Null => "unknown",
                     Datum::Bool(_) => "boolean",
@@ -405,6 +412,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Macaddr(_) => "macaddr",
                     Datum::Macaddr8(_) => "macaddr8",
                     Datum::Record(_) => "record",
+                    Datum::Enum { .. } => "enum",
                 }))
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),

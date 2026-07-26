@@ -35,6 +35,10 @@ impl<'a> Parser<'a> {
         if self.eat_ident("view")? {
             return self.create_view(false);
         }
+        if self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            return self.create_materialized_view();
+        }
         if self.eat_ident("index")? {
             return self.create_index(false);
         }
@@ -44,14 +48,15 @@ impl<'a> Parser<'a> {
         self.create_table()
     }
 
-    /// The shared tail of `CREATE TABLE ... AS`: capture the SELECT text
-    /// (validated now, re-run to populate the new table), then an optional
-    /// `WITH [NO] DATA`.
+    /// The shared tail of `CREATE TABLE ... AS` / `CREATE MATERIALIZED VIEW`:
+    /// capture the SELECT text (validated now, re-run to populate the backing
+    /// table), then an optional `WITH [NO] DATA`.
     fn create_table_as(
         &mut self,
         name: QualName<'a>,
         columns: &'a [&'a str],
         if_not_exists: bool,
+        materialized: bool,
     ) -> Result<Stmt<'a>, ParseError> {
         let start = self.peek_at;
         let _ = self.query()?;
@@ -64,7 +69,41 @@ impl<'a> Parser<'a> {
         } else {
             true
         };
-        Ok(Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists })
+        Ok(Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists, materialized })
+    }
+
+    /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] AS <query>
+    /// [WITH [NO] DATA]` ("create materialized view" consumed). A `(` here is
+    /// always a column-name list (a materialized view has no column defs).
+    fn create_materialized_view(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.qual_name("materialized view name")?;
+        let mut columns: &'a [&'a str] = &[];
+        if self.peeked == Tok::Op("(") {
+            self.expect_op("(")?;
+            let mut list = [""; MAX_LIST];
+            let mut m = 0;
+            loop {
+                if m == MAX_LIST {
+                    return Err(self.limit("column list", MAX_LIST));
+                }
+                list[m] = self.col_ident("column name")?;
+                m += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            columns = self.arena_slice(&list[..m])?;
+        }
+        self.expect_ident("as")?;
+        self.create_table_as(name, columns, if_not_exists, true)
     }
 
     /// CREATE SCHEMA [IF NOT EXISTS] { name [AUTHORIZATION role] |
@@ -174,6 +213,11 @@ impl<'a> Parser<'a> {
             let (names, if_exists) = self.drop_targets("view name")?;
             return Ok(Stmt::DropView { names, if_exists });
         }
+        if self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            let (names, if_exists) = self.drop_targets("materialized view name")?;
+            return Ok(Stmt::DropMaterializedView { names, if_exists });
+        }
         if self.eat_ident("index")? {
             let (names, if_exists) = self.drop_targets("index name")?;
             return Ok(Stmt::DropIndex { names, if_exists });
@@ -257,7 +301,7 @@ impl<'a> Parser<'a> {
         let name = self.qual_name("table name")?;
         // `CREATE TABLE name AS <query>` — no explicit column list.
         if self.eat_ident("as")? {
-            return self.create_table_as(name, &[], if_not_exists);
+            return self.create_table_as(name, &[], if_not_exists, false);
         }
         self.expect_op("(")?;
         // A `(` is either column definitions or — for `CREATE TABLE ... AS` — a
@@ -284,7 +328,7 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
                 self.expect_ident("as")?;
                 let cols = self.arena_slice(&list[..m])?;
-                return self.create_table_as(name, cols, if_not_exists);
+                return self.create_table_as(name, cols, if_not_exists, false);
             }
             // Otherwise it is a column definition whose name we already read.
             pending_first_col = Some(first_ident);

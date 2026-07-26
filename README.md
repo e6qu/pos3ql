@@ -48,7 +48,7 @@ Working single-node database:
   simple and extended query protocol (including binary parameters and named
   prepared statements).
 - SQL: DDL (CREATE/DROP TABLE, CREATE TABLE AS, CREATE/DROP VIEW,
-  CREATE/DROP INDEX),
+  CREATE/REFRESH/DROP MATERIALIZED VIEW, CREATE/DROP INDEX),
   INSERT/SELECT/UPDATE/DELETE with WHERE / ORDER BY (PostgreSQL null ordering)
   / LIMIT, joins, GROUP BY and aggregates, subqueries (correlated + EXISTS),
   non-recursive CTEs, updatable views, arbitrary-precision NUMERIC, casts and

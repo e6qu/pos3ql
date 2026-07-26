@@ -43,16 +43,22 @@ pub enum Stmt<'a> {
     CreateView { name: QualName<'a>, or_replace: bool, sql: &'a str },
     /// DROP VIEW [IF EXISTS] name.
     DropView { names: &'a [QualName<'a>], if_exists: bool },
-    /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`.
-    /// `sql` is the raw SELECT text, run once to populate the new table;
-    /// `columns` optionally renames the query's output columns.
+    /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
+    /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
+    /// SELECT text, run once to populate the new (backing) table; `columns`
+    /// optionally renames the query's output columns.
     CreateTableAs {
         name: QualName<'a>,
         columns: &'a [&'a str],
         sql: &'a str,
         with_data: bool,
         if_not_exists: bool,
+        materialized: bool,
     },
+    /// REFRESH MATERIALIZED VIEW name — re-run the stored query, replacing rows.
+    RefreshMaterializedView { name: QualName<'a> },
+    /// DROP MATERIALIZED VIEW [IF EXISTS] name.
+    DropMaterializedView { names: &'a [QualName<'a>], if_exists: bool },
     /// CREATE [UNIQUE] INDEX name ON table (col, ...).
     CreateIndex {
         name: &'a str,

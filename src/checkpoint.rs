@@ -1090,6 +1090,39 @@ impl Checkpointer {
                         storage.commit_view_drop(old);
                     }
                 }
+                Some("mv2") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let read_hex = |w: Option<&str>, what: &'static str| {
+                        w.ok_or(CheckpointSetupError::Corrupt(what))
+                            .and_then(decode_hex_name)
+                    };
+                    let sql = read_hex(words.next(), "mv2 sql missing")?;
+                    let schema = read_hex(words.next(), "mv2 schema missing")?;
+                    let path = read_hex(words.next(), "mv2 path missing")?;
+                    let name = read_hex(words.next(), "mv2 name missing")?;
+                    let populated: u8 = parse_field(words.next(), "mv2 populated")?;
+                    use core::fmt::Write;
+                    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+                    let _ = write!(buffer, "{sql}");
+                    let mut path_buffer = StackStr::<128>::new();
+                    let _ = write!(path_buffer, "{path}");
+                    let slot = storage
+                        .create_matview(
+                            sql_name(&schema)?,
+                            sql_name(&name)?,
+                            buffer,
+                            path_buffer,
+                            populated != 0,
+                            0,
+                        )
+                        .map_err(|e| {
+                            CheckpointSetupError::S3(format!(
+                                "manifest matview rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_matview_create(slot);
+                }
                 Some("idx") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let unique: u8 = parse_field(words.next(), "idx unique")?;
@@ -1727,6 +1760,39 @@ Ok(CheckpointStep::Published { lsn })
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str()
+                ),
+            )?;
+        }
+        // Materialized views: like `vw2`, plus a trailing populated flag (0/1).
+        // The backing table's rows serialize through the ordinary table/dsst
+        // loop; this line records only the defining query.
+        for mv in storage.live_matviews() {
+            use core::fmt::Write;
+            let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
+            for b in mv.sql.as_str().as_bytes() {
+                let _ = write!(hex, "{b:02x}");
+            }
+            let mut hschema = StackStr::<130>::new();
+            for b in mv.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{b:02x}");
+            }
+            let mut hpath = StackStr::<260>::new();
+            for b in mv.creation_path.as_str().as_bytes() {
+                let _ = write!(hpath, "{b:02x}");
+            }
+            let mut hname = StackStr::<130>::new();
+            for b in mv.name.as_str().as_bytes() {
+                let _ = write!(hname, "{b:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "mv2 {} {} {} {} {}",
+                    hex.as_str(),
+                    hschema.as_str(),
+                    hpath.as_str(),
+                    hname.as_str(),
+                    u8::from(mv.populated)
                 ),
             )?;
         }

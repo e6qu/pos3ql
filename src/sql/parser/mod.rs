@@ -595,6 +595,13 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident("vacuum") => self.vacuum_or_analyze(true),
             Tok::Ident("analyze") | Tok::Ident("analyse") => self.vacuum_or_analyze(false),
+            Tok::Ident("refresh") => {
+                self.advance()?;
+                self.expect_ident("materialized")?;
+                self.expect_ident("view")?;
+                let name = self.qual_name("materialized view name")?;
+                Ok(Stmt::RefreshMaterializedView { name })
+            }
             Tok::Ident("alter") => self.alter_table(),
             Tok::Ident("copy") => self.copy_statement(),
             Tok::Ident("prepare") => self.prepare(),

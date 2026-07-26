@@ -685,6 +685,24 @@ pub fn drop_table(
             ));
         }
         match storage.resolve_relation(name.schema, name.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::Table(index))
+                if storage
+                    .matview_slot(
+                        storage.table(index).def.schema.as_str(),
+                        storage.table(index).def.name.as_str(),
+                        txn.txid,
+                    )
+                    .is_some() =>
+            {
+                // The backing table of a materialized view is not an ordinary
+                // table; PostgreSQL refuses DROP TABLE on it (42809), directing
+                // the user to DROP MATERIALIZED VIEW.
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a table",
+                    name.name
+                ));
+            }
             Some(crate::storage::ResolvedRelation::Table(index)) => {
                 if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
                     let _ = other;
@@ -1232,6 +1250,8 @@ pub fn create_table_as(
     sql: &str,
     with_data: bool,
     if_not_exists: bool,
+    materialized: bool,
+    raw_path: &str,
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
@@ -1363,7 +1383,255 @@ pub fn create_table_as(
             count += 1;
         }
     }
+    // A materialized view additionally records its defining query (for REFRESH)
+    // and its populated state in the parallel matview catalog. Its rows are the
+    // backing table's, which we just filled.
+    if materialized {
+        use core::fmt::Write;
+        let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+        let _ = write!(buffer, "{sql}");
+        if buffer.is_truncated() {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "materialized view query exceeds {} bytes",
+                crate::storage::VIEW_SQL_MAX
+            ));
+        }
+        let mut cpath = crate::util::StackStr::<128>::new();
+        let _ = write!(cpath, "{raw_path}");
+        match storage.create_matview(def.schema, def.name, buffer, cpath, with_data, txn.txid) {
+            Ok(slot) => {
+                let lsn = storage.bump_lsn();
+                if let Err(e) = wal.append(
+                    lsn,
+                    &WalOp::CreateMatview {
+                        schema: def.schema.as_str(),
+                        name: name.name,
+                        sql,
+                        path: raw_path,
+                        populated: with_data,
+                    },
+                ) {
+                    storage.rollback_matview_create(slot);
+                    return sql_fail(e);
+                }
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::MatviewCreated(slot as u32)) {
+                    storage.rollback_matview_create(slot);
+                    return sql_fail(e);
+                }
+            }
+            Err(e) => return sql_fail(e),
+        }
+    }
     responder.command_complete(stack_format!(32, "SELECT {count}").as_str())?;
+    sql_ok()
+}
+
+/// REFRESH MATERIALIZED VIEW: re-run the stored query, replacing every row of
+/// the backing table.
+pub fn refresh_materialized_view(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &crate::sql::ast::QualName,
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+) -> Outcome {
+    let table_index = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+        Some(crate::storage::ResolvedRelation::Table(idx)) => idx,
+        _ => return sql_fail(undefined_kind("relation", name.name)),
+    };
+    let def = storage.table(table_index).def;
+    let Some(slot) = storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a materialized view",
+            name.name
+        ));
+    };
+    // Copy the stored query out before mutating storage.
+    let sql = match arena.alloc_str(storage.matview(slot).sql.as_str()) {
+        Ok(s) => s,
+        Err(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "materialized view query exceeds the statement arena"
+            ))
+        }
+    };
+    // Remove every visible row, transactionally (a matview has no constraints).
+    let mut rowids: [u64; 4096] = [0; 4096];
+    loop {
+        let mut count = 0usize;
+        let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            if state.visible_to(txn.txid).is_none() {
+                return Ok(ControlFlow::Continue(()));
+            }
+            if count == rowids.len() {
+                return Ok(ControlFlow::Break(()));
+            }
+            rowids[count] = rowid;
+            count += 1;
+            Ok(ControlFlow::Continue(()))
+        });
+        if count == 0 {
+            break;
+        }
+        for &rowid in &rowids[..count] {
+            match storage.write_pending(table_index, rowid, txn.txid, None) {
+                Ok(prior) => {
+                    if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
+                        storage.restore_pending(table_index, rowid, txn.txid, prior);
+                        return sql_fail(e);
+                    }
+                }
+                Err(e) => return sql_fail(e),
+            }
+        }
+    }
+    // Re-run the query and store its rows into the backing table (two-pass, so
+    // the source may read another table without overlapping the write).
+    let sel = match crate::sql::parser::parse_query(sql, arena) {
+        Ok(s) => s,
+        Err(e) => return sql_fail(e),
+    };
+    let mut rows = 0usize;
+    if let Err(e) = super::query::select_into_rows(
+        storage, txn.txid, sel, arena, params, None, &mut |_| {
+            rows += 1;
+            Ok(())
+        },
+    ) {
+        return sql_fail(e);
+    }
+    let empty: &[u8] = &[];
+    let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(rows, |_| empty) {
+        Ok(r) => r,
+        Err(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "REFRESH result exceeds the statement arena"
+            ))
+        }
+    };
+    let mut at = 0usize;
+    if let Err(e) = super::query::select_into_rows(
+        storage, txn.txid, sel, arena, params, None, &mut |vals| {
+            rows_bytes[at] = encode_projected_pub(vals, arena)?;
+            at += 1;
+            Ok(())
+        },
+    ) {
+        return sql_fail(e);
+    }
+    let n_cols = def.n_columns;
+    for bytes in rows_bytes.iter() {
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        for (i, slot_v) in values.iter_mut().enumerate().take(n_cols) {
+            let v = decode_projected_pub(bytes, i);
+            match coerce(v, &def.columns()[i], arena) {
+                Ok(v) => *slot_v = v,
+                Err(e) => return sql_fail(e),
+            }
+        }
+        if let Err(e) = store_row(storage, txn, table_index, None, &values[..n_cols]) {
+            return sql_fail(e);
+        }
+    }
+    // Mark it populated (durably).
+    storage.set_matview_populated(slot, true);
+    let lsn = storage.bump_lsn();
+    if let Err(e) = wal.append(
+        lsn,
+        &WalOp::SetMatviewPopulated {
+            schema: def.schema.as_str(),
+            name: def.name.as_str(),
+            populated: true,
+        },
+    ) {
+        return sql_fail(e);
+    }
+    responder.command_complete("REFRESH MATERIALIZED VIEW")?;
+    sql_ok()
+}
+
+/// DROP MATERIALIZED VIEW [IF EXISTS]: drops the backing table and its matview
+/// catalog entry.
+pub fn drop_materialized_view(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[crate::sql::ast::QualName],
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let idx = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::Table(idx))
+                if storage
+                    .matview_slot(
+                        storage.table(idx).def.schema.as_str(),
+                        storage.table(idx).def.name.as_str(),
+                        txn.txid,
+                    )
+                    .is_some() =>
+            {
+                idx
+            }
+            // A relation that exists but is not a materialized view is a type
+            // error (42809), which IF EXISTS does not suppress.
+            Some(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a materialized view",
+                    name.name
+                ))
+            }
+            None if if_exists => {
+                responder.notice(
+                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "materialized view \"{}\" does not exist, skipping", name.name)
+                        .as_str(),
+                )?;
+                continue;
+            }
+            None => return sql_fail(undefined_kind("materialized view", name.name)),
+        };
+        let def = storage.table(idx).def;
+        // Drop the backing table.
+        let lsn = storage.bump_lsn();
+        if let Err(e) = wal.append(
+            lsn,
+            &WalOp::DropTable { schema: def.schema.as_str(), name: def.name.as_str() },
+        ) {
+            return sql_fail(e);
+        }
+        if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(idx as u32)) {
+            return sql_fail(e);
+        }
+        storage.drop_table_in(idx, txn.txid);
+        storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+        // Drop the matview catalog entry.
+        let lsn = storage.bump_lsn();
+        if let Err(e) = wal.append(
+            lsn,
+            &WalOp::DropMatview { schema: def.schema.as_str(), name: def.name.as_str() },
+        ) {
+            return sql_fail(e);
+        }
+        match storage.drop_matview(def.schema.as_str(), def.name.as_str(), txn.txid) {
+            Ok(Some(slot)) => {
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32)) {
+                    return sql_fail(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return sql_fail(e),
+        }
+    }
+    responder.command_complete("DROP MATERIALIZED VIEW")?;
     sql_ok()
 }
 

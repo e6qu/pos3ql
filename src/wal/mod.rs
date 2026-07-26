@@ -46,6 +46,9 @@ const KIND_CREATE_SCHEMA: u8 = 10;
 const KIND_DROP_SCHEMA: u8 = 11;
 const KIND_SET_TABLE_SCHEMA: u8 = 12;
 const KIND_DROP_FK: u8 = 13;
+const KIND_CREATE_MATVIEW: u8 = 14;
+const KIND_DROP_MATVIEW: u8 = 15;
+const KIND_SET_MATVIEW_POPULATED: u8 = 16;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -120,6 +123,25 @@ pub enum WalOp<'a> {
         schema: &'a str,
         table: &'a str,
         fk_name: &'a str,
+    },
+    /// CREATE MATERIALIZED VIEW: its rows replay as the backing table's own
+    /// Upsert records; this records only the defining query and populated state.
+    CreateMatview {
+        schema: &'a str,
+        name: &'a str,
+        sql: &'a str,
+        path: &'a str,
+        populated: bool,
+    },
+    DropMatview {
+        schema: &'a str,
+        name: &'a str,
+    },
+    /// REFRESH / WITH [NO] DATA changing whether the matview is populated.
+    SetMatviewPopulated {
+        schema: &'a str,
+        name: &'a str,
+        populated: bool,
     },
 }
 
@@ -265,7 +287,7 @@ impl Wal {
                     u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_DROP_FK).contains(&kind)
+                if !(KIND_CREATE..=KIND_SET_MATVIEW_POPULATED).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -461,6 +483,9 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropSchema(_) => KIND_DROP_SCHEMA,
         WalOp::SetTableSchema { .. } => KIND_SET_TABLE_SCHEMA,
         WalOp::DropTableFk { .. } => KIND_DROP_FK,
+        WalOp::CreateMatview { .. } => KIND_CREATE_MATVIEW,
+        WalOp::DropMatview { .. } => KIND_DROP_MATVIEW,
+        WalOp::SetMatviewPopulated { .. } => KIND_SET_MATVIEW_POPULATED,
     }
 }
 
@@ -520,6 +545,13 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropTableFk { schema, table, fk_name } => {
             1 + schema.len() + 1 + table.len() + 1 + fk_name.len()
+        }
+        WalOp::CreateMatview { schema, name, sql, path, .. } => {
+            1 + name.len() + 2 + sql.len() + 1 + schema.len() + 2 + path.len() + 1
+        }
+        WalOp::DropMatview { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::SetMatviewPopulated { schema, name, .. } => {
+            1 + name.len() + 1 + schema.len() + 1
         }
     }
 }
@@ -636,6 +668,23 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, fk_name)
+        }
+        WalOp::CreateMatview { schema, name, sql, path, populated } => {
+            name_bytes(buffer, name)
+                && buffer.append(&(sql.len() as u16).to_le_bytes())
+                && buffer.append(sql.as_bytes())
+                && name_bytes(buffer, schema)
+                && buffer.append(&(path.len() as u16).to_le_bytes())
+                && buffer.append(path.as_bytes())
+                && buffer.append(&[u8::from(*populated)])
+        }
+        WalOp::DropMatview { schema, name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        }
+        WalOp::SetMatviewPopulated { schema, name, populated } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[u8::from(*populated)])
         }
     }
 }
@@ -854,6 +903,37 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
+        }
+        KIND_CREATE_MATVIEW => {
+            let name = take_name(&mut at)?;
+            let sql_len =
+                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+            at += 2;
+            let sql = core::str::from_utf8(payload.get(at..at + sql_len)?).ok()?;
+            at += sql_len;
+            let schema = take_name(&mut at)?;
+            let path_len =
+                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+            at += 2;
+            let path = core::str::from_utf8(payload.get(at..at + path_len)?).ok()?;
+            at += path_len;
+            let populated = *payload.get(at)? != 0;
+            at += 1;
+            (at == payload.len())
+                .then_some(WalOp::CreateMatview { schema, name, sql, path, populated })
+        }
+        KIND_DROP_MATVIEW => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropMatview { schema, name })
+        }
+        KIND_SET_MATVIEW_POPULATED => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let populated = *payload.get(at)? != 0;
+            at += 1;
+            (at == payload.len())
+                .then_some(WalOp::SetMatviewPopulated { schema, name, populated })
         }
         KIND_CREATE_INDEX => {
             let name = take_name(&mut at)?;

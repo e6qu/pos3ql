@@ -64,7 +64,9 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::SetDefault { .. }
         | AlterAction::DropDefault { .. }
         | AlterAction::SetNotNull { .. }
-        | AlterAction::DropNotNull { .. } => 4,
+        | AlterAction::DropNotNull { .. }
+        | AlterAction::AddIdentity { .. }
+        | AlterAction::DropIdentity { .. } => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
         | AlterAction::RenameColumn { .. }
@@ -1847,6 +1849,7 @@ impl<'a> Parser<'a> {
             let mut default = None;
             let mut default_text = None;
             let mut generated_text = None;
+            let mut identity = None;
             loop {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
@@ -1858,7 +1861,10 @@ impl<'a> Parser<'a> {
                     default = Some(self.expression(0)?);
                     default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("generated")? {
-                    generated_text = Some(self.generated_clause()?);
+                    match self.generated_clause()? {
+                        crate::sql::ast::ColGen::Generated(text) => generated_text = Some(text),
+                        crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
+                    }
                 } else if self.eat_ident("unique")? {
                     unique = true;
                 } else {
@@ -1875,6 +1881,7 @@ impl<'a> Parser<'a> {
                 default,
                 default_text,
                 generated_text,
+                identity,
             }))
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {
@@ -1919,13 +1926,32 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("drop")? {
                 if self.eat_ident("default")? {
                     Ok(AlterAction::DropDefault { column })
+                } else if self.eat_ident("identity")? {
+                    let if_exists = if self.eat_ident("if")? {
+                        self.expect_ident("exists")?;
+                        true
+                    } else {
+                        false
+                    };
+                    Ok(AlterAction::DropIdentity { column, if_exists })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;
                     Ok(AlterAction::DropNotNull { column })
                 }
+            } else if self.eat_ident("add")? {
+                // ALTER COLUMN col ADD GENERATED ... AS IDENTITY.
+                self.expect_ident("generated")?;
+                match self.generated_clause()? {
+                    crate::sql::ast::ColGen::Identity(spec) => {
+                        Ok(AlterAction::AddIdentity { column, spec })
+                    }
+                    crate::sql::ast::ColGen::Generated(_) => {
+                        Err(self.err_here("a column cannot be turned into a generated column"))
+                    }
+                }
             } else {
-                Err(self.unexpected("expected TYPE, SET or DROP"))
+                Err(self.unexpected("expected TYPE, SET, DROP or ADD"))
             }
         } else {
             Err(self.unexpected("expected ADD, DROP or ALTER"))
@@ -2007,6 +2033,19 @@ impl<'a> Parser<'a> {
             }
             self.expect_op(")")?;
         }
+        // OVERRIDING { SYSTEM | USER } VALUE for identity columns.
+        let overriding = if self.eat_ident("overriding")? {
+            let mode = if self.eat_ident("system")? {
+                crate::sql::ast::Overriding::System
+            } else {
+                self.expect_ident("user")?;
+                crate::sql::ast::Overriding::User
+            };
+            self.expect_ident("value")?;
+            mode
+        } else {
+            crate::sql::ast::Overriding::None
+        };
         // Source is either VALUES (...), ... or a SELECT.
         let mut rows: [&'a [&'a Expr<'a>]; MAX_ROWS] = [&[]; MAX_ROWS];
         let mut n_rows = 0;
@@ -2062,6 +2101,7 @@ impl<'a> Parser<'a> {
             select,
             on_conflict,
             returning,
+            overriding,
         }))
     }
 

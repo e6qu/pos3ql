@@ -956,6 +956,21 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   GENERATED` with `IDENTITY`); it now copies a generated column as plain unless
   `INCLUDING GENERATED`, matching PostgreSQL. Verified byte-for-byte against
   PostgreSQL (corpus `56_generated`) and a WAL-replay restart test.
+- **Identity columns** — done: `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY
+  [(START WITH n INCREMENT BY n)]`, the SQL-standard auto-increment. It reuses
+  the existing serial counter (`serial_last`, journaled + floored at startup)
+  with two new column flags (`is_identity`, `identity_always`, packed into the
+  codec flags byte) and a per-column `auto_increment_step` (default 1, so
+  `serial` is unchanged; the identity `START` seeds the counter at
+  `start - step` so the first value is `START`). `ALWAYS` rejects an explicit
+  `INSERT` value (428C9) unless `OVERRIDING SYSTEM VALUE`; `BY DEFAULT` accepts
+  one, and `OVERRIDING USER VALUE` discards it for the sequence. `ALTER COLUMN
+  ADD GENERATED ... AS IDENTITY` (requires NOT NULL, else 55000) and `DROP
+  IDENTITY [IF EXISTS]` (55000 / notice when the column is not an identity) round
+  it out. `pg_attribute.attidentity` reports `'a'`/`'d'`. `MIN/MAXVALUE`, `CACHE`
+  and `CYCLE` in the options are rejected loudly (they would need per-column
+  sequence machinery) rather than silently dropped. Verified byte-for-byte
+  against PostgreSQL (corpus `57_identity`) and a WAL-replay restart test.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

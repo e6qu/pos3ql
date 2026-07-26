@@ -530,6 +530,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 n += 1 + c.name.as_str().len() + 2 + 4 + encoded_default_len(&c.default_value);
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
                 n += 2 + c.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
+                // auto_increment_step (i64).
+                n += 8;
             }
             // uniques
             n += 1;
@@ -614,13 +616,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3)
-                    | (u8::from(c.is_generated) << 4);
+                    | (u8::from(c.is_generated) << 4)
+                    | (u8::from(c.is_identity) << 5)
+                    | (u8::from(c.identity_always) << 6);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 ok &= append_default(buffer, &c.default_value);
                 let de = c.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
                 ok &= buffer.append(&(de.len() as u16).to_le_bytes());
                 ok &= buffer.append(de.as_bytes());
+                ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
             ok &= buffer.append(&[def.n_uniques as u8]);
@@ -809,6 +814,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     default_value: None,
                     default_expr: None,
                     is_generated: false,
+                    is_identity: false,
+                    identity_always: false,
+                    auto_increment_step: 1,
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
                 ..TableDef::empty()
@@ -830,6 +838,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 } else {
                     None
                 };
+                let auto_increment_step =
+                    i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
+                at += 8;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
                     ctype: ColType::from_code(meta[0])?,
@@ -841,6 +852,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     default_value,
                     default_expr,
                     is_generated: meta[1] & 16 != 0,
+                    is_identity: meta[1] & 32 != 0,
+                    identity_always: meta[1] & 64 != 0,
+                    auto_increment_step,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -1301,6 +1315,9 @@ mod tests {
                 default_value: None,
                 default_expr: None,
                 is_generated: false,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
             }; MAX_COLUMNS],
             n_columns: 2,
             ..TableDef::empty()
@@ -1316,6 +1333,9 @@ mod tests {
             default_value: None,
             default_expr: None,
             is_generated: false,
+            is_identity: false,
+            identity_always: false,
+            auto_increment_step: 1,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -1328,6 +1348,9 @@ mod tests {
             default_value: Some(OwnedDatum::Int4(7)),
             default_expr: None,
             is_generated: false,
+            is_identity: false,
+            identity_always: false,
+            auto_increment_step: 1,
         };
         // A multi-column UNIQUE, a CHECK, and a FOREIGN KEY, so the WAL
         // round-trip covers every constraint kind.

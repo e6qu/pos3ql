@@ -824,7 +824,8 @@ impl Checkpointer {
                     } else {
                         Some(crate::util::StackStr::from_str(&decode_hex_name(dexpr_hex)?))
                     };
-                    let name = rest_of(line, 6)?;
+                    let auto_increment_step: i64 = parse_field(words.next(), "col step")?;
+                    let name = rest_of(line, 7)?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -840,6 +841,9 @@ impl Checkpointer {
                         default_value: default_from_hex(default_hex)?,
                         default_expr,
                         is_generated: not_null & 16 != 0,
+                        is_identity: not_null & 32 != 0,
+                        identity_always: not_null & 64 != 0,
+                        auto_increment_step,
                     };
                     *seen += 1;
                 }
@@ -1628,16 +1632,19 @@ Ok(CheckpointStep::Published { lsn })
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3)
-                    | (u8::from(c.is_generated) << 4);
+                    | (u8::from(c.is_generated) << 4)
+                    | (u8::from(c.is_identity) << 5)
+                    | (u8::from(c.identity_always) << 6);
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col {} {} {} {} {} {}",
+                        "col {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
+                        c.auto_increment_step,
                         c.name.as_str()
                     ),
                 )?;
@@ -2439,6 +2446,9 @@ fn empty_column() -> ColumnMeta {
         default_value: None,
         default_expr: None,
         is_generated: false,
+        is_identity: false,
+        identity_always: false,
+        auto_increment_step: 1,
     }
 }
 

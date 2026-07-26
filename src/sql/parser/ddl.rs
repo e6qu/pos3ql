@@ -189,10 +189,11 @@ impl<'a> Parser<'a> {
     }
 
     /// The tail of a `GENERATED` column clause ("generated" consumed): either
-    /// `ALWAYS AS (expr) STORED` (returns the raw expression text) or one of the
-    /// IDENTITY forms, which this engine does not yet model (a loud error).
-    pub(super) fn generated_clause(&mut self) -> Result<&'a str, ParseError> {
-        if self.eat_ident("always")? {
+    /// `ALWAYS AS (expr) STORED` or `{ ALWAYS | BY DEFAULT } AS IDENTITY
+    /// [(sequence options)]`.
+    pub(super) fn generated_clause(&mut self) -> Result<crate::sql::ast::ColGen<'a>, ParseError> {
+        use crate::sql::ast::{ColGen, IdentitySpec};
+        let always = if self.eat_ident("always")? {
             self.expect_ident("as")?;
             if self.eat_op("(")? {
                 let start = self.peek_at;
@@ -200,16 +201,37 @@ impl<'a> Parser<'a> {
                 let text = self.text[start..self.peek_at].trim_end();
                 self.expect_op(")")?;
                 self.expect_ident("stored")?;
-                return Ok(text);
+                return Ok(ColGen::Generated(text));
             }
-            self.expect_ident("identity")?;
+            true
         } else {
             self.expect_ident("by")?;
             self.expect_ident("default")?;
             self.expect_ident("as")?;
-            self.expect_ident("identity")?;
+            false
+        };
+        self.expect_ident("identity")?;
+        // Optional `(START WITH n INCREMENT BY n ...)` sequence options.
+        let mut start = None;
+        let mut increment = None;
+        if self.eat_op("(")? {
+            while !self.eat_op(")")? {
+                if self.eat_ident("start")? {
+                    let _ = self.eat_ident("with")?;
+                    start = Some(self.seq_int()?);
+                } else if self.eat_ident("increment")? {
+                    let _ = self.eat_ident("by")?;
+                    increment = Some(self.seq_int()?);
+                } else {
+                    // MIN/MAXVALUE, CACHE, CYCLE would need the full per-column
+                    // sequence machinery; rejected loudly rather than dropped.
+                    return Err(self.err_here(
+                        "only START and INCREMENT are supported in an identity column's options",
+                    ));
+                }
+            }
         }
-        Err(self.err_here("GENERATED ... AS IDENTITY is not supported"))
+        Ok(ColGen::Identity(IdentitySpec { always, start, increment }))
     }
 
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] AS <query>
@@ -477,7 +499,7 @@ impl<'a> Parser<'a> {
             // Otherwise it is a column definition whose name we already read.
             pending_first_col = Some(first_ident);
         }
-        let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None, default_text: None, generated_text: None }; MAX_LIST];
+        let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None, default_text: None, generated_text: None, identity: None }; MAX_LIST];
         let mut n = 0;
         let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
         let mut n_cons = 0;
@@ -551,6 +573,7 @@ impl<'a> Parser<'a> {
             let mut default = None;
             let mut default_text = None;
             let mut generated_text = None;
+            let mut identity = None;
             loop {
                 // Column-level constraints may carry their own CONSTRAINT name.
                 let col_cons_name = if self.eat_ident("constraint")? {
@@ -622,14 +645,17 @@ impl<'a> Parser<'a> {
                     n_cons += 1;
                     continue;
                 } else if self.eat_ident("generated")? {
-                    generated_text = Some(self.generated_clause()?);
+                    match self.generated_clause()? {
+                        crate::sql::ast::ColGen::Generated(text) => generated_text = Some(text),
+                        crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
+                    }
                 } else if col_cons_name.is_some() {
                     return Err(self.err_here("expected a column constraint after CONSTRAINT name"));
                 } else {
                     break;
                 }
             }
-            columns[n] = ColumnDef { name: col_name, type_name, type_mod, not_null, unique, primary, default, default_text, generated_text };
+            columns[n] = ColumnDef { name: col_name, type_name, type_mod, not_null, unique, primary, default, default_text, generated_text, identity };
             n += 1;
             if !self.eat_op(",")? {
                 break;

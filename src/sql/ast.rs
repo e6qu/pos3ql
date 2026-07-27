@@ -100,9 +100,8 @@ pub enum Stmt<'a> {
     Set { name: &'a str, value: &'a str, local: bool },
     /// RESET name / RESET ALL restores one or every settable GUC to default.
     Reset(Option<&'a str>),
-    /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ...:
-    /// the engine provides one isolation level, so the clause is acknowledged.
-    SetTransaction,
+    /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ....
+    SetTransaction(&'a str),
     Show(&'a str),
     /// SHOW ALL: every readable setting as (name, setting, description).
     ShowAll,
@@ -1286,7 +1285,7 @@ impl Expr<'_> {
                 "lastval", "setval", "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
                 "current_user", "session_user", "user", "current_role", "current_schema",
                 "current_database", "current_catalog", "pg_backend_pid", "txid_current",
-                "pg_current_xact_id", "current_setting", "set_config",
+                "pg_current_xact_id", "pg_is_in_recovery", "current_setting", "set_config",
             ];
             NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
         }

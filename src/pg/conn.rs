@@ -727,31 +727,47 @@ impl Conn {
             }
             wire::FMSG_COPY_DONE => self.copy_finish(engine),
             wire::FMSG_COPY_FAIL => {
+                let message = MsgIn::new(&self.recv.readable()[5..total])
+                    .cstr()
+                    .unwrap_or("client sent an invalid CopyFail message");
+                let detail = crate::stack_format!(256, "COPY from stdin failed: {message}");
+                let extended = self.copy.as_ref().expect("in copy-in mode").extended;
                 engine.copy_abort(&mut self.txn, &self.guc);
                 self.copy = None;
                 self.copy_buf.clear();
-                let status = self.txn.status_byte();
                 let mut responder = Responder::new(&mut self.send);
-                let sent = responder
-                    .error(sqlstate::QUERY_CANCELED, "COPY from stdin failed")
-                    .and_then(|()| responder.ready_for_query(status));
+                let sent = responder.error(sqlstate::QUERY_CANCELED, detail.as_str());
+                if extended {
+                    self.phase = Phase::SkipToSync;
+                }
+                let sent = if extended {
+                    sent
+                } else {
+                    sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                };
                 if sent.is_err() { Step::Close } else { Step::Continue }
             }
             wire::FMSG_TERMINATE => Step::Close,
             // Flush and Sync during copy-in are ignored, as PostgreSQL does.
             wire::FMSG_SYNC | wire::FMSG_FLUSH => Step::Continue,
             _ => {
+                let extended = self.copy.as_ref().expect("in copy-in mode").extended;
                 engine.copy_abort(&mut self.txn, &self.guc);
                 self.copy = None;
                 self.copy_buf.clear();
-                let status = self.txn.status_byte();
                 let mut responder = Responder::new(&mut self.send);
-                let sent = responder
-                    .error(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "unexpected message type during COPY from stdin",
-                    )
-                    .and_then(|()| responder.ready_for_query(status));
+                let sent = responder.error(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "unexpected message type during COPY from stdin",
+                );
+                if extended {
+                    self.phase = Phase::SkipToSync;
+                }
+                let sent = if extended {
+                    sent
+                } else {
+                    sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                };
                 if sent.is_err() { Step::Close } else { Step::Continue }
             }
         }
@@ -925,6 +941,7 @@ impl Conn {
             self.copy_buf.clear();
         }
         let copy = self.copy.take().expect("in copy-in mode");
+        let extended = copy.extended;
         let outcome = match copy.failed {
             Some(e) => {
                 engine.copy_abort(&mut self.txn, &self.guc);
@@ -932,14 +949,21 @@ impl Conn {
             }
             None => engine.copy_finish(&mut self.txn, &self.guc).map(|()| copy.count),
         };
-        let status = self.txn.status_byte();
+        let failed = outcome.is_err();
         let mut responder = Responder::new(&mut self.send);
         let sent = match outcome {
             Ok(count) => responder
                 .command_complete(crate::stack_format!(32, "COPY {count}").as_str()),
             Err(e) => responder.error(e.sqlstate, e.message.as_str()),
+        };
+        if extended && failed {
+            self.phase = Phase::SkipToSync;
         }
-        .and_then(|()| responder.ready_for_query(status));
+        let sent = if extended {
+            sent
+        } else {
+            sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+        };
         if sent.is_err() { Step::Close } else { Step::Continue }
     }
 
@@ -1272,7 +1296,7 @@ impl Conn {
         // from its buffer, even for a following Execute with max_rows=0.
         // A fresh portal buffers when paged (max_rows>0), else streams.
         let already_started = self.portals[portal_slot].executed;
-        let paged = max_rows > 0 || already_started;
+        let mut paged = max_rows > 0 || already_started;
         let need_run = !already_started;
 
         if need_run {
@@ -1284,6 +1308,12 @@ impl Conn {
             }
             let text =
                 core::str::from_utf8(prepared.text.readable()).expect("stored from valid UTF-8");
+            if engine.is_copy_statement(text, &self.arena) {
+                // COPY uses CopyData framing, not DataRow/PortalSuspended.
+                // Stream it even when Execute carries a nonzero max_rows.
+                paged = false;
+                self.arena.reset();
+            }
             let mut params = [Datum::Null; MAX_BIND_PARAMS];
             let raw = portal.params.readable();
             // Resolve any parameter the client left untyped (OID 0) from its use
@@ -1348,21 +1378,14 @@ impl Conn {
                 )
             };
             engine.maybe_checkpoint();
-            if engine.take_pending_copy().is_some() {
-                // The extended protocol's COPY flow (CopyInResponse after
-                // Execute) is not wired; refuse loudly rather than leave
-                // the portal cycle wedged. psql and pg_dump use the simple
-                // protocol for COPY.
-                engine.copy_abort(&mut self.txn, &self.guc);
-                return ext_err(&mut self.send, &mut self.phase, 
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "COPY FROM STDIN is not supported via the extended protocol",
-                );
-            }
+            let pending_copy = engine.take_pending_copy();
             self.arena.reset();
             match result {
                 Ok(true) => {}
                 Ok(false) => {
+                    if pending_copy.is_some() {
+                        engine.copy_abort(&mut self.txn, &self.guc);
+                    }
                     if paged {
                         // Forward the buffered error output.
                         let portal = &mut self.portals[portal_slot];
@@ -1375,7 +1398,36 @@ impl Conn {
                     self.phase = Phase::SkipToSync;
                     return Step::Continue;
                 }
-                Err(WireFull) => return Step::Close,
+                Err(WireFull) => {
+                    if pending_copy.is_some() {
+                        engine.copy_abort(&mut self.txn, &self.guc);
+                    }
+                    return Step::Close;
+                }
+            }
+            if let Some(setup) = pending_copy {
+                if paged {
+                    let portal = &mut self.portals[portal_slot];
+                    let bytes_ok = self.send.append(portal.result.readable());
+                    portal.result.clear();
+                    if !bytes_ok {
+                        engine.copy_abort(&mut self.txn, &self.guc);
+                        return Step::Close;
+                    }
+                }
+                let header_pending = setup.fmt.header;
+                let binary_header_pending = setup.fmt.binary;
+                self.copy = Some(CopyInProgress {
+                    setup,
+                    count: 0,
+                    failed: None,
+                    end_seen: false,
+                    header_pending,
+                    binary_header_pending,
+                    extended: true,
+                });
+                self.copy_buf.clear();
+                return Step::Continue;
             }
             if paged {
                 self.portals[portal_slot].executed = true;
@@ -1508,6 +1560,7 @@ impl Conn {
                         end_seen: false,
                         header_pending,
                         binary_header_pending,
+                        extended: false,
                     });
                     self.copy_buf.clear();
                     self.recv.consume(total);
@@ -1594,6 +1647,9 @@ struct CopyInProgress {
     header_pending: bool,
     /// Binary format: the file header (signature + flags) is still to consume.
     binary_header_pending: bool,
+    /// Extended-query COPY completes with CommandComplete/ErrorResponse only;
+    /// ReadyForQuery belongs to a later Sync. Simple-query COPY sends it here.
+    extended: bool,
 }
 
 fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {

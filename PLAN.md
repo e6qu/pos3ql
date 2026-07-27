@@ -854,12 +854,17 @@ adaptive-execution capstone. This section is the plan of record for all of it.
 
 - **COPY** — IN/OUT in text, CSV, and binary are implemented (see the datatype
   section above; binary is byte-exact against PostgreSQL across the whole type
-  surface, composites included). What remains of this once-largest hole is the
-  end-to-end `pg_dump`/`pg_restore` round-trip, gated not on COPY itself but on
-  the `pg_catalog` surface `pg_dump` queries. Milestone: *a pg_dump of a pos3ql
-  database restores into real PostgreSQL, and vice versa* — which doubles as the
-  forcing function for the remaining `pg_catalog` completeness (`\d table`,
-  B-033). The extended-protocol COPY sub-flow is refused pending its own wiring.
+  surface, composites included). The extended-protocol sub-flow is complete:
+  COPY IN holds its implicit transaction through CopyDone, observes extended
+  Sync/error recovery, preserves CopyFail's client reason, and COPY OUT streams
+  independently of Execute's row limit. What remains is the end-to-end
+  `pg_dump`/`pg_restore` round-trip. PostgreSQL 18's connection bootstrap now
+  works and the first catalog discovery passes, but a consistent dump requires
+  `REPEATABLE READ, READ ONLY` plus table locks. pos3ql now rejects those
+  unsupported transaction characteristics instead of silently claiming them;
+  the real implementation is gated by Stage F's multi-version LSN snapshots
+  as well as the remaining `pg_catalog` surface (`\d table`, B-033). Milestone:
+  *a pg_dump of a pos3ql database restores into real PostgreSQL, and vice versa*.
 - **Server-side TLS for clients** — done. With `tls_on` (plus `tls_cert_file`
   and `tls_key_file`), the SSLRequest probe is answered `S` and the connection
   negotiates TLS; a client that does not ask for TLS still connects in the
@@ -1739,8 +1744,10 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
    prior Describe. Verified by `tests/external/binary_param_diff.py` (arrays with
    NULL/empty, int4/int8 ranges incl. the untyped empty range, multiranges)
    diffing against real PostgreSQL. The extended-protocol COPY flow is refused
-   pending its own wiring. The pg_dump round-trip milestone stays open pending
-   the catalog surface pg_dump queries.
+   fully streams COPY IN and OUT through Parse/Bind/Execute too, including
+   PostgreSQL's CopyFail and Sync recovery. The pg_dump round-trip milestone
+   stays open pending Stage F's repeatable-read snapshots/table locks and the
+   remaining catalog surface pg_dump queries.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;

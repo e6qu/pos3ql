@@ -493,8 +493,13 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.row_security = defaults.row_security;
     } else if name.eq_ignore_ascii_case("bytea_output") {
         values.bytea_escape = defaults.bytea_escape;
+    } else if name.eq_ignore_ascii_case("intervalstyle") {
+        // Interval rendering is fixed to PostgreSQL's default style.
+    } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
+        // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
         || name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
+        || name.eq_ignore_ascii_case("transaction_timeout")
     {
         // Their only accepted value is already the fixed default.
     } else if is_read_only(name) {
@@ -572,6 +577,24 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "standard_conforming_strings can only be on (strings always conform)"
+        ));
+    }
+    if name.eq_ignore_ascii_case("intervalstyle") {
+        if is_default || v.eq_ignore_ascii_case("postgres") {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "IntervalStyle can only be postgres (other interval renderings are not supported)"
+        ));
+    }
+    if name.eq_ignore_ascii_case("synchronize_seqscans") {
+        if is_default || v.eq_ignore_ascii_case("off") {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "synchronize_seqscans can only be off (synchronized scans are not supported)"
         ));
     }
     if name.eq_ignore_ascii_case("client_min_messages") {
@@ -653,9 +676,11 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         }
         return store(&mut values.statement_timeout, v);
     }
-    if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
-        // No idle-in-transaction reaper yet, so only the disabled value is
-        // honored; a non-zero value would be a silent no-operator.
+    if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
+        || name.eq_ignore_ascii_case("transaction_timeout")
+    {
+        // These timeout mechanisms do not run yet, so only the disabled value
+        // is honored; a non-zero value would be a silent no-operator.
         if is_default || v == "0" {
             return Ok(());
         }
@@ -731,7 +756,9 @@ impl GucState {
             Some(StackStr::from_str(values.row_security.as_str()))
         } else if name.eq_ignore_ascii_case("statement_timeout") {
             Some(StackStr::from_str(values.statement_timeout.as_str()))
-        } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
+        } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
+            || name.eq_ignore_ascii_case("transaction_timeout")
+        {
             Some(StackStr::from_str("0"))
         } else if name.eq_ignore_ascii_case("bytea_output") {
             Some(StackStr::from_str(if values.bytea_escape {
@@ -739,6 +766,10 @@ impl GucState {
             } else {
                 "hex"
             }))
+        } else if name.eq_ignore_ascii_case("intervalstyle") {
+            Some(StackStr::from_str("postgres"))
+        } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
+            Some(StackStr::from_str("off"))
         } else {
             None
         }

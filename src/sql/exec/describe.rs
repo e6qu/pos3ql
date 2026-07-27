@@ -1693,11 +1693,12 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
             }
             "current_date" => of(ColType::Date),
+            "pg_is_in_recovery" => of(ColType::Bool),
             // The identifier-returning functions are `name`-typed in PostgreSQL.
             "current_user" | "session_user" | "user" | "current_role" | "current_schema"
             | "current_database" | "current_catalog" => of(ColType::Name),
             // current_setting(name [, missing_ok]) returns the value as text.
-            "current_setting" | "set_config" => of(ColType::Text),
+            "current_setting" | "set_config" | "acldefault" => of(ColType::Text),
             "current_time" => of(ColType::Timetz),
             "localtime" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),

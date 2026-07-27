@@ -1,6 +1,7 @@
 //! System / introspection built-ins.
 //!
-//! Covers session identity (`version`, `current_database`/`current_catalog`,
+//! Covers server identity/state (`version`, `pg_is_in_recovery`), session identity
+//! (`current_database`/`current_catalog`,
 //! `current_schema`/`current_schemas`, `current_user`/`session_user`/`user`,
 //! `pg_get_userbyid`), the always-true visibility/privilege predicates, the
 //! catalog-definition reconstructors (`pg_get_indexdef`/`pg_get_constraintdef`
@@ -161,6 +162,7 @@ pub(crate) fn dispatch<'a>(
     if !matches!(
         name,
         "version"
+            | "pg_is_in_recovery"
             | "current_database"
             | "current_catalog"
             | "current_schema"
@@ -193,6 +195,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_typeof"
             | "current_setting"
             | "set_config"
+            | "acldefault"
     ) {
         return None;
     }
@@ -217,6 +220,17 @@ pub(crate) fn dispatch<'a>(
                     env!("CARGO_PKG_VERSION"),
                     ") on aarch64-apple-darwin"
                 )))
+            }
+            // pos3ql is a single-primary server and has no recovery/standby mode.
+            "pg_is_in_recovery" => {
+                arity(0)?;
+                Ok(Datum::Bool(false))
+            }
+            // There are no grantable ACLs yet. Catalog rows therefore have the
+            // same empty default ACL for every supported object kind.
+            "acldefault" => {
+                arity(2)?;
+                Ok(Datum::Text("{}"))
             }
             "current_database" | "current_catalog" => {
                 arity(0)?;

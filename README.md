@@ -78,7 +78,8 @@ Working single-node database:
   `RESET ALL` and `current_setting(...)` / `set_config(...)` for session
   settings (including savepoint rollback),
   PostgreSQL lexical rules, and SQLSTATE-correct errors.
-- COPY FROM STDIN / TO STDOUT (including `COPY (query) TO STDOUT`) in
+- COPY FROM STDIN / TO STDOUT (including `COPY (query) TO STDOUT`) over both
+  the simple and extended query protocols, in
   PostgreSQL's text, CSV, and binary formats —
   psql `\copy` and pg_dump-style inline data streams work, with each type's
   input and output functions and full constraint enforcement. The binary format

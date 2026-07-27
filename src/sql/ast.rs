@@ -766,9 +766,13 @@ pub enum Overriding {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OnConflict<'a> {
-    /// Conflict-target columns (`ON CONFLICT (a, b)`); empty means any unique
-    /// constraint or unique index.
+    /// Conflict-target columns (`ON CONFLICT (a, b)`); empty means no
+    /// column-inference target was given (either a named `constraint`, or —
+    /// with neither — any unique constraint for DO NOTHING).
     pub target: &'a [&'a str],
+    /// A named arbiter constraint (`ON CONFLICT ON CONSTRAINT name`); mutually
+    /// exclusive with a column `target`.
+    pub constraint: Option<&'a str>,
     /// `None` = DO NOTHING; `Some` = DO UPDATE SET .... Assignments may
     /// reference the target row's columns and `excluded.<col>` (the proposed
     /// row).

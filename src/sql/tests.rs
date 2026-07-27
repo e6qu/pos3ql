@@ -664,6 +664,48 @@ fn on_conflict_do_nothing() {
 }
 
 #[test]
+fn on_conflict_arbiter_and_returning() {
+    // Arbiter resolution (matching PostgreSQL 18.4): the conflict is caught only
+    // on the inferred/named unique, RETURNING projects the post-update row, and
+    // the analysis errors fire regardless of the data.
+    let (mut e, mut b) = test_engine();
+    macro_rules! run {
+        ($sql:expr) => {
+            run_with(&mut e, &mut b, $sql)
+        };
+    }
+    let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    run!("CREATE TABLE oc (a int UNIQUE, b int UNIQUE, note text)");
+    run!("INSERT INTO oc VALUES (1,10,'x'),(2,20,'y')");
+
+    // DO UPDATE ... RETURNING returns the updated row's post-update values.
+    let out = run!("INSERT INTO oc VALUES (1,10,'z') ON CONFLICT (a) DO UPDATE SET note='upd' RETURNING a,b,note");
+    assert_eq!(data_rows(&out), ["1|10|upd"]);
+
+    // ON CONSTRAINT names the arbiter directly (auto-named single-col unique).
+    let out = run!("INSERT INTO oc VALUES (99,20,'z') ON CONFLICT ON CONSTRAINT oc_b_key DO UPDATE SET note='byname' RETURNING a,b,note");
+    assert_eq!(data_rows(&out), ["2|20|byname"]);
+
+    // A conflict on a DIFFERENT unique than the arbiter is not caught — it
+    // falls through to a normal duplicate-key error.
+    assert!(err(&run!("INSERT INTO oc VALUES (1,999,'d') ON CONFLICT (b) DO UPDATE SET note='no'")).contains("23505"), "non-arbiter conflict is 23505");
+
+    // Analysis errors, independent of whether a row conflicts:
+    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT DO UPDATE SET note='q'")).contains("42601"), "DO UPDATE needs an arbiter");
+    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT (note) DO NOTHING")).contains("42P10"), "target must be unique");
+    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT (nope) DO NOTHING")).contains("42703"), "target column must exist");
+    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT ON CONSTRAINT nope DO NOTHING")).contains("42704"), "named constraint must exist");
+
+    // Composite-key arbiter matches order-independently; ON CONSTRAINT by pkey.
+    run!("CREATE TABLE cc (x int, y int, v text, PRIMARY KEY (x,y))");
+    run!("INSERT INTO cc VALUES (1,2,'a')");
+    let out = run!("INSERT INTO cc VALUES (1,2,'b') ON CONFLICT (y,x) DO UPDATE SET v=excluded.v RETURNING x,y,v");
+    assert_eq!(data_rows(&out), ["1|2|b"]);
+    let out = run!("INSERT INTO cc VALUES (1,2,'multi'),(3,4,'fresh') ON CONFLICT ON CONSTRAINT cc_pkey DO UPDATE SET v=excluded.v RETURNING x,y,v");
+    assert_eq!(data_rows(&out), ["1|2|multi", "3|4|fresh"]);
+}
+
+#[test]
 fn multi_column_unique_and_primary_key() {
     // SQLSTATEs verified against PostgreSQL 18.4: duplicate multi-column key
     // is 23505; a NULL member makes the tuple distinct (no conflict).

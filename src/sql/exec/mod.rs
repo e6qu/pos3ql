@@ -488,15 +488,144 @@ fn next_auto_value<'x>(
     Ok(out)
 }
 
-/// Finds an existing visible row that conflicts with the candidate on a
-/// column-level UNIQUE/PRIMARY KEY or a UNIQUE index — the row ON CONFLICT
-/// acts on. NULLs are distinct, so a candidate with a NULL key never conflicts.
+/// The unique constraint or index an `ON CONFLICT` clause arbitrates on.
+/// `Any` (no target, DO NOTHING) treats a violation of *any* unique constraint
+/// as the conflict; `Columns` restricts the conflict to rows equal on exactly
+/// this column set, so a violation of a *different* unique falls through to a
+/// normal 23505 — matching PostgreSQL, which uses the arbiter index alone.
+enum Arbiter {
+    Any,
+    Columns([u16; crate::storage::MAX_INDEX_COLS], usize),
+}
+
+/// Does some unique constraint/index on `def` cover exactly `want` (as a set,
+/// order-independent)? Validates an `ON CONFLICT (columns)` inference target.
+fn unique_arbiter_matches(storage: &Storage, def: &TableDef, want: &[u16], txid: u32) -> bool {
+    let same = |cols: &[u16]| cols.len() == want.len() && want.iter().all(|w| cols.contains(w));
+    for (i, c) in def.columns().iter().enumerate() {
+        if c.unique && same(&[i as u16]) {
+            return true;
+        }
+    }
+    for uk in def.uniques() {
+        if same(uk.columns()) {
+            return true;
+        }
+    }
+    for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if same(&index.columns[..index.n_cols]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolves `ON CONSTRAINT name` to the named arbiter's column set: a named
+/// UNIQUE/PRIMARY KEY, a unique index, or a single-column key's synthesized
+/// name (`<table>_pkey` / `<table>_<col>_key`).
+fn arbiter_by_name(
+    storage: &Storage,
+    def: &TableDef,
+    name: &str,
+    txid: u32,
+) -> Option<([u16; crate::storage::MAX_INDEX_COLS], usize)> {
+    let mut cols = [0u16; crate::storage::MAX_INDEX_COLS];
+    for uk in def.uniques() {
+        if uk.name.as_str() == name {
+            let n = uk.n_cols;
+            cols[..n].copy_from_slice(uk.columns());
+            return Some((cols, n));
+        }
+    }
+    for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if index.name.as_str() == name {
+            let n = index.n_cols;
+            cols[..n].copy_from_slice(&index.columns[..n]);
+            return Some((cols, n));
+        }
+    }
+    for (i, c) in def.columns().iter().enumerate() {
+        let synth = if c.primary {
+            ddl::auto_key_name(def, &[i as u16], "pkey", false)
+        } else if c.unique {
+            ddl::auto_key_name(def, &[i as u16], "key", true)
+        } else {
+            continue;
+        };
+        if synth.map(|nm| nm.as_str() == name).unwrap_or(false) {
+            cols[0] = i as u16;
+            return Some((cols, 1));
+        }
+    }
+    None
+}
+
+/// Resolves an `ON CONFLICT` clause's arbiter, raising PostgreSQL's analysis
+/// errors (a data-independent step: it runs even when no row conflicts).
+fn resolve_arbiter(
+    storage: &Storage,
+    def: &TableDef,
+    oc: &super::ast::OnConflict,
+    txid: u32,
+) -> Result<Arbiter, SqlError> {
+    if !oc.target.is_empty() {
+        let mut want = [0u16; crate::storage::MAX_INDEX_COLS];
+        let mut n = 0;
+        for name in oc.target {
+            let Some(index) = def.column_index(name) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ));
+            };
+            if n == crate::storage::MAX_INDEX_COLS {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "ON CONFLICT target has too many columns"
+                ));
+            }
+            want[n] = index as u16;
+            n += 1;
+        }
+        if unique_arbiter_matches(storage, def, &want[..n], txid) {
+            return Ok(Arbiter::Columns(want, n));
+        }
+        return Err(sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+        ));
+    }
+    if let Some(cname) = oc.constraint {
+        if let Some((cols, n)) = arbiter_by_name(storage, def, cname, txid) {
+            return Ok(Arbiter::Columns(cols, n));
+        }
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "constraint \"{}\" for table \"{}\" does not exist",
+            cname,
+            def.name.as_str()
+        ));
+    }
+    if oc.update.is_some() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "ON CONFLICT DO UPDATE requires inference specification or constraint name"
+        ));
+    }
+    Ok(Arbiter::Any)
+}
+
+/// Finds an existing visible row that conflicts with the candidate on the
+/// resolved [`Arbiter`] — the row `ON CONFLICT` acts on. NULLs are distinct, so
+/// a candidate with a NULL key column never conflicts.
 fn find_conflict(
     storage: &Storage,
     table_index: usize,
     def: &TableDef,
     schema: &[ColType],
     values: &[Datum],
+    arbiter: &Arbiter,
     txid: u32,
 ) -> Option<u64> {
     let mut found: Option<u64> = None;
@@ -516,32 +645,37 @@ fn find_conflict(
                         && !b.is_null()
                         && compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false)
                 };
-                for (i, c) in def.columns().iter().enumerate() {
-                    if c.unique && eq(&values[i], &other[i]) {
-                        return Ok(true);
-                    }
-                }
-                // Table-level keys, including the single-column ones that carry
-                // an explicit name (so they live here rather than on a flag).
-                for uk in def.uniques() {
-                    let cols = uk.columns();
-                    if !cols.iter().any(|&c| values[c as usize].is_null())
+                let key_hit = |cols: &[u16]| {
+                    !cols.iter().any(|&c| values[c as usize].is_null())
                         && cols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
-                    {
-                        return Ok(true);
+                };
+                match arbiter {
+                    // A named/inferred arbiter conflicts on its own columns only.
+                    Arbiter::Columns(cols, n) => Ok(key_hit(&cols[..*n])),
+                    // No target (DO NOTHING): any unique violation is a conflict.
+                    Arbiter::Any => {
+                        for (i, c) in def.columns().iter().enumerate() {
+                            if c.unique && eq(&values[i], &other[i]) {
+                                return Ok(true);
+                            }
+                        }
+                        for uk in def.uniques() {
+                            if key_hit(uk.columns()) {
+                                return Ok(true);
+                            }
+                        }
+                        for index in storage.unique_indexes_for(
+                            def.schema.as_str(),
+                            def.name.as_str(),
+                            txid,
+                        ) {
+                            if key_hit(&index.columns[..index.n_cols]) {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
                     }
                 }
-                for index in
-                    storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
-                {
-                    let icols = &index.columns[..index.n_cols];
-                    if !icols.iter().any(|&c| values[c as usize].is_null())
-                        && icols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
-                    {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
             })
             .unwrap_or(false);
         if hit {
@@ -585,15 +719,18 @@ impl<'v> ColumnLookup<'v> for ExcludedCtx<'_, 'v, '_> {
     }
 }
 
-enum ConflictOutcome {
+enum ConflictOutcome<'a> {
     Store,
     Skip,
-    Updated,
+    /// DO UPDATE applied; carries the arena-encoded updated row so RETURNING can
+    /// project the post-update values (PostgreSQL returns the updated row).
+    Updated(&'a [u8]),
 }
 
-/// Applies an ON CONFLICT clause to one candidate row.
+/// Applies an ON CONFLICT clause to one candidate row, against the arbiter
+/// already resolved once for the statement.
 #[allow(clippy::too_many_arguments)]
-fn handle_conflict(
+fn handle_conflict<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     table_index: usize,
@@ -601,14 +738,16 @@ fn handle_conflict(
     schema: &[ColType],
     values: &[Datum],
     on_conflict: &Option<super::ast::OnConflict>,
+    arbiter: &Arbiter,
     checks: &ParsedChecks,
-    arena: &Arena,
+    arena: &'a Arena,
     params: &[Datum],
-) -> Result<ConflictOutcome, SqlError> {
+) -> Result<ConflictOutcome<'a>, SqlError> {
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
     };
-    let Some(rowid) = find_conflict(storage, table_index, def, schema, values, txn.txid) else {
+    let Some(rowid) = find_conflict(storage, table_index, def, schema, values, arbiter, txn.txid)
+    else {
         return Ok(ConflictOutcome::Store);
     };
     let Some(assigns) = oc.update else {
@@ -664,7 +803,7 @@ fn handle_conflict(
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
     }
-    Ok(ConflictOutcome::Updated)
+    Ok(ConflictOutcome::Updated(new_bytes))
 }
 
 /// Assigns each omitted/defaulted auto-increment column its next value. A
@@ -4349,6 +4488,16 @@ pub fn insert(
         Err(e) => return sql_fail(e),
     };
 
+    // Resolve the ON CONFLICT arbiter once: PostgreSQL raises its inference
+    // errors up front, independent of whether any row actually conflicts.
+    let arbiter = match &statement.on_conflict {
+        Some(oc) => match resolve_arbiter(storage, &def, oc, txn.txid) {
+            Ok(a) => a,
+            Err(e) => return sql_fail(e),
+        },
+        None => Arbiter::Any,
+    };
+
     // Column list → target indices.
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if statement.columns.is_empty() {
@@ -4505,10 +4654,17 @@ pub fn insert(
             {
                 let mut sch = [ColType::Bool; MAX_COLUMNS];
                 def.schema(&mut sch);
-                match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &checks, arena, params) {
+                match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &arbiter, &checks, arena, params) {
                     Ok(ConflictOutcome::Store) => {}
                     Ok(ConflictOutcome::Skip) => continue,
-                    Ok(ConflictOutcome::Updated) => { inserted += 1; continue; }
+                    Ok(ConflictOutcome::Updated(row_bytes)) => {
+                        inserted += 1;
+                        if !statement.returning.is_empty()
+                            && let Err(e) = emit_conflict_returning(&def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
+                                return sql_fail(e);
+                            }
+                        continue;
+                    }
                     Err(e) => return sql_fail(e),
                 }
             }
@@ -4639,10 +4795,17 @@ pub fn insert(
         {
             let mut sch = [ColType::Bool; MAX_COLUMNS];
             def.schema(&mut sch);
-            match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &checks, arena, params) {
+            match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &arbiter, &checks, arena, params) {
                 Ok(ConflictOutcome::Store) => {}
                 Ok(ConflictOutcome::Skip) => continue,
-                Ok(ConflictOutcome::Updated) => { inserted += 1; continue; }
+                Ok(ConflictOutcome::Updated(row_bytes)) => {
+                    inserted += 1;
+                    if !statement.returning.is_empty()
+                        && let Err(e) = emit_conflict_returning(&def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
+                            return sql_fail(e);
+                        }
+                    continue;
+                }
                 Err(e) => return sql_fail(e),
             }
         }
@@ -4679,6 +4842,28 @@ pub fn insert(
 }
 
 /// Projects `values` through `items` and emits one DataRow.
+/// Emits a `RETURNING` row for the row an `ON CONFLICT DO UPDATE` just wrote,
+/// decoding the arena-encoded updated bytes so the projection sees the
+/// post-update values (matching PostgreSQL, which returns the updated row).
+#[allow(clippy::type_complexity)]
+fn emit_conflict_returning(
+    def: &TableDef,
+    row_bytes: &[u8],
+    items: &[SelectItem],
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+) -> Result<Result<(), SqlError>, WireFull> {
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    let mut updated = [Datum::Null; MAX_COLUMNS];
+    if let Err(e) = rowenc::decode(row_bytes, &schema[..def.n_columns], &mut updated) {
+        return Ok(Err(e));
+    }
+    emit_projected(def, &updated[..def.n_columns], items, arena, params, responder, capture)
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_projected(
     def: &TableDef,

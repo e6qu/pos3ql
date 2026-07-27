@@ -4096,6 +4096,7 @@ pub fn merge(
         with_ties: false,
         with: &[],
         set_body: None,
+        locking: &[],
     };
     // Copy the synthesized def out of the borrow (it is tied to `storage`),
     // so the write path below can borrow storage mutably.

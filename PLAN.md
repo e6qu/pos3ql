@@ -1356,6 +1356,28 @@ projects its post-update values (and `excluded.*`), composing with a multi-row
 upsert (each inserted or updated row appears) and the data-modifying-CTE capture
 path. Corpus `66_on_conflict`, with unit tests.
 
+### Row-locking clauses — FOR UPDATE / SHARE (2026-07-27)
+
+`SELECT ... FOR UPDATE` (and `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY
+SHARE`, each with an optional `OF table` list and `NOWAIT` / `SKIP LOCKED`) was
+a flat syntax error — a real hole, since every ORM emits it
+(`select_for_update()`, `.lock`, `with_for_update()`). It now parses, and its
+analysis-time semantics are byte-for-byte with PostgreSQL: the clause returns
+the query's rows unchanged in a single session, the restrictions raise `0A000`
+with the clause's own keyword (aggregate / `GROUP BY` / `HAVING` / `DISTINCT` /
+window function / set operation), and an `OF` target that names no FROM relation
+raises `42P01` (an aliased table is reachable only by its alias). A FROM-less
+`SELECT 1 FOR UPDATE` is allowed (it locks nothing) — which surfaced a latent
+bare-alias bug the fix also closes: `for` and `fetch` were missing from the
+implicit-alias reserved set, so `SELECT 1 FOR UPDATE` / `SELECT 1 FETCH FIRST 1
+ROW ONLY` swallowed the keyword as a column alias. The clause validates in the
+simple-query, extended-protocol, and `DECLARE CURSOR` paths. Corpus
+`67_for_update`, with unit tests. The one behavior deliberately left unmodeled
+is the cross-transaction lock *contention* (block / `55P03` / skip when another
+transaction holds the row) — pos3ql's run-to-completion core cannot block, and
+the no-lost-update safety is already delivered by the existing `40001`
+write-conflict detection; documented as B-175, the same architecture as B-004.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

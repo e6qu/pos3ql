@@ -88,6 +88,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         with_ties: false,
         with: &[],
         set_body: None,
+        locking: &[],
     };
     let inner = arena.alloc(inner).map_err(|_| arena_full())?;
 
@@ -165,6 +166,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         with_ties: statement.with_ties,
         with: &[],
         set_body: None,
+        locking: &[],
     };
     Ok(&*arena.alloc(outer).map_err(|_| arena_full())?)
 }

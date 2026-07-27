@@ -224,6 +224,10 @@ pub struct SetQuery<'a> {
     /// `FETCH FIRST n ROWS WITH TIES`: after the limit, also keep rows tying
     /// with the last one on the `ORDER BY` keys.
     pub with_ties: bool,
+    /// Trailing `FOR UPDATE`/… clauses. A set operation can never be locked, so
+    /// a non-empty list here is rejected at execution; carried only to raise
+    /// PostgreSQL's exact error.
+    pub locking: &'a [LockClause<'a>],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -256,6 +260,53 @@ pub struct Select<'a> {
     /// subquery position): its rows come from `set_body`, and only `order_by`
     /// / `limit` / `offset` above apply. `items`/`from`/etc. are unused.
     pub set_body: Option<&'a SetTree<'a>>,
+    /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
+    /// when the query carries none.
+    pub locking: &'a [LockClause<'a>],
+}
+
+/// The strength of a `FOR ...` row-locking clause, strongest first (this order
+/// is how PostgreSQL combines two clauses naming the same table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStrength {
+    Update,
+    NoKeyUpdate,
+    Share,
+    KeyShare,
+}
+
+impl LockStrength {
+    /// The clause keyword as PostgreSQL spells it in errors (`FOR UPDATE`, …).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            LockStrength::Update => "FOR UPDATE",
+            LockStrength::NoKeyUpdate => "FOR NO KEY UPDATE",
+            LockStrength::Share => "FOR SHARE",
+            LockStrength::KeyShare => "FOR KEY SHARE",
+        }
+    }
+}
+
+/// What a row-locking clause does when a target row is already locked by another
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWait {
+    /// Block until the lock is released (PostgreSQL's default).
+    Wait,
+    /// Raise `55P03` rather than wait.
+    NoWait,
+    /// Omit the locked row from the result.
+    SkipLocked,
+}
+
+/// A single `FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE } [OF t, …]
+/// [NOWAIT | SKIP LOCKED]` row-locking clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockClause<'a> {
+    pub strength: LockStrength,
+    /// Tables named in `OF`; empty means every base table in the FROM clause.
+    pub of: &'a [&'a str],
+    pub wait: LockWait,
 }
 
 /// One `WITH name [(col, ...)] AS (SELECT ...)` common table expression.

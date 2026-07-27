@@ -211,6 +211,7 @@ fn wrap_set_tree_with<'a>(
         with_ties: false,
         with,
         set_body: Some(tree),
+        locking: &[],
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -415,6 +416,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         with_ties: false,
         with: &[],
         set_body: Some(tree),
+        locking: &[],
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -631,6 +633,7 @@ fn subst_select<'a>(
         with_ties: s.with_ties,
         with: &[],
         set_body,
+        locking: &[],
     };
     Ok(&*arena.alloc(new).map_err(|_| arena_full())?)
 }

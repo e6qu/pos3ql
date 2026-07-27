@@ -23,6 +23,8 @@ pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
 pub const MAX_LIST: usize = 64;
 
 pub const MAX_CTES: usize = 16;
+/// Maximum number of `FOR UPDATE`/`FOR SHARE`/… clauses on one query.
+pub const MAX_LOCK_CLAUSES: usize = 8;
 /// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
 pub const MAX_WINDOW_DEFS: usize = 16;
 /// Upper bound on warnings one statement's parse may raise.
@@ -796,6 +798,7 @@ impl<'a> Parser<'a> {
             with_ties: false,
             with: &[],
             set_body: None,
+            locking: &[],
         })
     }
 
@@ -943,6 +946,8 @@ impl<'a> Parser<'a> {
         let enclosing_windows = (self.windows, self.n_windows);
         let body = self.set_union()?;
         let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        // Row-locking clauses come last, after ORDER BY / LIMIT / OFFSET.
+        let locking = self.locking_clauses()?;
         (self.windows, self.n_windows) = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
@@ -950,6 +955,7 @@ impl<'a> Parser<'a> {
             sel.limit = limit;
             sel.offset = offset;
             sel.with_ties = with_ties;
+            sel.locking = locking;
             return Ok(sel);
         }
         Ok(Select {
@@ -967,7 +973,63 @@ impl<'a> Parser<'a> {
             with_ties,
             with: &[],
             set_body: Some(body),
+            locking,
         })
+    }
+
+    /// Parses the trailing `FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
+    /// [OF t, …] [NOWAIT | SKIP LOCKED]` row-locking clauses (zero or more).
+    fn locking_clauses(&mut self) -> Result<&'a [LockClause<'a>], ParseError> {
+        let mut clauses = [LockClause {
+            strength: LockStrength::Update,
+            of: &[],
+            wait: LockWait::Wait,
+        }; MAX_LOCK_CLAUSES];
+        let mut n = 0;
+        while self.eat_ident("for")? {
+            if n == MAX_LOCK_CLAUSES {
+                return Err(self.limit("locking clauses", MAX_LOCK_CLAUSES));
+            }
+            let strength = if self.eat_ident("update")? {
+                LockStrength::Update
+            } else if self.eat_ident("no")? {
+                self.expect_ident("key")?;
+                self.expect_ident("update")?;
+                LockStrength::NoKeyUpdate
+            } else if self.eat_ident("share")? {
+                LockStrength::Share
+            } else if self.eat_ident("key")? {
+                self.expect_ident("share")?;
+                LockStrength::KeyShare
+            } else {
+                return Err(self.err_here("expected UPDATE, NO KEY UPDATE, SHARE, or KEY SHARE after FOR"));
+            };
+            let mut of = [""; MAX_LIST];
+            let mut nof = 0;
+            if self.eat_ident("of")? {
+                loop {
+                    if nof == MAX_LIST {
+                        return Err(self.limit("FOR ... OF list", MAX_LIST));
+                    }
+                    of[nof] = self.col_ident("table name")?;
+                    nof += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+            }
+            let wait = if self.eat_ident("nowait")? {
+                LockWait::NoWait
+            } else if self.eat_ident("skip")? {
+                self.expect_ident("locked")?;
+                LockWait::SkipLocked
+            } else {
+                LockWait::Wait
+            };
+            clauses[n] = LockClause { strength, of: self.arena_slice(&of[..nof])?, wait };
+            n += 1;
+        }
+        self.arena_slice(&clauses[..n])
     }
 
     /// A top-level query: a set-operation tree of SELECTs, then the trailing
@@ -994,6 +1056,7 @@ impl<'a> Parser<'a> {
                 with_ties: false,
                 with: &[],
                 set_body: None,
+                locking: &[],
             })
             .map_err(|_| self.err_here("statement too large for SQL arena"))?;
         let mut ctes =
@@ -1053,6 +1116,7 @@ impl<'a> Parser<'a> {
         let enclosing_windows = (self.windows, self.n_windows);
         let body = self.set_union()?;
         let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let locking = self.locking_clauses()?;
         (self.windows, self.n_windows) = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
@@ -1060,9 +1124,10 @@ impl<'a> Parser<'a> {
             sel.limit = limit;
             sel.offset = offset;
             sel.with_ties = with_ties;
+            sel.locking = locking;
             return Ok(Stmt::Select(sel));
         }
-        Ok(Stmt::SetQuery(SetQuery { with: &[], body, order_by, limit, offset, with_ties }))
+        Ok(Stmt::SetQuery(SetQuery { with: &[], body, order_by, limit, offset, with_ties, locking }))
     }
 
     /// UNION / EXCEPT level (lowest precedence, left-associative).
@@ -1132,6 +1197,7 @@ impl<'a> Parser<'a> {
                     with_ties,
                     with: &[],
                     set_body: Some(op),
+                    locking: &[],
                 },
             };
             let boxed = self
@@ -1183,6 +1249,7 @@ impl<'a> Parser<'a> {
                     with_ties: false,
                     with: &[],
                     set_body: None,
+                    locking: &[],
                 };
                 let leaf = self.alloc_set(SetTree::Select(
                     self.arena.alloc(sel).map_err(|_| self.err_here("VALUES too large"))?,
@@ -2683,7 +2750,7 @@ impl<'a> Parser<'a> {
             let reserved = matches!(
                 name,
                 "from" | "where" | "order" | "limit" | "group" | "having" | "union"
-                    | "intersect" | "except" | "window"
+                    | "intersect" | "except" | "window" | "for" | "fetch"
                     | "and" | "or" | "is" | "as" | "asc" | "desc" | "offset"
             );
             if !reserved {

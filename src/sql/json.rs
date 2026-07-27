@@ -490,6 +490,52 @@ impl<'a> Json<'a> {
             _ => None,
         }
     }
+
+    fn is_primitive(&self) -> bool {
+        matches!(self, Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_))
+    }
+}
+
+/// PostgreSQL's jsonb `@>` deep containment: does `container` contain
+/// `contained`? An object contains an object when every member of the
+/// contained side matches a member of the container (deeply); an array contains
+/// an array when every contained element is deeply contained by some container
+/// element; an array contains a bare primitive that appears as one of its
+/// elements; and two primitives match when equal. Every other type pairing (an
+/// array vs an object, a scalar vs a container, …) is not containment.
+pub fn contains(container: &Json, contained: &Json) -> bool {
+    match (container, contained) {
+        (Json::Object(members), Json::Object(sub)) => sub.iter().all(|(sk, sv)| {
+            members
+                .iter()
+                .find(|(k, _)| k == sk)
+                .is_some_and(|(_, v)| contains(v, sv))
+        }),
+        (Json::Array(items), Json::Array(sub)) => {
+            sub.iter().all(|se| items.iter().any(|e| contains(e, se)))
+        }
+        (Json::Array(items), value) if value.is_primitive() => {
+            items.iter().any(|e| contains(e, value))
+        }
+        (a, b) if a.is_primitive() && b.is_primitive() => scalar_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Equality of two JSON primitives. Numbers compare by numeric value (so
+/// `1.0` and `1` match, as PostgreSQL's containment does — jsonb preserves the
+/// written scale, but compares by value).
+fn scalar_eq(a: &Json, b: &Json) -> bool {
+    match (a, b) {
+        (Json::Null, Json::Null) => true,
+        (Json::Bool(x), Json::Bool(y)) => x == y,
+        (Json::Str(x), Json::Str(y)) => x == y,
+        (Json::Number(x), Json::Number(y)) => {
+            x == y
+                || crate::sql::numeric::cmp_decimal_str(x, y) == Some(core::cmp::Ordering::Equal)
+        }
+        _ => false,
+    }
 }
 
 /// Sorts and deduplicates object members into a fresh arena slice, in jsonb key

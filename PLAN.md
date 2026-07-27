@@ -1470,6 +1470,22 @@ rejected. Fixed by routing an SRF subquery through that same executor via
 `generate_series` now expand correctly, including the empty-array and NOT IN
 NULL semantics. Corpus `72_srf_subquery`, with a unit test.
 
+### jsonb containment operators (2026-07-27)
+
+The `jsonb @> jsonb` / `jsonb <@ jsonb` deep-containment operators — the primary
+way applications query jsonb — errored ("operator range operator does not accept
+jsonb"): `@>`/`<@` dispatched to the array and range paths but had no jsonb
+branch. Added PostgreSQL's `JsonbDeepContains`: an object contains an object when
+every contained member matches a container member (recursively); an array
+contains an array when every contained element is deeply contained by some
+container element; an array contains a bare primitive that appears as an element;
+scalars match by value (so `1.0 @> 1`, via numeric comparison, not text); every
+other type pairing is non-containment. An unknown string literal coerces to jsonb
+against a jsonb operand (`doc @> '{"k":1}'`), while plain `json` still has no
+containment operator (`42883`), as PostgreSQL. Implemented on the existing `Json`
+value tree (`json::contains`); the key-existence operators `?`/`?|`/`?&` already
+worked. Corpus `73_jsonb_containment`, with unit-test coverage.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

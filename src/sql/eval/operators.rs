@@ -94,6 +94,44 @@ pub(crate) fn array_set_op<'a>(
     Ok(Datum::Bool(result))
 }
 
+/// `jsonb @> jsonb` (`Contains`) and `jsonb <@ jsonb` (`ContainedBy`) — deep
+/// containment. Both operands must be `jsonb`; plain `json` has no containment
+/// operator (PostgreSQL rejects it), so a non-jsonb operand errors.
+pub(crate) fn jsonb_contains<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    l_unknown: bool,
+    r_unknown: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    // A jsonb operand contributes its stored text; an unknown string literal
+    // coerces to jsonb (validated by the parse below). Anything else — a plain
+    // `json`, a text column — has no containment operator.
+    let jsonb_text = |d: &Datum<'a>, unknown: bool| -> Result<&'a str, SqlError> {
+        match d {
+            Datum::Json { text, jsonb: true } => Ok(text),
+            Datum::Text(text) if unknown => Ok(text),
+            _ => Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: jsonb {} json — cast to jsonb",
+                if operator == BinaryOp::Contains { "@>" } else { "<@" }
+            )),
+        }
+    };
+    let (container_text, contained_text) = if operator == BinaryOp::Contains {
+        (jsonb_text(&l, l_unknown)?, jsonb_text(&r, r_unknown)?)
+    } else {
+        (jsonb_text(&r, r_unknown)?, jsonb_text(&l, l_unknown)?)
+    };
+    let container = crate::sql::json::parse(container_text, arena)?;
+    let contained = crate::sql::json::parse(contained_text, arena)?;
+    Ok(Datum::Bool(crate::sql::json::contains(&container, &contained)))
+}
+
 pub(crate) fn range_op<'a>(
     operator: BinaryOp,
     l: Datum<'a>,
@@ -1547,6 +1585,12 @@ pub(crate) fn binary<'a>(
             if matches!(l, Datum::Multirange { .. }) || matches!(r, Datum::Multirange { .. }) =>
         {
             multirange_op(operator, l, r, arena)
+        }
+        // `jsonb @> jsonb` / `jsonb <@ jsonb` deep containment.
+        Contains | ContainedBy
+            if matches!(l, Datum::Json { .. }) || matches!(r, Datum::Json { .. }) =>
+        {
+            jsonb_contains(operator, l, r, l_unknown, r_unknown, arena)
         }
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => {
             range_op(operator, l, r, arena)

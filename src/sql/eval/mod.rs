@@ -576,6 +576,16 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             fold_check(index, arena)?;
             Ok(None)
         }
+        Expr::Slice { base, lower, upper } => {
+            fold_check(base, arena)?;
+            if let Some(e) = lower {
+                fold_check(e, arena)?;
+            }
+            if let Some(e) = upper {
+                fold_check(e, arena)?;
+            }
+            Ok(None)
+        }
         Expr::Field { base, .. } => {
             fold_check(base, arena)?;
             Ok(None)
@@ -1188,6 +1198,53 @@ pub fn eval_full<'a>(
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
             }
+        }
+        Expr::Slice { base, lower, upper } => {
+            let b = eval_full(base, arena, params, row, hooks)?;
+            let (element, raw) = match b {
+                Datum::Array { element, raw } => (element, raw),
+                Datum::Null => return Ok(Datum::Null),
+                _ => return Err(type_mismatch("cannot slice a non-array", &b)),
+            };
+            // Resolve each bound (1-based, inclusive); an omitted bound defaults
+            // to the array's first/last element, and a NULL bound yields NULL.
+            let bound = |e: &Expr<'a>| -> Result<Option<i64>, SqlError> {
+                match eval_full(e, arena, params, row, hooks)? {
+                    Datum::Int2(x) => Ok(Some(x as i64)),
+                    Datum::Int4(x) => Ok(Some(x as i64)),
+                    Datum::Int8(x) => Ok(Some(x)),
+                    Datum::Null => Ok(None),
+                    other => Err(type_mismatch("array slice bound must be integer", &other)),
+                }
+            };
+            let n = super::array::len(raw) as i64;
+            let lo = match lower {
+                Some(e) => match bound(e)? {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                },
+                None => 1,
+            };
+            let hi = match upper {
+                Some(e) => match bound(e)? {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                },
+                None => n,
+            };
+            // Clamp to the array's 1..n range; an empty overlap is an empty array.
+            let lo = lo.max(1);
+            let hi = hi.min(n);
+            let items: &[Datum] = if lo > hi {
+                &[]
+            } else {
+                arena
+                    .alloc_slice_with((hi - lo + 1) as usize, |i| {
+                        super::array::get(raw, element, (lo as usize - 1) + i).unwrap_or(Datum::Null)
+                    })
+                    .map_err(|_| arena_full())?
+            };
+            Ok(Datum::Array { element, raw: super::array::build(items, arena)? })
         }
         Expr::Field { base, field } => {
             // A `.*` that survived to a value position was not a top-level

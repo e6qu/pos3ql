@@ -338,8 +338,9 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         Expr::Case { synthetic: true, .. } => None,
         Expr::Case { otherwise: Some(e), .. } => name_of(e),
         Expr::Array(_) | Expr::ArraySubquery(_) => Some("array"),
-        // An array subscript keeps the base column's name (`m[1]` → `m`).
-        Expr::Subscript { base, .. } => name_of(base),
+        // An array subscript or slice keeps the base column's name (`m[1]` → `m`,
+        // `m[1:2]` → `m`; a slice of an `ARRAY[...]` constructor is `array`).
+        Expr::Subscript { base, .. } | Expr::Slice { base, .. } => name_of(base),
         // `(record).field` is named after the field.
         Expr::Field { field, .. } => Some(field),
         _ => None,
@@ -1268,6 +1269,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 _ => (oid::UNKNOWN, -2),
             }
         }
+        // An array slice keeps the array type (unlike a subscript, which yields
+        // the element type).
+        Expr::Slice { base, .. } => infer_type_res(base, columns)?,
         // `(record).field`: the field's type from the record's shape. When the
         // shape is not a statically known record (a `_pg_expandarray` result,
         // reached directly or through a derived-table column — the shape driver

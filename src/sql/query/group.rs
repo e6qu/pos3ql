@@ -726,6 +726,9 @@ fn ungrouped_column<'e, 'a>(
             .or_else(|| otherwise.and_then(|o| ungrouped_column(o, group_by, scope))),
         Expr::Array(items) => items.iter().find_map(|e| ungrouped_column(e, group_by, scope)),
         Expr::Subscript { base, index } => first(&[base, index]),
+        Expr::Slice { base, lower, upper } => ungrouped_column(base, group_by, scope)
+            .or_else(|| lower.and_then(|e| ungrouped_column(e, group_by, scope)))
+            .or_else(|| upper.and_then(|e| ungrouped_column(e, group_by, scope))),
         Expr::Field { base, .. } => ungrouped_column(base, group_by, scope),
         Expr::AnyAll { operand, array, .. } => first(&[operand, array]),
     }

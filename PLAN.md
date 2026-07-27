@@ -1486,6 +1486,20 @@ containment operator (`42883`), as PostgreSQL. Implemented on the existing `Json
 value tree (`json::contains`); the key-existence operators `?`/`?|`/`?&` already
 worked. Corpus `73_jsonb_containment`, with unit-test coverage.
 
+### Array slice subscripting (2026-07-27)
+
+Array slices `a[lower:upper]` — with either bound optional (`a[:2]`, `a[2:]`,
+`a[:]`) — were a lexer error ("unexpected ':'"): a lone colon was rejected, so
+only single-element subscripts parsed. The lexer now emits `:` as a token (the
+parser still rejects it anywhere but a slice), a new `Expr::Slice` carries the
+optional bounds, and evaluation extracts the 1-based inclusive range, matching
+PostgreSQL: bounds clamp to the array (a lower below 1 clamps to 1, an upper past
+the end clamps to it), a non-overlapping range is an empty array, and a NULL
+bound yields NULL. The slice keeps the *array* type (unlike a subscript, which
+yields the element type) and the base column's name (`m[1:2]` → `m`, a sliced
+`ARRAY[...]` → `array`), so it composes with `||`, `array_length`, `unnest`, and
+the rest. Corpus `74_array_slicing`, with unit-test coverage.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

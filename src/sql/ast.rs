@@ -1054,6 +1054,9 @@ pub enum Expr<'a> {
     Array(&'a [&'a Expr<'a>]),
     /// `base[index]` array element access (1-based).
     Subscript { base: &'a Expr<'a>, index: &'a Expr<'a> },
+    /// Array slice `base[lower:upper]`; either bound may be omitted (`base[:2]`,
+    /// `base[2:]`, `base[:]`), defaulting to the array's first / last element.
+    Slice { base: &'a Expr<'a>, lower: Option<&'a Expr<'a>>, upper: Option<&'a Expr<'a>> },
     /// `(base).field` composite field access. Used by driver introspection with
     /// the `_pg_expandarray` set function, whose result exposes `.x` (element)
     /// and `.n` (1-based ordinal).
@@ -1165,6 +1168,11 @@ impl Expr<'_> {
             }
             Expr::Array(items) => items.iter().all(|e| e.is_constant()),
             Expr::Subscript { base, index } => base.is_constant() && index.is_constant(),
+            Expr::Slice { base, lower, upper } => {
+                base.is_constant()
+                    && lower.is_none_or(|e| e.is_constant())
+                    && upper.is_none_or(|e| e.is_constant())
+            }
             Expr::Field { base, .. } => base.is_constant(),
             Expr::AnyAll { operand, array, .. } => operand.is_constant() && array.is_constant(),
         }
@@ -1182,6 +1190,11 @@ impl Expr<'_> {
             Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
             | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
                 operand.contains_call()
+            }
+            Expr::Slice { base, lower, upper } => {
+                base.contains_call()
+                    || lower.is_some_and(|e| e.contains_call())
+                    || upper.is_some_and(|e| e.contains_call())
             }
             Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
             | Expr::AnyAll { operand: left, array: right, .. } => {
@@ -1221,6 +1234,11 @@ impl Expr<'_> {
             Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
             | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
                 operand.contains_subquery()
+            }
+            Expr::Slice { base, lower, upper } => {
+                base.contains_subquery()
+                    || lower.is_some_and(|e| e.contains_subquery())
+                    || upper.is_some_and(|e| e.contains_subquery())
             }
             Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
             | Expr::AnyAll { operand: left, array: right, .. } => {
@@ -1283,6 +1301,10 @@ impl Expr<'_> {
             | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
                 operand.contains_nonimmutable_function()
             }
+            Expr::Slice { base, lower, upper } => base
+                .contains_nonimmutable_function()
+                .or_else(|| lower.and_then(|e| e.contains_nonimmutable_function()))
+                .or_else(|| upper.and_then(|e| e.contains_nonimmutable_function())),
             Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
             | Expr::AnyAll { operand: left, array: right, .. } => left
                 .contains_nonimmutable_function()
@@ -1324,6 +1346,15 @@ impl Expr<'_> {
             Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
             | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
                 operand.for_each_column(f)
+            }
+            Expr::Slice { base, lower, upper } => {
+                base.for_each_column(f);
+                if let Some(e) = lower {
+                    e.for_each_column(f);
+                }
+                if let Some(e) = upper {
+                    e.for_each_column(f);
+                }
             }
             Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
             | Expr::AnyAll { operand: left, array: right, .. } => {

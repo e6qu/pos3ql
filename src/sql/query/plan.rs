@@ -813,6 +813,11 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         }
         Array(items) => items.iter().map(|x| postpone_cost(x, scope, arena)).sum(),
         Subscript { base, index } => postpone_cost(base, scope, arena) + postpone_cost(index, scope, arena),
+        Slice { base, lower, upper } => {
+            postpone_cost(base, scope, arena)
+                + lower.map_or(0, |e| postpone_cost(e, scope, arena))
+                + upper.map_or(0, |e| postpone_cost(e, scope, arena))
+        }
         Field { base, .. } => postpone_cost(base, scope, arena),
         AnyAll { operand, array, .. } => {
             let elements = if let Array(items) = array { items.len() as u32 } else { 20 };

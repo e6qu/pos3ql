@@ -56,6 +56,7 @@ data_dir = ${WORK}/p3data
 s3 = ${POS3QL_DIFF_S3:-off}
 max_tables = 64
 table_rows = 65536
+max_value_indexes = 64
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
 ${POS3QL_EXTRA_CONF:-}
 EOF

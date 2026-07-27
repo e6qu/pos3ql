@@ -1399,10 +1399,44 @@ client's state — so a `SET search_path = …` on one connection was still visi
 (through `SHOW` / `SET` / `current_setting`) to the next client to reuse that
 slot. `open` now resets all of it, closing the whole slot-reuse leak class.
 
-The write sibling `set_config(name, value, is_local)` is deferred (B-176): it
-must mutate a session GUC from inside expression evaluation, which the
-deliberately-immutable eval layer and un-threaded `GucState` do not allow without
-a dedicated mutable-settings channel.
+### Transactional GUC mutation (2026-07-27, B-176 — closed)
+
+The write side is now complete as one state machine rather than a punctual
+`set_config` patch. `set_config(name, value, is_local)` mutates during expression
+evaluation, returns the canonical stored value, and a later
+`current_setting` in the same row sees it; a NULL new value means RESET, a NULL
+scope means session, and invalid/unknown/read-only settings raise PostgreSQL's
+`22023`/`42704`/`55P02` errors at the call site. Rendering settings changed by
+the function (`bytea_output`, `DateStyle`, `TimeZone`,
+`client_min_messages`) take effect on that same output row through a
+statement-scoped live render context.
+
+The larger bug class surfaced while wiring it: `SET LOCAL` had been silently
+parsed as session `SET`, ordinary `SET` survived a transaction rollback, and
+`RESET` / `RESET ALL` did not parse. `GucState` now keeps separate visible,
+transaction-start, and eventual-session snapshots behind fixed-size
+interior-mutable state. Session changes persist only after commit; local changes
+end at commit or rollback; `SET` followed by `SET LOCAL` publishes the SET value
+after commit; a session assignment following an unrelated local overlay changes
+only its named setting rather than promoting that overlay; and savepoint
+rollback restores both tracks while RELEASE keeps them. RESET uses the
+connection's startup value (including startup-packet settings), not a hard-coded
+process default. Corpus `75_guc_mutation` exercises the whole surface
+byte-for-byte against PostgreSQL 18.4, with an engine test covering the same
+transaction/savepoint transitions.
+
+That verification exposed a separate harness blind spot (B-177): the
+sqllogictest runner configured 64 tables but left the new uniqueness-index pool
+at its 16-index default, so `select5` exhausted the pool at table 17 and reported
+424 cascading "unsupported" blocks while the wrapper still passed. The harness
+now sizes 64 value indexes too; all 3205 blocks are again real matches, with
+zero unsupported and zero divergence.
+
+The final full-suite pass caught another quality-gate false positive (B-178):
+the SQLSTATE scanner treated any standalone five-character uppercase string as
+an inline code, even ordinary SQL such as `"BEGIN"`. Bare literals are now
+classified only when they immediately follow `sql_err!(`, with a regression
+test proving the scanner still rejects a multiline `"22P02"`.
 
 ### SELECT ... INTO (2026-07-27)
 
@@ -1723,7 +1757,7 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
 
 ## Verification
 
-- `cargo test` — 353 unit/property tests plus the integration suites
+- `cargo test` — 444 unit/property tests plus the integration suites
   (memory guard incl. unwind safety and the TLS budget scope, differential
   FixedMap vs std, PCG32/CRC-32C/SHA-256/SHA-512/HMAC/SigV4 official vectors,
   row codec fuzz-by-truncation, WAL corruption/floor/stale-tail, engine
@@ -1737,8 +1771,9 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
   spill beyond `memtable_bytes`, crash torture vs real PostgreSQL, the TLS
   durability cycle, and the forced-spill differential (the whole suite over a
   256 KiB memtable on MinIO). All green as of 2026-07-24.
-- `tests/external/differential.sh` — 42 corpora + the exact-error corpus +
-  3205 sqllogictest blocks against real PostgreSQL 18.4, plus the generative
+- `tests/external/differential.sh` — 78 corpora + 3 exact-error corpora +
+  3205/3205 matching sqllogictest blocks (zero unsupported/divergence) against
+  real PostgreSQL 18.4, plus the generative
   fuzzer; also run sharded in CI with a hermetic PostgreSQL service.
 - `cargo clippy --lib --bins --tests -- -D warnings` — zero warnings.
 - `tools/coverage.sh` — line coverage across both test layers (~78–80%,

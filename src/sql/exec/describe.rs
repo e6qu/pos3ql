@@ -1690,7 +1690,7 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "current_user" | "session_user" | "user" | "current_role" | "current_schema"
             | "current_database" | "current_catalog" => of(ColType::Name),
             // current_setting(name [, missing_ok]) returns the value as text.
-            "current_setting" => of(ColType::Text),
+            "current_setting" | "set_config" => of(ColType::Text),
             "current_time" => of(ColType::Timetz),
             "localtime" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),

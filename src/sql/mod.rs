@@ -240,7 +240,7 @@ impl Engine {
     }
 
     /// Starts a transaction if none is active.
-    fn ensure_txn(&mut self, txn: &mut TxnState, mode: TxnMode) {
+    fn ensure_txn(&mut self, txn: &mut TxnState, mode: TxnMode, guc: &GucState) {
         if txn.is_active() {
             if mode == TxnMode::Explicit {
                 txn.mode = TxnMode::Explicit;
@@ -251,13 +251,18 @@ impl Engine {
         txn.txid = self.next_txid;
         txn.mode = mode;
         datetime::begin_transaction();
+        guc.begin_transaction();
         txn.failed = false;
         txn.wal_mark = self.wal.mark();
     }
 
     /// Commits: journals every touched row, fsyncs once, then promotes the
     /// in-memory images. On failure the transaction rolls back entirely.
-    pub fn commit_txn(&mut self, txn: &mut TxnState) -> Result<(), SqlError> {
+    pub fn commit_txn(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         if !txn.is_active() {
@@ -307,7 +312,7 @@ impl Engine {
                 ),
             };
             if let Err(e) = appended {
-                self.rollback_txn(txn);
+                self.rollback_txn(txn, guc);
                 return Err(e);
             }
             self.storage.set_lsn(lsn);
@@ -336,7 +341,7 @@ impl Engine {
                         last,
                     },
                 ) {
-                    self.rollback_txn(txn);
+                    self.rollback_txn(txn, guc);
                     return Err(e);
                 }
                 self.storage.set_lsn(lsn);
@@ -366,7 +371,7 @@ impl Engine {
                     is_called,
                 },
             ) {
-                self.rollback_txn(txn);
+                self.rollback_txn(txn, guc);
                 return Err(e);
             }
             self.storage.set_lsn(lsn);
@@ -466,6 +471,7 @@ impl Engine {
         // a loud error reported to the client — like a post-commit upload
         // failure, the data is committed regardless — never a silent drop.
         let notify_result = self.flush_committed_notifications(txn);
+        guc.commit_transaction();
         txn.clear();
         notify_result.and(upload_result)
     }
@@ -485,7 +491,7 @@ impl Engine {
 
     /// Discards every uncommitted change and journal byte of the
     /// transaction.
-    pub fn rollback_txn(&mut self, txn: &mut TxnState) {
+    pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         // Reverse-replay every write to its prior image (newest first), so a
@@ -552,6 +558,7 @@ impl Engine {
             }
         }
         self.wal.truncate_to_mark(txn.wal_mark);
+        guc.rollback_transaction();
         txn.clear();
     }
 
@@ -559,7 +566,12 @@ impl Engine {
     /// performed after it (reverse-replayed), discards the journal tail, and
     /// restores the pre-savepoint failed state — leaving the transaction (and
     /// the savepoint) open for reuse.
-    fn rollback_to_savepoint(&mut self, txn: &mut TxnState, index: usize) {
+    fn rollback_to_savepoint(
+        &mut self,
+        txn: &mut TxnState,
+        index: usize,
+        guc: &GucState,
+    ) {
         let sp = txn.savepoint_at(index);
         for i in (sp.touched_mark..txn.touched().len()).rev() {
             let (table, rowid, prior) = txn.touched()[i];
@@ -627,6 +639,7 @@ impl Engine {
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
         txn.rollback_savepoints_after(index);
         self.wal.truncate_to_mark(sp.wal_mark);
+        guc.rollback_to_savepoint(index);
         txn.failed = sp.failed;
     }
 
@@ -817,9 +830,13 @@ impl Engine {
     /// Ends a successful COPY FROM: an implicit transaction commits here
     /// (this was the statement's end); an explicit one stays open, exactly
     /// as INSERT inside BEGIN would.
-    pub fn copy_finish(&mut self, txn: &mut TxnState) -> Result<(), SqlError> {
+    pub fn copy_finish(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
         if txn.mode == TxnMode::Implicit {
-            return self.commit_txn(txn);
+            return self.commit_txn(txn, guc);
         }
         Ok(())
     }
@@ -827,9 +844,9 @@ impl Engine {
     /// Abandons a failed COPY FROM: an implicit transaction rolls back
     /// outright; an explicit one is marked failed, as any errored statement
     /// leaves it.
-    pub fn copy_abort(&mut self, txn: &mut TxnState) {
+    pub fn copy_abort(&mut self, txn: &mut TxnState, guc: &GucState) {
         if txn.mode == TxnMode::Implicit {
-            self.rollback_txn(txn);
+            self.rollback_txn(txn, guc);
         } else {
             txn.failed = true;
         }
@@ -915,7 +932,7 @@ impl Engine {
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit);
+        self.ensure_txn(txn, TxnMode::Implicit, guc);
         let mut executed_any = false;
         loop {
             match parser.next_stmt() {
@@ -924,7 +941,7 @@ impl Engine {
                         // COPY FROM STDIN takes over the connection; a
                         // statement after it in the same string has nowhere
                         // to run.
-                        self.copy_abort(txn);
+                        self.copy_abort(txn, guc);
                         let e = sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
                             "COPY FROM STDIN must be the last statement in a query string"
@@ -938,7 +955,7 @@ impl Engine {
                         if txn.is_explicit() {
                             txn.failed = true;
                         } else {
-                            self.rollback_txn(txn);
+                            self.rollback_txn(txn, guc);
                         }
                         responder.error(e.sqlstate, e.message.as_str())?;
                         return Ok(());
@@ -949,7 +966,7 @@ impl Engine {
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
-                        self.rollback_txn(txn);
+                        self.rollback_txn(txn, guc);
                     }
                     return report_parse_error(responder, &e);
                 }
@@ -962,7 +979,7 @@ impl Engine {
         // FROM in flight, whose statement does not end until CopyDone.
         if txn.mode == TxnMode::Implicit
             && self.pending_copy.is_none()
-            && let Err(e) = self.commit_txn(txn) {
+            && let Err(e) = self.commit_txn(txn, guc) {
                 responder.error(e.sqlstate, e.message.as_str())?;
             }
         Ok(())
@@ -996,7 +1013,7 @@ impl Engine {
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit);
+        self.ensure_txn(txn, TxnMode::Implicit, guc);
         let outcome = match parser.next_stmt() {
             Ok(Some(statement)) => {
                 emit_parse_warnings(&mut parser, responder)?;
@@ -1010,7 +1027,7 @@ impl Engine {
                 if txn.is_explicit() {
                     txn.failed = true;
                 } else {
-                    self.rollback_txn(txn);
+                    self.rollback_txn(txn, guc);
                 }
                 report_parse_error(responder, &e)?;
                 return Ok(false);
@@ -1019,7 +1036,7 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 if txn.mode == TxnMode::Implicit
-                    && let Err(e) = self.commit_txn(txn) {
+                    && let Err(e) = self.commit_txn(txn, guc) {
                         responder.error(e.sqlstate, e.message.as_str())?;
                         return Ok(false);
                     }
@@ -1029,7 +1046,7 @@ impl Engine {
                 if txn.is_explicit() {
                     txn.failed = true;
                 } else {
-                    self.rollback_txn(txn);
+                    self.rollback_txn(txn, guc);
                 }
                 responder.error(e.sqlstate, e.message.as_str())?;
                 Ok(false)
@@ -1406,6 +1423,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let _guc_eval_scope = guc::enter_eval_scope(guc);
         // Reclaim the shared execution arena from the previous statement: its
         // materialized rows have already been paged to the wire.
         self.work.reset();
@@ -1415,8 +1433,9 @@ impl Engine {
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
         eval::funcs::system::set_session_user(guc.session_user());
+        let raw_path = guc.search_path();
         let path =
-            self.storage.compute_path(guc.search_path(), guc.session_user(), txn.txid);
+            self.storage.compute_path(raw_path.as_str(), guc.session_user(), txn.txid);
         self.storage.swap_path(path);
         // Publish the path's schema names for current_schema/current_schemas.
         {
@@ -1454,16 +1473,23 @@ impl Engine {
         // Publish this statement's readable settings for `current_setting()`,
         // the exact values `SHOW` reports (fixed server params + session GUCs).
         {
-            let mut pairs: [(&'static str, &str); SETTING_NAMES.len()] =
-                [("", ""); SETTING_NAMES.len()];
-            let mut n = 0;
+            let mut names = [""; SETTING_NAMES.len()];
+            let mut values = [crate::util::StackStr::<256>::new(); SETTING_NAMES.len()];
+            let mut setting_count = 0;
             for &name in SETTING_NAMES {
-                if let Some(value) = fixed_setting(name).or_else(|| guc.get(name)) {
-                    pairs[n] = (name, value);
-                    n += 1;
+                if let Some(value) = fixed_setting(name)
+                    .map(crate::util::StackStr::from_str)
+                    .or_else(|| guc.get_owned(name))
+                {
+                    names[setting_count] = name;
+                    values[setting_count] = value;
+                    setting_count += 1;
                 }
             }
-            if let Err(e) = eval::funcs::system::set_session_settings(&pairs[..n]) {
+            if let Err(e) = eval::funcs::system::set_session_settings(
+                &names[..setting_count],
+                &values[..setting_count],
+            ) {
                 return Ok(Err(e));
             }
         }
@@ -1564,7 +1590,7 @@ impl Engine {
                 name,
                 *or_replace,
                 sql,
-                guc.search_path(),
+                guc.search_path().as_str(),
                 arena,
                 responder,
             ),
@@ -1582,7 +1608,7 @@ impl Engine {
                     *with_data,
                     *if_not_exists,
                     *materialized,
-                    guc.search_path(),
+                    guc.search_path().as_str(),
                     arena,
                     params,
                     responder,
@@ -1945,7 +1971,7 @@ impl Engine {
                         "there is already a transaction in progress",
                     )?;
                 }
-                self.ensure_txn(txn, TxnMode::Explicit);
+                self.ensure_txn(txn, TxnMode::Explicit, guc);
                 responder.command_complete("BEGIN")?;
                 Ok(Ok(()))
             }
@@ -1955,10 +1981,10 @@ impl Engine {
                 }
                 let tag = if txn.failed { "ROLLBACK" } else { "COMMIT" };
                 if txn.failed {
-                    self.rollback_txn(txn);
+                    self.rollback_txn(txn, guc);
                     cursors.on_rollback();
                 } else {
-                    if let Err(e) = self.commit_txn(txn) {
+                    if let Err(e) = self.commit_txn(txn, guc) {
                         return Ok(Err(e));
                     }
                     cursors.on_commit();
@@ -1968,20 +1994,20 @@ impl Engine {
                 // Freeze this statement's clock before anything anchors a
                 // transaction to it.
                 datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit);
+                self.ensure_txn(txn, TxnMode::Implicit, guc);
                 Ok(Ok(()))
             }
             Stmt::Rollback => {
                 if !txn.is_explicit() {
                     responder.warning("25P01", "there is no transaction in progress")?;
                 }
-                self.rollback_txn(txn);
+                self.rollback_txn(txn, guc);
                 cursors.on_rollback();
                 responder.command_complete("ROLLBACK")?;
                 // Freeze this statement's clock before anything anchors a
                 // transaction to it.
                 datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit);
+                self.ensure_txn(txn, TxnMode::Implicit, guc);
                 Ok(Ok(()))
             }
             Stmt::Savepoint(name) => {
@@ -1995,6 +2021,7 @@ impl Engine {
                 if let Err(e) = txn.savepoint(name, mark) {
                     return Ok(Err(e));
                 }
+                guc.savepoint();
                 responder.command_complete("SAVEPOINT")?;
                 Ok(Ok(()))
             }
@@ -2008,6 +2035,7 @@ impl Engine {
                 match txn.savepoint_index(name) {
                     Some(index) => {
                         txn.release_savepoints_from(index);
+                        guc.release_savepoints_from(index);
                         responder.command_complete("RELEASE")?;
                         Ok(Ok(()))
                     }
@@ -2032,17 +2060,41 @@ impl Engine {
                         name
                     )));
                 };
-                self.rollback_to_savepoint(txn, index);
+                self.rollback_to_savepoint(txn, index, guc);
                 responder.command_complete("ROLLBACK")?;
                 Ok(Ok(()))
             }
-            Stmt::Set { name, value } => match guc.set(name, value) {
-                Ok(()) => {
-                    responder.command_complete("SET")?;
-                    Ok(Ok(()))
+            Stmt::Set { name, value, local } => {
+                if *local && !txn.is_explicit() {
+                    responder.warning(
+                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                        "SET LOCAL can only be used in transaction blocks",
+                    )?;
                 }
-                Err(e) => Ok(Err(e)),
-            },
+                match guc.set(name, value, *local) {
+                    Ok(()) => {
+                        responder.command_complete("SET")?;
+                        Ok(Ok(()))
+                    }
+                    Err(e) => Ok(Err(e)),
+                }
+            }
+            Stmt::Reset(name) => {
+                let result = match name {
+                    Some(name) => guc.reset(name),
+                    None => {
+                        guc.reset_all();
+                        Ok(())
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        responder.command_complete("RESET")?;
+                        Ok(Ok(()))
+                    }
+                    Err(e) => Ok(Err(e)),
+                }
+            }
             Stmt::SetTransaction => {
                 responder.command_complete("SET")?;
                 Ok(Ok(()))
@@ -2086,7 +2138,7 @@ impl Engine {
                     // the connection takes over, streaming CopyData into
                     // copy_row_line under this same (implicit or explicit)
                     // transaction, and the command tag waits for CopyDone.
-                    self.ensure_txn(txn, txn.mode);
+                    self.ensure_txn(txn, txn.mode, guc);
                     responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
                     self.pending_copy = Some(setup);
                     Ok(Ok(()))
@@ -2181,13 +2233,13 @@ impl Engine {
                 }
                 // ALTER acts as an autocommit barrier: prior implicit work
                 // commits, the rewrite runs and commits by itself.
-                if let Err(e) = self.commit_txn(txn) {
+                if let Err(e) = self.commit_txn(txn, guc) {
                     return Ok(Err(e));
                 }
                 // Freeze this statement's clock before anything anchors a
                 // transaction to it.
                 datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit);
+                self.ensure_txn(txn, TxnMode::Implicit, guc);
                 let out = exec::alter_table(
                     &mut self.storage,
                     &mut self.wal,
@@ -2199,21 +2251,21 @@ impl Engine {
                 )?;
                 match out {
                     Ok(()) => {
-                        if let Err(e) = self.commit_txn(txn) {
+                        if let Err(e) = self.commit_txn(txn, guc) {
                             return Ok(Err(e));
                         }
                         // Freeze this statement's clock before anything anchors a
-                // transaction to it.
-                datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit);
+                        // transaction to it.
+                        datetime::begin_statement();
+                        self.ensure_txn(txn, TxnMode::Implicit, guc);
                         Ok(Ok(()))
                     }
                     Err(e) => {
-                        self.rollback_txn(txn);
+                        self.rollback_txn(txn, guc);
                         // Freeze this statement's clock before anything anchors a
-                // transaction to it.
-                datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit);
+                        // transaction to it.
+                        datetime::begin_statement();
+                        self.ensure_txn(txn, TxnMode::Implicit, guc);
                         Ok(Err(e))
                     }
                 }
@@ -2361,9 +2413,12 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         // Session GUCs come from the per-session store; the rest are fixed
         // server parameters.
-        let value = match fixed_setting(name).or_else(|| guc.get(name)) {
-            Some(v) => v,
-            None => {
+        let owned = guc.get_owned(name);
+        let value = if let Some(value) = fixed_setting(name) {
+            value
+        } else if let Some(value) = owned.as_ref() {
+            value.as_str()
+        } else {
                 return Ok(Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_OBJECT,
                     message: stack_format!(
@@ -2371,8 +2426,7 @@ impl Engine {
                         "unrecognized configuration parameter \"{}\"",
                         name
                     ),
-                }))
-            }
+                }));
         };
         // The column titles as PostgreSQL canonicalizes them: most parameters
         // are lowercase, but a few keep their registered mixed case.
@@ -2404,8 +2458,15 @@ impl Engine {
             ColDesc::new("description", types::oid::TEXT, -1),
         ])?;
         for &name in SETTING_NAMES {
-            if let Some(v) = fixed_setting(name).or_else(|| guc.get(name)) {
-                responder.data_row(&[Datum::Text(name), Datum::Text(v), Datum::Text("")])?;
+            let owned = guc.get_owned(name);
+            if let Some(value) =
+                fixed_setting(name).or_else(|| owned.as_ref().map(|value| value.as_str()))
+            {
+                responder.data_row(&[
+                    Datum::Text(name),
+                    Datum::Text(value),
+                    Datum::Text(""),
+                ])?;
             }
         }
         responder.command_complete("SHOW")?;

@@ -10,6 +10,33 @@
 
 use std::path::Path;
 
+fn inline_sqlstates(source: &str) -> Vec<(usize, &str)> {
+    let mut offenders = Vec::new();
+    let mut previous = "";
+    for (number, line) in source.lines().enumerate() {
+        let inline_err = line.contains("sql_err!(\"");
+        let inline_field = line.contains("sqlstate: \"");
+        // A code alone on the line immediately after `sql_err!(` is
+        // rustfmt's multi-line layout. Requiring that context avoids treating
+        // ordinary five-letter SQL strings such as "BEGIN" as SQLSTATEs.
+        let bare_code = {
+            let trimmed = line.trim();
+            previous.contains("sql_err!(")
+                && trimmed.len() == 8
+                && trimmed.starts_with('"')
+                && trimmed.ends_with("\",")
+                && trimmed[1..6]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+        };
+        if inline_err || inline_field || bare_code {
+            offenders.push((number + 1, line.trim()));
+        }
+        previous = line;
+    }
+    offenders
+}
+
 fn scan(dir: &Path, offenders: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).expect("readable source tree") {
         let path = entry.expect("dir entry").path();
@@ -25,21 +52,8 @@ fn scan(dir: &Path, offenders: &mut Vec<String>) {
         if source.contains("pub mod sqlstate") {
             continue;
         }
-        for (number, line) in source.lines().enumerate() {
-            let inline_err = line.contains("sql_err!(\"");
-            let inline_field = line.contains("sqlstate: \"");
-            // A code alone on its line: rustfmt's multi-line sql_err! layout,
-            // which the two substring checks above cannot see.
-            let bare_code = {
-                let t = line.trim();
-                t.len() == 8
-                    && t.starts_with('"')
-                    && t.ends_with("\",")
-                    && t[1..6].bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
-            };
-            if inline_err || inline_field || bare_code {
-                offenders.push(format!("{}:{}: {}", path.display(), number + 1, line.trim()));
-            }
+        for (number, line) in inline_sqlstates(&source) {
+            offenders.push(format!("{}:{number}: {line}", path.display()));
         }
     }
 }
@@ -54,4 +68,18 @@ fn sqlstates_are_named_constants() {
          code cannot compile:\n{}",
         offenders.join("\n")
     );
+}
+
+#[test]
+fn scanner_distinguishes_sql_text_from_multiline_error_codes() {
+    let source = r#"
+        execute(
+            "BEGIN",
+        );
+        let error = sql_err!(
+            "22P02",
+            "invalid text"
+        );
+    "#;
+    assert_eq!(inline_sqlstates(source), [(6, "\"22P02\",")]);
 }

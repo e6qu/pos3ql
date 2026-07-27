@@ -95,9 +95,11 @@ pub enum Stmt<'a> {
     },
     /// DROP INDEX [IF EXISTS] name.
     DropIndex { names: &'a [QualName<'a>], if_exists: bool },
-    /// SET name {=|TO} value. `value` is the raw source text of the value
-    /// (quotes included); the session GUC store validates and applies it.
-    Set { name: &'a str, value: &'a str },
+    /// SET [LOCAL] name {=|TO} value. `value` is the raw source text of the
+    /// value (quotes included); the session GUC store validates and applies it.
+    Set { name: &'a str, value: &'a str, local: bool },
+    /// RESET name / RESET ALL restores one or every settable GUC to default.
+    Reset(Option<&'a str>),
     /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ...:
     /// the engine provides one isolation level, so the clause is acknowledged.
     SetTransaction,
@@ -1105,11 +1107,12 @@ impl Expr<'_> {
         /// foldable constant.
         /// Volatile sequence functions: never a foldable constant (they have
         /// side effects and must reach the sequence engine).
-        fn is_sequence_function(name: &str) -> bool {
+        fn is_side_effecting_function(name: &str) -> bool {
             name.eq_ignore_ascii_case("nextval")
                 || name.eq_ignore_ascii_case("currval")
                 || name.eq_ignore_ascii_case("lastval")
                 || name.eq_ignore_ascii_case("setval")
+                || name.eq_ignore_ascii_case("set_config")
         }
         fn is_set_returning(name: &str) -> bool {
             name.eq_ignore_ascii_case("unnest")
@@ -1163,7 +1166,7 @@ impl Expr<'_> {
                 over.is_none()
                     && !self.is_aggregate()
                     && !is_set_returning(name)
-                    && !is_sequence_function(name)
+                    && !is_side_effecting_function(name)
                     && args.iter().all(|a| a.is_constant())
             }
             Expr::Array(items) => items.iter().all(|e| e.is_constant()),
@@ -1281,7 +1284,7 @@ impl Expr<'_> {
                 "lastval", "setval", "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
                 "current_user", "session_user", "user", "current_role", "current_schema",
                 "current_database", "current_catalog", "pg_backend_pid", "txid_current",
-                "pg_current_xact_id",
+                "pg_current_xact_id", "current_setting", "set_config",
             ];
             NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
         }

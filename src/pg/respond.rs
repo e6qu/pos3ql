@@ -123,7 +123,7 @@ impl<'b> Responder<'b> {
     /// Updates the value-rendering context in place (e.g. after a SET changed
     /// DateStyle mid-batch).
     pub fn render_context(&self) -> crate::sql::guc::RenderContext {
-        self.render
+        crate::sql::guc::active_render().unwrap_or(self.render)
     }
 
     pub fn set_render(&mut self, render: crate::sql::guc::RenderContext) {
@@ -388,7 +388,7 @@ impl<'b> Responder<'b> {
 
     pub fn data_row(&mut self, values: &[Datum]) -> Result<(), WireFull> {
         let formats = self.formats;
-        let render = self.render;
+        let render = self.render_context();
         self.with_retry(|buffer| Self::build_data_row(buffer, values, formats, render))
     }
 
@@ -848,7 +848,7 @@ impl<'b> Responder<'b> {
         // The stashed detail belongs to this diagnostic even when the level
         // filter drops it — take it either way so it cannot leak forward.
         let diagnostic = crate::sql::eval::take_diagnostic();
-        if !self.render.min_message_level.allows(level) {
+        if !self.render_context().min_message_level.allows(level) {
             return Ok(());
         }
         let mut m = MsgOut::begin(self.buffer, wire::MSG_NOTICE_RESPONSE);

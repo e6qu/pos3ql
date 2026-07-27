@@ -322,7 +322,8 @@ impl Server {
         for i in 0..self.slots.len() {
             if self.slots[i].conn.is_open() {
                 let slot = &mut self.slots[i];
-                self.engine.rollback_txn(&mut slot.conn.txn);
+                self.engine
+                    .rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 self.release(i);
             }
         }
@@ -410,7 +411,8 @@ impl Server {
             After::Close => {
                 // A dropped connection releases its uncommitted work.
                 let slot = &mut self.slots[index];
-                self.engine.rollback_txn(&mut slot.conn.txn);
+                self.engine
+                    .rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 self.release(index)
             }
             After::Continue => {

@@ -1307,6 +1307,32 @@ fn run_session(
     buffer.readable().to_vec()
 }
 
+fn run_session_transaction(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    transaction: &mut TxnState,
+    guc: &mut GucState,
+    sql_text: &str,
+) -> Vec<u8> {
+    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let mut pool = test_pool(budget);
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple(
+            sql_text,
+            &arena,
+            transaction,
+            &mut pool,
+            &mut test_cursors(budget),
+            guc,
+            &mut responder,
+            1,
+        )
+        .unwrap();
+    buffer.readable().to_vec()
+}
+
 fn run_with_txn_bytes(
     engine: &mut Engine,
     budget: &mut Budget,
@@ -2845,6 +2871,172 @@ fn current_setting_reads_gucs() {
     let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
     assert!(err(&run_with(&mut e, &mut b, "SELECT current_setting('no_such_xyz')")).contains("42704"));
     assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT current_setting('no_such_xyz', true) IS NULL")), ["t"]);
+}
+
+#[test]
+fn configuration_changes_follow_transaction_scope() {
+    let (mut engine, mut budget) = test_engine();
+    let mut guc = GucState::new();
+
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SELECT set_config('application_name', 'committed', false), \
+                    current_setting('application_name')"
+        )),
+        ["committed|committed"]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SHOW application_name"
+        )),
+        ["committed"]
+    );
+
+    // A session SET rolls back with its transaction; SET LOCAL is visible only
+    // until commit and then exposes a preceding session SET.
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "BEGIN; SET application_name = rolled_back; \
+             SELECT current_setting('application_name'); ROLLBACK; \
+             SHOW application_name"
+        )),
+        ["rolled_back", "committed"]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "BEGIN; SET application_name = session_value; \
+             SET LOCAL application_name = local_value; \
+             SELECT current_setting('application_name'); COMMIT; \
+             SHOW application_name"
+        )),
+        ["local_value", "session_value"]
+    );
+    // A session assignment after an unrelated LOCAL overlay must not make
+    // that overlay survive commit.
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "BEGIN; SET LOCAL search_path = private; \
+             SET application_name = mixed_session; COMMIT; \
+             SELECT current_setting('application_name'), current_setting('search_path')"
+        )),
+        ["mixed_session|\"$user\", public"]
+    );
+
+    // Savepoint rollback restores both the visible and eventual session value.
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "BEGIN; SAVEPOINT s; SET application_name = doomed; \
+             SET LOCAL search_path = private; ROLLBACK TO s; \
+             SELECT current_setting('application_name'), current_setting('search_path'); \
+             COMMIT"
+        )),
+        ["mixed_session|\"$user\", public"]
+    );
+
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "RESET application_name; SHOW application_name; \
+             SET search_path = private; RESET ALL; \
+             SELECT current_setting('search_path')"
+        )),
+        ["", "\"$user\", public"]
+    );
+
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SELECT set_config('application_name', 'null-scope', NULL), \
+                    current_setting('application_name'); \
+             SELECT set_config('application_name', NULL, false), \
+                    current_setting('application_name')"
+        )),
+        ["null-scope|null-scope", "|"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SELECT set_config(NULL, 'x', false)"
+        ))
+        .contains("22004")
+    );
+
+    // The transaction and GUC state normally persist across protocol messages,
+    // not merely across semicolon-separated statements in one message.
+    let mut transaction = TxnState::new(&mut budget, 128).unwrap();
+    let mut connection_guc = GucState::new();
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut connection_guc,
+        "SET application_name = before",
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut connection_guc,
+        "BEGIN",
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut connection_guc,
+        "SET application_name = inside",
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut connection_guc,
+            "SHOW application_name"
+        )),
+        ["inside"]
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut connection_guc,
+        "ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut connection_guc,
+            "SHOW application_name"
+        )),
+        ["before"]
+    );
 }
 
 #[test]

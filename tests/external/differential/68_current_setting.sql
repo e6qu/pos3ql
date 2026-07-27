@@ -1,7 +1,10 @@
 -- current_setting(name [, missing_ok]) — the function form of SHOW, returning
 -- a setting's value as text. Matches PostgreSQL 18. (server_version / _num are
--- intentionally omitted: their value is release-specific.)
---
+-- intentionally omitted: their value is release-specific; TimeZone is pinned
+-- below because a server's default zone is environment-dependent.)
+SET TimeZone = 'UTC';
+SET DateStyle = 'ISO, MDY';
+
 -- Values that are stable across releases:
 SELECT current_setting('client_encoding');
 SELECT current_setting('server_encoding');

@@ -56,7 +56,9 @@ Working single-node database:
   ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, joins (including
   `LATERAL` subqueries and set-returning functions), GROUP BY and aggregates,
   subqueries (correlated + EXISTS),
-  non-recursive CTEs, updatable views, constant and expression column DEFAULTs
+  non-recursive CTEs (including data-modifying CTEs — `WITH x AS (INSERT /
+  UPDATE / DELETE ... RETURNING) SELECT ...` under PostgreSQL's single-command
+  snapshot), updatable views, constant and expression column DEFAULTs
   (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row), generated columns
   (`GENERATED ALWAYS AS (expr) STORED`), identity columns
   (`GENERATED ALWAYS/BY DEFAULT AS IDENTITY`), arbitrary-precision NUMERIC,

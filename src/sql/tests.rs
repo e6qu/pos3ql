@@ -2716,6 +2716,73 @@ fn fromless_select_with_subquery() {
 }
 
 #[test]
+fn data_modifying_cte_select_main() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE dc (id int, v text)");
+    run_with(&mut e, &mut b, "INSERT INTO dc VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')");
+
+    // DELETE ... RETURNING is a relation the main query reads.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "WITH m AS (DELETE FROM dc WHERE id <= 2 RETURNING id, v) SELECT id, v FROM m ORDER BY id",
+    );
+    assert_eq!(data_rows(&bytes), ["1|a", "2|b"]);
+
+    // The command snapshot: the main query reads the base table as it was
+    // BEFORE the statement, so the just-deleted rows are still counted.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "WITH d AS (DELETE FROM dc WHERE id = 3 RETURNING id) \
+         SELECT (SELECT count(*) FROM d) AS deleted, (SELECT count(*) FROM dc) AS still",
+    );
+    assert_eq!(data_rows(&bytes), ["1|2"]);
+
+    // INSERT ... RETURNING as a relation.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "WITH i AS (INSERT INTO dc VALUES (10,'x'),(20,'y') RETURNING id) SELECT sum(id) FROM i",
+    );
+    assert_eq!(data_rows(&bytes), ["30"]);
+
+    // UPDATE ... RETURNING as a relation; the main query still reads the
+    // pre-update value from the base table under the same snapshot.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "WITH u AS (UPDATE dc SET v='Z' WHERE id=4 RETURNING v) \
+         SELECT (SELECT v FROM u) AS updated, (SELECT v FROM dc WHERE id=4) AS base",
+    );
+    assert_eq!(data_rows(&bytes), ["Z|d"]);
+
+    // The RETURNING relation honors a CTE column rename list.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "WITH r(the_id) AS (DELETE FROM dc WHERE id=10 RETURNING id) SELECT the_id FROM r",
+    );
+    assert_eq!(data_rows(&bytes), ["10"]);
+}
+
+#[test]
+fn data_modifying_cte_main_dml_rejected_loudly() {
+    // WITH followed by a data-modifying main statement is not yet supported
+    // and must raise a loud error rather than discard the WITH (see BUGS.md).
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE dc2 (id int, v text)");
+    run_with(&mut e, &mut b, "INSERT INTO dc2 VALUES (1,'a')");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "WITH m AS (DELETE FROM dc2 WHERE id=1 RETURNING id, v) INSERT INTO dc2 SELECT id+100, v FROM m",
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("ERROR"), "expected a loud error, got {text:?}");
+}
+
+#[test]
 fn in_subquery_empty_and_null_semantics() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE empt (x int)");

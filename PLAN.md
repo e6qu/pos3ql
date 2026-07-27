@@ -1114,6 +1114,26 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   cold-start assertion. Four narrow behaviors are documented in BUGS.md (B-173):
   `RENAME VALUE`, `RENAME TO`, enum arrays, and `COPY BINARY` of an enum — each
   by-design against the inline-value or catalog-free-codec invariants.
+- **Data-modifying CTEs** — done (`SELECT` main statement): `WITH x AS (INSERT
+  / UPDATE / DELETE ... RETURNING ...) SELECT ...`, where the data-modifying
+  sub-statement runs exactly once and its RETURNING rows become the CTE
+  relation, read by the same materialization path recursive CTEs use. The
+  correctness subtlety is PostgreSQL's single command snapshot: all the WITH
+  sub-statements and the main query see the tables as they were *before* the
+  statement, so the main query counts rows a DELETE CTE just removed and reads
+  the pre-image of rows an UPDATE CTE just changed — visible only through the
+  CTE's own RETURNING relation. This required a per-command MVCC layer under the
+  existing pending-row model: `PendingChange` gained a command-id (`cid`), the
+  transaction bumps a `command_id` per statement, and `RowState::visible_at`
+  takes a read snapshot (default `SNAPSHOT_ALL`, so every existing read path is
+  unchanged; a data-modifying WITH statement lowers it to the command id) so a
+  CTE's own writes are invisible to its siblings and the main query. Verified
+  byte-for-byte against PostgreSQL (corpus `65_dml_cte`), with unit tests. Two
+  narrow cases are documented in BUGS.md (B-174): a data-modifying *main*
+  statement under a WITH (a loud error — the `expand_ctes_exec` borrow graph
+  unifies the storage lifetime, a dedicated refactor), and cross-command
+  row-version loss inside one explicit transaction (the single pending slot per
+  row is a static-memory invariant).
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

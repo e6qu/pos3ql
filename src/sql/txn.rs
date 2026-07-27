@@ -57,6 +57,13 @@ pub struct TxnState {
     /// COMMIT/ROLLBACK fails with 25P02.
     pub failed: bool,
     pub txid: u32,
+    /// PostgreSQL's command-id: a monotonically increasing counter bumped once
+    /// per statement. A row write records the command that made it, so a query
+    /// snapshotting at command K sees writes from commands `< K` but not its own
+    /// (K) — the mechanism that keeps a data-modifying CTE's changes invisible
+    /// to the same statement's main query. Starts at 1 so any stored `cid: 0`
+    /// (a restored pre-savepoint change) is always visible.
+    command_id: u32,
     /// Every row write, in order: (table slot, rowid, pending image before the
     /// write). Recorded per write (not per row) so `ROLLBACK TO SAVEPOINT` can
     /// reverse-replay to any earlier point.
@@ -144,6 +151,7 @@ impl TxnState {
             mode: TxnMode::Idle,
             failed: false,
             txid: 0,
+            command_id: 1,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
             ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
             savepoints: FixedVec::new(budget, "txn_savepoints", MAX_SAVEPOINTS)?,
@@ -175,6 +183,19 @@ impl TxnState {
     }
 
     /// The ReadyForQuery status byte: idle / in transaction / failed.
+    /// The current command-id, stamped on this statement's row writes and used
+    /// as the read snapshot within the statement.
+    pub fn command_id(&self) -> u32 {
+        self.command_id
+    }
+
+    /// Advances to the next command. Called once at the start of each statement,
+    /// so all of a statement's sub-parts (a WITH clause's data-modifying CTEs
+    /// and its main query) share one command-id and therefore one snapshot.
+    pub fn begin_command(&mut self) {
+        self.command_id = self.command_id.saturating_add(1);
+    }
+
     pub fn status_byte(&self) -> u8 {
         match (self.mode, self.failed) {
             (TxnMode::Explicit, true) => b'E',

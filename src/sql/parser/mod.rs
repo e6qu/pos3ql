@@ -996,7 +996,8 @@ impl<'a> Parser<'a> {
                 set_body: None,
             })
             .map_err(|_| self.err_here("statement too large for SQL arena"))?;
-        let mut ctes = [Cte { name: "", columns: &[], recursive: false, query: placeholder }; MAX_CTES];
+        let mut ctes =
+            [Cte { name: "", columns: &[], recursive: false, query: placeholder, dml: None }; MAX_CTES];
         let mut n = 0;
         loop {
             if n == MAX_CTES {
@@ -1007,13 +1008,28 @@ impl<'a> Parser<'a> {
             let columns = self.column_alias_list()?.unwrap_or(&[]);
             self.expect_ident("as")?;
             self.expect_op("(")?;
-            let q = self.select()?;
+            // A data-modifying CTE body is an INSERT/UPDATE/DELETE (run once,
+            // its RETURNING becomes the relation); anything else is a query.
+            let (boxed, dml) = if matches!(
+                self.peeked,
+                Tok::Ident("insert") | Tok::Ident("update") | Tok::Ident("delete")
+            ) {
+                let stmt = self.statement()?;
+                let boxed_stmt = self
+                    .arena
+                    .alloc(stmt)
+                    .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                (placeholder, Some(&*boxed_stmt))
+            } else {
+                let q = self.select()?;
+                let boxed = self
+                    .arena
+                    .alloc(q)
+                    .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                (&*boxed, None)
+            };
             self.expect_op(")")?;
-            let boxed = self
-                .arena
-                .alloc(q)
-                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
-            ctes[n] = Cte { name, columns, recursive, query: boxed };
+            ctes[n] = Cte { name, columns, recursive, query: boxed, dml };
             n += 1;
             if !self.eat_op(",")? {
                 break;

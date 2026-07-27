@@ -2776,6 +2776,31 @@ fn for_update_locking_clause() {
 }
 
 #[test]
+fn select_into_creates_table() {
+    // SELECT ... INTO table is CREATE TABLE AS spelled the old way.
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE si (id int, v int, s text)");
+    run_with(&mut e, &mut b, "INSERT INTO si VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')");
+
+    // Basic projection + WHERE materialize into a new table.
+    run_with(&mut e, &mut b, "SELECT id, v INTO t1 FROM si WHERE id < 3");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM t1 ORDER BY id")), ["1|10", "2|20"]);
+
+    // INTO TABLE, computed/renamed columns, trailing ORDER BY.
+    run_with(&mut e, &mut b, "SELECT id AS k, v*2 AS d INTO TABLE t2 FROM si ORDER BY id");
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT k, d FROM t2 ORDER BY k")), ["1|20", "2|40", "3|60"]);
+
+    // Re-running into an existing table errors (42P07).
+    let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    assert!(err(&run_with(&mut e, &mut b, "SELECT id INTO t1 FROM si")).contains("42P07"));
+
+    // INTO inside a subquery is rejected (42601), and never as a bare alias.
+    assert!(err(&run_with(&mut e, &mut b, "SELECT * FROM (SELECT 1 INTO nope) x")).contains("42601"));
+    // `into` remains usable as an explicit column alias.
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT 1 AS into")), ["1"]);
+}
+
+#[test]
 fn current_setting_reads_gucs() {
     // current_setting(name [, missing_ok]) returns a setting's value as text —
     // the same value SHOW reports — and composes in expressions.

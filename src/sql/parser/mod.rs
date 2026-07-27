@@ -215,6 +215,14 @@ pub struct Parser<'a> {
     /// `next_stmt` and emits them ahead of executing it.
     warnings: [StackStr<96>; MAX_PARSE_WARNINGS],
     n_warnings: usize,
+    /// True while parsing a position where `SELECT ... INTO table` is legal (a
+    /// top-level query). A subquery / CTE / set-op branch clears it, so an
+    /// `INTO` there is rejected as PostgreSQL rejects it.
+    allow_into: bool,
+    /// The `INTO table` clause a top-level SELECT carried, with the byte range
+    /// of the clause itself so the query can be reconstructed without it (for
+    /// reuse of the CREATE TABLE AS machinery). `None` when there was none.
+    into_clause: Option<(QualName<'a>, usize, usize)>,
 }
 
 /// Parses a stored view definition (a single SELECT) into a `Select` in the
@@ -299,6 +307,8 @@ impl<'a> Parser<'a> {
             n_windows: 0,
             warnings: [StackStr::new(); MAX_PARSE_WARNINGS],
             n_warnings: 0,
+            allow_into: false,
+            into_clause: None,
         })
     }
 
@@ -761,6 +771,25 @@ impl<'a> Parser<'a> {
         };
         let items = self.select_items()?;
 
+        // `SELECT ... INTO [TABLE] name ...` — a CREATE TABLE AS spelled the
+        // old way. Legal only at the top level; a subquery / CTE / set-op branch
+        // rejects it as PostgreSQL does. The clause's byte range is recorded so
+        // the query can be reconstructed without it.
+        if self.peeked == Tok::Ident("into") {
+            let into_start = self.peek_at;
+            self.advance()?;
+            if !self.allow_into {
+                return Err(self.err_here("SELECT ... INTO is not allowed here"));
+            }
+            if self.into_clause.is_some() {
+                return Err(self.err_here("multiple INTO clauses in one query"));
+            }
+            let _ = self.eat_ident("table")?;
+            let name = self.qual_name("table name")?;
+            let into_end = self.peek_at;
+            self.into_clause = Some((name, into_start, into_end));
+        }
+
         let from = if self.eat_ident("from")? {
             Some(self.from_clause()?)
         } else {
@@ -944,10 +973,15 @@ impl<'a> Parser<'a> {
         // This is the nesting boundary for every subquery, so it is where a
         // nested SELECT's named windows stop being visible.
         let enclosing_windows = (self.windows, self.n_windows);
+        // A subquery / CTE / set-op branch is not a place `SELECT ... INTO` may
+        // appear; forbid it here (select_core checks the flag).
+        let saved_allow = self.allow_into;
+        self.allow_into = false;
         let body = self.set_union()?;
         let (order_by, limit, offset, with_ties) = self.order_limit()?;
         // Row-locking clauses come last, after ORDER BY / LIMIT / OFFSET.
         let locking = self.locking_clauses()?;
+        self.allow_into = saved_allow;
         (self.windows, self.n_windows) = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
@@ -1114,10 +1148,40 @@ impl<'a> Parser<'a> {
 
     fn query(&mut self) -> Result<Stmt<'a>, ParseError> {
         let enclosing_windows = (self.windows, self.n_windows);
+        // A top-level query may carry `SELECT ... INTO table`; capture the whole
+        // statement's byte span so it can be rewritten to CREATE TABLE AS.
+        let stmt_start = self.peek_at;
+        let saved_allow = self.allow_into;
+        let saved_into = self.into_clause.take();
+        self.allow_into = true;
         let body = self.set_union()?;
         let (order_by, limit, offset, with_ties) = self.order_limit()?;
         let locking = self.locking_clauses()?;
+        let stmt_end = self.peek_at;
+        self.allow_into = saved_allow;
+        let into = self.into_clause.take();
+        self.into_clause = saved_into;
         (self.windows, self.n_windows) = enclosing_windows;
+        if let Some((name, into_start, into_end)) = into {
+            // Reconstruct the query without its INTO clause and hand it to the
+            // CREATE TABLE AS machinery.
+            let sql = self
+                .arena
+                .alloc_str_display(format_args!(
+                    "{} {}",
+                    self.text[stmt_start..into_start].trim_end(),
+                    self.text[into_end..stmt_end].trim_start()
+                ))
+                .map_err(|_| self.err_here("SELECT INTO query too large for the SQL arena"))?;
+            return Ok(Stmt::CreateTableAs {
+                name,
+                columns: &[],
+                sql: sql.trim(),
+                with_data: true,
+                if_not_exists: false,
+                materialized: false,
+            });
+        }
         if let SetTree::Select(s) = body {
             let mut sel = **s;
             sel.order_by = order_by;
@@ -2750,7 +2814,7 @@ impl<'a> Parser<'a> {
             let reserved = matches!(
                 name,
                 "from" | "where" | "order" | "limit" | "group" | "having" | "union"
-                    | "intersect" | "except" | "window" | "for" | "fetch"
+                    | "intersect" | "except" | "window" | "for" | "fetch" | "into"
                     | "and" | "or" | "is" | "as" | "asc" | "desc" | "offset"
             );
             if !reserved {

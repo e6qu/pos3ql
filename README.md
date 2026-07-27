@@ -47,7 +47,7 @@ Working single-node database:
 - psql 18 and psycopg 3 connect and work — wire protocol 3.0 **and 3.2**,
   simple and extended query protocol (including binary parameters and named
   prepared statements).
-- SQL: DDL (CREATE/DROP TABLE, CREATE TABLE AS, CREATE/DROP VIEW,
+- SQL: DDL (CREATE/DROP TABLE, CREATE TABLE AS / SELECT ... INTO, CREATE/DROP VIEW,
   CREATE/REFRESH/DROP MATERIALIZED VIEW, CREATE/ALTER/DROP SEQUENCE
   (nextval/currval/lastval/setval), CREATE/DROP INDEX, COMMENT ON
   TABLE/VIEW/MATERIALIZED VIEW/INDEX/SEQUENCE/COLUMN/SCHEMA read back through

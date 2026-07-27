@@ -1404,6 +1404,25 @@ must mutate a session GUC from inside expression evaluation, which the
 deliberately-immutable eval layer and un-threaded `GucState` do not allow without
 a dedicated mutable-settings channel.
 
+### SELECT ... INTO (2026-07-27)
+
+`SELECT ... INTO table` — the older spelling of `CREATE TABLE AS`, still emitted
+by scripts and some ORMs — was a flat syntax error. It now materializes the
+query's result into a new table, matching PostgreSQL: `INTO [TABLE] name` after
+the select list, computed/renamed columns, `SELECT *`, `WHERE`/`GROUP BY`/
+`ORDER BY`, and a set operation carrying `INTO` on its first branch; re-running
+into an existing table is `42P07`, and `INTO` in a subquery / CTE / set-op branch
+is `42601` ("SELECT ... INTO is not allowed here"), exactly as PostgreSQL scopes
+it. The implementation adds no AST node: the parser recognizes the clause only
+where it is legal (a top-level query, gated by an `allow_into` flag a subquery
+clears), then reconstructs the query text with the `INTO` clause excised and
+hands it to the existing CREATE TABLE AS machinery — so the whole materialize /
+column-inference / durability path is reused unchanged. `into` was also added to
+the bare-alias reserved set (it stays usable as an explicit `AS into`). Corpus
+`69_select_into`, with a unit test. `SELECT INTO TEMP` is not supported, for the
+same reason `CREATE TEMP TABLE` is not: this engine has no temporary-table
+storage class yet.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

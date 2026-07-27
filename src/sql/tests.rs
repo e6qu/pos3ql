@@ -870,6 +870,16 @@ fn json_and_jsonb_types() {
     assert!(run("SELECT to_jsonb('2020-06-15 08:00:00+00'::timestamptz)").contains("\"2020-06-15T08:00:00+00:00\""));
     // date / time keep their ordinary text form.
     assert!(run("SELECT to_json('2020-06-15'::date)").contains("\"2020-06-15\""));
+    // jsonb deep containment @> / <@ (object subset, array membership incl. the
+    // bare-primitive exception, numeric-value equality, and type mismatch).
+    assert!(run("SELECT '{\"a\":1,\"b\":2}'::jsonb @> '{\"a\":1}'::jsonb").contains('t'));
+    assert!(run("SELECT '{\"a\":1}'::jsonb @> '{\"a\":1,\"b\":2}'::jsonb").contains('f'));
+    assert!(run("SELECT '[1,2,3]'::jsonb @> '2'::jsonb").contains('t'));
+    assert!(run("SELECT '[{\"a\":1}]'::jsonb @> '{\"a\":1}'::jsonb").contains('f'));
+    assert!(run("SELECT '1.0'::jsonb @> '1'::jsonb").contains('t'));
+    assert!(run("SELECT '{\"a\":1}'::jsonb <@ '{\"a\":1,\"b\":2}'::jsonb").contains('t'));
+    // plain json has no containment operator.
+    assert!(run("SELECT '{}'::json @> '{}'::json").contains("42883"));
 }
 
 #[test]

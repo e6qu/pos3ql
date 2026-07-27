@@ -2360,21 +2360,117 @@ fn datetime_uuid_bytea_types() {
 fn comment_roundtrip_and_removal() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE ct (id int PRIMARY KEY, a text)");
+    run_with(&mut e, &mut b, "CREATE VIEW cv AS SELECT a AS renamed FROM ct");
+    run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
+    run_with(&mut e, &mut b, "CREATE DOMAIN positive AS int CHECK (VALUE > 0)");
     run_with(&mut e, &mut b, "CREATE SCHEMA cs");
+    run_with(&mut e, &mut b, "CREATE TABLE cs.source (value int)");
+    let mut guc = GucState::new();
+    run_session(&mut e, &mut b, &mut guc, "SET search_path = cs, public");
+    let bytes = run_session(
+        &mut e,
+        &mut b,
+        &mut guc,
+        "CREATE VIEW public.captured AS SELECT value AS captured_value FROM source",
+    );
+    assert_eq!(message_types(&bytes), [b'C']);
+    run_session(&mut e, &mut b, &mut guc, "SET search_path = public");
     run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'the table'");
     run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.a IS 'col a'");
+    run_with(&mut e, &mut b, "COMMENT ON VIEW cv IS 'view object'");
+    run_with(&mut e, &mut b, "COMMENT ON COLUMN cv.renamed IS 'view col'");
+    run_with(&mut e, &mut b, "COMMENT ON TYPE cv IS 'view row type'");
+    run_with(&mut e, &mut b, "COMMENT ON TYPE mood IS 'the enum'");
+    run_with(&mut e, &mut b, "COMMENT ON DOMAIN positive IS 'the domain'");
+    run_with(&mut e, &mut b, "COMMENT ON TYPE integer IS 'the builtin'");
+    run_with(&mut e, &mut b, "COMMENT ON TYPE regclass IS 'the regtype'");
+    run_with(&mut e, &mut b, "COMMENT ON TYPE integer[] IS 'the array'");
+    run_with(&mut e, &mut b, "COMMENT ON TYPE ct IS 'the row type'");
+    let bytes = run_session(
+        &mut e,
+        &mut b,
+        &mut guc,
+        "COMMENT ON COLUMN captured.captured_value IS 'captured path col'",
+    );
+    assert_eq!(message_types(&bytes), [b'C']);
     run_with(&mut e, &mut b, "COMMENT ON SCHEMA cs IS 'the schema'");
 
     let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
     assert_eq!(data_rows(&bytes), ["the table"]);
     let bytes = run_with(&mut e, &mut b, "SELECT col_description('ct'::regclass, 2)");
     assert_eq!(data_rows(&bytes), ["col a"]);
+    let bytes = run_with(&mut e, &mut b, "SELECT col_description('cv'::regclass, 1)");
+    assert_eq!(data_rows(&bytes), ["view col"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE OR REPLACE VIEW cv AS SELECT a AS renamed FROM ct WHERE id >= 0",
+    );
     let bytes = run_with(
         &mut e,
         &mut b,
-        "SELECT description FROM pg_description WHERE description LIKE 'the %' OR description = 'col a' ORDER BY description",
+        "SELECT obj_description('cv'::regclass), col_description('cv'::regclass, 1)",
     );
-    assert_eq!(data_rows(&bytes), ["col a", "the schema", "the table"]);
+    assert_eq!(data_rows(&bytes), ["view object|view col"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT obj_description(oid, 'pg_type') FROM pg_type WHERE typname = 'cv'",
+    );
+    assert_eq!(data_rows(&bytes), ["view row type"]);
+    let bytes = run_session(
+        &mut e,
+        &mut b,
+        &mut guc,
+        "SELECT col_description('captured'::regclass, 1)",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["captured path col"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT obj_description(oid, 'pg_type') FROM pg_type \
+         WHERE typname IN ('int4', 'mood', 'positive') ORDER BY typname",
+    );
+    assert_eq!(data_rows(&bytes), ["the builtin", "the enum", "the domain"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT obj_description(2205, 'pg_type'), obj_description(1007, 'pg_type')",
+    );
+    assert_eq!(data_rows(&bytes), ["the regtype|the array"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT obj_description(oid, 'pg_type') FROM pg_type WHERE typname = 'ct'",
+    );
+    assert_eq!(data_rows(&bytes), ["the row type"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT description FROM pg_description \
+         WHERE description LIKE 'the %' OR description IN ('col a', 'view col') \
+         ORDER BY description",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        [
+            "col a",
+            "the array",
+            "the builtin",
+            "the domain",
+            "the enum",
+            "the regtype",
+            "the row type",
+            "the schema",
+            "the table",
+            "view col",
+        ]
+    );
 
     // Overwrite is last-write-wins; IS NULL removes.
     run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'renamed'");
@@ -2390,12 +2486,23 @@ fn comment_errors_match_postgres() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE ct (a int)");
     run_with(&mut e, &mut b, "CREATE VIEW cv AS SELECT a FROM ct");
+    run_with(&mut e, &mut b, "CREATE INDEX ci ON ct (a)");
+    run_with(&mut e, &mut b, "CREATE SEQUENCE cs");
+    run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
     // Missing relation, wrong kind, missing column, missing schema.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE nope IS 'x'")).contains("42P01"));
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE cv IS 'x'")).contains("42809"));
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON VIEW ct IS 'x'")).contains("42809"));
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.nope IS 'x'")).contains("42703"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN cv.nope IS 'x'")).contains("42703"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN ci.a IS 'x'")).contains("42809"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN cs.last_value IS 'x'")).contains("42809"));
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON SCHEMA nope IS 'x'")).contains("3F000"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE nope IS 'x'")).contains("42704"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE pg_catalog.integer IS 'x'")).contains("42704"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE serial IS 'x'")).contains("42704"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN mood IS 'x'")).contains("42809"));
+    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN ct IS 'x'")).contains("42809"));
 }
 
 #[test]
@@ -2403,6 +2510,7 @@ fn comment_rolls_back() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE ct (a int)");
+    run_txn(&mut e, &mut b, &mut t, "CREATE TYPE mood AS ENUM ('low', 'high')");
     run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS 'committed'");
     // A rolled-back overwrite restores the committed comment.
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
@@ -2417,6 +2525,28 @@ fn comment_rolls_back() {
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
     let bytes = run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT obj_description('ct'::regclass)");
     assert_eq!(data_rows(&bytes), ["NULL"]);
+
+    // Catalog scans and helper functions both see the transaction's own
+    // comment overlay, then return to the committed value after rollback.
+    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TYPE mood IS 'committed type'");
+    run_txn(&mut e, &mut b, &mut t, "BEGIN");
+    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TYPE mood IS 'doomed type'");
+    let bytes = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT description FROM pg_description d JOIN pg_type t ON t.oid = d.objoid \
+         WHERE t.typname = 'mood'",
+    );
+    assert_eq!(data_rows(&bytes), ["doomed type"]);
+    run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
+    let bytes = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT obj_description(oid, 'pg_type') FROM pg_type WHERE typname = 'mood'",
+    );
+    assert_eq!(data_rows(&bytes), ["committed type"]);
 }
 
 #[test]
@@ -2426,8 +2556,10 @@ fn comment_survives_restart_and_drop_clears_it() {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a text)");
+        run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
         run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'durable'");
         run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.a IS 'durable col'");
+        run_with(&mut e, &mut b, "COMMENT ON TYPE mood IS 'durable type'");
     }
     // The comment survives WAL replay.
     {
@@ -2437,10 +2569,25 @@ fn comment_survives_restart_and_drop_clears_it() {
         assert_eq!(data_rows(&bytes), ["durable"]);
         let bytes = run_with(&mut e, &mut b, "SELECT col_description('ct'::regclass, 2)");
         assert_eq!(data_rows(&bytes), ["durable col"]);
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT obj_description(oid, 'pg_type') FROM pg_type WHERE typname = 'mood'",
+        );
+        assert_eq!(data_rows(&bytes), ["durable type"]);
         // Dropping the table clears its comments; the freed name carries none.
         run_with(&mut e, &mut b, "DROP TABLE ct");
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a text)");
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+        assert_eq!(data_rows(&bytes), ["NULL"]);
+        // Type drops have the same cleanup guarantee.
+        run_with(&mut e, &mut b, "DROP TYPE mood");
+        run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('new')");
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT obj_description(oid, 'pg_type') FROM pg_type WHERE typname = 'mood'",
+        );
         assert_eq!(data_rows(&bytes), ["NULL"]);
     }
     // The drop's comment removal is itself durable across another restart.
@@ -2448,6 +2595,12 @@ fn comment_survives_restart_and_drop_clears_it() {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
+        assert_eq!(data_rows(&bytes), ["NULL"]);
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT obj_description(oid, 'pg_type') FROM pg_type WHERE typname = 'mood'",
+        );
         assert_eq!(data_rows(&bytes), ["NULL"]);
     }
 }

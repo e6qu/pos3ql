@@ -1287,9 +1287,11 @@ impl Checkpointer {
                     let text = read_hex(words.next(), "cmt text missing")?;
                     let stored = crate::storage::comment_stackstr(&text)
                         .map_err(|_| CheckpointSetupError::Corrupt("cmt text too long"))?;
+                    let class = crate::storage::CommentClass::from_u8(class)
+                        .ok_or(CheckpointSetupError::Corrupt("cmt class unknown"))?;
                     storage
                         .apply_comment(
-                            crate::storage::CommentClass::from_u8(class),
+                            class,
                             sql_name(&schema)?,
                             sql_name(&name)?,
                             subid,
@@ -2712,5 +2714,4 @@ fn default_from_hex(hex: &str) -> Result<Option<OwnedDatum>, CheckpointSetupErro
     }
     Ok(d)
 }
-
 

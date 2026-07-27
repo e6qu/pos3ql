@@ -28,6 +28,29 @@ pub fn expand_ctes<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
+    expand_ctes_with_path(sel, storage, txid, None, arena)
+}
+
+/// Expands a view body under the search path captured when that view was
+/// created, qualifying its base relations before the ordinary describe path
+/// resolves the resulting query.
+pub fn expand_ctes_under<'a>(
+    sel: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    expand_ctes_with_path(sel, storage, txid, Some(path), arena)
+}
+
+fn expand_ctes_with_path<'a>(
+    sel: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    path: Option<crate::storage::PathContext>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
     // Fast path: nothing to rewrite (no CTEs anywhere and no views defined).
     if sel.with.is_empty() && !storage.has_any_view() {
         return Ok(sel);
@@ -43,7 +66,14 @@ pub fn expand_ctes<'a>(
         if resolved[..n].iter().any(|(name, _, _)| *name == cte.name) {
             return Err(sql_err!(sqlstate::DUPLICATE_ALIAS, "WITH query name \"{}\" specified more than once", cte.name));
         }
-        let context = Subst { ctes: &resolved[..n], materialized: &[], storage, txid, depth: 0, path: None };
+        let context = Subst {
+            ctes: &resolved[..n],
+            materialized: &[],
+            storage,
+            txid,
+            depth: 0,
+            path,
+        };
         // A self-referencing recursive CTE cannot be inlined; this schema-only
         // path (Describe / view validation) binds its non-recursive term,
         // which carries the CTE's column shape. Execution goes through
@@ -60,7 +90,14 @@ pub fn expand_ctes<'a>(
     }
     // Substitute the body against all CTEs (the WITH list is dropped by
     // subst_select, which never copies it) and expand any view references.
-    let context = Subst { ctes: &resolved[..n], materialized: &[], storage, txid, depth: 0, path: None };
+    let context = Subst {
+        ctes: &resolved[..n],
+        materialized: &[],
+        storage,
+        txid,
+        depth: 0,
+        path,
+    };
     subst_select(sel, context, arena)
 }
 

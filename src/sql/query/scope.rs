@@ -213,7 +213,7 @@ impl<'d> QueryScope<'d> {
                 storage.resolve_relation(tref.schema, tref.table, txid),
                 Some(crate::storage::ResolvedRelation::Catalog)
             ) {
-                return self.add_catalog(storage, tref, arena, true);
+                return self.add_catalog(storage, tref, txid, arena, true);
             }
             return self.add(storage, tref.schema, tref.table, tref.alias, txid);
         };
@@ -318,7 +318,7 @@ impl<'d> QueryScope<'d> {
                 storage.resolve_relation(tref.schema, tref.table, txid),
                 Some(crate::storage::ResolvedRelation::Catalog)
             ) {
-                return self.add_catalog(storage, tref, arena, false);
+                return self.add_catalog(storage, tref, txid, arena, false);
             }
             return self.add(storage, tref.schema, tref.table, tref.alias, txid);
         };
@@ -354,13 +354,15 @@ impl<'d> QueryScope<'d> {
         &mut self,
         storage: &'a Storage,
         tref: &'a TableRef<'a>,
+        txid: u32,
         arena: &'a Arena,
         materialize: bool,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
     {
-        let synth = crate::sql::catalog::synthesize(storage, tref.schema, tref.table, arena)?;
+        let synth =
+            crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, arena)?;
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(

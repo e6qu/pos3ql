@@ -1428,6 +1428,7 @@ pub fn comment(
     txn: &mut TxnState,
     target: &super::ast::CommentTarget,
     text: Option<&str>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{CommentClass, StoredRelKind};
@@ -1479,25 +1480,70 @@ pub fn comment(
                     relation.name
                 ));
             };
-            if !matches!(actual, StoredRelKind::Table | StoredRelKind::Matview) {
-                // Column comments on views/sequences/indexes need the
-                // relation's column list resolved from its body, which our
-                // stored catalog does not carry for non-tables.
+            if matches!(actual, StoredRelKind::Sequence | StoredRelKind::Index) {
                 return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "COMMENT ON COLUMN is supported only for tables and materialized views"
-                ));
-            }
-            let slot = storage
-                .find_visible(schema.as_str(), relation.name, txid)
-                .expect("classified relation resolves to a table slot");
-            let Some(attnum) = storage.column_number(slot, column) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
-                    column,
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot set comment on relation \"{}\"",
                     relation.name
                 ));
+            }
+            let attnum = if actual == StoredRelKind::View {
+                let Some(crate::storage::ResolvedRelation::View(slot)) =
+                    storage.resolve_relation(Some(schema.as_str()), relation.name, txid)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "relation \"{}\" does not exist",
+                        relation.name
+                    ));
+                };
+                let view = storage.view(slot).clone();
+                let user = super::eval::funcs::system::session_user_owned();
+                let view_path =
+                    storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+                let view_sql = match arena.alloc_str(view.sql.as_str()) {
+                    Ok(sql) => sql,
+                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                };
+                let mut columns =
+                    [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+                let described = super::query::describe_query_under(
+                    view_sql,
+                    storage,
+                    txid,
+                    view_path,
+                    arena,
+                    &mut columns,
+                );
+                let column_count = match described {
+                    Ok(count) => count,
+                    Err(error) => return sql_fail(error),
+                };
+                let Some(index) = columns[..column_count]
+                    .iter()
+                    .position(|description| description.name == column)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        column,
+                        relation.name
+                    ));
+                };
+                index as u32 + 1
+            } else {
+                let slot = storage
+                    .find_visible(schema.as_str(), relation.name, txid)
+                    .expect("classified relation resolves to a table slot");
+                let Some(attnum) = storage.column_number(slot, column) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        column,
+                        relation.name
+                    ));
+                };
+                attnum
             };
             let stored = match SqlName::parse(relation.name) {
                 Ok(n) => n,
@@ -1518,6 +1564,89 @@ pub fn comment(
                 Err(e) => return sql_fail(e),
             };
             (CommentClass::Schema, SqlName::EMPTY, stored, 0u32)
+        }
+        CommentTarget::Type {
+            name: type_name,
+            domain_only,
+        } => {
+            let domain_slot = storage.resolve_domain_slot(type_name, txid);
+            let enum_slot = storage.resolve_enum_slot(type_name, txid);
+            let (qualifier, bare_name) = type_name
+                .split_once('.')
+                .map_or((None, type_name), |(schema, name)| (Some(schema), name));
+            let builtin = (qualifier.is_none() || qualifier == Some("pg_catalog"))
+                .then(|| {
+                    super::catalog::builtin_type_identity(bare_name, qualifier.is_none())
+                })
+                .flatten();
+            let composite = storage
+                .classify_relation(qualifier, bare_name, txid)
+                .filter(|(_, kind)| {
+                    matches!(
+                        kind,
+                        StoredRelKind::Table | StoredRelKind::View | StoredRelKind::Matview
+                    )
+                });
+            let (schema, name) = if let Some(slot) = domain_slot {
+                let definition = storage.domain(slot);
+                (definition.schema, definition.name)
+            } else if domain_only {
+                if let Some((catalog_name, _)) = builtin {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"pg_catalog.{}\" is not a domain",
+                        catalog_name
+                    ));
+                }
+                if enum_slot.is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is not a domain",
+                        type_name
+                    ));
+                }
+                if composite.is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is not a domain",
+                        type_name
+                    ));
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    type_name
+                ));
+            } else if let Some(slot) = enum_slot {
+                let definition = storage.enum_def(slot);
+                (definition.schema, definition.name)
+            } else if let Some((schema, _)) = composite {
+                let stored = match SqlName::parse(bare_name) {
+                    Ok(name) => name,
+                    Err(error) => return sql_fail(error),
+                };
+                (schema, stored)
+            } else {
+                let Some((catalog_name, _)) = builtin else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        type_name
+                    ));
+                };
+                let stored = match SqlName::parse(catalog_name) {
+                    Ok(name) => name,
+                    Err(error) => return sql_fail(error),
+                };
+                (
+                    match SqlName::parse("pg_catalog") {
+                        Ok(schema) => schema,
+                        Err(error) => return sql_fail(error),
+                    },
+                    stored,
+                )
+            };
+            (CommentClass::Type, schema, name, 0u32)
         }
     };
 

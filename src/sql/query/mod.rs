@@ -45,7 +45,7 @@ mod scope;
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn, MAX_MERGED_COLUMNS};
 
 mod cte;
-pub use cte::{describe_set_query, expand_ctes, expand_ctes_exec};
+pub use cte::{describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under};
 use cte::expand_set_tree_exec;
 
 mod aggregate;
@@ -155,12 +155,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
 
     fn comment<'a>(
         &self,
-        is_namespace: bool,
+        catalog_name: &str,
         oid: i32,
         subid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::comment_text_for(self.storage, self.txid, is_namespace, oid, subid, arena)
+        super::catalog::comment_text_for(
+            self.storage,
+            self.txid,
+            catalog_name,
+            oid,
+            subid,
+            arena,
+        )
     }
 
     fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
@@ -705,6 +712,21 @@ pub fn describe_query<'a>(
     let sel = super::parser::parse_query(sql, arena)?;
     let sel = expand_ctes(sel, storage, txid, arena)?;
     describe_select(sel, storage, txid, arena, out)
+}
+
+/// Resolves a stored view body's output under the creator's captured search
+/// path, rather than the session path of the client inspecting the view.
+pub fn describe_query_under<'a>(
+    sql: &'a str,
+    storage: &'a Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    let select = super::parser::parse_query(sql, arena)?;
+    let select = expand_ctes_under(select, storage, txid, path, arena)?;
+    describe_select(select, storage, txid, arena, out)
 }
 
 fn describe_select<'a>(

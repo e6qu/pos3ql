@@ -406,8 +406,9 @@ pub(crate) fn dispatch<'a>(
             }
             "obj_description" => {
                 // obj_description(objoid [, catalog]): the object's comment.
-                // A `pg_namespace` catalog selects a schema; anything else (the
-                // default) a `pg_class` relation.
+                // The optional catalog selects the object's catalog class. The
+                // deprecated one-argument form keeps the historical pg_class
+                // default used by clients.
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
@@ -416,15 +417,18 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(v) => v as i32,
                     _ => return Ok(Datum::Null),
                 };
-                let is_namespace = if args.len() >= 2 {
-                    matches!(
-                        eval_full(args[1], arena, params, row, hooks)?,
-                        Datum::Text(t) if t == "pg_namespace"
-                    )
+                let catalog_name = if args.len() >= 2 {
+                    match eval_full(args[1], arena, params, row, hooks)? {
+                        Datum::Text(name) => name,
+                        _ => return Ok(Datum::Null),
+                    }
                 } else {
-                    false
+                    "pg_class"
                 };
-                Ok(cat.comment(is_namespace, oid, 0, arena)?.map(Datum::Text).unwrap_or(Datum::Null))
+                Ok(cat
+                    .comment(catalog_name, oid, 0, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             "col_description" => {
                 // col_description(objoid, objsubid): a column's comment.
@@ -442,7 +446,10 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(v) => v as i32,
                     _ => return Ok(Datum::Null),
                 };
-                Ok(cat.comment(false, oid, col, arena)?.map(Datum::Text).unwrap_or(Datum::Null))
+                Ok(cat
+                    .comment("pg_class", oid, col, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             "pg_get_expr" | "pg_get_viewdef"
             | "pg_get_functiondef"

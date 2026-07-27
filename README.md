@@ -50,7 +50,8 @@ Working single-node database:
 - SQL: DDL (CREATE/DROP TABLE, CREATE TABLE AS / SELECT ... INTO, CREATE/DROP VIEW,
   CREATE/REFRESH/DROP MATERIALIZED VIEW, CREATE/ALTER/DROP SEQUENCE
   (nextval/currval/lastval/setval), CREATE/DROP INDEX, COMMENT ON
-  TABLE/VIEW/MATERIALIZED VIEW/INDEX/SEQUENCE/COLUMN/SCHEMA read back through
+  TABLE/VIEW/MATERIALIZED VIEW/INDEX/SEQUENCE/COLUMN/SCHEMA/TYPE/DOMAIN
+  (including view columns and relation composite types), read back through
   obj_description/col_description/pg_description),
   INSERT/SELECT/UPDATE/DELETE/MERGE with WHERE / ORDER BY (PostgreSQL null
   ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, row-locking clauses

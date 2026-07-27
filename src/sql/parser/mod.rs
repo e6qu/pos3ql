@@ -2619,6 +2619,16 @@ impl<'a> Parser<'a> {
             }
         } else if self.eat_ident("schema")? {
             CommentTarget::Schema(self.col_ident("schema name")?)
+        } else if self.eat_ident("type")? {
+            CommentTarget::Type {
+                name: self.comment_type_name()?,
+                domain_only: false,
+            }
+        } else if self.eat_ident("domain")? {
+            CommentTarget::Type {
+                name: self.comment_type_name()?,
+                domain_only: true,
+            }
         } else if self.eat_ident("column")? {
             // `[schema.]table.column`: the last dotted part is the column.
             let first = self.col_ident("column reference")?;
@@ -2635,7 +2645,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             return Err(self.err_here(
-                "COMMENT ON supports TABLE, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, or COLUMN",
+                "COMMENT ON supports TABLE, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, TYPE, DOMAIN, or COLUMN",
             ));
         };
         self.expect_ident("is")?;
@@ -2645,6 +2655,48 @@ impl<'a> Parser<'a> {
             _ => return Err(self.err_here("COMMENT value must be a string literal or NULL")),
         };
         Ok(Stmt::Comment { target, text })
+    }
+
+    /// A type name in `COMMENT ON TYPE/DOMAIN`: keep a user schema qualifier,
+    /// while canonicalizing PostgreSQL's multi-word built-in spellings.
+    fn comment_type_name(&mut self) -> Result<&'a str, ParseError> {
+        let first = self.any_ident("type name")?;
+        if self.eat_op(".")? {
+            let second = self.any_ident("type name")?;
+            if self.eat_op("[")? {
+                self.expect_op("]")?;
+                return self
+                    .arena_str(stack_format!(144, "{}.{}[]", first, second).as_str());
+            }
+            return self.arena_str(stack_format!(144, "{}.{}", first, second).as_str());
+        }
+        let mut name = first;
+        if name == "double" {
+            self.expect_ident("precision")?;
+            name = "float8";
+        } else if name == "bit" && self.eat_ident("varying")? {
+            name = "varbit";
+        } else if (name == "character" || name == "char") && self.eat_ident("varying")? {
+            name = "varchar";
+        } else if name == "timestamp" || name == "time" {
+            if self.eat_ident("with")? {
+                self.expect_ident("time")?;
+                self.expect_ident("zone")?;
+                name = if name == "timestamp" {
+                    "timestamptz"
+                } else {
+                    "timetz"
+                };
+            } else if self.eat_ident("without")? {
+                self.expect_ident("time")?;
+                self.expect_ident("zone")?;
+            }
+        }
+        if self.eat_op("[")? {
+            self.expect_op("]")?;
+            return self.arena_str(stack_format!(144, "{}[]", name).as_str());
+        }
+        Ok(name)
     }
 
     fn delete(&mut self) -> Result<Stmt<'a>, ParseError> {

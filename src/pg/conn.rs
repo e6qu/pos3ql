@@ -448,7 +448,7 @@ impl Conn {
                 // as PostgreSQL does — never silently left at a wrong default.
                 _ => {
                     if guc_error.is_none()
-                        && let Err(e) = self.guc.set(key, value) {
+                        && let Err(e) = self.guc.set(key, value, false) {
                             guc_error = Some(e);
                         }
                 }
@@ -727,7 +727,7 @@ impl Conn {
             }
             wire::FMSG_COPY_DONE => self.copy_finish(engine),
             wire::FMSG_COPY_FAIL => {
-                engine.copy_abort(&mut self.txn);
+                engine.copy_abort(&mut self.txn, &self.guc);
                 self.copy = None;
                 self.copy_buf.clear();
                 let status = self.txn.status_byte();
@@ -741,7 +741,7 @@ impl Conn {
             // Flush and Sync during copy-in are ignored, as PostgreSQL does.
             wire::FMSG_SYNC | wire::FMSG_FLUSH => Step::Continue,
             _ => {
-                engine.copy_abort(&mut self.txn);
+                engine.copy_abort(&mut self.txn, &self.guc);
                 self.copy = None;
                 self.copy_buf.clear();
                 let status = self.txn.status_byte();
@@ -927,10 +927,10 @@ impl Conn {
         let copy = self.copy.take().expect("in copy-in mode");
         let outcome = match copy.failed {
             Some(e) => {
-                engine.copy_abort(&mut self.txn);
+                engine.copy_abort(&mut self.txn, &self.guc);
                 Err(e)
             }
-            None => engine.copy_finish(&mut self.txn).map(|()| copy.count),
+            None => engine.copy_finish(&mut self.txn, &self.guc).map(|()| copy.count),
         };
         let status = self.txn.status_byte();
         let mut responder = Responder::new(&mut self.send);
@@ -1353,7 +1353,7 @@ impl Conn {
                 // Execute) is not wired; refuse loudly rather than leave
                 // the portal cycle wedged. psql and pg_dump use the simple
                 // protocol for COPY.
-                engine.copy_abort(&mut self.txn);
+                engine.copy_abort(&mut self.txn, &self.guc);
                 return ext_err(&mut self.send, &mut self.phase, 
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "COPY FROM STDIN is not supported via the extended protocol",
@@ -1521,7 +1521,7 @@ impl Conn {
             }
             Err(WireFull) => {
                 if engine.take_pending_copy().is_some() {
-                    engine.copy_abort(&mut self.txn);
+                    engine.copy_abort(&mut self.txn, &self.guc);
                 }
                 let mut responder = Responder::new(&mut self.send);
                 let recovered = responder

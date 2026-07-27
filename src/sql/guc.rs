@@ -7,7 +7,7 @@
 //! the accepted set widens here.
 
 use crate::sql::eval::sqlstate;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::fmt::Write;
 
 use crate::sql_err;
@@ -16,6 +16,68 @@ use crate::util::StackStr;
 
 use super::datetime::{DateFormat, DateStyle, FieldOrder};
 use super::eval::SqlError;
+
+std::thread_local! {
+    static ACTIVE_GUC: Cell<*const GucState> = const { Cell::new(core::ptr::null()) };
+    static ACTIVE_RENDER: RefCell<Option<RenderContext>> = const { RefCell::new(None) };
+}
+
+/// Keeps expression-time setting mutations scoped to the connection whose
+/// statement is executing. The engine is single-threaded, and the GUC payload
+/// itself is interior-mutable; the guard prevents a pointer from surviving the
+/// statement on either success or error.
+pub struct EvalScope {
+    prior: *const GucState,
+    prior_render: Option<RenderContext>,
+}
+
+impl Drop for EvalScope {
+    fn drop(&mut self) {
+        ACTIVE_GUC.with(|active| active.set(self.prior));
+        ACTIVE_RENDER.with(|active| *active.borrow_mut() = self.prior_render);
+    }
+}
+
+pub fn enter_eval_scope(guc: &GucState) -> EvalScope {
+    let pointer = guc as *const GucState;
+    let prior = ACTIVE_GUC.with(|active| active.replace(pointer));
+    let prior_render = ACTIVE_RENDER.with(|active| active.replace(Some(guc.render())));
+    EvalScope {
+        prior,
+        prior_render,
+    }
+}
+
+pub fn active_render() -> Option<RenderContext> {
+    ACTIVE_RENDER.with(|active| *active.borrow())
+}
+
+pub fn set_active_config(
+    name: &str,
+    value: Option<&str>,
+    local: bool,
+) -> Result<StackStr<256>, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set_config is not available outside statement execution"
+            ));
+        }
+        // SAFETY: `enter_eval_scope` installs a live per-connection GucState
+        // for exactly the dynamic extent of execute_stmt and its Drop guard
+        // clears it on every exit. GucState mutation is behind RefCell.
+        let guc = unsafe { &*pointer };
+        let result = guc.set_config(name, value, local)?;
+        let render = guc.render();
+        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(render));
+        if name.eq_ignore_ascii_case("timezone") {
+            crate::sql::timezone::set_session(guc.timezone());
+        }
+        Ok(result)
+    })
+}
 
 /// The `client_min_messages` severity threshold, ordered as PostgreSQL orders
 /// it: a message is delivered to the client only when its own severity is at or
@@ -151,7 +213,8 @@ impl SeqSession {
     }
 }
 
-pub struct GucState {
+#[derive(Clone, Copy)]
+struct GucValues {
     datestyle: StackStr<48>,
     timezone: StackStr<64>,
     /// Parsed current time zone, so rendering does not re-parse it.
@@ -160,9 +223,6 @@ pub struct GucState {
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
     search_path: StackStr<128>,
-    /// The startup packet's user, for `current_user` and `"$user"` in the
-    /// search path. Trust auth: the client's claim is the identity.
-    session_user: StackStr<64>,
     client_min_messages: MessageLevel,
     extra_float_digits: StackStr<8>,
     lock_timeout: StackStr<24>,
@@ -172,6 +232,61 @@ pub struct GucState {
     row_security: StackStr<4>,
     /// bytea_output = escape (false = hex, the default).
     bytea_escape: bool,
+}
+
+impl GucValues {
+    fn new() -> Self {
+        let mut values = Self {
+            datestyle: StackStr::new(),
+            timezone: StackStr::new(),
+            parsed_timezone: super::timezone::Timezone::utc(),
+            client_encoding: StackStr::new(),
+            application_name: StackStr::new(),
+            search_path: StackStr::new(),
+            client_min_messages: MessageLevel::Notice,
+            extra_float_digits: StackStr::new(),
+            lock_timeout: StackStr::new(),
+            statement_timeout: StackStr::new(),
+            row_security: StackStr::new(),
+            bytea_escape: false,
+        };
+        let _ = write!(values.datestyle, "ISO, MDY");
+        let _ = write!(values.timezone, "UTC");
+        let _ = write!(values.client_encoding, "UTF8");
+        let _ = write!(values.search_path, "\"$user\", public");
+        let _ = write!(values.extra_float_digits, "1");
+        let _ = write!(values.lock_timeout, "0");
+        let _ = write!(values.statement_timeout, "0");
+        let _ = write!(values.row_security, "on");
+        values
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GucSavepoint {
+    current: GucValues,
+    session: GucValues,
+}
+
+struct GucTransaction {
+    active: bool,
+    start: GucValues,
+    session: GucValues,
+    savepoints: [Option<GucSavepoint>; super::txn::MAX_SAVEPOINTS],
+    savepoint_count: usize,
+}
+
+struct GucStore {
+    current: GucValues,
+    defaults: GucValues,
+    transaction: GucTransaction,
+}
+
+pub struct GucState {
+    store: RefCell<GucStore>,
+    /// The startup packet's user, for `current_user` and `"$user"` in the
+    /// search path. Trust auth: the client's claim is the identity.
+    session_user: StackStr<64>,
     /// This connection's `currval`/`lastval` state.
     seq_session: SeqSession,
 }
@@ -184,37 +299,28 @@ impl Default for GucState {
 
 impl GucState {
     pub fn new() -> Self {
+        let values = GucValues::new();
         let mut g = Self {
-            datestyle: StackStr::new(),
-            timezone: StackStr::new(),
-            parsed_timezone: super::timezone::Timezone::utc(),
-            client_encoding: StackStr::new(),
-            application_name: StackStr::new(),
-            search_path: StackStr::new(),
+            store: RefCell::new(GucStore {
+                current: values,
+                defaults: values,
+                transaction: GucTransaction {
+                    active: false,
+                    start: values,
+                    session: values,
+                    savepoints: [None; super::txn::MAX_SAVEPOINTS],
+                    savepoint_count: 0,
+                },
+            }),
             session_user: StackStr::new(),
-            client_min_messages: MessageLevel::Notice,
-            extra_float_digits: StackStr::new(),
-            lock_timeout: StackStr::new(),
-            statement_timeout: StackStr::new(),
-            row_security: StackStr::new(),
-            bytea_escape: false,
             seq_session: SeqSession::new(),
         };
-        let _ = write!(g.datestyle, "ISO, MDY");
-        let _ = write!(g.timezone, "UTC");
-        let _ = write!(g.client_encoding, "UTF8");
-        let _ = write!(g.search_path, "\"$user\", public");
         let _ = write!(g.session_user, "postgres");
-        let _ = write!(g.extra_float_digits, "1");
-        let _ = write!(g.lock_timeout, "0");
-        let _ = write!(g.statement_timeout, "0");
-        let _ = write!(g.row_security, "on");
         g
     }
 
-    /// The current statement_timeout in milliseconds (0 = disabled).
-    pub fn search_path(&self) -> &str {
-        self.search_path.as_str()
+    pub fn search_path(&self) -> StackStr<128> {
+        self.store.borrow().current.search_path
     }
 
     pub fn seq_session(&self) -> &SeqSession {
@@ -231,226 +337,408 @@ impl GucState {
     }
 
     pub fn statement_timeout_ms(&self) -> u64 {
-        parse_timeout_ms(self.statement_timeout.as_str()).unwrap_or(0)
+        parse_timeout_ms(self.store.borrow().current.statement_timeout.as_str()).unwrap_or(0)
     }
 
     /// Applies `SET name = raw`. `raw` is the raw source text of the value
     /// (surrounding single quotes and whitespace are stripped here). Returns an
     /// error for an unknown parameter, a read-only parameter, or a value whose
     /// behavior is not implemented.
-    pub fn set(&mut self, name: &str, raw: &str) -> Result<(), SqlError> {
-        let v = unquote(raw);
-        let is_default = v.eq_ignore_ascii_case("default");
+    pub fn set(&self, name: &str, raw: &str, local: bool) -> Result<(), SqlError> {
+        let mut state = self.store.borrow_mut();
+        let mut values = state.current;
+        change_setting(&mut values, &state.defaults, name, raw)?;
+        state.current = values;
+        if !state.transaction.active {
+            // Before the first transaction this is a startup-packet setting;
+            // PostgreSQL makes it the value RESET returns to.
+            state.defaults = values;
+        } else if !local {
+            let mut session = state.transaction.session;
+            change_setting(&mut session, &state.defaults, name, raw)?;
+            state.transaction.session = session;
+        }
+        Ok(())
+    }
 
-        if name.eq_ignore_ascii_case("datestyle") {
-            // DateStyle is cumulative: each SET updates only the components it
-            // names, keeping the rest.
-            let (fmt, ord) = if is_default {
-                (DateFormat::Iso, Order3::Mdy)
-            } else {
-                let cur = parse_full(self.datestyle.as_str());
-                apply_datestyle(cur, v).ok_or_else(|| unsupported_value("DateStyle", v))?
-            };
-            return store(&mut self.datestyle, canonical_datestyle(fmt, ord).as_str());
+    pub fn reset(&self, name: &str) -> Result<(), SqlError> {
+        self.set(name, "DEFAULT", false)
+    }
+
+    pub fn reset_all(&self) {
+        let mut state = self.store.borrow_mut();
+        let values = state.defaults;
+        state.current = values;
+        if state.transaction.active {
+            state.transaction.session = values;
         }
-        if name.eq_ignore_ascii_case("timezone") {
-            // UTC, fixed numeric offsets, Etc/GMT±N, and named IANA zones (with
-            // DST) are honored; an unknown zone is rejected loudly.
-            let timezone = if is_default {
-                super::timezone::Timezone::utc()
-            } else {
-                parse_timezone(v).ok_or_else(|| {
-                    sql_err!(
-                        crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
-                        "invalid value for parameter \"TimeZone\": \"{}\"",
-                        v
-                    )
-                })?
-            };
-            store(&mut self.timezone, if is_default { "UTC" } else { v })?;
-            self.parsed_timezone = timezone;
-            return Ok(());
+    }
+
+    pub fn begin_transaction(&self) {
+        let mut state = self.store.borrow_mut();
+        if state.transaction.active {
+            return;
         }
-        if name.eq_ignore_ascii_case("client_encoding") {
-            // UTF8 is native; SQL_ASCII is byte-pass-through (no conversion), so
-            // both are served without transcoding. Any other encoding would
-            // require a conversion we do not implement.
-            if is_default || is_utf8(v) {
-                return store(&mut self.client_encoding, "UTF8");
-            }
-            if v.eq_ignore_ascii_case("sql_ascii") {
-                return store(&mut self.client_encoding, "SQL_ASCII");
-            }
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "conversion between {} and UTF8 is not supported",
-                v
-            ));
+        let current = state.current;
+        state.transaction.active = true;
+        state.transaction.start = current;
+        state.transaction.session = current;
+        state.transaction.savepoint_count = 0;
+    }
+
+    pub fn commit_transaction(&self) {
+        let mut state = self.store.borrow_mut();
+        if !state.transaction.active {
+            return;
         }
-        if name.eq_ignore_ascii_case("standard_conforming_strings") {
-            if is_default || v.eq_ignore_ascii_case("on") {
-                return Ok(());
-            }
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "standard_conforming_strings can only be on (strings always conform)"
-            ));
+        state.current = state.transaction.session;
+        state.transaction.active = false;
+        state.transaction.savepoint_count = 0;
+    }
+
+    pub fn rollback_transaction(&self) {
+        let mut state = self.store.borrow_mut();
+        if !state.transaction.active {
+            return;
         }
-        if name.eq_ignore_ascii_case("client_min_messages") {
-            // Filters which NOTICE/WARNING messages reach the client. The
-            // default is `notice`; an unrecognized level errors like PostgreSQL.
-            self.client_min_messages = if is_default {
-                MessageLevel::Notice
-            } else {
-                MessageLevel::parse(v).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "invalid value for parameter \"client_min_messages\": \"{}\"",
-                        v
-                    )
-                })?
-            };
-            return Ok(());
+        state.current = state.transaction.start;
+        state.transaction.active = false;
+        state.transaction.savepoint_count = 0;
+    }
+
+    pub fn savepoint(&self) {
+        let mut state = self.store.borrow_mut();
+        if !state.transaction.active {
+            return;
         }
-        if name.eq_ignore_ascii_case("application_name") {
-            return store(&mut self.application_name, if is_default { "" } else { v });
+        let index = state.transaction.savepoint_count;
+        debug_assert!(index < super::txn::MAX_SAVEPOINTS);
+        state.transaction.savepoints[index] = Some(GucSavepoint {
+            current: state.current,
+            session: state.transaction.session,
+        });
+        state.transaction.savepoint_count += 1;
+    }
+
+    pub fn release_savepoints_from(&self, index: usize) {
+        let mut state = self.store.borrow_mut();
+        if state.transaction.active {
+            state.transaction.savepoint_count = index;
         }
-        if name.eq_ignore_ascii_case("search_path") {
-            if is_default {
-                return store(&mut self.search_path, "\"$user\", public");
-            }
-            let mut canonical = StackStr::<128>::new();
-            // The raw text, not the pre-unquoted value: quoting decides how
-            // elements split, and a single-quoted string is one element
-            // however many commas it holds.
-            canonicalize_search_path(raw, &mut canonical)?;
-            return store(&mut self.search_path, canonical.as_str());
+    }
+
+    pub fn rollback_to_savepoint(&self, index: usize) {
+        let mut state = self.store.borrow_mut();
+        if !state.transaction.active || index >= state.transaction.savepoint_count {
+            return;
         }
-        if name.eq_ignore_ascii_case("extra_float_digits") {
-            // Floats already render at their shortest exact round-trip form —
-            // the extra_float_digits >= 0 behavior — so the value is validated
-            // to PostgreSQL's range and retained for SHOW.
-            let n: i32 = if is_default {
-                1
-            } else {
-                v.parse().map_err(|_| {
-                    sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "invalid value for parameter \"extra_float_digits\": \"{}\"",
-                        v
-                    )
-                })?
-            };
-            if !(-15..=3).contains(&n) {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "{} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)",
-                    n
-                ));
-            }
-            self.extra_float_digits.clear();
-            let _ = write!(self.extra_float_digits, "{n}");
-            return Ok(());
-        }
-        if name.eq_ignore_ascii_case("lock_timeout") {
-            // A write conflict fails fast (40001) rather than waiting on a
-            // lock, so there is never a lock wait for lock_timeout to bound —
-            // any value is trivially satisfied.
-            return store(&mut self.lock_timeout, if is_default { "0" } else { v });
-        }
-        if name.eq_ignore_ascii_case("statement_timeout") {
-            // Enforced at scan boundaries during execution.
-            if is_default {
-                return store(&mut self.statement_timeout, "0");
-            }
-            if parse_timeout_ms(v).is_none() {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "invalid value for parameter \"statement_timeout\": \"{}\"",
-                    v
-                ));
-            }
-            return store(&mut self.statement_timeout, v);
-        }
-        if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
-            // No idle-in-transaction reaper yet, so only the disabled value is
-            // honored; a non-zero value would be a silent no-operator.
-            if is_default || v == "0" {
-                return Ok(());
-            }
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "{} is not enforced yet; only 0 (disabled) is accepted",
+        let savepoint =
+            state.transaction.savepoints[index].expect("GUC savepoint mirrors transaction");
+        state.current = savepoint.current;
+        state.transaction.session = savepoint.session;
+        state.transaction.savepoint_count = index + 1;
+    }
+
+    pub fn set_config(
+        &self,
+        name: &str,
+        value: Option<&str>,
+        local: bool,
+    ) -> Result<StackStr<256>, SqlError> {
+        self.set(name, value.unwrap_or("DEFAULT"), local)?;
+        self.get_owned(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "unrecognized configuration parameter \"{}\"",
                 name
-            ));
-        }
-        if name.eq_ignore_ascii_case("bytea_output") {
-            if is_default || v.eq_ignore_ascii_case("hex") {
-                self.bytea_escape = false;
-                return Ok(());
-            }
-            if v.eq_ignore_ascii_case("escape") {
-                self.bytea_escape = true;
-                return Ok(());
-            }
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"bytea_output\": \"{}\"",
-                v
-            ));
-        }
-        if name.eq_ignore_ascii_case("row_security") {
-            // No row-level-security policies exist, so `on` and `offset` select
-            // the same rows; the value is validated and retained for SHOW.
-            let on = if is_default {
-                true
-            } else {
-                parse_on_off(v).ok_or_else(|| unsupported_value("row_security", v))?
-            };
-            return store(&mut self.row_security, if on { "on" } else { "off" });
-        }
-        // Read-only parameters cannot be assigned.
-        if is_read_only(name) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::CANT_CHANGE_RUNTIME_PARAM,
-                "parameter \"{}\" cannot be changed",
-                name
-            ));
-        }
-        Err(sql_err!(
+            )
+        })
+    }
+}
+
+fn change_setting(
+    values: &mut GucValues,
+    defaults: &GucValues,
+    name: &str,
+    raw: &str,
+) -> Result<(), SqlError> {
+    if unquote(raw).eq_ignore_ascii_case("default") {
+        reset_setting(values, defaults, name)
+    } else {
+        apply_setting(values, name, raw)
+    }
+}
+
+fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Result<(), SqlError> {
+    if name.eq_ignore_ascii_case("datestyle") {
+        values.datestyle = defaults.datestyle;
+    } else if name.eq_ignore_ascii_case("timezone") {
+        values.timezone = defaults.timezone;
+        values.parsed_timezone = defaults.parsed_timezone;
+    } else if name.eq_ignore_ascii_case("client_encoding") {
+        values.client_encoding = defaults.client_encoding;
+    } else if name.eq_ignore_ascii_case("application_name") {
+        values.application_name = defaults.application_name;
+    } else if name.eq_ignore_ascii_case("search_path") {
+        values.search_path = defaults.search_path;
+    } else if name.eq_ignore_ascii_case("client_min_messages") {
+        values.client_min_messages = defaults.client_min_messages;
+    } else if name.eq_ignore_ascii_case("extra_float_digits") {
+        values.extra_float_digits = defaults.extra_float_digits;
+    } else if name.eq_ignore_ascii_case("lock_timeout") {
+        values.lock_timeout = defaults.lock_timeout;
+    } else if name.eq_ignore_ascii_case("statement_timeout") {
+        values.statement_timeout = defaults.statement_timeout;
+    } else if name.eq_ignore_ascii_case("row_security") {
+        values.row_security = defaults.row_security;
+    } else if name.eq_ignore_ascii_case("bytea_output") {
+        values.bytea_escape = defaults.bytea_escape;
+    } else if name.eq_ignore_ascii_case("standard_conforming_strings")
+        || name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
+    {
+        // Their only accepted value is already the fixed default.
+    } else if is_read_only(name) {
+        return Err(sql_err!(
+            sqlstate::CANT_CHANGE_RUNTIME_PARAM,
+            "parameter \"{}\" cannot be changed",
+            name
+        ));
+    } else {
+        return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "unrecognized configuration parameter \"{}\"",
             name
-        ))
+        ));
     }
+    Ok(())
+}
 
+fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), SqlError> {
+    let v = unquote(raw);
+    let is_default = v.eq_ignore_ascii_case("default");
+
+    if name.eq_ignore_ascii_case("datestyle") {
+        // DateStyle is cumulative: each SET updates only the components it
+        // names, keeping the rest.
+        let (fmt, ord) = if is_default {
+            (DateFormat::Iso, Order3::Mdy)
+        } else {
+            let cur = parse_full(values.datestyle.as_str());
+            apply_datestyle(cur, v).ok_or_else(|| unsupported_value("DateStyle", v))?
+        };
+        return store(
+            &mut values.datestyle,
+            canonical_datestyle(fmt, ord).as_str(),
+        );
+    }
+    if name.eq_ignore_ascii_case("timezone") {
+        // UTC, fixed numeric offsets, Etc/GMT±N, and named IANA zones (with
+        // DST) are honored; an unknown zone is rejected loudly.
+        let timezone = if is_default {
+            super::timezone::Timezone::utc()
+        } else {
+            parse_timezone(v).ok_or_else(|| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid value for parameter \"TimeZone\": \"{}\"",
+                    v
+                )
+            })?
+        };
+        store(&mut values.timezone, if is_default { "UTC" } else { v })?;
+        values.parsed_timezone = timezone;
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("client_encoding") {
+        // UTF8 is native; SQL_ASCII is byte-pass-through (no conversion), so
+        // both are served without transcoding. Any other encoding would
+        // require a conversion we do not implement.
+        if is_default || is_utf8(v) {
+            return store(&mut values.client_encoding, "UTF8");
+        }
+        if v.eq_ignore_ascii_case("sql_ascii") {
+            return store(&mut values.client_encoding, "SQL_ASCII");
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "conversion between {} and UTF8 is not supported",
+            v
+        ));
+    }
+    if name.eq_ignore_ascii_case("standard_conforming_strings") {
+        if is_default || v.eq_ignore_ascii_case("on") {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "standard_conforming_strings can only be on (strings always conform)"
+        ));
+    }
+    if name.eq_ignore_ascii_case("client_min_messages") {
+        // Filters which NOTICE/WARNING messages reach the client. The
+        // default is `notice`; an unrecognized level errors like PostgreSQL.
+        values.client_min_messages = if is_default {
+            MessageLevel::Notice
+        } else {
+            MessageLevel::parse(v).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid value for parameter \"client_min_messages\": \"{}\"",
+                    v
+                )
+            })?
+        };
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("application_name") {
+        return store(
+            &mut values.application_name,
+            if is_default { "" } else { v },
+        );
+    }
+    if name.eq_ignore_ascii_case("search_path") {
+        if is_default {
+            return store(&mut values.search_path, "\"$user\", public");
+        }
+        let mut canonical = StackStr::<128>::new();
+        // The raw text, not the pre-unquoted value: quoting decides how
+        // elements split, and a single-quoted string is one element
+        // however many commas it holds.
+        canonicalize_search_path(raw, &mut canonical)?;
+        return store(&mut values.search_path, canonical.as_str());
+    }
+    if name.eq_ignore_ascii_case("extra_float_digits") {
+        // Floats already render at their shortest exact round-trip form —
+        // the extra_float_digits >= 0 behavior — so the value is validated
+        // to PostgreSQL's range and retained for SHOW.
+        let n: i32 = if is_default {
+            1
+        } else {
+            v.parse().map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid value for parameter \"extra_float_digits\": \"{}\"",
+                    v
+                )
+            })?
+        };
+        if !(-15..=3).contains(&n) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "{} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)",
+                n
+            ));
+        }
+        values.extra_float_digits.clear();
+        let _ = write!(values.extra_float_digits, "{n}");
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("lock_timeout") {
+        // A write conflict fails fast (40001) rather than waiting on a
+        // lock, so there is never a lock wait for lock_timeout to bound —
+        // any value is trivially satisfied.
+        return store(&mut values.lock_timeout, if is_default { "0" } else { v });
+    }
+    if name.eq_ignore_ascii_case("statement_timeout") {
+        // Enforced at scan boundaries during execution.
+        if is_default {
+            return store(&mut values.statement_timeout, "0");
+        }
+        if parse_timeout_ms(v).is_none() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"statement_timeout\": \"{}\"",
+                v
+            ));
+        }
+        return store(&mut values.statement_timeout, v);
+    }
+    if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
+        // No idle-in-transaction reaper yet, so only the disabled value is
+        // honored; a non-zero value would be a silent no-operator.
+        if is_default || v == "0" {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} is not enforced yet; only 0 (disabled) is accepted",
+            name
+        ));
+    }
+    if name.eq_ignore_ascii_case("bytea_output") {
+        if is_default || v.eq_ignore_ascii_case("hex") {
+            values.bytea_escape = false;
+            return Ok(());
+        }
+        if v.eq_ignore_ascii_case("escape") {
+            values.bytea_escape = true;
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid value for parameter \"bytea_output\": \"{}\"",
+            v
+        ));
+    }
+    if name.eq_ignore_ascii_case("row_security") {
+        // No row-level-security policies exist, so `on` and `offset` select
+        // the same rows; the value is validated and retained for SHOW.
+        let on = if is_default {
+            true
+        } else {
+            parse_on_off(v).ok_or_else(|| unsupported_value("row_security", v))?
+        };
+        return store(&mut values.row_security, if on { "on" } else { "off" });
+    }
+    // Read-only parameters cannot be assigned.
+    if is_read_only(name) {
+        return Err(sql_err!(
+            crate::sql::eval::sqlstate::CANT_CHANGE_RUNTIME_PARAM,
+            "parameter \"{}\" cannot be changed",
+            name
+        ));
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_OBJECT,
+        "unrecognized configuration parameter \"{}\"",
+        name
+    ))
+}
+
+impl GucState {
     /// The current value for `SHOW name`, or None if the parameter is unknown
     /// here (the caller falls back to fixed server parameters).
-    pub fn get(&self, name: &str) -> Option<&str> {
+    pub fn get_owned(&self, name: &str) -> Option<StackStr<256>> {
+        let state = self.store.borrow();
+        let values = &state.current;
         if name.eq_ignore_ascii_case("datestyle") {
-            Some(self.datestyle.as_str())
+            Some(StackStr::from_str(values.datestyle.as_str()))
         } else if name.eq_ignore_ascii_case("timezone") {
-            Some(self.timezone.as_str())
+            Some(StackStr::from_str(values.timezone.as_str()))
         } else if name.eq_ignore_ascii_case("client_encoding") {
-            Some(self.client_encoding.as_str())
+            Some(StackStr::from_str(values.client_encoding.as_str()))
         } else if name.eq_ignore_ascii_case("application_name") {
-            Some(self.application_name.as_str())
+            Some(StackStr::from_str(values.application_name.as_str()))
         } else if name.eq_ignore_ascii_case("search_path") {
-            Some(self.search_path.as_str())
+            Some(StackStr::from_str(values.search_path.as_str()))
         } else if name.eq_ignore_ascii_case("client_min_messages") {
-            Some(self.client_min_messages.as_str())
+            Some(StackStr::from_str(values.client_min_messages.as_str()))
         } else if name.eq_ignore_ascii_case("extra_float_digits") {
-            Some(self.extra_float_digits.as_str())
+            Some(StackStr::from_str(values.extra_float_digits.as_str()))
         } else if name.eq_ignore_ascii_case("lock_timeout") {
-            Some(self.lock_timeout.as_str())
+            Some(StackStr::from_str(values.lock_timeout.as_str()))
         } else if name.eq_ignore_ascii_case("row_security") {
-            Some(self.row_security.as_str())
+            Some(StackStr::from_str(values.row_security.as_str()))
         } else if name.eq_ignore_ascii_case("statement_timeout") {
-            Some(self.statement_timeout.as_str())
+            Some(StackStr::from_str(values.statement_timeout.as_str()))
         } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
-            Some("0")
+            Some(StackStr::from_str("0"))
         } else if name.eq_ignore_ascii_case("bytea_output") {
-            Some(if self.bytea_escape { "escape" } else { "hex" })
+            Some(StackStr::from_str(if values.bytea_escape {
+                "escape"
+            } else {
+                "hex"
+            }))
         } else {
             None
         }
@@ -459,26 +747,38 @@ impl GucState {
     /// Value-rendering settings for the wire layer (DateStyle + zone).
     /// The session's resolved `TimeZone`.
     pub fn timezone(&self) -> super::timezone::Timezone {
-        self.parsed_timezone
+        self.store.borrow().current.parsed_timezone
     }
 
     pub fn render(&self) -> RenderContext {
-        let (format, ord) = parse_full(self.datestyle.as_str());
-        let order = if ord == Order3::Dmy { FieldOrder::Dmy } else { FieldOrder::Mdy };
+        let state = self.store.borrow();
+        let values = &state.current;
+        let (format, ord) = parse_full(values.datestyle.as_str());
+        let order = if ord == Order3::Dmy {
+            FieldOrder::Dmy
+        } else {
+            FieldOrder::Mdy
+        };
         RenderContext {
             datestyle: DateStyle { format, order },
-            parsed_timezone: self.parsed_timezone,
-            min_message_level: self.client_min_messages,
-            bytea_escape: self.bytea_escape,
+            parsed_timezone: values.parsed_timezone,
+            min_message_level: values.client_min_messages,
+            bytea_escape: values.bytea_escape,
         }
     }
 }
 
 /// Parses a PostgreSQL boolean GUC value (on/off/true/false/1/0), allocation-free.
 fn parse_on_off(v: &str) -> Option<bool> {
-    if ["on", "true", "yes", "1"].iter().any(|s| v.eq_ignore_ascii_case(s)) {
+    if ["on", "true", "yes", "1"]
+        .iter()
+        .any(|s| v.eq_ignore_ascii_case(s))
+    {
         Some(true)
-    } else if ["off", "false", "no", "0"].iter().any(|s| v.eq_ignore_ascii_case(s)) {
+    } else if ["off", "false", "no", "0"]
+        .iter()
+        .any(|s| v.eq_ignore_ascii_case(s))
+    {
         Some(false)
     } else {
         None
@@ -503,14 +803,21 @@ fn parse_timeout_ms(v: &str) -> Option<u64> {
     } else {
         (t, 1)
     };
-    num_part.trim().parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
+    num_part
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
 }
 
 fn store<const N: usize>(dst: &mut StackStr<N>, v: &str) -> Result<(), SqlError> {
     dst.clear();
     let _ = write!(dst, "{v}");
     if dst.is_truncated() {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "configuration value is too long"));
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "configuration value is too long"
+        ));
     }
     Ok(())
 }
@@ -636,7 +943,10 @@ pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
             return Some(Timezone::utc());
         }
         let offset = -parse_hms(rest)?;
-        return Some(Timezone::fixed(offset, super::datetime::iso_offset_string(offset).as_str()));
+        return Some(Timezone::fixed(
+            offset,
+            super::datetime::iso_offset_string(offset).as_str(),
+        ));
     }
     // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
     if t.starts_with('+') || t.starts_with('-') {
@@ -672,7 +982,9 @@ fn parse_hms(s: &str) -> Option<i32> {
 }
 
 fn is_utf8(v: &str) -> bool {
-    v.eq_ignore_ascii_case("utf8") || v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("unicode")
+    v.eq_ignore_ascii_case("utf8")
+        || v.eq_ignore_ascii_case("utf-8")
+        || v.eq_ignore_ascii_case("unicode")
 }
 
 /// Renders a `SET search_path` value the way PostgreSQL stores it for SHOW:

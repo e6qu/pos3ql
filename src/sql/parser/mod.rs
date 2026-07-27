@@ -553,8 +553,11 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident("set") => {
                 self.advance()?;
-                // SESSION / LOCAL scope prefixes are both treated as session.
-                let _ = self.eat_ident("session")? || self.eat_ident("local")?;
+                let local = if self.eat_ident("session")? {
+                    false
+                } else {
+                    self.eat_ident("local")?
+                };
                 // SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS
                 // TRANSACTION ...: set the (default) transaction characteristics.
                 // The engine provides one isolation level, as BEGIN does, so the
@@ -584,7 +587,15 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                 }
                 let value = self.text[start..self.peek_at].trim();
-                Ok(Stmt::Set { name, value })
+                Ok(Stmt::Set { name, value, local })
+            }
+            Tok::Ident("reset") => {
+                self.advance()?;
+                if self.eat_ident("all")? {
+                    Ok(Stmt::Reset(None))
+                } else {
+                    Ok(Stmt::Reset(Some(self.any_ident("configuration parameter")?)))
+                }
             }
             Tok::Ident("show") => {
                 self.advance()?;

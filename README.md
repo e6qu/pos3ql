@@ -72,7 +72,9 @@ Working single-node database:
   with `ALTER TYPE ... ADD VALUE`, ordered by definition order and reflected in
   `pg_type`/`pg_enum`), casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
-  introspection, `SHOW` / `SET` and `current_setting(...)` for session settings,
+  introspection, transactional `SHOW` / `SET` / `SET LOCAL` / `RESET` /
+  `RESET ALL` and `current_setting(...)` / `set_config(...)` for session
+  settings (including savepoint rollback),
   PostgreSQL lexical rules, and SQLSTATE-correct errors.
 - COPY FROM STDIN / TO STDOUT (including `COPY (query) TO STDOUT`) in
   PostgreSQL's text, CSV, and binary formats —

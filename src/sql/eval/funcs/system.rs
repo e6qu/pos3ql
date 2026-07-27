@@ -84,24 +84,26 @@ std::thread_local! {
 /// Publishes the readable settings for the statement about to evaluate. Each
 /// pair is `(static name, current value)`; more than `MAX_SESSION_SETTINGS` is a
 /// loud error, never silent truncation.
-pub fn set_session_settings(pairs: &[(&'static str, &str)]) -> Result<(), SqlError> {
-    if pairs.len() > MAX_SESSION_SETTINGS {
+pub fn set_session_settings(
+    names: &[&'static str],
+    values: &[crate::util::StackStr<256>],
+) -> Result<(), SqlError> {
+    if names.len() != values.len() {
+        return Err(sql_err!(sqlstate::INTERNAL_ERROR, "session setting snapshot is misaligned"));
+    }
+    if names.len() > MAX_SESSION_SETTINGS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many session settings to publish ({} > {})",
-            pairs.len(),
+            names.len(),
             MAX_SESSION_SETTINGS
         ));
     }
     SESSION_SETTINGS.with(|s| {
         let mut s = s.borrow_mut();
-        for (i, &(name, value)) in pairs.iter().enumerate() {
-            s.names[i] = name;
-            let mut v = crate::util::StackStr::new();
-            let _ = core::fmt::Write::write_str(&mut v, value);
-            s.values[i] = v;
-        }
-        s.n = pairs.len();
+        s.names[..names.len()].copy_from_slice(names);
+        s.values[..values.len()].copy_from_slice(values);
+        s.n = names.len();
     });
     Ok(())
 }
@@ -114,6 +116,17 @@ fn session_setting(name: &str) -> Option<crate::util::StackStr<256>> {
             .find(|&i| s.names[i].eq_ignore_ascii_case(name))
             .map(|i| s.values[i])
     })
+}
+
+fn update_session_setting(name: &str, value: crate::util::StackStr<256>) {
+    SESSION_SETTINGS.with(|settings| {
+        let mut settings = settings.borrow_mut();
+        if let Some(index) =
+            (0..settings.n).find(|&index| settings.names[index].eq_ignore_ascii_case(name))
+        {
+            settings.values[index] = value;
+        }
+    });
 }
 
 pub fn set_session_user(user: &str) {
@@ -179,6 +192,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_encoding_to_char"
             | "pg_typeof"
             | "current_setting"
+            | "set_config"
     ) {
         return None;
     }
@@ -242,6 +256,55 @@ pub(crate) fn dispatch<'a>(
                         name_value
                     )),
                 }
+            }
+            "set_config" => {
+                if args.len() != 3 || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function set_config(...) with {} arguments does not exist",
+                        if star { 1 } else { args.len() }
+                    ));
+                }
+                let name = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(value) => value,
+                    Datum::Null => {
+                        return Err(sql_err!(
+                            sqlstate::NULL_VALUE_NOT_ALLOWED,
+                            "SET requires parameter name"
+                        ))
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "set_config() requires a text setting name"
+                        ))
+                    }
+                };
+                let value = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Text(value) => Some(value),
+                    Datum::Null => None,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "set_config() requires a text setting value"
+                        ))
+                    }
+                };
+                let local = match eval_full(args[2], arena, params, row, hooks)? {
+                    Datum::Bool(value) => value,
+                    Datum::Null => false,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "set_config() requires a boolean is_local argument"
+                        ))
+                    }
+                };
+                let configured = crate::sql::guc::set_active_config(name, value, local)?;
+                update_session_setting(name, configured);
+                Ok(Datum::Text(
+                    arena.alloc_str(configured.as_str()).map_err(|_| arena_full())?,
+                ))
             }
             "current_schema" => {
                 arity(0)?;

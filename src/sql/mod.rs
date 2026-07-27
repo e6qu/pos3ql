@@ -1789,7 +1789,15 @@ impl Engine {
                 responder,
             ),
             Stmt::Comment { target, text } => {
-                exec::comment(&mut self.storage, &mut self.wal, txn, target, *text, responder)
+                exec::comment(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    target,
+                    *text,
+                    arena,
+                    responder,
+                )
             }
             Stmt::Truncate { tables, restart_identity, cascade } => {
                 exec::truncate(&mut self.storage, txn, tables, *restart_identity, *cascade, responder)
@@ -2771,8 +2779,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::Comment { class, schema, name, subid, text } => {
             let stored = text.map(crate::storage::comment_stackstr).transpose()?;
+            let class = crate::storage::CommentClass::from_u8(class).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt WAL comment class {}",
+                    class
+                )
+            })?;
             storage.apply_comment(
-                crate::storage::CommentClass::from_u8(class),
+                class,
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
                 subid,

@@ -17,8 +17,7 @@
 # FUZZ_BUDGET so its known edge-case divergences can be ratcheted to zero.
 
 set -u
-cd "$(dirname "$0")/../.."
-ROOT=$(pwd)
+cd "$(dirname "$0")/../.." || exit
 EXT=tests/external
 VENV=${POS3QL_VENV:-target/external-venv}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pos3ql-ci-diff.XXXXXX")
@@ -65,6 +64,7 @@ data_dir = ${WORK}/p3data
 s3 = off
 max_tables = 64
 table_rows = 65536
+max_value_indexes = 64
 memtable_bytes = 256MiB
 EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
@@ -81,6 +81,20 @@ wait_up "$PGPORT" || { echo "PostgreSQL not reachable on $PGHOST:$PGPORT"; exit 
 psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 \
   || { for _ in $(seq 1 100); do psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break; sleep 0.1; done; }
 echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW server_version')"
+
+restart_p3_fresh() {
+  kill "$P3_PID" 2>/dev/null
+  wait "$P3_PID" 2>/dev/null
+  rm -rf "${WORK}/p3data"
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  P3_PID=$!
+  for _ in $(seq 1 100); do
+    psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  echo "pos3ql did not restart on 127.0.0.1:$P3_PORT"
+  return 1
+}
 
 # --- raw wire-protocol probes ----------------------------------------------
 echo "=== wire protocol probes ==="
@@ -166,6 +180,11 @@ fi
 # Query-block sharded: all files, all statements; this shard runs its slice of
 # the read-only query blocks.
 if [[ "$RUN_SLT" == 1 ]]; then
+  # The curated corpora intentionally leave some objects alive. Give the
+  # sqllogictest files the full bounded catalog: one file creates 64 primary-key
+  # tables, exactly matching both configured pools.
+  echo "=== restart pos3ql (fresh table space for sqllogictest) ==="
+  restart_p3_fresh || exit 1
   echo "=== sqllogictest replay (query shard $SLT_QUERY_SHARD/$SLT_QUERY_SHARDS) ==="
   if "$PY" "$EXT/slt_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --limit "$SLT_LIMIT" \
        --query-shards "$SLT_QUERY_SHARDS" --query-shard "$SLT_QUERY_SHARD" \
@@ -180,14 +199,7 @@ if [[ "$RUN_FUZZ" == 1 ]]; then
   # the generative fuzzer its own fresh instance (a clean table space) rather
   # than letting its schema setup fail against a full catalog.
   echo "=== restart pos3ql (fresh table space for the fuzzer) ==="
-  kill "$P3_PID" 2>/dev/null; wait "$P3_PID" 2>/dev/null
-  rm -rf "${WORK}/p3data"
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
-  P3_PID=$!
-  for _ in $(seq 1 100); do
-    psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
+  restart_p3_fresh || exit 1
 
   # --- generative differential fuzzer (gated by a ratchet budget) ----------
   echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, budget=$FUZZ_BUDGET) ==="
@@ -195,7 +207,7 @@ if [[ "$RUN_FUZZ" == 1 ]]; then
     > "$WORK/fuzz.out" 2>&1 || true
   DIV=$(grep -oE 'divergence=[0-9]+' "$WORK/fuzz.out" | tail -1 | cut -d= -f2)
   DIV=${DIV:-unknown}
-  echo "$(grep '^TOTAL' "$WORK/fuzz.out")"
+  grep '^TOTAL' "$WORK/fuzz.out"
   if [[ ! "$DIV" =~ ^[0-9]+$ ]]; then
     # No divergence count means the fuzzer crashed before finishing — show why.
     bad "fuzzer produced no divergence count (crashed)"; tail -40 "$WORK/fuzz.out"

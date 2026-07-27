@@ -28,6 +28,7 @@ const PG_CATALOG_NS_OID: i32 = 11;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
 const PG_CLASS_OID: i32 = 1259;
 const PG_NAMESPACE_OID: i32 = 2615;
+const PG_TYPE_OID: i32 = 1247;
 
 pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
     match qualifier {
@@ -79,6 +80,7 @@ pub fn synthesize<'a>(
     storage: &Storage,
     qualifier: Option<&str>,
     name: &'a str,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let info = qualifier == Some("information_schema");
@@ -281,7 +283,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_description") => pg_description(storage, arena),
+        (false, "pg_description") => pg_description(storage, txid, arena),
         (false, "pg_enum") => pg_enum(storage, arena),
         (false, "pg_range") => finish(
             def_of(
@@ -353,6 +355,28 @@ fn view_oid(slot: usize) -> i32 {
 const FIRST_DOMAIN_OID: i32 = 110_000;
 fn domain_oid(slot: usize) -> i32 {
     FIRST_DOMAIN_OID + slot as i32
+}
+
+/// Tables/materialized views and plain views have distinct composite-type OID
+/// bands. PostgreSQL gives every row-bearing relation a separate pg_type row.
+const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = 130_000;
+const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
+
+fn composite_type_oid(
+    storage: &Storage,
+    schema: &str,
+    name: &str,
+    txid: u32,
+) -> Option<i32> {
+    match storage.resolve_relation(Some(schema), name, txid)? {
+        crate::storage::ResolvedRelation::Table(slot) => {
+            Some(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32)
+        }
+        crate::storage::ResolvedRelation::View(slot) => {
+            Some(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32)
+        }
+        crate::storage::ResolvedRelation::Catalog => None,
+    }
 }
 
 /// One materialized index relation (implicit primary-key / unique index from a
@@ -504,7 +528,11 @@ pub fn reloid_of_name(storage: &Storage, name: &str) -> Option<i32> {
 /// `pg_description`: one row per committed object comment, resolving each to
 /// its `(objoid, classoid, objsubid)`. A comment whose object no longer
 /// resolves to an OID is omitted, matching that its row would be dangling.
-fn pg_description<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_description<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_description",
         &[
@@ -516,7 +544,7 @@ fn pg_description<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<
     );
     let mut out: [&[Datum]; crate::storage::MAX_COMMENTS] = [&[]; crate::storage::MAX_COMMENTS];
     let mut n = 0;
-    for (class, schema, name, subid, description) in storage.comments_visible(0) {
+    for (class, schema, name, subid, description) in storage.comments_visible(txid) {
         if n == out.len() {
             break;
         }
@@ -526,6 +554,10 @@ fn pg_description<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<
                 None => continue,
             },
             crate::storage::CommentClass::Schema => (namespace_oid(storage, name), PG_NAMESPACE_OID),
+            crate::storage::CommentClass::Type => match type_oid_of(storage, schema, name, txid) {
+                Some(oid) => (oid, PG_TYPE_OID),
+                None => continue,
+            },
         };
         out[n] = row(
             &[
@@ -569,26 +601,126 @@ fn relation_oid_of(storage: &Storage, schema: &str, name: &str) -> Option<i32> {
         .map(|info| info.oid)
 }
 
+/// Resolves a modeled built-in SQL type to its real catalog name and OID.
+/// Qualified names accept only `pg_type.typname` spellings; PostgreSQL does
+/// not resolve aliases such as `pg_catalog.integer`.
+pub fn builtin_type_identity(name: &str, allow_aliases: bool) -> Option<(&'static str, i32)> {
+    use crate::sql::types::{oid, ArrElem};
+
+    let catalog_only = match name {
+        "oid" => Some(("oid", 26)),
+        "record" => Some(("record", oid::RECORD)),
+        "regproc" => Some(("regproc", oid::REGPROC)),
+        "regprocedure" => Some(("regprocedure", oid::REGPROCEDURE)),
+        "regoper" => Some(("regoper", oid::REGOPER)),
+        "regoperator" => Some(("regoperator", oid::REGOPERATOR)),
+        "regclass" => Some(("regclass", oid::REGCLASS)),
+        "regtype" => Some(("regtype", oid::REGTYPE)),
+        "regnamespace" => Some(("regnamespace", oid::REGNAMESPACE)),
+        "regrole" => Some(("regrole", oid::REGROLE)),
+        _ => None,
+    };
+    if catalog_only.is_some() {
+        return catalog_only;
+    }
+    // SERIAL spellings are DDL shorthand, not entries in pg_type.
+    if matches!(
+        name,
+        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
+    ) {
+        return None;
+    }
+    let array_elements = [
+        ArrElem::Bool,
+        ArrElem::Int2,
+        ArrElem::Int4,
+        ArrElem::Int8,
+        ArrElem::Float4,
+        ArrElem::Float8,
+        ArrElem::Text,
+        ArrElem::Name,
+        ArrElem::Varchar,
+        ArrElem::Bpchar,
+        ArrElem::Date,
+        ArrElem::Timestamp,
+        ArrElem::Timestamptz,
+        ArrElem::Time,
+        ArrElem::Timetz,
+        ArrElem::Interval,
+        ArrElem::Json,
+        ArrElem::Jsonb,
+        ArrElem::Uuid,
+        ArrElem::Bytea,
+        ArrElem::Numeric,
+        ArrElem::Inet,
+        ArrElem::Cidr,
+        ArrElem::Macaddr,
+        ArrElem::Macaddr8,
+    ];
+    if let Some(element) = array_elements
+        .iter()
+        .find(|element| element.catalog_name() == name)
+    {
+        return Some((element.catalog_name(), element.array_oid()));
+    }
+    let column_type = ColType::from_sql_name(name)?;
+    let canonical = column_type.catalog_name();
+    if allow_aliases || name == canonical {
+        return Some((canonical, column_type.oid()));
+    }
+    if let (ColType::Array(element), Some(base)) = (column_type, name.strip_suffix("[]"))
+        && ColType::from_sql_name(base).is_some_and(|base_type| base_type.catalog_name() == base)
+    {
+        return Some((element.catalog_name(), element.array_oid()));
+    }
+    None
+}
+
+fn type_oid_of(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option<i32> {
+    if let Some(slot) = storage.domain_slot(schema, name, txid) {
+        return Some(domain_oid(slot));
+    }
+    if let Some(slot) = storage.enum_slot(schema, name, txid) {
+        return Some(crate::sql::types::oid::enum_oid(slot as u16));
+    }
+    if let Some(oid) = composite_type_oid(storage, schema, name, txid) {
+        return Some(oid);
+    }
+    if schema == "pg_catalog" {
+        return builtin_type_identity(name, false).map(|(_, oid)| oid);
+    }
+    None
+}
+
 /// The comment text `txid` sees on the object with this OID (and column
-/// `subid`), for `obj_description`/`col_description`. `is_namespace` selects a
-/// `pg_namespace` object (a schema) over a `pg_class` one.
+/// `subid`), for `obj_description`/`col_description`. `catalog_name` selects
+/// the object's catalog, defaulting to `pg_class` for deprecated one-argument
+/// `obj_description`.
 pub fn comment_text_for<'a>(
     storage: &Storage,
     txid: u32,
-    is_namespace: bool,
+    catalog_name: &str,
     oid: i32,
     subid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     for (class, schema, name, csub, text) in storage.comments_visible(txid) {
-        let hit = if is_namespace {
-            class == crate::storage::CommentClass::Schema
-                && subid == 0
-                && namespace_oid(storage, name) == oid
-        } else {
-            class == crate::storage::CommentClass::Relation
-                && csub as i32 == subid
-                && relation_oid_of(storage, schema, name) == Some(oid)
+        let hit = match catalog_name {
+            "pg_namespace" => {
+                class == crate::storage::CommentClass::Schema
+                    && subid == 0
+                    && namespace_oid(storage, name) == oid
+            }
+            "pg_type" => {
+                class == crate::storage::CommentClass::Type
+                    && subid == 0
+                    && type_oid_of(storage, schema, name, txid) == Some(oid)
+            }
+            _ => {
+                class == crate::storage::CommentClass::Relation
+                    && csub as i32 == subid
+                    && relation_oid_of(storage, schema, name) == Some(oid)
+            }
         };
         if hit {
             let bytes = arena.alloc_slice_copy(text.as_bytes()).map_err(|_| arena_full())?;
@@ -1328,8 +1460,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
         ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
         _ => "S",
     };
-    let mut out: [&[Datum]; 32 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS] =
-        [&[]; 32 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS];
+    let mut out: [&[Datum]; 512 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS] =
+        [&[]; 512 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS];
     for (i, t) in types.iter().enumerate() {
         out[i] = row(
             &[
@@ -1397,6 +1529,61 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    // Every table, materialized view and plain view owns a composite row type.
+    for (slot, table) in storage.live_tables() {
+        if n == out.len() {
+            break;
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
+                text(table.def.name.as_str(), arena)?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, table.def.schema.as_str())),
+                text("c", arena)?,
+                text("C", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(table_oid(storage, slot)),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for (slot, view) in storage.views_with_slots() {
+        if n == out.len() {
+            break;
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
+                text(view.name.as_str(), arena)?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, view.schema.as_str())),
+                text("c", arena)?,
+                text("C", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(view_oid(slot)),
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,

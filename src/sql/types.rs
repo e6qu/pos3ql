@@ -56,6 +56,14 @@ pub mod oid {
     pub const UNKNOWN: i32 = 705;
     /// Anonymous composite / record type.
     pub const RECORD: i32 = 2249;
+    pub const REGPROC: i32 = 24;
+    pub const REGPROCEDURE: i32 = 2202;
+    pub const REGOPER: i32 = 2203;
+    pub const REGOPERATOR: i32 = 2204;
+    pub const REGCLASS: i32 = 2205;
+    pub const REGTYPE: i32 = 2206;
+    pub const REGNAMESPACE: i32 = 4089;
+    pub const REGROLE: i32 = 4096;
     /// Base OID for user-defined enum types, synthesized as `FIRST_ENUM + slot`.
     /// Kept clear of the domain range (`FIRST_DOMAIN_OID = 110_000`).
     pub const FIRST_ENUM: i32 = 120_000;
@@ -391,6 +399,15 @@ impl ColType {
         }
     }
 
+    /// The actual `pg_type.typname`, which differs from SQL's display spelling
+    /// for arrays (`_int4`, not `integer[]`).
+    pub fn catalog_name(self) -> &'static str {
+        match self {
+            Self::Array(element) => element.catalog_name(),
+            other => other.internal_name(),
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Bool => "boolean",
@@ -555,6 +572,37 @@ pub enum ArrElem {
 }
 
 impl ArrElem {
+    /// The array type's internal `pg_type.typname`.
+    pub fn catalog_name(self) -> &'static str {
+        match self {
+            ArrElem::Bool => "_bool",
+            ArrElem::Int4 => "_int4",
+            ArrElem::Int8 => "_int8",
+            ArrElem::Float8 => "_float8",
+            ArrElem::Text => "_text",
+            ArrElem::Numeric => "_numeric",
+            ArrElem::Date => "_date",
+            ArrElem::Timestamp => "_timestamp",
+            ArrElem::Timestamptz => "_timestamptz",
+            ArrElem::Int2 => "_int2",
+            ArrElem::Float4 => "_float4",
+            ArrElem::Time => "_time",
+            ArrElem::Timetz => "_timetz",
+            ArrElem::Interval => "_interval",
+            ArrElem::Uuid => "_uuid",
+            ArrElem::Bytea => "_bytea",
+            ArrElem::Json => "_json",
+            ArrElem::Jsonb => "_jsonb",
+            ArrElem::Varchar => "_varchar",
+            ArrElem::Bpchar => "_bpchar",
+            ArrElem::Name => "_name",
+            ArrElem::Inet => "_inet",
+            ArrElem::Cidr => "_cidr",
+            ArrElem::Macaddr => "_macaddr",
+            ArrElem::Macaddr8 => "_macaddr8",
+        }
+    }
+
     /// The array type's own name, as PostgreSQL reports it in a message:
     /// `integer[]`, not `array`. The element's name with `[]` appended, but as
     /// a static string, since that is what a type name is here.

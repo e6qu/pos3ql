@@ -1179,11 +1179,13 @@ pub(crate) const COMMENT_MAX: usize = 192;
 
 /// Which catalog a comment's object lives in. `Relation` covers every
 /// `pg_class` object (table, view, materialized view, index, sequence — and a
-/// column, via a non-zero `subid`); `Schema` covers `pg_namespace`.
+/// column, via a non-zero `subid`); `Schema` covers `pg_namespace`; `Type`
+/// covers built-in and user-defined rows of `pg_type`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommentClass {
     Relation,
     Schema,
+    Type,
 }
 
 impl CommentClass {
@@ -1191,14 +1193,17 @@ impl CommentClass {
         match self {
             CommentClass::Relation => 0,
             CommentClass::Schema => 1,
+            CommentClass::Type => 2,
         }
     }
 
-    pub fn from_u8(value: u8) -> Self {
-        match value {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => CommentClass::Relation,
             1 => CommentClass::Schema,
-            _ => CommentClass::Relation,
-        }
+            2 => CommentClass::Type,
+            _ => return None,
+        })
     }
 }
 
@@ -3541,6 +3546,7 @@ impl Storage {
     pub fn drop_table(&mut self, index: usize) {
         let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.release_enforcers(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
@@ -3565,6 +3571,7 @@ impl Storage {
     pub fn commit_drop(&mut self, index: usize) {
         let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.release_enforcers(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
@@ -4137,6 +4144,8 @@ impl Storage {
     }
 
     pub fn commit_domain_drop(&mut self, slot: usize) {
+        let (schema, name) = (self.domains[slot].schema, self.domains[slot].name);
+        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.domains[slot].live = false;
         self.domains[slot].pending = None;
     }
@@ -4318,6 +4327,8 @@ impl Storage {
     }
 
     pub fn commit_enum_drop(&mut self, slot: usize) {
+        let (schema, name) = (self.enums[slot].schema, self.enums[slot].name);
+        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.enums[slot].live = false;
         self.enums[slot].pending = None;
     }
@@ -4455,7 +4466,19 @@ impl Storage {
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
     pub fn commit_view_drop(&mut self, slot: usize) {
         let (schema, name) = (self.views[slot].schema, self.views[slot].name);
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+        // CREATE OR REPLACE installs the replacement before retiring this
+        // slot. Comments belong to the logical same-named object and survive;
+        // an ordinary DROP has no replacement and removes them.
+        let replaced = self.views.iter().enumerate().any(|(other, view)| {
+            other != slot
+                && view.live
+                && view.schema == schema
+                && view.name == name
+        });
+        if !replaced {
+            self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+            self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+        }
         self.views[slot].live = false;
         self.views[slot].pending = None;
     }
@@ -4775,6 +4798,19 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_class_codec_rejects_unknown_values() {
+        for class in [
+            CommentClass::Relation,
+            CommentClass::Schema,
+            CommentClass::Type,
+        ] {
+            assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
+        }
+        assert_eq!(CommentClass::from_u8(3), None);
+        assert_eq!(CommentClass::from_u8(u8::MAX), None);
+    }
 
     fn test_config() -> Config {
         let mut c = Config::default_dev();

@@ -360,12 +360,12 @@ pub trait CatalogAccess {
     /// The OID of the relation named `name`, for `'relname'::regclass`.
     fn reloid(&self, name: &str) -> Option<i32>;
     /// The comment text on the object with this OID and column `subid` (0 for
-    /// the object itself), or `None`. `is_namespace` selects a schema
-    /// (`pg_namespace`) rather than a `pg_class` relation. Backs
+    /// the object itself), or `None`. `catalog_name` selects the owning
+    /// catalog (`pg_class`, `pg_namespace`, or `pg_type`). Backs
     /// `obj_description`/`col_description`.
     fn comment<'a>(
         &self,
-        is_namespace: bool,
+        catalog_name: &str,
         oid: i32,
         subid: i32,
         arena: &'a Arena,

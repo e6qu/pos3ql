@@ -196,6 +196,8 @@ pub enum CommentTarget<'a> {
     Column { relation: QualName<'a>, column: &'a str },
     /// SCHEMA name.
     Schema(&'a str),
+    /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
+    Type { name: &'a str, domain_only: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

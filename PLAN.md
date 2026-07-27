@@ -1440,6 +1440,22 @@ encoders — so the output path is shared with table `COPY TO` and cannot drift.
 Only `TO STDOUT` is accepted for a query (a query is never a `COPY FROM` target).
 Corpus `70_copy_query`, with a unit test.
 
+### JSON date-time rendering (2026-07-27)
+
+`to_json` / `row_to_json` / `to_jsonb` / `json_build_object` / `json_agg` /
+`array_to_json` rendered a `timestamp` or `timestamptz` in the space-separated
+`::text` form (`2020-01-01 00:00:00+00`) where PostgreSQL uses ISO 8601 —
+a `T` between date and time and, for `timestamptz`, a full `+HH:MM` offset
+(`2020-01-01T00:00:00+00:00`). Any application serializing a timestamp column to
+JSON got the wrong string. Fixed with a JSON-specific `format_timestamp_json`
+and explicit `Datum::Timestamp`/`Timestamptz` arms in the JSON writer;
+fractional seconds still trim trailing zeros, and `date`/`time`/`timetz`/
+`interval` keep their ordinary text form (which already matched). Corpus
+`71_json_datetime`, with unit-test coverage. (The session-zone shift PostgreSQL
+also applies to a JSON `timestamptz` is the same pre-existing limitation the
+plain `::text` render carries — the whole `Datum` Display path renders at UTC —
+and is unchanged here.)
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

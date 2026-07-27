@@ -862,6 +862,14 @@ fn json_and_jsonb_types() {
     assert!(run("SELECT ('[10,20,30]'::jsonb)->1").contains("20"));
     // Invalid json is rejected loudly.
     assert!(run("SELECT '{bad}'::jsonb").contains("22P02"));
+    // Date-time types render in ISO 8601 inside JSON (a `T` separator, and a
+    // `+00:00` offset for timestamptz), not the space-separated `::text` form.
+    assert!(run("SELECT to_json('2020-01-01 12:30:45'::timestamp)").contains("\"2020-01-01T12:30:45\""));
+    assert!(run("SELECT to_json('2020-01-01 12:30:45.1'::timestamp)").contains("\"2020-01-01T12:30:45.1\""));
+    assert!(run("SELECT to_json('2020-01-01 12:30:45+00'::timestamptz)").contains("\"2020-01-01T12:30:45+00:00\""));
+    assert!(run("SELECT to_jsonb('2020-06-15 08:00:00+00'::timestamptz)").contains("\"2020-06-15T08:00:00+00:00\""));
+    // date / time keep their ordinary text form.
+    assert!(run("SELECT to_json('2020-06-15'::date)").contains("\"2020-06-15\""));
 }
 
 #[test]

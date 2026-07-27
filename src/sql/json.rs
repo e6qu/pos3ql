@@ -1020,6 +1020,15 @@ pub fn write_datum_json_styled(
         | Datum::Float8(_)
         | Datum::Numeric(_) => write!(out, "{v}"),
         Datum::Json { text, .. } => out.write_str(text),
+        // Date-time types render in ISO 8601 (a `T` separator, `+HH:MM` offset
+        // for timestamptz), which is how PostgreSQL's to_json / row_to_json
+        // spell them — distinct from the space-separated `::text` form.
+        Datum::Timestamp(t) => {
+            write_json_raw_string(crate::sql::datetime::format_timestamp_json(*t, false).as_str(), out)
+        }
+        Datum::Timestamptz(t) => {
+            write_json_raw_string(crate::sql::datetime::format_timestamp_json(*t, true).as_str(), out)
+        }
         Datum::Array { element, raw } => {
             out.write_char('[')?;
             let count = crate::sql::array::len(raw);

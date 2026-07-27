@@ -3817,6 +3817,204 @@ fn wire_to_sql(_: crate::pg::wire::WireFull) -> SqlError {
     sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "COPY output exceeds the send buffer")
 }
 
+/// Resolves COPY format options for a `COPY (query) TO STDOUT`, whose columns
+/// are the query's output columns (named for `FORCE_QUOTE` and the header),
+/// with no backing table. Mirrors [`CopyFmt::resolve`] but resolves the
+/// `force_*` column lists against the output column names.
+fn copy_fmt_for_columns(
+    names: &[&str],
+    options: &crate::sql::ast::CopyOptions,
+) -> Result<CopyFmt, SqlError> {
+    use core::fmt::Write as _;
+    // FORCE_NOT_NULL / FORCE_NULL are COPY FROM-only, as for a table source.
+    if !options.force_not_null.is_empty() || !options.force_null.is_empty() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "COPY FORCE_NOT_NULL/FORCE_NULL cannot be used with COPY TO"
+        ));
+    }
+    let mut null = StackStr::<64>::new();
+    let _ = null.write_str(options.null_str());
+    if null.is_truncated() {
+        return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "COPY NULL string is too long"));
+    }
+    let mask = |cols: &[&str]| -> Result<u64, SqlError> {
+        let mut bits = 0u64;
+        for name in cols {
+            let Some(index) = names.iter().position(|n| n.eq_ignore_ascii_case(name)) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ));
+            };
+            bits |= 1u64 << index;
+        }
+        Ok(bits)
+    };
+    let delimiter = options.delimiter_byte();
+    let quote = options.quote_byte();
+    if options.is_csv() && delimiter == quote {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY delimiter and quote must be different"
+        ));
+    }
+    Ok(CopyFmt {
+        csv: options.is_csv(),
+        binary: options.is_binary(),
+        delimiter,
+        quote,
+        escape: options.escape_byte(),
+        header: options.header,
+        null,
+        force_quote_all: options.force_quote_all,
+        force_quote: mask(options.force_quote)?,
+        force_not_null: 0,
+        force_null: 0,
+    })
+}
+
+/// Streams the rows of `COPY (query) TO STDOUT`: describe the query's output
+/// columns, then run it and format each result row exactly as a table COPY TO
+/// would (text / CSV / binary), so the output is byte-identical to PostgreSQL.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_out_query(
+    storage: &Storage,
+    txid: u32,
+    sql: &str,
+    options: &crate::sql::ast::CopyOptions,
+    seq: Option<&dyn crate::sql::eval::SequenceAccess>,
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+) -> Result<u64, SqlError> {
+    let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+    let n = super::query::describe_query(sql, storage, txid, arena, &mut columns)?;
+    let mut names = [""; MAX_PROJ];
+    for (i, c) in columns[..n].iter().enumerate() {
+        names[i] = c.name;
+    }
+    let fmt = copy_fmt_for_columns(&names[..n], options)?;
+    if fmt.binary {
+        for c in &columns[..n] {
+            let Some(ctype) = coltype_of_oid(c.type_oid) else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COPY BINARY cannot send a column of type oid {}",
+                    c.type_oid
+                ));
+            };
+            if !binary_copy_supported(ctype) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COPY BINARY of type {} is not supported yet",
+                    ctype.name()
+                ));
+            }
+        }
+    }
+    responder.copy_out_response(n, fmt.binary).map_err(wire_to_sql)?;
+    if fmt.binary {
+        responder.copy_binary_header().map_err(wire_to_sql)?;
+    }
+    if fmt.header {
+        responder
+            .copy_data_row(&|out| {
+                for (i, c) in columns[..n].iter().enumerate() {
+                    if i > 0 {
+                        out(&[fmt.delimiter]);
+                    }
+                    if fmt.csv {
+                        crate::sql::copy::encode_field_csv(
+                            out, Some(c.name), fmt.null.as_str(), fmt.delimiter, fmt.quote,
+                            fmt.escape, false,
+                        );
+                    } else {
+                        crate::sql::copy::encode_field(out, Some(c.name));
+                    }
+                }
+            })
+            .map_err(wire_to_sql)?;
+    }
+    let sel = crate::sql::parser::parse_query(sql, arena)?;
+    let render = responder.render_context();
+    let fmt = &fmt;
+    let mut count = 0u64;
+    super::query::select_into_rows(
+        storage,
+        txid,
+        sel,
+        arena,
+        params,
+        None,
+        seq,
+        &mut |vals| {
+            if fmt.binary {
+                let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
+                for (i, plan) in plans.iter_mut().enumerate().take(n) {
+                    *plan = binary_field_plan(&vals[i], arena)?;
+                }
+                responder
+                    .copy_binary_row(n, &|m| {
+                        for (i, plan) in plans.iter().enumerate().take(n) {
+                            match *plan {
+                                BinaryFieldPlan::Direct => {
+                                    Responder::encode_value_binary(m, &vals[i]);
+                                }
+                                BinaryFieldPlan::Range(f, l, u) => {
+                                    m.field(|m| encode_range_binary(m, f, l, u));
+                                }
+                                BinaryFieldPlan::Multirange(ranges) => {
+                                    m.field(|m| {
+                                        m.i32(ranges.len() as i32);
+                                        for &(f, l, u) in ranges {
+                                            m.field(|m| encode_range_binary(m, f, l, u));
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    })
+                    .map_err(wire_to_sql)?;
+            } else {
+                let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+                for (i, slot) in texts.iter_mut().enumerate().take(n) {
+                    *slot = Responder::datum_wire_text(&vals[i], render, arena)?;
+                }
+                responder
+                    .copy_data_row(&|out| {
+                        for (i, text) in texts.iter().enumerate().take(n) {
+                            if i > 0 {
+                                out(&[fmt.delimiter]);
+                            }
+                            if fmt.csv {
+                                let force =
+                                    fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, i);
+                                crate::sql::copy::encode_field_csv(
+                                    out, *text, fmt.null.as_str(), fmt.delimiter, fmt.quote,
+                                    fmt.escape, force,
+                                );
+                            } else if let Some(value) = text {
+                                crate::sql::copy::encode_field(out, Some(value));
+                            } else {
+                                out(fmt.null.as_str().as_bytes());
+                            }
+                        }
+                    })
+                    .map_err(wire_to_sql)?;
+            }
+            count += 1;
+            Ok(())
+        },
+    )?;
+    if fmt.binary {
+        responder.copy_binary_trailer().map_err(wire_to_sql)?;
+    }
+    responder.copy_done().map_err(wire_to_sql)?;
+    Ok(count)
+}
+
 /// A range's binary parts: the flags byte, and its two bound datums already
 /// parsed from the canonical text (`None` = infinite bound, or both `None` for
 /// an empty range).

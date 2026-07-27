@@ -2050,6 +2050,24 @@ impl Engine {
             Stmt::Show(name) => self.show(name, guc, responder),
             Stmt::ShowAll => self.show_all(guc, responder),
             Stmt::Copy(c) => {
+                // COPY (query) TO STDOUT streams a query's rows, not a table's.
+                if let Some(sql) = c.query {
+                    let seq = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                    return Ok(
+                        match exec::copy_out_query(
+                            &self.storage, txn.txid, sql, &c.options, Some(&seq), arena, params,
+                            responder,
+                        ) {
+                            Ok(count) => {
+                                responder.command_complete(
+                                    crate::stack_format!(32, "COPY {count}").as_str(),
+                                )?;
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        },
+                    );
+                }
                 let setup = match exec::copy_begin(&self.storage, c, txn.txid) {
                     Ok(s) => s,
                     Err(e) => return Ok(Err(e)),

@@ -943,6 +943,29 @@ pub fn format_timestamp_styled(
     out
 }
 
+/// ISO 8601 timestamp for JSON output — the form `to_json` / `row_to_json` /
+/// `to_jsonb` render date-time types in: a `T` between date and time, and, for
+/// `timestamptz`, a full `+HH:MM` offset (never trimmed to `+HH`). The value is
+/// UTC (as the whole `Datum` Display path renders timestamps), so the offset is
+/// `+00:00` — the session-zone shift PostgreSQL also applies here is the same
+/// limitation the plain `::text` render carries.
+pub fn format_timestamp_json(micros: i64, with_timezone: bool) -> StackStr<48> {
+    let days = micros.div_euclid(DAY_US);
+    let in_day = micros.rem_euclid(DAY_US);
+    let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    let seconds = in_day / 1_000_000;
+    let frac = in_day % 1_000_000;
+    let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
+    let mut out = StackStr::<48>::new();
+    use core::fmt::Write;
+    let _ = write!(out, "{y:04}-{m:02}-{d:02}T{h:02}:{minute:02}:{s:02}");
+    write_frac(&mut out, frac);
+    if with_timezone {
+        let _ = out.write_str("+00:00");
+    }
+    out
+}
+
 /// ISO-style zone suffix: `+00`, `+05:30`, `-08`, trimming trailing `:00`.
 fn write_iso_offset(out: &mut impl core::fmt::Write, off_secs: i32) {
     let _ = write!(out, "{}", iso_offset_string(off_secs).as_str());

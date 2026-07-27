@@ -559,14 +559,28 @@ impl<'a> Parser<'a> {
                     self.eat_ident("local")?
                 };
                 // SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS
-                // TRANSACTION ...: set the (default) transaction characteristics.
-                // The engine provides one isolation level, as BEGIN does, so the
-                // clause is consumed and acknowledged.
-                if self.eat_ident("transaction")? || self.eat_ident("characteristics")? {
+                // TRANSACTION ...: retain the characteristics so execution can
+                // reject isolation/read modes it cannot actually provide.
+                let transaction = self.eat_ident("transaction")?;
+                let characteristics = if transaction {
+                    true
+                } else if self.eat_ident("characteristics")? {
+                    self.expect_ident("as")?;
+                    self.expect_ident("transaction")?;
+                    true
+                } else {
+                    false
+                };
+                if characteristics {
+                    let start = self.peek_at;
                     while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
                         self.advance()?;
                     }
-                    return Ok(Stmt::SetTransaction);
+                    let characteristics = self.text[start..self.peek_at].trim();
+                    if characteristics.is_empty() {
+                        return Err(self.unexpected("expected transaction characteristics"));
+                    }
+                    return Ok(Stmt::SetTransaction(characteristics));
                 }
                 // Special spellings: SET TIME ZONE ..., SET NAMES ...
                 let name = if self.eat_ident("time")? {

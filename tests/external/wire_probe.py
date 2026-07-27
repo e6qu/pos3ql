@@ -57,6 +57,27 @@ def recv_exact(s, n):
     return buf
 
 
+def frontend_message(kind, payload=b""):
+    return kind + struct.pack("!i", len(payload) + 4) + payload
+
+
+def simple_query(s, text):
+    s.sendall(frontend_message(b"Q", text.encode() + b"\x00"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            return out
+
+
+def start_extended(s, text, max_rows=0):
+    parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    execute = frontend_message(b"E", b"\x00" + struct.pack("!i", max_rows))
+    s.sendall(parse + bind + execute + frontend_message(b"H"))
+
+
 def drain_startup(s):
     """Reads messages until ReadyForQuery; returns dict of interesting ones."""
     seen = {}
@@ -220,6 +241,105 @@ def test_cancel_request_closes_quietly():
     s.sendall(struct.pack("!ii", 16, 80877102) + b"\x00" * 8)
     tail = s.recv(1)
     check("CancelRequest: closed without response", tail == b"")
+    s.close()
+
+
+def test_extended_copy():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    simple_query(
+        s,
+        "DROP TABLE IF EXISTS wire_copy; "
+        "CREATE TABLE wire_copy (id integer, note text)",
+    )
+
+    start_extended(s, "COPY wire_copy FROM STDIN", max_rows=1)
+    before = [read_message(s), read_message(s), read_message(s)]
+    check(
+        "extended COPY IN: ParseComplete, BindComplete, CopyInResponse",
+        [kind for kind, _ in before] == [b"1", b"2", b"G"],
+        [kind for kind, _ in before],
+    )
+
+    # A pipelined Sync received in copy mode is ignored. CopyDone completes
+    # the command, and the client must send a later Sync for ReadyForQuery.
+    s.sendall(
+        frontend_message(b"S")
+        + frontend_message(b"d", b"1\tone")
+        + frontend_message(b"d", b"\n2\ttwo\n")
+        + frontend_message(b"c")
+        + frontend_message(b"H")
+    )
+    kind, payload = read_message(s)
+    check(
+        "extended COPY IN: CopyDone returns command count",
+        kind == b"C" and payload == b"COPY 2\x00",
+        (kind, payload),
+    )
+    s.settimeout(0.1)
+    try:
+        unexpected = read_message(s)
+    except TimeoutError:
+        unexpected = None
+    check(
+        "extended COPY IN: no ReadyForQuery before post-COPY Sync",
+        unexpected is None,
+        unexpected,
+    )
+    s.settimeout(5)
+    s.sendall(frontend_message(b"S"))
+    check("extended COPY IN: Sync returns ReadyForQuery", read_message(s)[0] == b"Z")
+
+    rows = simple_query(s, "SELECT id, note FROM wire_copy ORDER BY id")
+    check(
+        "extended COPY IN: split CopyData chunks stored both rows",
+        [kind for kind, _ in rows] == [b"T", b"D", b"D", b"C", b"Z"],
+        [kind for kind, _ in rows],
+    )
+
+    start_extended(s, "COPY wire_copy FROM STDIN")
+    while read_message(s)[0] != b"G":
+        pass
+    s.sendall(
+        frontend_message(b"f", b"probe stopped the copy\x00")
+        + frontend_message(b"H")
+    )
+    kind, payload = read_message(s)
+    check(
+        "extended COPY IN: CopyFail preserves reason and SQLSTATE",
+        kind == b"E"
+        and b"C57014\x00" in payload
+        and b"probe stopped the copy" in payload,
+        (kind, payload),
+    )
+    s.sendall(frontend_message(b"S"))
+    kind, payload = read_message(s)
+    check(
+        "extended COPY IN: CopyFail recovers at Sync",
+        kind == b"Z" and payload == b"I",
+        (kind, payload),
+    )
+
+    start_extended(s, "COPY wire_copy TO STDOUT", max_rows=1)
+    s.sendall(frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    kinds = [kind for kind, _ in out]
+    check(
+        "extended COPY OUT: max_rows does not suspend COPY",
+        kinds == [b"1", b"2", b"H", b"d", b"d", b"c", b"C", b"Z"],
+        kinds,
+    )
+    check(
+        "extended COPY OUT: streams both rows",
+        b"".join(payload for kind, payload in out if kind == b"d")
+        == b"1\tone\n2\ttwo\n",
+    )
     s.close()
 
 

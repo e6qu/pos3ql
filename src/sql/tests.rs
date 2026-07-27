@@ -514,7 +514,10 @@ fn session_gucs_honored_or_rejected_faithfully() {
         "SET lock_timeout = 5000",
         "SET statement_timeout = 0",
         "SET idle_in_transaction_session_timeout = 0",
+        "SET transaction_timeout = 0",
         "SET bytea_output = 'hex'",
+        "SET intervalstyle = postgres",
+        "SET synchronize_seqscans = off",
         "SET row_security = off",
     ] {
         assert!(run(s).contains("SET"), "should accept: {s}");
@@ -523,6 +526,8 @@ fn session_gucs_honored_or_rejected_faithfully() {
     assert!(run("SET extra_float_digits = 2; SHOW extra_float_digits").contains('2'));
     assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5000"));
     assert!(run("SET row_security = off; SHOW row_security").contains("off"));
+    assert!(run("SET intervalstyle = postgres; SHOW intervalstyle").contains("postgres"));
+    assert!(run("SET synchronize_seqscans = off; SHOW synchronize_seqscans").contains("off"));
     // Rejected loudly — never accepted-and-ignored.
     assert!(run("SET extra_float_digits = 9").contains("22023"), "out of range");
     // statement_timeout is now accepted (enforced at scan boundaries); a
@@ -535,6 +540,8 @@ fn session_gucs_honored_or_rejected_faithfully() {
     let escaped = run("SET bytea_output = 'escape'; SELECT '\\x5c00'::bytea");
     assert!(escaped.contains("\\\\000"), "escape rendering: {escaped}");
     assert!(run("SET bytea_output = 'bogus'").contains("22023"), "unknown format");
+    assert!(run("SET intervalstyle = sql_standard").contains("0A000"), "unsupported style");
+    assert!(run("SET synchronize_seqscans = on").contains("0A000"), "unsupported scan mode");
 }
 
 #[test]
@@ -561,10 +568,11 @@ fn set_show_transaction_and_show_all() {
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
     // Transaction-control SET forms that JDBC/tools send (one isolation
     // level, as BEGIN provides — the clause is acknowledged).
-    assert!(run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").contains("SET"));
+    assert!(run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").contains("0A000"));
     assert!(run("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .contains("SET"));
-    assert!(run("SET TRANSACTION READ ONLY").contains("SET"));
+    assert!(run("SET TRANSACTION READ ONLY").contains("0A000"));
+    assert!(run("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE").contains("SET"));
     // SQL-standard multi-word SHOW forms.
     assert!(run("SHOW TRANSACTION ISOLATION LEVEL").contains("read committed"));
     assert!(run("SHOW ALL").contains("client_encoding"));
@@ -3929,6 +3937,42 @@ fn catalog_joins_and_subqueries() {
              WHERE attrelid IN (SELECT oid FROM pg_class WHERE relname='demo') AND attnum>0")),
         ["2"]
     );
+}
+
+#[test]
+fn pg_dump_bootstrap_surface() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_catalog.pg_is_in_recovery()"
+        )),
+        ["f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1"
+        )),
+        ["10|postgres"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_extension x \
+             JOIN pg_namespace n ON n.oid=x.extnamespace"
+        )),
+        ["0"]
+    );
+    assert!(String::from_utf8_lossy(&run_with(
+        &mut engine,
+        &mut budget,
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    ))
+    .contains("0A000"));
 }
 
 #[test]

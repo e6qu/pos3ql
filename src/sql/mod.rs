@@ -146,6 +146,16 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Whether one extended-protocol statement is COPY. Execute's `max_rows`
+    /// applies only to row-returning portals; COPY has its own streaming
+    /// protocol and must never be staged in the bounded portal buffer.
+    pub fn is_copy_statement(&self, text: &str, arena: &Arena) -> bool {
+        Parser::new(text, arena)
+            .ok()
+            .and_then(|mut parser| parser.next_stmt().ok().flatten())
+            .is_some_and(|statement| matches!(statement, Stmt::Copy(_)))
+    }
+
     /// Bytes drawn beyond the row heap, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
@@ -1071,6 +1081,7 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 if txn.mode == TxnMode::Implicit
+                    && self.pending_copy.is_none()
                     && let Err(e) = self.commit_txn(txn, guc) {
                         responder.error(e.sqlstate, e.message.as_str())?;
                         return Ok(false);
@@ -2176,7 +2187,22 @@ impl Engine {
                     Err(e) => Ok(Err(e)),
                 }
             }
-            Stmt::SetTransaction => {
+            Stmt::SetTransaction(characteristics) => {
+                let unsupported = characteristics
+                    .split(',')
+                    .map(str::trim)
+                    .find(|part| {
+                        !part.eq_ignore_ascii_case("isolation level read committed")
+                            && !part.eq_ignore_ascii_case("read write")
+                            && !part.eq_ignore_ascii_case("not deferrable")
+                    });
+                if let Some(characteristic) = unsupported {
+                    return Ok(Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "transaction characteristic \"{}\" is not supported",
+                        characteristic
+                    )));
+                }
                 responder.command_complete("SET")?;
                 Ok(Ok(()))
             }
@@ -2581,6 +2607,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "extra_float_digits",
     "idle_in_transaction_session_timeout",
     "integer_datetimes",
+    "IntervalStyle",
     "is_superuser",
     "lock_timeout",
     "row_security",
@@ -2590,8 +2617,10 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "server_version_num",
     "standard_conforming_strings",
     "statement_timeout",
+    "synchronize_seqscans",
     "TimeZone",
     "transaction_isolation",
+    "transaction_timeout",
 ];
 
 /// Emits the warnings a statement's parse raised, ahead of running it —

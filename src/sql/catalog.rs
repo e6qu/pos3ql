@@ -70,6 +70,9 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_range"
                 | "pg_settings"
                 | "pg_proc"
+                | "pg_extension"
+                | "pg_depend"
+                | "pg_tablespace"
         ),
     }
 }
@@ -283,6 +286,74 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
+        (false, "pg_extension") => finish(
+            def_of(
+                "pg_extension",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("extname", ColType::Name),
+                    ("extnamespace", ColType::Int4),
+                    ("extrelocatable", ColType::Bool),
+                    ("extversion", ColType::Text),
+                    ("extconfig", ColType::Array(super::types::ArrElem::Int4)),
+                    ("extcondition", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_depend") => finish(
+            def_of(
+                "pg_depend",
+                &[
+                    ("classid", ColType::Int4),
+                    ("objid", ColType::Int4),
+                    ("objsubid", ColType::Int4),
+                    ("refclassid", ColType::Int4),
+                    ("refobjid", ColType::Int4),
+                    ("refobjsubid", ColType::Int4),
+                    ("deptype", ColType::Bpchar),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_tablespace") => finish(
+            def_of(
+                "pg_tablespace",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("spcname", ColType::Name),
+                    ("spcowner", ColType::Int4),
+                    ("spcacl", ColType::Text),
+                    ("spcoptions", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_roles") => {
+            let user = super::eval::funcs::system::session_user_owned();
+            finish(
+                def_of(
+                    "pg_roles",
+                    &[("oid", ColType::Int4), ("rolname", ColType::Name)],
+                ),
+                &[row(
+                    &[
+                        Datum::Int4(10),
+                        text(
+                            arena.alloc_str(user.as_str()).map_err(|_| arena_full())?,
+                            arena,
+                        )?,
+                    ],
+                    arena,
+                )?],
+                arena,
+            )
+        }
         (false, "pg_description") => pg_description(storage, txid, arena),
         (false, "pg_enum") => pg_enum(storage, arena),
         (false, "pg_range") => finish(
@@ -296,7 +367,7 @@ pub fn synthesize<'a>(
         (false, "pg_matviews") => pg_matviews(storage, arena),
         (false, "pg_sequences") => pg_sequences(storage, arena),
         (false, "pg_sequence") => pg_sequence(storage, arena),
-        (false, "pg_views") | (false, "pg_roles") | (false, "pg_database") => {
+        (false, "pg_views") | (false, "pg_database") => {
             empty_like(name, storage, arena)
         }
         (true, "tables") => info_tables(storage, arena),
@@ -946,6 +1017,15 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             ("reltoastrelid", ColType::Int4),
             ("relpersistence", ColType::Bpchar),
             ("relreplident", ColType::Bpchar),
+            ("tableoid", ColType::Int4),
+            ("reltype", ColType::Int4),
+            ("relacl", ColType::Text),
+            ("relallvisible", ColType::Int4),
+            ("relallfrozen", ColType::Int4),
+            ("relfrozenxid", ColType::Int4),
+            ("relminmxid", ColType::Int4),
+            ("reloptions", ColType::Array(super::types::ArrElem::Text)),
+            ("relispopulated", ColType::Bool),
         ],
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
@@ -992,6 +1072,15 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 Datum::Int4(0),     // reltoastrelid
                 text("p", arena)?,  // relpersistence: permanent
                 text("d", arena)?,  // relreplident: default
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
             ],
             arena,
         )?;
@@ -1029,6 +1118,15 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 Datum::Int4(0),
                 text("p", arena)?,
                 text("d", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
             ],
             arena,
         )?;
@@ -1063,6 +1161,15 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 Datum::Int4(0),
                 text("p", arena)?,
                 text("n", arena)?, // relreplident: nothing (sequences)
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
             ],
             arena,
         )?;
@@ -1674,17 +1781,35 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
 fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_namespace",
-        &[("oid", ColType::Int4), ("nspname", ColType::Text)],
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("nspname", ColType::Text),
+            ("nspowner", ColType::Int4),
+            ("nspacl", ColType::Text),
+        ],
     );
     let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
         [&[]; 2 + crate::storage::MAX_SCHEMAS];
-    out[0] = row(&[Datum::Int4(PG_CATALOG_NS_OID), text("pg_catalog", arena)?], arena)?;
+    out[0] = row(
+        &[
+            Datum::Int4(PG_NAMESPACE_OID),
+            Datum::Int4(PG_CATALOG_NS_OID),
+            text("pg_catalog", arena)?,
+            Datum::Int4(10),
+            Datum::Null,
+        ],
+        arena,
+    )?;
     let mut n = 1;
     for (_, schema) in storage.live_schemas() {
         out[n] = row(
             &[
+                Datum::Int4(PG_NAMESPACE_OID),
                 Datum::Int4(namespace_oid(storage, schema.name.as_str())),
                 text(arena.alloc_str(schema.name.as_str()).map_err(|_| crate::sql::eval::arena_full())?, arena)?,
+                Datum::Int4(10),
+                Datum::Null,
             ],
             arena,
         )?;

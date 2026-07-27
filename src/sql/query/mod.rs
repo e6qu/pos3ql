@@ -1105,6 +1105,11 @@ fn rewrite_grouped_expr<'a>(
         Expr::Subscript { base, index } => {
             alloc(Expr::Subscript { base: rewrite(base)?, index: rewrite(index)? })
         }
+        Expr::Slice { base, lower, upper } => alloc(Expr::Slice {
+            base: rewrite(base)?,
+            lower: lower.map(&rewrite).transpose()?,
+            upper: upper.map(&rewrite).transpose()?,
+        }),
         Expr::Field { base, field } => alloc(Expr::Field { base: rewrite(base)?, field }),
         Expr::AnyAll { operand, operator, array, all } => alloc(Expr::AnyAll {
             operand: rewrite(operand)?,

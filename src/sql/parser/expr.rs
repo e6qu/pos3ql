@@ -68,12 +68,23 @@ impl<'a> Parser<'a> {
                 }
                 return Err(self.err_here("expected NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS"));
             }
-            // Array subscript `base[index]` (1-based).
+            // Array subscript `base[index]` or slice `base[lo:hi]` (1-based,
+            // either slice bound optional: `[lo:]`, `[:hi]`, `[:]`).
             if self.peeked == Tok::Op("[") {
                 self.advance()?;
-                let index = self.expression(0)?;
-                self.expect_op("]")?;
-                left = self.arena_expr(Expr::Subscript { base: left, index })?;
+                let lower =
+                    if self.peeked == Tok::Op(":") { None } else { Some(self.expression(0)?) };
+                if self.peeked == Tok::Op(":") {
+                    self.advance()?;
+                    let upper =
+                        if self.peeked == Tok::Op("]") { None } else { Some(self.expression(0)?) };
+                    self.expect_op("]")?;
+                    left = self.arena_expr(Expr::Slice { base: left, lower, upper })?;
+                } else {
+                    self.expect_op("]")?;
+                    let index = lower.expect("non-slice subscript has an index");
+                    left = self.arena_expr(Expr::Subscript { base: left, index })?;
+                }
                 continue;
             }
             // `expression COLLATE collation`: we implement a single (default)

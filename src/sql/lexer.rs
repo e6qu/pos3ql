@@ -117,7 +117,10 @@ impl<'a> Lexer<'a> {
                     self.at += 2;
                     Ok(Tok::Op("::"))
                 } else {
-                    Err(self.error("unexpected ':'"))
+                    // A lone colon is the array-slice separator (`a[1:3]`); the
+                    // parser rejects it anywhere else.
+                    self.at += 1;
+                    Ok(Tok::Op(":"))
                 }
             }
             '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#' | '@' | '?' => self.operator(),

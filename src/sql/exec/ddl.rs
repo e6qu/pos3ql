@@ -408,6 +408,15 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
             validate_check_refs(base, def, cols)?;
             validate_check_refs(index, def, cols)?;
         }
+        Expr::Slice { base, lower, upper } => {
+            validate_check_refs(base, def, cols)?;
+            if let Some(e) = lower {
+                validate_check_refs(e, def, cols)?;
+            }
+            if let Some(e) = upper {
+                validate_check_refs(e, def, cols)?;
+            }
+        }
         Expr::Field { base, .. } => validate_check_refs(base, def, cols)?,
         Expr::AnyAll { operand, array, .. } => {
             validate_check_refs(operand, def, cols)?;

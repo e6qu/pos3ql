@@ -842,6 +842,15 @@ fn array_type() {
     assert!(run("SELECT cardinality(ARRAY[1,2,3])").contains('3'));
     assert!(run("SELECT 20 = ANY(ARRAY[10,20,30])").contains('t'));
     assert!(run("SELECT 99 = ANY(ARRAY[10,20,30])").contains('f'));
+    // Array slicing a[lo:hi], with optional bounds and clamping.
+    assert!(run("SELECT (ARRAY[1,2,3,4,5])[2:4]").contains("{2,3,4}"));
+    assert!(run("SELECT (ARRAY[1,2,3,4,5])[:3]").contains("{1,2,3}"));
+    assert!(run("SELECT (ARRAY[1,2,3,4,5])[3:]").contains("{3,4,5}"));
+    assert!(run("SELECT (ARRAY[1,2,3])[2:10]").contains("{2,3}"));
+    assert!(run("SELECT (ARRAY[1,2,3])[5:10]").contains("{}"));
+    assert!(run("SELECT (ARRAY[1,2,3])[NULL:2] IS NULL").contains('t'));
+    // A slice keeps the array type (not the element type).
+    assert!(run("SELECT pg_typeof((ARRAY[1,2,3])[1:2])").contains("integer[]"));
 }
 
 #[test]

@@ -1451,6 +1451,22 @@ impl Engine {
             }
             eval::funcs::system::set_session_schemas(published);
         }
+        // Publish this statement's readable settings for `current_setting()`,
+        // the exact values `SHOW` reports (fixed server params + session GUCs).
+        {
+            let mut pairs: [(&'static str, &str); SETTING_NAMES.len()] =
+                [("", ""); SETTING_NAMES.len()];
+            let mut n = 0;
+            for &name in SETTING_NAMES {
+                if let Some(value) = fixed_setting(name).or_else(|| guc.get(name)) {
+                    pairs[n] = (name, value);
+                    n += 1;
+                }
+            }
+            if let Err(e) = eval::funcs::system::set_session_settings(&pairs[..n]) {
+                return Ok(Err(e));
+            }
+        }
         // Arm this statement's `statement_timeout` deadline (0 clears it); each
         // statement re-arms, so no explicit disarm is needed.
         query::arm_timeout(guc.statement_timeout_ms());
@@ -2364,32 +2380,12 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        const NAMES: &[&str] = &[
-            "application_name",
-            "bytea_output",
-            "client_encoding",
-            "client_min_messages",
-            "DateStyle",
-            "extra_float_digits",
-            "idle_in_transaction_session_timeout",
-            "integer_datetimes",
-            "is_superuser",
-            "lock_timeout",
-            "row_security",
-            "search_path",
-            "server_encoding",
-            "server_version",
-            "standard_conforming_strings",
-            "statement_timeout",
-            "TimeZone",
-            "transaction_isolation",
-        ];
         responder.row_description(&[
             ColDesc::new("name", types::oid::TEXT, -1),
             ColDesc::new("setting", types::oid::TEXT, -1),
             ColDesc::new("description", types::oid::TEXT, -1),
         ])?;
-        for &name in NAMES {
+        for &name in SETTING_NAMES {
             if let Some(v) = fixed_setting(name).or_else(|| guc.get(name)) {
                 responder.data_row(&[Datum::Text(name), Datum::Text(v), Datum::Text("")])?;
             }
@@ -2403,6 +2399,7 @@ impl Engine {
 fn fixed_setting(name: &str) -> Option<&'static str> {
     match name {
         "server_version" => Some(crate::pg::REPORTED_SERVER_VERSION),
+        "server_version_num" => Some(crate::pg::REPORTED_SERVER_VERSION_NUM),
         "server_encoding" => Some("UTF8"),
         "standard_conforming_strings" => Some("on"),
         "integer_datetimes" => Some("on"),
@@ -2411,6 +2408,31 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Every setting readable through `SHOW`, `SHOW ALL`, and `current_setting` —
+/// the fixed server parameters plus the per-session GUCs. Names carry
+/// PostgreSQL's canonical case for the mixed-case ones.
+pub(crate) const SETTING_NAMES: &[&str] = &[
+    "application_name",
+    "bytea_output",
+    "client_encoding",
+    "client_min_messages",
+    "DateStyle",
+    "extra_float_digits",
+    "idle_in_transaction_session_timeout",
+    "integer_datetimes",
+    "is_superuser",
+    "lock_timeout",
+    "row_security",
+    "search_path",
+    "server_encoding",
+    "server_version",
+    "server_version_num",
+    "standard_conforming_strings",
+    "statement_timeout",
+    "TimeZone",
+    "transaction_isolation",
+];
 
 /// Emits the warnings a statement's parse raised, ahead of running it —
 /// PostgreSQL reports them in that order (e.g. `timestamp(7)` clamping).

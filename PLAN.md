@@ -1378,6 +1378,32 @@ transaction holds the row) — pos3ql's run-to-completion core cannot block, and
 the no-lost-update safety is already delivered by the existing `40001`
 write-conflict detection; documented as B-175, the same architecture as B-004.
 
+### current_setting + a cross-connection GUC leak (2026-07-27)
+
+`current_setting(name [, missing_ok])` — the function form of `SHOW`, which
+drivers and tools call constantly to introspect settings — was missing (a flat
+`function does not exist`). It now returns any readable setting's value as text,
+matching PostgreSQL byte-for-byte: the same value `SHOW` reports (fixed server
+params + session GUCs, published per statement like the session user), a
+case-insensitive name, composition inside expressions, `42704` on an unknown
+setting, and `NULL` when `missing_ok` is true. `server_version_num` was added to
+the fixed parameters (so both `SHOW` and `current_setting` report it), and the
+`SHOW ALL` name list is now the single shared `SETTING_NAMES`. Corpus
+`68_current_setting`, with a unit test.
+
+Probing it surfaced a pre-existing **cross-connection session leak**: connection
+slots are statically pre-allocated and recycled, but `Conn::open` reset the
+arena, transaction, prepared statements and portals while leaving `guc`, the
+cursor pool, the auth flow, and any in-flight `COPY` carrying the *previous*
+client's state — so a `SET search_path = …` on one connection was still visible
+(through `SHOW` / `SET` / `current_setting`) to the next client to reuse that
+slot. `open` now resets all of it, closing the whole slot-reuse leak class.
+
+The write sibling `set_config(name, value, is_local)` is deferred (B-176): it
+must mutate a session GUC from inside expression evaluation, which the
+deliberately-immutable eval layer and un-threaded `GucState` do not allow without
+a dedicated mutable-settings channel.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

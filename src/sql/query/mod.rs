@@ -1140,6 +1140,124 @@ pub fn check_select_constants<'a>(statement: &Select<'a>, arena: &'a Arena) -> R
 
 /// The SELECT entry point (FROM present; FROM-less selects stay in the
 /// engine).
+/// True if the expression tree contains an aggregate *use* (a bare aggregate
+/// call, not a window aggregate).
+fn expr_has_aggregate(expression: &Expr) -> bool {
+    if expression.is_aggregate_use() {
+        return true;
+    }
+    let mut found = false;
+    let _ = subquery::walk_children(expression, &mut |child| {
+        if expr_has_aggregate(child) {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
+/// True if the expression tree contains a window-function call (`OVER ...`).
+fn expr_has_window(expression: &Expr) -> bool {
+    if matches!(expression, Expr::Call { over: Some(_), .. }) {
+        return true;
+    }
+    let mut found = false;
+    let _ = subquery::walk_children(expression, &mut |child| {
+        if expr_has_window(child) {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
+/// True if `name` names a base table in `from` by the identifier a FOR-UPDATE
+/// `OF` clause would use — the alias when one is given, else the table name.
+fn from_binds_relation(from: Option<&FromClause>, name: &str) -> bool {
+    let Some(from) = from else {
+        return false;
+    };
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|j| &j.table))
+        .any(|r| r.alias.unwrap_or(r.table).eq_ignore_ascii_case(name))
+}
+
+/// Validates the analysis-time semantics of a query's `FOR UPDATE`/`FOR SHARE`/…
+/// row-locking clauses, raising PostgreSQL's exact errors: `0A000` when the
+/// clause combines with a construct it cannot lock (aggregates, GROUP BY,
+/// HAVING, DISTINCT, window functions, or a set operation), and `42P01` when an
+/// `OF` target names no relation in the FROM clause. Returns `Ok(())` when there
+/// is no clause or every clause is well-formed.
+///
+/// pos3ql's run-to-completion execution model does not take blocking row locks
+/// (the same architecture B-004 documents for write-write conflicts): a locked
+/// query returns the correct rows, and the safety a `FOR UPDATE` reader relies
+/// on is delivered by the existing fail-fast (40001) conflict detection at write
+/// time. So beyond these analysis-time errors the clause does not change a
+/// single query's observable result.
+pub fn validate_locking(statement: &Select) -> Result<(), SqlError> {
+    for clause in statement.locking {
+        let keyword = clause.strength.keyword();
+        if statement.set_body.is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} is not allowed with UNION/INTERSECT/EXCEPT",
+                keyword
+            ));
+        }
+        if statement.distinct {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} is not allowed with DISTINCT clause",
+                keyword
+            ));
+        }
+        if !statement.group_by.is_empty() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} is not allowed with GROUP BY clause",
+                keyword
+            ));
+        }
+        if statement.having.is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} is not allowed with HAVING clause",
+                keyword
+            ));
+        }
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item {
+                if expr_has_window(expression) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "{} is not allowed with window functions",
+                        keyword
+                    ));
+                }
+                if expr_has_aggregate(expression) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "{} is not allowed with aggregate functions",
+                        keyword
+                    ));
+                }
+            }
+        }
+        for of in clause.of {
+            if !from_binds_relation(statement.from.as_ref(), of) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" in {} clause not found in FROM clause",
+                    of,
+                    keyword
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn select_query<'a>(
     storage: &'a Storage,
     txid: u32,

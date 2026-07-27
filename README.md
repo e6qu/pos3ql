@@ -53,7 +53,9 @@ Working single-node database:
   TABLE/VIEW/MATERIALIZED VIEW/INDEX/SEQUENCE/COLUMN/SCHEMA read back through
   obj_description/col_description/pg_description),
   INSERT/SELECT/UPDATE/DELETE/MERGE with WHERE / ORDER BY (PostgreSQL null
-  ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, INSERT ... ON CONFLICT
+  ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, row-locking clauses
+  (`FOR UPDATE`/`SHARE`/`NO KEY UPDATE`/`KEY SHARE` with `OF`/`NOWAIT`/`SKIP
+  LOCKED`), INSERT ... ON CONFLICT
   (`DO NOTHING` / `DO UPDATE` upsert with column- or `ON CONSTRAINT`-inferred
   arbiters, `excluded.*`, and RETURNING), joins (including
   `LATERAL` subqueries and set-returning functions), GROUP BY and aggregates,

@@ -36,6 +36,15 @@ pub fn set_query<'a>(
     params: &[Datum<'a>],
     responder: &mut Responder,
 ) -> Outcome {
+    // A row-locking clause can never apply to a set operation, matching
+    // PostgreSQL's 0A000.
+    if let Some(clause) = q.locking.first() {
+        return sql_fail(sql_err!(
+            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} is not allowed with UNION/INTERSECT/EXCEPT",
+            clause.strength.keyword()
+        ));
+    }
     // WITH CTEs and view references expand across the whole tree first.
     let body = match expand_set_tree_exec(q.with, q.body, storage, txid, arena, params) {
         Ok(b) => b,

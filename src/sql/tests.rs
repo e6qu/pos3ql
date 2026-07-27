@@ -2740,6 +2740,42 @@ fn exists_uncorrelated() {
 }
 
 #[test]
+fn for_update_locking_clause() {
+    // Row-locking clauses return the query's rows unchanged in a single
+    // session, and enforce PostgreSQL's analysis-time restrictions.
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE lk (id int, v int)");
+    run_with(&mut e, &mut b, "INSERT INTO lk VALUES (1,10),(2,20),(3,30)");
+
+    // Each strength + OF / NOWAIT / SKIP LOCKED returns the same rows.
+    for sql in [
+        "SELECT id FROM lk ORDER BY id FOR UPDATE",
+        "SELECT id FROM lk ORDER BY id FOR NO KEY UPDATE",
+        "SELECT id FROM lk ORDER BY id FOR SHARE",
+        "SELECT id FROM lk ORDER BY id FOR KEY SHARE",
+        "SELECT id FROM lk ORDER BY id FOR UPDATE OF lk",
+        "SELECT id FROM lk ORDER BY id FOR UPDATE NOWAIT",
+        "SELECT id FROM lk ORDER BY id FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM lk t1 ORDER BY id FOR UPDATE OF t1",
+    ] {
+        assert_eq!(data_rows(&run_with(&mut e, &mut b, sql)), ["1", "2", "3"], "{sql}");
+    }
+    // A FROM-less SELECT may carry the clause (it locks nothing).
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT 1 FOR UPDATE")), ["1"]);
+
+    // Analysis-time restrictions, each with the clause's own keyword and SQLSTATE.
+    let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    assert!(err(&run_with(&mut e, &mut b, "SELECT count(*) FROM lk FOR UPDATE")).contains("0A000"));
+    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk GROUP BY id FOR UPDATE")).contains("0A000"));
+    assert!(err(&run_with(&mut e, &mut b, "SELECT DISTINCT id FROM lk FOR UPDATE")).contains("0A000"));
+    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk UNION SELECT v FROM lk FOR UPDATE")).contains("0A000"));
+    assert!(err(&run_with(&mut e, &mut b, "SELECT id, row_number() OVER () FROM lk FOR UPDATE")).contains("0A000"));
+    // OF must name a relation in the FROM clause (42P01); an alias hides the name.
+    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk FOR UPDATE OF nope")).contains("42P01"));
+    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk x FOR UPDATE OF lk")).contains("42P01"));
+}
+
+#[test]
 fn fromless_select_with_subquery() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t1 (x int)");

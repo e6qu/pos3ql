@@ -1516,6 +1516,11 @@ impl Engine {
                     Ok(x) => x,
                     Err(e) => return Ok(Err(e)),
                 };
+                // FOR UPDATE / FOR SHARE row-locking clauses: enforce their
+                // analysis-time restrictions (0A000 / 42P01) before executing.
+                if let Err(e) = query::validate_locking(s) {
+                    return Ok(Err(e));
+                }
                 // Execution (row materialization) uses the shared work arena;
                 // the parsed AST (`s`, `params`) lives in the per-connection
                 // arena, which outlives it — so the work arena can be reset
@@ -1832,6 +1837,10 @@ impl Engine {
                                     return Ok(Err(e));
                                 }
                             };
+                            if let Err(e) = query::validate_locking(sel) {
+                                cursors.abandon(at);
+                                return Ok(Err(e));
+                            }
                             if sel.from.is_none() {
                                 query::constant_select(
                                     &self.storage, txn.txid, sel, &self.work, params,

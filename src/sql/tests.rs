@@ -2914,6 +2914,31 @@ fn data_modifying_cte_main_dml_rejected_loudly() {
 }
 
 #[test]
+fn srf_in_value_subquery() {
+    // A set-returning function in the select list of an IN / ANY / ARRAY
+    // subquery expands to its set of rows (matching PostgreSQL).
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE sr (id int)");
+    run_with(&mut e, &mut b, "INSERT INTO sr VALUES (1),(2),(3)");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM sr WHERE id IN (SELECT unnest(ARRAY[1,3])) ORDER BY id")),
+        ["1", "3"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM sr WHERE id = ANY (SELECT generate_series(2,3)) ORDER BY id")),
+        ["2", "3"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM sr WHERE id NOT IN (SELECT unnest(ARRAY[2])) ORDER BY id")),
+        ["1", "3"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT array(SELECT unnest(ARRAY[5,6]) ORDER BY 1)")),
+        ["{5,6}"]
+    );
+}
+
+#[test]
 fn in_subquery_empty_and_null_semantics() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE empt (x int)");

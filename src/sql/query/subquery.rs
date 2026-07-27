@@ -686,11 +686,19 @@ fn run_subquery<'a>(
     for ob in select.order_by {
         collect_windows(ob.expression, &mut win_probe, &mut n_win_probe)?;
     }
-    if !select.group_by.is_empty() || select.having.is_some() || select.distinct || n_win_probe > 0
+    // A set-returning function in the subquery's select list expands to many
+    // rows, so its body belongs to the row-source executor too (which handles
+    // SRF expansion) — just like a grouped or windowed subquery.
+    let has_srf = super::srf::find_srf(select.items).is_some();
+    if !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || n_win_probe > 0
+        || has_srf
     {
-        // Grouped/DISTINCT/windowed subquery: the row-source executor already
-        // handles grouping, HAVING, DISTINCT, and windows; collect its single
-        // output column.
+        // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
+        // already handles grouping, HAVING, DISTINCT, windows, and SRF
+        // expansion; collect its single output column.
         let mut count = 0usize;
         select_into_rows(storage, txid, select, arena, params, outer, None, &mut |_| {
             count += 1;

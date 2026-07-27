@@ -1456,6 +1456,20 @@ also applies to a JSON `timestamptz` is the same pre-existing limitation the
 plain `::text` render carries — the whole `Datum` Display path renders at UTC —
 and is unchanged here.)
 
+### Set-returning functions in a value subquery (2026-07-27)
+
+A set-returning function in the SELECT list of an `IN` / `ANY` / `ALL` / `ARRAY`
+subquery (`WHERE id IN (SELECT unnest(ARRAY[1,3]))`) raised "set-returning
+function called where not allowed", where PostgreSQL expands it to the set of
+rows. SRFs already worked in derived-table, scalar, and `EXISTS` subqueries — the
+value-subquery path (`run_subquery`) just had a narrower routing condition:
+the grouped / DISTINCT / windowed cases went to the row-source executor (which
+handles SRF expansion) while a plain SRF projection was evaluated per row and
+rejected. Fixed by routing an SRF subquery through that same executor via
+`find_srf`, so `IN`/`ANY`/`ALL`/`ARRAY(subquery)` over an `unnest` /
+`generate_series` now expand correctly, including the empty-array and NOT IN
+NULL semantics. Corpus `72_srf_subquery`, with a unit test.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

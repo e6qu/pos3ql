@@ -831,7 +831,13 @@ impl Conn {
                 } else if crate::sql::copy::is_end_marker(line) {
                     copy.end_seen = true;
                 } else {
-                    match engine.copy_row_line(&copy.setup, &mut self.txn, &self.arena, line) {
+                    match engine.copy_row_line(
+                        &copy.setup,
+                        &mut self.txn,
+                        self.guc.seq_session(),
+                        &self.arena,
+                        line,
+                    ) {
                         Ok(()) => copy.count += 1,
                         Err(e) => copy.failed = Some(e),
                     }
@@ -905,7 +911,13 @@ impl Conn {
                     self.arena.reset();
                     if !copy.end_seen && copy.failed.is_none() {
                         let row = &self.copy_buf.readable()[..len];
-                        match engine.copy_row_binary(&copy.setup, &mut self.txn, &self.arena, row) {
+                        match engine.copy_row_binary(
+                            &copy.setup,
+                            &mut self.txn,
+                            self.guc.seq_session(),
+                            &self.arena,
+                            row,
+                        ) {
                             Ok(()) => copy.count += 1,
                             Err(e) => copy.failed = Some(e),
                         }
@@ -933,7 +945,13 @@ impl Conn {
                 && copy.failed.is_none()
                 && !crate::sql::copy::is_end_marker(line)
             {
-                match engine.copy_row_line(&copy.setup, &mut self.txn, &self.arena, line) {
+                match engine.copy_row_line(
+                    &copy.setup,
+                    &mut self.txn,
+                    self.guc.seq_session(),
+                    &self.arena,
+                    line,
+                ) {
                     Ok(()) => copy.count += 1,
                     Err(e) => copy.failed = Some(e),
                 }

@@ -9,7 +9,7 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{ColumnDef, Expr, FkAction, QualName, TableConstraint};
-use crate::sql::eval::{cast_to, eval, sqlstate, NoColumns, SqlError};
+use crate::sql::eval::{cast_to, eval_full, sqlstate, EvalHooks, NoColumns, SqlError};
 use crate::sql::types::ColType;
 use crate::util::StackStr;
 use crate::storage::{
@@ -202,7 +202,8 @@ pub(super) fn build_column(
         }
         (None, Some(resolve_generated(gtext, arena)?), true)
     } else {
-        let (dv, de) = resolve_default(c.default, c.default_text, ctype, type_mod, arena)?;
+        let (dv, de) =
+            resolve_default(c.default, c.default_text, ctype, type_mod, storage, txid, arena)?;
         // A domain-typed column with no column-level DEFAULT inherits the
         // domain's DEFAULT (baked in at creation, re-evaluated per insert).
         if dv.is_none() && de.is_none() {
@@ -291,16 +292,17 @@ pub(super) fn resolve_generated(
     Ok(stored)
 }
 
-/// Resolves a column DEFAULT into either a folded constant (`default_value`, for
-/// a literal-only expression — the fast insert path) or its raw source text
-/// (`default_expr`, re-evaluated per inserted row — for anything with a function
-/// call, so `now()`/`nextval(...)` behave as PostgreSQL requires). Exactly one
-/// of the two is `Some` when a default is present.
+/// Resolves a column DEFAULT into its raw source text plus, when it fits the
+/// fixed inline representation, a folded scalar cache (`default_value`) for the
+/// fast insert path. Arena-backed values and call-bearing expressions retain
+/// only the source and are evaluated per inserted row.
 pub(super) fn resolve_default(
     default: Option<&Expr>,
     default_text: Option<&str>,
     ctype: ColType,
     type_mod: i32,
+    storage: &Storage,
+    txid: u32,
     arena: &Arena,
 ) -> Result<(Option<OwnedDatum>, Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>), SqlError> {
     let Some(expression) = default else {
@@ -309,12 +311,72 @@ pub(super) fn resolve_default(
     // A literal-only default folds to a constant now; anything volatile or
     // stable (any function call) is kept as text and evaluated at insert time.
     if !expression.contains_call() {
-        let v = eval(expression, arena, crate::sql::eval::NO_PARAMS, &NoColumns)?;
-        let v = cast_to(v, ctype, arena)?;
+        let catalog = crate::sql::query::storage_catalog(storage, txid);
+        let hooks = EvalHooks {
+            group: None,
+            aggs: None,
+            subs: None,
+            windows: None,
+            catalog: Some(&catalog),
+            srf_index: None,
+            sequences: None,
+        };
+        let v = eval_full(
+            expression,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            &NoColumns,
+            &hooks,
+        )?;
+        let v = match ctype {
+            ColType::Enum(slot) => super::coerce_enum_value(v, slot, storage, arena)?,
+            ColType::Array(
+                element
+                @ (crate::sql::types::ArrElem::Enum(_)
+                | crate::sql::types::ArrElem::Domain { .. }),
+            ) => super::coerce_user_type_array(v, element, storage, arena)?,
+            _ => cast_to(v, ctype, arena)?,
+        };
         let v = apply_typmod(v, ctype, type_mod, arena)?;
-        return Ok((Some(OwnedDatum::from_datum(&v)?), None));
+        // Fixed-size scalar defaults live inline in the table definition.
+        // Arena-backed values (arrays, temporal values, JSON, bytea, ranges,
+        // and bit strings) retain their source expression and are evaluated
+        // through the ordinary catalog-aware default path per inserted row.
+        if matches!(
+            v,
+            crate::sql::types::Datum::Date(_)
+                | crate::sql::types::Datum::Timestamp(_)
+                | crate::sql::types::Datum::Timestamptz(_)
+                | crate::sql::types::Datum::Time(_)
+                | crate::sql::types::Datum::Timetz(..)
+                | crate::sql::types::Datum::Interval(_)
+                | crate::sql::types::Datum::Json { .. }
+                | crate::sql::types::Datum::Array { .. }
+                | crate::sql::types::Datum::Range { .. }
+                | crate::sql::types::Datum::Multirange { .. }
+                | crate::sql::types::Datum::Bit { .. }
+                | crate::sql::types::Datum::Uuid(_)
+                | crate::sql::types::Datum::Bytea(_)
+        ) {
+            return Ok((None, Some(store_default_text(default_text)?)));
+        }
+        return Ok((
+            Some(OwnedDatum::from_datum(&v)?),
+            Some(store_default_text(default_text)?),
+        ));
     }
-    let text = default_text.unwrap_or("");
+    Ok((None, Some(store_default_text(default_text)?)))
+}
+
+fn store_default_text(
+    default_text: Option<&str>,
+) -> Result<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>, SqlError> {
+    let text = default_text.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "DEFAULT expression source text is unavailable"
+        )
+    })?;
     let stored = StackStr::from_str(text);
     if stored.is_truncated() {
         return Err(sql_err!(
@@ -323,7 +385,7 @@ pub(super) fn resolve_default(
             crate::storage::DEFAULT_EXPR_MAX
         ));
     }
-    Ok((None, Some(stored)))
+    Ok(stored)
 }
 
 fn fk_action_of(a: FkAction) -> crate::storage::FkAction {

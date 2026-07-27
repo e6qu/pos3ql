@@ -336,6 +336,13 @@ impl ColType {
         {
             return Some(Self::Enum((type_oid - oid::FIRST_ENUM) as u16));
         }
+        if type_oid >= oid::FIRST_ENUM_ARRAY
+            && type_oid < oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32
+        {
+            return Some(Self::Array(ArrElem::Enum(
+                (type_oid - oid::FIRST_ENUM_ARRAY) as u16,
+            )));
+        }
         // Bit-string arrays have no array-element type here, so they (and any
         // other unmodeled OID) fall through unsupported.
         None

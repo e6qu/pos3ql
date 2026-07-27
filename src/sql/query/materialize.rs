@@ -20,9 +20,10 @@ use crate::{sql_err, stack_format};
 use crate::storage::{Storage, MAX_COLUMNS};
 
 use super::{
-    arena_full, find_srf, merge_correlated, postpone_cost, project_row_skipping,
-    record_star_width, resolve_order_target, scan_source, sql_fail, sql_ok, srf_max_count,
-    where_passes, Outcome, QueryScope, ResolvedColumn, MAX_JOIN_TABLES, MAX_SUBQUERIES,
+    arena_full, correlated_in_expression, correlated_where_passes, find_srf, merge_correlated,
+    postpone_cost, project_row_skipping, record_star_width, resolve_order_target, scan_source,
+    sql_fail, sql_ok, srf_max_count, JoinRow, Outcome, QueryScope, ResolvedColumn,
+    MAX_JOIN_TABLES, MAX_SUBQUERIES,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
@@ -62,6 +63,109 @@ impl<'a> ColumnLookup<'a> for RawRow<'_, '_, 'a> {
     }
 }
 
+/// Runs the per-source-row part shared by materialization's sizing and
+/// encoding passes. Both passes must evaluate predicates, correlated
+/// subqueries, SRFs, projection, and sort keys in exactly the same order.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn for_each_materialized_projection<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    statement: &'a Select<'a>,
+    row: &JoinRow<'_, 'a, '_>,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
+    where_correlated: &[&'a Expr<'a>],
+    order_exprs: &[Option<&'a Expr<'a>>; MAX_PROJ],
+    n_keys: usize,
+    postponed: Option<&[bool; MAX_PROJ]>,
+    has_srf: bool,
+    consume: &mut impl FnMut(
+        &JoinRow<'_, 'a, '_>,
+        &[Datum<'a>],
+        &[Datum<'a>],
+    ) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if !where_correlated.is_empty()
+        && !correlated_where_passes(
+            where_correlated,
+            base,
+            statement.where_clause,
+            row,
+            storage,
+            txid,
+            arena,
+            params,
+            hooks,
+        )?
+    {
+        return Ok(());
+    }
+    let mut scalars: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
+        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+    let mut lists: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
+        [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+    let row_subqueries;
+    let owned_hooks;
+    let row_hooks: &EvalHooks = if correlated.is_empty() {
+        hooks
+    } else {
+        row_subqueries = merge_correlated(
+            correlated,
+            base,
+            row,
+            storage,
+            txid,
+            arena,
+            params,
+            &mut scalars,
+            &mut lists,
+        )?;
+        owned_hooks = EvalHooks {
+            group: None,
+            aggs: None,
+            subs: Some(&row_subqueries),
+            windows: None,
+            catalog: hooks.catalog,
+            srf_index: None,
+            sequences: hooks.sequences,
+        };
+        &owned_hooks
+    };
+    let expansions = srf_max_count(statement.items, arena, params, row, row_hooks)?;
+    for expansion in 1..=expansions {
+        let srf_hooks;
+        let use_hooks: &EvalHooks = if has_srf {
+            srf_hooks = EvalHooks { srf_index: Some(expansion), ..*row_hooks };
+            &srf_hooks
+        } else {
+            row_hooks
+        };
+        let mut projected = [Datum::Null; MAX_PROJ];
+        let width = project_row_skipping(
+            statement.items,
+            postponed,
+            scope,
+            row,
+            arena,
+            params,
+            use_hooks,
+            &mut projected,
+            None,
+        )?;
+        let mut keys = [Datum::Null; MAX_PROJ];
+        for (key, expression) in order_exprs.iter().take(n_keys).enumerate() {
+            keys[key] =
+                eval_full(expression.expect("resolved"), arena, params, row, use_hooks)?;
+        }
+        consume(row, &projected[..width], &keys[..n_keys])?;
+    }
+    Ok(())
+}
+
 /// A schema-only lookup for aggregate and grouped projections: it exposes the
 /// scope's column *types* — so static type inference (e.g. `pg_typeof`) still
 /// names a column's type when an aggregate over an empty or all-NULL group
@@ -76,6 +180,18 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         let entry = self.0.find_column(qualifier, name).ok()?;
         Some(self.0.output_type(entry))
+    }
+    fn column_domain(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::SqlName> {
+        match self.0.find_column(qualifier, name).ok()? {
+            super::scope::ResolvedColumn::Table(table, column) => {
+                self.0.defs[table]?.columns().get(column)?.domain
+            }
+            super::scope::ResolvedColumn::Merged(_) => None,
+        }
     }
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
         match self.0.find_column(qualifier, name).ok()? {
@@ -168,9 +284,16 @@ pub(crate) fn materialized_rows<'a>(
     // first row per key, in ORDER BY order — PostgreSQL requires the ON
     // expressions to match the leftmost ORDER BY).
     let n_on = statement.distinct_on.len();
-    // With correlated subqueries WHERE is applied per row (against merged
-    // hooks); otherwise the scan applies it directly.
-    let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
+    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
+    let n_where_correlated = correlated_in_expression(
+        statement.where_clause,
+        correlated,
+        &mut where_correlated,
+    )?;
+    // Select-list and ORDER BY subqueries do not prevent predicate pushdown.
+    // Only a correlated subquery actually used by WHERE needs per-row hooks.
+    let where_in_scan =
+        if n_where_correlated == 0 { statement.where_clause } else { None };
 
     // Resolve ORDER BY ordinals to item expressions, then the DISTINCT ON keys.
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
@@ -268,45 +391,27 @@ pub(crate) fn materialized_rows<'a>(
         storage, scope, from, txid, where_in_scan, arena, params, hooks,
         outer,
         &mut |row| {
-            let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-                [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-            let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
-                [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
-            let row_subs;
-            let row_hooks_owned;
-            let row_hooks: &EvalHooks = if correlated.is_empty() {
-                hooks
-            } else {
-                row_subs = merge_correlated(
-                    correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
-                )?;
-                row_hooks_owned =
-                    EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
-                if let Some(w) = statement.where_clause
-                    && !where_passes(w, arena, params, row, &row_hooks_owned)? {
-                        return Ok(true);
-                    }
-                &row_hooks_owned
-            };
-            let expansions = srf_max_count(statement.items, arena, params, row, row_hooks)?;
-            for k in 1..=expansions {
-                let srf_hooks;
-                let use_hooks: &EvalHooks = if srf_call.is_some() {
-                    srf_hooks = EvalHooks { srf_index: Some(k), ..*row_hooks };
-                    &srf_hooks
-                } else {
-                    row_hooks
-                };
-                let mut projected = [Datum::Null; MAX_PROJ];
-                project_row_skipping(
-                    statement.items, if any_postponed { Some(&postponed) } else { None },
-                    scope, row, arena, params, use_hooks, &mut projected, None,
-                )?;
-                for oe in order_exprs.iter().take(n_keys) {
-                    eval_full(oe.expect("resolved"), arena, params, row, use_hooks)?;
-                }
-                count += 1;
-            }
+            for_each_materialized_projection(
+                storage,
+                scope,
+                statement,
+                row,
+                txid,
+                arena,
+                params,
+                hooks,
+                correlated,
+                base,
+                &where_correlated[..n_where_correlated],
+                &order_exprs,
+                n_keys,
+                if any_postponed { Some(&postponed) } else { None },
+                srf_call.is_some(),
+                &mut |_, _, _| {
+                    count += 1;
+                    Ok(())
+                },
+            )?;
             Ok(true)
         },
     )?;
@@ -321,48 +426,28 @@ pub(crate) fn materialized_rows<'a>(
             storage, scope, from, txid, where_in_scan, arena, params, hooks,
             outer,
             &mut |row| {
-                let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-                let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
-                let row_subs;
-                let row_hooks_owned;
-                let row_hooks: &EvalHooks = if correlated.is_empty() {
-                    hooks
-                } else {
-                    row_subs = merge_correlated(
-                        correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
-                    )?;
-                    row_hooks_owned =
-                        EvalHooks { group: None, aggs: None, subs: Some(&row_subs), windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
-                    if let Some(w) = statement.where_clause
-                        && !where_passes(w, arena, params, row, &row_hooks_owned)? {
-                            return Ok(true);
-                        }
-                    &row_hooks_owned
-                };
-                let expansions = srf_max_count(statement.items, arena, params, row, row_hooks)?;
-                for k in 1..=expansions {
-                    let srf_hooks;
-                    let use_hooks: &EvalHooks = if srf_call.is_some() {
-                        srf_hooks = EvalHooks { srf_index: Some(k), ..*row_hooks };
-                        &srf_hooks
-                    } else {
-                        row_hooks
-                    };
-                    let mut projected = [Datum::Null; MAX_PROJ];
-                    let n = project_row_skipping(
-                        statement.items, if any_postponed { Some(&postponed) } else { None },
-                        scope, row, arena, params, use_hooks, &mut projected, None,
-                    )?;
-                    debug_assert_eq!(n, width);
+                for_each_materialized_projection(
+                    storage,
+                    scope,
+                    statement,
+                    row,
+                    txid,
+                    arena,
+                    params,
+                    hooks,
+                    correlated,
+                    base,
+                    &where_correlated[..n_where_correlated],
+                    &order_exprs,
+                    n_keys,
+                    if any_postponed { Some(&postponed) } else { None },
+                    srf_call.is_some(),
+                    &mut |row, projected, keys| {
+                    debug_assert_eq!(projected.len(), width);
                     let mut full =
                         [Datum::Null; MAX_PROJ + MAX_PROJ + MAX_COLUMNS * MAX_JOIN_TABLES];
                     full[..width].copy_from_slice(&projected[..width]);
-                    for (key, oe) in order_exprs.iter().take(n_keys).enumerate() {
-                        full[width + key] =
-                            eval_full(oe.expect("resolved"), arena, params, row, use_hooks)?;
-                    }
+                    full[width..width + n_keys].copy_from_slice(keys);
                     // Raw source columns for deferred projection after the sort.
                     if any_postponed {
                         let mut flat = width + n_keys;
@@ -380,7 +465,9 @@ pub(crate) fn materialized_rows<'a>(
                         arena,
                     )?;
                     at += 1;
-                }
+                    Ok(())
+                },
+                )?;
                 Ok(true)
             },
         )?;
@@ -564,4 +651,3 @@ pub(crate) fn materialized_select<'a>(
     responder.command_complete(tag.as_str())?;
     sql_ok()
 }
-

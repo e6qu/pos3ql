@@ -463,11 +463,12 @@ pub(crate) fn parse_checks<'a>(def: &'a TableDef, arena: &'a Arena) -> Result<Pa
     Ok(out)
 }
 
-/// A column's non-constant DEFAULT, re-parsed once per statement (indexed by
-/// column). `None` where the column has no default or a folded constant one.
+/// A column's DEFAULT source, re-parsed once per statement (indexed by column).
+/// Folded scalar defaults may also have a parsed source for catalog fidelity;
+/// execution still takes their `default_value` fast path.
 pub(crate) type ParsedDefaults<'a> = [Option<&'a Expr<'a>>; MAX_COLUMNS];
 
-/// Re-parses every stored non-constant DEFAULT expression once per statement.
+/// Re-parses every stored DEFAULT expression once per statement.
 /// Generated columns (whose `default_expr` is a generation expression) are
 /// excluded — they are computed from the row by [`parse_generated`], not
 /// defaulted.

@@ -762,6 +762,10 @@ impl Engine {
     /// the heap. The atomic form — drives the sliced checkpoint's beats to
     /// completion in one call, for the explicit `CHECKPOINT` statement and
     /// shutdown. `Ok(false)` = nothing to do.
+    pub fn checkpoint_enabled(&self) -> bool {
+        self.ckpt.is_some()
+    }
+
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {
@@ -855,10 +859,11 @@ impl Engine {
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
+        seq_session: &guc::SeqSession,
         arena: &Arena,
         line: &[u8],
     ) -> Result<(), SqlError> {
-        exec::copy_row(&mut self.storage, txn, setup, line, arena)
+        exec::copy_row(&mut self.storage, txn, seq_session, setup, line, arena)
     }
 
     /// One complete COPY FROM binary row (int16 field count + fields).
@@ -866,10 +871,11 @@ impl Engine {
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
+        seq_session: &guc::SeqSession,
         arena: &Arena,
         row: &[u8],
     ) -> Result<(), SqlError> {
-        exec::copy_row_binary(&mut self.storage, txn, setup, row, arena)
+        exec::copy_row_binary(&mut self.storage, txn, seq_session, setup, row, arena)
     }
 
     /// Ends a successful COPY FROM: an implicit transaction commits here

@@ -177,14 +177,20 @@ pub(crate) fn dispatch<'a>(
             | "pg_table_is_visible"
             | "pg_type_is_visible"
             | "pg_function_is_visible"
+            | "pg_collation_is_visible"
             | "has_table_privilege"
             | "has_column_privilege"
             | "has_schema_privilege"
+            | "has_database_privilege"
             | "pg_relation_is_publishable"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
             | "pg_get_expr"
             | "pg_get_viewdef"
+            | "pg_table_size"
+            | "pg_database_size"
+            | "pg_tablespace_location"
+            | "pg_tablespace_size"
             | "pg_get_functiondef"
             | "col_description"
             | "obj_description"
@@ -192,6 +198,8 @@ pub(crate) fn dispatch<'a>(
             | "pg_get_statisticsobjdef_columns"
             | "format_type"
             | "pg_encoding_to_char"
+            | "pg_char_to_encoding"
+            | "getdatabaseencoding"
             | "pg_typeof"
             | "current_setting"
             | "set_config"
@@ -378,8 +386,9 @@ pub(crate) fn dispatch<'a>(
                 eval_full(args[0], arena, params, row, hooks)
             }
             "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible"
+            | "pg_collation_is_visible"
             | "has_table_privilege" | "has_column_privilege" | "has_schema_privilege"
-            | "pg_relation_is_publishable" => {
+            | "has_database_privilege" | "pg_relation_is_publishable" => {
                 Ok(Datum::Bool(true))
             }
             "pg_get_indexdef" => {
@@ -465,8 +474,88 @@ pub(crate) fn dispatch<'a>(
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
-            "pg_get_expr" | "pg_get_viewdef"
-            | "pg_get_functiondef"
+            "pg_get_expr" => {
+                if !(2..=3).contains(&args.len()) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function pg_get_expr(...) does not exist"
+                    ));
+                }
+                match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(expression) => Ok(Datum::Text(expression)),
+                    Datum::Null => Ok(Datum::Null),
+                    _ => Ok(Datum::Null),
+                }
+            }
+            "pg_get_viewdef" => {
+                if !(1..=2).contains(&args.len()) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function pg_get_viewdef(...) does not exist"
+                    ));
+                }
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(oid) => oid,
+                    Datum::Int8(oid) => oid as i32,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .view_def(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
+            }
+            "pg_table_size" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(oid) => oid,
+                    Datum::Int8(oid) => oid as i32,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .relation_size(oid)?
+                    .map(Datum::Int8)
+                    .unwrap_or(Datum::Null))
+            }
+            "pg_database_size" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(_) | Datum::Int4(_) | Datum::Int8(_) => {
+                        Ok(Datum::Int8(cat.database_size()?))
+                    }
+                    Datum::Null => Ok(Datum::Null),
+                    _ => Ok(Datum::Null),
+                }
+            }
+            "pg_tablespace_location" => {
+                arity(1)?;
+                let _ = eval_full(args[0], arena, params, row, hooks)?;
+                Ok(Datum::Text(""))
+            }
+            "pg_tablespace_size" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(_) | Datum::Int8(_) | Datum::Text(_) => {
+                        Ok(Datum::Int8(cat.database_size()?))
+                    }
+                    Datum::Null => Ok(Datum::Null),
+                    _ => Ok(Datum::Null),
+                }
+            }
+            "pg_get_functiondef"
             | "shobj_description" | "pg_get_statisticsobjdef_columns" => {
                 // Definitions/comments we do not reconstruct render as empty/NULL,
                 // as PostgreSQL does for an absent comment.
@@ -488,6 +577,11 @@ pub(crate) fn dispatch<'a>(
                     // A NULL modifier means "no modifier", not a NULL result.
                     _ => -1,
                 };
+                if let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.type_name(o, arena)?
+                {
+                    return Ok(Datum::Text(name));
+                }
                 let Some(coltype) = exec::coltype_of_oid(o) else {
                     return Ok(Datum::Text("???"));
                 };
@@ -525,6 +619,22 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_encoding_to_char" => {
                 arity(1)?;
+                Ok(Datum::Text("UTF8"))
+            }
+            "pg_char_to_encoding" => {
+                arity(1)?;
+                match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(name) if name.eq_ignore_ascii_case("UTF8") => Ok(Datum::Int4(6)),
+                    Datum::Text(_) => Ok(Datum::Int4(-1)),
+                    Datum::Null => Ok(Datum::Null),
+                    _ => Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "pg_char_to_encoding() requires a text encoding name"
+                    )),
+                }
+            }
+            "getdatabaseencoding" => {
+                arity(0)?;
                 Ok(Datum::Text("UTF8"))
             }
             "pg_typeof" => {

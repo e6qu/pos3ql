@@ -70,9 +70,14 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_range"
                 | "pg_settings"
                 | "pg_proc"
+                | "pg_language"
+                | "pg_auth_members"
+                | "pg_db_role_setting"
+                | "pg_parameter_acl"
                 | "pg_extension"
                 | "pg_depend"
                 | "pg_tablespace"
+                | "pg_foreign_data_wrapper"
         ),
     }
 }
@@ -152,7 +157,13 @@ pub fn synthesize<'a>(
                 &[
                     ("oid", ColType::Int4),
                     ("pubname", ColType::Text),
+                    ("pubowner", ColType::Int4),
                     ("puballtables", ColType::Bool),
+                    ("pubinsert", ColType::Bool),
+                    ("pubupdate", ColType::Bool),
+                    ("pubdelete", ColType::Bool),
+                    ("pubtruncate", ColType::Bool),
+                    ("pubviaroot", ColType::Bool),
                 ],
             ),
             &[],
@@ -238,9 +249,32 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_foreign_server",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("srvname", ColType::Text),
+                    ("srvowner", ColType::Int4),
+                    ("srvfdw", ColType::Int4),
+                    ("srvtype", ColType::Text),
+                    ("srvversion", ColType::Text),
+                    ("srvacl", ColType::Array(super::types::ArrElem::Text)),
                     ("srvoptions", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_foreign_data_wrapper") => finish(
+            def_of(
+                "pg_foreign_data_wrapper",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("fdwname", ColType::Text),
+                    ("fdwowner", ColType::Int4),
+                    ("fdwhandler", ColType::Int4),
+                    ("fdwvalidator", ColType::Int4),
+                    ("fdwacl", ColType::Array(super::types::ArrElem::Text)),
+                    ("fdwoptions", ColType::Array(super::types::ArrElem::Text)),
                 ],
             ),
             &[],
@@ -260,13 +294,23 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_settings") => finish(
-            def_of("pg_settings", &[("name", ColType::Text), ("setting", ColType::Text)]),
+            def_of(
+                "pg_settings",
+                &[
+                    ("name", ColType::Text),
+                    ("setting", ColType::Text),
+                    ("source", ColType::Text),
+                    ("boot_val", ColType::Text),
+                    ("vartype", ColType::Text),
+                    ("context", ColType::Text),
+                ],
+            ),
             &[
-                row(&[text("max_index_keys", arena)?, text("32", arena)?], arena)?,
-                row(&[text("max_identifier_length", arena)?, text("63", arena)?], arena)?,
-                row(&[text("server_version", arena)?, text("18.4", arena)?], arena)?,
-                row(&[text("server_encoding", arena)?, text("UTF8", arena)?], arena)?,
-                row(&[text("standard_conforming_strings", arena)?, text("on", arena)?], arena)?,
+                row(&[text("max_index_keys", arena)?, text("32", arena)?, text("default", arena)?, text("32", arena)?, text("integer", arena)?, text("internal", arena)?], arena)?,
+                row(&[text("max_identifier_length", arena)?, text("63", arena)?, text("default", arena)?, text("63", arena)?, text("integer", arena)?, text("internal", arena)?], arena)?,
+                row(&[text("server_version", arena)?, text("18.4", arena)?, text("default", arena)?, text("18.4", arena)?, text("string", arena)?, text("internal", arena)?], arena)?,
+                row(&[text("server_encoding", arena)?, text("UTF8", arena)?, text("default", arena)?, text("UTF8", arena)?, text("string", arena)?, text("internal", arena)?], arena)?,
+                row(&[text("standard_conforming_strings", arena)?, text("on", arena)?, text("default", arena)?, text("on", arena)?, text("bool", arena)?, text("user", arena)?], arena)?,
             ],
             arena,
         ),
@@ -280,7 +324,63 @@ pub fn synthesize<'a>(
                     ("prorettype", ColType::Int4),
                     ("prokind", ColType::Bpchar),
                     ("proargtypes", ColType::Text),
+                    ("provolatile", ColType::Bpchar),
+                    ("proparallel", ColType::Bpchar),
+                    ("proowner", ColType::Int4),
+                    ("prosecdef", ColType::Bool),
+                    ("proacl", ColType::Array(super::types::ArrElem::Text)),
+                    ("prolang", ColType::Int4),
                     ("prosrc", ColType::Text),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_language") => finish(
+            def_of(
+                "pg_language",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("lanname", ColType::Name),
+                    ("lanowner", ColType::Int4),
+                    ("lanpltrusted", ColType::Bool),
+                    ("lanispl", ColType::Bool),
+                    ("lanplcallfoid", ColType::Int4),
+                    ("lanvalidator", ColType::Int4),
+                    ("laninline", ColType::Int4),
+                    ("lanacl", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_auth_members") => finish(
+            def_of(
+                "pg_auth_members",
+                &[("roleid", ColType::Int4), ("member", ColType::Int4)],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_db_role_setting") => finish(
+            def_of(
+                "pg_db_role_setting",
+                &[
+                    ("setdatabase", ColType::Int4),
+                    ("setrole", ColType::Int4),
+                    ("setconfig", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_parameter_acl") => finish(
+            def_of(
+                "pg_parameter_acl",
+                &[
+                    ("parname", ColType::Text),
+                    ("paracl", ColType::Array(super::types::ArrElem::Text)),
                 ],
             ),
             &[],
@@ -319,27 +419,52 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_tablespace") => finish(
-            def_of(
+        (false, "pg_tablespace") => {
+            let def = def_of(
                 "pg_tablespace",
                 &[
                     ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("spcname", ColType::Name),
                     ("spcowner", ColType::Int4),
-                    ("spcacl", ColType::Text),
+                    ("spcacl", ColType::Array(super::types::ArrElem::Text)),
                     ("spcoptions", ColType::Array(super::types::ArrElem::Text)),
                 ],
-            ),
-            &[],
-            arena,
-        ),
+            );
+            finish(
+                def,
+                &[row(
+                    &[
+                        Datum::Int4(1213),
+                        Datum::Int4(1663),
+                        text("pg_default", arena)?,
+                        Datum::Int4(10),
+                        Datum::Null,
+                        Datum::Null,
+                    ],
+                    arena,
+                )?],
+                arena,
+            )
+        }
         (false, "pg_roles") => {
             let user = super::eval::funcs::system::session_user_owned();
             finish(
                 def_of(
                     "pg_roles",
-                    &[("oid", ColType::Int4), ("rolname", ColType::Name)],
+                    &[
+                        ("oid", ColType::Int4),
+                        ("rolname", ColType::Name),
+                        ("rolsuper", ColType::Bool),
+                        ("rolinherit", ColType::Bool),
+                        ("rolcreaterole", ColType::Bool),
+                        ("rolcreatedb", ColType::Bool),
+                        ("rolcanlogin", ColType::Bool),
+                        ("rolconnlimit", ColType::Int4),
+                        ("rolvaliduntil", ColType::Timestamptz),
+                        ("rolreplication", ColType::Bool),
+                        ("rolbypassrls", ColType::Bool),
+                    ],
                 ),
                 &[row(
                     &[
@@ -348,6 +473,15 @@ pub fn synthesize<'a>(
                             arena.alloc_str(user.as_str()).map_err(|_| arena_full())?,
                             arena,
                         )?,
+                        Datum::Bool(true),
+                        Datum::Bool(true),
+                        Datum::Bool(true),
+                        Datum::Bool(true),
+                        Datum::Bool(true),
+                        Datum::Int4(-1),
+                        Datum::Null,
+                        Datum::Bool(true),
+                        Datum::Bool(true),
                     ],
                     arena,
                 )?],
@@ -367,7 +501,40 @@ pub fn synthesize<'a>(
         (false, "pg_matviews") => pg_matviews(storage, arena),
         (false, "pg_sequences") => pg_sequences(storage, arena),
         (false, "pg_sequence") => pg_sequence(storage, arena),
-        (false, "pg_views") | (false, "pg_database") => {
+        (false, "pg_database") => finish(
+            def_of(
+                "pg_database",
+                &[
+                    ("oid", ColType::Int4),
+                    ("datname", ColType::Name),
+                    ("datdba", ColType::Int4),
+                    ("encoding", ColType::Int4),
+                    ("datcollate", ColType::Text),
+                    ("datctype", ColType::Text),
+                    ("daticulocale", ColType::Text),
+                    ("datlocprovider", ColType::Bpchar),
+                    ("datacl", ColType::Array(super::types::ArrElem::Text)),
+                    ("dattablespace", ColType::Int4),
+                ],
+            ),
+            &[row(
+                &[
+                    Datum::Int4(5),
+                    text("postgres", arena)?,
+                    Datum::Int4(10),
+                    Datum::Int4(6),
+                    text("C", arena)?,
+                    text("C", arena)?,
+                    Datum::Null,
+                    text("c", arena)?,
+                    Datum::Null,
+                    Datum::Int4(1663),
+                ],
+                arena,
+            )?],
+            arena,
+        ),
+        (false, "pg_views") => {
             empty_like(name, storage, arena)
         }
         (true, "tables") => info_tables(storage, arena),
@@ -594,6 +761,85 @@ pub fn reloid_of_name(storage: &Storage, name: &str) -> Option<i32> {
         .map(|(slot, _)| view_oid(slot))
 }
 
+/// Stored SELECT text for `pg_get_viewdef`, by relation OID.
+pub fn view_def_text<'a>(
+    storage: &Storage,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    for (slot, table) in storage.live_tables() {
+        if table_oid(storage, slot) != oid {
+            continue;
+        }
+        let Some(view) =
+            storage.find_matview(table.def.schema.as_str(), table.def.name.as_str(), 0)
+        else {
+            return Ok(None);
+        };
+        return arena
+            .alloc_str(view.sql.as_str())
+            .map(Some)
+            .map_err(|_| arena_full());
+    }
+    for (slot, view) in storage.views_with_slots() {
+        if view_oid(slot) == oid {
+            return arena
+                .alloc_str(view.sql.as_str())
+                .map(Some)
+                .map_err(|_| arena_full());
+        }
+    }
+    Ok(None)
+}
+
+/// The bytes occupied by a relation's visible encoded row images. Plain views
+/// and indexes have no physical row store in pos3ql, so their exact size is
+/// zero; tables and materialized views share the table row store.
+pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i64>, SqlError> {
+    for (slot, _) in storage.live_tables() {
+        if table_oid(storage, slot) != oid {
+            continue;
+        }
+        return table_size(storage, txid, slot).map(Some);
+    }
+    if storage.views_with_slots().any(|(slot, _)| view_oid(slot) == oid) {
+        return Ok(Some(0));
+    }
+    let mut indexes = [None; MAX_SYNTH_INDEXES];
+    let count = collect_indexes(storage, &mut indexes);
+    if indexes[..count].iter().flatten().any(|index| index.oid == oid) {
+        return Ok(Some(0));
+    }
+    Ok(None)
+}
+
+pub fn database_size(storage: &Storage, txid: u32) -> Result<i64, SqlError> {
+    let mut total = 0i64;
+    for (slot, _) in storage.live_tables() {
+        total = total.checked_add(table_size(storage, txid, slot)?).ok_or_else(|| {
+            sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "database size exceeds bigint")
+        })?;
+    }
+    Ok(total)
+}
+
+fn table_size(storage: &Storage, txid: u32, slot: usize) -> Result<i64, SqlError> {
+    let mut bytes = 0i64;
+    storage.for_each_row_state(slot, &mut |_, state| {
+        if let Some(home) = state.visible_to(txid) {
+            let len = match home {
+                crate::storage::RowHome::Heap(location) => location.len,
+                crate::storage::RowHome::Spilled { len, .. } => len,
+            };
+            bytes = bytes.checked_add(i64::from(len)).ok_or_else(|| {
+                sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "relation size exceeds bigint")
+            })?;
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    Ok(bytes)
+}
+
 /// `pg_description`: one row per committed object comment, resolving each to
 /// its `(objoid, classoid, objsubid)`. A comment whose object no longer
 /// resolves to an OID is omitted, matching that its row would be dangling.
@@ -761,6 +1007,105 @@ fn type_oid_of(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option
     None
 }
 
+/// Search-path-aware SQL spelling of a user-defined type OID. `format_type`
+/// uses this for domains/enums and their automatically-created array types;
+/// built-in types deliberately return `None` and stay on the static path.
+pub fn user_type_name_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use crate::sql::types::oid as type_oid;
+    let (schema, name, visible, array, enumeration) =
+        if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+            .contains(&oid)
+        {
+            let slot = (oid - type_oid::FIRST_DOMAIN) as usize;
+            let definition = storage.domain(slot);
+            (
+                definition.schema,
+                definition.name,
+                definition.visible_to(txid),
+                false,
+                false,
+            )
+        } else if (type_oid::FIRST_DOMAIN_ARRAY
+            ..type_oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+            .contains(&oid)
+        {
+            let slot = (oid - type_oid::FIRST_DOMAIN_ARRAY) as usize;
+            let definition = storage.domain(slot);
+            (
+                definition.schema,
+                definition.name,
+                definition.visible_to(txid),
+                true,
+                false,
+            )
+        } else if (type_oid::FIRST_ENUM
+            ..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
+            .contains(&oid)
+        {
+            let slot = (oid - type_oid::FIRST_ENUM) as usize;
+            let definition = storage.enum_def(slot);
+            (
+                definition.schema,
+                definition.name,
+                definition.visible_to(txid),
+                false,
+                true,
+            )
+        } else if (type_oid::FIRST_ENUM_ARRAY
+            ..type_oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32)
+            .contains(&oid)
+        {
+            let slot = (oid - type_oid::FIRST_ENUM_ARRAY) as usize;
+            let definition = storage.enum_def(slot);
+            (
+                definition.schema,
+                definition.name,
+                definition.visible_to(txid),
+                true,
+                true,
+            )
+        } else {
+            return Ok(None);
+        };
+    if !visible {
+        return Ok(None);
+    }
+    let unqualified_visible = if enumeration {
+        storage.resolve_enum_slot(name.as_str(), txid)
+            == Some(if array {
+                (oid - type_oid::FIRST_ENUM_ARRAY) as usize
+            } else {
+                (oid - type_oid::FIRST_ENUM) as usize
+            })
+    } else {
+        storage.resolve_domain_slot(name.as_str(), txid)
+            == Some(if array {
+                (oid - type_oid::FIRST_DOMAIN_ARRAY) as usize
+            } else {
+                (oid - type_oid::FIRST_DOMAIN) as usize
+            })
+    };
+    let mut rendered = StackStr::<140>::new();
+    use core::fmt::Write as _;
+    if !unqualified_visible {
+        let _ = write!(rendered, "{}.", schema.as_str());
+    }
+    let _ = rendered.write_str(name.as_str());
+    if array {
+        let _ = rendered.write_str("[]");
+    }
+    Ok(Some(alloc_rendered(
+        &rendered,
+        "formatted type name is too long",
+        arena,
+    )?))
+}
+
 /// The comment text `txid` sees on the object with this OID (and column
 /// `subid`), for `obj_description`/`col_description`. `catalog_name` selects
 /// the object's catalog, defaulting to `pg_class` for deprecated one-argument
@@ -811,6 +1156,8 @@ struct FkInfo {
 }
 
 const FIRST_FK_OID: i32 = 200_000;
+const FIRST_CHECK_OID: i32 = 300_000;
+const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
 
 /// Enumerates every foreign-key constraint, resolving each child/parent table to
 /// its OID. A child whose parent no longer exists is skipped (it cannot be
@@ -863,7 +1210,7 @@ pub fn constraint_def_text<'a>(
             return Ok(None);
         };
         let parent = &storage.table(pslot).def;
-        let mut s = StackStr::<256>::new();
+        let mut s = StackStr::<1280>::new();
         use core::fmt::Write as _;
         let _ = s.write_str("FOREIGN KEY (");
         for (k, &c) in fk.columns[..fk.n_cols].iter().enumerate() {
@@ -882,8 +1229,74 @@ pub fn constraint_def_text<'a>(
         let _ = s.write_str(")");
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
         let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
-        let bytes = arena.alloc_slice_copy(s.as_str().as_bytes()).map_err(|_| arena_full())?;
-        return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+        return Ok(Some(alloc_rendered(
+            &s,
+            "foreign key definition is too long",
+            arena,
+        )?));
+    }
+    for (slot, table) in storage.live_tables() {
+        for (check_index, check) in table.def.checks().iter().enumerate() {
+            let check_oid = FIRST_CHECK_OID
+                + slot as i32 * crate::storage::MAX_CHECKS as i32
+                + check_index as i32;
+            if check_oid != oid {
+                continue;
+            }
+            let mut rendered = StackStr::<1024>::new();
+            use core::fmt::Write as _;
+            let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+            return Ok(Some(alloc_rendered(
+                &rendered,
+                "table constraint definition is too long",
+                arena,
+            )?));
+        }
+    }
+    for (slot, domain) in storage.live_domains() {
+        for (check_index, check) in domain.checks().iter().enumerate() {
+            let check_oid = FIRST_DOMAIN_CHECK_OID
+                + slot as i32 * crate::storage::MAX_DOMAIN_CHECKS as i32
+                + check_index as i32;
+            if check_oid != oid {
+                continue;
+            }
+            let mut rendered = StackStr::<1024>::new();
+            use core::fmt::Write as _;
+            let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+            return Ok(Some(alloc_rendered(
+                &rendered,
+                "domain constraint definition is too long",
+                arena,
+            )?));
+        }
+    }
+    let mut indexes = [None; MAX_SYNTH_INDEXES];
+    let count = collect_indexes(storage, &mut indexes);
+    for info in indexes[..count].iter().flatten() {
+        if oid != info.oid + 500_000 || (!info.is_primary && !info.is_unique) {
+            continue;
+        }
+        let table = &storage.table(info.table_slot).def;
+        let mut rendered = StackStr::<640>::new();
+        use core::fmt::Write as _;
+        let _ = rendered.write_str(if info.is_primary {
+            "PRIMARY KEY ("
+        } else {
+            "UNIQUE ("
+        });
+        for (index, &column) in info.columns[..info.n_cols].iter().enumerate() {
+            if index > 0 {
+                let _ = rendered.write_str(", ");
+            }
+            let _ = rendered.write_str(table.columns()[column as usize].name.as_str());
+        }
+        let _ = rendered.write_str(")");
+        return Ok(Some(alloc_rendered(
+            &rendered,
+            "unique constraint definition is too long",
+            arena,
+        )?));
     }
     Ok(None)
 }
@@ -926,7 +1339,7 @@ pub fn index_def_text<'a>(
             let bytes = arena.alloc_slice_copy(name.as_bytes()).map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
-        let mut s = StackStr::<256>::new();
+        let mut s = StackStr::<640>::new();
         use core::fmt::Write as _;
         let _ = s.write_str("btree (");
         for k in 0..info.n_cols {
@@ -936,8 +1349,11 @@ pub fn index_def_text<'a>(
             let _ = s.write_str(col_name(k));
         }
         let _ = s.write_str(")");
-        let bytes = arena.alloc_slice_copy(s.as_str().as_bytes()).map_err(|_| arena_full())?;
-        return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+        return Ok(Some(alloc_rendered(
+            &s,
+            "index definition is too long",
+            arena,
+        )?));
     }
     Ok(None)
 }
@@ -992,6 +1408,17 @@ fn text<'a>(s: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     arena.alloc_str(s).map(Datum::Text).map_err(|_| arena_full())
 }
 
+fn describe_view<'a>(
+    storage: &'a Storage,
+    view: &'a crate::storage::ViewDef,
+    arena: &'a Arena,
+    out: &mut [super::types::ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    let user = crate::sql::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), 0);
+    super::query::describe_query_under(view.sql.as_str(), storage, 0, path, arena, out)
+}
+
 fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_class",
@@ -1030,6 +1457,8 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
     let n_idx = collect_indexes(storage, &mut indexes);
+    let mut foreign_keys = [None; MAX_SYNTH_INDEXES];
+    let n_foreign_keys = collect_fkeys(storage, &mut foreign_keys);
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
     for (slot, table) in storage.live_tables() {
@@ -1038,6 +1467,11 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         }
         let toid = table_oid(storage, slot);
         let has_index = indexes[..n_idx].iter().flatten().any(|i| i.table_oid == toid);
+        let has_triggers = !table.def.fkeys().is_empty()
+            || foreign_keys[..n_foreign_keys]
+                .iter()
+                .flatten()
+                .any(|foreign_key| foreign_key.confrelid == toid);
         let n_checks = table.def.n_checks as i32;
         // A table that has a matching matview catalog entry is a materialized
         // view (relkind 'm'), not an ordinary table ('r').
@@ -1063,7 +1497,7 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 Datum::Int4(n_checks), // relchecks
                 Datum::Bool(has_index),
                 Datum::Bool(false), // relhasrules
-                Datum::Bool(false), // relhastriggers
+                Datum::Bool(has_triggers), // FK enforcement is trigger-backed in PostgreSQL
                 Datum::Bool(false), // relrowsecurity
                 Datum::Bool(false), // relforcerowsecurity
                 Datum::Bool(false), // relispartition
@@ -1175,6 +1609,52 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         )?;
         n += 1;
     }
+    // Plain views are pg_class relations too (relkind 'v'). Their column count
+    // is derived under the creator's captured search path, the same binding
+    // rule used when the view executes.
+    for (slot, view) in storage.views_with_slots() {
+        if n == out.len() {
+            break;
+        }
+        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let n_columns = describe_view(storage, view, arena, &mut columns)?;
+        out[n] = row(
+            &[
+                Datum::Int4(view_oid(slot)),
+                text(view.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, view.schema.as_str())),
+                text("v", arena)?,
+                Datum::Int4(n_columns as i32),
+                Datum::Float8(0.0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(10),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(true), // a view is represented by a rewrite rule
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     finish(def, &out[..n], arena)
 }
 
@@ -1185,6 +1665,7 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
             ("oid", ColType::Int4),
             ("conname", ColType::Text),
             ("conrelid", ColType::Int4),
+            ("contypid", ColType::Int4),
             ("contype", ColType::Bpchar),
             ("conparentid", ColType::Int4),
             ("conindid", ColType::Int4),
@@ -1201,7 +1682,7 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
     let n_idx = collect_indexes(storage, &mut indexes);
-    let mut out: [&[Datum]; MAX_SYNTH_INDEXES] = [&[]; MAX_SYNTH_INDEXES];
+    let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
     // A PRIMARY KEY or UNIQUE constraint has a backing index; its `conindid`
     // links to that index so psql's `\d` labels a UNIQUE index as a constraint.
@@ -1213,11 +1694,15 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
         } else {
             continue;
         };
+        if n == out.len() {
+            break;
+        }
         out[n] = row(
             &[
                 Datum::Int4(info.oid + 500_000), // constraint oid, distinct from the index's
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(info.table_oid),
+                Datum::Int4(0),
                 text(contype, arena)?,
                 Datum::Int4(0), // conparentid
                 Datum::Int4(info.oid), // conindid -> the backing index
@@ -1261,6 +1746,7 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
                 Datum::Int4(info.oid),
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(info.conrelid),
+                Datum::Int4(0),
                 text("f", arena)?,
                 Datum::Int4(0), // conparentid
                 Datum::Int4(conindid),
@@ -1277,6 +1763,77 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
             arena,
         )?;
         n += 1;
+    }
+    // CHECK constraints are catalog objects too. Their source predicate is
+    // preserved by the table definition and reconstructed by
+    // pg_get_constraintdef, which is what psql's "Check constraints" section
+    // reads.
+    for (slot, table) in storage.live_tables() {
+        for (check_index, check) in table.def.checks().iter().enumerate() {
+            if n == out.len() {
+                break;
+            }
+            out[n] = row(
+                &[
+                    Datum::Int4(
+                        FIRST_CHECK_OID
+                            + slot as i32 * crate::storage::MAX_CHECKS as i32
+                            + check_index as i32,
+                    ),
+                    text(check.name.as_str(), arena)?,
+                    Datum::Int4(table_oid(storage, slot)),
+                    Datum::Int4(0),
+                    text("c", arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                    Datum::Bool(true),
+                    Datum::Bool(false),
+                    text(" ", arena)?,
+                    text(" ", arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    // Domain CHECK constraints are attached to `contypid`, not a table.
+    for (slot, domain) in storage.live_domains() {
+        for (check_index, check) in domain.checks().iter().enumerate() {
+            if n == out.len() {
+                break;
+            }
+            out[n] = row(
+                &[
+                    Datum::Int4(
+                        FIRST_DOMAIN_CHECK_OID
+                            + slot as i32 * crate::storage::MAX_DOMAIN_CHECKS as i32
+                            + check_index as i32,
+                    ),
+                    text(check.name.as_str(), arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(domain_oid(slot)),
+                    text("c", arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                    Datum::Bool(true),
+                    Datum::Bool(false),
+                    text(" ", arena)?,
+                    text(" ", arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
     }
     finish(def, &out[..n], arena)
 }
@@ -1323,10 +1880,14 @@ fn pg_index<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             ("indisunique", ColType::Bool),
             ("indisclustered", ColType::Bool),
             ("indisvalid", ColType::Bool),
+            ("indimmediate", ColType::Bool),
             ("indisreplident", ColType::Bool),
+            ("indnullsnotdistinct", ColType::Bool),
             ("indnatts", ColType::Int4),
+            ("indnkeyatts", ColType::Int4),
             ("indkey", ColType::Array(super::types::ArrElem::Int4)),
             ("indoption", ColType::Array(super::types::ArrElem::Int4)),
+            ("indpred", ColType::Text),
         ],
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
@@ -1345,10 +1906,14 @@ fn pg_index<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 Datum::Bool(info.is_unique),
                 Datum::Bool(false), // indisclustered
                 Datum::Bool(true),  // indisvalid
+                Datum::Bool(true),  // constraints are checked immediately
                 Datum::Bool(false), // indisreplident
+                Datum::Bool(false), // NULL values are distinct by default
+                Datum::Int4(info.n_cols as i32),
                 Datum::Int4(info.n_cols as i32),
                 attnum_array(&info.columns[..info.n_cols], arena)?,
                 option_array(&zeros[..info.n_cols], arena)?,
+                Datum::Null, // partial indexes are not yet accepted by the DDL grammar
             ],
             arena,
         )?;
@@ -1369,6 +1934,25 @@ fn option_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlE
     })
 }
 
+fn column_type_oid(storage: &Storage, column: &ColumnMeta) -> i32 {
+    match (column.ctype, column.domain, column.user_type_schema) {
+        (
+            ColType::Array(super::types::ArrElem::Domain { slot, .. }),
+            _,
+            _,
+        ) => super::types::oid::domain_array_oid(slot),
+        (ColType::Enum(slot), _, _) => super::types::oid::enum_oid(slot),
+        (ColType::Array(super::types::ArrElem::Enum(slot)), _, _) => {
+            super::types::oid::enum_array_oid(slot)
+        }
+        (_, Some(name), Some(schema)) => storage
+            .domain_slot(schema.as_str(), name.as_str(), 0)
+            .map(|slot| super::types::oid::domain_oid(slot as u16))
+            .unwrap_or_else(|| column.ctype.oid()),
+        _ => column.ctype.oid(),
+    }
+}
+
 fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_attribute",
@@ -1384,6 +1968,9 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
             ("attcollation", ColType::Int4),
             ("attidentity", ColType::Bpchar),
             ("attgenerated", ColType::Bpchar),
+            ("attstorage", ColType::Bpchar),
+            ("attcompression", ColType::Bpchar),
+            ("attstattarget", ColType::Int4),
             ("attisdropped", ColType::Bool),
             ("attnum_ord", ColType::Int4),
         ],
@@ -1399,7 +1986,7 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                 &[
                     Datum::Int4(table_oid(storage, slot)),
                     text(c.name.as_str(), arena)?,
-                    Datum::Int4(c.ctype.oid()),
+                    Datum::Int4(column_type_oid(storage, c)),
                     Datum::Int4(i as i32 + 1),
                     Datum::Bool(c.not_null),
                     Datum::Int4(i32::from(c.ctype.typlen())),
@@ -1417,8 +2004,85 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                         arena,
                     )?, // attidentity: always 'a' / by default 'd'
                     text(if c.is_generated { "s" } else { "" }, arena)?, // attgenerated
+                    // Fixed-width values are plain; variable-width values use
+                    // PostgreSQL's ordinary extended storage policy.
+                    text(if c.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                    text("", arena)?, // attcompression: type default
+                    Datum::Int4(-1),  // attstattarget: use server default
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i as i32 + 1),
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    let mut indexes = [None; MAX_SYNTH_INDEXES];
+    let index_count = collect_indexes(storage, &mut indexes);
+    for info in indexes[..index_count].iter().flatten() {
+        let table = &storage.table(info.table_slot).def;
+        for (attribute, &column_index) in info.columns[..info.n_cols].iter().enumerate() {
+            if n == out.len() {
+                break;
+            }
+            let column = &table.columns()[column_index as usize];
+            out[n] = row(
+                &[
+                    Datum::Int4(info.oid),
+                    text(column.name.as_str(), arena)?,
+                    Datum::Int4(column_type_oid(storage, column)),
+                    Datum::Int4(attribute as i32 + 1),
+                    Datum::Bool(false),
+                    Datum::Int4(i32::from(column.ctype.typlen())),
+                    Datum::Int4(column.type_mod),
+                    Datum::Bool(false),
+                    Datum::Int4(0),
+                    text("", arena)?,
+                    text("", arena)?,
+                    text(if column.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                    text("", arena)?,
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(attribute as i32 + 1),
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    for (slot, view) in storage.views_with_slots() {
+        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let count = describe_view(storage, view, arena, &mut columns)?;
+        for (attribute, column) in columns[..count].iter().enumerate() {
+            if n == out.len() {
+                break;
+            }
+            let ctype = super::exec::coltype_of_oid(column.type_oid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "view column \"{}\" has unsupported type oid {}",
+                    column.name,
+                    column.type_oid
+                )
+            })?;
+            out[n] = row(
+                &[
+                    Datum::Int4(view_oid(slot)),
+                    text(column.name, arena)?,
+                    Datum::Int4(column.type_oid),
+                    Datum::Int4(attribute as i32 + 1),
+                    Datum::Bool(false),
+                    Datum::Int4(i32::from(column.typlen)),
+                    Datum::Int4(column.type_mod),
+                    Datum::Bool(false),
+                    Datum::Int4(0),
+                    text("", arena)?,
+                    text("", arena)?,
+                    text(if ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                    text("", arena)?,
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(attribute as i32 + 1),
                 ],
                 arena,
             )?;
@@ -1438,9 +2102,9 @@ fn pg_attrdef<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>,
             ("adbin", ColType::Text),
         ],
     );
-    // A row per column carrying a non-constant DEFAULT — the raw source text in
-    // `adbin`. (Folded constant defaults keep only their value; `adbin` here is
-    // the engine's source text, not PostgreSQL's serialized node tree.)
+    // A row per column carrying a DEFAULT — the raw source text in `adbin`.
+    // This is the engine's source text, not PostgreSQL's serialized node tree;
+    // pg_get_expr exposes it through the same catalog contract.
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
     for (slot, table) in storage.live_tables() {
@@ -1471,7 +2135,17 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     finish(
         def_of(
             "pg_collation",
-            &[("oid", ColType::Int4), ("collname", ColType::Text)],
+            &[
+                ("oid", ColType::Int4),
+                ("collname", ColType::Text),
+                ("collnamespace", ColType::Int4),
+                ("collcollate", ColType::Text),
+                ("collctype", ColType::Text),
+                ("colliculocale", ColType::Text),
+                ("collprovider", ColType::Bpchar),
+                ("collisdeterministic", ColType::Bool),
+                ("collencoding", ColType::Int4),
+            ],
         ),
         &[],
         arena,
@@ -1530,6 +2204,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
             ("typdefault", ColType::Text),
             ("typinput", ColType::Text),
             ("typoutput", ColType::Text),
+            ("typacl", ColType::Text),
+            ("tableoid", ColType::Int4),
         ],
     );
     let types = [
@@ -1587,6 +2263,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Null, // typdefault
                 text("", arena)?,
                 text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
             ],
             arena,
         )?;
@@ -1629,6 +2307,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 },
                 text("", arena)?,
                 text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
             ],
             arena,
         )?;
@@ -1657,6 +2337,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Null,
                 text("", arena)?,
                 text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
             ],
             arena,
         )?;
@@ -1687,6 +2369,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Null,
                 text("", arena)?,
                 text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
             ],
             arena,
         )?;
@@ -1715,6 +2399,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Null,
                 text("", arena)?,
                 text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
             ],
             arena,
         )?;
@@ -1743,6 +2429,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Null,
                 text("", arena)?,
                 text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
             ],
             arena,
         )?;
@@ -1770,6 +2458,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Null,
                 text("", arena)?,
                 text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
             ],
             arena,
         )?;
@@ -1838,7 +2528,7 @@ fn pg_indexes<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>,
     let mut n = 0;
     for info in indices[..count].iter().flatten() {
         let table_def = &storage.table(info.table_slot).def;
-        let mut indexdef = StackStr::<384>::new();
+        let mut indexdef = StackStr::<896>::new();
         {
             use core::fmt::Write as _;
             let _ = write!(
@@ -1874,12 +2564,7 @@ fn pg_indexes<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>,
                     arena,
                 )?,
                 Datum::Null,
-                text(
-                    arena
-                        .alloc_str(indexdef.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
+                text(alloc_rendered(&indexdef, "index definition is too long", arena)?, arena)?,
             ],
             arena,
         )?;
@@ -2230,4 +2915,15 @@ fn arena_full() -> SqlError {
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "catalog relation exceeds the statement arena"
     )
+}
+
+fn alloc_rendered<'a, const N: usize>(
+    rendered: &StackStr<N>,
+    too_long: &'static str,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    if rendered.is_truncated() {
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", too_long));
+    }
+    arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }

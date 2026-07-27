@@ -1423,6 +1423,23 @@ the bare-alias reserved set (it stays usable as an explicit `AS into`). Corpus
 same reason `CREATE TEMP TABLE` is not: this engine has no temporary-table
 storage class yet.
 
+### COPY (query) TO STDOUT (2026-07-27)
+
+`COPY (SELECT ...) TO STDOUT` — the way psql `\copy` and export tooling stream a
+query's result rather than a whole table — was a flat "expected table name". It
+now runs the parenthesized query and formats each result row exactly as a table
+`COPY TO` does, matching PostgreSQL byte-for-byte in text, CSV, and binary: the
+header line, `NULL` marker, `DELIMITER`, `QUOTE`/`ESCAPE`, CSV quoting of
+embedded delimiters/quotes/newlines, and `FORCE_QUOTE` (resolved against the
+query's *output* column names). The query may aggregate / group / join like any
+`SELECT`. Implementation: the parser treats a `(` after `COPY` as a query source
+(a column list needs a table, so it is unambiguous) and captures the query text;
+execution describes the query for its columns, then drives `select_into_rows`
+with an emit closure that reuses the existing `datum_wire_text` + COPY field
+encoders — so the output path is shared with table `COPY TO` and cannot drift.
+Only `TO STDOUT` is accepted for a query (a query is never a `COPY FROM` target).
+Corpus `70_copy_query`, with a unit test.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

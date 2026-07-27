@@ -1592,6 +1592,30 @@ impl<'a> Parser<'a> {
     /// psql and pg_dump emit); every other option is refused loudly.
     fn copy_statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("copy")?;
+        // `COPY (query) TO STDOUT`: a parenthesized query stands in for a table
+        // (a column list requires a table, so `(` here is always a query).
+        if self.peeked == Tok::Op("(") {
+            self.advance()?;
+            let start = self.peek_at;
+            let _ = self.query()?;
+            let end = self.peek_at;
+            self.expect_op(")")?;
+            let query = self.text[start..end].trim();
+            if !self.eat_ident("to")? {
+                return Err(self.unexpected("COPY (query) supports only TO STDOUT"));
+            }
+            self.expect_ident("stdout")
+                .map_err(|_| self.unexpected("COPY (query) TO supports only STDOUT"))?;
+            let options = self.copy_options()?;
+            self.validate_copy_options(&options)?;
+            return Ok(Stmt::Copy(crate::sql::ast::CopyStmt {
+                table: QualName { schema: None, name: "" },
+                columns: &[],
+                query: Some(query),
+                to: true,
+                options,
+            }));
+        }
         let table = self.qual_name("table name")?;
         let mut columns = [""; crate::storage::MAX_COLUMNS];
         let mut n_columns = 0usize;
@@ -1625,10 +1649,17 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.unexpected("expected FROM or TO"));
         };
-        // Options: both the modern `WITH (FORMAT csv, HEADER, ...)` list and the
-        // legacy bare `[WITH] CSV HEADER DELIMITER 'x' ...` shorthand real tools
-        // still emit. Binary format and unknown options fail loudly rather than
-        // mis-read data.
+        let options = self.copy_options()?;
+        self.validate_copy_options(&options)?;
+        let columns = self.arena_slice(&columns[..n_columns])?;
+        Ok(Stmt::Copy(crate::sql::ast::CopyStmt { table, columns, query: None, to, options }))
+    }
+
+    /// The COPY option list: both the modern `WITH (FORMAT csv, HEADER, ...)`
+    /// list and the legacy bare `[WITH] CSV HEADER DELIMITER 'x' ...` shorthand
+    /// real tools still emit. Binary format and unknown options fail loudly
+    /// rather than mis-read data.
+    fn copy_options(&mut self) -> Result<CopyOptions<'a>, ParseError> {
         let mut options = CopyOptions::TEXT;
         let _ = self.eat_ident("with")?;
         if self.peeked == Tok::Op("(") {
@@ -1648,9 +1679,7 @@ impl<'a> Parser<'a> {
         } else {
             while self.copy_legacy_option(&mut options)? {}
         }
-        self.validate_copy_options(&options)?;
-        let columns = self.arena_slice(&columns[..n_columns])?;
-        Ok(Stmt::Copy(crate::sql::ast::CopyStmt { table, columns, to, options }))
+        Ok(options)
     }
 
     /// One option inside `COPY ... WITH ( ... )`.

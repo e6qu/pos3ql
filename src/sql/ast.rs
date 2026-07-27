@@ -690,6 +690,9 @@ pub struct CopyStmt<'a> {
     pub table: QualName<'a>,
     /// Empty means "all columns in table order".
     pub columns: &'a [&'a str],
+    /// `COPY (query) TO STDOUT`: the parenthesized query's raw text, re-parsed at
+    /// execution. When set, `table`/`columns` are unused and only `TO` is legal.
+    pub query: Option<&'a str>,
     /// `TO STDOUT` when true; `FROM STDIN` otherwise.
     pub to: bool,
     pub options: CopyOptions<'a>,

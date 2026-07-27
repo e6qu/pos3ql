@@ -3972,6 +3972,34 @@ fn copy_formats_and_unsupported() {
 }
 
 #[test]
+fn copy_query_to_stdout() {
+    // COPY (query) TO STDOUT streams a query's rows in COPY's formats.
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE TABLE cq (id int, v int, s text)");
+    run_with(&mut engine, &mut budget, "INSERT INTO cq VALUES (1,10,'a'),(2,20,'b,x')");
+
+    // Default text format: tab-delimited rows for the projected columns.
+    let out = run_with(&mut engine, &mut budget, "COPY (SELECT id, s FROM cq ORDER BY id) TO STDOUT");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!message_types(&out).contains(&b'E'), "{text}");
+    assert!(text.contains("1\ta") && text.contains("2\tb,x"), "text rows: {text}");
+    assert!(text.contains("COPY 2"), "command tag: {text}");
+
+    // CSV with a header quotes the embedded comma.
+    let out = run_with(&mut engine, &mut budget, "COPY (SELECT id, s FROM cq ORDER BY id) TO STDOUT WITH CSV HEADER");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("id,s") && text.contains("2,\"b,x\""), "csv: {text}");
+
+    // An aggregate query streams its single row.
+    let out = run_with(&mut engine, &mut budget, "COPY (SELECT count(*) FROM cq) TO STDOUT");
+    assert!(String::from_utf8_lossy(&out).contains('2'), "aggregate");
+
+    // A query source is TO-only; FROM STDIN is rejected.
+    let out = run_with(&mut engine, &mut budget, "COPY (SELECT id FROM cq) FROM STDIN");
+    assert!(message_types(&out).contains(&b'E'), "COPY (query) FROM STDIN must error");
+}
+
+#[test]
 fn listen_notify_engine_semantics() {
     let (mut engine, mut budget) = test_engine();
 

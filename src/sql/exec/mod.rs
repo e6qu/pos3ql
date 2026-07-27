@@ -502,7 +502,7 @@ fn find_conflict(
     let mut found: Option<u64> = None;
     let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) = state.visible_to(txid) else {
+        let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
             return Ok(ControlFlow::Continue(()));
         };
         let hit = storage
@@ -621,7 +621,7 @@ fn handle_conflict(
             .table(table_index)
             .rows
             .get(&rowid)
-            .and_then(|s| s.visible_to(txn.txid))
+            .and_then(|s| s.visible_at(txn.txid, storage.read_snapshot()))
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
         rowenc::decode(bytes, schema, &mut existing)?;
@@ -659,7 +659,7 @@ fn handle_conflict(
     };
     let (new_loc, slice) = storage.heap.append(new_bytes.len())?;
     slice.copy_from_slice(new_bytes);
-    let prior = storage.write_pending(table_index, rowid, txn.txid, Some(new_loc))?;
+    let prior = storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(new_loc))?;
     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
@@ -1652,7 +1652,7 @@ pub fn refresh_materialized_view(
         let mut count = 0usize;
         let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            if state.visible_to(txn.txid).is_none() {
+            if state.visible_at(txn.txid, storage.read_snapshot()).is_none() {
                 return Ok(ControlFlow::Continue(()));
             }
             if count == rowids.len() {
@@ -1666,7 +1666,7 @@ pub fn refresh_materialized_view(
             break;
         }
         for &rowid in &rowids[..count] {
-            match storage.write_pending(table_index, rowid, txn.txid, None) {
+            match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), None) {
                 Ok(prior) => {
                     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
                         storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -3575,7 +3575,7 @@ pub fn copy_out(
     // the visible tokens first, sort, then stream.
     let mut visible = 0usize;
     storage.for_each_row_state(setup.table_index, &mut |_, state| {
-        if state.visible_to(txid).is_some() {
+        if state.visible_at(txid, storage.read_snapshot()).is_some() {
             visible += 1;
         }
         Ok(core::ops::ControlFlow::Continue(()))
@@ -3585,7 +3585,7 @@ pub fn copy_out(
         .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "COPY TO snapshot exceeds the statement arena"))?;
     let mut fill = 0usize;
     storage.for_each_row_state(setup.table_index, &mut |rowid, state| {
-        if let Some(home) = state.visible_to(txid) {
+        if let Some(home) = state.visible_at(txid, storage.read_snapshot()) {
             tokens[fill] = (rowid, home);
             fill += 1;
         }
@@ -4034,7 +4034,7 @@ pub fn merge(
             };
         let mut k = 0usize;
         if let Err(e) = storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) = state.visible_to(txn.txid)
+            if let Some(home) = state.visible_at(txn.txid, storage.read_snapshot())
                 && k < ids.len()
             {
                 ids[k] = rowid;
@@ -4121,7 +4121,7 @@ pub fn merge(
                             return sql_fail(merge_cardinality());
                         }
                         affected[j] = true;
-                        match storage.write_pending(table_index, target_ids[j], txn.txid, None) {
+                        match storage.write_pending(table_index, target_ids[j], txn.txid, txn.command_id(), None) {
                             Ok(prior) => {
                                 if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior) {
                                     return sql_fail(e);
@@ -4174,7 +4174,7 @@ pub fn merge(
                             Err(e) => return sql_fail(e),
                         };
                         slice.copy_from_slice(out);
-                        match storage.write_pending(table_index, target_ids[j], txn.txid, Some(loc)) {
+                        match storage.write_pending(table_index, target_ids[j], txn.txid, txn.command_id(), Some(loc)) {
                             Ok(prior) => {
                                 if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior) {
                                     storage.restore_pending(table_index, target_ids[j], txn.txid, prior);
@@ -4327,7 +4327,7 @@ fn merge_insert(
     store_row(storage, txn, table_index, None, &row_arr[..def.n_columns])
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn insert(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -4336,7 +4336,9 @@ pub fn insert(
     params: &[Datum],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
+    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
+    let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
         Err(e) => return sql_fail(e),
@@ -4369,8 +4371,9 @@ pub fn insert(
         statement.columns.len()
     };
 
-    // RETURNING sends its RowDescription before any rows.
-    if !statement.returning.is_empty() {
+    // RETURNING sends its RowDescription before any rows — unless the rows are
+    // being captured for a data-modifying CTE, which describes them itself.
+    if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_items(statement.returning, Some(&def), &mut columns) {
             Ok(n) => responder.row_description(&columns[..n])?,
@@ -4529,13 +4532,13 @@ pub fn insert(
                 return sql_fail(e);
             }
             if !statement.returning.is_empty()
-                && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder)? {
+                && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
                     return sql_fail(e);
                 }
             inserted += 1;
         }
         let tag = stack_format!(48, "INSERT 0 {}", inserted);
-        responder.command_complete(tag.as_str())?;
+        if !capturing { responder.command_complete(tag.as_str())?; }
         return sql_ok();
     }
 
@@ -4663,17 +4666,20 @@ pub fn insert(
             return sql_fail(e);
         }
         if !statement.returning.is_empty()
-            && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder)? {
+            && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
                 return sql_fail(e);
             }
         inserted += 1;
     }
     let tag = stack_format!(48, "INSERT 0 {}", inserted);
-    responder.command_complete(tag.as_str())?;
+    if !capturing {
+        responder.command_complete(tag.as_str())?;
+    }
     sql_ok()
 }
 
 /// Projects `values` through `items` and emits one DataRow.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_projected(
     def: &TableDef,
     values: &[Datum],
@@ -4681,6 +4687,7 @@ fn emit_projected(
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
+    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let context = RowCtx { def, values };
     let mut projected = [Datum::Null; MAX_PROJ];
@@ -4726,11 +4733,19 @@ fn emit_projected(
             },
         }
     }
-    responder.data_row(&projected[..n])?;
+    // A data-modifying CTE captures its RETURNING rows in memory instead of
+    // streaming them to the client.
+    if let Some(sink) = capture.as_deref_mut() {
+        if let Err(e) = sink(&projected[..n]) {
+            return Ok(Err(e));
+        }
+    } else {
+        responder.data_row(&projected[..n])?;
+    }
     Ok(Ok(()))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn update(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -4740,7 +4755,9 @@ pub fn update(
     params: &[Datum],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
+    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
+    let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
         Err(e) => return sql_fail(e),
@@ -4802,7 +4819,7 @@ pub fn update(
         return sql_fail(e);
     }
 
-    if !statement.returning.is_empty() {
+    if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_items(statement.returning, Some(&def), &mut columns) {
             Ok(n) => responder.row_description(&columns[..n])?,
@@ -4926,7 +4943,7 @@ pub fn update(
             Err(e) => return sql_fail(e),
         };
         slice.copy_from_slice(new_bytes);
-        match storage.write_pending(table_index, rowid, txn.txid, Some(new_loc)) {
+        match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(new_loc)) {
             Ok(prior) => {
                 if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
                     storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -4983,6 +5000,7 @@ pub fn update(
                 arena,
                 params,
                 responder,
+                &mut capture,
             )? {
                 return sql_fail(e);
             }
@@ -4990,10 +5008,11 @@ pub fn update(
         updated += 1;
     }
     let tag = stack_format!(48, "UPDATE {}", updated);
-    responder.command_complete(tag.as_str())?;
+    if !capturing { responder.command_complete(tag.as_str())?; }
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn delete(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -5002,7 +5021,9 @@ pub fn delete(
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
+    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
+    let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
         Err(e) => return sql_fail(e),
@@ -5031,7 +5052,7 @@ pub fn delete(
     if let Err(e) = collect {
         return sql_fail(e);
     }
-    if !statement.returning.is_empty() {
+    if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_items(statement.returning, Some(&def), &mut columns) {
             Ok(n) => responder.row_description(&columns[..n])?,
@@ -5087,12 +5108,13 @@ pub fn delete(
                     arena,
                     params,
                     responder,
+                    &mut capture,
                 )?
             {
                 return sql_fail(e);
             }
         }
-        match storage.write_pending(table_index, rowid, txn.txid, None) {
+        match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), None) {
             Ok(prior) => {
                 if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
                     storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -5103,7 +5125,9 @@ pub fn delete(
         }
     }
     let tag = stack_format!(48, "DELETE {}", scratch.len());
-    responder.command_complete(tag.as_str())?;
+    if !capturing {
+        responder.command_complete(tag.as_str())?;
+    }
     sql_ok()
 }
 
@@ -5198,7 +5222,7 @@ pub fn truncate(
             let mut count = 0usize;
             let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                if state.visible_to(txn.txid).is_none() {
+                if state.visible_at(txn.txid, storage.read_snapshot()).is_none() {
                     return Ok(ControlFlow::Continue(()));
                 }
                 if count == rowids.len() {
@@ -5212,7 +5236,7 @@ pub fn truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                match storage.write_pending(table_index, rowid, txn.txid, None) {
+                match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), None) {
                     Ok(prior) => {
                         if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
                             storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -6353,7 +6377,7 @@ fn collect_matches<'a>(
     let def = &storage.table(table_index).def;
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(loc) = state.visible_to(txid) else {
+        let Some(loc) = state.visible_at(txid, storage.read_snapshot()) else {
             return Ok(ControlFlow::Continue(()));
         };
         if row_matches(storage, table_index, rowid, def, schema, loc, where_clause, arena, params, hooks)? {
@@ -6389,7 +6413,7 @@ fn collect_join_matches<'a>(
     scratch.clear();
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(loc) = state.visible_to(txid) else {
+        let Some(loc) = state.visible_at(txid, storage.read_snapshot()) else {
             return Ok(ControlFlow::Continue(()));
         };
         // Consume-in-place, as in row_matches: the joined-row probe reads
@@ -6429,7 +6453,7 @@ fn store_row(
     let (loc, slice) = storage.heap.append(len)?;
     rowenc::encode(values, slice);
     let rowid = rowid.unwrap_or_else(|| storage.next_rowid());
-    let prior = storage.write_pending(table_index, rowid, txn.txid, Some(loc))?;
+    let prior = storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(loc))?;
     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
@@ -6786,7 +6810,7 @@ fn undefined_qual(name: &QualName) -> SqlError {
 }
 
 /// Resolves a DML/DDL target through the search path to a table slot.
-fn resolve_dml_table(
+pub(crate) fn resolve_dml_table(
     storage: &Storage,
     name: &QualName,
     txid: u32,

@@ -74,6 +74,7 @@ pub fn expand_ctes_exec<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
 ) -> Result<&'a Select<'a>, SqlError> {
     if sel.with.is_empty() && !storage.has_any_view() {
         return Ok(sel);
@@ -101,7 +102,23 @@ pub fn expand_ctes_exec<'a>(
             depth: 0,
             path: None,
         };
-        if cte.recursive && select_references(cte.query, cte.name) > 0 {
+        if cte.dml.is_some() {
+            // A data-modifying CTE was already run and captured (see
+            // `Engine::run_dml_ctes`); bind its RETURNING rows by name.
+            let m = dml_mats
+                .iter()
+                .find(|(name, _)| *name == cte.name)
+                .map(|(_, m)| *m)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "data-modifying CTE \"{}\" was not materialized",
+                        cte.name
+                    )
+                })?;
+            materialized[nm] = (cte.name, m);
+            nm += 1;
+        } else if cte.recursive && select_references(cte.query, cte.name) > 0 {
             let m = materialize_recursive(cte, context, storage, txid, arena, params)?;
             materialized[nm] = (cte.name, m);
             nm += 1;
@@ -167,7 +184,7 @@ pub(super) fn expand_set_tree_exec<'a>(
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
-    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params)?;
+    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, &[])?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 

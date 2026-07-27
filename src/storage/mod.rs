@@ -499,9 +499,18 @@ impl RowHome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingChange {
     pub txid: u32,
+    /// The command (statement) within the transaction that made this change —
+    /// PostgreSQL's command-id. A reader with an earlier command's snapshot does
+    /// not see it, which is what lets a data-modifying CTE's changes stay
+    /// invisible to the same statement's main query (they share one snapshot).
+    pub cid: u32,
     /// `None` = pending delete.
     pub loc: Option<RowLoc>,
 }
+
+/// The command-id a read that should see *all* of its own transaction's
+/// uncommitted changes uses (the ordinary case: every write so far is visible).
+pub(crate) const SNAPSHOT_ALL: u32 = u32::MAX;
 
 impl RowState {
     pub fn committed_only(loc: RowLoc) -> Self {
@@ -512,11 +521,19 @@ impl RowState {
     }
 
 
-    /// What transaction `txid` sees: its own pending change, else the
-    /// committed image. `None` = row invisible.
+    /// What transaction `txid` sees with all its own changes visible (the
+    /// ordinary snapshot). `None` = row invisible.
     pub fn visible_to(&self, txid: u32) -> Option<RowHome> {
+        self.visible_at(txid, SNAPSHOT_ALL)
+    }
+
+    /// What `txid` sees under a command snapshot: its own pending change is
+    /// visible only if that change was made by a command *earlier* than
+    /// `snapshot` (`cid < snapshot`); a later/same-command change is not, so the
+    /// committed image shows through. `snapshot == SNAPSHOT_ALL` sees everything.
+    pub fn visible_at(&self, txid: u32, snapshot: u32) -> Option<RowHome> {
         match self.pending {
-            Some(p) if p.txid == txid => p.loc.map(RowHome::Heap),
+            Some(p) if p.txid == txid && p.cid < snapshot => p.loc.map(RowHome::Heap),
             _ => self.committed,
         }
     }
@@ -1331,6 +1348,12 @@ pub struct Storage {
     /// Monotonic stamp for `created_at` fields.
     catalog_seq: u64,
     next_rowid: u64,
+    /// Command snapshot for reads: a row's own-transaction pending change is
+    /// visible only if its command-id is `< read_snapshot`. [`SNAPSHOT_ALL`]
+    /// (the default, reset at every statement) sees every own write; a
+    /// data-modifying `WITH` statement lowers it to that statement's command-id
+    /// so its main query does not see its CTEs' changes.
+    read_snapshot: u32,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
     /// The read path for spilled rows: the tiered block stack shared with the
@@ -1625,6 +1648,7 @@ impl Storage {
             comments,
             path: PathContext::public_only(),
             catalog_seq: 0,
+            read_snapshot: SNAPSHOT_ALL,
             next_rowid: 1,
             lsn: 0,
             spill: None,
@@ -2498,11 +2522,13 @@ impl Storage {
         }))
     }
 
-    /// How many rows `txid` sees, through the same seam.
+    /// How many rows `txid` sees, through the same seam — under the current
+    /// command snapshot, so it matches what the scan loop iterates.
     pub fn visible_row_count(&self, table_slot: usize, txid: u32) -> Result<usize, SqlError> {
+        let snapshot = self.read_snapshot;
         let mut count = 0usize;
         self.for_each_row_state(table_slot, &mut |_, state| {
-            if state.visible_to(txid).is_some() {
+            if state.visible_at(txid, snapshot).is_some() {
                 count += 1;
             }
             Ok(core::ops::ControlFlow::Continue(()))
@@ -2889,6 +2915,7 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         txid: u32,
+        cid: u32,
         loc: Option<RowLoc>,
     ) -> Result<Option<Option<RowLoc>>, SqlError> {
         let table = &mut self.tables[table_index];
@@ -2901,7 +2928,7 @@ impl Storage {
                 ));
             }
             let prior = state.pending.map(|p| p.loc);
-            state.pending = Some(PendingChange { txid, loc });
+            state.pending = Some(PendingChange { txid, cid, loc });
             return Ok(prior);
         }
         // An absent entry no longer means an absent row: the spill list may
@@ -2931,7 +2958,7 @@ impl Storage {
                 rowid,
                 RowState {
                     committed,
-                    pending: Some(PendingChange { txid, loc }),
+                    pending: Some(PendingChange { txid, cid, loc }),
                 },
             )
             .expect("capacity checked above");
@@ -3027,7 +3054,7 @@ impl Storage {
                     table.rows.remove(&rowid);
                 }
             }
-            Some(loc) => state.pending = Some(PendingChange { txid, loc }),
+            Some(loc) => state.pending = Some(PendingChange { txid, cid: 0, loc }),
         }
     }
 
@@ -4720,6 +4747,18 @@ impl Storage {
 
     pub fn lsn(&self) -> u64 {
         self.lsn
+    }
+
+    /// The current command read snapshot (see [`Storage::read_snapshot`] field).
+    pub fn read_snapshot(&self) -> u32 {
+        self.read_snapshot
+    }
+
+    /// Lowers reads to a command snapshot (a data-modifying `WITH` statement) or
+    /// restores full own-write visibility ([`SNAPSHOT_ALL`]). Reset to
+    /// `SNAPSHOT_ALL` at the start of every statement, so a snapshot never leaks.
+    pub fn set_read_snapshot(&mut self, snapshot: u32) {
+        self.read_snapshot = snapshot;
     }
 
     /// Recovery: pins the LSN to a replayed record's.

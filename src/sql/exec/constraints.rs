@@ -566,7 +566,7 @@ fn parent_has_key(
     let mut found = false;
     storage.for_each_row_state(parent_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) = state.visible_to(txid) else {
+        let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
             return Ok(ControlFlow::Continue(()));
         };
         let all_eq = storage.with_row_bytes(parent_index, rowid, home, |bytes| {
@@ -665,7 +665,7 @@ pub(crate) fn apply_fk_parent_actions(
             let mut n_match = 0usize;
             storage.for_each_row_state(child_index, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                let Some(home) = state.visible_to(txn.txid) else {
+                let Some(home) = state.visible_at(txn.txid, storage.read_snapshot()) else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 let is_match = storage.with_row_bytes(child_index, rowid, home, |bytes| {
@@ -707,7 +707,7 @@ pub(crate) fn apply_fk_parent_actions(
                 let mut at = 0usize;
                 storage.for_each_row_state(child_index, &mut |rowid, state| {
                     use core::ops::ControlFlow;
-                    let Some(home) = state.visible_to(txn.txid) else {
+                    let Some(home) = state.visible_at(txn.txid, storage.read_snapshot()) else {
                         return Ok(ControlFlow::Continue(()));
                     };
                     // The cascade mutates storage below, so a matching row is
@@ -741,7 +741,7 @@ pub(crate) fn apply_fk_parent_actions(
                         storage, txn, child_schema, child_name, crow, None, arena, params,
                         depth - 1,
                     )?;
-                    let prior = storage.write_pending(child_index, rowid, txn.txid, None)?;
+                    let prior = storage.write_pending(child_index, rowid, txn.txid, txn.command_id(), None)?;
                     if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
                         storage.restore_pending(child_index, rowid, txn.txid, prior);
                         return Err(e);
@@ -804,7 +804,7 @@ pub(crate) fn apply_fk_parent_actions(
                 rowenc::encode(new_child, out);
                 let (new_loc, slice) = storage.heap.append(out.len())?;
                 slice.copy_from_slice(out);
-                let prior = storage.write_pending(child_index, rowid, txn.txid, Some(new_loc))?;
+                let prior = storage.write_pending(child_index, rowid, txn.txid, txn.command_id(), Some(new_loc))?;
                 if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
                     storage.restore_pending(child_index, rowid, txn.txid, prior);
                     return Err(e);

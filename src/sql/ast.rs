@@ -267,7 +267,13 @@ pub struct Cte<'a> {
     /// The WITH clause carried the RECURSIVE keyword (a self-referencing body
     /// is executed by fixpoint iteration rather than inline expansion).
     pub recursive: bool,
+    /// The CTE body as a query. For a data-modifying CTE (`dml` is `Some`) this
+    /// is a placeholder and unused.
     pub query: &'a Select<'a>,
+    /// A data-modifying CTE body (`WITH x AS (INSERT/UPDATE/DELETE ... RETURNING
+    /// ...)`): the statement runs exactly once and its RETURNING rows become the
+    /// CTE relation. `None` for an ordinary query CTE.
+    pub dml: Option<&'a Stmt<'a>>,
 }
 
 /// The materialized rows of a recursive CTE, bound during CTE expansion so a

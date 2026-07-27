@@ -1330,6 +1330,32 @@ is allowed inside a transaction. Options and per-table/column targets are
 parsed. Corpus `48_vacuum_analyze` (the `VERBOSE` form omitted — it prints
 INFO progress this engine does not emit).
 
+### ON CONFLICT arbiter fidelity (2026-07-27)
+
+`ON CONFLICT` had shipped as `DO NOTHING`/`DO UPDATE` with `excluded.*`, but the
+arbiter — the specific unique constraint the clause acts on — was ignored:
+`find_conflict` treated a violation of *any* unique as the conflict, so
+`ON CONFLICT (a)` and `ON CONFLICT (b)` behaved identically and, worse, a
+conflict on a unique *other* than the named target silently updated the wrong
+row instead of raising `23505`. And `RETURNING` on the `DO UPDATE` branch
+emitted nothing (the update applied, but its row was dropped — an
+accept-and-ignore of a client-observable clause).
+
+Both are now PostgreSQL-faithful. The arbiter is resolved once per statement as
+a data-independent analysis step: an `ON CONFLICT (columns)` target must match a
+unique/exclusion constraint on exactly that column set (order-independent), a
+new `ON CONFLICT ON CONSTRAINT name` names it directly (a UNIQUE/PK, a unique
+index, or a single-column key's synthesized `<table>_pkey` / `<table>_<col>_key`
+name), and `find_conflict` then conflicts on that arbiter alone — so a violation
+of a different unique falls through to the ordinary `23505`. The resolution
+errors fire regardless of whether any row conflicts, byte-for-byte with
+PostgreSQL: `42601` (`DO UPDATE` with no arbiter), `42P10` (target matches no
+unique), `42703` (target column absent), `42704` (named constraint absent).
+`RETURNING` on `DO UPDATE` now decodes the arena-encoded updated row and
+projects its post-update values (and `excluded.*`), composing with a multi-row
+upsert (each inserted or updated row appears) and the data-modifying-CTE capture
+path. Corpus `66_on_conflict`, with unit tests.
+
 ### The order (dependency-driven)
 
 1. **Storage VOPR (Stage H)** — the virtual object store + grid disk with

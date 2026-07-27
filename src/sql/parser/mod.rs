@@ -2185,7 +2185,8 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// `ON CONFLICT [(columns)] DO {NOTHING | UPDATE SET a = e, ... [WHERE cond]}`.
+    /// `ON CONFLICT [(columns) | ON CONSTRAINT name] DO {NOTHING | UPDATE SET a
+    /// = e, ... [WHERE cond]}`.
     fn on_conflict(&mut self) -> Result<Option<OnConflict<'a>>, ParseError> {
         if !self.eat_ident("on")? {
             return Ok(None);
@@ -2193,6 +2194,7 @@ impl<'a> Parser<'a> {
         self.expect_ident("conflict")?;
         let mut target: [&'a str; MAX_LIST] = [""; MAX_LIST];
         let mut nt = 0;
+        let mut constraint = None;
         if self.eat_op("(")? {
             loop {
                 if nt == MAX_LIST {
@@ -2205,6 +2207,10 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+        } else if self.eat_ident("on")? {
+            // `ON CONFLICT ON CONSTRAINT name`.
+            self.expect_ident("constraint")?;
+            constraint = Some(self.col_ident("constraint name")?);
         }
         self.expect_ident("do")?;
         let (update, update_where) = if self.eat_ident("nothing")? {
@@ -2237,6 +2243,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Some(OnConflict {
             target: self.arena_slice(&target[..nt])?,
+            constraint,
             update,
             update_where,
         }))

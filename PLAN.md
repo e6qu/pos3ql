@@ -1071,15 +1071,15 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   output columns) still tie, NULLs equal. Verified byte-for-byte against
   PostgreSQL 18 (corpus `61_fetch_ties`), covering every path plus multi-key
   ties and OFFSET composition.
-- **`CREATE DOMAIN`** — done (scalar domains): a user-defined type is a base type
+- **`CREATE DOMAIN`** — done (casts, nesting, arrays, validation, durability): a user-defined type is a base type
   plus optional `NOT NULL` / `DEFAULT` / `CHECK (VALUE ...)` constraints. This is
   the engine's first user-defined type and its first catalog-aware type
   resolution. A domain adds **no** `Datum`/`ColType` variant — a domain value is a
   plain base-type value — so the comparison/storage/wire pipeline is untouched; a
-  domain is (a) a new `DomainDef` catalog (transactional MVCC + WAL + a `dom`
-  checkpoint line, mirroring the sequence catalog), (b) an `Option<SqlName>` on
-  `ColumnMeta` carrying the domain's name (durable through the column codec — bit 7
-  of the per-column WAL flags, a new checkpoint `col` field), and (c) constraint
+  domain is (a) a new `DomainDef` catalog (transactional MVCC + WAL + a `dom2`
+  checkpoint line, mirroring the sequence catalog), (b) a schema-qualified
+  identity on `ColumnMeta` (durable through the column codec and checkpoint
+  `col2` field), and (c) constraint
   enforcement reusing the CHECK machinery. Column-type resolution became
   catalog-aware: an unknown type name falls back to the domain catalog (threading
   `&Storage`/`txid` into `build_column`), yielding the domain's base type + typmod
@@ -1093,12 +1093,16 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   'd', `typbasetype`, `typnotnull`, `typdefault`, own OID range). `ALTER DOMAIN`
   (`ADD`/`DROP CONSTRAINT`, `SET`/`DROP NOT NULL`, `SET`/`DROP DEFAULT`, journaled
   as a redefinition) and `DROP DOMAIN [CASCADE|RESTRICT]` (`2BP01` on a dependent
-  column). Verified byte-for-byte against PostgreSQL 18 (corpus `62_domains`),
-  with WAL-replay unit tests and a `run.sh` crash + cold-start assertion. Four
-  narrow behaviors are documented in BUGS.md (B-172): `value::domain` casts,
-  `ALTER` re-validating existing rows, domain arrays, and domain-over-domain —
-  each blocked on threading storage into a pure path or on a fixed-type change.
-- **`CREATE TYPE ... AS ENUM`** — done (scalar enums): the engine's first
+  column). B-172 completes the catalog-aware surface: exact `value::domain`
+  casts; domains over domains with immediate-parent identity and copied
+  defaults; generated array types whose elements run the full recursive
+  coercion chain; and `ALTER DOMAIN` revalidation of existing rows, with the
+  old definition restored atomically on failure. User-type array identities
+  carry their slot and base representation through projected rows, WAL,
+  checkpoints, wire OIDs, and restart. Verified byte-for-byte against
+  PostgreSQL 18 (expanded corpus `62_domains`), with transactional and
+  schema-collision durability tests.
+- **`CREATE TYPE ... AS ENUM`** — done (arrays, renames, binary COPY): the engine's first
   user-defined *value* type. Unlike a domain, an enum is its own type with its
   own OID and an ordered label set, so it adds a `ColType::Enum(slot)` and a
   `Datum::Enum { slot, sort, label }`. The value is stored inline as its
@@ -1107,8 +1111,7 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   label text) and row decode stays catalog-free. It is (a) a new `EnumDef`
   catalog (transactional MVCC + WAL `CreateEnum`/`DropEnum` + an `enm`
   checkpoint line, mirroring the domain catalog); (b) a slot in the column's
-  `ColType`, persisted as the enum *name* (reusing `ColumnMeta`'s user-type-name
-  field) and re-bound to a live slot on load, since slots are not stable across
+  `ColType`, persisted as the enum's schema-qualified identity and re-bound to a live slot on load, since slots are not stable across
   restart. Column-type resolution falls back through the enum catalog after the
   domain catalog. A write coerces text→member (invalid label is `22P02`);
   comparison against an unknown literal resolves it to a member; `pg_typeof`
@@ -1116,10 +1119,13 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   members. `ALTER TYPE ... ADD VALUE [IF NOT EXISTS] [BEFORE|AFTER]` (fractional
   sort keys, journaled as a redefinition) and `DROP TYPE [CASCADE|RESTRICT]`
   (`2BP01` on a dependent column). Verified byte-for-byte against PostgreSQL 18
-  (corpus `63_enums`), with WAL-replay unit tests and a `run.sh` crash +
-  cold-start assertion. Four narrow behaviors are documented in BUGS.md (B-173):
-  `RENAME VALUE`, `RENAME TO`, enum arrays, and `COPY BINARY` of an enum — each
-  by-design against the inline-value or catalog-free-codec invariants.
+  (expanded corpus `63_enums`), with WAL-replay unit tests and a `run.sh` crash +
+  cold-start assertion. B-173 adds generated enum arrays, catalog-aware binary
+  COPY label decoding, transactional `RENAME VALUE` (rewriting every inline
+  scalar/array label while preserving sort identity), and `RENAME TO`
+  (dependent columns, generated array row, and comments move together).
+  Compact inverse undo entries preserve transaction/savepoint semantics
+  without multiplying a whole enum catalog by the per-session DDL pool.
 - **Data-modifying CTEs** — done (`SELECT` main statement): `WITH x AS (INSERT
   / UPDATE / DELETE ... RETURNING ...) SELECT ...`, where the data-modifying
   sub-statement runs exactly once and its RETURNING rows become the CTE

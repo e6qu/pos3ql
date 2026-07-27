@@ -9,21 +9,19 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
-use crate::sql::eval::{eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
-use crate::sql::exec::{describe_items, MAX_PROJ};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
+use crate::sql::exec::MAX_PROJ;
 
 /// Pieces one `string_to_table` call may split into.
 const MAX_PIECES: usize = 1024;
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, SqlName, Storage, TableDef, MAX_COLUMNS};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
 
 use super::setops::describe_set_body;
 use super::subquery::subquery_witness;
 
-use super::{
-    arena_full, describe_scope_items, record_star_width, QueryScope,
-};
+use super::{QueryScope, arena_full, describe_scope_items, record_star_width};
 
 /// Whether `name` is one of the supported set-returning functions.
 pub(super) fn is_srf_name(name: &str) -> bool {
@@ -331,7 +329,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
-                let n = describe_scope_items(sub.items, &ss, &mut descriptors)?;
+                let n = describe_scope_items(sub.items, &ss, storage, txid, &mut descriptors)?;
                 // A bare scalar/array subquery item (possibly correlated) has
                 // no static type from the scope and describes as text; infer
                 // its real type from the inner select's projection so the
@@ -387,11 +385,21 @@ pub(crate) fn synth_derived_def_outer<'a>(
             }
             // A FROM-less lateral body types its projection against the outer
             // scope (`SELECT t.a * 2` sees the enclosing `t`).
-            None if outer.is_some() => {
-                describe_scope_items(sub.items, outer.expect("checked"), &mut descriptors)?
-            }
+            None if outer.is_some() => describe_scope_items(
+                sub.items,
+                outer.expect("checked"),
+                storage,
+                txid,
+                &mut descriptors,
+            )?,
             None => {
-                let n = describe_items(sub.items, None, &mut descriptors)?;
+                let n = super::describe_catalog_items(
+                    sub.items,
+                    None,
+                    storage,
+                    txid,
+                    &mut descriptors,
+                )?;
                 let mut slot = 0usize;
                 for item in sub.items {
                     if let SelectItem::Expr { expression, .. } = item {
@@ -449,6 +457,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         identity_always: false,
         auto_increment_step: 1,
         domain: None,
+        user_type_schema: None,
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {
@@ -530,6 +539,7 @@ pub(super) fn table_func_def<'a>(
         identity_always: false,
         auto_increment_step: 1,
         domain: None,
+        user_type_schema: None,
     };
     // Each supported function's output columns: `key`/`value` for the `each`
     // family (two columns), a single column named per the function otherwise.

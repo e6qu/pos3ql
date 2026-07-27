@@ -69,8 +69,9 @@ Working single-node database:
   (`GENERATED ALWAYS/BY DEFAULT AS IDENTITY`), arbitrary-precision NUMERIC,
   network address types (`inet`/`cidr`/`macaddr`/`macaddr8` with their operators
   and functions), user-defined domains (`CREATE DOMAIN` with NOT NULL / DEFAULT /
-  CHECK, enforced on write), user-defined enum types (`CREATE TYPE ... AS ENUM`
-  with `ALTER TYPE ... ADD VALUE`, ordered by definition order and reflected in
+  CHECK, recursive domains, casts, generated arrays, and ALTER validation),
+  user-defined enum types (`CREATE TYPE ... AS ENUM` with arrays, ADD/RENAME
+  VALUE and RENAME TO, ordered by definition order and reflected in
   `pg_type`/`pg_enum`), casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
   introspection, transactional `SHOW` / `SET` / `SET LOCAL` / `RESET` /
@@ -101,9 +102,7 @@ Working single-node database:
   MinIO (psql golden files, raw wire probes, psycopg driver suite, kill-9 and
   cold-start durability scenarios, differential vs PostgreSQL 18).
 
-Not yet: multi-replica VSR and client-facing TLS (TLS to the bucket is in;
-the server's SSLRequest answer is still `N`). See [PLAN.md](PLAN.md) for the
-roadmap and
+Not yet: multi-replica VSR. See [PLAN.md](PLAN.md) for the roadmap and
 [BUGS.md](BUGS.md) for known divergences; the headline ones are summarized
 under **Limitations** below. [AGENTS.md](AGENTS.md) holds the standing
 directives, and [docs/terminology.md](docs/terminology.md) is the glossary and
@@ -145,11 +144,10 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   immediately with `40001` (serialization failure) — pos3ql does **not**
   block-and-wait like PostgreSQL READ COMMITTED, so applications must retry
   (B-004).
-- **DDL isolation covers tables only.** Uncommitted `CREATE`/`DROP TABLE` is
-  invisible to other sessions until commit (catalog MVCC); uncommitted
-  `CREATE`/`DROP VIEW` and `CREATE`/`DROP INDEX` still apply to the shared
-  catalog immediately (B-016). A concurrent CREATE/DROP of the same name is
-  reported as `40001` rather than blocking on the catalog lock.
+- **Catalog conflicts are fail-fast.** Tables, views, materialized views,
+  indexes, schemas, sequences, domains, and enums all participate in
+  transactional catalog MVCC and savepoint rollback. A concurrent DDL change
+  to the same object reports `40001` rather than blocking on a catalog lock.
 - **Sorts are bounded by a `work_mem` analogue.** `ORDER BY` / `DISTINCT` /
   `GROUP BY` materialize in a fixed shared arena (`work_arena_bytes`, 64 MiB
   default — larger than PostgreSQL's 4 MiB default `work_mem`). A result that
@@ -176,10 +174,9 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.
-- **No client-facing TLS.** The object-store side speaks HTTPS
-  (`s3_tls = on`, isolated rustls); the PostgreSQL wire side still answers
-  the SSLRequest probe with `N` — server-side TLS is in the maturity
-  roadmap's compatibility wave.
+- **TLS is opt-in.** Object-store HTTPS is controlled by `s3_tls`; PostgreSQL
+  wire TLS is enabled with `tls_on`, `tls_cert_file`, and `tls_key_file`.
+  Cleartext clients remain accepted when server TLS is configured.
 
 ## Quick start
 

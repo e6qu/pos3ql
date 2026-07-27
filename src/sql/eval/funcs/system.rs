@@ -11,7 +11,7 @@
 use crate::sql::array;
 use crate::sql::ast::Expr;
 use crate::sql::exec;
-use crate::sql::types::{ArrElem, Datum, TypeMod};
+use crate::sql::types::{ArrElem, ColType, Datum, TypeMod};
 use crate::sql_err;
 use crate::stack_format;
 
@@ -520,11 +520,24 @@ pub(crate) fn dispatch<'a>(
                 if let crate::sql::ast::Expr::Column { qualifier, name } = args[0]
                     && let Some(dname) = row.column_domain(*qualifier, name)
                 {
+                    if let Some(ColType::Array(element)) = row.col_type(*qualifier, name)
+                        && element.user_type_slot().is_some()
+                        && let Some(cat) = hooks.catalog
+                        && let Some(name) = cat.user_array_name(element, arena)?
+                    {
+                        return Ok(Datum::Text(name));
+                    }
                     return Ok(Datum::Text(
                         arena.alloc_str(dname.as_str()).map_err(|_| arena_full())?,
                     ));
                 }
                 let v = eval_full(args[0], arena, params, row, hooks)?;
+                if let crate::sql::ast::Expr::Cast { type_name, .. } = args[0]
+                    && let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.user_type_name(type_name, arena)?
+                {
+                    return Ok(Datum::Text(name));
+                }
                 // PostgreSQL's pg_typeof reports the argument's *static* type —
                 // `current_user` is `name` though the value is plain text. The
                 // static answer is used whenever it is consistent with the
@@ -543,6 +556,13 @@ pub(crate) fn dispatch<'a>(
                 if let Datum::Enum { slot, .. } = v
                     && let Some(cat) = hooks.catalog
                     && let Some(name) = cat.enum_name(slot, arena)?
+                {
+                    return Ok(Datum::Text(name));
+                }
+                if let Datum::Array { element, .. } = v
+                    && element.user_type_slot().is_some()
+                    && let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.user_array_name(element, arena)?
                 {
                     return Ok(Datum::Text(name));
                 }

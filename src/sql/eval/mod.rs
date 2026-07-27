@@ -271,6 +271,13 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).column_identity(qualifier, name)
     }
 
+    fn column_domain(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::SqlName> {
+        (**self).column_domain(qualifier, name)
+    }
 }
 
 /// Whether a qualifier answers to one concrete table: its bare name, or the
@@ -386,6 +393,34 @@ pub trait CatalogAccess {
     /// resolve `value::enumtype` casts, which base-type name lookup cannot.
     fn enum_slot_of_name(&self, _type_name: &str) -> Option<u16> {
         None
+    }
+    /// Casts to a catalog-defined domain, enum, or its automatically-created
+    /// array type. `Ok(None)` means the name is not a visible user-defined
+    /// type; `Some` contains the fully coerced and validated value.
+    fn cast_user_type<'a>(
+        &self,
+        _type_name: &str,
+        _value: Datum<'a>,
+        _arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
+    /// The SQL name of a user-defined array element identity, for
+    /// `pg_typeof`. Built-in arrays do not consult the catalog.
+    fn user_array_name<'a>(
+        &self,
+        _element: crate::sql::types::ArrElem,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Canonical visible name of a user-defined scalar or array type spelling.
+    fn user_type_name<'a>(
+        &self,
+        _type_name: &str,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
     }
 }
 
@@ -830,47 +865,24 @@ pub fn eval_full<'a>(
                 };
                 let value = match v {
                     Datum::Int2(x) => x as u16 as u64,
-                Datum::Int4(x) => x as u32 as u64,
+                    Datum::Int4(x) => x as u32 as u64,
                     Datum::Int8(x) => x as u64,
                     _ => unreachable!(),
                 };
-                return Ok(Datum::Bit { bits: int_to_bits(value, n, arena)?, varying });
+                return Ok(Datum::Bit {
+                    bits: int_to_bits(value, n, arena)?,
+                    varying,
+                });
             }
-            // Cast to a user-defined enum type: base-type name lookup does not
-            // know enums, so resolve the type name to its catalog slot and
-            // coerce the value to a member (validating the label, 22P02).
+            // Base-type lookup deliberately has no catalog dependency. Route
+            // any other type spelling through the one catalog-aware cast hook:
+            // domains, enums, and their automatically-created array types all
+            // resolve and validate there.
             if ColType::from_sql_name(type_name).is_none()
                 && let Some(cat) = hooks.catalog
-                && let Some(slot) = cat.enum_slot_of_name(type_name)
+                && let Some(value) = cat.cast_user_type(type_name, v, arena)?
             {
-                if v.is_null() {
-                    return Ok(Datum::Null);
-                }
-                let label = match text_view(v) {
-                    Datum::Text(s) => s,
-                    Datum::Enum { label, .. } => label,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::CANNOT_COERCE,
-                            "cannot cast type {} to {}",
-                            type_name_of(&v),
-                            type_name
-                        ))
-                    }
-                };
-                let Some(sort) = cat.enum_label_sort(slot, label) else {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_TEXT_REPRESENTATION,
-                        "invalid input value for enum {}: \"{}\"",
-                        type_name,
-                        label
-                    ));
-                };
-                return Ok(Datum::Enum {
-                    slot,
-                    sort,
-                    label: arena.alloc_str(label).map_err(|_| arena_full())?,
-                });
+                return Ok(value);
             }
             let v = cast(v, type_name, arena)?;
             // `::numeric(p,s)` / `::varchar(n)`: enforce the modifier on the

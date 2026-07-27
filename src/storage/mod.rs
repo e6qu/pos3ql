@@ -15,8 +15,8 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
 use crate::mem::value_index::ValueIndexPool;
-use crate::sql::eval::{hash_key, sqlstate, SqlError};
-use crate::sql::types::{ColType, Datum};
+use crate::sql::eval::{SqlError, hash_key, sqlstate};
+use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
 use crate::util::StackStr;
 
@@ -247,11 +247,12 @@ pub struct ColumnMeta {
     pub identity_always: bool,
     /// The auto-increment step: 1 for `serial`, or the identity `INCREMENT BY`.
     pub auto_increment_step: i64,
-    /// When the column was declared with a domain type, the domain's name (its
-    /// `ctype`/`type_mod` are the domain's base). Reported by `pg_typeof` and
-    /// RowDescription, and its NOT NULL / CHECK constraints are enforced on
-    /// write. `None` for an ordinary base-typed column.
+    /// When the column was declared with a user-defined type, its stable name
+    /// and schema. Runtime enum/domain slots are rebound from this identity
+    /// after restart; storing both parts prevents same-named types in different
+    /// schemas from aliasing each other.
     pub domain: Option<SqlName>,
+    pub user_type_schema: Option<SqlName>,
 }
 
 /// Maximum stored length of a non-constant DEFAULT expression's source text.
@@ -275,6 +276,7 @@ impl ColumnMeta {
         identity_always: false,
         auto_increment_step: 1,
         domain: None,
+        user_type_schema: None,
     };
 }
 
@@ -797,6 +799,11 @@ pub struct DomainDef {
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
+    /// Immediate parent when this domain was declared over another domain.
+    /// The value representation is flattened to `base`, but the parent chain
+    /// remains explicit so every inherited NOT NULL/CHECK is enforced.
+    pub base_domain: Option<SqlName>,
+    pub base_domain_schema: Option<SqlName>,
     pub base: ColType,
     /// The base type's atttypmod (e.g. `varchar(5)` → 9), applied to a value
     /// before the domain's own constraints.
@@ -814,6 +821,8 @@ impl DomainDef {
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
+        base_domain: None,
+        base_domain_schema: None,
         base: ColType::Bool,
         base_type_mod: -1,
         not_null: false,
@@ -840,6 +849,8 @@ impl DomainDef {
 /// the executor and handed to storage (apart from the `live`/`pending` state).
 #[derive(Clone, Copy)]
 pub struct DomainSpec {
+    pub base_domain: Option<SqlName>,
+    pub base_domain_schema: Option<SqlName>,
     pub base: ColType,
     pub base_type_mod: i32,
     pub not_null: bool,
@@ -1517,6 +1528,7 @@ impl Storage {
                             identity_always: false,
                             auto_increment_step: 1,
                             domain: None,
+                            user_type_schema: None,
                         }; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
@@ -3463,24 +3475,71 @@ impl Storage {
 
     /// Committed create (journal replay): the table is immediately part of the
     /// durable image.
-    /// Binds any reloaded enum column (`Enum(ENUM_SLOT_UNRESOLVED)` carrying the
-    /// enum name in `domain`) to its live catalog slot. A no-op for a freshly
-    /// built def, whose enum columns already hold a resolved slot.
-    fn bind_enum_columns(&self, def: &mut TableDef) -> Result<(), SqlError> {
+    /// Rebinds every persisted user-defined column type from its stable name to
+    /// the current catalog slot. Slots are runtime identities and may change
+    /// across restart; scalar enums and enum/domain arrays therefore never
+    /// trust the slot encoded in the table definition.
+    fn bind_user_type_columns(&self, def: &mut TableDef) -> Result<(), SqlError> {
         for i in 0..def.n_columns {
             let col = &def.columns[i];
-            if col.ctype == ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED) {
-                let name = col.domain.ok_or_else(|| {
-                    sql_err!(sqlstate::UNDEFINED_OBJECT, "reloaded enum column has no type name")
-                })?;
-                let slot = self.enum_slot_by_name(name.as_str(), 0).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "enum type \"{}\" for a reloaded column does not exist",
-                        name.as_str()
-                    )
-                })?;
-                def.columns[i].ctype = ColType::Enum(slot as u16);
+            match col.ctype {
+                ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => {
+                    let name = col.domain.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "reloaded enum column has no type name"
+                        )
+                    })?;
+                    let slot = match col.user_type_schema {
+                        Some(schema) => self
+                            .enum_slot(schema.as_str(), name.as_str(), 0)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "enum type \"{}.{}\" for a reloaded column does not exist",
+                                    schema.as_str(),
+                                    name.as_str()
+                                )
+                            })?,
+                        None => self.unique_enum_slot_by_name(name.as_str(), 0)?,
+                    };
+                    def.columns[i].ctype = if matches!(col.ctype, ColType::Array(_)) {
+                        ColType::Array(ArrElem::Enum(slot as u16))
+                    } else {
+                        ColType::Enum(slot as u16)
+                    };
+                }
+                ColType::Array(ArrElem::Domain { .. }) => {
+                    let name = col.domain.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "reloaded domain-array column has no type name"
+                        )
+                    })?;
+                    let slot = match col.user_type_schema {
+                        Some(schema) => self
+                            .domain_slot(schema.as_str(), name.as_str(), 0)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "domain type \"{}.{}\" for a reloaded column does not exist",
+                                    schema.as_str(),
+                                    name.as_str()
+                                )
+                            })?,
+                        None => self.unique_domain_slot_by_name(name.as_str(), 0)?,
+                    };
+                    let domain = self.domain(slot);
+                    let element = ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "arrays of domain {} require a scalar base type",
+                            name.as_str()
+                        )
+                    })?;
+                    def.columns[i].ctype = ColType::Array(element);
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -3497,7 +3556,7 @@ impl Storage {
         // A reloaded enum column decodes as `Enum(ENUM_SLOT_UNRESOLVED)` plus the
         // enum's name (in `domain`); bind it to the live catalog slot now that
         // the enum has itself been loaded (WAL/checkpoint order guarantees it).
-        self.bind_enum_columns(&mut def)?;
+        self.bind_user_type_columns(&mut def)?;
         let slot = self.alloc_table(def, None)?;
         // Build the (empty) enforcers now; replay repopulates them once its rows
         // are applied (see the rebuild in Engine startup).
@@ -4016,6 +4075,29 @@ impl Storage {
             .find(|d| d.visible_to(txid) && d.name.as_str() == name)
     }
 
+    fn unique_domain_slot_by_name(&self, name: &str, txid: u32) -> Result<usize, SqlError> {
+        let mut matches = self
+            .domains
+            .iter()
+            .enumerate()
+            .filter(|(_, domain)| domain.visible_to(txid) && domain.name.as_str() == name);
+        let Some((slot, _)) = matches.next() else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "domain type \"{}\" for a reloaded column does not exist",
+                name
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_COLUMN,
+                "domain type \"{}\" for a reloaded column is ambiguous",
+                name
+            ));
+        }
+        Ok(slot)
+    }
+
     /// The domain named `(schema, name)` visible to `txid`, by slot.
     pub fn domain_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.domains.iter().position(|d| {
@@ -4037,11 +4119,12 @@ impl Storage {
     /// the dependency that makes `DROP DOMAIN ... RESTRICT` fail.
     pub fn domain_in_use(&self, schema: &str, name: &str) -> Option<(SqlName, SqlName)> {
         for table in self.tables.iter().filter(|t| t.live) {
-            if table.def.schema.as_str() != schema {
-                continue;
-            }
             for col in table.def.columns() {
-                if col.domain.is_some_and(|d| d.as_str() == name) {
+                if col.domain.is_some_and(|domain| domain.as_str() == name)
+                    && col
+                        .user_type_schema
+                        .is_some_and(|domain_schema| domain_schema.as_str() == schema)
+                {
                     return Some((table.def.name, col.name));
                 }
             }
@@ -4083,6 +4166,8 @@ impl Storage {
             created_at: self.catalog_seq,
             schema,
             name,
+            base_domain: spec.base_domain,
+            base_domain_schema: spec.base_domain_schema,
             base: spec.base,
             base_type_mod: spec.base_type_mod,
             not_null: spec.not_null,
@@ -4098,12 +4183,47 @@ impl Storage {
     /// Replaces a live domain's spec in place (ALTER DOMAIN).
     pub fn alter_domain(&mut self, slot: usize, spec: DomainSpec) {
         let d = &mut self.domains[slot];
+        d.base_domain = spec.base_domain;
+        d.base_domain_schema = spec.base_domain_schema;
         d.base = spec.base;
         d.base_type_mod = spec.base_type_mod;
         d.not_null = spec.not_null;
         d.default_expr = spec.default_expr;
         d.checks = spec.checks;
         d.n_checks = spec.n_checks;
+    }
+
+    pub fn restore_domain(&mut self, slot: usize, prior: DomainDef) {
+        self.domains[slot] = prior;
+    }
+
+    pub fn restore_domain_nullability(&mut self, slot: usize, prior: bool) {
+        self.domains[slot].not_null = prior;
+    }
+
+    pub fn restore_domain_default(
+        &mut self,
+        slot: usize,
+        prior: Option<StackStr<DEFAULT_EXPR_MAX>>,
+    ) {
+        self.domains[slot].default_expr = prior;
+    }
+
+    pub fn undo_domain_check_add(&mut self, slot: usize, prior_count: usize) {
+        let domain = &mut self.domains[slot];
+        for check in domain.checks[prior_count..domain.n_checks].iter_mut() {
+            *check = CheckConstraint::EMPTY;
+        }
+        domain.n_checks = prior_count;
+    }
+
+    pub fn restore_domain_check(&mut self, slot: usize, index: usize, prior: CheckConstraint) {
+        let domain = &mut self.domains[slot];
+        for position in (index..domain.n_checks).rev() {
+            domain.checks[position + 1] = domain.checks[position];
+        }
+        domain.checks[index] = prior;
+        domain.n_checks += 1;
     }
 
     pub fn drop_domain(
@@ -4202,12 +4322,37 @@ impl Storage {
     /// The definition of an enum named `name` (any schema) visible to `txid` —
     /// for resolving a column whose stored type identity is only the enum name.
     pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<&EnumDef> {
-        self.enums.iter().find(|e| e.visible_to(txid) && e.name.as_str() == name)
+        self.enums
+            .iter()
+            .find(|e| e.visible_to(txid) && e.name.as_str() == name)
     }
 
     /// The slot of an enum named `name` (any schema) visible to `txid`.
     pub fn enum_slot_by_name(&self, name: &str, txid: u32) -> Option<usize> {
-        self.enums.iter().position(|e| e.visible_to(txid) && e.name.as_str() == name)
+        self.enums
+            .iter()
+            .position(|e| e.visible_to(txid) && e.name.as_str() == name)
+    }
+
+    fn unique_enum_slot_by_name(&self, name: &str, txid: u32) -> Result<usize, SqlError> {
+        let mut matches = self.enums.iter().enumerate().filter(|(_, enumeration)| {
+            enumeration.visible_to(txid) && enumeration.name.as_str() == name
+        });
+        let Some((slot, _)) = matches.next() else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "enum type \"{}\" for a reloaded column does not exist",
+                name
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_COLUMN,
+                "enum type \"{}\" for a reloaded column is ambiguous",
+                name
+            ));
+        }
+        Ok(slot)
     }
 
     /// The enum named `(schema, name)` visible to `txid`, by slot.
@@ -4232,7 +4377,12 @@ impl Storage {
     pub fn enum_in_use(&self, slot: usize) -> Option<(SqlName, SqlName)> {
         for table in self.tables.iter().filter(|t| t.live) {
             for col in table.def.columns() {
-                if matches!(col.ctype, ColType::Enum(s) if s as usize == slot) {
+                if matches!(col.ctype, ColType::Enum(s) if s as usize == slot)
+                    || matches!(
+                        col.ctype,
+                        ColType::Array(ArrElem::Enum(s)) if s as usize == slot
+                    )
+                {
                     return Some((table.def.name, col.name));
                 }
             }
@@ -4287,6 +4437,64 @@ impl Storage {
         let e = &mut self.enums[slot];
         e.members = spec.members;
         e.n_members = spec.n_members;
+    }
+
+    /// Renames an enum and every persisted reference to its type name. Runtime
+    /// slots and value sort keys stay stable; comments are name-keyed and move
+    /// with the type just as PostgreSQL keeps the same `pg_type` OID.
+    pub fn rename_enum(&mut self, slot: usize, new_name: SqlName) {
+        let old_name = self.enums[slot].name;
+        let schema = self.enums[slot].schema;
+        self.enums[slot].name = new_name;
+        for table in self
+            .tables
+            .iter_mut()
+            .filter(|table| table.live || table.pending_ddl.is_some())
+        {
+            let mut changed = false;
+            for column in table.def.columns[..table.def.n_columns].iter_mut() {
+                let uses_enum = matches!(column.ctype, ColType::Enum(s) if s as usize == slot)
+                    || matches!(
+                        column.ctype,
+                        ColType::Array(ArrElem::Enum(s)) if s as usize == slot
+                    );
+                if uses_enum {
+                    column.domain = Some(new_name);
+                    changed = true;
+                }
+            }
+            if changed {
+                table.mark_dirty();
+            }
+        }
+        for comment in self.comments.iter_mut() {
+            if comment.used
+                && comment.class == CommentClass::Type
+                && comment.schema == schema
+                && comment.name == old_name
+            {
+                comment.name = new_name;
+            }
+        }
+    }
+
+    pub fn restore_enum(&mut self, slot: usize, prior: EnumDef) {
+        if self.enums[slot].name != prior.name {
+            self.rename_enum(slot, prior.name);
+        }
+        self.enums[slot] = prior;
+    }
+
+    pub fn undo_enum_value_add(&mut self, slot: usize, prior_count: usize) {
+        let definition = &mut self.enums[slot];
+        for member in definition.members[prior_count..definition.n_members].iter_mut() {
+            *member = EnumMember::EMPTY;
+        }
+        definition.n_members = prior_count;
+    }
+
+    pub fn restore_enum_value_name(&mut self, slot: usize, index: usize, prior: SqlName) {
+        self.enums[slot].members[index].label = prior;
     }
 
     pub fn drop_enum(
@@ -4841,6 +5049,7 @@ mod tests {
                 identity_always: false,
                 auto_increment_step: 1,
                 domain: None,
+                user_type_schema: None,
             }; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
@@ -4861,6 +5070,7 @@ mod tests {
                 identity_always: false,
                 auto_increment_step: 1,
                 domain: None,
+                user_type_schema: None,
             };
         }
         def

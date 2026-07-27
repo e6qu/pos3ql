@@ -116,10 +116,38 @@ pub enum DdlUndo {
     DomainCreated(u32),
     /// DROP DOMAIN at this slot — undo by reviving it.
     DomainDropped(u32),
+    /// ALTER DOMAIN changed nullability.
+    DomainNullabilityAltered { slot: u32, prior: bool },
+    /// ALTER DOMAIN changed its default expression.
+    DomainDefaultAltered {
+        slot: u32,
+        prior: Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>,
+    },
+    /// ALTER DOMAIN appended a CHECK constraint.
+    DomainCheckAdded { slot: u32, prior_count: u8 },
+    /// ALTER DOMAIN removed a CHECK constraint.
+    DomainCheckDropped {
+        slot: u32,
+        index: u8,
+        prior: crate::storage::CheckConstraint,
+    },
     /// CREATE TYPE (enum) at this slot — undo by dropping it.
     EnumCreated(u32),
     /// DROP TYPE (enum) at this slot — undo by reviving it.
     EnumDropped(u32),
+    /// ALTER TYPE appended an enum member.
+    EnumValueAdded { slot: u32, prior_count: u8 },
+    /// ALTER TYPE renamed one enum label.
+    EnumValueRenamed {
+        slot: u32,
+        index: u8,
+        prior: crate::storage::SqlName,
+    },
+    /// ALTER TYPE renamed the type itself.
+    EnumRenamed {
+        slot: u32,
+        prior: crate::storage::SqlName,
+    },
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.

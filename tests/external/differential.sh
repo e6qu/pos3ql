@@ -155,6 +155,19 @@ for f in $EXT/differential_exact/*.sql; do
   fi
 done
 
+print -- "\n=== binary COPY (wire bytes + cross-load) ==="
+if [[ -x "$ROOT_VENV/bin/python" ]]; then
+  if "$ROOT_VENV/bin/python" "$EXT/copy_binary_diff.py" \
+       --pg $PG_PORT --p3 $P3_PORT > "$WORK/copy-binary.out" 2>&1; then
+    ok "COPY BINARY differential"
+  else
+    bad "COPY BINARY differential"
+    cat "$WORK/copy-binary.out"
+  fi
+else
+  print -- "SKIP: COPY BINARY differential (need a psycopg venv at \$POS3QL_VENV)"
+fi
+
 print -- "\n=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==="
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
 if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then

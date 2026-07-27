@@ -2728,11 +2728,20 @@ impl<'a> Parser<'a> {
     /// (precision[, scale]); any other type with a modifier is a loud error.
     fn type_name_mod(&mut self) -> Result<(&'a str, i32), ParseError> {
         let mut name = self.any_ident("type name")?;
-        // A schema-qualified type (`pg_catalog.int4`, `pg_catalog.regtype`):
-        // drop the schema and keep the bare type name.
+        // System-qualified built-ins normalize to their bare spelling. A user
+        // schema is part of the type identity and must survive parsing; dropping
+        // it aliases same-named domains/enums in different schemas.
         if self.peeked == Tok::Op(".") {
+            let schema = name;
             self.advance()?;
-            name = self.any_ident("type name")?;
+            let base = self.any_ident("type name")?;
+            name = if schema == "pg_catalog" || schema == "information_schema" {
+                base
+            } else {
+                self.arena
+                    .alloc_str(stack_format!(128, "{}.{}", schema, base).as_str())
+                    .map_err(|_| self.err_here("type name too long"))?
+            };
         }
         if name == "double" {
             self.expect_ident("precision")?;
@@ -2777,7 +2786,7 @@ impl<'a> Parser<'a> {
             }
             let array = self
                 .arena
-                .alloc_str(stack_format!(72, "{}[]", name).as_str())
+                .alloc_str(stack_format!(132, "{}[]", name).as_str())
                 .map_err(|_| self.err_here("type name too long"))?;
             return Ok((array, -1));
         }

@@ -806,7 +806,8 @@ impl Checkpointer {
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
                 }
-                Some("col") => {
+                tag @ (Some("col") | Some("col2")) => {
+                    let has_user_type_schema = tag == Some("col2");
                     let Some((_, def, seen, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
@@ -822,9 +823,23 @@ impl Checkpointer {
                     let default_expr = if dexpr_hex == "0" {
                         None
                     } else {
-                        Some(crate::util::StackStr::from_str(&decode_hex_name(dexpr_hex)?))
+                        Some(crate::util::StackStr::from_str(&decode_hex_name(
+                            dexpr_hex,
+                        )?))
                     };
                     let auto_increment_step: i64 = parse_field(words.next(), "col step")?;
+                    let user_type_schema = if has_user_type_schema {
+                        let schema_hex = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "col user type schema missing",
+                        ))?;
+                        if schema_hex == "0" {
+                            None
+                        } else {
+                            Some(sql_name(&decode_hex_name(schema_hex)?)?)
+                        }
+                    } else {
+                        None
+                    };
                     let domain_hex = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("col domain missing"))?;
@@ -833,7 +848,7 @@ impl Checkpointer {
                     } else {
                         Some(sql_name(&decode_hex_name(domain_hex)?)?)
                     };
-                    let name = rest_of(line, 8)?;
+                    let name = rest_of(line, if has_user_type_schema { 9 } else { 8 })?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -853,6 +868,7 @@ impl Checkpointer {
                         is_identity: not_null & 32 != 0,
                         identity_always: not_null & 64 != 0,
                         auto_increment_step,
+                        user_type_schema,
                     };
                     *seen += 1;
                 }
@@ -1190,7 +1206,8 @@ impl Checkpointer {
                     seq.is_called.set(is_called != 0);
                     seq.dirty.set(false);
                 }
-                Some("dom") => {
+                tag @ (Some("dom") | Some("dom2")) => {
+                    let has_parent = tag == Some("dom2");
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
@@ -1209,6 +1226,14 @@ impl Checkpointer {
                     }
                     let schema = hexstr(words.next(), "dom schema missing")?;
                     let name = hexstr(words.next(), "dom name missing")?;
+                    let (base_domain, base_domain_schema) = if has_parent {
+                        (
+                            hexstr(words.next(), "dom base domain missing")?,
+                            hexstr(words.next(), "dom base domain schema missing")?,
+                        )
+                    } else {
+                        (String::new(), String::new())
+                    };
                     let default_text = hexstr(words.next(), "dom default missing")?;
                     let base = crate::sql::types::ColType::from_code(base_code)
                         .ok_or(CheckpointSetupError::Corrupt("bad domain base type"))?;
@@ -1223,6 +1248,12 @@ impl Checkpointer {
                         };
                     }
                     let spec = crate::storage::DomainSpec {
+                        base_domain: (!base_domain.is_empty())
+                            .then(|| sql_name(&base_domain))
+                            .transpose()?,
+                        base_domain_schema: (!base_domain_schema.is_empty())
+                            .then(|| sql_name(&base_domain_schema))
+                            .transpose()?,
                         base,
                         base_type_mod,
                         not_null: not_null != 0,
@@ -1705,6 +1736,63 @@ Ok(CheckpointStep::Published { lsn })
             }
             write_manifest(&mut self.manifest_buf, format_args!("nsp {}", hex.as_str()))?;
         }
+        // Domains: `dom2 <base-code> <base-typmod> <not-null> <n-checks>
+        // <hex-schema> <hex-name> <hex-base-domain> <hex-base-domain-schema> <hex-default>
+        // [<hex-cname> <hex-cexpr>]...`. Like enums, domains precede tables
+        // because generated domain-array columns bind their runtime slot while
+        // the table definition is rebuilt.
+        for (_, d) in storage.live_domains() {
+            use core::fmt::Write;
+            let mut line = StackStr::<10_240>::new();
+            let hex = |line: &mut StackStr<10_240>, s: &str| {
+                if s.is_empty() {
+                    let _ = write!(line, "0");
+                } else {
+                    for b in s.as_bytes() {
+                        let _ = write!(line, "{b:02x}");
+                    }
+                }
+            };
+            let _ = write!(
+                line,
+                "dom2 {} {} {} {} ",
+                d.base.code(),
+                d.base_type_mod,
+                u8::from(d.not_null),
+                d.n_checks,
+            );
+            hex(&mut line, d.schema.as_str());
+            let _ = write!(line, " ");
+            hex(&mut line, d.name.as_str());
+            let _ = write!(line, " ");
+            hex(
+                &mut line,
+                d.base_domain
+                    .as_ref()
+                    .map(|name| name.as_str())
+                    .unwrap_or(""),
+            );
+            let _ = write!(line, " ");
+            hex(
+                &mut line,
+                d.base_domain_schema
+                    .as_ref()
+                    .map(|schema| schema.as_str())
+                    .unwrap_or(""),
+            );
+            let _ = write!(line, " ");
+            hex(
+                &mut line,
+                d.default_expr.as_ref().map(|e| e.as_str()).unwrap_or(""),
+            );
+            for c in d.checks() {
+                let _ = write!(line, " ");
+                hex(&mut line, c.name.as_str());
+                let _ = write!(line, " ");
+                hex(&mut line, c.expression.as_str());
+            }
+            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+        }
         // Enum types: `enm <hex-schema> <hex-name> <n-members> [<hex-label>
         // <sort-bits>]...`. Written before tables so an enum-typed column
         // resolves its type slot when its table is rebuilt on load. The sort
@@ -1788,6 +1876,17 @@ Ok(CheckpointStep::Published { lsn })
                     | (u8::from(c.identity_always) << 6);
                 // The domain type name, hex-encoded (`0` = ordinary base type),
                 // before the name (which may contain spaces).
+                let mut domain_schema_hex = StackStr::<130>::new();
+                match &c.user_type_schema {
+                    Some(schema) => {
+                        for byte in schema.as_str().as_bytes() {
+                            let _ = write!(domain_schema_hex, "{byte:02x}");
+                        }
+                    }
+                    None => {
+                        let _ = write!(domain_schema_hex, "0");
+                    }
+                }
                 let mut domain_hex = StackStr::<130>::new();
                 match &c.domain {
                     Some(d) => {
@@ -1802,13 +1901,14 @@ Ok(CheckpointStep::Published { lsn })
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col {} {} {} {} {} {} {} {}",
+                        "col2 {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
                         c.auto_increment_step,
+                        domain_schema_hex.as_str(),
                         domain_hex.as_str(),
                         c.name.as_str()
                     ),
@@ -2068,42 +2168,6 @@ Ok(CheckpointStep::Published { lsn })
                     u8::from(seq.is_called.get()),
                 ),
             )?;
-        }
-        // Domains: `dom <base-code> <base-typmod> <not-null> <n-checks>
-        // <hex-schema> <hex-name> <hex-default> [<hex-cname> <hex-cexpr>]...`,
-        // all strings hex-encoded so their spaces are safe on the line.
-        for (_, d) in storage.live_domains() {
-            use core::fmt::Write;
-            let mut line = StackStr::<10_240>::new();
-            let hex = |line: &mut StackStr<10_240>, s: &str| {
-                if s.is_empty() {
-                    let _ = write!(line, "0");
-                } else {
-                    for b in s.as_bytes() {
-                        let _ = write!(line, "{b:02x}");
-                    }
-                }
-            };
-            let _ = write!(
-                line,
-                "dom {} {} {} {} ",
-                d.base.code(),
-                d.base_type_mod,
-                u8::from(d.not_null),
-                d.n_checks,
-            );
-            hex(&mut line, d.schema.as_str());
-            let _ = write!(line, " ");
-            hex(&mut line, d.name.as_str());
-            let _ = write!(line, " ");
-            hex(&mut line, d.default_expr.as_ref().map(|e| e.as_str()).unwrap_or(""));
-            for c in d.checks() {
-                let _ = write!(line, " ");
-                hex(&mut line, c.name.as_str());
-                let _ = write!(line, " ");
-                hex(&mut line, c.expression.as_str());
-            }
-            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
         }
         // Object comments: `cmt <class> <subid> <hex-schema> <hex-name>
         // <hex-text>`. Only committed comments carrying text are written.
@@ -2680,6 +2744,7 @@ fn empty_column() -> ColumnMeta {
         identity_always: false,
         auto_increment_step: 1,
         domain: None,
+        user_type_schema: None,
     }
 }
 
@@ -2714,4 +2779,3 @@ fn default_from_hex(hex: &str) -> Result<Option<OwnedDatum>, CheckpointSetupErro
     }
     Ok(d)
 }
-

@@ -426,36 +426,29 @@ impl Engine {
                 }
                 DdlUndo::ViewCreated(slot) => self.storage.commit_view_create(*slot as usize),
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
-                DdlUndo::MatviewCreated(slot) => {
-                    self.storage.commit_matview_create(*slot as usize)
-                }
-                DdlUndo::MatviewDropped(slot) => {
-                    self.storage.commit_matview_drop(*slot as usize)
-                }
+                DdlUndo::MatviewCreated(slot) => self.storage.commit_matview_create(*slot as usize),
+                DdlUndo::MatviewDropped(slot) => self.storage.commit_matview_drop(*slot as usize),
                 DdlUndo::SequenceCreated(slot) => {
                     self.storage.commit_sequence_create(*slot as usize)
                 }
-                DdlUndo::SequenceDropped(slot) => {
-                    self.storage.commit_sequence_drop(*slot as usize)
-                }
-                DdlUndo::DomainCreated(slot) => {
-                    self.storage.commit_domain_create(*slot as usize)
-                }
-                DdlUndo::DomainDropped(slot) => {
-                    self.storage.commit_domain_drop(*slot as usize)
-                }
+                DdlUndo::SequenceDropped(slot) => self.storage.commit_sequence_drop(*slot as usize),
+                DdlUndo::DomainCreated(slot) => self.storage.commit_domain_create(*slot as usize),
+                DdlUndo::DomainDropped(slot) => self.storage.commit_domain_drop(*slot as usize),
+                DdlUndo::DomainNullabilityAltered { .. }
+                | DdlUndo::DomainDefaultAltered { .. }
+                | DdlUndo::DomainCheckAdded { .. }
+                | DdlUndo::DomainCheckDropped { .. } => {}
                 DdlUndo::EnumCreated(slot) => self.storage.commit_enum_create(*slot as usize),
                 DdlUndo::EnumDropped(slot) => self.storage.commit_enum_drop(*slot as usize),
+                DdlUndo::EnumValueAdded { .. }
+                | DdlUndo::EnumValueRenamed { .. }
+                | DdlUndo::EnumRenamed { .. } => {}
                 DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } => {}
-                DdlUndo::SchemaCreated(slot) => {
-                    self.storage.commit_schema_create(*slot as usize)
-                }
-                DdlUndo::SchemaDropped(slot) => {
-                    self.storage.commit_schema_drop(*slot as usize)
-                }
+                DdlUndo::SchemaCreated(slot) => self.storage.commit_schema_create(*slot as usize),
+                DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
                 // The removal already happened in place; committing keeps it.
                 DdlUndo::FkDropped { .. } => {}
                 // Promote the uncommitted comment overlay to committed; its WAL
@@ -530,9 +523,30 @@ impl Engine {
                 DdlUndo::DomainDropped(slot) => {
                     self.storage.rollback_domain_drop(slot as usize, txn.txid)
                 }
+                DdlUndo::DomainNullabilityAltered { slot, prior } => self
+                    .storage
+                    .restore_domain_nullability(slot as usize, prior),
+                DdlUndo::DomainDefaultAltered { slot, prior } => {
+                    self.storage.restore_domain_default(slot as usize, prior)
+                }
+                DdlUndo::DomainCheckAdded { slot, prior_count } => self
+                    .storage
+                    .undo_domain_check_add(slot as usize, prior_count as usize),
+                DdlUndo::DomainCheckDropped { slot, index, prior } => self
+                    .storage
+                    .restore_domain_check(slot as usize, index as usize, prior),
                 DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
                 DdlUndo::EnumDropped(slot) => {
                     self.storage.rollback_enum_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::EnumValueAdded { slot, prior_count } => self
+                    .storage
+                    .undo_enum_value_add(slot as usize, prior_count as usize),
+                DdlUndo::EnumValueRenamed { slot, index, prior } => self
+                    .storage
+                    .restore_enum_value_name(slot as usize, index as usize, prior),
+                DdlUndo::EnumRenamed { slot, prior } => {
+                    self.storage.rename_enum(slot as usize, prior)
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
@@ -607,9 +621,30 @@ impl Engine {
                 DdlUndo::DomainDropped(slot) => {
                     self.storage.rollback_domain_drop(slot as usize, txn.txid)
                 }
+                DdlUndo::DomainNullabilityAltered { slot, prior } => self
+                    .storage
+                    .restore_domain_nullability(slot as usize, prior),
+                DdlUndo::DomainDefaultAltered { slot, prior } => {
+                    self.storage.restore_domain_default(slot as usize, prior)
+                }
+                DdlUndo::DomainCheckAdded { slot, prior_count } => self
+                    .storage
+                    .undo_domain_check_add(slot as usize, prior_count as usize),
+                DdlUndo::DomainCheckDropped { slot, index, prior } => self
+                    .storage
+                    .restore_domain_check(slot as usize, index as usize, prior),
                 DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
                 DdlUndo::EnumDropped(slot) => {
                     self.storage.rollback_enum_drop(slot as usize, txn.txid)
+                }
+                DdlUndo::EnumValueAdded { slot, prior_count } => self
+                    .storage
+                    .undo_enum_value_add(slot as usize, prior_count as usize),
+                DdlUndo::EnumValueRenamed { slot, index, prior } => self
+                    .storage
+                    .restore_enum_value_name(slot as usize, index as usize, prior),
+                DdlUndo::EnumRenamed { slot, prior } => {
+                    self.storage.rename_enum(slot as usize, prior)
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
                 DdlUndo::IndexDropped(slot) => {
@@ -1255,15 +1290,32 @@ impl Engine {
                 let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
                 let described = match &s.from {
                     Some(from) => {
-                        match query::QueryScope::resolve_schema(&self.storage, from, txn.txid, arena) {
-                            Ok(scope) => query::describe_scope_items(s.items, &scope, &mut columns),
+                        match query::QueryScope::resolve_schema(
+                            &self.storage,
+                            from,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(scope) => query::describe_scope_items(
+                                s.items,
+                                &scope,
+                                &self.storage,
+                                txn.txid,
+                                &mut columns,
+                            ),
                             Err(e) => {
                                 responder.error(e.sqlstate, e.message.as_str())?;
                                 return Ok(false);
                             }
                         }
                     }
-                    None => exec::describe_items(s.items, None, &mut columns),
+                    None => query::describe_catalog_items(
+                        s.items,
+                        None,
+                        &self.storage,
+                        txn.txid,
+                        &mut columns,
+                    ),
                 };
                 match described {
                     Ok(n) => {
@@ -1317,7 +1369,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Option<&'a [(&'a str, &'a ast::MaterializedCte<'a>)]>, SqlError> {
-        use crate::sql::exec::{describe_items, encode_projected_pub, MAX_PROJ};
+        use crate::sql::exec::{MAX_PROJ, encode_projected_pub};
         use crate::sql::types::ColDesc;
         if !with.iter().any(|c| c.dml.is_some()) {
             return Ok(None);
@@ -1345,7 +1397,13 @@ impl Engine {
             let idx = crate::sql::exec::resolve_dml_table(&self.storage, target, txn.txid)?;
             let def = self.storage.table(idx).def;
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = describe_items(returning, Some(&def), &mut descs)?;
+            let ncols = query::describe_catalog_items(
+                returning,
+                Some(&def),
+                &self.storage,
+                txn.txid,
+                &mut descs,
+            )?;
             let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
             let mut types = [(0i32, 0i16); MAX_PROJ];
             for i in 0..ncols {
@@ -1678,13 +1736,28 @@ impl Engine {
                 *cascade,
                 responder,
             ),
-            Stmt::CreateEnum { name, labels } => {
-                exec::create_enum(&mut self.storage, &mut self.wal, txn, name, labels, responder)
-            }
-            Stmt::AlterType { name, action } => {
-                exec::alter_type(&mut self.storage, &mut self.wal, txn, name, action, responder)
-            }
-            Stmt::DropType { names, if_exists, cascade } => exec::drop_enum(
+            Stmt::CreateEnum { name, labels } => exec::create_enum(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                labels,
+                responder,
+            ),
+            Stmt::AlterType { name, action } => exec::alter_type(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                action,
+                arena,
+                responder,
+            ),
+            Stmt::DropType {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_enum(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2744,6 +2817,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // An ALTER replays as a redefinition: redefine in place if it
             // exists, else create it committed (txid 0).
             let spec = crate::storage::DomainSpec {
+                base_domain: def.base_domain,
+                base_domain_schema: def.base_domain_schema,
                 base: def.base,
                 base_type_mod: def.base_type_mod,
                 not_null: def.not_null,
@@ -2777,7 +2852,27 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_enum_drop(slot);
             }
         }
-        WalOp::Comment { class, schema, name, subid, text } => {
+        WalOp::RenameEnum {
+            schema,
+            old_name,
+            new_name,
+        } => {
+            let slot = storage.enum_slot(schema, old_name, 0).ok_or_else(|| {
+                sql_err!(
+                    eval::sqlstate::UNDEFINED_OBJECT,
+                    "enum type \"{}\" for WAL rename does not exist",
+                    old_name
+                )
+            })?;
+            storage.rename_enum(slot, crate::storage::SqlName::parse(new_name)?);
+        }
+        WalOp::Comment {
+            class,
+            schema,
+            name,
+            subid,
+            text,
+        } => {
             let stored = text.map(crate::storage::comment_stackstr).transpose()?;
             let class = crate::storage::CommentClass::from_u8(class).ok_or_else(|| {
                 sql_err!(

@@ -351,10 +351,8 @@ fn view_oid(slot: usize) -> i32 {
     FIRST_VIEW_OID + slot as i32
 }
 
-/// Domains get their own OID range, above views.
-const FIRST_DOMAIN_OID: i32 = 110_000;
 fn domain_oid(slot: usize) -> i32 {
-    FIRST_DOMAIN_OID + slot as i32
+    crate::sql::types::oid::domain_oid(slot as u16)
 }
 
 /// Tables/materialized views and plain views have distinct composite-type OID
@@ -891,6 +889,7 @@ fn def_of(name: &str, columns: &[(&str, ColType)]) -> TableDef {
             identity_always: false,
             auto_increment_step: 1,
             domain: None,
+            user_type_schema: None,
         }; MAX_COLUMNS],
         n_columns: columns.len(),
         ..TableDef::empty()
@@ -1460,8 +1459,8 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
         ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
         _ => "S",
     };
-    let mut out: [&[Datum]; 512 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS] =
-        [&[]; 512 + crate::storage::MAX_DOMAINS + crate::storage::MAX_ENUMS];
+    let mut out: [&[Datum]; 512 + crate::storage::MAX_DOMAINS * 2 + crate::storage::MAX_ENUMS * 2] =
+        [&[]; 512 + crate::storage::MAX_DOMAINS * 2 + crate::storage::MAX_ENUMS * 2];
     for (i, t) in types.iter().enumerate() {
         out[i] = row(
             &[
@@ -1488,6 +1487,20 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
     let mut n = types.len();
     // User-defined domains: typtype 'd', with their base type and constraints.
     for (slot, d) in storage.live_domains() {
+        let base_oid = match d.base_domain {
+            Some(parent) => storage
+                .domain_slot(
+                    d.base_domain_schema
+                        .expect("parent domain identity carries its schema")
+                        .as_str(),
+                    parent.as_str(),
+                    0,
+                )
+                .map(domain_oid)
+                .expect("visible domain retains its parent identity"),
+            None => d.base.oid(),
+        };
+        let array_oid = crate::sql::types::oid::domain_array_oid(slot as u16);
         out[n] = row(
             &[
                 Datum::Int4(domain_oid(slot)),
@@ -1497,9 +1510,9 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Int4(namespace_oid(storage, d.schema.as_str())),
                 text("d", arena)?,
                 text(category(&d.base), arena)?,
-                Datum::Int4(d.base.oid()),
+                Datum::Int4(base_oid),
                 Datum::Int4(0),
-                Datum::Int4(0),
+                Datum::Int4(array_oid),
                 Datum::Int4(0),
                 Datum::Int4(d.base_type_mod),
                 Datum::Bool(d.not_null),
@@ -1513,13 +1526,46 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
             arena,
         )?;
         n += 1;
+        let array_name = crate::stack_format!(128, "_{}", d.name.as_str());
+        out[n] = row(
+            &[
+                Datum::Int4(array_oid),
+                text(
+                    arena
+                        .alloc_str(array_name.as_str())
+                        .map_err(|_| arena_full())?,
+                    arena,
+                )?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, d.schema.as_str())),
+                text("b", arena)?,
+                text("A", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(domain_oid(slot)),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
     }
     // User-defined enum types: typtype 'e', typcategory 'E', no base type.
     for (slot, e) in storage.live_enums() {
+        let enum_oid = crate::sql::types::oid::enum_oid(slot as u16);
+        let array_oid = crate::sql::types::oid::enum_array_oid(slot as u16);
         out[n] = row(
             &[
-                Datum::Int4(crate::sql::types::oid::enum_oid(slot as u16)),
-                text(arena.alloc_str(e.name.as_str()).map_err(|_| arena_full())?, arena)?,
+                Datum::Int4(enum_oid),
+                text(
+                    arena.alloc_str(e.name.as_str()).map_err(|_| arena_full())?,
+                    arena,
+                )?,
                 Datum::Int4(4), // typlen: enums are a 4-byte oid on the wire
                 Datum::Int4(0),
                 Datum::Int4(namespace_oid(storage, e.schema.as_str())),
@@ -1527,6 +1573,34 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("E", arena)?,
                 Datum::Int4(0), // typbasetype
                 Datum::Int4(0),
+                Datum::Int4(array_oid),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+        let array_name = crate::stack_format!(128, "_{}", e.name.as_str());
+        out[n] = row(
+            &[
+                Datum::Int4(array_oid),
+                text(
+                    arena
+                        .alloc_str(array_name.as_str())
+                        .map_err(|_| arena_full())?,
+                    arena,
+                )?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, e.schema.as_str())),
+                text("b", arena)?,
+                text("A", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(enum_oid),
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(-1),

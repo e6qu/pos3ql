@@ -2701,53 +2701,238 @@ fn network_operators_match_postgres() {
 fn fetch_first_and_with_ties() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE ft (id int, v int)");
-    run_with(&mut e, &mut b, "INSERT INTO ft VALUES (1,10),(2,10),(3,20),(4,20),(5,30),(6,30)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO ft VALUES (1,10),(2,10),(3,20),(4,20),(5,30),(6,30)",
+    );
     // FETCH FIRST n ROWS ONLY == LIMIT n.
-    let bytes = run_with(&mut e, &mut b, "SELECT id FROM ft ORDER BY id FETCH FIRST 2 ROWS ONLY");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id FROM ft ORDER BY id FETCH FIRST 2 ROWS ONLY",
+    );
     assert_eq!(data_rows(&bytes), ["1", "2"]);
     // FETCH FIRST ROW ONLY (count defaults to 1).
-    let bytes = run_with(&mut e, &mut b, "SELECT id FROM ft ORDER BY id FETCH FIRST ROW ONLY");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id FROM ft ORDER BY id FETCH FIRST ROW ONLY",
+    );
     assert_eq!(data_rows(&bytes), ["1"]);
     // OFFSET ... FETCH NEXT.
-    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft ORDER BY v OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT v FROM ft ORDER BY v OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY",
+    );
     assert_eq!(data_rows(&bytes), ["10", "20"]);
     // WITH TIES: the first row plus every row tying on the ORDER BY key.
-    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES",
+    );
     assert_eq!(data_rows(&bytes), ["10", "10"]);
-    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft ORDER BY v FETCH FIRST 3 ROWS WITH TIES");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT v FROM ft ORDER BY v FETCH FIRST 3 ROWS WITH TIES",
+    );
     assert_eq!(data_rows(&bytes), ["10", "10", "20", "20"]);
     // WITH TIES requires ORDER BY (42601).
-    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft FETCH FIRST 2 ROWS WITH TIES");
-    assert!(String::from_utf8_lossy(&bytes).contains("42601"), "{}", String::from_utf8_lossy(&bytes));
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT v FROM ft FETCH FIRST 2 ROWS WITH TIES",
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     // WITH TIES over a grouped/aggregate query.
-    let bytes = run_with(&mut e, &mut b, "SELECT v, count(*) FROM ft GROUP BY v ORDER BY count(*) FETCH FIRST 1 ROWS WITH TIES");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT v, count(*) FROM ft GROUP BY v ORDER BY count(*) FETCH FIRST 1 ROWS WITH TIES",
+    );
     assert_eq!(data_rows(&bytes), ["10|2", "20|2", "30|2"]);
     // WITH TIES over a UNION.
-    let bytes = run_with(&mut e, &mut b, "SELECT v FROM ft UNION ALL SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT v FROM ft UNION ALL SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES",
+    );
     assert_eq!(data_rows(&bytes), ["10", "10", "10", "10"]);
 }
 
 #[test]
 fn domains_enforce_and_report() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE DOMAIN posint AS int CHECK (VALUE > 0)");
-    run_with(&mut e, &mut b, "CREATE DOMAIN email AS text NOT NULL CHECK (VALUE LIKE '%@%')");
-    run_with(&mut e, &mut b, "CREATE TABLE dt (id posint DEFAULT 1, addr email)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE DOMAIN posint AS int CHECK (VALUE > 0)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE DOMAIN email AS text NOT NULL CHECK (VALUE LIKE '%@%')",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE dt (id posint DEFAULT 1, addr email)",
+    );
     run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, 'a@b.com')");
     run_with(&mut e, &mut b, "INSERT INTO dt (addr) VALUES ('x@y.com')"); // id defaults to 1
     // pg_typeof: the domain on a bare column, the base through an expression.
-    let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(id), pg_typeof(addr), pg_typeof(id + 1) FROM dt WHERE id = 5");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT pg_typeof(id), pg_typeof(addr), pg_typeof(id + 1) FROM dt WHERE id = 5",
+    );
     assert_eq!(data_rows(&bytes), ["posint|email|integer"]);
     let bytes = run_with(&mut e, &mut b, "SELECT id, addr FROM dt ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1|x@y.com", "5|a@b.com"]);
     // Constraint violations.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (-1, 'a@b.com')")).contains("23514"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, 'bad')")).contains("23514"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, NULL)")).contains("23502"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO dt VALUES (-1, 'a@b.com')"
+        ))
+        .contains("23514")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO dt VALUES (5, 'bad')"
+        ))
+        .contains("23514")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, NULL)"))
+            .contains("23502")
+    );
     // DROP RESTRICT fails with a dependent column.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP DOMAIN posint")).contains("2BP01"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP DOMAIN posint")).contains("2BP01")
+    );
     // Unknown type name.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad (a nope)")).contains("42704"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad (a nope)"))
+            .contains("42704")
+    );
+
+    // Explicit casts run the same base coercion + constraint path as columns.
+    let bytes = run_with(&mut e, &mut b, "SELECT 5::posint, pg_typeof(5::posint)");
+    assert_eq!(data_rows(&bytes), ["5|posint"]);
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT 0::posint")).contains("23514")
+    );
+
+    // A domain over a domain keeps the parent constraint chain and inherited
+    // default, while adding its own rules. Arrays validate every element.
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE DOMAIN smallpos AS posint DEFAULT 7 CHECK (VALUE < 10)",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE nested (a smallpos, xs smallpos[])",
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("CREATE TABLE"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO nested VALUES (DEFAULT, ARRAY[1,2,9]::smallpos[])",
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("INSERT 0 1"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT a, xs, pg_typeof(a), pg_typeof(xs) FROM nested",
+    );
+    assert_eq!(data_rows(&bytes), ["7|{1,2,9}|smallpos|smallpos[]"]);
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT ARRAY[1,0]::smallpos[]"))
+            .contains("23514")
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "UPDATE nested SET xs = ARRAY[3,4]::smallpos[]",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT xs FROM nested")),
+        ["{3,4}"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "ALTER DOMAIN smallpos ADD CHECK (VALUE < 8)"
+        ))
+        .contains("2BP01")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT ARRAY[1,10]::smallpos[]"))
+            .contains("23514")
+    );
+
+    // ALTER validates stored scalar values before installing a stronger rule.
+    run_with(&mut e, &mut b, "CREATE DOMAIN capped AS int");
+    run_with(&mut e, &mut b, "CREATE TABLE capped_t (v capped)");
+    run_with(&mut e, &mut b, "INSERT INTO capped_t VALUES (8)");
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "ALTER DOMAIN capped ADD CHECK (VALUE < 5)"
+        ))
+        .contains("23514")
+    );
+    // The failed ALTER was rolled back, not left half-installed.
+    run_with(&mut e, &mut b, "INSERT INTO capped_t VALUES (9)");
+
+    // Successful ALTER actions also carry compact transaction inverses. This
+    // exercises nullability, default, added-check, and dropped-check rollback
+    // without embedding a whole domain catalog in every undo entry.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "BEGIN;\
+         ALTER DOMAIN capped SET NOT NULL;\
+         ALTER DOMAIN capped SET DEFAULT 4;\
+         ALTER DOMAIN capped ADD CHECK (VALUE < 10);\
+         ROLLBACK;\
+         INSERT INTO capped_t VALUES (12);\
+         INSERT INTO capped_t VALUES (NULL);\
+         SELECT v FROM capped_t ORDER BY v NULLS LAST",
+    );
+    assert_eq!(data_rows(&bytes), ["8", "9", "12", "NULL"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "BEGIN;\
+         ALTER DOMAIN posint DROP CONSTRAINT posint_check;\
+         ROLLBACK;\
+         SELECT 0::posint",
+    );
+    assert!(String::from_utf8_lossy(&bytes).contains("23514"));
 }
 
 #[test]
@@ -2780,31 +2965,125 @@ fn domains_survive_restart() {
 #[test]
 fn enums_order_and_enforce() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
-    run_with(&mut e, &mut b, "CREATE TABLE et (id int, m mood)");
-    run_with(&mut e, &mut b, "INSERT INTO et VALUES (1,'happy'),(2,'sad'),(3,'ok')");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE et (id int, m mood, moods mood[])",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO et VALUES \
+         (1,'happy',ARRAY['happy']::mood[]),\
+         (2,'sad',ARRAY['sad','happy']::mood[]),\
+         (3,'ok',ARRAY['ok']::mood[])",
+    );
     // Ordering follows definition order, not label text.
     let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
     assert_eq!(data_rows(&bytes), ["2", "3", "1"]);
     // pg_typeof reports the enum; comparison uses the sort order.
     let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(m) FROM et WHERE id = 1");
     assert_eq!(data_rows(&bytes), ["mood"]);
-    let bytes = run_with(&mut e, &mut b, "SELECT id FROM et WHERE m > 'sad' ORDER BY id");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id FROM et WHERE m > 'sad' ORDER BY id",
+    );
     assert_eq!(data_rows(&bytes), ["1", "3"]);
     // An invalid label is 22P02, on write and on cast.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO et VALUES (9,'nope')")).contains("22P02"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT 'nope'::mood")).contains("22P02"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO et VALUES (9,'nope','{}'::mood[])"
+        ))
+        .contains("22P02")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT 'nope'::mood")).contains("22P02")
+    );
     // ADD VALUE BEFORE inserts between neighbours; the new order is respected.
-    run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'");
-    run_with(&mut e, &mut b, "INSERT INTO et VALUES (4,'meh')");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO et VALUES (4,'meh',ARRAY['meh']::mood[])",
+    );
     let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
     assert_eq!(data_rows(&bytes), ["2", "4", "3", "1"]);
     // A duplicate label errors 42710; IF NOT EXISTS is a no-op.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'ok'")).contains("42710"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'ok'"))
+            .contains("42710")
+    );
     // DROP RESTRICT fails while a column depends on the enum.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
-    // RENAME VALUE is a loud, documented gap.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'")).contains("0A000"));
+    // Renames rewrite inline scalar/array labels while preserving sort order,
+    // then move the type identity (including its generated array type).
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'",
+    );
+    let bytes = run_with(&mut e, &mut b, "SELECT m, moods FROM et WHERE id=2");
+    assert_eq!(data_rows(&bytes), ["blue|{blue,happy}"]);
+    run_with(&mut e, &mut b, "ALTER TYPE mood RENAME TO feeling");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT pg_typeof(m), pg_typeof(moods), m, moods FROM et WHERE id=2",
+    );
+    assert_eq!(data_rows(&bytes), ["feeling|feeling[]|blue|{blue,happy}"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "UPDATE et SET moods = ARRAY['meh']::feeling[] WHERE id = 4",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT moods FROM et WHERE id = 4"
+        )),
+        ["{meh}"]
+    );
+
+    // Catalog changes and the row rewrite are ordinary transactional work:
+    // every inverse is compact, savepoint-safe, and restores the prior names.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "BEGIN;\
+         ALTER TYPE feeling ADD VALUE 'ecstatic';\
+         ALTER TYPE feeling RENAME VALUE 'blue' TO 'azure';\
+         ALTER TYPE feeling RENAME TO emotion;\
+         ROLLBACK;\
+         SELECT pg_typeof(m), m, moods FROM et WHERE id=2",
+    );
+    assert_eq!(data_rows(&bytes), ["feeling|blue|{blue,happy}"]);
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT 'ecstatic'::feeling"))
+            .contains("22P02")
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TYPE array_only AS ENUM ('x');\
+         CREATE TABLE enum_array_only (values array_only[])",
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE array_only"))
+            .contains("2BP01")
+    );
 }
 
 #[test]
@@ -2833,6 +3112,102 @@ fn enums_survive_restart() {
         run_with(&mut e, &mut b, "INSERT INTO et VALUES (4,'ok')");
         let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
         assert_eq!(data_rows(&bytes), ["3", "2", "4", "1"]);
+    }
+}
+
+#[test]
+fn user_type_schema_identity_survives_restart() {
+    let config = test_config("user-type-schema-durable");
+    {
+        let mut b = Budget::new(1 << 25);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        run_with(&mut e, &mut b, "CREATE SCHEMA first; CREATE SCHEMA second");
+        run_with(
+            &mut e,
+            &mut b,
+            "CREATE DOMAIN first.measure AS int CHECK (VALUE > 0);\
+             CREATE DOMAIN second.measure AS int CHECK (VALUE < 0);\
+             CREATE DOMAIN first.small AS first.measure CHECK (VALUE < 10);\
+             CREATE TYPE first.state AS ENUM ('red');\
+             CREATE TYPE second.state AS ENUM ('blue')",
+        );
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "CREATE TABLE typed (\
+                 positive first.small,\
+                 negative second.measure,\
+                 positives first.measure[],\
+                 negatives second.measure[],\
+                 signal first.state,\
+                 signals second.state[]\
+             )",
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("CREATE TABLE"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO typed VALUES (\
+                 5, -5,\
+                 ARRAY[1,2]::first.measure[],\
+                 ARRAY[-1,-2]::second.measure[],\
+                 'red', ARRAY['blue']::second.state[]\
+             )",
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("INSERT 0 1"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let bytes = run_with(&mut e, &mut b, "ALTER TYPE first.state RENAME TO signal");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("ALTER TYPE"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT typname FROM pg_type WHERE typname IN ('signal','state') ORDER BY typname",
+        );
+        assert_eq!(data_rows(&bytes), ["signal", "state"]);
+        e.commit_wal();
+    }
+    {
+        let mut b = Budget::new(1 << 25);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT positive, negative, positives, negatives, signal, signals FROM typed",
+        );
+        assert_eq!(data_rows(&bytes), ["5|-5|{1,2}|{-1,-2}|red|{blue}"]);
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT typname FROM pg_type WHERE typname IN ('signal','state') ORDER BY typname",
+        );
+        assert_eq!(data_rows(&bytes), ["signal", "state"]);
+        assert!(
+            String::from_utf8_lossy(&run_with(
+                &mut e,
+                &mut b,
+                "INSERT INTO typed VALUES (\
+                    -1, 1, '{}', '{}', 'red', ARRAY['blue']::second.state[]\
+                 )"
+            ))
+            .contains("23514")
+        );
+        let bytes = run_with(&mut e, &mut b, "SELECT 'blue'::first.signal");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("22P02"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 }
 

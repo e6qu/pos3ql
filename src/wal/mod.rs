@@ -57,6 +57,8 @@ const KIND_CREATE_DOMAIN: u8 = 21;
 const KIND_DROP_DOMAIN: u8 = 22;
 const KIND_CREATE_ENUM: u8 = 23;
 const KIND_DROP_ENUM: u8 = 24;
+const KIND_RENAME_ENUM: u8 = 25;
+const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -185,6 +187,11 @@ pub enum WalOp<'a> {
     DropEnum {
         schema: &'a str,
         name: &'a str,
+    },
+    RenameEnum {
+        schema: &'a str,
+        old_name: &'a str,
+        new_name: &'a str,
     },
     /// A `nextval`/`setval`/`RESTART` advance: the absolute value state, so
     /// replay is idempotent. Advances are non-transactional (they survive
@@ -347,11 +354,10 @@ impl Wal {
                     continue 'outer;
                 }
                 let stored_crc = u32::from_le_bytes(data[0..4].try_into().unwrap());
-                let payload_len =
-                    u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+                let payload_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_DROP_ENUM).contains(&kind)
+                if !(KIND_CREATE..=KIND_RENAME_ENUM).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -558,6 +564,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
         WalOp::CreateEnum(_) => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
+        WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
     }
 }
 
@@ -571,9 +578,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 n += 2 + c.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
                 // auto_increment_step (i64).
                 n += 8;
-                // Domain-typed column: the domain name (1-byte len + bytes).
+                // User-defined column: name, then a format marker and schema.
                 if let Some(d) = &c.domain {
                     n += 1 + d.as_str().len();
+                    n += 2 + c.user_type_schema.map_or(0, |schema| schema.as_str().len());
                 }
             }
             // uniques
@@ -641,8 +649,26 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateDomain(def) => {
             let de = def.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
-            let mut n = 1 + def.name.as_str().len() + 1 + def.schema.as_str().len()
-                + 1 + 4 + 1 + 2 + de + 1;
+            let parent = def.base_domain.map(|d| d.as_str().len()).unwrap_or(0);
+            let parent_schema = def
+                .base_domain_schema
+                .map(|schema| schema.as_str().len())
+                .unwrap_or(0);
+            let mut n = 1
+                + def.name.as_str().len()
+                + 1
+                + def.schema.as_str().len()
+                + 1
+                + 1
+                + parent
+                + 1
+                + parent_schema
+                + 1
+                + 4
+                + 1
+                + 2
+                + de
+                + 1;
             for c in def.checks() {
                 n += 1 + c.name.as_str().len() + 2 + c.expression.as_str().len();
             }
@@ -657,12 +683,15 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n
         }
         WalOp::DropEnum { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SequenceAdvance { schema, name, .. } => {
-            1 + name.len() + 1 + schema.len() + 8 + 1
-        }
-        WalOp::Comment { schema, name, text, .. } => {
-            1 + name.len() + 1 + schema.len() + 1 + 4 + 1 + text.map_or(0, |t| 2 + t.len())
-        }
+        WalOp::RenameEnum {
+            schema,
+            old_name,
+            new_name,
+        } => 1 + old_name.len() + 1 + schema.len() + 1 + new_name.len(),
+        WalOp::SequenceAdvance { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 8 + 1,
+        WalOp::Comment {
+            schema, name, text, ..
+        } => 1 + name.len() + 1 + schema.len() + 1 + 4 + 1 + text.map_or(0, |t| 2 + t.len()),
     }
 }
 
@@ -695,6 +724,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
                 if let Some(d) = &c.domain {
                     ok &= name_bytes(buffer, d.as_str());
+                    ok &= buffer.append(&[u8::MAX]);
+                    let schema = c
+                        .user_type_schema
+                        .expect("user-defined column carries its type schema");
+                    ok &= name_bytes(buffer, schema.as_str());
                 }
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -837,6 +871,18 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let de = def.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
             let mut ok = name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
+                && buffer.append(&[DOMAIN_PAYLOAD_WITH_PARENT])
+                && name_bytes(
+                    buffer,
+                    def.base_domain.as_ref().map(|d| d.as_str()).unwrap_or(""),
+                )
+                && name_bytes(
+                    buffer,
+                    def.base_domain_schema
+                        .as_ref()
+                        .map(|schema| schema.as_str())
+                        .unwrap_or(""),
+                )
                 && buffer.append(&[def.base.code()])
                 && buffer.append(&def.base_type_mod.to_le_bytes())
                 && buffer.append(&[u8::from(def.not_null)])
@@ -862,16 +908,34 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::DropEnum { schema, name } => {
-            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        WalOp::DropEnum { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::RenameEnum {
+            schema,
+            old_name,
+            new_name,
+        } => {
+            name_bytes(buffer, old_name)
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, new_name)
         }
-        WalOp::SequenceAdvance { schema, name, last, is_called } => {
+        WalOp::SequenceAdvance {
+            schema,
+            name,
+            last,
+            is_called,
+        } => {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&last.to_le_bytes())
                 && buffer.append(&[u8::from(*is_called)])
         }
-        WalOp::Comment { class, schema, name, subid, text } => {
+        WalOp::Comment {
+            class,
+            schema,
+            name,
+            subid,
+            text,
+        } => {
             let mut ok = name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&[*class])
@@ -935,6 +999,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     identity_always: false,
                     auto_increment_step: 1,
                     domain: None,
+                    user_type_schema: None,
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
                 ..TableDef::empty()
@@ -961,10 +1026,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 8;
                 // Bit 7 set (in a journal written by this build or later) means a
                 // domain name follows; older journals have it clear.
-                let domain = if meta[1] & 128 != 0 {
-                    Some(SqlName::parse(take_name(&mut at)?).ok()?)
+                let (domain, user_type_schema) = if meta[1] & 128 != 0 {
+                    let domain = Some(SqlName::parse(take_name(&mut at)?).ok()?);
+                    let schema = if payload.get(at).copied() == Some(u8::MAX) {
+                        at += 1;
+                        Some(SqlName::parse(take_name(&mut at)?).ok()?)
+                    } else {
+                        // Journals written before schemas were included retain
+                        // an unresolved schema; startup accepts it only when
+                        // the name identifies exactly one visible type.
+                        None
+                    };
+                    (domain, schema)
                 } else {
-                    None
+                    (None, None)
                 };
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
@@ -981,6 +1056,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     identity_always: meta[1] & 64 != 0,
                     auto_increment_step,
                     domain,
+                    user_type_schema,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -1273,6 +1349,25 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_CREATE_DOMAIN => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
+            let (base_domain, base_domain_schema) =
+                if *payload.get(at)? == DOMAIN_PAYLOAD_WITH_PARENT {
+                    at += 1;
+                    let base_domain_name = take_name(&mut at)?;
+                    let base_domain = if base_domain_name.is_empty() {
+                        None
+                    } else {
+                        Some(SqlName::parse(base_domain_name).ok()?)
+                    };
+                    let base_domain_schema_name = take_name(&mut at)?;
+                    let base_domain_schema = if base_domain_schema_name.is_empty() {
+                        None
+                    } else {
+                        Some(SqlName::parse(base_domain_schema_name).ok()?)
+                    };
+                    (base_domain, base_domain_schema)
+                } else {
+                    (None, None)
+                };
             let base = crate::sql::types::ColType::from_code(*payload.get(at)?)?;
             at += 1;
             let base_type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
@@ -1307,6 +1402,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at: 0,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
+                base_domain,
+                base_domain_schema,
                 base,
                 base_type_mod,
                 not_null,
@@ -1352,6 +1449,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropEnum { schema, name })
+        }
+        KIND_RENAME_ENUM => {
+            let old_name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameEnum {
+                schema,
+                old_name,
+                new_name,
+            })
         }
         KIND_CREATE_SCHEMA => {
             let name = take_name(&mut at)?;
@@ -1614,6 +1721,7 @@ mod tests {
                 identity_always: false,
                 auto_increment_step: 1,
                 domain: None,
+                user_type_schema: None,
             }; MAX_COLUMNS],
             n_columns: 2,
             ..TableDef::empty()
@@ -1633,6 +1741,7 @@ mod tests {
             identity_always: false,
             auto_increment_step: 1,
             domain: None,
+            user_type_schema: None,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -1649,6 +1758,7 @@ mod tests {
             identity_always: false,
             auto_increment_step: 1,
             domain: None,
+            user_type_schema: None,
         };
         // A multi-column UNIQUE, a CHECK, and a FOREIGN KEY, so the WAL
         // round-trip covers every constraint kind.
@@ -1786,6 +1896,40 @@ mod tests {
         // Appending continues after the replayed tail.
         wal.append(10, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
         wal.commit();
+    }
+
+    #[test]
+    fn legacy_domain_payload_without_parent_fields_still_decodes() {
+        fn push_name(payload: &mut Vec<u8>, value: &str) {
+            payload.push(value.len() as u8);
+            payload.extend_from_slice(value.as_bytes());
+        }
+
+        let mut payload = Vec::new();
+        push_name(&mut payload, "positive");
+        push_name(&mut payload, "public");
+        payload.push(ColType::Int4.code());
+        payload.extend_from_slice(&(-1_i32).to_le_bytes());
+        payload.push(1);
+        payload.extend_from_slice(&(1_u16).to_le_bytes());
+        payload.extend_from_slice(b"7");
+        payload.push(1);
+        push_name(&mut payload, "positive_check");
+        payload.extend_from_slice(&(9_u16).to_le_bytes());
+        payload.extend_from_slice(b"VALUE > 0");
+
+        let WalOp::CreateDomain(domain) =
+            decode_op(KIND_CREATE_DOMAIN, &payload).expect("legacy domain payload")
+        else {
+            panic!("decoded the wrong WAL operation");
+        };
+        assert_eq!(domain.schema.as_str(), "public");
+        assert_eq!(domain.name.as_str(), "positive");
+        assert_eq!(domain.base, ColType::Int4);
+        assert_eq!(domain.base_domain, None);
+        assert_eq!(domain.base_domain_schema, None);
+        assert_eq!(domain.default_expr.expect("domain default").as_str(), "7");
+        assert_eq!(domain.checks()[0].expression.as_str(), "VALUE > 0");
     }
 
     #[test]

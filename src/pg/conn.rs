@@ -170,12 +170,21 @@ impl Conn {
         self.arena.reset();
         self.txn.clear();
         self.sqlprep.clear();
+        self.cursors.clear();
         for p in &mut self.prepared {
             p.active = false;
         }
         for p in &mut self.portals {
             p.active = false;
         }
+        // A recycled slot must carry no session state from its previous client:
+        // reset the GUCs (else a `SET` leaks across connections — SHOW/SET/
+        // current_setting all read a stale value), the auth flow, and any COPY
+        // left in flight by an abrupt disconnect.
+        self.guc = GucState::new();
+        self.scram = ScramFlow::new();
+        self.copy = None;
+        self.copy_buf.clear();
         self.phase = Phase::Startup;
         self.minor = 0;
         self.id = id;

@@ -72,7 +72,8 @@ Working single-node database:
   with `ALTER TYPE ... ADD VALUE`, ordered by definition order and reflected in
   `pg_type`/`pg_enum`), casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
-  introspection, PostgreSQL lexical rules, and SQLSTATE-correct errors.
+  introspection, `SHOW` / `SET` and `current_setting(...)` for session settings,
+  PostgreSQL lexical rules, and SQLSTATE-correct errors.
 - COPY FROM STDIN / TO STDOUT in PostgreSQL's text, CSV, and binary formats —
   psql `\copy` and pg_dump-style inline data streams work, with each type's
   input and output functions and full constraint enforcement. The binary format

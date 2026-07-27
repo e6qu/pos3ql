@@ -57,6 +57,65 @@ fn session_schemas() -> SessionSchemas {
     SESSION_SCHEMAS.with(|s| *s.borrow())
 }
 
+/// Maximum number of readable settings published per statement for
+/// `current_setting`. Comfortably covers the `SHOW ALL` set plus a margin.
+pub const MAX_SESSION_SETTINGS: usize = 32;
+
+/// A per-statement snapshot of the session's readable settings (name → value),
+/// published like the session user so `current_setting` reads exactly what
+/// `SHOW` would. Names are static; values are copied from the session GUC store.
+#[derive(Clone, Copy)]
+pub struct SessionSettings {
+    pub names: [&'static str; MAX_SESSION_SETTINGS],
+    pub values: [crate::util::StackStr<256>; MAX_SESSION_SETTINGS],
+    pub n: usize,
+}
+
+std::thread_local! {
+    static SESSION_SETTINGS: core::cell::RefCell<SessionSettings> = const {
+        core::cell::RefCell::new(SessionSettings {
+            names: [""; MAX_SESSION_SETTINGS],
+            values: [crate::util::StackStr::new(); MAX_SESSION_SETTINGS],
+            n: 0,
+        })
+    };
+}
+
+/// Publishes the readable settings for the statement about to evaluate. Each
+/// pair is `(static name, current value)`; more than `MAX_SESSION_SETTINGS` is a
+/// loud error, never silent truncation.
+pub fn set_session_settings(pairs: &[(&'static str, &str)]) -> Result<(), SqlError> {
+    if pairs.len() > MAX_SESSION_SETTINGS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many session settings to publish ({} > {})",
+            pairs.len(),
+            MAX_SESSION_SETTINGS
+        ));
+    }
+    SESSION_SETTINGS.with(|s| {
+        let mut s = s.borrow_mut();
+        for (i, &(name, value)) in pairs.iter().enumerate() {
+            s.names[i] = name;
+            let mut v = crate::util::StackStr::new();
+            let _ = core::fmt::Write::write_str(&mut v, value);
+            s.values[i] = v;
+        }
+        s.n = pairs.len();
+    });
+    Ok(())
+}
+
+/// The published value of setting `name` (case-insensitive), if any.
+fn session_setting(name: &str) -> Option<crate::util::StackStr<256>> {
+    SESSION_SETTINGS.with(|s| {
+        let s = s.borrow();
+        (0..s.n)
+            .find(|&i| s.names[i].eq_ignore_ascii_case(name))
+            .map(|i| s.values[i])
+    })
+}
+
 pub fn set_session_user(user: &str) {
     SESSION_USER.with(|u| {
         let mut u = u.borrow_mut();
@@ -119,6 +178,7 @@ pub(crate) fn dispatch<'a>(
             | "format_type"
             | "pg_encoding_to_char"
             | "pg_typeof"
+            | "current_setting"
     ) {
         return None;
     }
@@ -147,6 +207,41 @@ pub(crate) fn dispatch<'a>(
             "current_database" | "current_catalog" => {
                 arity(0)?;
                 Ok(Datum::Text("postgres"))
+            }
+            // `current_setting(name [, missing_ok])` returns the setting's value
+            // as text — the same value `SHOW name` reports. An unknown setting
+            // errors `42704`, unless `missing_ok` is true, when it returns NULL.
+            "current_setting" => {
+                if args.len() != 1 && args.len() != 2 || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function current_setting(...) with {} arguments does not exist",
+                        if star { 1 } else { args.len() }
+                    ));
+                }
+                let name_value = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(t) => t,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "current_setting() requires a text setting name"
+                        ))
+                    }
+                };
+                let missing_ok = args.len() == 2
+                    && matches!(eval_full(args[1], arena, params, row, hooks)?, Datum::Bool(true));
+                match session_setting(name_value) {
+                    Some(v) => Ok(Datum::Text(
+                        arena.alloc_str(v.as_str()).map_err(|_| arena_full())?,
+                    )),
+                    None if missing_ok => Ok(Datum::Null),
+                    None => Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "unrecognized configuration parameter \"{}\"",
+                        name_value
+                    )),
+                }
             }
             "current_schema" => {
                 arity(0)?;

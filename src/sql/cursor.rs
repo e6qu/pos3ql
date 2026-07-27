@@ -79,6 +79,15 @@ impl CursorPool {
         Ok(Self { slots, emit: Vec::with_capacity(MAX_CURSOR_ROWS) })
     }
 
+    /// Closes every cursor — used when a connection slot is recycled for a new
+    /// client so no cursor leaks across sessions.
+    pub fn clear(&mut self) {
+        for s in &mut self.slots {
+            s.active = false;
+        }
+        self.emit.clear();
+    }
+
     fn find(&self, name: &str) -> Option<usize> {
         self.slots
             .iter()

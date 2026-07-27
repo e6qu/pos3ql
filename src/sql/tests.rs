@@ -2776,6 +2776,26 @@ fn for_update_locking_clause() {
 }
 
 #[test]
+fn current_setting_reads_gucs() {
+    // current_setting(name [, missing_ok]) returns a setting's value as text —
+    // the same value SHOW reports — and composes in expressions.
+    let (mut e, mut b) = test_engine();
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT current_setting('client_encoding')")), ["UTF8"]);
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT current_setting('server_version_num')")), ["180004"]);
+    // Case-insensitive name; composes under another function.
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT lower(current_setting('SERVER_ENCODING'))")), ["utf8"]);
+    // Reflects a SET earlier in the same message.
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SET search_path = myschema, public; SELECT current_setting('search_path')")),
+        ["myschema, public"]
+    );
+    // Unknown setting: 42704, or NULL with missing_ok = true.
+    let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    assert!(err(&run_with(&mut e, &mut b, "SELECT current_setting('no_such_xyz')")).contains("42704"));
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT current_setting('no_such_xyz', true) IS NULL")), ["t"]);
+}
+
+#[test]
 fn fromless_select_with_subquery() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t1 (x int)");

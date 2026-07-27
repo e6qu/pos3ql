@@ -33,6 +33,75 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
     }
 }
 
+/// Coerces a value to a domain's base representation, applies the base typmod,
+/// then enforces the domain's own constraints. This is the one catalog-aware
+/// path shared by explicit casts, domain-array elements, and table writes.
+pub(crate) fn coerce_domain_value<'a>(
+    storage: &Storage,
+    slot: usize,
+    value: Datum<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<Datum<'a>, SqlError> {
+    let domain = storage.domain(slot);
+    let value = if let Some(parent_name) = domain.base_domain {
+        let parent_schema = domain
+            .base_domain_schema
+            .expect("parent domain identity carries its schema");
+        let parent = storage
+            .domain_slot(parent_schema.as_str(), parent_name.as_str(), txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "base domain \"{}.{}\" does not exist",
+                    parent_schema.as_str(),
+                    parent_name.as_str()
+                )
+            })?;
+        coerce_domain_value(storage, parent, value, txid, arena, params)?
+    } else {
+        crate::sql::eval::cast_to(value, domain.base, arena)?
+    };
+    let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
+    validate_domain_value(domain, value, arena, params)?;
+    Ok(value)
+}
+
+fn validate_domain_value(
+    domain: &crate::storage::DomainDef,
+    value: Datum,
+    arena: &Arena,
+    params: &[Datum],
+) -> Result<(), SqlError> {
+    if value.is_null() {
+        if domain.not_null {
+            return Err(sql_err!(
+                sqlstate::NOT_NULL_VIOLATION,
+                "domain {} does not allow null values",
+                domain.name.as_str()
+            ));
+        }
+        return Ok(());
+    }
+    let context = ValueLookup { value };
+    for check in domain.checks() {
+        let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+        if matches!(
+            eval(expression, arena, params, &context)?,
+            Datum::Bool(false)
+        ) {
+            return Err(sql_err!(
+                sqlstate::CHECK_VIOLATION,
+                "value for domain {} violates check constraint \"{}\"",
+                domain.name.as_str(),
+                check.name.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Enforces every domain-typed column's NOT NULL and CHECK constraints against a
 /// candidate row: base coercion has already happened, so this only runs the
 /// domain's own rules, binding `VALUE` to each column's value.
@@ -46,31 +115,28 @@ pub(crate) fn check_domain_constraints(
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
         let Some(dname) = col.domain else { continue };
-        let Some(domain) = storage.domain_by_name(dname.as_str(), txid) else { continue };
-        let value = values.get(i).copied().unwrap_or(Datum::Null);
-        if value.is_null() {
-            if domain.not_null {
-                return Err(sql_err!(
-                    sqlstate::NOT_NULL_VIOLATION,
-                    "domain {} does not allow null values",
-                    dname.as_str()
-                ));
-            }
-            // NULL bypasses a domain's CHECK constraints (three-valued logic).
+        // Enum identity also lives in `domain`, as do enum/domain array element
+        // identities. Only a scalar domain applies its constraint to the whole
+        // column value; a domain array validates each element while coercing.
+        if matches!(
+            col.ctype,
+            ColType::Enum(_)
+                | ColType::Array(crate::sql::types::ArrElem::Enum(_))
+                | ColType::Array(crate::sql::types::ArrElem::Domain { .. })
+        ) {
             continue;
         }
-        let context = ValueLookup { value };
-        for check in domain.checks() {
-            let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-            if matches!(eval(expression, arena, params, &context)?, Datum::Bool(false)) {
-                return Err(sql_err!(
-                    sqlstate::CHECK_VIOLATION,
-                    "value for domain {} violates check constraint \"{}\"",
-                    dname.as_str(),
-                    check.name.as_str()
-                ));
-            }
-        }
+        let Some(schema) = col.user_type_schema else {
+            continue;
+        };
+        let Some(slot) = storage.domain_slot(schema.as_str(), dname.as_str(), txid) else {
+            continue;
+        };
+        let value = values.get(i).copied().unwrap_or(Datum::Null);
+        // The column was already coerced to the base representation. Reusing
+        // the catalog-aware path applies every inherited constraint as well as
+        // the leaf domain's rules.
+        let _ = coerce_domain_value(storage, slot, value, txid, arena, params)?;
     }
     Ok(())
 }

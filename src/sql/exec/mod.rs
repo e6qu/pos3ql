@@ -114,29 +114,31 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod describe;
-pub use describe::{could_not_identify, init_record_shapes, not_composite, register_shape_for, reset_record_shapes, expr_record_handle as expr_record_handle_pub, visit_record_shape as visit_record_shape_pub,
-    check_row_field_types, derived_name, describe_items, infer_type_pub, infer_type_res,
-    record_field_type, record_shape, typeof_static, typeof_static_coltype, ColTypeResolver, DefCols, NoCols,
-    RECORD_FIELD_NAMES,
+pub use describe::{
+    ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
+    could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
+    infer_type_pub, infer_type_res, init_record_shapes, not_composite, record_field_type,
+    record_shape, register_shape_for, reset_record_shapes, typeof_static, typeof_static_coltype,
+    visit_record_shape as visit_record_shape_pub,
 };
 pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeric_tower};
 
 mod projected;
 pub use projected::{
-    decode_projected_col_record, decode_projected_pub, decode_projected_value, encode_projected_pub, projected_prefix_len,
-    projected_value_len, sort_dedup_projected,
+    decode_projected_col_record, decode_projected_pub, decode_projected_value,
+    encode_projected_pub, projected_prefix_len, projected_value_len, sort_dedup_projected,
 };
 
 mod ddl;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 
 mod constraints;
-pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
+pub(crate) use constraints::coerce_domain_value;
 use constraints::{
-    apply_fk_parent_actions, enforce_row_constraints, parse_checks, parse_defaults,
-    parse_generated, referenced_key_changed, table_is_referenced, ParsedChecks,
-    MAX_FK_CASCADE_DEPTH,
+    MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions, enforce_row_constraints,
+    parse_checks, parse_defaults, parse_generated, referenced_key_changed, table_is_referenced,
 };
+pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
 
 pub fn create_table(
     storage: &mut Storage,
@@ -1758,6 +1760,7 @@ pub fn create_table_as(
             identity_always: false,
             auto_increment_step: 1,
             domain: None,
+            user_type_schema: None,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -2465,6 +2468,8 @@ fn validate_domain_expr(
 /// names.
 #[allow(clippy::too_many_arguments)]
 fn build_domain_spec(
+    storage: &Storage,
+    txid: u32,
     domain: &str,
     base_type: &str,
     base_type_mod: i32,
@@ -2473,15 +2478,31 @@ fn build_domain_spec(
     ast_checks: &[crate::sql::ast::DomainCheck],
     arena: &Arena,
 ) -> Result<crate::storage::DomainSpec, SqlError> {
-    let base = ColType::from_sql_name(base_type).ok_or_else(|| {
-        sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", base_type)
-    })?;
+    let (base_domain, base_domain_schema, base, inherited_default) =
+        if let Some(base) = ColType::from_sql_name(base_type) {
+            (None, None, base, None)
+        } else if let Some(parent) = storage.find_domain(base_type, txid) {
+            (
+                Some(parent.name),
+                Some(parent.schema),
+                parent.base,
+                parent.default_expr,
+            )
+        } else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                base_type
+            ));
+        };
     let default_expr = match default_text {
         Some(t) => {
             validate_domain_expr(t, false, arena)?;
             Some(domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(t)?)
         }
-        None => None,
+        // PostgreSQL copies a parent domain's default at CREATE time: a later
+        // ALTER of the parent default does not change the child.
+        None => inherited_default,
     };
     let mut checks = [crate::storage::CheckConstraint::EMPTY; crate::storage::MAX_DOMAIN_CHECKS];
     let mut n = 0;
@@ -2504,7 +2525,16 @@ fn build_domain_spec(
         };
         n += 1;
     }
-    Ok(crate::storage::DomainSpec { base, base_type_mod, not_null, default_expr, checks, n_checks: n })
+    Ok(crate::storage::DomainSpec {
+        base_domain,
+        base_domain_schema,
+        base,
+        base_type_mod,
+        not_null,
+        default_expr,
+        checks,
+        n_checks: n,
+    })
 }
 
 /// PostgreSQL's unnamed-constraint naming for a domain CHECK: `<domain>_check`,
@@ -2546,6 +2576,8 @@ pub fn create_domain(
         ));
     }
     let spec = match build_domain_spec(
+        storage,
+        txn.txid,
         d.name.name,
         d.base_type,
         d.base_type_mod,
@@ -2587,7 +2619,11 @@ pub fn drop_domain(
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
-        let Some(slot) = storage.resolve_domain_slot(name.name, txn.txid) else {
+        let slot = match name.schema {
+            Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
+            None => storage.resolve_domain_slot(name.name, txn.txid),
+        };
+        let Some(slot) = slot else {
             if if_exists {
                 responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
@@ -2643,7 +2679,11 @@ pub fn alter_domain(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::AlterDomainAction as A;
-    let Some(slot) = storage.resolve_domain_slot(name.name, txn.txid) else {
+    let slot = match name.schema {
+        Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
+        None => storage.resolve_domain_slot(name.name, txn.txid),
+    };
+    let Some(slot) = slot else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "type \"{}\" does not exist",
@@ -2653,6 +2693,8 @@ pub fn alter_domain(
     // Start from the current definition and apply the action.
     let current = *storage.domain(slot);
     let mut spec = crate::storage::DomainSpec {
+        base_domain: current.base_domain,
+        base_domain_schema: current.base_domain_schema,
         base: current.base,
         base_type_mod: current.base_type_mod,
         not_null: current.not_null,
@@ -2660,13 +2702,27 @@ pub fn alter_domain(
         checks: current.checks,
         n_checks: current.n_checks,
     };
+    let revalidate;
+    let undo;
     match action {
-        // NOTE: ALTER DOMAIN SET NOT NULL / ADD CHECK do not re-validate
-        // existing rows here (PostgreSQL does). The constraint applies to
-        // subsequent writes; see BUGS.md.
-        A::SetNotNull => spec.not_null = true,
-        A::DropNotNull => spec.not_null = false,
+        A::SetNotNull => {
+            spec.not_null = true;
+            revalidate = true;
+            undo = super::txn::DdlUndo::DomainNullabilityAltered {
+                slot: slot as u32,
+                prior: current.not_null,
+            };
+        }
+        A::DropNotNull => {
+            spec.not_null = false;
+            revalidate = false;
+            undo = super::txn::DdlUndo::DomainNullabilityAltered {
+                slot: slot as u32,
+                prior: current.not_null,
+            };
+        }
         A::SetDefault(text) => {
+            revalidate = false;
             if let Err(e) = validate_domain_expr(text, false, arena) {
                 return sql_fail(e);
             }
@@ -2674,9 +2730,21 @@ pub fn alter_domain(
                 Ok(t) => spec.default_expr = Some(t),
                 Err(e) => return sql_fail(e),
             }
+            undo = super::txn::DdlUndo::DomainDefaultAltered {
+                slot: slot as u32,
+                prior: current.default_expr,
+            };
         }
-        A::DropDefault => spec.default_expr = None,
+        A::DropDefault => {
+            revalidate = false;
+            spec.default_expr = None;
+            undo = super::txn::DdlUndo::DomainDefaultAltered {
+                slot: slot as u32,
+                prior: current.default_expr,
+            };
+        }
         A::AddCheck(check) => {
+            revalidate = true;
             if spec.n_checks == crate::storage::MAX_DOMAIN_CHECKS {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2692,25 +2760,48 @@ pub fn alter_domain(
                     Ok(n) => n,
                     Err(e) => return sql_fail(e),
                 },
-                None => match generate_check_name(current.name.as_str(), &spec.checks[..spec.n_checks]) {
-                    Ok(n) => n,
+                None => {
+                    match generate_check_name(current.name.as_str(), &spec.checks[..spec.n_checks])
+                    {
+                        Ok(n) => n,
+                        Err(e) => return sql_fail(e),
+                    }
+                }
+            };
+            let expression =
+                match domain_text::<{ crate::storage::CHECK_SQL_MAX }>(check.expression) {
+                    Ok(t) => t,
                     Err(e) => return sql_fail(e),
-                },
+                };
+            spec.checks[spec.n_checks] = crate::storage::CheckConstraint {
+                name: cname,
+                expression,
             };
-            let expression = match domain_text::<{ crate::storage::CHECK_SQL_MAX }>(check.expression) {
-                Ok(t) => t,
-                Err(e) => return sql_fail(e),
-            };
-            spec.checks[spec.n_checks] = crate::storage::CheckConstraint { name: cname, expression };
             spec.n_checks += 1;
+            undo = super::txn::DdlUndo::DomainCheckAdded {
+                slot: slot as u32,
+                prior_count: current.n_checks as u8,
+            };
         }
-        A::DropConstraint { name: cname, if_exists } => {
-            let Some(pos) = spec.checks[..spec.n_checks].iter().position(|c| c.name.as_str() == *cname)
+        A::DropConstraint {
+            name: cname,
+            if_exists,
+        } => {
+            revalidate = false;
+            let Some(pos) = spec.checks[..spec.n_checks]
+                .iter()
+                .position(|c| c.name.as_str() == *cname)
             else {
                 if *if_exists {
                     responder.notice(
                         sqlstate::SUCCESSFUL_COMPLETION,
-                        stack_format!(128, "constraint \"{}\" of domain \"{}\" does not exist, skipping", cname, name.name).as_str(),
+                        stack_format!(
+                            128,
+                            "constraint \"{}\" of domain \"{}\" does not exist, skipping",
+                            cname,
+                            name.name
+                        )
+                        .as_str(),
                     )?;
                     responder.command_complete("ALTER DOMAIN")?;
                     return sql_ok();
@@ -2722,18 +2813,42 @@ pub fn alter_domain(
                     name.name
                 ));
             };
+            let prior = spec.checks[pos];
             for i in pos..spec.n_checks - 1 {
                 spec.checks[i] = spec.checks[i + 1];
             }
             spec.n_checks -= 1;
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint::EMPTY;
+            undo = super::txn::DdlUndo::DomainCheckDropped {
+                slot: slot as u32,
+                index: pos as u8,
+                prior,
+            };
         }
     }
     storage.alter_domain(slot, spec);
+    if revalidate && let Err(e) = validate_domain_rows(storage, slot, txn.txid, arena) {
+        storage.alter_domain(
+            slot,
+            crate::storage::DomainSpec {
+                base_domain: current.base_domain,
+                base_domain_schema: current.base_domain_schema,
+                base: current.base,
+                base_type_mod: current.base_type_mod,
+                not_null: current.not_null,
+                default_expr: current.default_expr,
+                checks: current.checks,
+                n_checks: current.n_checks,
+            },
+        );
+        return sql_fail(e);
+    }
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.append(lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
         // Restore the pre-ALTER definition on a journal failure.
         let restore = crate::storage::DomainSpec {
+            base_domain: current.base_domain,
+            base_domain_schema: current.base_domain_schema,
             base: current.base,
             base_type_mod: current.base_type_mod,
             not_null: current.not_null,
@@ -2744,8 +2859,116 @@ pub fn alter_domain(
         storage.alter_domain(slot, restore);
         return sql_fail(e);
     }
+    if let Err(e) = txn.record_ddl(undo) {
+        storage.restore_domain(slot, current);
+        return sql_fail(e);
+    }
     responder.command_complete("ALTER DOMAIN")?;
     sql_ok()
+}
+
+/// Re-validates every stored scalar value whose declared domain is `target` or
+/// a descendant of it. PostgreSQL refuses to ALTER a domain while an array of
+/// that domain exists; scalar columns are scanned before the catalog change is
+/// made visible.
+fn validate_domain_rows(
+    storage: &Storage,
+    target: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let target_name = storage.domain(target).name;
+    for (table_index, table) in storage.live_tables() {
+        let def = table.def;
+        let mut affected = [false; MAX_COLUMNS];
+        let mut any = false;
+        for (column_index, column) in def.columns().iter().enumerate() {
+            let Some(domain_name) = column.domain else {
+                continue;
+            };
+            let Some(domain_schema) = column.user_type_schema else {
+                continue;
+            };
+            let Some(domain_slot) =
+                storage.domain_slot(domain_schema.as_str(), domain_name.as_str(), txid)
+            else {
+                continue;
+            };
+            if !domain_depends_on(storage, domain_slot, target, txid) {
+                continue;
+            }
+            if matches!(
+                column.ctype,
+                ColType::Array(crate::sql::types::ArrElem::Domain { .. })
+            ) {
+                return Err(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot alter type \"{}\" because column \"{}.{}\" uses it",
+                    target_name.as_str(),
+                    def.name.as_str(),
+                    column.name.as_str()
+                ));
+            }
+            affected[column_index] = true;
+            any = true;
+        }
+        if !any {
+            continue;
+        }
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        def.schema(&mut schema);
+        storage.for_each_row_state(table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
+            for column_index in 0..def.n_columns {
+                if !affected[column_index] {
+                    continue;
+                }
+                let domain_name = def.columns()[column_index].domain.expect("affected domain");
+                let domain_schema = def.columns()[column_index]
+                    .user_type_schema
+                    .expect("affected domain schema");
+                let leaf = storage
+                    .domain_slot(domain_schema.as_str(), domain_name.as_str(), txid)
+                    .expect("affected domain remains visible");
+                let _ = coerce_domain_value(
+                    storage,
+                    leaf,
+                    values[column_index],
+                    txid,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                )?;
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+    }
+    Ok(())
+}
+
+fn domain_depends_on(storage: &Storage, mut slot: usize, target: usize, txid: u32) -> bool {
+    for _ in 0..crate::storage::MAX_DOMAINS {
+        if slot == target {
+            return true;
+        }
+        let Some(parent) = storage.domain(slot).base_domain else {
+            return false;
+        };
+        let Some(parent_schema) = storage.domain(slot).base_domain_schema else {
+            return false;
+        };
+        let Some(parent_slot) = storage.domain_slot(parent_schema.as_str(), parent.as_str(), txid)
+        else {
+            return false;
+        };
+        slot = parent_slot;
+    }
+    false
 }
 
 /// Builds an [`EnumSpec`] from a `CREATE TYPE ... AS ENUM` label list: rejects
@@ -2829,7 +3052,11 @@ pub fn drop_enum(
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
-        let Some(slot) = storage.resolve_enum_slot(name.name, txn.txid) else {
+        let slot = match name.schema {
+            Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
+            None => storage.resolve_enum_slot(name.name, txn.txid),
+        };
+        let Some(slot) = slot else {
             if if_exists {
                 responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
@@ -2881,10 +3108,15 @@ pub fn alter_type(
     txn: &mut TxnState,
     name: &QualName,
     action: &crate::sql::ast::AlterTypeAction,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::AlterTypeAction as A;
-    let Some(slot) = storage.resolve_enum_slot(name.name, txn.txid) else {
+    let slot = match name.schema {
+        Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
+        None => storage.resolve_enum_slot(name.name, txn.txid),
+    };
+    let Some(slot) = slot else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "type \"{}\" does not exist",
@@ -2928,35 +3160,259 @@ pub fn alter_type(
                 members: current.members,
                 n_members: current.n_members,
             };
-            spec.members[spec.n_members] = crate::storage::EnumMember { label: new_label, sort };
+            spec.members[spec.n_members] = crate::storage::EnumMember {
+                label: new_label,
+                sort,
+            };
             spec.n_members += 1;
             storage.alter_enum(slot, spec);
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
-                storage.alter_enum(slot, crate::storage::EnumSpec {
-                    members: current.members,
-                    n_members: current.n_members,
-                });
+                storage.alter_enum(
+                    slot,
+                    crate::storage::EnumSpec {
+                        members: current.members,
+                        n_members: current.n_members,
+                    },
+                );
+                return sql_fail(e);
+            }
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumValueAdded {
+                slot: slot as u32,
+                prior_count: current.n_members as u8,
+            }) {
+                storage.restore_enum(slot, current);
                 return sql_fail(e);
             }
         }
-        A::RenameTo(_) => {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "ALTER TYPE ... RENAME TO is not supported: enum-typed columns store the \
-                 type name, so a rename would require rewriting every dependent column"
-            ))
+        A::RenameTo(new_name) => {
+            let current = *storage.enum_def(slot);
+            if current.name.as_str() == *new_name {
+                responder.command_complete("ALTER TYPE")?;
+                return sql_ok();
+            }
+            if storage
+                .enum_slot(current.schema.as_str(), new_name, txn.txid)
+                .is_some()
+                || storage
+                    .domain_slot(current.schema.as_str(), new_name, txn.txid)
+                    .is_some()
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    new_name
+                ));
+            }
+            let renamed = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(e) => return sql_fail(e),
+            };
+            storage.rename_enum(slot, renamed);
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(
+                lsn,
+                &WalOp::RenameEnum {
+                    schema: current.schema.as_str(),
+                    old_name: current.name.as_str(),
+                    new_name,
+                },
+            ) {
+                storage.restore_enum(slot, current);
+                return sql_fail(e);
+            }
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumRenamed {
+                slot: slot as u32,
+                prior: current.name,
+            }) {
+                storage.restore_enum(slot, current);
+                return sql_fail(e);
+            }
         }
-        A::RenameValue { .. } => {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "ALTER TYPE ... RENAME VALUE is not supported: enum values are stored inline, \
-                 so a rename would require rewriting every stored row"
-            ))
+        A::RenameValue { from, to } => {
+            let current = *storage.enum_def(slot);
+            let Some(member_index) = current
+                .members()
+                .iter()
+                .position(|member| member.label.as_str() == *from)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "\"{}\" is not an existing enum label",
+                    from
+                ));
+            };
+            if current.sort_of(to).is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "enum label \"{}\" already exists",
+                    to
+                ));
+            }
+            let renamed = match SqlName::parse(to) {
+                Ok(label) => label,
+                Err(e) => return sql_fail(e),
+            };
+            let mut spec = crate::storage::EnumSpec {
+                members: current.members,
+                n_members: current.n_members,
+            };
+            spec.members[member_index].label = renamed;
+            storage.alter_enum(slot, spec);
+            if let Err(e) =
+                rewrite_enum_label(storage, txn, slot as u16, from, renamed.as_str(), arena)
+            {
+                storage.restore_enum(slot, current);
+                return sql_fail(e);
+            }
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.append(lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
+                storage.restore_enum(slot, current);
+                return sql_fail(e);
+            }
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumValueRenamed {
+                slot: slot as u32,
+                index: member_index as u8,
+                prior: current.members[member_index].label,
+            }) {
+                storage.restore_enum(slot, current);
+                return sql_fail(e);
+            }
         }
     }
     responder.command_complete("ALTER TYPE")?;
     sql_ok()
+}
+
+/// Rewrites the inline label carried by every stored value of one enum. The
+/// sort key and type slot are stable, so comparisons and indexes keep their
+/// identity; scalar enum columns, enum arrays, and domain arrays over the enum
+/// all pass through this one walk. Writes are ordinary transaction-pending row
+/// changes, hence rollback/savepoint semantics come for free.
+fn rewrite_enum_label(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    enum_slot: u16,
+    from: &str,
+    to: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for table_index in 0..storage.table_count() {
+        if !storage.table(table_index).visible_to(txn.txid) {
+            continue;
+        }
+        let def = storage.table(table_index).def;
+        let mut affected = [false; MAX_COLUMNS];
+        let mut any = false;
+        for (column_index, column) in def.columns().iter().enumerate() {
+            let hit = matches!(column.ctype, ColType::Enum(slot) if slot == enum_slot)
+                || matches!(
+                    column.ctype,
+                    ColType::Array(element)
+                        if matches!(element.to_coltype(), ColType::Enum(slot) if slot == enum_slot)
+                );
+            affected[column_index] = hit;
+            any |= hit;
+        }
+        if !any {
+            continue;
+        }
+        let count = storage.visible_row_count(table_index, txn.txid)?;
+        let rows = arena
+            .alloc_slice_with(count, |_| None::<(u64, RowHome)>)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "enum rename exceeds the statement arena"
+                )
+            })?;
+        let mut n = 0;
+        storage.for_each_row_state(table_index, &mut |rowid, state| {
+            if let Some(home) = state.visible_at(txn.txid, storage.read_snapshot()) {
+                rows[n] = Some((rowid, home));
+                n += 1;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        def.schema(&mut schema);
+        for entry in rows[..n].iter().copied().flatten() {
+            let (rowid, home) = entry;
+            let source = storage.row_bytes(table_index, rowid, home, arena)?;
+            let bytes = arena.alloc_slice_copy(source).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "enum rename exceeds the statement arena"
+                )
+            })?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
+            let mut changed = false;
+            for column_index in 0..def.n_columns {
+                if !affected[column_index] {
+                    continue;
+                }
+                match values[column_index] {
+                    Datum::Enum { slot, sort, label } if slot == enum_slot && label == from => {
+                        values[column_index] = Datum::Enum {
+                            slot,
+                            sort,
+                            label: arena.alloc_str(to).map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "enum rename exceeds the statement arena"
+                                )
+                            })?,
+                        };
+                        changed = true;
+                    }
+                    Datum::Array { element, raw } => {
+                        let count = crate::sql::array::len(raw);
+                        let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+                        let mut array_changed = false;
+                        for (index, item) in items.iter_mut().take(count).enumerate() {
+                            *item =
+                                crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
+                            if let Datum::Enum { slot, sort, label } = *item
+                                && slot == enum_slot
+                                && label == from
+                            {
+                                *item = Datum::Enum {
+                                    slot,
+                                    sort,
+                                    label: arena.alloc_str(to).map_err(|_| {
+                                        sql_err!(
+                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                            "enum rename exceeds the statement arena"
+                                        )
+                                    })?,
+                                };
+                                array_changed = true;
+                            }
+                        }
+                        if array_changed {
+                            values[column_index] = Datum::Array {
+                                element,
+                                raw: crate::sql::array::build(&items[..count], arena)?,
+                            };
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if changed {
+                store_row(
+                    storage,
+                    txn,
+                    table_index,
+                    Some(rowid),
+                    &values[..def.n_columns],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The sort key for a new enum member: appended past the current maximum, or —
@@ -3557,7 +4013,7 @@ pub fn copy_row_binary(
         } else {
             let field = &row[at..at + flen as usize];
             at += flen as usize;
-            let decoded = decode_binary_field(col.ctype, field, arena)?;
+            let decoded = decode_binary_field_with_storage(col.ctype, field, arena, Some(storage))?;
             coerce(decoded, &col, storage, arena)?
         };
         explicit[col_index] = true;
@@ -3592,8 +4048,23 @@ pub(crate) fn decode_binary_field<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    decode_binary_field_with_storage(ctype, bytes, arena, None)
+}
+
+fn decode_binary_field_with_storage<'a>(
+    ctype: ColType,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    storage: Option<&Storage>,
+) -> Result<Datum<'a>, SqlError> {
     use crate::sql::types::oid as oids;
-    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary field for type {}", ctype.name());
+    let bad = || {
+        sql_err!(
+            sqlstate::BAD_COPY_FILE_FORMAT,
+            "invalid binary field for type {}",
+            ctype.name()
+        )
+    };
     let via = |oid| crate::pg::conn::decode_binary_param(oid, bytes, arena).map_err(|_| bad());
     match ctype {
         ColType::Bool => via(oids::BOOL),
@@ -3630,7 +4101,7 @@ pub(crate) fn decode_binary_field<'a>(
         ColType::Cidr => via(oids::CIDR),
         ColType::Macaddr => via(oids::MACADDR),
         ColType::Macaddr8 => via(oids::MACADDR8),
-        ColType::Array(element) => decode_binary_array(element, bytes, arena),
+        ColType::Array(element) => decode_binary_array(element, bytes, arena, storage),
         ColType::Range(kind) => decode_binary_range(kind, bytes, arena),
         ColType::Multirange(kind) => decode_binary_multirange(kind, bytes, arena),
         ColType::Bit { varying } => decode_binary_bit(varying, bytes, arena),
@@ -3639,13 +4110,16 @@ pub(crate) fn decode_binary_field<'a>(
             "COPY BINARY of type {} is not supported yet",
             ctype.name()
         )),
-        // An enum's binary field is its label, but resolving the label to a
-        // member's sort key needs the catalog, which this codec does not carry.
-        // COPY (text) of enum columns works; binary is a loud gap.
-        ColType::Enum(_) => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY BINARY of an enum type is not supported yet (use COPY text format)"
-        )),
+        ColType::Enum(slot) => {
+            let label = core::str::from_utf8(bytes).map_err(|_| bad())?;
+            let Some(storage) = storage else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "binary input of a user-defined enum requires catalog context"
+                ));
+            };
+            coerce_enum_value(Datum::Text(label), slot, storage, arena)
+        }
     }
 }
 
@@ -3657,6 +4131,7 @@ fn decode_binary_array<'a>(
     element: crate::sql::types::ArrElem,
     bytes: &'a [u8],
     arena: &'a Arena,
+    storage: Option<&Storage>,
 ) -> Result<Datum<'a>, SqlError> {
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary array");
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
@@ -3689,7 +4164,26 @@ fn decode_binary_array<'a>(
             continue;
         }
         let field = reader.take(len as usize).map_err(|_| bad())?;
-        *slot = decode_binary_field(element_type, field, arena)?;
+        let value = decode_binary_field_with_storage(element_type, field, arena, storage)?;
+        *slot = match element {
+            crate::sql::types::ArrElem::Domain { slot, .. } => {
+                let Some(storage) = storage else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "binary input of a domain array requires catalog context"
+                    ));
+                };
+                coerce_domain_value(
+                    storage,
+                    slot as usize,
+                    value,
+                    u32::MAX,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                )?
+            }
+            _ => value,
+        };
     }
     Ok(Datum::Array {
         element,
@@ -4757,7 +5251,12 @@ fn merge_insert(
             ));
         }
         let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let hooks = super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+        let catalog = super::query::storage_catalog(storage, txn.txid);
+        let hooks = super::eval::EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&seq),
+            ..super::eval::NO_HOOKS
+        };
         for (i, expression) in values.iter().enumerate() {
             reject_generated_write(def, targets[i])?;
             let v = super::eval::eval_full(expression, arena, params, source_ctx, &hooks)?;
@@ -4768,7 +5267,12 @@ fn merge_insert(
     // Defaults + auto-increment + generated for the unset columns.
     {
         let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let hooks = super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+        let catalog = super::query::storage_catalog(storage, txn.txid);
+        let hooks = super::eval::EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&seq),
+            ..super::eval::NO_HOOKS
+        };
         for (i, col) in def.columns().iter().enumerate() {
             if explicit[i] {
                 continue;
@@ -4852,7 +5356,13 @@ pub fn insert(
     // being captured for a data-modifying CTE, which describes them itself.
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(statement.returning, Some(&def), &mut columns) {
+        match super::query::describe_catalog_items(
+            statement.returning,
+            Some(&def),
+            storage,
+            txn.txid,
+            &mut columns,
+        ) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -4944,8 +5454,12 @@ pub fn insert(
             // evaluator, so a `nextval` default advances once per inserted row).
             {
                 let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let hooks =
-                    super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+                let catalog = super::query::storage_catalog(storage, txn.txid);
+                let hooks = super::eval::EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(&seq),
+                    ..super::eval::NO_HOOKS
+                };
                 for (i, col) in def.columns().iter().enumerate() {
                     if explicit[i] {
                         continue;
@@ -5070,12 +5584,18 @@ pub fn insert(
             // or a DEFAULT expression advance once per row). Scoped so its shared
             // `&storage` borrow ends before the row is written mutably below.
             let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-            let hooks = super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+            let catalog = super::query::storage_catalog(storage, txn.txid);
+            let hooks = super::eval::EvalHooks {
+                catalog: Some(&catalog),
+                sequences: Some(&seq),
+                ..super::eval::NO_HOOKS
+            };
             for (i, expression) in row_exprs.iter().enumerate() {
                 if matches!(expression, Expr::DefaultMarker) || ignore[targets[i]] {
                     continue; // filled from the default / identity below
                 }
-                let v = match super::eval::eval_full(expression, arena, params, &NoColumns, &hooks) {
+                let v = match super::eval::eval_full(expression, arena, params, &NoColumns, &hooks)
+                {
                     Ok(v) => v,
                     Err(e) => return sql_fail(e),
                 };
@@ -5322,11 +5842,41 @@ pub fn update(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: None };
+    let catalog = super::query::storage_catalog(storage, txn.txid);
+    let hooks = super::eval::EvalHooks {
+        group: None,
+        aggs: None,
+        subs: Some(&subs),
+        windows: None,
+        catalog: Some(&catalog),
+        srf_index: None,
+        sequences: None,
+    };
     let collect = if let Some(from) = statement.from {
-        collect_join_matches(storage, table_index, &def, schema, from, statement.where_clause, arena, params, txn.txid, scratch)
+        collect_join_matches(
+            storage,
+            table_index,
+            &def,
+            schema,
+            from,
+            statement.where_clause,
+            arena,
+            params,
+            txn.txid,
+            scratch,
+        )
     } else {
-        collect_matches(storage, table_index, txn.txid, schema, statement.where_clause, arena, params, &hooks, scratch)
+        collect_matches(
+            storage,
+            table_index,
+            txn.txid,
+            schema,
+            statement.where_clause,
+            arena,
+            params,
+            &hooks,
+            scratch,
+        )
     };
     if let Err(e) = collect {
         return sql_fail(e);
@@ -5334,7 +5884,13 @@ pub fn update(
 
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(statement.returning, Some(&def), &mut columns) {
+        match super::query::describe_catalog_items(
+            statement.returning,
+            Some(&def),
+            storage,
+            txn.txid,
+            &mut columns,
+        ) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -5399,16 +5955,21 @@ pub fn update(
                 // row; a scoped sequence evaluator (shared `&storage`) supplies
                 // them and is dropped before the row is written back mutably.
                 let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let hooks =
-                    super::eval::EvalHooks { sequences: Some(&seq), ..super::eval::NO_HOOKS };
+                let catalog = super::query::storage_catalog(storage, txn.txid);
+                let hooks = super::eval::EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(&seq),
+                    ..super::eval::NO_HOOKS
+                };
                 for (a, (_, expression)) in statement.assignments.iter().enumerate() {
                     if def.columns()[targets[a]].is_generated {
                         continue; // recomputed from the finished row below
                     }
-                    let v = match super::eval::eval_full(expression, arena, params, &context, &hooks) {
-                        Ok(v) => v,
-                        Err(e) => return sql_fail(e),
-                    };
+                    let v =
+                        match super::eval::eval_full(expression, arena, params, &context, &hooks) {
+                            Ok(v) => v,
+                            Err(e) => return sql_fail(e),
+                        };
                     let col = &def.columns()[targets[a]];
                     match coerce(v, col, storage, arena) {
                         Ok(v) => new_values[targets[a]] = v,
@@ -5556,18 +6117,54 @@ pub fn delete(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let hooks = super::eval::EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: None };
+    let catalog = super::query::storage_catalog(storage, txn.txid);
+    let hooks = super::eval::EvalHooks {
+        group: None,
+        aggs: None,
+        subs: Some(&subs),
+        windows: None,
+        catalog: Some(&catalog),
+        srf_index: None,
+        sequences: None,
+    };
     let collect = if let Some(using) = statement.using {
-        collect_join_matches(storage, table_index, &def, schema, using, statement.where_clause, arena, params, txn.txid, scratch)
+        collect_join_matches(
+            storage,
+            table_index,
+            &def,
+            schema,
+            using,
+            statement.where_clause,
+            arena,
+            params,
+            txn.txid,
+            scratch,
+        )
     } else {
-        collect_matches(storage, table_index, txn.txid, schema, statement.where_clause, arena, params, &hooks, scratch)
+        collect_matches(
+            storage,
+            table_index,
+            txn.txid,
+            schema,
+            statement.where_clause,
+            arena,
+            params,
+            &hooks,
+            scratch,
+        )
     };
     if let Err(e) = collect {
         return sql_fail(e);
     }
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_items(statement.returning, Some(&def), &mut columns) {
+        match super::query::describe_catalog_items(
+            statement.returning,
+            Some(&def),
+            storage,
+            txn.txid,
+            &mut columns,
+        ) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -6523,7 +7120,9 @@ pub fn alter_table(
                                     seq_session,
                                     u32::MAX,
                                 );
+                                let catalog = super::query::storage_catalog(storage, u32::MAX);
                                 let hooks = super::eval::EvalHooks {
+                                    catalog: Some(&catalog),
                                     sequences: Some(&seq),
                                     ..super::eval::NO_HOOKS
                                 };
@@ -6985,6 +7584,12 @@ fn coerce<'a>(
     if let ColType::Enum(slot) = col.ctype {
         return coerce_enum_value(v, slot, storage, arena);
     }
+    if let ColType::Array(
+        element @ (crate::sql::types::ArrElem::Enum(_) | crate::sql::types::ArrElem::Domain { .. }),
+    ) = col.ctype
+    {
+        return coerce_user_type_array(v, element, storage, arena);
+    }
     let v = cast_to(v, col.ctype, arena).map_err(|e| {
         // Data errors (out of range, bad input syntax — class 22) keep their
         // specific message; only a genuine type mismatch is rewritten with the
@@ -7003,10 +7608,64 @@ fn coerce<'a>(
     apply_typmod(v, col.ctype, col.type_mod, arena)
 }
 
+/// Coerces an array to a user-defined element type. Its raw element payloads
+/// keep the ordinary scalar row encoding, while the array tag carries the enum
+/// or domain identity used by comparisons, wire OIDs, and `pg_typeof`.
+pub(crate) fn coerce_user_type_array<'a>(
+    value: Datum<'a>,
+    target: crate::sql::types::ArrElem,
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (source, raw) = match value {
+        Datum::Array { element, raw } => (element, raw),
+        Datum::Text(text) | Datum::Bpchar(text) => (
+            crate::sql::types::ArrElem::Text,
+            crate::sql::array::parse_literal(
+                text.trim_end_matches(' '),
+                crate::sql::types::ArrElem::Text,
+                arena,
+            )?,
+        ),
+        Datum::Null => return Ok(Datum::Null),
+        other => {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot cast type {} to {}",
+                crate::sql::eval::type_name_of_pub(&other),
+                target.array_name()
+            ));
+        }
+    };
+    let count = crate::sql::array::len(raw);
+    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    for (index, item) in items.iter_mut().take(count).enumerate() {
+        let value = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
+        *item = match target {
+            crate::sql::types::ArrElem::Enum(slot) => {
+                coerce_enum_value(value, slot, storage, arena)?
+            }
+            crate::sql::types::ArrElem::Domain { slot, .. } => constraints::coerce_domain_value(
+                storage,
+                slot as usize,
+                value,
+                u32::MAX,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+            )?,
+            _ => unreachable!("caller restricts user-defined array elements"),
+        };
+    }
+    Ok(Datum::Array {
+        element: target,
+        raw: crate::sql::array::build(&items[..count], arena)?,
+    })
+}
+
 /// Coerces a value into an enum column: a NULL passes through; a text or
 /// already-typed enum value must name a member of the enum at `slot`, else
 /// PostgreSQL's 22P02 `invalid input value for enum <type>: "..."`.
-fn coerce_enum_value<'a>(
+pub(crate) fn coerce_enum_value<'a>(
     v: Datum<'a>,
     slot: u16,
     storage: &Storage,

@@ -64,12 +64,25 @@ pub mod oid {
     pub const REGTYPE: i32 = 2206;
     pub const REGNAMESPACE: i32 = 4089;
     pub const REGROLE: i32 = 4096;
-    /// Base OID for user-defined enum types, synthesized as `FIRST_ENUM + slot`.
-    /// Kept clear of the domain range (`FIRST_DOMAIN_OID = 110_000`).
+    /// Base OIDs for user-defined domains, enums, and the array types PostgreSQL
+    /// creates alongside each of them. Slots are catalog-local identities; the
+    /// bands are deliberately disjoint from relation/composite OIDs.
+    pub const FIRST_DOMAIN: i32 = 110_000;
     pub const FIRST_ENUM: i32 = 120_000;
+    pub const FIRST_DOMAIN_ARRAY: i32 = 150_000;
+    pub const FIRST_ENUM_ARRAY: i32 = 160_000;
+    pub fn domain_oid(slot: u16) -> i32 {
+        FIRST_DOMAIN + slot as i32
+    }
     /// The synthesized OID of the enum type in catalog `slot`.
     pub fn enum_oid(slot: u16) -> i32 {
         FIRST_ENUM + slot as i32
+    }
+    pub fn domain_array_oid(slot: u16) -> i32 {
+        FIRST_DOMAIN_ARRAY + slot as i32
+    }
+    pub fn enum_array_oid(slot: u16) -> i32 {
+        FIRST_ENUM_ARRAY + slot as i32
     }
 }
 
@@ -569,9 +582,24 @@ pub enum ArrElem {
     Cidr,
     Macaddr,
     Macaddr8,
+    /// An enum array keeps the catalog slot as its runtime identity. Table
+    /// metadata also persists the type name and rebinds the slot on startup.
+    Enum(u16),
+    /// An array whose elements are values of a domain. Domain values use their
+    /// ultimate base representation; `base_code` identifies that scalar
+    /// representation and `enum_slot` completes it when the base is an enum.
+    /// Keeping both facts inline preserves allocation-free array decoding.
+    Domain {
+        slot: u16,
+        base_code: u8,
+        enum_slot: u16,
+    },
 }
 
 impl ArrElem {
+    const ENUM_CODE_BASE: u8 = 32;
+    const DOMAIN_CODE_BASE: u8 = 64;
+
     /// The array type's internal `pg_type.typname`.
     pub fn catalog_name(self) -> &'static str {
         match self {
@@ -600,6 +628,8 @@ impl ArrElem {
             ArrElem::Cidr => "_cidr",
             ArrElem::Macaddr => "_macaddr",
             ArrElem::Macaddr8 => "_macaddr8",
+            ArrElem::Enum(_) => "_enum",
+            ArrElem::Domain { .. } => "_domain",
         }
     }
 
@@ -633,6 +663,8 @@ impl ArrElem {
             ArrElem::Cidr => "cidr[]",
             ArrElem::Macaddr => "macaddr[]",
             ArrElem::Macaddr8 => "macaddr8[]",
+            ArrElem::Enum(_) => "enum[]",
+            ArrElem::Domain { .. } => "domain[]",
         }
     }
 
@@ -671,6 +703,7 @@ impl ArrElem {
             Datum::Cidr(_) => ArrElem::Cidr,
             Datum::Macaddr(_) => ArrElem::Macaddr,
             Datum::Macaddr8(_) => ArrElem::Macaddr8,
+            Datum::Enum { slot, .. } => ArrElem::Enum(*slot),
             _ => return None,
         })
     }
@@ -685,6 +718,7 @@ impl ArrElem {
             ColType::Name => return Some(ArrElem::Name),
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
+            ColType::Enum(slot) => return Some(ArrElem::Enum(slot)),
             _ => {}
         }
         Some(match c.storage() {
@@ -740,6 +774,19 @@ impl ArrElem {
             ArrElem::Cidr => ColType::Cidr,
             ArrElem::Macaddr => ColType::Macaddr,
             ArrElem::Macaddr8 => ColType::Macaddr8,
+            ArrElem::Enum(slot) => ColType::Enum(slot),
+            ArrElem::Domain {
+                base_code,
+                enum_slot,
+                ..
+            } => {
+                match ColType::from_code(base_code)
+                    .expect("domain array carries a valid scalar base code")
+                {
+                    ColType::Enum(_) => ColType::Enum(enum_slot),
+                    base => base,
+                }
+            }
         }
     }
 
@@ -771,6 +818,8 @@ impl ArrElem {
             ArrElem::Cidr => oid::CIDR_ARRAY,
             ArrElem::Macaddr => oid::MACADDR_ARRAY,
             ArrElem::Macaddr8 => oid::MACADDR8_ARRAY,
+            ArrElem::Enum(slot) => oid::enum_array_oid(slot),
+            ArrElem::Domain { slot, .. } => oid::domain_array_oid(slot),
         }
     }
 
@@ -801,6 +850,8 @@ impl ArrElem {
             ArrElem::Cidr => 22,
             ArrElem::Macaddr => 23,
             ArrElem::Macaddr8 => 24,
+            ArrElem::Enum(slot) => Self::ENUM_CODE_BASE + slot as u8,
+            ArrElem::Domain { slot, .. } => Self::DOMAIN_CODE_BASE + slot as u8,
         }
     }
 
@@ -831,8 +882,48 @@ impl ArrElem {
             22 => ArrElem::Cidr,
             23 => ArrElem::Macaddr,
             24 => ArrElem::Macaddr8,
+            c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + crate::storage::MAX_ENUMS as u8)
+                .contains(&c) =>
+            {
+                ArrElem::Enum((c - Self::ENUM_CODE_BASE) as u16)
+            }
+            c if (Self::DOMAIN_CODE_BASE
+                ..Self::DOMAIN_CODE_BASE + crate::storage::MAX_DOMAINS as u8)
+                .contains(&c) =>
+            {
+                ArrElem::Domain {
+                    slot: (c - Self::DOMAIN_CODE_BASE) as u16,
+                    base_code: ColType::Text.code(),
+                    enum_slot: ColType::ENUM_SLOT_UNRESOLVED,
+                }
+            }
             _ => return None,
         })
+    }
+
+    /// Rebuilds a domain-array element identity from the domain catalog. A
+    /// domain over an array would be a multidimensional array element and is
+    /// deliberately rejected by the caller.
+    pub fn domain(slot: u16, base: ColType) -> Option<Self> {
+        if matches!(base, ColType::Array(_) | ColType::Record) {
+            return None;
+        }
+        let enum_slot = match base {
+            ColType::Enum(slot) => slot,
+            _ => ColType::ENUM_SLOT_UNRESOLVED,
+        };
+        Some(Self::Domain {
+            slot,
+            base_code: base.code(),
+            enum_slot,
+        })
+    }
+
+    pub fn user_type_slot(self) -> Option<u16> {
+        match self {
+            Self::Enum(slot) | Self::Domain { slot, .. } => Some(slot),
+            _ => None,
+        }
     }
 }
 

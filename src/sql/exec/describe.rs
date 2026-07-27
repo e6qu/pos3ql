@@ -330,13 +330,20 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             _ if type_name.ends_with("[]") => {
                 ColType::from_sql_name(type_name.trim_end_matches("[]"))
                     .map(ColType::internal_name)
+                    .or_else(|| type_name.trim_end_matches("[]").rsplit('.').next())
             }
-            _ => ColType::from_sql_name(type_name).map(ColType::internal_name),
+            _ => ColType::from_sql_name(type_name)
+                .map(ColType::internal_name)
+                .or_else(|| type_name.rsplit('.').next()),
         },
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
-        Expr::Case { synthetic: true, .. } => None,
-        Expr::Case { otherwise: Some(e), .. } => name_of(e),
+        Expr::Case {
+            synthetic: true, ..
+        } => None,
+        Expr::Case {
+            otherwise: Some(e), ..
+        } => name_of(e),
         Expr::Array(_) | Expr::ArraySubquery(_) => Some("array"),
         // An array subscript or slice keeps the base column's name (`m[1]` → `m`,
         // `m[1:2]` → `m`; a slice of an `ARRAY[...]` constructor is `array`).

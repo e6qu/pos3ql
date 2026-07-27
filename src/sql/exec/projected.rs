@@ -53,7 +53,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Macaddr8(_) => 8,
         Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
         Datum::Json { text, .. } => 5 + text.len(),
-        Datum::Array { raw, .. } => 6 + raw.len(),
+        Datum::Array { raw, .. } => 8 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
         Datum::Numeric(nm) => 7 + nm.digits.len(),
         Datum::Range { text, .. } => 5 + text.len(),
@@ -186,9 +186,19 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         Datum::Array { element, raw } => {
             out[0] = 15;
             out[1] = element.code();
-            out[2..6].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-            out[6..6 + raw.len()].copy_from_slice(raw);
-            6 + raw.len()
+            let (base_code, enum_slot) = match element {
+                crate::sql::types::ArrElem::Domain {
+                    base_code,
+                    enum_slot,
+                    ..
+                } => (*base_code, *enum_slot),
+                _ => (0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED),
+            };
+            out[2] = base_code;
+            out[3..5].copy_from_slice(&enum_slot.to_le_bytes());
+            out[5..9].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            out[9..9 + raw.len()].copy_from_slice(raw);
+            9 + raw.len()
         }
         Datum::Uuid(b) => {
             out[0] = 9;
@@ -365,30 +375,48 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         14 => {
             let jsonb = bytes[at] != 0;
             let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
+                .expect("projected JSON was encoded from valid UTF-8");
             (Datum::Json { text: s, jsonb }, 5 + len)
         }
         15 => {
-            let element = crate::sql::types::ArrElem::from_code(bytes[at]).unwrap_or(crate::sql::types::ArrElem::Int4);
-            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-            (Datum::Array { element, raw: &bytes[at + 5..at + 5 + len] }, 5 + len)
+            let mut element = crate::sql::types::ArrElem::from_code(bytes[at])
+                .expect("projected array carries a valid element code");
+            if let crate::sql::types::ArrElem::Domain { slot, .. } = element {
+                element = crate::sql::types::ArrElem::Domain {
+                    slot,
+                    base_code: bytes[at + 1],
+                    enum_slot: u16::from_le_bytes(bytes[at + 2..at + 4].try_into().unwrap()),
+                };
+            }
+            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            (
+                Datum::Array {
+                    element,
+                    raw: &bytes[at + 8..at + 8 + len],
+                },
+                8 + len,
+            )
         }
         16 => {
             let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
             let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
+                .expect("projected range was encoded from valid UTF-8");
             (Datum::Range { text: s, kind }, 5 + len)
         }
         17 => {
             let varying = bytes[at] != 0;
             let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
+                .expect("projected bit string was encoded from valid UTF-8");
             (Datum::Bit { bits: s, varying }, 5 + len)
         }
         18 => {
             let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
             let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
-            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len]).unwrap_or("");
+            let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
+                .expect("projected multirange was encoded from valid UTF-8");
             (Datum::Multirange { text: s, kind }, 5 + len)
         }
         19 => {
@@ -397,20 +425,24 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             // [`decode_projected_col_record`], which rebuilds the structure
             // from the tail this arm skips over.
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            let s = core::str::from_utf8(&bytes[at + 4..at + 4 + len]).unwrap_or("");
-            (Datum::Text(s), 4 + len + record_tail_len(bytes, at + 4 + len))
+            let s = core::str::from_utf8(&bytes[at + 4..at + 4 + len])
+                .expect("projected record text was encoded from valid UTF-8");
+            (
+                Datum::Text(s),
+                4 + len + record_tail_len(bytes, at + 4 + len),
+            )
         }
         9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
         10 => {
-            let len =
-                u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             (Datum::Bytea(&bytes[at + 4..at + 4 + len]), 4 + len)
         }
         11 => {
             let sign = match bytes[at] {
                 0 => crate::sql::numeric::Sign::Pos,
                 1 => crate::sql::numeric::Sign::Neg,
-                _ => crate::sql::numeric::Sign::NaN,
+                2 => crate::sql::numeric::Sign::NaN,
+                _ => panic!("projected numeric carries a valid sign tag"),
             };
             let weight = i16::from_le_bytes(bytes[at + 1..at + 3].try_into().unwrap());
             let dscale = u16::from_le_bytes(bytes[at + 3..at + 5].try_into().unwrap());
@@ -592,7 +624,8 @@ fn decode_record_tail<'a>(
     for f in fields.iter_mut() {
         let name_len = bytes[cursor] as usize;
         cursor += 1;
-        f.name = core::str::from_utf8(&bytes[cursor..cursor + name_len]).unwrap_or("");
+        f.name = core::str::from_utf8(&bytes[cursor..cursor + name_len])
+            .expect("projected record name was encoded from valid UTF-8");
         cursor += name_len;
         f.type_oid = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
         cursor += 4;

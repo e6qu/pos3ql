@@ -216,11 +216,14 @@ step "durability: kill -9, restart, data intact"
   -c "COMMENT ON TABLE crashy IS 'crash-comment'" \
   -c "COMMENT ON COLUMN crashy.v IS 'crash-col'" \
   -c "CREATE DOMAIN crashy_pos AS int CHECK (VALUE > 0)" \
-  -c "CREATE TABLE crashy_dom (n crashy_pos)" \
-  -c "INSERT INTO crashy_dom VALUES (42)" \
+  -c "CREATE DOMAIN crashy_small AS crashy_pos DEFAULT 7 CHECK (VALUE < 100)" \
+  -c "CREATE TABLE crashy_dom (n crashy_small, ns crashy_small[])" \
+  -c "INSERT INTO crashy_dom VALUES (42, ARRAY[1,2]::crashy_small[])" \
   -c "CREATE TYPE crashy_mood AS ENUM ('sad','ok','happy')" \
-  -c "CREATE TABLE crashy_enum (id int, m crashy_mood)" \
-  -c "INSERT INTO crashy_enum VALUES (1,'happy'),(2,'sad')"
+  -c "CREATE TABLE crashy_enum (id int, m crashy_mood, ms crashy_mood[])" \
+  -c "INSERT INTO crashy_enum VALUES (1,'happy',ARRAY['happy','ok']::crashy_mood[]),(2,'sad',ARRAY['sad']::crashy_mood[])" \
+  -c "ALTER TYPE crashy_mood RENAME VALUE 'happy' TO 'glad'" \
+  -c "ALTER TYPE crashy_mood RENAME TO crashy_feeling"
 # With asynchronous wal_upload, a commit is durable on local disk immediately
 # but its S3 upload drains just after; a trailing query plus a short pause lets
 # that drain reach MinIO before the abrupt kill, so the later disk-wipe steps
@@ -267,20 +270,22 @@ out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -c "SELECT count(*) FROM 
 # A domain and its column identity + constraints survive the crash: the journal
 # replays CREATE DOMAIN, and the domain still enforces and reports its name.
 dom=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
-  -c "SELECT pg_typeof(n), n FROM crashy_dom" 2>&1)
+  -c "SELECT pg_typeof(n), n, ns::text FROM crashy_dom" 2>&1)
 # The domain's CHECK still enforces after replay (psql default verbosity prints
 # the message, not the SQLSTATE, so match the message).
 dom_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -q \
-  -c "INSERT INTO crashy_dom VALUES (-1)" 2>&1 | grep -c 'violates check constraint')
-[[ "$dom" == "crashy_pos|42" && "$dom_bad" -ge 1 ]] && ok "domains survive restart" \
-  || bad "domains after restart: '$dom' / '$dom_bad'"
+  -c "INSERT INTO crashy_dom(n) VALUES (-1)" 2>&1 | grep -c 'violates check constraint')
+dom_array_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -q \
+  -c "INSERT INTO crashy_dom VALUES (50, ARRAY[101]::crashy_small[])" 2>&1 | grep -c 'violates check constraint')
+[[ "$dom" == "crashy_small|42|{1,2}" && "$dom_bad" -ge 1 && "$dom_array_bad" -ge 1 ]] && ok "domains survive restart" \
+  || bad "domains after restart: '$dom' / '$dom_bad' / '$dom_array_bad'"
 # An enum, its ordering, column identity and label enforcement survive the crash:
 # the journal replays CREATE TYPE and the enum-typed column binds back to it.
 enm=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
   -c "SELECT pg_typeof(m), string_agg(id::text, ',' ORDER BY m) FROM crashy_enum GROUP BY m ORDER BY m" 2>&1 | tr '\n' ';')
 enm_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -q \
-  -c "INSERT INTO crashy_enum VALUES (3,'bogus')" 2>&1 | grep -c 'invalid input value for enum')
-[[ "$enm" == "crashy_mood|2;crashy_mood|1;" && "$enm_bad" -ge 1 ]] && ok "enums survive restart" \
+  -c "INSERT INTO crashy_enum VALUES (3,'bogus',NULL)" 2>&1 | grep -c 'invalid input value for enum')
+[[ "$enm" == "crashy_feeling|2;crashy_feeling|1;" && "$enm_bad" -ge 1 ]] && ok "enums survive restart" \
   || bad "enums after restart: '$enm' / '$enm_bad'"
 # Object comments survive the crash: the journal replays the COMMENT records.
 cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
@@ -375,16 +380,17 @@ cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
   -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
 [[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive a cold start" \
   || bad "comments after cold start: '$cmt'"
-# Domains rebuild from the manifest `dom` line alone (wiped disk).
+# Domains rebuild from the manifest `dom2` line alone (wiped disk), including
+# immediate parent identity and generated array identity.
 dom=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
-  -c "SELECT pg_typeof(n), n FROM crashy_dom" 2>&1)
-[[ "$dom" == "crashy_pos|42" ]] && ok "domains survive a cold start" \
+  -c "SELECT pg_typeof(n), n, ns::text FROM crashy_dom" 2>&1)
+[[ "$dom" == "crashy_small|42|{1,2}" ]] && ok "domains survive a cold start" \
   || bad "domains after cold start: '$dom'"
 # Enums rebuild from the manifest `enm` line alone (wiped disk); the enum-typed
 # column binds back to it and still reports and enforces its type.
 enm=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
-  -c "SELECT pg_typeof(m), m FROM crashy_enum WHERE id = 1" 2>&1)
-[[ "$enm" == "crashy_mood|happy" ]] && ok "enums survive a cold start" \
+  -c "SELECT pg_typeof(m), m, ms::text FROM crashy_enum WHERE id = 1" 2>&1)
+[[ "$enm" == "crashy_feeling|glad|{glad,ok}" ]] && ok "enums survive a cold start" \
   || bad "enums after cold start: '$enm'"
 
 fi # dur

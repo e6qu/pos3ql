@@ -15,41 +15,38 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{ColumnMeta, Storage};
+use crate::storage::{ColumnMeta, Storage, TableDef};
 
 use super::ast::{
-    Expr, FrameBound, FromClause, OrderBy, QualName, Select, SelectItem, TableRef,
-    WindowFrame,
+    Expr, FrameBound, FromClause, OrderBy, QualName, Select, SelectItem, TableRef, WindowFrame,
 };
 use super::eval::{
-    compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SequenceAccess, SqlError,
-    SubqueryValues,
+    ColumnLookup, EvalHooks, SequenceAccess, SqlError, SubqueryValues, compare_datums, eval_full,
+    sqlstate,
 };
-use super::exec::{describe_items, MAX_PROJ};
+use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
 
 mod setops;
-pub use setops::set_query;
 use setops::materialize_set_body;
+pub use setops::set_query;
 
 mod materialize;
-use materialize::{
-    finalize_projected_row, materialized_rows, materialized_select, ScopeSchema,
-};
+use materialize::{ScopeSchema, finalize_projected_row, materialized_rows, materialized_select};
 
 mod scan;
 pub use scan::JoinRow;
-use scan::{scan_source, Chained};
+use scan::{Chained, scan_source};
 
 mod scope;
-pub use scope::{MergedColumn, QueryScope, ResolvedColumn, MAX_MERGED_COLUMNS};
+pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
-pub use cte::{describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under};
 use cte::expand_set_tree_exec;
+pub use cte::{describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under};
 
 mod aggregate;
-use aggregate::{fold_aggregates, AggState};
+use aggregate::{AggState, fold_aggregates};
 
 mod srf;
 use srf::{find_srf, srf_count, srf_max_count, table_func_def, table_func_rows};
@@ -128,9 +125,13 @@ type Outcome = Result<Result<(), SqlError>, WireFull>;
 
 /// Bridges `EvalHooks`' abstract `CatalogAccess` to the concrete `Storage`, so
 /// `pg_get_indexdef` can reconstruct an index's definition during evaluation.
-struct StorageCatalog<'s> {
+pub(super) struct StorageCatalog<'s> {
     storage: &'s Storage,
     txid: u32,
+}
+
+pub(super) fn storage_catalog(storage: &Storage, txid: u32) -> StorageCatalog<'_> {
+    StorageCatalog { storage, txid }
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_> {
@@ -187,7 +188,107 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     }
 
     fn enum_slot_of_name(&self, type_name: &str) -> Option<u16> {
-        self.storage.resolve_enum_slot(type_name, self.txid).map(|s| s as u16)
+        self.storage
+            .resolve_enum_slot(type_name, self.txid)
+            .map(|s| s as u16)
+    }
+
+    fn cast_user_type<'a>(
+        &self,
+        type_name: &str,
+        value: Datum<'a>,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        if let Some(element_name) = type_name.strip_suffix("[]") {
+            if let Some(slot) = self.storage.resolve_enum_slot(element_name, self.txid) {
+                return super::exec::coerce_user_type_array(
+                    value,
+                    super::types::ArrElem::Enum(slot as u16),
+                    self.storage,
+                    arena,
+                )
+                .map(Some);
+            }
+            if let Some(slot) = self.storage.resolve_domain_slot(element_name, self.txid) {
+                let domain = self.storage.domain(slot);
+                let Some(element) = super::types::ArrElem::domain(slot as u16, domain.base) else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "arrays of domain {} require a scalar base type",
+                        element_name
+                    ));
+                };
+                return super::exec::coerce_user_type_array(value, element, self.storage, arena)
+                    .map(Some);
+            }
+            return Ok(None);
+        }
+        if let Some(slot) = self.storage.resolve_domain_slot(type_name, self.txid) {
+            return super::exec::coerce_domain_value(
+                self.storage,
+                slot,
+                value,
+                self.txid,
+                arena,
+                super::eval::NO_PARAMS,
+            )
+            .map(Some);
+        }
+        let Some(slot) = self.storage.resolve_enum_slot(type_name, self.txid) else {
+            return Ok(None);
+        };
+        super::exec::coerce_enum_value(value, slot as u16, self.storage, arena).map(Some)
+    }
+
+    fn user_array_name<'a>(
+        &self,
+        element: super::types::ArrElem,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let name = match element {
+            super::types::ArrElem::Enum(slot) => {
+                let def = self.storage.enum_def(slot as usize);
+                def.visible_to(self.txid).then_some(def.name.as_str())
+            }
+            super::types::ArrElem::Domain { slot, .. } => {
+                let def = self.storage.domain(slot as usize);
+                def.visible_to(self.txid).then_some(def.name.as_str())
+            }
+            _ => None,
+        };
+        let Some(name) = name else { return Ok(None) };
+        let rendered = crate::stack_format!(128, "{}[]", name);
+        Ok(Some(
+            arena
+                .alloc_str(rendered.as_str())
+                .map_err(|_| arena_full())?,
+        ))
+    }
+
+    fn user_type_name<'a>(
+        &self,
+        type_name: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let (base, array) = match type_name.strip_suffix("[]") {
+            Some(base) => (base, true),
+            None => (type_name, false),
+        };
+        let visible = self.storage.resolve_domain_slot(base, self.txid).is_some()
+            || self.storage.resolve_enum_slot(base, self.txid).is_some();
+        if !visible {
+            return Ok(None);
+        }
+        let rendered = if array {
+            crate::stack_format!(128, "{}[]", base)
+        } else {
+            crate::stack_format!(128, "{}", base)
+        };
+        Ok(Some(
+            arena
+                .alloc_str(rendered.as_str())
+                .map_err(|_| arena_full())?,
+        ))
     }
 }
 
@@ -743,9 +844,9 @@ fn describe_select<'a>(
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(sel.items, &scope, out)
+            describe_scope_items(sel.items, &scope, storage, txid, out)
         }
-        None => describe_items(sel.items, None, out),
+        None => describe_catalog_items(sel.items, None, storage, txid, out),
     }
 }
 
@@ -1425,7 +1526,7 @@ pub fn select_query<'a>(
 
     // Result description.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = match describe_scope_items(statement.items, &scope, &mut columns) {
+    let n_cols = match describe_scope_items(statement.items, &scope, storage, txid, &mut columns) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -1705,7 +1806,7 @@ pub fn constant_select<'a>(
         Err(e) => return sql_fail(e),
     };
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = match describe_items(statement.items, None, &mut columns) {
+    let n = match describe_catalog_items(statement.items, None, storage, txid, &mut columns) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -2439,14 +2540,10 @@ fn project_row_skipping<'a>(
 pub fn describe_scope_items<'q>(
     items: &[SelectItem<'q>],
     scope: &QueryScope<'q>,
+    storage: &Storage,
+    txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    // The single-table fast path resolves a qualifier against the table name,
-    // so only take it when the exposed name equals the table name (no alias);
-    // an aliased table falls through to the alias-aware scope path below.
-    if scope.n == 1 && scope.names[0] == scope.defs[0].expect("resolved").name.as_str() {
-        return describe_items(items, Some(scope.defs[0].expect("resolved")), out);
-    }
     let mut n = 0;
     for item in items {
         match item {
@@ -2481,11 +2578,18 @@ pub fn describe_scope_items<'q>(
             }
             SelectItem::Expr { expression, alias } => {
                 if n == out.len() {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "select list too wide"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "select list too wide"
+                    ));
                 }
                 // Multi-table type inference: columns resolve via scope.
-                let (oid, typlen) = infer_scope_type(expression, scope)?;
                 let name = alias.unwrap_or(super::exec::derived_name(expression));
+                let user_type = user_type_cast_description(expression, name, storage, txid);
+                let (oid, typlen) = match user_type {
+                    Some(description) => (description.type_oid, description.typlen),
+                    None => infer_scope_type(expression, scope)?,
+                };
                 // A bare column carries its declared modifier and a cast its
                 // target's, as RowDescription reports them; anything computed
                 // is -1 — the rule PostgreSQL follows.
@@ -2501,12 +2605,84 @@ pub fn describe_scope_items<'q>(
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
-                out[n] = ColDesc::new(name, oid, typlen).with_type_mod(type_mod);
+                out[n] = ColDesc::new(name, oid, typlen)
+                    .with_type_mod(user_type.map_or(type_mod, |description| description.type_mod));
                 n += 1;
             }
         }
     }
     Ok(n)
+}
+
+/// Catalog-aware wrapper around the ordinary single-table/FROM-less
+/// descriptor. Static inference deliberately has no catalog dependency, so an
+/// exact cast to a domain/enum would otherwise be described as text even
+/// though evaluation returns its base/enum representation.
+pub fn describe_catalog_items<'q>(
+    items: &[SelectItem<'q>],
+    definition: Option<&'q TableDef>,
+    storage: &Storage,
+    txid: u32,
+    out: &mut [ColDesc<'q>],
+) -> Result<usize, SqlError> {
+    let count = describe_items(items, definition, out)?;
+    let mut column = 0;
+    for item in items {
+        match item {
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                column += definition.map_or(0, |table| table.n_columns);
+            }
+            SelectItem::RecordStar(base) => {
+                let resolver: &dyn super::exec::ColTypeResolver = match definition {
+                    Some(table) => &super::exec::DefCols(table),
+                    None => &super::exec::NoCols,
+                };
+                column += super::exec::record_shape(base, resolver, |_, _| {})
+                    .expect("described record star has a static shape");
+            }
+            SelectItem::Expr { expression, alias } => {
+                if let Some(description) = user_type_cast_description(
+                    expression,
+                    alias.unwrap_or(super::exec::derived_name(expression)),
+                    storage,
+                    txid,
+                ) {
+                    out[column] = description;
+                }
+                column += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn user_type_cast_description<'q>(
+    expression: &Expr<'q>,
+    name: &'q str,
+    storage: &Storage,
+    txid: u32,
+) -> Option<ColDesc<'q>> {
+    let Expr::Cast { type_name, .. } = expression else {
+        return None;
+    };
+    let (base_name, array) = match type_name.strip_suffix("[]") {
+        Some(base) => (base, true),
+        None => (*type_name, false),
+    };
+    if let Some(slot) = storage.resolve_domain_slot(base_name, txid) {
+        let domain = storage.domain(slot);
+        return Some(if array {
+            ColDesc::new(name, super::types::oid::domain_array_oid(slot as u16), -1)
+        } else {
+            ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod)
+        });
+    }
+    let slot = storage.resolve_enum_slot(base_name, txid)?;
+    Some(if array {
+        ColDesc::new(name, super::types::oid::enum_array_oid(slot as u16), -1)
+    } else {
+        ColDesc::new(name, super::types::oid::enum_oid(slot as u16), 4)
+    })
 }
 
 /// Emits one `ColDesc` per field of a `(record).*` expansion against a join

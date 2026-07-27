@@ -730,7 +730,12 @@ impl<'b> Responder<'b> {
                     // OID; then for a non-empty array one dim descriptor
                     // {count, lower-bound=1}; then each element as int32 length
                     // (-1 for NULL) + its binary (elements are always scalars).
-                    let elem_oid = element.to_coltype().oid();
+                    let elem_oid = match element {
+                        crate::sql::types::ArrElem::Domain { slot, .. } => {
+                            crate::sql::types::oid::domain_oid(*slot)
+                        }
+                        _ => element.to_coltype().oid(),
+                    };
                     let count = crate::sql::array::len(raw);
                     m.field(|m| {
                         m.i32(if count == 0 { 0 } else { 1 });

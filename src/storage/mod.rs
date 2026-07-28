@@ -844,6 +844,157 @@ impl Table {
 /// Maximum length of a stored view definition (the SELECT text).
 pub(crate) const VIEW_SQL_MAX: usize = 2048;
 
+pub(crate) const MAX_STORED_QUERY_DEPENDENCIES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DependencyClass {
+    Table = 1,
+    View = 2,
+    Domain = 3,
+    Enum = 4,
+    Sequence = 5,
+}
+
+impl DependencyClass {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Table),
+            2 => Some(Self::View),
+            3 => Some(Self::Domain),
+            4 => Some(Self::Enum),
+            5 => Some(Self::Sequence),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredQueryDependency {
+    pub class: DependencyClass,
+    pub slot: u16,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub referenced_schema: SqlName,
+    pub referenced_name: SqlName,
+}
+
+impl StoredQueryDependency {
+    pub const EMPTY: Self = Self {
+        class: DependencyClass::Table,
+        slot: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        referenced_schema: SqlName::EMPTY,
+        referenced_name: SqlName::EMPTY,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredQueryDependencies {
+    entries: [StoredQueryDependency; MAX_STORED_QUERY_DEPENDENCIES],
+    len: u8,
+}
+
+impl StoredQueryDependencies {
+    pub const EMPTY: Self = Self {
+        entries: [StoredQueryDependency::EMPTY; MAX_STORED_QUERY_DEPENDENCIES],
+        len: 0,
+    };
+
+    pub fn entries(&self) -> &[StoredQueryDependency] {
+        &self.entries[..self.len as usize]
+    }
+
+    pub fn push(&mut self, dependency: StoredQueryDependency) -> Result<(), SqlError> {
+        if self.entries().iter().any(|entry| {
+            entry.class == dependency.class
+                && entry.slot == dependency.slot
+                && entry.referenced_schema == dependency.referenced_schema
+                && entry.referenced_name == dependency.referenced_name
+        }) {
+            return Ok(());
+        }
+        if self.len as usize == MAX_STORED_QUERY_DEPENDENCIES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query depends on more than {} catalog objects",
+                MAX_STORED_QUERY_DEPENDENCIES
+            ));
+        }
+        self.entries[self.len as usize] = dependency;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn depends_on(&self, class: DependencyClass, slot: usize) -> bool {
+        self.entries().iter().any(|entry| entry.class == class && entry.slot as usize == slot)
+    }
+
+    pub fn serialized_push(
+        &mut self,
+        class: DependencyClass,
+        schema: SqlName,
+        name: SqlName,
+        referenced_schema: SqlName,
+        referenced_name: SqlName,
+    ) -> Result<(), SqlError> {
+        if self.len as usize == MAX_STORED_QUERY_DEPENDENCIES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query depends on more than {} catalog objects",
+                MAX_STORED_QUERY_DEPENDENCIES
+            ));
+        }
+        self.entries[self.len as usize] = StoredQueryDependency {
+            class,
+            slot: u16::MAX,
+            schema,
+            name,
+            referenced_schema,
+            referenced_name,
+        };
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn replace_slot(
+        &mut self,
+        class: DependencyClass,
+        old_slot: usize,
+        new_slot: usize,
+        schema: SqlName,
+        name: SqlName,
+    ) {
+        for entry in &mut self.entries[..self.len as usize] {
+            if entry.class == class && entry.slot as usize == old_slot {
+                entry.slot = new_slot as u16;
+                entry.schema = schema;
+                entry.name = name;
+            }
+        }
+    }
+
+    pub fn rename(&mut self, class: DependencyClass, slot: usize, schema: SqlName, name: SqlName) {
+        for entry in &mut self.entries[..self.len as usize] {
+            if entry.class == class && entry.slot as usize == slot {
+                entry.schema = schema;
+                entry.name = name;
+            }
+        }
+    }
+}
+
+/// The durable, creation-time portion shared by views and materialized views.
+/// Keeping these fields together makes it impossible for a catalog creation
+/// path to pass SQL text without its binding context.
+#[derive(Clone)]
+pub struct StoredQueryDefinition {
+    pub sql: StackStr<VIEW_SQL_MAX>,
+    pub creation_path: StackStr<128>,
+    pub dependencies: StoredQueryDependencies,
+}
+
 /// A named view: its output is its stored SELECT text, expanded as a derived
 /// table at query time.
 #[derive(Clone)]
@@ -857,6 +1008,7 @@ pub struct ViewDef {
     /// view body by OID at creation; this engine re-resolves the stored text,
     /// so it must re-resolve under the creator's path, not the reader's.
     pub creation_path: StackStr<128>,
+    pub dependencies: StoredQueryDependencies,
     pub live: bool,
     /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
     /// mirroring `Table::pending_ddl`): other transactions see `live`; the
@@ -884,6 +1036,7 @@ pub struct MatviewDef {
     pub name: SqlName,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
+    pub dependencies: StoredQueryDependencies,
     /// False after `WITH NO DATA` until the first REFRESH.
     pub populated: bool,
     pub live: bool,
@@ -1647,6 +1800,101 @@ impl SpillReader {
 }
 
 impl Storage {
+    pub fn rebind_stored_query_dependencies(
+        &self,
+        serialized: StoredQueryDependencies,
+        txid: u32,
+    ) -> Result<StoredQueryDependencies, SqlError> {
+        let mut rebound = StoredQueryDependencies::EMPTY;
+        for dependency in serialized.entries() {
+            let schema = dependency.schema.as_str();
+            let name = dependency.name.as_str();
+            let slot = match dependency.class {
+                DependencyClass::Table => self.find_visible(schema, name, txid),
+                DependencyClass::View => self.views.iter().position(|view| {
+                    view.visible_to(txid)
+                        && view.schema.as_str() == schema
+                        && view.name.as_str() == name
+                }),
+                DependencyClass::Domain => self.domain_slot(schema, name, txid),
+                DependencyClass::Enum => self.enum_slot(schema, name, txid),
+                DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
+            }
+            .ok_or_else(|| sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "stored-query dependency {}.{} does not exist",
+                schema,
+                name
+            ))?;
+            rebound.push(StoredQueryDependency {
+                class: dependency.class,
+                slot: slot as u16,
+                schema: dependency.schema,
+                name: dependency.name,
+                referenced_schema: dependency.referenced_schema,
+                referenced_name: dependency.referenced_name,
+            })?;
+        }
+        Ok(rebound)
+    }
+
+    pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
+        for slot in 0..self.views.len() {
+            if self.views[slot].live {
+                let serialized = self.views[slot].dependencies;
+                self.views[slot].dependencies =
+                    self.rebind_stored_query_dependencies(serialized, 0)?;
+            }
+        }
+        for slot in 0..self.matviews.len() {
+            if self.matviews[slot].live {
+                let serialized = self.matviews[slot].dependencies;
+                self.matviews[slot].dependencies =
+                    self.rebind_stored_query_dependencies(serialized, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_stored_query_dependency(
+        &mut self,
+        class: DependencyClass,
+        slot: usize,
+        schema: SqlName,
+        name: SqlName,
+    ) {
+        for view in self.views.iter_mut() {
+            if view.live || view.pending.is_some() {
+                view.dependencies.rename(class, slot, schema, name);
+            }
+        }
+        for matview in self.matviews.iter_mut() {
+            if matview.live || matview.pending.is_some() {
+                matview.dependencies.rename(class, slot, schema, name);
+            }
+        }
+    }
+
+    fn replace_stored_query_dependency_slot(
+        &mut self,
+        class: DependencyClass,
+        old_slot: usize,
+        new_slot: usize,
+        schema: SqlName,
+        name: SqlName,
+    ) {
+        for view in self.views.iter_mut() {
+            if view.live || view.pending.is_some() {
+                view.dependencies.replace_slot(class, old_slot, new_slot, schema, name);
+            }
+        }
+        for matview in self.matviews.iter_mut() {
+            if matview.live || matview.pending.is_some() {
+                matview.dependencies.replace_slot(class, old_slot, new_slot, schema, name);
+            }
+        }
+    }
+
     /// Bytes drawn beyond the row heap itself, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         config.max_tables
@@ -1732,6 +1980,7 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
+                    dependencies: StoredQueryDependencies::EMPTY,
                     live: false,
                     pending: None,
                 })
@@ -1746,6 +1995,7 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
+                    dependencies: StoredQueryDependencies::EMPTY,
                     populated: false,
                     live: false,
                     pending: None,
@@ -3812,6 +4062,12 @@ impl Storage {
         }
         self.set_table_def(index, pending.def, &pending.column_mapping);
         self.clear_pending_table_defs(index);
+        self.rename_stored_query_dependency(
+            DependencyClass::Table,
+            index,
+            pending.def.schema,
+            pending.def.name,
+        );
         pending.rewrites_rows
     }
 
@@ -3852,6 +4108,9 @@ impl Storage {
         table.n_spill_ssts = 0;
         table.n_tombstones = 0;
         table.tombstones_overflow = false;
+        let schema = table.def.schema;
+        let name = table.def.name;
+        self.rename_stored_query_dependency(DependencyClass::Table, slot, schema, name);
         Ok(slot)
     }
 
@@ -4115,8 +4374,7 @@ impl Storage {
         &mut self,
         schema: SqlName,
         name: SqlName,
-        sql: StackStr<VIEW_SQL_MAX>,
-        creation_path: StackStr<128>,
+        query: StoredQueryDefinition,
         populated: bool,
         txid: u32,
     ) -> Result<usize, SqlError> {
@@ -4147,8 +4405,9 @@ impl Storage {
             created_at: self.catalog_seq,
             schema,
             name,
-            sql,
-            creation_path,
+            sql: query.sql,
+            creation_path: query.creation_path,
+            dependencies: query.dependencies,
             populated,
             live: false,
             pending: Some(PendingDdl { txid, creating: true }),
@@ -4911,6 +5170,7 @@ impl Storage {
                 comment.name = new_name;
             }
         }
+        self.rename_stored_query_dependency(DependencyClass::Enum, slot, schema, new_name);
     }
 
     pub fn restore_enum(&mut self, slot: usize, prior: EnumDef) {
@@ -5000,8 +5260,7 @@ impl Storage {
         &mut self,
         schema: SqlName,
         name: SqlName,
-        sql: StackStr<VIEW_SQL_MAX>,
-        creation_path: StackStr<128>,
+        query: StoredQueryDefinition,
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<usize>), SqlError> {
@@ -5056,8 +5315,9 @@ impl Storage {
             created_at: self.catalog_seq,
             schema,
             name,
-            sql,
-            creation_path,
+            sql: query.sql,
+            creation_path: query.creation_path,
+            dependencies: query.dependencies,
             live: false,
             pending: Some(PendingDdl { txid, creating: true }),
         };
@@ -5102,6 +5362,20 @@ impl Storage {
 
     /// Promotes an uncommitted CREATE VIEW into the committed catalog.
     pub fn commit_view_create(&mut self, slot: usize) {
+        let schema = self.views[slot].schema;
+        let name = self.views[slot].name;
+        if let Some(old_slot) = self.views.iter().enumerate().find_map(|(old_slot, view)| {
+            (old_slot != slot && view.live && view.schema == schema && view.name == name)
+                .then_some(old_slot)
+        }) {
+            self.replace_stored_query_dependency_slot(
+                DependencyClass::View,
+                old_slot,
+                slot,
+                schema,
+                name,
+            );
+        }
         self.views[slot].live = true;
         self.views[slot].pending = None;
     }

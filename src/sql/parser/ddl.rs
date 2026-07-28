@@ -544,7 +544,7 @@ impl<'a> Parser<'a> {
             };
             n
         };
-        let mut elements: [&'a Stmt<'a>; 16] = [&Stmt::Begin; 16];
+        let mut elements: [&'a Stmt<'a>; 16] = [&Stmt::Begin(""); 16];
         let mut n = 0usize;
         while self.peeked == Tok::Ident("create") {
             if n == elements.len() {
@@ -624,12 +624,24 @@ impl<'a> Parser<'a> {
         self.expect_ident("drop")?;
         if self.eat_ident("view")? {
             let (names, if_exists) = self.drop_targets("view name")?;
-            return Ok(Stmt::DropView { names, if_exists });
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropView { names, if_exists, cascade });
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
             let (names, if_exists) = self.drop_targets("materialized view name")?;
-            return Ok(Stmt::DropMaterializedView { names, if_exists });
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropMaterializedView { names, if_exists, cascade });
         }
         if self.eat_ident("index")? {
             let (names, if_exists) = self.drop_targets("index name")?;
@@ -640,7 +652,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("sequence")? {
             let (names, if_exists) = self.drop_targets("sequence name")?;
-            return Ok(Stmt::DropSequence { names, if_exists });
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropSequence { names, if_exists, cascade });
         }
         if self.eat_ident("domain")? {
             return self.drop_domain();
@@ -1085,5 +1103,11 @@ impl<'a> Parser<'a> {
     fn drop_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("table")?;
         let (names, if_exists) = self.drop_targets("table name")?;
-        Ok(Stmt::DropTable(DropTable { names, if_exists }))
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropTable(DropTable { names, if_exists, cascade }))
     }}

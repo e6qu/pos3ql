@@ -29,7 +29,7 @@ pub fn expand_ctes<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_ctes_with_path(sel, storage, txid, None, arena)
+    expand_ctes_with_path(sel, storage, txid, None, None, arena)
 }
 
 /// Expands a view body under the search path captured when that view was
@@ -42,7 +42,18 @@ pub fn expand_ctes_under<'a>(
     path: crate::storage::PathContext,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_ctes_with_path(sel, storage, txid, Some(path), arena)
+    expand_ctes_with_path(sel, storage, txid, Some(path), None, arena)
+}
+
+pub(crate) fn expand_stored_query<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    expand_ctes_with_path(select, storage, txid, Some(path), Some(dependencies), arena)
 }
 
 fn expand_ctes_with_path<'a>(
@@ -50,10 +61,11 @@ fn expand_ctes_with_path<'a>(
     storage: &Storage,
     txid: u32,
     path: Option<crate::storage::PathContext>,
+    dependencies: Option<&crate::storage::StoredQueryDependencies>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     // Fast path: nothing to rewrite (no CTEs anywhere and no views defined).
-    if sel.with.is_empty() && !storage.has_any_view() {
+    if sel.with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
         return Ok(sel);
     }
     if sel.with.len() > crate::sql::parser::MAX_CTES {
@@ -74,6 +86,7 @@ fn expand_ctes_with_path<'a>(
             txid,
             depth: 0,
             path,
+            dependencies,
             qualifier: None,
         };
         // A self-referencing recursive CTE cannot be inlined; this schema-only
@@ -99,6 +112,7 @@ fn expand_ctes_with_path<'a>(
         txid,
         depth: 0,
         path,
+        dependencies,
         qualifier: None,
     };
     subst_select(sel, context, arena)
@@ -195,6 +209,7 @@ pub fn rewrite_view_dml<'a>(
         txid,
         depth: 0,
         path: None,
+        dependencies: None,
         qualifier: Some(ViewQualifier {
             from: view_name,
             to: base_name,
@@ -347,6 +362,7 @@ fn with_exec_context<'a, 's, R>(
             txid,
             depth: 0,
             path: None,
+            dependencies: None,
             qualifier: None,
         };
         if cte.dml.is_some() {
@@ -381,6 +397,7 @@ fn with_exec_context<'a, 's, R>(
         txid,
         depth: 0,
         path: None,
+        dependencies: None,
         qualifier: None,
     };
     build(context)
@@ -503,6 +520,7 @@ struct Subst<'c, 'a, 's> {
     /// are rewritten fully qualified under it, so the surrounding statement's
     /// path cannot re-bind them. `None` at the statement level.
     path: Option<crate::storage::PathContext>,
+    dependencies: Option<&'s crate::storage::StoredQueryDependencies>,
     /// DML on an auto-updatable view is executed against its base table.
     /// Qualified target references must follow that rewrite too.
     qualifier: Option<ViewQualifier<'a>>,
@@ -801,6 +819,7 @@ fn materialize_recursive<'a>(
             txid: outer.txid,
             depth: 0,
             path: None,
+            dependencies: None,
             qualifier: None,
         };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
@@ -1200,12 +1219,30 @@ fn subst_tableref<'a>(
     // by a table earlier in the path) expands to a derived table over the
     // view's stored SELECT, recursively expanded under the view creator's
     // search path.
-    let resolved = match context.path {
+    let captured = context.dependencies.and_then(|dependencies| {
+        dependencies.entries().iter().find_map(|dependency| {
+            if dependency.referenced_schema.as_str() != t.schema.unwrap_or("")
+                || dependency.referenced_name.as_str() != t.table
+            {
+                return None;
+            }
+            match dependency.class {
+                crate::storage::DependencyClass::Table => {
+                    Some(crate::storage::ResolvedRelation::Table(dependency.slot as usize))
+                }
+                crate::storage::DependencyClass::View => {
+                    Some(crate::storage::ResolvedRelation::View(dependency.slot as usize))
+                }
+                _ => None,
+            }
+        })
+    });
+    let resolved = captured.or_else(|| match context.path {
         Some(p) => context
             .storage
             .resolve_relation_under(&p, t.schema, t.table, context.txid),
         None => context.storage.resolve_relation(t.schema, t.table, context.txid),
-    };
+    });
     if let Some(crate::storage::ResolvedRelation::View(slot)) = resolved {
         if context.depth >= MAX_VIEW_DEPTH {
             return Err(sql_err!(
@@ -1233,6 +1270,7 @@ fn subst_tableref<'a>(
             txid: context.txid,
             depth: context.depth + 1,
             path: Some(view_path),
+            dependencies: Some(&view.dependencies),
             qualifier: None,
         };
         let expanded = subst_select(vsel, inner, arena)?;
@@ -1253,12 +1291,17 @@ fn subst_tableref<'a>(
     // it.
     if let (Some(_), Some(crate::storage::ResolvedRelation::Table(slot))) =
         (context.path, resolved)
-        && t.schema.is_none()
     {
         let def = context.storage.table_def(slot, context.txid);
         let schema =
             arena.alloc_str(def.schema.as_str()).map_err(|_| arena_full())?;
-        return Ok(TableRef { schema: Some(schema), ..*t });
+        let table = arena.alloc_str(def.name.as_str()).map_err(|_| arena_full())?;
+        return Ok(TableRef {
+            schema: Some(schema),
+            table,
+            alias: Some(t.alias.unwrap_or(t.table)),
+            ..*t
+        });
     }
     Ok(*t)
 }
@@ -1375,12 +1418,42 @@ fn subst_frame_bound<'a>(
     })
 }
 
+fn rewrite_stored_type_name<'a>(
+    type_name: &'a str,
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let Some(dependencies) = context.dependencies else {
+        return Ok(type_name);
+    };
+    let (bare, array) = type_name
+        .strip_suffix("[]")
+        .map_or((type_name, false), |bare| (bare, true));
+    let (referenced_schema, referenced_name) =
+        bare.split_once('.').map_or(("", bare), |parts| parts);
+    let Some(dependency) = dependencies.entries().iter().find(|dependency| {
+        matches!(
+            dependency.class,
+            crate::storage::DependencyClass::Domain | crate::storage::DependencyClass::Enum
+        ) && dependency.referenced_schema.as_str() == referenced_schema
+            && dependency.referenced_name.as_str() == referenced_name
+    }) else {
+        return Ok(type_name);
+    };
+    let rendered = if array {
+        crate::stack_format!(192, "{}.{}[]", dependency.schema.as_str(), dependency.name.as_str())
+    } else {
+        crate::stack_format!(192, "{}.{}", dependency.schema.as_str(), dependency.name.as_str())
+    };
+    arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
+}
+
 fn subst_expr<'a>(
     e: &'a Expr<'a>,
     context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    if context.qualifier.is_none() && !expr_has_subquery(e) {
+    if context.qualifier.is_none() && context.dependencies.is_none() && !expr_has_subquery(e) {
         return Ok(e);
     }
     let rebuilt = match e {
@@ -1403,7 +1476,7 @@ fn subst_expr<'a>(
         },
         Expr::Cast { operand, type_name, type_mod } => Expr::Cast {
             operand: subst_expr(operand, context, arena)?,
-            type_name,
+            type_name: rewrite_stored_type_name(type_name, context, arena)?,
             type_mod: *type_mod,
         },
         Expr::IsNull { operand, negated } => Expr::IsNull {

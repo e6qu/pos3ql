@@ -25,8 +25,8 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnMeta, FkAction, ForeignKey, OwnedDatum, SqlName, TableDef, UniqueKey,
-    MAX_COLUMNS, MAX_INDEX_COLS,
+    CheckConstraint, ColumnMeta, DependencyClass, FkAction, ForeignKey, OwnedDatum, SqlName,
+    StoredQueryDependencies, TableDef, UniqueKey, MAX_COLUMNS, MAX_INDEX_COLS,
 };
 
 use crc32c::{crc32c, Crc32c};
@@ -63,6 +63,87 @@ const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
 
+fn append_stored_dependency_name(buffer: &mut FixedBuf, name: &str) -> bool {
+    name.len() <= u8::MAX as usize
+        && buffer.append(&[name.len() as u8])
+        && buffer.append(name.as_bytes())
+}
+
+/// Stored-query dependencies cross the WAL boundary in one of two compact
+/// forms: a reference to the creation-time set while appending, or a slice of
+/// the encoded record while replaying. Keeping the fixed dependency array out
+/// of [`WalOp`] prevents every WAL operation from inheriting the largest
+/// variant's stack footprint.
+#[derive(Debug, Clone, Copy)]
+pub enum WalStoredQueryDependencies<'a> {
+    Captured(&'a StoredQueryDependencies),
+    Encoded(&'a [u8]),
+    LegacyEmpty,
+}
+
+impl WalStoredQueryDependencies<'_> {
+    fn encoded_len(self) -> usize {
+        match self {
+            Self::Captured(dependencies) => {
+                1 + dependencies
+                    .entries()
+                    .iter()
+                    .map(|dependency| {
+                        1 + 1
+                            + dependency.schema.as_str().len()
+                            + 1
+                            + dependency.name.as_str().len()
+                            + 1
+                            + dependency.referenced_schema.as_str().len()
+                            + 1
+                            + dependency.referenced_name.as_str().len()
+                    })
+                    .sum::<usize>()
+            }
+            Self::Encoded(bytes) => bytes.len(),
+            Self::LegacyEmpty => 0,
+        }
+    }
+
+    fn append(self, buffer: &mut FixedBuf) -> bool {
+        match self {
+            Self::Captured(dependencies) => {
+                let mut ok = buffer.append(&[dependencies.entries().len() as u8]);
+                for dependency in dependencies.entries() {
+                    ok &= buffer.append(&[dependency.class as u8])
+                        && append_stored_dependency_name(buffer, dependency.schema.as_str())
+                        && append_stored_dependency_name(buffer, dependency.name.as_str())
+                        && append_stored_dependency_name(
+                            buffer,
+                            dependency.referenced_schema.as_str(),
+                        )
+                        && append_stored_dependency_name(
+                            buffer,
+                            dependency.referenced_name.as_str(),
+                        );
+                }
+                ok
+            }
+            Self::Encoded(bytes) => buffer.append(bytes),
+            Self::LegacyEmpty => true,
+        }
+    }
+
+    #[inline(never)]
+    pub fn materialize(self) -> Result<StoredQueryDependencies, SqlError> {
+        match self {
+            Self::Captured(dependencies) => Ok(*dependencies),
+            Self::Encoded(bytes) => decode_stored_query_dependencies(bytes).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt stored-query dependencies in journal"
+                )
+            }),
+            Self::LegacyEmpty => Ok(StoredQueryDependencies::EMPTY),
+        }
+    }
+}
+
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
@@ -91,6 +172,7 @@ pub enum WalOp<'a> {
         sql: &'a str,
         /// The creator's search_path, under which the body re-resolves.
         path: &'a str,
+        dependencies: WalStoredQueryDependencies<'a>,
     },
     DropView {
         schema: &'a str,
@@ -141,6 +223,7 @@ pub enum WalOp<'a> {
         name: &'a str,
         sql: &'a str,
         path: &'a str,
+        dependencies: WalStoredQueryDependencies<'a>,
         populated: bool,
     },
     DropMatview {
@@ -618,8 +701,15 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + table.len() + 8 + 4 + row.len() + 1 + schema.len()
         }
         WalOp::Delete { schema, table, .. } => 1 + table.len() + 8 + 1 + schema.len(),
-        WalOp::CreateView { schema, name, sql, path } => {
-            1 + name.len() + 2 + sql.len() + 1 + schema.len() + 2 + path.len()
+        WalOp::CreateView { schema, name, sql, path, dependencies } => {
+            1 + name.len()
+                + 2
+                + sql.len()
+                + 1
+                + schema.len()
+                + 2
+                + path.len()
+                + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateIndex { schema, name, table, n_cols, .. } => {
@@ -636,8 +726,16 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropTableFk { schema, table, fk_name } => {
             1 + schema.len() + 1 + table.len() + 1 + fk_name.len()
         }
-        WalOp::CreateMatview { schema, name, sql, path, .. } => {
-            1 + name.len() + 2 + sql.len() + 1 + schema.len() + 2 + path.len() + 1
+        WalOp::CreateMatview { schema, name, sql, path, dependencies, .. } => {
+            1 + name.len()
+                + 2
+                + sql.len()
+                + 1
+                + schema.len()
+                + 2
+                + path.len()
+                + 1
+                + dependencies.encoded_len()
         }
         WalOp::DropMatview { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::SetMatviewPopulated { schema, name, .. } => {
@@ -813,13 +911,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&rowid.to_le_bytes())
                 && name_bytes(buffer, schema)
         }
-        WalOp::CreateView { schema, name, sql, path } => {
+        WalOp::CreateView { schema, name, sql, path, dependencies } => {
             name_bytes(buffer, name)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
                 && name_bytes(buffer, schema)
                 && buffer.append(&(path.len() as u16).to_le_bytes())
                 && buffer.append(path.as_bytes())
+                && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
@@ -855,7 +954,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, fk_name)
         }
-        WalOp::CreateMatview { schema, name, sql, path, populated } => {
+        WalOp::CreateMatview { schema, name, sql, path, dependencies, populated } => {
             name_bytes(buffer, name)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
@@ -863,6 +962,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&(path.len() as u16).to_le_bytes())
                 && buffer.append(path.as_bytes())
                 && buffer.append(&[u8::from(*populated)])
+                && dependencies.append(buffer)
         }
         WalOp::DropMatview { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
@@ -1006,6 +1106,67 @@ pub(crate) fn decode_record(record: &[u8]) -> Option<WalOp<'_>> {
         return None;
     }
     decode_op(record[0], &record[8..])
+}
+
+fn stored_dependency_name<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a str> {
+    let length = *payload.get(*at)? as usize;
+    *at += 1;
+    let bytes = payload.get(*at..*at + length)?;
+    *at += length;
+    core::str::from_utf8(bytes).ok()
+}
+
+fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
+    let Some(&count) = payload.first() else {
+        return false;
+    };
+    if count as usize > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
+        return false;
+    }
+    let mut at = 1;
+    for _ in 0..count {
+        let Some(&class) = payload.get(at) else {
+            return false;
+        };
+        if DependencyClass::from_code(class).is_none() {
+            return false;
+        }
+        at += 1;
+        for _ in 0..4 {
+            if stored_dependency_name(payload, &mut at).is_none() {
+                return false;
+            }
+        }
+    }
+    at == payload.len()
+}
+
+#[inline(never)]
+fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDependencies> {
+    if !validate_stored_query_dependencies(payload) {
+        return None;
+    }
+    let count = payload[0] as usize;
+    let mut at = 1;
+    let mut dependencies = StoredQueryDependencies::EMPTY;
+    for _ in 0..count {
+        let class = DependencyClass::from_code(payload[at])?;
+        at += 1;
+        let schema = stored_dependency_name(payload, &mut at)?;
+        let name = stored_dependency_name(payload, &mut at)?;
+        let referenced_schema = stored_dependency_name(payload, &mut at)?;
+        let referenced_name = stored_dependency_name(payload, &mut at)?;
+        dependencies
+            .serialized_push(
+                class,
+                SqlName::parse(schema).ok()?,
+                SqlName::parse(name).ok()?,
+                SqlName::parse(referenced_schema).ok()?,
+                SqlName::parse(referenced_name).ok()?,
+            )
+            .ok()?;
+    }
+    Some(dependencies)
 }
 
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
@@ -1249,7 +1410,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             } else {
                 ("public", "\"$user\", public")
             };
-            (at == payload.len()).then_some(WalOp::CreateView { schema, name, sql, path })
+            let dependencies = if at < payload.len() {
+                let encoded = payload.get(at..)?;
+                if !validate_stored_query_dependencies(encoded) {
+                    return None;
+                }
+                at = payload.len();
+                WalStoredQueryDependencies::Encoded(encoded)
+            } else {
+                WalStoredQueryDependencies::LegacyEmpty
+            };
+            (at == payload.len()).then_some(WalOp::CreateView {
+                schema, name, sql, path, dependencies,
+            })
         }
         KIND_DROP_VIEW => {
             let name = take_name(&mut at)?;
@@ -1271,8 +1444,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += path_len;
             let populated = *payload.get(at)? != 0;
             at += 1;
-            (at == payload.len())
-                .then_some(WalOp::CreateMatview { schema, name, sql, path, populated })
+            let dependencies = if at < payload.len() {
+                let encoded = payload.get(at..)?;
+                if !validate_stored_query_dependencies(encoded) {
+                    return None;
+                }
+                at = payload.len();
+                WalStoredQueryDependencies::Encoded(encoded)
+            } else {
+                WalStoredQueryDependencies::LegacyEmpty
+            };
+            (at == payload.len()).then_some(WalOp::CreateMatview {
+                schema, name, sql, path, dependencies, populated,
+            })
         }
         KIND_DROP_MATVIEW => {
             let name = take_name(&mut at)?;
@@ -1762,6 +1946,16 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_size_is_bounded_by_the_table_definition_variant() {
+        assert!(
+            core::mem::size_of::<WalOp<'static>>()
+                <= core::mem::size_of::<TableDef>() + 64,
+            "WalOp grew to {} bytes",
+            core::mem::size_of::<WalOp<'static>>()
+        );
+    }
 
     fn test_config(dir: &str) -> Config {
         let mut c = Config::default_dev();

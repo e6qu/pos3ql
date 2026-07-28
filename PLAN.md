@@ -828,10 +828,11 @@ storage-aware-planner + async-scheduler + push-based-pipeline approach needs.
 A full step-back audit against the founding goal — a mature,
 PostgreSQL-compatible engine whose *primary* storage is object storage, with
 local disk and memory as **mere caches** — found the SQL/wire-fidelity axis
-substantially complete (differential + sqllogictest + fuzzer green, bug ledger
-empty but for B-124, unmatchable by design) and the remaining work
-concentrated in three structural storage gaps, one compatibility wave, and the
-adaptive-execution capstone. This section is the plan of record for all of it.
+substantially complete (differential + sqllogictest + fuzzer green; the
+remaining open ledger entries document explicitly accepted or architectural
+concurrency differences) and the remaining work concentrated in one open
+structural storage gap, one compatibility wave, and the adaptive-execution
+capstone. This section is the plan of record for all of it.
 
 ### Decisions of record (fixed with the project owner)
 
@@ -863,7 +864,7 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   bucket-synchronous mode is what makes a **single** node's disk formally a
   cache.
 
-### The three structural gaps ("disk and RAM are mere caches")
+### The structural storage gaps ("disk and RAM are mere caches")
 
 1. **Closed: acknowledged durability moved off local disk.** With object
    storage enabled, commit-durable-on-bucket is the default: the acknowledged
@@ -951,6 +952,18 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   and an `mv2` checkpoint manifest line; `SetMatviewPopulated` makes REFRESH /
   WITH NO DATA state survive pure WAL replay. Verified byte-for-byte against
   PostgreSQL (corpus `53_materialized_view`) and by a WAL-replay restart test.
+- **Durable stored-query dependencies** — done: views and materialized views
+  capture a bounded, resolved identity set for referenced tables, views,
+  domains, enums, and constant-regclass sequences when they are created.
+  Query expansion follows the stable catalog slot while retaining the source
+  spelling needed to rewrite the stored AST to the object's current qualified
+  name. Table/type renames and table schema moves therefore preserve
+  PostgreSQL binding, and one transitive graph drives RESTRICT/CASCADE for
+  relation, type, sequence, and schema drops. The graph is carried through
+  view replacement, WAL replay, and versioned checkpoint manifests; restart
+  and differential coverage include table→view→materialized-view→view chains,
+  explicit casts, sequence calls, rename, schema move, refresh, and cascade
+  (B-204).
 - **Sequences** — done: `CREATE SEQUENCE [IF NOT EXISTS] name [AS type]
   [INCREMENT] [MIN/MAXVALUE] [START] [CACHE] [[NO] CYCLE]`, `ALTER SEQUENCE`
   (redefine + `RESTART`), `DROP SEQUENCE`, and the functions `nextval` /

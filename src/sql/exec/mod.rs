@@ -1064,6 +1064,73 @@ pub fn drop_table(
                     ));
                 }
                 let def = *storage.table_def(index, txn.txid);
+                let root = |dependency: &crate::storage::StoredQueryDependency| {
+                    dependency.class == crate::storage::DependencyClass::Table
+                        && dependency.slot as usize == index
+                };
+                let closure = stored_query_dependent_closure(storage, txn.txid, root);
+                let (dependent_views, dependent_matviews) = match closure {
+                    Ok(closure) => closure,
+                    Err(error) => return sql_fail(error),
+                };
+                let has_dependents = dependent_views.iter().any(|selected| *selected)
+                    || dependent_matviews.iter().any(|selected| *selected);
+                if has_dependents && !statement.cascade {
+                    if let Err(error) = report_stored_query_dependents(
+                        storage,
+                        txn.txid,
+                        StoredQueryRoot {
+                            class: crate::storage::DependencyClass::Table,
+                            slot: index,
+                            kind: "table",
+                            schema: def.schema,
+                            name: def.name,
+                        },
+                        StoredQuerySelection {
+                            views: &dependent_views,
+                            matviews: &dependent_matviews,
+                        },
+                        false,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    return sql_fail(sql_err!(
+                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                        "cannot drop table {} because other objects depend on it",
+                        def.name.as_str()
+                    ));
+                }
+                if statement.cascade {
+                    if let Err(error) = report_stored_query_dependents(
+                        storage,
+                        txn.txid,
+                        StoredQueryRoot {
+                            class: crate::storage::DependencyClass::Table,
+                            slot: index,
+                            kind: "table",
+                            schema: def.schema,
+                            name: def.name,
+                        },
+                        StoredQuerySelection {
+                            views: &dependent_views,
+                            matviews: &dependent_matviews,
+                        },
+                        true,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = drop_selected_stored_queries(
+                        storage,
+                        wal,
+                        txn,
+                        &dependent_views,
+                        &dependent_matviews,
+                    ) {
+                        return sql_fail(error);
+                    }
+                }
                 // Owned serial/identity sequences are internal dependencies:
                 // dropping their table drops them in the same transaction.
                 for sequence_index in 0..storage.sequence_count() {
@@ -1616,29 +1683,52 @@ pub fn drop_schema(
                 return sql_fail(error);
             }
         }
-        // A surviving stored query may depend on a table or type being
-        // removed. Until view dependencies have durable catalog identities,
-        // refuse the ambiguous case loudly instead of preserving a broken
-        // view. Views inside the listed schemas are already in the sweep.
+        // Stored queries outside the dropped schemas follow their resolved
+        // dependencies transitively, exactly as pg_depend drives CASCADE.
         if n_objects > 0 {
-            for view_slot in 0..storage.view_count() {
+            let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+                in_listed(storage, dependency.schema.as_str())
+            });
+            let (dependent_views, dependent_matviews) = match closure {
+                Ok(closure) => closure,
+                Err(error) => return sql_fail(error),
+            };
+            for (view_slot, &is_dependent) in dependent_views
+                .iter()
+                .enumerate()
+                .take(storage.view_count())
+            {
                 let view = storage.view(view_slot);
-                if view.visible_to(txn.txid) && !in_listed(storage, view.schema.as_str()) {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cannot cascade schema drop while surviving views lack durable dependency identities"
-                    ));
+                if is_dependent
+                    && view.visible_to(txn.txid)
+                    && !in_listed(storage, view.schema.as_str())
+                    && let Err(error) = push(SchemaObject::View(view_slot), &mut n_objects)
+                {
+                    return sql_fail(error);
                 }
             }
-            for matview_slot in 0..storage.matview_count() {
+            for (matview_slot, &is_dependent) in dependent_matviews
+                .iter()
+                .enumerate()
+                .take(storage.matview_count())
+            {
                 let matview = storage.matview(matview_slot);
-                if matview.visible_to(txn.txid)
-                    && !in_listed(storage, matview.schema.as_str())
+                if !is_dependent
+                    || !matview.visible_to(txn.txid)
+                    || in_listed(storage, matview.schema.as_str())
                 {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cannot cascade schema drop while surviving materialized views lack durable dependency identities"
-                    ));
+                    continue;
+                }
+                let Some(table) =
+                    storage.find_visible(matview.schema.as_str(), matview.name.as_str(), txn.txid)
+                else {
+                    return sql_fail(undefined_kind("materialized view", matview.name.as_str()));
+                };
+                if let Err(error) = push(
+                    SchemaObject::Matview { table, catalog: matview_slot },
+                    &mut n_objects,
+                ) {
+                    return sql_fail(error);
                 }
             }
         }
@@ -2190,6 +2280,14 @@ pub fn create_view(
     if let Err(e) = super::query::validate_view(buffer.as_str(), storage, txn.txid, arena) {
         return sql_fail(e);
     }
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
+    let dependencies = match super::query::stored_query_dependencies(
+        buffer.as_str(), storage, txn.txid, path, arena,
+    ) {
+        Ok(dependencies) => dependencies,
+        Err(error) => return sql_fail(error),
+    };
     let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
@@ -2206,7 +2304,17 @@ pub fn create_view(
             "search_path is too long to store with a view"
         ));
     }
-    match storage.create_view(schema, sqlname, buffer, creation_path, or_replace, txn.txid) {
+    match storage.create_view(
+        schema,
+        sqlname,
+        crate::storage::StoredQueryDefinition {
+            sql: buffer,
+            creation_path,
+            dependencies,
+        },
+        or_replace,
+        txn.txid,
+    ) {
         Ok((new_slot, old_slot)) => {
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(
@@ -2216,6 +2324,7 @@ pub fn create_view(
                     name: name.name,
                     sql,
                     path: raw_path,
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
                 },
             ) {
                 // The journal rejected the record; undo the in-memory apply.
@@ -2329,11 +2438,12 @@ pub fn comment(
                 };
                 let mut columns =
                     [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-                let described = super::query::describe_query_under(
+                let described = super::query::describe_stored_query(
                     view_sql,
                     storage,
                     txid,
                     view_path,
+                    &view.dependencies,
                     arena,
                     &mut columns,
                 );
@@ -2533,6 +2643,16 @@ pub fn create_table_as(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    let dependencies = if materialized {
+        let user = super::eval::funcs::system::session_user_owned();
+        let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
+        match super::query::stored_query_dependencies(sql, storage, txn.txid, path, arena) {
+            Ok(dependencies) => dependencies,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        crate::storage::StoredQueryDependencies::EMPTY
+    };
     if !rename.is_empty() && rename.len() != n_cols {
         return sql_fail(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -2678,7 +2798,17 @@ pub fn create_table_as(
         }
         let mut cpath = crate::util::StackStr::<128>::new();
         let _ = write!(cpath, "{raw_path}");
-        match storage.create_matview(def.schema, def.name, buffer, cpath, with_data, txn.txid) {
+        match storage.create_matview(
+            def.schema,
+            def.name,
+            crate::storage::StoredQueryDefinition {
+                sql: buffer,
+                creation_path: cpath,
+                dependencies,
+            },
+            with_data,
+            txn.txid,
+        ) {
             Ok(slot) => {
                 let lsn = storage.bump_lsn();
                 if let Err(e) = wal.append(
@@ -2688,6 +2818,9 @@ pub fn create_table_as(
                         name: name.name,
                         sql,
                         path: raw_path,
+                        dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                            &dependencies,
+                        ),
                         populated: with_data,
                     },
                 ) {
@@ -2773,7 +2906,8 @@ pub fn refresh_materialized_view(
         ));
     };
     // Copy the stored query out before mutating storage.
-    let sql = match arena.alloc_str(storage.matview(slot).sql.as_str()) {
+    let matview = storage.matview(slot).clone();
+    let sql = match arena.alloc_str(matview.sql.as_str()) {
         Ok(s) => s,
         Err(_) => {
             return sql_fail(sql_err!(
@@ -2815,13 +2949,21 @@ pub fn refresh_materialized_view(
     }
     // Re-run the query and store its rows into the backing table (two-pass, so
     // the source may read another table without overlapping the write).
-    let sel = match crate::sql::parser::parse_query(sql, arena) {
-        Ok(s) => s,
+    let select = match crate::sql::parser::parse_query(sql, arena) {
+        Ok(select) => select,
         Err(e) => return sql_fail(e),
+    };
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(matview.creation_path.as_str(), user.as_str(), txn.txid);
+    let select = match super::query::expand_stored_query(
+        select, storage, txn.txid, path, &matview.dependencies, arena,
+    ) {
+        Ok(select) => select,
+        Err(error) => return sql_fail(error),
     };
     let mut rows = 0usize;
     if let Err(e) = super::query::select_into_rows(
-        storage, txn.txid, sel, arena, params, None, None, &mut |_| {
+        storage, txn.txid, select, arena, params, None, None, &mut |_| {
             rows += 1;
             Ok(())
         },
@@ -2840,8 +2982,8 @@ pub fn refresh_materialized_view(
     };
     let mut at = 0usize;
     if let Err(e) = super::query::select_into_rows(
-        storage, txn.txid, sel, arena, params, None, None, &mut |vals| {
-            rows_bytes[at] = encode_projected_pub(vals, arena)?;
+        storage, txn.txid, select, arena, params, None, None, &mut |values| {
+            rows_bytes[at] = encode_projected_pub(values, arena)?;
             at += 1;
             Ok(())
         },
@@ -2887,6 +3029,7 @@ pub fn drop_materialized_view(
     txn: &mut TxnState,
     names: &[crate::sql::ast::QualName],
     if_exists: bool,
+    cascade: bool,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -2922,6 +3065,30 @@ pub fn drop_materialized_view(
             None => return sql_fail(undefined_kind("materialized view", name.name)),
         };
         let def = *storage.table_def(idx, txn.txid);
+        let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            dependency.class == crate::storage::DependencyClass::Table
+                && dependency.slot as usize == idx
+        });
+        let (dependent_views, dependent_matviews) = match closure {
+            Ok(closure) => closure,
+            Err(error) => return sql_fail(error),
+        };
+        let has_dependents = dependent_views.iter().any(|selected| *selected)
+            || dependent_matviews.iter().any(|selected| *selected);
+        if has_dependents && !cascade {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop materialized view {} because other objects depend on it",
+                def.name.as_str()
+            ));
+        }
+        if cascade
+            && let Err(error) = drop_selected_stored_queries(
+                storage, wal, txn, &dependent_views, &dependent_matviews,
+            )
+        {
+            return sql_fail(error);
+        }
         // Drop the backing table.
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
@@ -3315,6 +3482,7 @@ pub fn drop_sequence(
     txn: &mut TxnState,
     names: &[crate::sql::ast::QualName],
     if_exists: bool,
+    cascade: bool,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -3345,6 +3513,68 @@ pub fn drop_sequence(
             }
             (s.schema, s.name)
         };
+        let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            dependency.class == crate::storage::DependencyClass::Sequence
+                && dependency.slot as usize == slot
+        });
+        let (dependent_views, dependent_matviews) = match closure {
+            Ok(closure) => closure,
+            Err(error) => return sql_fail(error),
+        };
+        let has_dependents = dependent_views.iter().any(|selected| *selected)
+            || dependent_matviews.iter().any(|selected| *selected);
+        if has_dependents && !cascade {
+            if let Err(error) = report_stored_query_dependents(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Sequence,
+                    slot,
+                    kind: "sequence",
+                    schema,
+                    name: sname,
+                },
+                StoredQuerySelection {
+                    views: &dependent_views,
+                    matviews: &dependent_matviews,
+                },
+                false,
+                responder,
+            ) {
+                return sql_fail(error);
+            }
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop sequence {} because other objects depend on it",
+                sname.as_str()
+            ));
+        }
+        if cascade {
+            if let Err(error) = report_stored_query_dependents(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Sequence,
+                    slot,
+                    kind: "sequence",
+                    schema,
+                    name: sname,
+                },
+                StoredQuerySelection {
+                    views: &dependent_views,
+                    matviews: &dependent_matviews,
+                },
+                true,
+                responder,
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = drop_selected_stored_queries(
+                storage, wal, txn, &dependent_views, &dependent_matviews,
+            ) {
+                return sql_fail(error);
+            }
+        }
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
             lsn,
@@ -3662,13 +3892,13 @@ fn drop_domain_selection(
 ) -> Result<(), SqlError> {
     let selected_count = selected.iter().filter(|&&yes| yes).count();
     if selected_count > 0 || selected_enum.is_some() {
-        reject_type_drop_with_stored_queries(
+        apply_type_drop_to_stored_queries(
             storage,
-            txn.txid,
+            wal,
+            txn,
             selected,
             selected_enum,
             cascade,
-            arena,
         )?;
     }
     for (slot, is_selected) in selected
@@ -4369,349 +4599,457 @@ pub fn drop_enum(
     sql_ok()
 }
 
-fn reject_type_drop_with_stored_queries(
-    storage: &Storage,
-    txid: u32,
+fn apply_type_drop_to_stored_queries(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
     selected_domains: &[bool; crate::storage::MAX_DOMAINS],
     selected_enum: Option<usize>,
     cascade: bool,
-    arena: &Arena,
 ) -> Result<(), SqlError> {
-    let user = crate::sql::eval::funcs::system::session_user_owned();
-    for slot in 0..storage.view_count() {
-        let view = storage.view(slot);
-        if !view.visible_to(txid) {
-            continue;
+    use crate::storage::DependencyClass;
+    let root = |dependency: &crate::storage::StoredQueryDependency| match dependency.class {
+        DependencyClass::Domain => selected_domains
+            .get(dependency.slot as usize)
+            .copied()
+            .unwrap_or(false),
+        DependencyClass::Enum => selected_enum == Some(dependency.slot as usize),
+        _ => false,
+    };
+    let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, root)?;
+    if !views.iter().any(|selected| *selected) && !matviews.iter().any(|selected| *selected) {
+        return Ok(());
+    }
+    if !cascade {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop type because a stored query depends on it"
+        ));
+    }
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews)
+}
+
+const MAX_DEPENDENT_STORED_QUERIES: usize = 64;
+
+fn stored_query_dependent_closure(
+    storage: &Storage,
+    txid: u32,
+    root: impl Fn(&crate::storage::StoredQueryDependency) -> bool,
+) -> Result<
+    (
+        [bool; MAX_DEPENDENT_STORED_QUERIES],
+        [bool; MAX_DEPENDENT_STORED_QUERIES],
+    ),
+    SqlError,
+> {
+    use crate::storage::DependencyClass;
+    if storage.view_count() > MAX_DEPENDENT_STORED_QUERIES
+        || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
+        || storage.table_count() > MAX_DEPENDENT_STORED_QUERIES
+    {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "stored-query dependency closure exceeds {} catalog slots",
+            MAX_DEPENDENT_STORED_QUERIES
+        ));
+    }
+    let mut views = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let mut matviews = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let mut matview_tables = [false; MAX_DEPENDENT_STORED_QUERIES];
+    loop {
+        let mut changed = false;
+        for slot in 0..storage.view_count() {
+            let view = storage.view(slot);
+            if views[slot] || !view.visible_to(txid) {
+                continue;
+            }
+            let hit = view.dependencies.entries().iter().any(|dependency| {
+                root(dependency)
+                    || (dependency.class == DependencyClass::View
+                        && views[dependency.slot as usize])
+                    || (dependency.class == DependencyClass::Table
+                        && matview_tables[dependency.slot as usize])
+            });
+            if hit {
+                views[slot] = true;
+                changed = true;
+            }
         }
-        let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
-        let select = crate::sql::parser::parse_query(view.sql.as_str(), arena)?;
-        if select_uses_dropped_type(
-            select,
-            storage,
-            txid,
-            &path,
-            selected_domains,
-            selected_enum,
-        ) {
-            return stored_query_type_dependency_error(cascade);
+        let mut slot = 0;
+        while slot < storage.matview_count() {
+            let matview = storage.matview(slot);
+            if matviews[slot] || !matview.visible_to(txid) {
+                slot += 1;
+                continue;
+            }
+            let hit = matview.dependencies.entries().iter().any(|dependency| {
+                root(dependency)
+                    || (dependency.class == DependencyClass::View
+                        && views[dependency.slot as usize])
+                    || (dependency.class == DependencyClass::Table
+                        && matview_tables[dependency.slot as usize])
+            });
+            if hit {
+                matviews[slot] = true;
+                let table = storage
+                    .find_visible(matview.schema.as_str(), matview.name.as_str(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_TABLE,
+                            "materialized view \"{}\" has no backing table",
+                            matview.name.as_str()
+                        )
+                    })?;
+                matview_tables[table] = true;
+                changed = true;
+            }
+            slot += 1;
+        }
+        if !changed {
+            break;
         }
     }
-    for slot in 0..storage.matview_count() {
-        let view = storage.matview(slot);
-        if !view.visible_to(txid) {
-            continue;
+    Ok((views, matviews))
+}
+
+#[derive(Clone, Copy)]
+struct StoredQueryRoot {
+    class: crate::storage::DependencyClass,
+    slot: usize,
+    kind: &'static str,
+    schema: SqlName,
+    name: SqlName,
+}
+
+#[derive(Clone, Copy)]
+struct StoredQuerySelection<'a> {
+    views: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
+}
+
+fn report_stored_query_dependents(
+    storage: &Storage,
+    txid: u32,
+    root: StoredQueryRoot,
+    selection: StoredQuerySelection<'_>,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    use crate::storage::DependencyClass;
+
+    let views = selection.views;
+    let matviews = selection.matviews;
+    let count = views.iter().filter(|selected| **selected).count()
+        + matviews.iter().filter(|selected| **selected).count();
+    if count == 0 {
+        return Ok(());
+    }
+
+    // A dependency report is parent-before-child. Derive a bounded depth from
+    // the same graph used for selection so a table→view→matview→view chain is
+    // rendered in PostgreSQL's order.
+    let mut view_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
+    let mut matview_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
+    loop {
+        let mut changed = false;
+        for slot in 0..storage.view_count() {
+            if !views[slot] || view_depth[slot] != 0 {
+                continue;
+            }
+            let mut depth = 0u8;
+            for dependency in storage.view(slot).dependencies.entries() {
+                let parent_depth = match dependency.class {
+                    class if class == root.class && dependency.slot as usize == root.slot => 1,
+                    DependencyClass::View => view_depth[dependency.slot as usize]
+                        .checked_add(1)
+                        .filter(|_| view_depth[dependency.slot as usize] != 0)
+                        .unwrap_or(0),
+                    DependencyClass::Table => {
+                        let mut found = 0;
+                        for matview_slot in 0..storage.matview_count() {
+                            if !matviews[matview_slot] || matview_depth[matview_slot] == 0 {
+                                continue;
+                            }
+                            let matview = storage.matview(matview_slot);
+                            if storage.find_visible(
+                                matview.schema.as_str(),
+                                matview.name.as_str(),
+                                txid,
+                            ) == Some(dependency.slot as usize)
+                            {
+                                found = matview_depth[matview_slot].saturating_add(1);
+                                break;
+                            }
+                        }
+                        found
+                    }
+                    _ => 0,
+                };
+                if parent_depth != 0 {
+                    depth = parent_depth;
+                    break;
+                }
+            }
+            if depth != 0 {
+                view_depth[slot] = depth;
+                changed = true;
+            }
         }
-        let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
-        let select = crate::sql::parser::parse_query(view.sql.as_str(), arena)?;
-        if select_uses_dropped_type(
-            select,
-            storage,
-            txid,
-            &path,
-            selected_domains,
-            selected_enum,
-        ) {
-            return stored_query_type_dependency_error(cascade);
+        for slot in 0..storage.matview_count() {
+            if !matviews[slot] || matview_depth[slot] != 0 {
+                continue;
+            }
+            let mut depth = 0u8;
+            for dependency in storage.matview(slot).dependencies.entries() {
+                let parent_depth = match dependency.class {
+                    class if class == root.class && dependency.slot as usize == root.slot => 1,
+                    DependencyClass::View if view_depth[dependency.slot as usize] != 0 => {
+                        view_depth[dependency.slot as usize].saturating_add(1)
+                    }
+                    _ => 0,
+                };
+                if parent_depth != 0 {
+                    depth = parent_depth;
+                    break;
+                }
+            }
+            if depth != 0 {
+                matview_depth[slot] = depth;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let in_path = |schema: &str| {
+        storage.path().entries().iter().any(|entry| match entry {
+            crate::storage::PathEntry::Schema(slot) => {
+                storage.schema_def(*slot as usize).name.as_str() == schema
+            }
+            crate::storage::PathEntry::Catalog => schema == "pg_catalog",
+        })
+    };
+    let write_name = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
+        if in_path(schema.as_str()) {
+            let _ = write!(out, "{}", name.as_str());
+        } else {
+            let _ = write!(out, "{}.{}", schema.as_str(), name.as_str());
+        }
+    };
+    let describe_view = |slot: usize, out: &mut crate::util::StackStr<192>| {
+        let view = storage.view(slot);
+        let _ = write!(out, "view ");
+        write_name(out, &view.schema, &view.name);
+    };
+    let describe_matview = |slot: usize, out: &mut crate::util::StackStr<192>| {
+        let matview = storage.matview(slot);
+        let _ = write!(out, "materialized view ");
+        write_name(out, &matview.schema, &matview.name);
+    };
+    let mut detail = crate::util::StackStr::<512>::new();
+    let mut written = 0usize;
+    for depth in 1..=MAX_DEPENDENT_STORED_QUERIES as u8 {
+        for slot in 0..storage.view_count() {
+            if views[slot] && view_depth[slot] == depth {
+                let mut object = crate::util::StackStr::<192>::new();
+                describe_view(slot, &mut object);
+                let _ = write!(
+                    detail,
+                    "{}{}{}",
+                    if written == 0 { "" } else { "\n" },
+                    if cascade { "drop cascades to " } else { "" },
+                    object.as_str()
+                );
+                if !cascade {
+                    let mut parent = crate::util::StackStr::<192>::new();
+                    if depth == 1 {
+                        let _ = write!(parent, "{} ", root.kind);
+                        write_name(&mut parent, &root.schema, &root.name);
+                    } else {
+                        for dependency in storage.view(slot).dependencies.entries() {
+                            if dependency.class == DependencyClass::View
+                                && view_depth[dependency.slot as usize] == depth - 1
+                            {
+                                describe_view(dependency.slot as usize, &mut parent);
+                                break;
+                            }
+                            if dependency.class == DependencyClass::Table {
+                                for (matview_slot, &parent_depth) in matview_depth
+                                    .iter()
+                                    .enumerate()
+                                    .take(storage.matview_count())
+                                {
+                                    let matview = storage.matview(matview_slot);
+                                    if parent_depth == depth - 1
+                                        && storage.find_visible(
+                                            matview.schema.as_str(),
+                                            matview.name.as_str(),
+                                            txid,
+                                        ) == Some(dependency.slot as usize)
+                                    {
+                                        describe_matview(matview_slot, &mut parent);
+                                        break;
+                                    }
+                                }
+                            }
+                            if !parent.as_str().is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = write!(detail, " depends on {}", parent.as_str());
+                }
+                written += 1;
+            }
+        }
+        for slot in 0..storage.matview_count() {
+            if matviews[slot] && matview_depth[slot] == depth {
+                let mut object = crate::util::StackStr::<192>::new();
+                describe_matview(slot, &mut object);
+                let _ = write!(
+                    detail,
+                    "{}{}{}",
+                    if written == 0 { "" } else { "\n" },
+                    if cascade { "drop cascades to " } else { "" },
+                    object.as_str()
+                );
+                if !cascade {
+                    let mut parent = crate::util::StackStr::<192>::new();
+                    if depth == 1 {
+                        let _ = write!(parent, "{} ", root.kind);
+                        write_name(&mut parent, &root.schema, &root.name);
+                    } else if let Some(dependency) = storage
+                        .matview(slot)
+                        .dependencies
+                        .entries()
+                        .iter()
+                        .find(|dependency| {
+                            dependency.class == DependencyClass::View
+                                && view_depth[dependency.slot as usize] == depth - 1
+                        })
+                    {
+                        describe_view(dependency.slot as usize, &mut parent);
+                    }
+                    let _ = write!(detail, " depends on {}", parent.as_str());
+                }
+                written += 1;
+            }
+        }
+    }
+    if written != count || detail.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "stored-query dependency report exceeds its fixed buffer"
+        ));
+    }
+
+    if cascade {
+        if count == 1 {
+            responder
+                .notice(sqlstate::SUCCESSFUL_COMPLETION, detail.as_str())
+                .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full"))?;
+        } else {
+            crate::sql::eval::stash_diagnostic(detail, None);
+            responder
+                .notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "drop cascades to {} other objects", count).as_str(),
+                )
+                .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full"))?;
+        }
+    } else {
+        let mut hint = crate::util::StackStr::<128>::new();
+        let _ = write!(hint, "Use DROP ... CASCADE to drop the dependent objects too.");
+        crate::sql::eval::stash_diagnostic(detail, Some(hint));
+    }
+    Ok(())
+}
+
+fn drop_selected_stored_queries(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+) -> Result<(), SqlError> {
+    // Dependents are already closed transitively. Reverse slot order avoids
+    // immediately reusing a just-freed low slot while this plan is executing.
+    for slot in (0..storage.view_count()).rev() {
+        if views[slot] && storage.view(slot).visible_to(txn.txid) {
+            drop_view_slot(storage, wal, txn, slot)?;
+        }
+    }
+    for slot in (0..storage.matview_count()).rev() {
+        if matviews[slot] && storage.matview(slot).visible_to(txn.txid) {
+            drop_matview_slot(storage, wal, txn, slot)?;
         }
     }
     Ok(())
 }
 
-fn stored_query_type_dependency_error(cascade: bool) -> Result<(), SqlError> {
-    if cascade {
-        Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot cascade type drop while stored queries lack durable dependency identities"
-        ))
-    } else {
-        Err(sql_err!(
-            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop type because a stored query depends on it"
-        ))
-    }
-}
-
-fn select_uses_dropped_type(
-    select: &super::ast::Select,
-    storage: &Storage,
-    txid: u32,
-    path: &crate::storage::PathContext,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
-    selected_enum: Option<usize>,
-) -> bool {
-    let expression_uses = |expression: &Expr| {
-        expression_uses_dropped_type(
-            expression,
-            storage,
-            txid,
-            path,
-            selected_domains,
-            selected_enum,
-        )
+fn drop_view_slot(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let (schema, name) = {
+        let view = storage.view(slot);
+        (view.schema, view.name)
     };
-    if select.items.iter().any(|item| match item {
-        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-            expression_uses(expression)
-        }
-        _ => false,
-    }) || select.distinct_on.iter().any(|expression| expression_uses(expression))
-        || select.where_clause.is_some_and(&expression_uses)
-        || select.group_by.iter().any(|expression| expression_uses(expression))
-        || select.having.is_some_and(&expression_uses)
-        || select.order_by.iter().any(|order| expression_uses(order.expression))
-        || select.limit.is_some_and(&expression_uses)
-        || select.offset.is_some_and(&expression_uses)
-        || select.with.iter().any(|cte| {
-            select_uses_dropped_type(
-                cte.query,
-                storage,
-                txid,
-                path,
-                selected_domains,
-                selected_enum,
-            )
-        })
-    {
-        return true;
+    let lsn = storage.bump_lsn();
+    wal.append(
+        lsn,
+        &WalOp::DropView {
+            schema: schema.as_str(),
+            name: name.as_str(),
+        },
+    )?;
+    if let Some(slot) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)? {
+        txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))?;
     }
-    if let Some(tree) = select.set_body
-        && set_tree_uses_dropped_type(
-            tree,
-            storage,
-            txid,
-            path,
-            selected_domains,
-            selected_enum,
-        )
-    {
-        return true;
-    }
-    let Some(from) = select.from else {
-        return false;
+    Ok(())
+}
+
+fn drop_matview_slot(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let (schema, name) = {
+        let matview = storage.matview(slot);
+        (matview.schema, matview.name)
     };
-    table_ref_uses_dropped_type(
-        &from.base,
-        storage,
-        txid,
-        path,
-        selected_domains,
-        selected_enum,
-    ) || from.joins.iter().any(|join| {
-        table_ref_uses_dropped_type(
-            &join.table,
-            storage,
-            txid,
-            path,
-            selected_domains,
-            selected_enum,
-        ) || join.on.is_some_and(&expression_uses)
-    })
-}
-
-fn set_tree_uses_dropped_type(
-    tree: &super::ast::SetTree,
-    storage: &Storage,
-    txid: u32,
-    path: &crate::storage::PathContext,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
-    selected_enum: Option<usize>,
-) -> bool {
-    match tree {
-        super::ast::SetTree::Select(select) => select_uses_dropped_type(
-            select,
-            storage,
-            txid,
-            path,
-            selected_domains,
-            selected_enum,
-        ),
-        super::ast::SetTree::Op { left, right, .. } => {
-            set_tree_uses_dropped_type(
-                left,
-                storage,
-                txid,
-                path,
-                selected_domains,
-                selected_enum,
-            ) || set_tree_uses_dropped_type(
-                right,
-                storage,
-                txid,
-                path,
-                selected_domains,
-                selected_enum,
-            )
-        }
+    let table = storage
+        .find_visible(schema.as_str(), name.as_str(), txn.txid)
+        .ok_or_else(|| undefined_kind("materialized view", name.as_str()))?;
+    let lsn = storage.bump_lsn();
+    wal.append(
+        lsn,
+        &WalOp::DropTable {
+            schema: schema.as_str(),
+            name: name.as_str(),
+        },
+    )?;
+    txn.record_ddl(super::txn::DdlUndo::Dropped(table as u32))?;
+    storage.drop_table_in(table, txn.txid);
+    storage.drop_indexes_for(schema.as_str(), name.as_str(), txn.txid);
+    let lsn = storage.bump_lsn();
+    wal.append(
+        lsn,
+        &WalOp::DropMatview {
+            schema: schema.as_str(),
+            name: name.as_str(),
+        },
+    )?;
+    if let Some(slot) = storage.drop_matview(schema.as_str(), name.as_str(), txn.txid)? {
+        txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32))?;
     }
-}
-
-fn table_ref_uses_dropped_type(
-    table: &super::ast::TableRef,
-    storage: &Storage,
-    txid: u32,
-    path: &crate::storage::PathContext,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
-    selected_enum: Option<usize>,
-) -> bool {
-    table.subquery.is_some_and(|select| {
-        select_uses_dropped_type(
-            select,
-            storage,
-            txid,
-            path,
-            selected_domains,
-            selected_enum,
-        )
-    }) || table.func_args.is_some_and(|arguments| {
-        arguments.iter().any(|argument| {
-            expression_uses_dropped_type(
-                argument,
-                storage,
-                txid,
-                path,
-                selected_domains,
-                selected_enum,
-            )
-        })
-    })
-}
-
-fn expression_uses_dropped_type(
-    expression: &Expr,
-    storage: &Storage,
-    txid: u32,
-    path: &crate::storage::PathContext,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
-    selected_enum: Option<usize>,
-) -> bool {
-    let child = |expression: &Expr| {
-        expression_uses_dropped_type(
-            expression,
-            storage,
-            txid,
-            path,
-            selected_domains,
-            selected_enum,
-        )
-    };
-    match expression {
-        Expr::Cast { operand, type_name, .. } => {
-            cast_resolves_to_dropped_type(
-                storage,
-                txid,
-                path,
-                type_name,
-                selected_domains,
-                selected_enum,
-            ) || child(operand)
-        }
-        Expr::Unary { operand, .. }
-        | Expr::IsNull { operand, .. }
-        | Expr::Field { base: operand, .. } => child(operand),
-        Expr::Binary { left, right, .. }
-        | Expr::Subscript { base: left, index: right }
-        | Expr::AnyAll { operand: left, array: right, .. } => child(left) || child(right),
-        Expr::Call { args, order_by, over, filter, .. } => {
-            args.iter().any(|argument| child(argument))
-                || order_by.iter().any(|order| child(order.expression))
-                || filter.is_some_and(&child)
-                || over.is_some_and(|window| {
-                    window.partition_by.iter().any(|expression| child(expression))
-                        || window.order_by.iter().any(|order| child(order.expression))
-                        || window.frame.is_some_and(|frame| {
-                            use super::ast::FrameBound;
-                            let bound = |bound| match bound {
-                                FrameBound::Preceding(expression)
-                                | FrameBound::Following(expression) => child(expression),
-                                _ => false,
-                            };
-                            bound(frame.start) || bound(frame.end)
-                        })
-                })
-        }
-        Expr::InList { operand, list, .. } => {
-            child(operand) || list.iter().any(|expression| child(expression))
-        }
-        Expr::Between { operand, low, high, .. } => {
-            child(operand) || child(low) || child(high)
-        }
-        Expr::Like { operand, pattern, escape, .. } => {
-            child(operand) || child(pattern) || escape.is_some_and(&child)
-        }
-        Expr::Match { operand, pattern, .. } => child(operand) || child(pattern),
-        Expr::Case { operand, whens, otherwise, .. } => {
-            operand.is_some_and(&child)
-                || whens.iter().any(|(condition, result)| child(condition) || child(result))
-                || otherwise.is_some_and(&child)
-        }
-        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
-            select_uses_dropped_type(
-                select,
-                storage,
-                txid,
-                path,
-                selected_domains,
-                selected_enum,
-            )
-        }
-        Expr::InSubquery { operand, select, .. } => {
-            child(operand)
-                || select_uses_dropped_type(
-                    select,
-                    storage,
-                    txid,
-                    path,
-                    selected_domains,
-                    selected_enum,
-                )
-        }
-        Expr::Array(items) => items.iter().any(|expression| child(expression)),
-        Expr::Slice { base, lower, upper } => {
-            child(base) || lower.is_some_and(&child) || upper.is_some_and(&child)
-        }
-        _ => false,
-    }
-}
-
-fn cast_resolves_to_dropped_type(
-    storage: &Storage,
-    txid: u32,
-    path: &crate::storage::PathContext,
-    type_name: &str,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
-    selected_enum: Option<usize>,
-) -> bool {
-    let bare_type = type_name.strip_suffix("[]").unwrap_or(type_name);
-    let selected_at = |schema: &str, name: &str| {
-        storage
-            .domain_slot(schema, name, txid)
-            .is_some_and(|slot| selected_domains[slot])
-            || storage
-                .enum_slot(schema, name, txid)
-                .is_some_and(|slot| selected_enum == Some(slot))
-    };
-    if let Some((schema, name)) = bare_type.split_once('.') {
-        return selected_at(schema, name);
-    }
-    for entry in path.entries() {
-        match entry {
-            crate::storage::PathEntry::Catalog => {
-                if ColType::from_sql_name(bare_type).is_some() {
-                    return false;
-                }
-            }
-            crate::storage::PathEntry::Schema(slot) => {
-                let schema = storage.schema_def(*slot as usize).name;
-                let domain = storage.domain_slot(schema.as_str(), bare_type, txid);
-                let enumeration = storage.enum_slot(schema.as_str(), bare_type, txid);
-                if domain.is_some() || enumeration.is_some() {
-                    return domain.is_some_and(|slot| selected_domains[slot])
-                        || enumeration.is_some_and(|slot| selected_enum == Some(slot));
-                }
-            }
-        }
-    }
-    false
+    Ok(())
 }
 
 fn enum_column_in_use(
@@ -5122,6 +5460,7 @@ pub fn drop_view(
     txn: &mut super::txn::TxnState,
     names: &[QualName],
     if_exists: bool,
+    cascade: bool,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -5144,6 +5483,30 @@ pub fn drop_view(
                 let v = storage.view(slot);
                 (v.schema, v.name)
             };
+            let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+                dependency.class == crate::storage::DependencyClass::View
+                    && dependency.slot as usize == slot
+            });
+            let (dependent_views, dependent_matviews) = match closure {
+                Ok(closure) => closure,
+                Err(error) => return sql_fail(error),
+            };
+            let has_dependents = dependent_views.iter().any(|selected| *selected)
+                || dependent_matviews.iter().any(|selected| *selected);
+            if has_dependents && !cascade {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop view {} because other objects depend on it",
+                    view_name.as_str()
+                ));
+            }
+            if cascade
+                && let Err(error) = drop_selected_stored_queries(
+                    storage, wal, txn, &dependent_views, &dependent_matviews,
+                )
+            {
+                return sql_fail(error);
+            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(
                 lsn,
@@ -8481,7 +8844,7 @@ fn alter_table_inner(
     // standalone form (never combined), so it is the whole action list.
     if let [AlterAction::SetSchema(new_schema)] = statement.actions {
         let new_schema = *new_schema;
-        let Some(_) = storage.find_schema(new_schema) else {
+        let Some(_) = storage.find_schema_visible(new_schema, txn.txid) else {
             return sql_fail(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "schema \"{}\" does not exist",

@@ -145,6 +145,18 @@ pub struct Engine {
     current_conn_id: i32,
 }
 
+fn unsupported_transaction_characteristic(characteristics: &str) -> Option<&str> {
+    characteristics
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .find(|part| {
+            !part.eq_ignore_ascii_case("isolation level read committed")
+                && !part.eq_ignore_ascii_case("read write")
+                && !part.eq_ignore_ascii_case("not deferrable")
+        })
+}
+
 impl Engine {
     /// Whether one extended-protocol statement is COPY. Execute's `max_rows`
     /// applies only to row-returning portals; COPY has its own streaming
@@ -2080,8 +2092,10 @@ impl Engine {
                 arena,
                 responder,
             ),
-            Stmt::DropView { names, if_exists } => {
-                exec::drop_view(&mut self.storage, &mut self.wal, txn, names, *if_exists, responder)
+            Stmt::DropView { names, if_exists, cascade } => {
+                exec::drop_view(
+                    &mut self.storage, &mut self.wal, txn, names, *if_exists, *cascade, responder,
+                )
             }
             Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists, materialized } => {
                 exec::create_table_as(
@@ -2109,12 +2123,13 @@ impl Engine {
                 params,
                 responder,
             ),
-            Stmt::DropMaterializedView { names, if_exists } => exec::drop_materialized_view(
+            Stmt::DropMaterializedView { names, if_exists, cascade } => exec::drop_materialized_view(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
                 names,
                 *if_exists,
+                *cascade,
                 responder,
             ),
             Stmt::CreateSequence { name, if_not_exists, options } => exec::create_sequence(
@@ -2135,12 +2150,13 @@ impl Engine {
                 options,
                 responder,
             ),
-            Stmt::DropSequence { names, if_exists } => exec::drop_sequence(
+            Stmt::DropSequence { names, if_exists, cascade } => exec::drop_sequence(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
                 names,
                 *if_exists,
+                *cascade,
                 responder,
             ),
             Stmt::CreateDomain(d) => {
@@ -2434,7 +2450,16 @@ impl Engine {
                 responder.command_complete("CLOSE CURSOR")?;
                 Ok(Ok(()))
             }
-            Stmt::Begin => {
+            Stmt::Begin(characteristics) => {
+                if let Some(characteristic) =
+                    unsupported_transaction_characteristic(characteristics)
+                {
+                    return Ok(Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "transaction characteristic \"{}\" is not supported",
+                        characteristic
+                    )));
+                }
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
                     responder.warning(
@@ -2567,15 +2592,9 @@ impl Engine {
                 }
             }
             Stmt::SetTransaction(characteristics) => {
-                let unsupported = characteristics
-                    .split(',')
-                    .map(str::trim)
-                    .find(|part| {
-                        !part.eq_ignore_ascii_case("isolation level read committed")
-                            && !part.eq_ignore_ascii_case("read write")
-                            && !part.eq_ignore_ascii_case("not deferrable")
-                    });
-                if let Some(characteristic) = unsupported {
+                if let Some(characteristic) =
+                    unsupported_transaction_characteristic(characteristics)
+                {
                     return Ok(Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "transaction characteristic \"{}\" is not supported",
@@ -3095,18 +3114,23 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             storage.remove_committed(index, rowid);
         }
-        WalOp::CreateView { schema, name, sql, path } => {
+        WalOp::CreateView { schema, name, sql, path, dependencies } => {
             // Replay reconstructs committed state: create then promote.
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             use core::fmt::Write;
             let _ = write!(buffer, "{sql}");
             let mut creation_path = crate::util::StackStr::<128>::new();
             let _ = write!(creation_path, "{path}");
+            let dependencies =
+                storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
             let (new_slot, old_slot) = storage.create_view(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
-                buffer,
-                creation_path,
+                crate::storage::StoredQueryDefinition {
+                    sql: buffer,
+                    creation_path,
+                    dependencies,
+                },
                 true,
                 0,
             )?;
@@ -3120,17 +3144,22 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_view_drop(slot);
             }
         }
-        WalOp::CreateMatview { schema, name, sql, path, populated } => {
+        WalOp::CreateMatview { schema, name, sql, path, dependencies, populated } => {
             use core::fmt::Write;
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             let _ = write!(buffer, "{sql}");
             let mut creation_path = crate::util::StackStr::<128>::new();
             let _ = write!(creation_path, "{path}");
+            let dependencies =
+                storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
             let slot = storage.create_matview(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
-                buffer,
-                creation_path,
+                crate::storage::StoredQueryDefinition {
+                    sql: buffer,
+                    creation_path,
+                    dependencies,
+                },
                 populated,
                 0,
             )?;

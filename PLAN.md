@@ -1144,10 +1144,11 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   (dependent columns, generated array row, and comments move together).
   Compact inverse undo entries preserve transaction/savepoint semantics
   without multiplying a whole enum catalog by the per-session DDL pool.
-- **Data-modifying CTEs** — done (`SELECT` main statement): `WITH x AS (INSERT
-  / UPDATE / DELETE ... RETURNING ...) SELECT ...`, where the data-modifying
-  sub-statement runs exactly once and its RETURNING rows become the CTE
-  relation, read by the same materialization path recursive CTEs use. The
+- **Data-modifying CTEs** — done for autocommit statements: `WITH x AS (INSERT
+  / UPDATE / DELETE ... RETURNING ...)` may feed a `SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`, or `MERGE` main statement; ordinary, recursive, and modifying CTEs
+  chain left-to-right, and each modifying sub-statement runs exactly once with
+  its RETURNING rows becoming a materialized relation. The
   correctness subtlety is PostgreSQL's single command snapshot: all the WITH
   sub-statements and the main query see the tables as they were *before* the
   statement, so the main query counts rows a DELETE CTE just removed and reads
@@ -1158,12 +1159,11 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   takes a read snapshot (default `SNAPSHOT_ALL`, so every existing read path is
   unchanged; a data-modifying WITH statement lowers it to the command id) so a
   CTE's own writes are invisible to its siblings and the main query. Verified
-  byte-for-byte against PostgreSQL (corpus `65_dml_cte`), with unit tests. Two
-  narrow cases are documented in BUGS.md (B-174): a data-modifying *main*
-  statement under a WITH (a loud error — the `expand_ctes_exec` borrow graph
-  unifies the storage lifetime, a dedicated refactor), and cross-command
-  row-version loss inside one explicit transaction (the single pending slot per
-  row is a static-memory invariant).
+  byte-for-byte against PostgreSQL (expanded corpus `65_dml_cte`) and through
+  psycopg's Parse/Bind/Describe/Execute path. The DML-main implementation split
+  catalog and arena lifetimes in the CTE substitution graph, so the rebuilt AST
+  releases its immutable catalog borrow before storage mutates; one remaining
+  explicit-transaction row-version limit is documented in BUGS.md (B-174).
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).

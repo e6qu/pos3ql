@@ -61,9 +61,10 @@ Working single-node database:
   arbiters, `excluded.*`, and RETURNING), joins (including
   `LATERAL` subqueries and set-returning functions), GROUP BY and aggregates,
   subqueries (correlated + EXISTS),
-  non-recursive CTEs (including data-modifying CTEs — `WITH x AS (INSERT /
-  UPDATE / DELETE ... RETURNING) SELECT ...` under PostgreSQL's single-command
-  snapshot), updatable views, constant and expression column DEFAULTs
+  non-recursive and recursive CTEs (including data-modifying CTEs — ordinary,
+  recursive, and modifying entries chain left-to-right into a `SELECT`,
+  `INSERT`, `UPDATE`, `DELETE`, or `MERGE` main statement under PostgreSQL's
+  single-command snapshot), updatable views, constant and expression column DEFAULTs
   (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row), generated columns
   (`GENERATED ALWAYS AS (expr) STORED`), identity columns
   (`GENERATED ALWAYS/BY DEFAULT AS IDENTITY`), arbitrary-precision NUMERIC,

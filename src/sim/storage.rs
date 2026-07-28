@@ -602,6 +602,18 @@ fn env_or(name: &str, default: u64) -> u64 {
 
 #[test]
 fn storage_vopr() {
+    let result = std::thread::Builder::new()
+        .name("storage-vopr-1.5-mib".to_string())
+        .stack_size(1_572_864)
+        .spawn(run_storage_vopr)
+        .expect("spawn storage VOPR with constrained stack")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn run_storage_vopr() {
     let seed0 = env_or("POS3QL_STORAGE_VOPR_SEED0", 0x705e3);
     let seeds = env_or("POS3QL_STORAGE_VOPR_SEEDS", 4);
     let steps = env_or("POS3QL_STORAGE_VOPR_STEPS", 120);

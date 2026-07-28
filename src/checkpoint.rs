@@ -738,7 +738,15 @@ impl Checkpointer {
         let text = core::str::from_utf8(self.client.body_bytes())
             .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
             .to_string();
+        self.load_manifest_text(storage, &text)
+    }
 
+    #[inline(never)]
+    fn load_manifest_text(
+        &mut self,
+        storage: &mut Storage,
+        text: &str,
+    ) -> Result<u64, CheckpointSetupError> {
         let mut lines = text.lines();
         if lines.next() != Some(MANIFEST_HEADER) {
             return Err(CheckpointSetupError::Corrupt("bad manifest header"));
@@ -754,29 +762,6 @@ impl Checkpointer {
         // (mindex, list index, count, crc, handle) — the block-grid form.
         let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
         let mut saw_end = false;
-
-        let finish_pending = |storage: &mut Storage,
-                              slot_of: &mut Vec<Option<usize>>,
-                              pending: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])>|
-         -> Result<(), CheckpointSetupError> {
-            if let Some((mindex, def, seen, serials)) = pending {
-                if seen != def.n_columns {
-                    return Err(CheckpointSetupError::Corrupt("manifest column count mismatch"));
-                }
-                let slot = storage
-                    .create_table(def)
-                    .map_err(|e| CheckpointSetupError::S3(format!(
-                        "manifest table rejected: {}",
-                        e.message.as_str()
-                    )))?;
-                storage.table_mut(slot).serial_last = serials;
-                if slot_of.len() <= mindex {
-                    slot_of.resize(mindex + 1, None);
-                }
-                slot_of[mindex] = Some(slot);
-            }
-            Ok(())
-        };
 
         for line in lines {
             let mut words = line.split(' ');
@@ -1059,134 +1044,25 @@ impl Checkpointer {
                 }
                 Some("view") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
-                    let hex = words
-                        .next()
-                        .ok_or(CheckpointSetupError::Corrupt("view sql missing"))?;
-                    if hex.len() % 2 != 0 || hex.len() / 2 > crate::storage::VIEW_SQL_MAX {
-                        return Err(CheckpointSetupError::Corrupt("bad view sql"));
-                    }
-                    let mut bytes = Vec::with_capacity(hex.len() / 2);
-                    for i in 0..hex.len() / 2 {
-                        bytes.push(
-                            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                                .map_err(|_| CheckpointSetupError::Corrupt("bad view sql hex"))?,
-                        );
-                    }
-                    let sql = String::from_utf8(bytes)
-                        .map_err(|_| CheckpointSetupError::Corrupt("view sql not UTF-8"))?;
-                    let name = rest_of(line, 2)?;
-                    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
-                    use core::fmt::Write;
-                    let _ = write!(buffer, "{sql}");
-                    let mut path = StackStr::<128>::new();
-                    let _ = write!(path, "\"$user\", public");
-                    // Checkpoint load reconstructs committed state.
-                    let (new_slot, old_slot) = storage
-                        .create_view(
-                            sql_name("public")?,
-                            sql_name(name)?,
-                            crate::storage::StoredQueryDefinition {
-                                sql: buffer,
-                                creation_path: path,
-                                dependencies: crate::storage::StoredQueryDependencies::EMPTY,
-                            },
-                            true,
-                            0,
-                        )
-                        .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
-                                "manifest view rejected: {}",
-                                e.message.as_str()
-                            ))
-                        })?;
-                    storage.commit_view_create(new_slot);
-                    if let Some(old) = old_slot {
-                        storage.commit_view_drop(old);
-                    }
+                    load_legacy_view(storage, line)?;
                 }
                 tag @ (Some("vw2") | Some("vw3") | Some("vw4")) => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
-                    let read_hex = |w: Option<&str>, what: &'static str| {
-                        w.ok_or(CheckpointSetupError::Corrupt(what))
-                            .and_then(decode_hex_name)
-                    };
-                    let sql = read_hex(words.next(), "vw2 sql missing")?;
-                    let schema = read_hex(words.next(), "vw2 schema missing")?;
-                    let path = read_hex(words.next(), "vw2 path missing")?;
-                    let name = read_hex(words.next(), "vw2 name missing")?;
-                    let dependencies = if tag == Some("vw3") || tag == Some("vw4") {
-                        parse_stored_query_dependencies(&mut words, tag == Some("vw4"))?
-                    } else {
-                        crate::storage::StoredQueryDependencies::EMPTY
-                    };
-                    use core::fmt::Write;
-                    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
-                    let _ = write!(buffer, "{sql}");
-                    let mut path_buffer = StackStr::<128>::new();
-                    let _ = write!(path_buffer, "{path}");
-                    let (new_slot, old_slot) = storage
-                        .create_view(
-                            sql_name(&schema)?,
-                            sql_name(&name)?,
-                            crate::storage::StoredQueryDefinition {
-                                sql: buffer,
-                                creation_path: path_buffer,
-                                dependencies,
-                            },
-                            true,
-                            0,
-                        )
-                        .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
-                                "manifest view rejected: {}",
-                                e.message.as_str()
-                            ))
-                        })?;
-                    storage.commit_view_create(new_slot);
-                    if let Some(old) = old_slot {
-                        storage.commit_view_drop(old);
-                    }
+                    load_view(
+                        storage,
+                        line,
+                        tag == Some("vw3") || tag == Some("vw4"),
+                        tag == Some("vw4"),
+                    )?;
                 }
                 tag @ (Some("mv2") | Some("mv3") | Some("mv4")) => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
-                    let read_hex = |w: Option<&str>, what: &'static str| {
-                        w.ok_or(CheckpointSetupError::Corrupt(what))
-                            .and_then(decode_hex_name)
-                    };
-                    let sql = read_hex(words.next(), "mv2 sql missing")?;
-                    let schema = read_hex(words.next(), "mv2 schema missing")?;
-                    let path = read_hex(words.next(), "mv2 path missing")?;
-                    let name = read_hex(words.next(), "mv2 name missing")?;
-                    let populated: u8 = parse_field(words.next(), "mv2 populated")?;
-                    let dependencies = if tag == Some("mv3") || tag == Some("mv4") {
-                        parse_stored_query_dependencies(&mut words, tag == Some("mv4"))?
-                    } else {
-                        crate::storage::StoredQueryDependencies::EMPTY
-                    };
-                    use core::fmt::Write;
-                    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
-                    let _ = write!(buffer, "{sql}");
-                    let mut path_buffer = StackStr::<128>::new();
-                    let _ = write!(path_buffer, "{path}");
-                    let slot = storage
-                        .create_matview(
-                            sql_name(&schema)?,
-                            sql_name(&name)?,
-                            crate::storage::StoredQueryDefinition {
-                                sql: buffer,
-                                creation_path: path_buffer,
-                                dependencies,
-                            },
-                            populated != 0,
-                            0,
-                        )
-                        .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
-                                "manifest matview rejected: {}",
-                                e.message.as_str()
-                            ))
-                        })?;
-                    storage.commit_matview_create(slot);
+                    load_matview(
+                        storage,
+                        line,
+                        tag == Some("mv3") || tag == Some("mv4"),
+                        tag == Some("mv4"),
+                    )?;
                 }
                 tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
                     let has_owner = tag == Some("sq3");
@@ -2839,6 +2715,185 @@ fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
         );
     }
     String::from_utf8(bytes).map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
+}
+
+#[inline(never)]
+fn finish_pending(
+    storage: &mut Storage,
+    slot_of: &mut Vec<Option<usize>>,
+    pending: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])>,
+) -> Result<(), CheckpointSetupError> {
+    if let Some((manifest_index, definition, seen, serials)) = pending {
+        if seen != definition.n_columns {
+            return Err(CheckpointSetupError::Corrupt(
+                "manifest column count mismatch",
+            ));
+        }
+        let slot = storage.create_table(definition).map_err(|error| {
+            CheckpointSetupError::S3(format!(
+                "manifest table rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+        storage.table_mut(slot).serial_last = serials;
+        if slot_of.len() <= manifest_index {
+            slot_of.resize(manifest_index + 1, None);
+        }
+        slot_of[manifest_index] = Some(slot);
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn load_legacy_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split(' ');
+    let _tag = words.next();
+    let hex = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("view sql missing"))?;
+    if !hex.len().is_multiple_of(2) || hex.len() / 2 > crate::storage::VIEW_SQL_MAX {
+        return Err(CheckpointSetupError::Corrupt("bad view sql"));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in 0..hex.len() / 2 {
+        bytes.push(
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                .map_err(|_| CheckpointSetupError::Corrupt("bad view sql hex"))?,
+        );
+    }
+    let sql = String::from_utf8(bytes)
+        .map_err(|_| CheckpointSetupError::Corrupt("view sql not UTF-8"))?;
+    let name = rest_of(line, 2)?;
+    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+    use core::fmt::Write;
+    let _ = write!(buffer, "{sql}");
+    let mut path = StackStr::<128>::new();
+    let _ = write!(path, "\"$user\", public");
+    let (new_slot, old_slot) = storage
+        .create_view(
+            sql_name("public")?,
+            sql_name(name)?,
+            crate::storage::StoredQueryDefinition {
+                sql: buffer,
+                creation_path: path,
+                dependencies: crate::storage::StoredQueryDependencies::EMPTY,
+            },
+            true,
+            0,
+        )
+        .map_err(|error| {
+            CheckpointSetupError::S3(format!(
+                "manifest view rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    storage.commit_view_create(new_slot);
+    if let Some(old_slot) = old_slot {
+        storage.commit_view_drop(old_slot);
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn load_view(
+    storage: &mut Storage,
+    line: &str,
+    has_dependencies: bool,
+    has_referenced_names: bool,
+) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split(' ');
+    let _tag = words.next();
+    let read_hex = |word: Option<&str>, what: &'static str| {
+        word.ok_or(CheckpointSetupError::Corrupt(what))
+            .and_then(decode_hex_name)
+    };
+    let sql = read_hex(words.next(), "vw2 sql missing")?;
+    let schema = read_hex(words.next(), "vw2 schema missing")?;
+    let path = read_hex(words.next(), "vw2 path missing")?;
+    let name = read_hex(words.next(), "vw2 name missing")?;
+    let dependencies = if has_dependencies {
+        parse_stored_query_dependencies(&mut words, has_referenced_names)?
+    } else {
+        crate::storage::StoredQueryDependencies::EMPTY
+    };
+    use core::fmt::Write;
+    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+    let _ = write!(buffer, "{sql}");
+    let mut path_buffer = StackStr::<128>::new();
+    let _ = write!(path_buffer, "{path}");
+    let (new_slot, old_slot) = storage
+        .create_view(
+            sql_name(&schema)?,
+            sql_name(&name)?,
+            crate::storage::StoredQueryDefinition {
+                sql: buffer,
+                creation_path: path_buffer,
+                dependencies,
+            },
+            true,
+            0,
+        )
+        .map_err(|error| {
+            CheckpointSetupError::S3(format!(
+                "manifest view rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    storage.commit_view_create(new_slot);
+    if let Some(old_slot) = old_slot {
+        storage.commit_view_drop(old_slot);
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn load_matview(
+    storage: &mut Storage,
+    line: &str,
+    has_dependencies: bool,
+    has_referenced_names: bool,
+) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split(' ');
+    let _tag = words.next();
+    let read_hex = |word: Option<&str>, what: &'static str| {
+        word.ok_or(CheckpointSetupError::Corrupt(what))
+            .and_then(decode_hex_name)
+    };
+    let sql = read_hex(words.next(), "mv2 sql missing")?;
+    let schema = read_hex(words.next(), "mv2 schema missing")?;
+    let path = read_hex(words.next(), "mv2 path missing")?;
+    let name = read_hex(words.next(), "mv2 name missing")?;
+    let populated: u8 = parse_field(words.next(), "mv2 populated")?;
+    let dependencies = if has_dependencies {
+        parse_stored_query_dependencies(&mut words, has_referenced_names)?
+    } else {
+        crate::storage::StoredQueryDependencies::EMPTY
+    };
+    use core::fmt::Write;
+    let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+    let _ = write!(buffer, "{sql}");
+    let mut path_buffer = StackStr::<128>::new();
+    let _ = write!(path_buffer, "{path}");
+    let slot = storage
+        .create_matview(
+            sql_name(&schema)?,
+            sql_name(&name)?,
+            crate::storage::StoredQueryDefinition {
+                sql: buffer,
+                creation_path: path_buffer,
+                dependencies,
+            },
+            populated != 0,
+            0,
+        )
+        .map_err(|error| {
+            CheckpointSetupError::S3(format!(
+                "manifest matview rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    storage.commit_matview_create(slot);
+    Ok(())
 }
 
 struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);

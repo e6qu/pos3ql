@@ -2443,7 +2443,7 @@ pub fn comment(
                     storage,
                     txid,
                     view_path,
-                    &view.dependencies,
+                    storage.view_dependencies(slot),
                     arena,
                     &mut columns,
                 );
@@ -2916,6 +2916,23 @@ pub fn refresh_materialized_view(
             ))
         }
     };
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(matview.creation_path.as_str(), user.as_str(), txn.txid);
+    let select = match crate::sql::parser::parse_query(sql, arena) {
+        Ok(select) => select,
+        Err(error) => return sql_fail(error),
+    };
+    let select = match super::query::expand_stored_query(
+        select,
+        storage,
+        txn.txid,
+        path,
+        storage.matview_dependencies(slot),
+        arena,
+    ) {
+        Ok(select) => select,
+        Err(error) => return sql_fail(error),
+    };
     // Remove every visible row, transactionally (a matview has no constraints).
     let mut rowids: [u64; 4096] = [0; 4096];
     loop {
@@ -2949,18 +2966,6 @@ pub fn refresh_materialized_view(
     }
     // Re-run the query and store its rows into the backing table (two-pass, so
     // the source may read another table without overlapping the write).
-    let select = match crate::sql::parser::parse_query(sql, arena) {
-        Ok(select) => select,
-        Err(e) => return sql_fail(e),
-    };
-    let user = super::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(matview.creation_path.as_str(), user.as_str(), txn.txid);
-    let select = match super::query::expand_stored_query(
-        select, storage, txn.txid, path, &matview.dependencies, arena,
-    ) {
-        Ok(select) => select,
-        Err(error) => return sql_fail(error),
-    };
     let mut rows = 0usize;
     if let Err(e) = super::query::select_into_rows(
         storage, txn.txid, select, arena, params, None, None, &mut |_| {
@@ -4663,7 +4668,7 @@ fn stored_query_dependent_closure(
             if views[slot] || !view.visible_to(txid) {
                 continue;
             }
-            let hit = view.dependencies.entries().iter().any(|dependency| {
+            let hit = storage.view_dependencies(slot).entries().iter().any(|dependency| {
                 root(dependency)
                     || (dependency.class == DependencyClass::View
                         && views[dependency.slot as usize])
@@ -4682,7 +4687,7 @@ fn stored_query_dependent_closure(
                 slot += 1;
                 continue;
             }
-            let hit = matview.dependencies.entries().iter().any(|dependency| {
+            let hit = storage.matview_dependencies(slot).entries().iter().any(|dependency| {
                 root(dependency)
                     || (dependency.class == DependencyClass::View
                         && views[dependency.slot as usize])
@@ -4758,7 +4763,7 @@ fn report_stored_query_dependents(
                 continue;
             }
             let mut depth = 0u8;
-            for dependency in storage.view(slot).dependencies.entries() {
+            for dependency in storage.view_dependencies(slot).entries() {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View => view_depth[dependency.slot as usize]
@@ -4801,7 +4806,7 @@ fn report_stored_query_dependents(
                 continue;
             }
             let mut depth = 0u8;
-            for dependency in storage.matview(slot).dependencies.entries() {
+            for dependency in storage.matview_dependencies(slot).entries() {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View if view_depth[dependency.slot as usize] != 0 => {
@@ -4869,7 +4874,7 @@ fn report_stored_query_dependents(
                         let _ = write!(parent, "{} ", root.kind);
                         write_name(&mut parent, &root.schema, &root.name);
                     } else {
-                        for dependency in storage.view(slot).dependencies.entries() {
+                        for dependency in storage.view_dependencies(slot).entries() {
                             if dependency.class == DependencyClass::View
                                 && view_depth[dependency.slot as usize] == depth - 1
                             {
@@ -4922,8 +4927,7 @@ fn report_stored_query_dependents(
                         let _ = write!(parent, "{} ", root.kind);
                         write_name(&mut parent, &root.schema, &root.name);
                     } else if let Some(dependency) = storage
-                        .matview(slot)
-                        .dependencies
+                        .matview_dependencies(slot)
                         .entries()
                         .iter()
                         .find(|dependency| {

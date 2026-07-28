@@ -2149,7 +2149,7 @@ Ok(CheckpointStep::Published { lsn })
         // Views: `vw2 <hex-SELECT> <hex-schema> <hex-creation-path> <hex-name>`
         // (all hex, so every field survives the space-separated format; the
         // loader still reads the older `view` line for old manifests).
-        for view in storage.live_views() {
+        for (view_slot, view) in storage.views_with_slots() {
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
             for b in view.sql.as_str().as_bytes() {
@@ -2175,14 +2175,14 @@ Ok(CheckpointStep::Published { lsn })
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str(),
-                    ManifestDependencies(view.dependencies)
+                    ManifestDependencies(storage.view_dependencies(view_slot))
                 ),
             )?;
         }
         // Materialized views: like `vw2`, plus a trailing populated flag (0/1).
         // The backing table's rows serialize through the ordinary table/dsst
         // loop; this line records only the defining query.
-        for mv in storage.live_matviews() {
+        for (matview_slot, mv) in storage.matviews_with_slots() {
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
             for b in mv.sql.as_str().as_bytes() {
@@ -2209,7 +2209,7 @@ Ok(CheckpointStep::Published { lsn })
                     hpath.as_str(),
                     hname.as_str(),
                     u8::from(mv.populated),
-                    ManifestDependencies(mv.dependencies)
+                    ManifestDependencies(storage.matview_dependencies(matview_slot))
                 ),
             )?;
         }
@@ -2841,9 +2841,9 @@ fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
     String::from_utf8(bytes).map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
 }
 
-struct ManifestDependencies(crate::storage::StoredQueryDependencies);
+struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);
 
-impl core::fmt::Display for ManifestDependencies {
+impl core::fmt::Display for ManifestDependencies<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(output, "{}", self.0.entries().len())?;
         for dependency in self.0.entries() {
@@ -2933,7 +2933,7 @@ mod stored_dependency_tests {
             SqlName::parse("").unwrap(),
             SqlName::parse("original_name").unwrap(),
         ).unwrap();
-        let encoded = format!("{}", ManifestDependencies(dependencies));
+        let encoded = format!("{}", ManifestDependencies(&dependencies));
         let mut words = encoded.split(' ');
         assert_eq!(
             parse_stored_query_dependencies(&mut words, true).unwrap(),

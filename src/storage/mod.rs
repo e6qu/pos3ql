@@ -1008,7 +1008,6 @@ pub struct ViewDef {
     /// view body by OID at creation; this engine re-resolves the stored text,
     /// so it must re-resolve under the creator's path, not the reader's.
     pub creation_path: StackStr<128>,
-    pub dependencies: StoredQueryDependencies,
     pub live: bool,
     /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
     /// mirroring `Table::pending_ddl`): other transactions see `live`; the
@@ -1036,7 +1035,6 @@ pub struct MatviewDef {
     pub name: SqlName,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
-    pub dependencies: StoredQueryDependencies,
     /// False after `WITH NO DATA` until the first REFRESH.
     pub populated: bool,
     pub live: bool,
@@ -1664,7 +1662,9 @@ pub struct Storage {
     tables: FixedVec<Table>,
     pending_table_defs: FixedVec<PendingTableDefSlot>,
     views: FixedVec<ViewDef>,
+    view_dependencies: FixedVec<StoredQueryDependencies>,
     matviews: FixedVec<MatviewDef>,
+    matview_dependencies: FixedVec<StoredQueryDependencies>,
     sequences: FixedVec<SequenceDef>,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
@@ -1799,6 +1799,21 @@ impl SpillReader {
     }
 }
 
+#[inline(never)]
+fn stored_query_dependency_slots(
+    budget: &mut Budget,
+    name: &'static str,
+    count: usize,
+) -> Result<FixedVec<StoredQueryDependencies>, BudgetError> {
+    let mut slots = FixedVec::new(budget, name, count)?;
+    for _ in 0..count {
+        slots
+            .push(StoredQueryDependencies::EMPTY)
+            .expect("sized to catalog slots");
+    }
+    Ok(slots)
+}
+
 impl Storage {
     pub fn rebind_stored_query_dependencies(
         &self,
@@ -1841,15 +1856,15 @@ impl Storage {
     pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
         for slot in 0..self.views.len() {
             if self.views[slot].live {
-                let serialized = self.views[slot].dependencies;
-                self.views[slot].dependencies =
+                let serialized = self.view_dependencies[slot];
+                self.view_dependencies[slot] =
                     self.rebind_stored_query_dependencies(serialized, 0)?;
             }
         }
         for slot in 0..self.matviews.len() {
             if self.matviews[slot].live {
-                let serialized = self.matviews[slot].dependencies;
-                self.matviews[slot].dependencies =
+                let serialized = self.matview_dependencies[slot];
+                self.matview_dependencies[slot] =
                     self.rebind_stored_query_dependencies(serialized, 0)?;
             }
         }
@@ -1863,14 +1878,14 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) {
-        for view in self.views.iter_mut() {
-            if view.live || view.pending.is_some() {
-                view.dependencies.rename(class, slot, schema, name);
+        for view_slot in 0..self.views.len() {
+            if self.views[view_slot].live || self.views[view_slot].pending.is_some() {
+                self.view_dependencies[view_slot].rename(class, slot, schema, name);
             }
         }
-        for matview in self.matviews.iter_mut() {
-            if matview.live || matview.pending.is_some() {
-                matview.dependencies.rename(class, slot, schema, name);
+        for matview_slot in 0..self.matviews.len() {
+            if self.matviews[matview_slot].live || self.matviews[matview_slot].pending.is_some() {
+                self.matview_dependencies[matview_slot].rename(class, slot, schema, name);
             }
         }
     }
@@ -1883,14 +1898,16 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) {
-        for view in self.views.iter_mut() {
-            if view.live || view.pending.is_some() {
-                view.dependencies.replace_slot(class, old_slot, new_slot, schema, name);
+        for view_slot in 0..self.views.len() {
+            if self.views[view_slot].live || self.views[view_slot].pending.is_some() {
+                self.view_dependencies[view_slot]
+                    .replace_slot(class, old_slot, new_slot, schema, name);
             }
         }
-        for matview in self.matviews.iter_mut() {
-            if matview.live || matview.pending.is_some() {
-                matview.dependencies.replace_slot(class, old_slot, new_slot, schema, name);
+        for matview_slot in 0..self.matviews.len() {
+            if self.matviews[matview_slot].live || self.matviews[matview_slot].pending.is_some() {
+                self.matview_dependencies[matview_slot]
+                    .replace_slot(class, old_slot, new_slot, schema, name);
             }
         }
     }
@@ -1901,7 +1918,9 @@ impl Storage {
             * (size_of::<Table>()
                 + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                 + size_of::<ViewDef>()
+                + size_of::<StoredQueryDependencies>()
                 + size_of::<MatviewDef>()
+                + size_of::<StoredQueryDependencies>()
                 + size_of::<IndexDef>())
             + config.max_tables
                 * MAX_PENDING_TABLE_DEFS
@@ -1980,12 +1999,13 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
-                    dependencies: StoredQueryDependencies::EMPTY,
                     live: false,
                     pending: None,
                 })
                 .expect("sized to max_tables");
         }
+        let view_dependencies =
+            stored_query_dependency_slots(budget, "view_dependencies", config.max_tables)?;
         let mut matviews = FixedVec::new(budget, "matviews", config.max_tables)?;
         for _ in 0..config.max_tables {
             matviews
@@ -1995,13 +2015,14 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
-                    dependencies: StoredQueryDependencies::EMPTY,
                     populated: false,
                     live: false,
                     pending: None,
                 })
                 .expect("sized to max_tables");
         }
+        let matview_dependencies =
+            stored_query_dependency_slots(budget, "matview_dependencies", config.max_tables)?;
         let mut sequences = FixedVec::new(budget, "sequences", MAX_SEQUENCES)?;
         for _ in 0..MAX_SEQUENCES {
             sequences
@@ -2081,7 +2102,9 @@ impl Storage {
             tables,
             pending_table_defs,
             views,
+            view_dependencies,
             matviews,
+            matview_dependencies,
             sequences,
             domains,
             enums,
@@ -4321,6 +4344,10 @@ impl Storage {
         &self.views[slot]
     }
 
+    pub(crate) fn view_dependencies(&self, slot: usize) -> &StoredQueryDependencies {
+        &self.view_dependencies[slot]
+    }
+
     pub(crate) fn view_count(&self) -> usize {
         self.views.len()
     }
@@ -4341,8 +4368,16 @@ impl Storage {
         self.matviews.iter().filter(|m| m.live)
     }
 
+    pub fn matviews_with_slots(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
+        self.matviews.iter().enumerate().filter(|(_, matview)| matview.live)
+    }
+
     pub(crate) fn matview(&self, slot: usize) -> &MatviewDef {
         &self.matviews[slot]
+    }
+
+    pub(crate) fn matview_dependencies(&self, slot: usize) -> &StoredQueryDependencies {
+        &self.matview_dependencies[slot]
     }
 
     pub(crate) fn matview_count(&self) -> usize {
@@ -4407,11 +4442,11 @@ impl Storage {
             name,
             sql: query.sql,
             creation_path: query.creation_path,
-            dependencies: query.dependencies,
             populated,
             live: false,
             pending: Some(PendingDdl { txid, creating: true }),
         };
+        self.matview_dependencies[new] = query.dependencies;
         Ok(new)
     }
 
@@ -5317,10 +5352,10 @@ impl Storage {
             name,
             sql: query.sql,
             creation_path: query.creation_path,
-            dependencies: query.dependencies,
             live: false,
             pending: Some(PendingDdl { txid, creating: true }),
         };
+        self.view_dependencies[new] = query.dependencies;
         Ok((new, existing))
     }
 
@@ -5862,6 +5897,12 @@ mod tests {
             };
         }
         def
+    }
+
+    #[test]
+    fn stored_query_dependency_arrays_live_outside_catalog_definitions() {
+        assert!(size_of::<ViewDef>() < size_of::<StoredQueryDependencies>());
+        assert!(size_of::<MatviewDef>() < size_of::<StoredQueryDependencies>());
     }
 
     #[test]

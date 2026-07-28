@@ -750,7 +750,7 @@ pub fn resolve_view_for_dml<'a>(
         storage,
         txid,
         view_path,
-        &view.dependencies,
+        storage.view_dependencies(view_slot),
         arena,
     )?;
     if sel.distinct

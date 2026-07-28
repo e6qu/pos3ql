@@ -1270,7 +1270,7 @@ fn subst_tableref<'a>(
             txid: context.txid,
             depth: context.depth + 1,
             path: Some(view_path),
-            dependencies: Some(&view.dependencies),
+            dependencies: Some(context.storage.view_dependencies(slot)),
             qualifier: None,
         };
         let expanded = subst_select(vsel, inner, arena)?;

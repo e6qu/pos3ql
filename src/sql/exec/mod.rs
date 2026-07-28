@@ -1732,7 +1732,9 @@ pub fn create_table_as(
     };
     def.n_columns = n_cols;
     for i in 0..n_cols {
-        let Some(ctype) = coltype_of_oid(columns[i].type_oid) else {
+        let Some((ctype, domain, user_type_schema)) =
+            materialized_column_type(storage, txn.txid, columns[i].type_oid)
+        else {
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "CREATE TABLE AS cannot materialize column {} (type oid {})",
@@ -1759,8 +1761,8 @@ pub fn create_table_as(
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
-            domain: None,
-            user_type_schema: None,
+            domain,
+            user_type_schema,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -1882,6 +1884,49 @@ pub fn create_table_as(
     }
     responder.command_complete(stack_format!(32, "SELECT {count}").as_str())?;
     sql_ok()
+}
+
+/// Resolves a described query column back to persistent table metadata.
+/// User-defined OID bands carry both their storage representation and their
+/// schema-qualified type identity, so CTAS and materialized views do not
+/// flatten enums/domains or lose their automatically-created array types.
+fn materialized_column_type(
+    storage: &Storage,
+    txid: u32,
+    type_oid: i32,
+) -> Option<(ColType, Option<crate::storage::SqlName>, Option<crate::storage::SqlName>)> {
+    use crate::sql::types::{oid, ArrElem};
+    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&type_oid)
+    {
+        let domain = storage.domain((type_oid - oid::FIRST_DOMAIN) as usize);
+        return domain
+            .visible_to(txid)
+            .then_some((domain.base, Some(domain.name), Some(domain.schema)));
+    }
+    if (oid::FIRST_DOMAIN_ARRAY
+        ..oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+        .contains(&type_oid)
+    {
+        let slot = (type_oid - oid::FIRST_DOMAIN_ARRAY) as usize;
+        let domain = storage.domain(slot);
+        let element = ArrElem::domain(slot as u16, domain.base)?;
+        return domain
+            .visible_to(txid)
+            .then_some((ColType::Array(element), Some(domain.name), Some(domain.schema)));
+    }
+    let ctype = coltype_of_oid(type_oid)?;
+    let user_type = match ctype {
+        ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot)) => {
+            let enumeration = storage.enum_def(slot as usize);
+            if !enumeration.visible_to(txid) {
+                return None;
+            }
+            (Some(enumeration.name), Some(enumeration.schema))
+        }
+        _ => (None, None),
+    };
+    Some((ctype, user_type.0, user_type.1))
 }
 
 /// REFRESH MATERIALIZED VIEW: re-run the stored query, replacing every row of
@@ -3888,6 +3933,17 @@ pub fn copy_begin(
             }
         }
     }
+    if !statement.to {
+        for &target in &targets[..n_targets] {
+            if def.columns()[target].is_generated {
+                return Err(sql_err!(
+                    sqlstate::GENERATED_ALWAYS,
+                    "cannot insert a non-DEFAULT value into column \"{}\"",
+                    def.columns()[target].name.as_str()
+                ));
+            }
+        }
+    }
     Ok(CopySetup { table_index, targets, n_targets, fmt })
 }
 
@@ -3908,6 +3964,7 @@ fn binary_copy_supported(ctype: ColType) -> bool {
 pub fn copy_row(
     storage: &mut Storage,
     txn: &mut TxnState,
+    seq_session: &crate::sql::guc::SeqSession,
     setup: &CopySetup,
     line: &[u8],
     arena: &Arena,
@@ -3938,12 +3995,9 @@ pub fn copy_row(
         ));
     }
     let checks = parse_checks(&def, arena)?;
+    let default_exprs = parse_defaults(&def, arena)?;
+    let generated_exprs = parse_generated(&def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
-    for (i, col) in def.columns().iter().enumerate() {
-        if let Some(d) = &col.default_value {
-            values[i] = d.as_datum();
-        }
-    }
     let mut explicit = [false; MAX_COLUMNS];
     for (i, field) in fields.iter().enumerate().take(setup.n_targets) {
         let col_index = setup.targets[i];
@@ -3954,7 +4008,18 @@ pub fn copy_row(
         };
         explicit[col_index] = true;
     }
+    fill_omitted_defaults(
+        storage,
+        txn.txid,
+        seq_session,
+        &def,
+        &default_exprs,
+        &mut values,
+        &explicit,
+        arena,
+    )?;
     fill_auto_increment(storage, setup.table_index, &def, &mut values, &explicit)?;
+    compute_generated(&def, &generated_exprs, &mut values, storage, arena)?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -3980,6 +4045,7 @@ pub fn copy_row(
 pub fn copy_row_binary(
     storage: &mut Storage,
     txn: &mut TxnState,
+    seq_session: &crate::sql::guc::SeqSession,
     setup: &CopySetup,
     row: &[u8],
     arena: &Arena,
@@ -3995,12 +4061,9 @@ pub fn copy_row_binary(
         ));
     }
     let checks = parse_checks(&def, arena)?;
+    let default_exprs = parse_defaults(&def, arena)?;
+    let generated_exprs = parse_generated(&def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
-    for (i, col) in def.columns().iter().enumerate() {
-        if let Some(d) = &col.default_value {
-            values[i] = d.as_datum();
-        }
-    }
     let mut explicit = [false; MAX_COLUMNS];
     let mut at = 2usize;
     for i in 0..setup.n_targets {
@@ -4018,7 +4081,18 @@ pub fn copy_row_binary(
         };
         explicit[col_index] = true;
     }
+    fill_omitted_defaults(
+        storage,
+        txn.txid,
+        seq_session,
+        &def,
+        &default_exprs,
+        &mut values,
+        &explicit,
+        arena,
+    )?;
     fill_auto_increment(storage, setup.table_index, &def, &mut values, &explicit)?;
+    compute_generated(&def, &generated_exprs, &mut values, storage, arena)?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -4756,6 +4830,50 @@ fn compute_generated<'a>(
         if let Some(expr) = g {
             let v = eval(expr, arena, crate::sql::eval::NO_PARAMS, &context)?;
             values[i] = coerce(v, &def.columns()[i], storage, arena)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fills every column the input row omitted from its folded or expression
+/// default. Expression defaults run once per row with live catalog and
+/// sequence access, matching INSERT (including enum/domain casts and nextval).
+#[expect(clippy::too_many_arguments, reason = "row-default execution context")]
+fn fill_omitted_defaults<'values, 'arena>(
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    def: &'values TableDef,
+    defaults: &constraints::ParsedDefaults<'arena>,
+    values: &mut [Datum<'values>; MAX_COLUMNS],
+    explicit: &[bool; MAX_COLUMNS],
+    arena: &'arena Arena,
+) -> Result<(), SqlError>
+where
+    'arena: 'values,
+{
+    let sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let catalog = super::query::storage_catalog(storage, txid);
+    let hooks = super::eval::EvalHooks {
+        catalog: Some(&catalog),
+        sequences: Some(&sequence),
+        ..super::eval::NO_HOOKS
+    };
+    for (index, column) in def.columns().iter().enumerate() {
+        if explicit[index] {
+            continue;
+        }
+        if let Some(default) = &column.default_value {
+            values[index] = default.as_datum();
+        } else if let Some(expression) = defaults[index] {
+            let value = super::eval::eval_full(
+                expression,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &NoColumns,
+                &hooks,
+            )?;
+            values[index] = coerce(value, column, storage, arena)?;
         }
     }
     Ok(())
@@ -6780,7 +6898,15 @@ pub fn alter_table(
                 // A literal-only default folds to a constant; a call-bearing one
                 // is stored as text and evaluated per row — CREATE TABLE's path.
                 let (default_value, default_expr) =
-                    match ddl::resolve_default(Some(value), Some(value_text), ctype, type_mod, arena) {
+                    match ddl::resolve_default(
+                        Some(value),
+                        Some(value_text),
+                        ctype,
+                        type_mod,
+                        storage,
+                        u32::MAX,
+                        arena,
+                    ) {
                         Ok(d) => d,
                         Err(e) => return sql_fail(e),
                     };

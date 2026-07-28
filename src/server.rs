@@ -327,12 +327,14 @@ impl Server {
                 self.release(i);
             }
         }
-        match self.engine.checkpoint() {
-            Ok(true) => stderr_line(b"pos3ql: final checkpoint written
+        if self.engine.checkpoint_enabled() {
+            match self.engine.checkpoint() {
+                Ok(true) => stderr_line(b"pos3ql: final checkpoint written
 "),
-            Ok(false) => {}
-            Err(_) => stderr_line(b"pos3ql: final checkpoint failed; journal is durable
+                Ok(false) => {}
+                Err(_) => stderr_line(b"pos3ql: final checkpoint failed; journal is durable
 "),
+            }
         }
         // Ensure the journal is durable even if no checkpoint ran.
         self.engine.commit_wal();

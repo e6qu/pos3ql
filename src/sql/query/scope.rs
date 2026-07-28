@@ -12,15 +12,15 @@ use crate::mem::arena::Arena;
 use crate::sql::ast::{
     BinaryOp, Expr, FromClause, MaterializedCte, TableRef, MAX_USING_COLUMNS,
 };
-use crate::sql::eval::{sqlstate, SqlError};
+use crate::sql::eval::{ColumnLookup, sqlstate, SqlError};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, SqlName, Storage, TableDef, MAX_COLUMNS};
 
 use super::{
     arena_full, common_using_type, select_into_rows, synth_derived_def, synth_derived_def_outer,
-    table_func_def,
-    table_func_rows, MAX_JOIN_TABLES,
+    table_func_def, table_func_def_outer, table_func_rows, table_func_rows_outer, Chained,
+    MAX_JOIN_TABLES,
 };
 
 /// Upper bound on distinct USING/NATURAL-merged columns across a join tree
@@ -87,6 +87,35 @@ pub struct QueryScope<'d> {
     pub join_on: [Option<&'d Expr<'d>>; MAX_JOIN_TABLES - 1],
 }
 
+/// Type-only lookup over FROM items already registered in a scope. Table
+/// functions are implicitly lateral in PostgreSQL, so their output definition
+/// may depend on a preceding column before a concrete row has been bound.
+struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
+
+impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.0.find_column(qualifier, name)?;
+        Ok(Datum::Null)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.0.find_column(qualifier, name).ok().map(|column| self.0.output_type(column))
+    }
+
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+        match self.0.find_column(qualifier, name).ok()? {
+            ResolvedColumn::Table(table, column) => {
+                self.0.defs[table]?.columns().get(column)?.domain
+            }
+            ResolvedColumn::Merged(_) => None,
+        }
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.0.func_scalar_type(table).is_some()
+    }
+}
+
 impl<'d> QueryScope<'d> {
     fn empty() -> Self {
         QueryScope {
@@ -120,10 +149,24 @@ impl<'d> QueryScope<'d> {
         arena: &'a Arena,
         params: &[Datum<'a>],
     ) -> Result<QueryScope<'a>, SqlError> {
+        Self::resolve_exec_outer(storage, from, txid, arena, params, None)
+    }
+
+    /// Execution scope with an enclosing row available while FROM items are
+    /// resolved. Correlated subqueries need this for a base table function
+    /// such as `unnest(outer.array)`.
+    pub fn resolve_exec_outer<'a>(
+        storage: &'a Storage,
+        from: &'a FromClause<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        outer: Option<&dyn ColumnLookup<'a>>,
+    ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty();
-        scope.add_exec(storage, &from.base, txid, arena, params)?;
+        scope.add_exec(storage, &from.base, txid, arena, params, outer)?;
         for j in from.joins {
-            scope.add_exec(storage, &j.table, txid, arena, params)?;
+            scope.add_exec(storage, &j.table, txid, arena, params, outer)?;
         }
         scope.build_merges(from, Some(arena))?;
         Ok(scope)
@@ -198,6 +241,7 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
+        outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -206,7 +250,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(tref, m, arena, true);
         }
         if tref.func_args.is_some() {
-            return self.add_table_func(tref, arena, params, true);
+            return self.add_table_func(tref, arena, params, true, outer);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -311,7 +355,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(tref, m, arena, false);
         }
         if tref.func_args.is_some() {
-            return self.add_table_func(tref, arena, &[], false);
+            return self.add_table_func(tref, arena, &[], false, None);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -400,11 +444,25 @@ impl<'d> QueryScope<'d> {
         arena: &'a Arena,
         params: &[Datum<'a>],
         materialize: bool,
+        outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
     {
-        let def_reference = table_func_def(tref, arena, params)?;
+        let scope_types = ScopeTypes(self);
+        let columns = Chained {
+            inner: if self.n == 0 {
+                &crate::sql::eval::NoColumns
+            } else {
+                &scope_types
+            },
+            outer,
+        };
+        let def_reference = if self.n == 0 && outer.is_none() {
+            table_func_def(tref, arena, params)?
+        } else {
+            table_func_def_outer(tref, arena, params, &columns)?
+        };
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
@@ -413,10 +471,10 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        // A LATERAL SRF (`LATERAL generate_series(1, t.n)`) evaluates its args
-        // against the outer row, so its rows are built per outer row by the
-        // scan — register an empty placeholder here.
-        if tref.lateral {
+        // Every table function is implicitly lateral to preceding FROM items;
+        // the keyword is optional for functions in PostgreSQL. Such rows are
+        // built per left-hand row by the scan.
+        if tref.lateral || self.n > 0 {
             self.names[self.n] = exposed;
             self.defs[self.n] = Some(def_reference);
             self.derived[self.n] = Some(&[]);
@@ -426,23 +484,13 @@ impl<'d> QueryScope<'d> {
             self.n += 1;
             return Ok(());
         }
-        let mut rows: &'a [&'a [u8]] =
-            if materialize { table_func_rows(tref, arena, params)? } else { &[] };
-        // `WITH ORDINALITY` appends a 1-based bigint to each materialized row.
-        if tref.with_ordinality && materialize {
-            let base_cols = def_reference.n_columns - 1;
-            const EMPTY: &[u8] = &[];
-            let wrapped = arena.alloc_slice_with(rows.len(), |_| EMPTY).map_err(|_| arena_full())?;
-            for (i, row) in rows.iter().enumerate() {
-                let mut vals = [Datum::Null; MAX_COLUMNS];
-                for (c, slot) in vals[..base_cols].iter_mut().enumerate() {
-                    *slot = crate::sql::exec::decode_projected_col_record(row, c, arena)?;
-                }
-                vals[base_cols] = Datum::Int8((i + 1) as i64);
-                wrapped[i] = crate::sql::exec::encode_projected_pub(&vals[..base_cols + 1], arena)?;
-            }
-            rows = &*wrapped;
-        }
+        let rows: &'a [&'a [u8]] = if !materialize {
+            &[]
+        } else if outer.is_some() {
+            table_func_rows_outer(tref, arena, params, &columns)?
+        } else {
+            table_func_rows(tref, arena, params)?
+        };
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);

@@ -377,6 +377,23 @@ pub trait CatalogAccess {
         subid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
+    /// SQL spelling of a user-defined type OID for `format_type`.
+    fn type_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Stored SELECT text of a view or materialized view OID.
+    fn view_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Bytes occupied by the relation's stored row images. Relations without
+    /// physical row storage (plain views and catalog-only indexes) report zero.
+    fn relation_size(&self, _oid: i32) -> Result<Option<i64>, SqlError> {
+        Ok(None)
+    }
+    /// Total bytes occupied by all stored row images in the current database.
+    fn database_size(&self) -> Result<i64, SqlError> {
+        Ok(0)
+    }
     /// The name of the enum type in catalog `slot`, for `pg_typeof` on an enum
     /// value. `None` if the slot holds no live enum.
     fn enum_name<'a>(&self, _slot: u16, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
@@ -817,6 +834,12 @@ pub fn eval_full<'a>(
                     // (pgx and most tools introspect this way).
                     Datum::Text(name) | Datum::Bpchar(name) => {
                         let name = name.trim_end_matches(' ');
+                        // regclass input accepts a decimal OID spelling without
+                        // resolving it as a relation name. psql uses this form
+                        // in catalog queries (`'16385'::regclass`).
+                        if let Ok(oid) = name.parse::<i32>() {
+                            return Ok(Datum::Int4(oid));
+                        }
                         if let Some(oid) = cat.reloid(name) {
                             return Ok(Datum::Int4(oid));
                         }

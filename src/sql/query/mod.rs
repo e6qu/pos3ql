@@ -49,7 +49,9 @@ mod aggregate;
 use aggregate::{AggState, fold_aggregates};
 
 mod srf;
-use srf::{find_srf, srf_count, srf_max_count, table_func_def, table_func_rows};
+use srf::{
+    find_srf, srf_count, srf_max_count, table_func_def, table_func_def_outer, table_func_rows,
+};
 pub(crate) use srf::{synth_derived_def, synth_derived_def_outer, table_func_rows_outer};
 
 mod group;
@@ -60,7 +62,10 @@ use plan::{join_order, reorder_qual, simplify_qual, where_passes, postpone_cost}
 
 mod subquery;
 pub use subquery::{prepare_subqueries, subquery_hooks};
-use subquery::{merge_correlated, prepare_outer_subqueries, subquery_witness, walk_children};
+use subquery::{
+    correlated_in_expression, correlated_where_passes, merge_correlated,
+    prepare_outer_subqueries, subquery_witness, walk_children,
+};
 
 mod window;
 use window::{
@@ -169,6 +174,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             subid,
             arena,
         )
+    }
+
+    fn type_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::user_type_name_text(self.storage, self.txid, oid, arena)
+    }
+
+    fn view_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::view_def_text(self.storage, oid, arena)
+    }
+
+    fn relation_size(&self, oid: i32) -> Result<Option<i64>, SqlError> {
+        super::catalog::relation_size(self.storage, self.txid, oid)
+    }
+
+    fn database_size(&self) -> Result<i64, SqlError> {
+        super::catalog::database_size(self.storage, self.txid)
     }
 
     fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
@@ -1471,6 +1492,15 @@ pub fn select_query<'a>(
         Err(e) => return sql_fail(e),
     };
     let correlated = outer_subs.correlated;
+    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
+    let n_where_correlated = match correlated_in_expression(
+        statement.where_clause,
+        correlated,
+        &mut where_correlated,
+    ) {
+        Ok(count) => count,
+        Err(error) => return sql_fail(error),
+    };
     let catalog = StorageCatalog { storage, txid };
     let hooks = EvalHooks {
         group: None,
@@ -1621,7 +1651,8 @@ pub fn select_query<'a>(
         // With correlated subqueries, WHERE is applied per row against merged
         // hooks (which include the correlated results); otherwise the scan
         // applies WHERE directly for the common, faster path.
-        let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
+        let where_in_scan =
+            if n_where_correlated == 0 { statement.where_clause } else { None };
         // A set-returning `_pg_expandarray(array)` expands each row into one output
         // row per array element.
         let srf_call = find_srf(statement.items);
@@ -1639,6 +1670,21 @@ pub fn select_query<'a>(
                 if emitted >= limit {
                     return Ok(false);
                 }
+                if n_where_correlated > 0
+                    && !correlated_where_passes(
+                        &where_correlated[..n_where_correlated],
+                        &outer_subs.base,
+                        statement.where_clause,
+                        row,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        &hooks,
+                    )?
+                {
+                    return Ok(true);
+                }
                 // Per-row hooks for correlated subqueries; then WHERE.
                 let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
                     [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
@@ -1654,20 +1700,9 @@ pub fn select_query<'a>(
                         &mut sc, &mut ls,
                     )?;
                     row_hooks_owned =
-                        EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
+                        EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: hooks.catalog, srf_index: None, sequences: seq };
                     &row_hooks_owned
                 };
-                if !correlated.is_empty()
-                    && let Some(w) = statement.where_clause {
-                        match eval_full(w, arena, params, row, row_hooks)? {
-                            Datum::Bool(true) => {}
-                            Datum::Bool(false) | Datum::Null => return Ok(true),
-                            _ => return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "argument of WHERE must be type boolean"
-                            )),
-                        }
-                    }
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
                 let count = srf_max_count(statement.items, arena, params, row, row_hooks)?;
@@ -2100,6 +2135,7 @@ pub fn select_into_rows<'a>(
         return Ok(());
     }
     check_select_constants(statement, arena)?;
+    let catalog = StorageCatalog { storage, txid };
     let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
@@ -2141,7 +2177,7 @@ pub fn select_into_rows<'a>(
                 sequences: seq,
                 subs: Some(&subs),
                 windows: None,
-                catalog: None,
+                catalog: Some(&catalog),
                 srf_index: None,
             };
             let Some((ptrs, values)) =
@@ -2173,7 +2209,7 @@ pub fn select_into_rows<'a>(
             emit(&vals[..n])?;
             return Ok(());
         };
-        let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
+        let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena)?;
         check_key_types(statement, &scope, arena)?;
         let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ] = [None; 2 + MAX_PROJ];
@@ -2185,7 +2221,7 @@ pub fn select_into_rows<'a>(
             }
         }
         let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
-        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: None, srf_index: None, sequences: seq };
+        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: Some(&catalog), srf_index: None, sequences: seq };
         let (rows, width) = grouped_rows(
             storage, &scope, from, txid, statement, &agg_nodes[..n_aggs], arena, params, &hooks,
             outer_subs.correlated, outer,
@@ -2233,7 +2269,7 @@ pub fn select_into_rows<'a>(
         // set-returning function in the list expands it to several.
         let subs =
             prepare_subqueries(&sub_exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
-        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
+        let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: Some(&catalog), srf_index: None, sequences: seq };
         let srf_call = find_srf(statement.items);
         let count = srf_max_count(statement.items, arena, params, &cols, &hooks)?;
         for k in 1..=count {
@@ -2269,10 +2305,16 @@ pub fn select_into_rows<'a>(
         return Ok(());
     };
 
-    let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
+    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
     let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
     let correlated = outer_subs.correlated;
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: None, srf_index: None, sequences: seq };
+    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
+    let n_where_correlated = correlated_in_expression(
+        statement.where_clause,
+        correlated,
+        &mut where_correlated,
+    )?;
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&outer_subs.base) , windows: None, catalog: Some(&catalog), srf_index: None, sequences: seq };
 
     // Window functions (`OVER (...)`) in the projection: materialize the rows
     // with each window value computed, then emit. ORDER BY/LIMIT are handled by
@@ -2365,7 +2407,8 @@ pub fn select_into_rows<'a>(
         }
         return Ok(());
     }
-    let where_in_scan = if correlated.is_empty() { statement.where_clause } else { None };
+    let where_in_scan =
+        if n_where_correlated == 0 { statement.where_clause } else { None };
 
     // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
@@ -2373,6 +2416,21 @@ pub fn select_into_rows<'a>(
     scan_source(
         storage, &scope, from, txid, where_in_scan, arena, params, &hooks, outer,
         &mut |row| {
+            if n_where_correlated > 0
+                && !correlated_where_passes(
+                    &where_correlated[..n_where_correlated],
+                    &outer_subs.base,
+                    statement.where_clause,
+                    row,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    &hooks,
+                )?
+            {
+                return Ok(true);
+            }
             let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
                 [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
             let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
@@ -2385,11 +2443,7 @@ pub fn select_into_rows<'a>(
                 row_subs = merge_correlated(
                     correlated, &outer_subs.base, row, storage, txid, arena, params, &mut sc, &mut ls,
                 )?;
-                row_hooks_owned = EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: None, srf_index: None, sequences: seq };
-                if let Some(w) = statement.where_clause
-                    && !where_passes(w, arena, params, row, &row_hooks_owned)? {
-                        return Ok(true);
-                    }
+                row_hooks_owned = EvalHooks { group: None, aggs: None, subs: Some(&row_subs) , windows: None, catalog: hooks.catalog, srf_index: None, sequences: seq };
                 &row_hooks_owned
             };
             let mut projected = [Datum::Null; MAX_PROJ];
@@ -2854,9 +2908,11 @@ pub fn first_from_match<'a>(
     target: &dyn ColumnLookup<'a>,
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
 ) -> Result<bool, SqlError> {
-    let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
+    let scope =
+        QueryScope::resolve_exec_outer(storage, from, txid, arena, params, Some(target))?;
     let subs = subquery_hooks(&[where_clause], storage, txid, arena, params)?;
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: None, srf_index: None, sequences: None };
+    let catalog = StorageCatalog { storage, txid };
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&subs) , windows: None, catalog: Some(&catalog), srf_index: None, sequences: None };
     let mut found = false;
     scan_source(
         storage,

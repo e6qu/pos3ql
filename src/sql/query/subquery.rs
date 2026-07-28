@@ -52,6 +52,34 @@ fn collect_subqueries<'a>(
     walk_children(expression, &mut |child| collect_subqueries(child, out, n))
 }
 
+/// Selects the already-classified correlated nodes that occur inside one
+/// expression. Executors use this to evaluate WHERE's correlated subqueries
+/// before the select-list ones, so rows rejected by ordinary join predicates
+/// never materialize unused subquery results.
+pub(super) fn correlated_in_expression<'a>(
+    expression: Option<&'a Expr<'a>>,
+    correlated: &[&'a Expr<'a>],
+    out: &mut [&'a Expr<'a>; MAX_SUBQUERIES],
+) -> Result<usize, SqlError> {
+    let Some(expression) = expression else {
+        return Ok(0);
+    };
+    let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
+    let mut count = 0;
+    collect_subqueries(expression, &mut nodes, &mut count)?;
+    let mut selected = 0;
+    for node in nodes[..count].iter().flatten() {
+        if correlated
+            .iter()
+            .any(|candidate| core::ptr::eq(*candidate, *node))
+        {
+            out[selected] = node;
+            selected += 1;
+        }
+    }
+    Ok(selected)
+}
+
 pub(super) fn walk_children<'a>(
     expression: &'a Expr<'a>,
     f: &mut dyn FnMut(&'a Expr<'a>) -> Result<(), SqlError>,
@@ -328,7 +356,8 @@ fn subquery_exists<'a>(
         depth - 1,
         outer,
     )?;
-    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&inner_subs) , windows: None, catalog: None, srf_index: None, sequences: None };
+    let catalog = super::storage_catalog(storage, txid);
+    let hooks = EvalHooks { group: None, aggs: None, subs: Some(&inner_subs) , windows: None, catalog: Some(&catalog), srf_index: None, sequences: None };
 
     let Some(from) = &select.from else {
         // FROM-less: an aggregate query yields its one output row even over
@@ -358,7 +387,7 @@ fn subquery_exists<'a>(
         }
         return Ok(true);
     };
-    let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
+    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
     let mut found = false;
     scan_source(
         storage,
@@ -421,6 +450,15 @@ fn select_has_outer_ref<'a>(
     storage: &'a Storage,
     arena: &'a Arena,
 ) -> bool {
+    if select.from.as_ref().is_some_and(|from| {
+        table_ref_has_outer_ref(&from.base, chain, storage, arena)
+            || from.joins.iter().any(|join| {
+                table_ref_has_outer_ref(&join.table, chain, storage, arena)
+                    || join.on.is_some_and(|on| expr_has_outer_ref(on, chain, storage, arena))
+            })
+    }) {
+        return true;
+    }
     if select.where_clause.is_some_and(|w| expr_has_outer_ref(w, chain, storage, arena)) {
         return true;
     }
@@ -434,6 +472,32 @@ fn select_has_outer_ref<'a>(
         SelectItem::Expr { expression, .. } => expr_has_outer_ref(expression, chain, storage, arena),
         _ => false,
     })
+}
+
+/// Whether a FROM item depends on a column beyond the select's own scope.
+/// Function arguments participate because table functions are implicitly
+/// lateral; a derived subquery pushes its own scope just like an expression
+/// subquery does.
+fn table_ref_has_outer_ref<'a>(
+    table: &'a crate::sql::ast::TableRef<'a>,
+    chain: &ScopeChain,
+    storage: &'a Storage,
+    arena: &'a Arena,
+) -> bool {
+    if table.func_args.is_some_and(|arguments| {
+        arguments.iter().any(|argument| expr_has_outer_ref(argument, chain, storage, arena))
+    }) {
+        return true;
+    }
+    let Some(select) = table.subquery else {
+        return false;
+    };
+    let scope = select
+        .from
+        .as_ref()
+        .and_then(|from| QueryScope::resolve_schema(storage, from, 0, arena).ok());
+    let child = ScopeChain { scope: scope.as_ref(), parent: Some(chain) };
+    select_has_outer_ref(select, &child, storage, arena)
 }
 
 /// Whether any column reference in `expression` resolves only in an enclosing scope
@@ -584,6 +648,43 @@ pub(super) fn merge_correlated<'a, 'b>(
         }
     }
     Ok(SubqueryValues { scalars: &scalars[..ns], lists: &lists[..nl] })
+}
+
+/// Evaluates a predicate after materializing only the correlated subqueries it
+/// contains. Keeping this at the subquery choke point makes every scan path
+/// apply WHERE before it evaluates correlated projection or ordering work.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn correlated_where_passes<'a>(
+    correlated: &[&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
+    predicate: Option<&'a Expr<'a>>,
+    row: &impl ColumnLookup<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    let Some(predicate) = predicate else {
+        return Ok(true);
+    };
+    let mut scalars: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
+        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+    let mut lists: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
+        [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+    let values = merge_correlated(
+        correlated,
+        base,
+        row,
+        storage,
+        txid,
+        arena,
+        params,
+        &mut scalars,
+        &mut lists,
+    )?;
+    let where_hooks = EvalHooks { subs: Some(&values), ..*hooks };
+    where_passes(predicate, arena, params, row, &where_hooks)
 }
 
 /// A representative zero value of a column type, used to coerce an IN operand
@@ -737,11 +838,12 @@ fn run_subquery<'a>(
         depth - 1,
         outer,
     )?;
+    let catalog = super::storage_catalog(storage, txid);
     let hooks = EvalHooks {
         group: None,
         aggs: None,
         subs: Some(&inner_subs),
-        windows: None, catalog: None, srf_index: None, sequences: None };
+        windows: None, catalog: Some(&catalog), srf_index: None, sequences: None };
 
     let Some(from) = &select.from else {
         if wildcard {
@@ -776,7 +878,7 @@ fn run_subquery<'a>(
         let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
         return Ok((&*out, v.is_null(), subquery_witness(item, None)));
     };
-    let scope = QueryScope::resolve_exec(storage, from, txid, arena, params)?;
+    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
 
     // `SELECT *` is a single-column subquery only if the source is exactly one
     // column; expand it to that column so the row-value path below applies.
@@ -826,7 +928,7 @@ fn run_subquery<'a>(
             group: None,
             aggs: Some((&*ptrs, agg_values)),
             subs: hooks.subs,
-        windows: None, catalog: None, srf_index: None, sequences: hooks.sequences };
+        windows: None, catalog: hooks.catalog, srf_index: None, sequences: hooks.sequences };
         let schema = ScopeSchema(&scope);
         let base = Chained { inner: &schema, outer };
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;

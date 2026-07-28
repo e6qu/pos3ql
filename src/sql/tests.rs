@@ -1054,6 +1054,71 @@ fn catalog_indexes_and_constraints_for_psql_d() {
 }
 
 #[test]
+fn catalog_definitions_do_not_silently_truncate() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    let columns = [
+        "deliberately_long_column_name_number_01",
+        "deliberately_long_column_name_number_02",
+        "deliberately_long_column_name_number_03",
+        "deliberately_long_column_name_number_04",
+        "deliberately_long_column_name_number_05",
+        "deliberately_long_column_name_number_06",
+        "deliberately_long_column_name_number_07",
+        "deliberately_long_column_name_number_08",
+    ];
+    let definitions = columns
+        .iter()
+        .map(|name| format!("{name} integer"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let names = columns.join(", ");
+    let parent_result = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &format!("CREATE TABLE long_parent ({definitions}, PRIMARY KEY ({names}))"),
+    );
+    assert!(!parent_result.contains("ERROR"), "{parent_result}");
+    let child_result = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &format!(
+            "CREATE TABLE long_child ({definitions}, \
+             CONSTRAINT long_child_parent_fkey \
+             FOREIGN KEY ({names}) REFERENCES long_parent ({names}))"
+        ),
+    );
+    assert!(!child_result.contains("ERROR"), "{child_result}");
+
+    let index_definition = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT pg_get_indexdef(conindid, 0, true) FROM pg_constraint \
+         WHERE contype='p' AND conrelid='long_parent'::regclass",
+    ));
+    assert!(
+        index_definition[0].ends_with("deliberately_long_column_name_number_08)"),
+        "index definition was truncated: {}",
+        index_definition[0]
+    );
+    let foreign_key_definition = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT pg_get_constraintdef(oid, true) FROM pg_constraint \
+         WHERE contype='f' AND conrelid='long_child'::regclass",
+    ));
+    assert!(
+        foreign_key_definition[0].ends_with("deliberately_long_column_name_number_08)"),
+        "foreign key definition was truncated: {}",
+        foreign_key_definition[0]
+    );
+}
+
+#[test]
 fn bitwise_operators_and_string_syntax() {
     // Bitwise operators and SQL trim/substring syntax used by JDBC's
     // DatabaseMetaData queries. Semantics verified against PostgreSQL 18.4.
@@ -2983,6 +3048,41 @@ fn enums_order_and_enforce() {
         &mut b,
         "CREATE TABLE et (id int, m mood, moods mood[])",
     );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE enum_defaults (\
+             m mood DEFAULT 'ok',\
+             moods mood[] DEFAULT ARRAY['sad','happy']::mood[]\
+         )",
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("CREATE TABLE"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(&mut e, &mut b, "INSERT INTO enum_defaults DEFAULT VALUES");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("INSERT 0 1"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT m, moods FROM enum_defaults"
+        )),
+        ["ok|{sad,happy}"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "CREATE TABLE invalid_enum_default (m mood DEFAULT 'missing')"
+        ))
+        .contains("22P02")
+    );
     run_with(
         &mut e,
         &mut b,
@@ -3104,20 +3204,32 @@ fn enums_survive_restart() {
         run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'");
         run_with(&mut e, &mut b, "CREATE TABLE et (id int, m mood)");
         run_with(&mut e, &mut b, "INSERT INTO et VALUES (1,'happy'),(2,'meh'),(3,'sad')");
+        run_with(&mut e, &mut b, "ALTER TYPE mood RENAME TO feeling");
         e.commit_wal();
     }
-    // WAL replay: the enum, its added value, ordering, and column identity survive.
+    // WAL replay: the enum, its rename, added value, ordering, and column
+    // identity survive, including through grouped projection's schema lookup.
     {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
         assert_eq!(data_rows(&bytes), ["3", "2", "1"]);
         let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(m) FROM et WHERE id = 1");
-        assert_eq!(data_rows(&bytes), ["mood"]);
+        assert_eq!(data_rows(&bytes), ["feeling"]);
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT pg_typeof(m), string_agg(id::text, ',' ORDER BY id) \
+             FROM et GROUP BY m ORDER BY m",
+        );
+        assert_eq!(
+            data_rows(&bytes),
+            ["feeling|3", "feeling|2", "feeling|1"]
+        );
         // Still enforces its labels after replay.
         assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO et VALUES (9,'bogus')")).contains("22P02"));
         // The added value is usable.
-        run_with(&mut e, &mut b, "INSERT INTO et VALUES (4,'ok')");
+        run_with(&mut e, &mut b, "INSERT INTO et VALUES (4,'ok'::feeling)");
         let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
         assert_eq!(data_rows(&bytes), ["3", "2", "4", "1"]);
     }
@@ -3243,6 +3355,31 @@ fn lateral_joins() {
     // contributes no rows.
     let bytes = run_with(&mut e, &mut b, "SELECT id, g FROM lt, LATERAL generate_series(1, lt.n) g ORDER BY id, g");
     assert_eq!(data_rows(&bytes), ["1|1", "1|2", "2|1", "2|2", "2|3"]);
+    // The LATERAL keyword is optional for functions: arguments may reference
+    // preceding FROM items, and WITH ORDINALITY restarts for every left row.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id, g, ordinality FROM lt, generate_series(1, lt.n) WITH ORDINALITY g ORDER BY id, g",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["1|1|1", "1|2|2", "2|1|1", "2|2|2", "2|3|3"]
+    );
+    // A table-function argument inside an ARRAY subquery can reference the
+    // enclosing query. This is the shape emitted by psql's describe queries.
+    run_with(&mut e, &mut b, "CREATE TABLE la (id int, options text[])");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO la VALUES (1, ARRAY['a','b']), (2, NULL), (3, ARRAY['c'])",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id, ARRAY(SELECT 'x.' || option FROM unnest(la.options) option) FROM la ORDER BY id",
+    );
+    assert_eq!(data_rows(&bytes), ["1|{x.a,x.b}", "2|{}", "3|{x.c}"]);
     // Two lateral items, the second referencing the first's output.
     let bytes = run_with(&mut e, &mut b, "SELECT t.id, a.g, b.d FROM lt t, LATERAL generate_series(1,t.n) a(g), LATERAL (SELECT a.g*10 AS d) b ORDER BY t.id, a.g");
     assert_eq!(data_rows(&bytes), ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]);
@@ -3290,6 +3427,49 @@ fn correlated_scalar_subquery_streaming() {
     let mut got = data_rows(&bytes);
     got.sort();
     assert_eq!(got, ["1|1", "2|2"]);
+}
+
+#[test]
+fn where_filters_before_correlated_projection() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE TABLE outer_rows (id integer)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE inner_rows (outer_id integer, value integer)",
+    );
+    run_with(&mut engine, &mut budget, "INSERT INTO outer_rows VALUES (1), (2)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO inner_rows VALUES (1, 10), (1, 11), (2, 20)",
+    );
+
+    // The rejected outer row has a multi-row scalar subquery. PostgreSQL never
+    // evaluates that select-list expression because WHERE removes the row first.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (SELECT value FROM inner_rows WHERE outer_id = o.id)
+         FROM outer_rows AS o
+         WHERE o.id = 2",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows, ["20"], "{}", String::from_utf8_lossy(&output));
+    let ordered = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (SELECT value FROM inner_rows WHERE outer_id = o.id)
+         FROM outer_rows AS o
+         WHERE o.id = 2
+         ORDER BY o.id",
+    );
+    assert_eq!(
+        data_rows(&ordered),
+        ["20"],
+        "{}",
+        String::from_utf8_lossy(&ordered)
+    );
 }
 
 #[test]
@@ -3937,6 +4117,63 @@ fn catalog_joins_and_subqueries() {
              WHERE attrelid IN (SELECT oid FROM pg_class WHERE relname='demo') AND attnum>0")),
         ["2"]
     );
+}
+
+#[test]
+fn psql_catalog_listing_contracts() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sized_relation (id integer);
+         INSERT INTO sized_relation VALUES (1)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT d.datname, t.spcname,
+                    pg_database_size(d.datname) >= pg_table_size('sized_relation'::regclass)
+             FROM pg_database d
+             JOIN pg_tablespace t ON t.oid = d.dattablespace"
+        )),
+        ["postgres|pg_default|t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+                    rolcanlogin, rolconnlimit, rolreplication, rolbypassrls
+             FROM pg_roles"
+        )),
+        ["postgres|t|t|t|t|t|-1|t|t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_tablespace_location(1663),
+                    pg_tablespace_size(1663) = pg_database_size('postgres')"
+        )),
+        ["|t"]
+    );
+    for query in [
+        "SELECT count(*) FROM pg_proc p LEFT JOIN pg_language l ON l.oid=p.prolang",
+        "SELECT count(*) FROM pg_publication",
+        "SELECT count(*) FROM pg_foreign_server s JOIN pg_foreign_data_wrapper f ON f.oid=s.srvfdw",
+        "SELECT count(*) FROM pg_db_role_setting s LEFT JOIN pg_database d ON d.oid=s.setdatabase",
+        "SELECT count(*) FROM pg_parameter_acl",
+        "SELECT count(*) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace",
+    ] {
+        let output = run_with(&mut engine, &mut budget, query);
+        assert_eq!(
+            data_rows(&output),
+            ["0"],
+            "{query}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 #[test]
@@ -4788,6 +5025,65 @@ fn copy_formats_and_unsupported() {
 }
 
 #[test]
+fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE copy_mood AS ENUM ('ready', 'done');
+         CREATE SEQUENCE copy_sequence START 10;
+         CREATE TABLE copy_defaults (
+             input integer,
+             sequence_value bigint DEFAULT nextval('copy_sequence'),
+             numbers integer[] DEFAULT ARRAY[1, 2],
+             doubled integer GENERATED ALWAYS AS (input * 2) STORED,
+             state copy_mood DEFAULT 'ready'::copy_mood
+         )",
+    );
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "copy send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "copy sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY copy_defaults (input) FROM STDIN",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine.take_pending_copy().expect("COPY enters streaming mode");
+    arena.reset();
+    engine
+        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"5")
+        .unwrap();
+    engine.copy_finish(&mut txn, &guc).unwrap();
+
+    let rows = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT input, sequence_value, numbers, doubled, state FROM copy_defaults",
+    ));
+    assert_eq!(rows, ["5|10|{1,2}|10|ready"]);
+
+    let rejected = run_with(&mut engine, &mut budget, "COPY copy_defaults FROM STDIN");
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("428C9"),
+        "COPY targeting a generated column must fail at setup"
+    );
+}
+
+#[test]
 fn copy_query_to_stdout() {
     // COPY (query) TO STDOUT streams a query's rows in COPY's formats.
     let (mut engine, mut budget) = test_engine();
@@ -4895,4 +5191,50 @@ fn create_table_as_builds_and_populates() {
     assert!(String::from_utf8_lossy(&out).contains('3'));
     let out = run_with(&mut engine, &mut budget, "INSERT INTO t VALUES ('bad', 'x')");
     assert!(String::from_utf8_lossy(&out).contains("22P02"));
+
+    // User-defined enum identity survives both CTAS and materialized-view
+    // materialization, including the enum's automatically-created array type.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE ctas_mood AS ENUM ('low','high');\
+         CREATE TABLE typed_src (m ctas_mood, ms ctas_mood[]);\
+         INSERT INTO typed_src VALUES ('high', ARRAY['low','high']::ctas_mood[])",
+    );
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE typed_copy AS SELECT m, ms FROM typed_src",
+    );
+    assert!(
+        String::from_utf8_lossy(&out).contains("SELECT 1"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(m), pg_typeof(ms), m, ms FROM typed_copy"
+        )),
+        ["ctas_mood|ctas_mood[]|high|{low,high}"]
+    );
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE MATERIALIZED VIEW typed_materialized AS SELECT m, ms FROM typed_src",
+    );
+    assert!(
+        String::from_utf8_lossy(&out).contains("SELECT 1"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(m), pg_typeof(ms) FROM typed_materialized"
+        )),
+        ["ctas_mood|ctas_mood[]"]
+    );
 }

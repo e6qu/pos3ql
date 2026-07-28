@@ -74,7 +74,9 @@ Working single-node database:
   VALUE and RENAME TO, ordered by definition order and reflected in
   `pg_type`/`pg_enum`), casts and
   scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
-  introspection, transactional `SHOW` / `SET` / `SET LOCAL` / `RESET` /
+  introspection (including psql's detailed table/view/materialized-view/index/
+  sequence/domain/type displays and standard object listings), transactional
+  `SHOW` / `SET` / `SET LOCAL` / `RESET` /
   `RESET ALL` and `current_setting(...)` / `set_config(...)` for session
   settings (including savepoint rollback),
   PostgreSQL lexical rules, and SQLSTATE-correct errors.
@@ -82,7 +84,8 @@ Working single-node database:
   the simple and extended query protocols, in
   PostgreSQL's text, CSV, and binary formats —
   psql `\copy` and pg_dump-style inline data streams work, with each type's
-  input and output functions and full constraint enforcement. The binary format
+  input and output functions, expression/sequence defaults, generated columns,
+  and full constraint enforcement. The binary format
   is byte-exact against PostgreSQL for the whole type surface, composites
   included (arrays, ranges, multiranges, bit strings, network addresses).
 - Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED snapshot isolation,

@@ -248,7 +248,7 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         3912 => ColType::Range(crate::sql::types::RangeKind::Date),
         3908 => ColType::Range(crate::sql::types::RangeKind::Ts),
         3910 => ColType::Range(crate::sql::types::RangeKind::Tstz),
-        _ => return None,
+        _ => return ColType::from_oid(o),
     })
 }
 

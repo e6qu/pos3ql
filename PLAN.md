@@ -1722,7 +1722,7 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
    length -1, empty array as ndim 0), **ranges** (the flags byte —
    empty/inclusive/infinite — then each finite bound as int32 length + binary),
    **multiranges** (int32 range count, each range length-framed), and **bit
-   strings** (int32 bit length then MSB-first packed bytes) — encoded on the
+strings** (int32 bit length then MSB-first packed bytes) — encoded on the
    arena-aware `copy_out` path (range bounds need typed parsing) and decoded via
    the shared per-type receiver; only anonymous `record`, which has no stored
    column representation, stays refused (0A000). The extended-protocol *binary
@@ -1745,9 +1745,14 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
    NULL/empty, int4/int8 ranges incl. the untyped empty range, multiranges)
    diffing against real PostgreSQL. The extended-protocol COPY flow is refused
    fully streams COPY IN and OUT through Parse/Bind/Execute too, including
-   PostgreSQL's CopyFail and Sync recovery. The pg_dump round-trip milestone
-   stays open pending Stage F's repeatable-read snapshots/table locks and the
-   remaining catalog surface pg_dump queries.
+   PostgreSQL's CopyFail and Sync recovery. COPY FROM now also shares INSERT's
+   expression/sequence-default and generated-column semantics. The psql
+   introspection half of the catalog milestone is complete: detailed
+   table/view/materialized-view/index/sequence/domain/type displays and the
+   standard relation/schema/database/role/function/tablespace/publication/FDW
+   listings execute end-to-end. The pg_dump round-trip milestone stays open
+   pending Stage F's repeatable-read snapshots/table locks and the remaining
+   pg_dump-specific catalog queries.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;
@@ -1776,7 +1781,7 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
 
 ## Verification
 
-- `cargo test` — 444 unit/property tests plus the integration suites
+- `cargo test` — 452 unit/property tests plus the integration suites
   (memory guard incl. unwind safety and the TLS budget scope, differential
   FixedMap vs std, PCG32/CRC-32C/SHA-256/SHA-512/HMAC/SigV4 official vectors,
   row codec fuzz-by-truncation, WAL corruption/floor/stale-tail, engine

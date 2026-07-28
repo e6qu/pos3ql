@@ -493,6 +493,19 @@ pub(super) fn table_func_def<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<&'a TableDef, SqlError> {
+    table_func_def_outer(tref, arena, params, &crate::sql::eval::NoColumns)
+}
+
+/// [`table_func_def`] with column types supplied by an enclosing row or the
+/// preceding FROM items. PostgreSQL table-function arguments are implicitly
+/// lateral, so their result type must be resolvable before a value exists for
+/// every referenced column.
+pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
+    tref: &'a TableRef<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+) -> Result<&'a TableDef, SqlError> {
     let is_gs = tref.table.eq_ignore_ascii_case("generate_series");
     let is_unnest = tref.table.eq_ignore_ascii_case("unnest");
     let is_re = tref.table.eq_ignore_ascii_case("regexp_matches");
@@ -561,10 +574,15 @@ pub(super) fn table_func_def<'a>(
         let single_type = if is_gs {
             // Integer series → int8; a date/timestamp start makes it temporal.
             match tref.func_args.and_then(|a| a.first()) {
-                Some(e) => match crate::sql::eval::eval(e, arena, params, &crate::sql::eval::NoColumns)? {
-                    Datum::Timestamp(_) => ColType::Timestamp,
-                    Datum::Timestamptz(_) | Datum::Date(_) => ColType::Timestamptz,
-                    _ => ColType::Int8,
+                Some(e) => match crate::sql::eval::static_type_pub(e, columns) {
+                    Some(ColType::Timestamp) => ColType::Timestamp,
+                    Some(ColType::Timestamptz | ColType::Date) => ColType::Timestamptz,
+                    Some(_) => ColType::Int8,
+                    None => match crate::sql::eval::eval(e, arena, params, columns)? {
+                        Datum::Timestamp(_) => ColType::Timestamp,
+                        Datum::Timestamptz(_) | Datum::Date(_) => ColType::Timestamptz,
+                        _ => ColType::Int8,
+                    },
                 },
                 None => ColType::Int8,
             }
@@ -585,9 +603,13 @@ pub(super) fn table_func_def<'a>(
         } else {
             let args = tref.func_args.unwrap_or(&[]);
             match args.first() {
-                Some(e) => match crate::sql::eval::eval(e, arena, params, &crate::sql::eval::NoColumns)? {
-                    Datum::Array { element, .. } => element.to_coltype(),
-                    _ => ColType::Text,
+                Some(e) => match crate::sql::eval::static_type_pub(e, columns) {
+                    Some(ColType::Array(element)) => element.to_coltype(),
+                    Some(_) => ColType::Text,
+                    None => match crate::sql::eval::eval(e, arena, params, columns)? {
+                        Datum::Array { element, .. } => element.to_coltype(),
+                        _ => ColType::Text,
+                    },
                 },
                 None => ColType::Text,
             }
@@ -658,6 +680,32 @@ pub(super) fn table_func_rows<'a>(
 /// [`table_func_rows`] evaluating the function's arguments against `columns` — an
 /// outer row, for a `LATERAL func(outer.col)`.
 pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
+    tref: &'a TableRef<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let rows = table_func_base_rows_outer(tref, arena, params, columns)?;
+    if !tref.with_ordinality {
+        return Ok(rows);
+    }
+    let def = table_func_def_outer(tref, arena, params, columns)?;
+    let base_columns = def.n_columns - 1;
+    const EMPTY: &[u8] = &[];
+    let wrapped = arena.alloc_slice_with(rows.len(), |_| EMPTY).map_err(|_| arena_full())?;
+    for (index, row) in rows.iter().enumerate() {
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        for (column, slot) in values[..base_columns].iter_mut().enumerate() {
+            *slot = crate::sql::exec::decode_projected_col_record(row, column, arena)?;
+        }
+        values[base_columns] = Datum::Int8((index + 1) as i64);
+        wrapped[index] =
+            crate::sql::exec::encode_projected_pub(&values[..base_columns + 1], arena)?;
+    }
+    Ok(&*wrapped)
+}
+
+fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],

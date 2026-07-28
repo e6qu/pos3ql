@@ -864,6 +864,18 @@ fn set_show_transaction_and_show_all() {
         .contains("SET"));
     assert!(run("SET TRANSACTION READ ONLY").contains("0A000"));
     assert!(run("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE").contains("SET"));
+    assert!(
+        run("BEGIN ISOLATION LEVEL REPEATABLE READ").contains("0A000"),
+        "unsupported BEGIN isolation must return 0A000"
+    );
+    assert!(
+        run("START TRANSACTION READ ONLY").contains("0A000"),
+        "unsupported START TRANSACTION access mode must return 0A000"
+    );
+    assert!(
+        run("BEGIN ISOLATION LEVEL READ COMMITTED, READ WRITE, NOT DEFERRABLE").contains("BEGIN")
+    );
+    assert!(run("ROLLBACK").contains("ROLLBACK"));
     // SQL-standard multi-word SHOW forms.
     assert!(run("SHOW TRANSACTION ISOLATION LEVEL").contains("read committed"));
     assert!(run("SHOW ALL").contains("client_encoding"));
@@ -3564,7 +3576,7 @@ fn drop_schema_cascade_handles_cross_schema_type_dependents_without_corruption()
 }
 
 #[test]
-fn drop_schema_cascade_refuses_to_leave_an_external_view_broken() {
+fn drop_schema_cascade_drops_external_stored_query_dependents() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -3579,23 +3591,16 @@ fn drop_schema_cascade_refuses_to_leave_an_external_view_broken() {
         &mut budget,
         "DROP SCHEMA view_source CASCADE",
     );
-    assert!(
-        String::from_utf8_lossy(&dropped).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&dropped)
-    );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT count(*) FROM view_consumer.items"
-        )),
-        ["0"]
-    );
+    assert!(!message_types(&dropped).contains(&b'E'));
+    assert!(String::from_utf8_lossy(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM view_consumer.items"
+    )).contains("42P01"));
 }
 
 #[test]
-fn type_drop_refuses_to_leave_a_stored_query_broken() {
+fn type_drop_cascades_to_stored_query_dependents() {
     let (mut engine, mut budget) = test_engine();
     let created = run_with(
         &mut engine,
@@ -3615,21 +3620,283 @@ fn type_drop_refuses_to_leave_a_stored_query_broken() {
         "DROP TYPE view_types.mood"
     ))
     .contains("2BP01"));
+    let dropped = run_with(&mut engine, &mut budget, "DROP TYPE view_types.mood CASCADE");
+    assert!(!message_types(&dropped).contains(&b'E'));
     assert!(String::from_utf8_lossy(&run_with(
         &mut engine,
         &mut budget,
-        "DROP TYPE view_types.mood CASCADE"
-    ))
-    .contains("0A000"));
+        "SELECT mood FROM public.mood_view"
+    )).contains("42P01"));
+}
+
+#[test]
+fn relation_drop_cascades_through_stored_query_dependency_closure() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dependency_root (id integer);
+         CREATE VIEW dependency_view AS SELECT id FROM dependency_root;
+         CREATE MATERIALIZED VIEW dependency_matview AS
+             SELECT id FROM dependency_view WITH NO DATA;
+         CREATE VIEW dependency_leaf AS SELECT id FROM dependency_matview;",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE dependency_root",
+    );
+    let restricted_text = String::from_utf8_lossy(&restricted);
+    assert!(restricted_text.contains("2BP01"));
+    assert!(restricted_text.contains(
+        "materialized view dependency_matview depends on view dependency_view"
+    ));
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE dependency_root CASCADE",
+    );
+    assert!(
+        !message_types(&dropped).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    assert!(
+        String::from_utf8_lossy(&dropped)
+            .contains("drop cascades to materialized view dependency_matview")
+    );
+    let catalogs = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT
+             (SELECT count(*) FROM pg_views WHERE viewname LIKE 'dependency_%'),
+             (SELECT count(*) FROM pg_matviews WHERE matviewname LIKE 'dependency_%')",
+    );
+    assert_eq!(
+        data_rows(&catalogs),
+        ["0|0"],
+        "{}",
+        String::from_utf8_lossy(&catalogs)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM dependency_view"
+        ))
+        .contains("42P01")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM dependency_matview"
+        ))
+        .contains("42P01")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM dependency_leaf"
+        ))
+        .contains("42P01")
+    );
+}
+
+#[test]
+fn sequence_drop_cascades_to_stored_query_dependents() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE dependency_sequence;
+         CREATE VIEW dependency_sequence_view AS
+             SELECT nextval('dependency_sequence') AS id;",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SEQUENCE dependency_sequence",
+    );
+    let restricted_text = String::from_utf8_lossy(&restricted);
+    assert!(restricted_text.contains("2BP01"));
+    assert!(restricted_text.contains(
+        "view dependency_sequence_view depends on sequence dependency_sequence"
+    ));
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SEQUENCE dependency_sequence CASCADE",
+    );
+    assert!(!message_types(&dropped).contains(&b'E'));
+    assert!(
+        String::from_utf8_lossy(&dropped)
+            .contains("drop cascades to view dependency_sequence_view")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM dependency_sequence_view"
+        ))
+        .contains("42P01")
+    );
+}
+
+#[test]
+fn stored_query_binding_survives_relation_and_type_renames() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE dependency_mood AS ENUM ('one');
+         CREATE SCHEMA dependency_moved;
+         CREATE TABLE dependency_named (id integer, mood dependency_mood);
+         INSERT INTO dependency_named VALUES (7, 'one');
+         CREATE VIEW dependency_named_view AS
+             SELECT id, mood::public.dependency_mood AS mood
+             FROM public.dependency_named;",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "DROP TABLE public.dependency_named"
+        ))
+        .contains("2BP01")
+    );
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE public.dependency_named RENAME TO dependency_renamed;
+         ALTER TABLE public.dependency_renamed SET SCHEMA dependency_moved;
+         ALTER TYPE public.dependency_mood RENAME TO dependency_feeling;",
+    );
+    assert!(
+        !message_types(&renamed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&renamed)
+    );
+    let selected = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id, mood::text FROM dependency_named_view",
+    );
+    assert_eq!(
+        data_rows(&selected),
+        ["7|one"],
+        "{}",
+        String::from_utf8_lossy(&selected)
+    );
+}
+
+#[test]
+fn stored_query_dependencies_survive_wal_replay() {
+    let config = test_config("stored_query_dependencies_restart");
+    {
+        let mut budget = Budget::new(1 << 26);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TYPE durable_mood AS ENUM ('one');
+             CREATE TABLE durable_source (id integer);
+             INSERT INTO durable_source VALUES (11);
+             CREATE VIEW durable_view AS
+                 SELECT id, 'one'::durable_mood AS mood FROM durable_source;
+             ALTER TABLE durable_source RENAME TO durable_renamed;
+             ALTER TYPE durable_mood RENAME TO durable_feeling;",
+        );
+        assert!(
+            !message_types(&created).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let selected = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id, mood::text FROM durable_view",
+    );
+    assert_eq!(
+        data_rows(&selected),
+        ["11|one"],
+        "{}",
+        String::from_utf8_lossy(&selected)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "DROP TABLE durable_renamed"
+        ))
+        .contains("2BP01")
+    );
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE durable_feeling CASCADE",
+    );
+    assert!(!message_types(&dropped).contains(&b'E'));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM durable_view"
+        ))
+        .contains("42P01")
+    );
+}
+
+#[test]
+fn materialized_view_refresh_uses_captured_dependencies_after_rename() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE refresh_mood AS ENUM ('one');
+         CREATE TABLE refresh_source (id integer);
+         INSERT INTO refresh_source VALUES (3);
+         CREATE MATERIALIZED VIEW refresh_view AS
+             SELECT id, 'one'::refresh_mood AS mood FROM refresh_source;
+         ALTER TABLE refresh_source RENAME TO refresh_renamed;
+         ALTER TYPE refresh_mood RENAME TO refresh_feeling;
+         INSERT INTO refresh_renamed VALUES (4);
+         REFRESH MATERIALIZED VIEW refresh_view;",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT mood FROM public.mood_view"
+            "SELECT id, mood::text FROM refresh_view ORDER BY id"
         )),
-        ["one"]
+        ["3|one", "4|one"]
     );
 }
+
 
 #[test]
 fn comment_survives_restart_and_drop_clears_it() {

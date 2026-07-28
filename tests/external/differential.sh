@@ -92,6 +92,7 @@ normalize() {
     -e 's/^ERROR:  ([0-9A-Z]{5}):.*/ERROR \1/' \
     -e '/^LINE [0-9]+:/d' \
     -e '/^ *\^ *$/d' \
+    -e '/^psql:[^:]*:[0-9]+: (HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d' \
     -e '/^HINT:/d' \
     -e '/^DETAIL:/d' \
     -e '/^LOCATION:/d' \
@@ -134,6 +135,7 @@ normalize_exact() {
     -e 's/^ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
     -e '/^LINE [0-9]+:/d' \
     -e '/^ *\^ *$/d' \
+    -e '/^psql:[^:]*:[0-9]+: (HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d' \
     -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
 }
 

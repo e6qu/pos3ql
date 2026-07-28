@@ -529,14 +529,14 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident("begin") => {
                 self.advance()?;
-                self.skip_transaction_modifiers()?;
-                Ok(Stmt::Begin)
+                let characteristics = self.transaction_modifiers(true)?;
+                Ok(Stmt::Begin(characteristics))
             }
             Tok::Ident("start") => {
                 self.advance()?;
                 self.expect_ident("transaction")?;
-                self.skip_transaction_modifiers()?;
-                Ok(Stmt::Begin)
+                let characteristics = self.transaction_modifiers(false)?;
+                Ok(Stmt::Begin(characteristics))
             }
             Tok::Ident("commit") | Tok::Ident("end") => {
                 self.advance()?;
@@ -3036,13 +3036,15 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    fn skip_transaction_modifiers(&mut self) -> Result<(), ParseError> {
-        // BEGIN [WORK | TRANSACTION] [ISOLATION LEVEL ...] — accepted, the
-        // engine provides its one isolation level regardless.
+    fn transaction_modifiers(&mut self, allow_work: bool) -> Result<&'a str, ParseError> {
+        if allow_work && !self.eat_ident("work")? {
+            let _ = self.eat_ident("transaction")?;
+        }
+        let start = self.peek_at;
         while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             self.advance()?;
         }
-        Ok(())
+        Ok(self.text[start..self.peek_at].trim())
     }
 
     // --- token helpers ---
@@ -3597,7 +3599,7 @@ mod tests {
             assert!(matches!(expression, Expr::Cast { type_name: "bigint", .. }));
             let SelectItem::Expr { expression, .. } = s.items[2] else { panic!() };
             assert!(matches!(expression, Expr::IsNull { negated: true, .. }));
-            assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Begin));
+            assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Begin("")));
             assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
             assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));
         });

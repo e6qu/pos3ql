@@ -498,7 +498,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_matviews") => pg_matviews(storage, arena),
+        (false, "pg_matviews") => pg_matviews(storage, txid, arena),
         (false, "pg_sequences") => pg_sequences(storage, arena),
         (false, "pg_sequence") => pg_sequence(storage, arena),
         (false, "pg_database") => finish(
@@ -534,9 +534,7 @@ pub fn synthesize<'a>(
             )?],
             arena,
         ),
-        (false, "pg_views") => {
-            empty_like(name, storage, arena)
-        }
+        (false, "pg_views") => pg_views(storage, txid, arena),
         (true, "tables") => info_tables(storage, txid, arena),
         (true, "columns") => info_columns(storage, txid, arena),
         (true, "schemata") => info_schemata(storage, arena),
@@ -2724,22 +2722,71 @@ fn pg_tables<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn pg_matviews<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_views<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_views",
+        &[
+            ("schemaname", ColType::Name),
+            ("viewname", ColType::Name),
+            ("viewowner", ColType::Name),
+            ("definition", ColType::Text),
+        ],
+    );
+    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let mut n = 0;
+    for slot in 0..storage.view_count() {
+        let view = storage.view(slot);
+        if !view.visible_to(txid) || n == out.len() {
+            continue;
+        }
+        out[n] = row(
+            &[
+                text(view.schema.as_str(), arena)?,
+                text(view.name.as_str(), arena)?,
+                text(
+                    arena
+                        .alloc_str(
+                            crate::sql::eval::funcs::system::session_user_owned().as_str(),
+                        )
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
+                text(view.sql.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &out[..n], arena)
+}
+
+fn pg_matviews<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_matviews",
         &[
-            ("schemaname", ColType::Text),
-            ("matviewname", ColType::Text),
-            ("matviewowner", ColType::Text),
+            ("schemaname", ColType::Name),
+            ("matviewname", ColType::Name),
+            ("matviewowner", ColType::Name),
+            ("tablespace", ColType::Name),
+            ("hasindexes", ColType::Bool),
             ("ispopulated", ColType::Bool),
             ("definition", ColType::Text),
         ],
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for mv in storage.live_matviews() {
-        if n == out.len() {
-            break;
+    for slot in 0..storage.matview_count() {
+        let mv = storage.matview(slot);
+        if !mv.visible_to(txid) || n == out.len() {
+            continue;
         }
         out[n] = row(
             &[
@@ -2763,6 +2810,8 @@ fn pg_matviews<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
+                Datum::Null,
+                Datum::Bool(false),
                 Datum::Bool(mv.populated),
                 text(
                     arena
@@ -3023,16 +3072,6 @@ fn info_schemata<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
     )?;
     n += 1;
     finish(def, &out[..n], arena)
-}
-
-fn empty_like<'a>(
-    name: &str,
-    _storage: &Storage,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    // A single-column empty relation is enough for existence probes.
-    let def = def_of(name, &[("oid", ColType::Int4)]);
-    finish(def, &[], arena)
 }
 
 fn arena_full() -> SqlError {

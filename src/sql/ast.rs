@@ -34,7 +34,9 @@ pub enum Stmt<'a> {
     Update(Update<'a>),
     Delete(Delete<'a>),
     Merge(Merge<'a>),
-    Begin,
+    /// BEGIN / START TRANSACTION plus the retained transaction
+    /// characteristics (empty when none were written).
+    Begin(&'a str),
     Commit,
     Rollback,
     /// SAVEPOINT name.
@@ -51,7 +53,7 @@ pub enum Stmt<'a> {
     /// stored and re-expanded as a derived table at query time.
     CreateView { name: QualName<'a>, or_replace: bool, sql: &'a str },
     /// DROP VIEW [IF EXISTS] name.
-    DropView { names: &'a [QualName<'a>], if_exists: bool },
+    DropView { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
     /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
     /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
     /// SELECT text, run once to populate the new (backing) table; `columns`
@@ -67,7 +69,7 @@ pub enum Stmt<'a> {
     /// REFRESH MATERIALIZED VIEW name — re-run the stored query, replacing rows.
     RefreshMaterializedView { name: QualName<'a> },
     /// DROP MATERIALIZED VIEW [IF EXISTS] name.
-    DropMaterializedView { names: &'a [QualName<'a>], if_exists: bool },
+    DropMaterializedView { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
     /// CREATE SEQUENCE [IF NOT EXISTS] name [options].
     CreateSequence {
         name: QualName<'a>,
@@ -81,7 +83,7 @@ pub enum Stmt<'a> {
         options: SeqOptions<'a>,
     },
     /// DROP SEQUENCE [IF EXISTS] name [, ...].
-    DropSequence { names: &'a [QualName<'a>], if_exists: bool },
+    DropSequence { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
     /// CREATE DOMAIN name [AS] basetype [ constraint ... ].
     CreateDomain(CreateDomain<'a>),
     /// ALTER DOMAIN name <action>.
@@ -681,6 +683,7 @@ pub enum FkAction {
 pub struct DropTable<'a> {
     pub names: &'a [QualName<'a>],
     pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

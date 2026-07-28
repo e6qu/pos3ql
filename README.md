@@ -1,8 +1,9 @@
 # pos3ql
 
-A PostgreSQL-compatible database engine whose durable storage is S3-compatible
-object storage (AWS S3, MinIO, or any endpoint speaking the S3 API), written
-in Rust with TigerBeetle-style engineering discipline.
+A PostgreSQL-compatible database engine whose durable storage is a
+provider-neutral object store (AWS S3, MinIO, Google Cloud Storage, Azure Blob
+Storage, or an equivalent adapter), written in Rust with TigerBeetle-style
+engineering discipline.
 
 ## Design pillars
 
@@ -11,13 +12,19 @@ in Rust with TigerBeetle-style engineering discipline.
   psql, JDBC, npgsql, psycopg, node-postgres, etc. work — including the
   introspection queries drivers issue on connect.
 - **Object storage is the durable home.** Content-addressed, checksummed
-  block SSTs, WAL segments, and the CAS'd manifest live in an S3-compatible
-  bucket, and a node can cold-start from an empty disk. Reads go **RAM block
+  block SSTs, WAL segments, and the CAS'd manifest live behind one semantic
+  object-store contract, and a node can cold-start from an empty disk. The
+  current transport speaks the S3 API; native adapters or compatibility
+  gateways provide the same immutable-object, range-read, listing, deletion,
+  and conditional-root semantics for other providers without storage-engine
+  special cases. Reads go **RAM block
   cache → local disk cache → ranged GET** (`block_cache_bytes` /
   `disk_cache_bytes`), and under memory pressure committed row bytes spill to
   the bucket and page back through the caches, so ingest is not bounded by
-  RAM *bytes*. The remaining RAM bound is the per-row index (row *count*),
-  and commit durability is still the local WAL first — closing both is the
+  RAM *bytes*. With object storage enabled, synchronous WAL upload is the
+  default, so acknowledged data is already in the durable tier and local disk
+  is disposable. The remaining architectural bound is the in-RAM per-row
+  index (row *count*), whose object-resident replacement is tracked in the
   *Maturity roadmap* in [PLAN.md](PLAN.md).
 - **Static allocation.** All memory is acquired at startup, sized from
   config. No heap allocation after init — enforced by a guarding global

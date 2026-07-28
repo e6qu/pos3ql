@@ -42,11 +42,23 @@ mod scope;
 pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
+mod dependencies;
 use cte::expand_set_tree_exec;
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
 };
+pub(crate) use cte::expand_stored_query;
+
+pub fn stored_query_dependencies(
+    sql: &str,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &Arena,
+) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
+    dependencies::collect(sql, storage, txid, path, arena)
+}
 
 mod aggregate;
 use aggregate::{AggState, fold_aggregates};
@@ -733,6 +745,14 @@ pub fn resolve_view_for_dml<'a>(
         )
     };
     let sel = super::parser::parse_view_select(sql, arena)?;
+    let sel = expand_stored_query(
+        sel,
+        storage,
+        txid,
+        view_path,
+        storage.view_dependencies(view_slot),
+        arena,
+    )?;
     if sel.distinct
         || !sel.group_by.is_empty()
         || sel.having.is_some()
@@ -851,6 +871,20 @@ pub fn describe_query_under<'a>(
 ) -> Result<usize, SqlError> {
     let select = super::parser::parse_query(sql, arena)?;
     let select = expand_ctes_under(select, storage, txid, path, arena)?;
+    describe_select(select, storage, txid, arena, out)
+}
+
+pub fn describe_stored_query<'a>(
+    sql: &'a str,
+    storage: &'a Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    let select = super::parser::parse_query(sql, arena)?;
+    let select = expand_stored_query(select, storage, txid, path, dependencies, arena)?;
     describe_select(select, storage, txid, arena, out)
 }
 

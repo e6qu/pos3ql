@@ -831,7 +831,7 @@ fn attach_fkey(
                 ),
             });
         };
-        storage.table(pi).def
+        *storage.table_def(pi, txid)
     };
 
     // Referenced columns default to the parent's primary key.

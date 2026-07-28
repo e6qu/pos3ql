@@ -90,7 +90,7 @@ pub struct TxnState {
 #[derive(Debug, Clone, Copy)]
 #[allow(
     clippy::large_enum_variant,
-    reason = "FkDropped and CommentSet carry their payloads inline (no heap after startup); the undo list is a small fixed pool"
+    reason = "CommentSet carries its payload inline (no heap after startup); the undo list is a small fixed pool"
 )]
 pub enum DdlUndo {
     /// CREATE TABLE at this slot — undo by dropping it.
@@ -98,6 +98,9 @@ pub enum DdlUndo {
     /// DROP TABLE at this slot (rows retained until commit) — undo by
     /// reviving it (and its indexes).
     Dropped(u32),
+    /// ALTER TABLE appended one pending table-definition version. Row-image
+    /// undo is carried by the ordinary touched-row log.
+    TableAltered(u32),
     /// CREATE VIEW at this slot — undo by dropping it.
     ViewCreated(u32),
     /// DROP VIEW at this slot (or the superseded view of an OR REPLACE) —
@@ -168,9 +171,6 @@ pub enum DdlUndo {
     SchemaCreated(u32),
     /// DROP SCHEMA at this slot — undo by reviving it.
     SchemaDropped(u32),
-    /// DROP SCHEMA CASCADE severed an inbound foreign key on a surviving
-    /// table — undo by restoring it.
-    FkDropped { table: u32, fk: crate::storage::ForeignKey },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
     /// promoted and journaled.
@@ -178,7 +178,7 @@ pub enum DdlUndo {
 }
 
 /// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and
-/// severed inbound foreign key takes one undo entry.
+/// transaction-versioned inbound foreign key takes one undo entry.
 pub const MAX_TXN_DDL: usize = 64;
 
 impl TxnState {

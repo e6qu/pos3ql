@@ -128,7 +128,7 @@ pub struct Engine {
     /// sorting SST entries at checkpoint.
     scratch: FixedVec<(u64, RowHome)>,
     /// Scratch for heap compaction: every live row image across tables.
-    compact_scratch: FixedVec<(u32, u64, bool, RowLoc)>,
+    compact_scratch: FixedVec<(u32, u64, u8, RowLoc)>,
     /// Shared execution arena: one query's materialized rows (ORDER BY /
     /// DISTINCT / GROUP BY buffers) live here, separate from the small
     /// per-connection AST arena. Single-threaded execution means one
@@ -160,7 +160,10 @@ impl Engine {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
             + config.table_rows * size_of::<(u64, RowHome)>()
-            + 2 * config.max_tables * config.table_rows * size_of::<(u32, u64, bool, RowLoc)>()
+            + (1 + crate::storage::MAX_PENDING_ROW_VERSIONS)
+                * config.max_tables
+                * config.table_rows
+                * size_of::<(u32, u64, u8, RowLoc)>()
             + config.work_arena_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + if config.s3_on {
@@ -236,7 +239,9 @@ impl Engine {
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
-                2 * config.max_tables * config.table_rows,
+                (1 + crate::storage::MAX_PENDING_ROW_VERSIONS)
+                    * config.max_tables
+                    * config.table_rows,
             )?,
             work: Arena::new(budget, "work_arena", config.work_arena_bytes)?,
             next_txid: 0,
@@ -294,13 +299,16 @@ impl Engine {
             let Some(state) = self.storage.row_state(table as usize, rowid)? else {
                 continue;
             };
-            let Some(p) = state.pending else { continue };
+            let Some(p) = state.pending.last() else {
+                continue;
+            };
             let t = self.storage.table(table as usize);
-            if p.txid != txn.txid {
+            if p.txid != txn.txid || !t.visible_to(txn.txid) {
                 continue;
             }
-            let name = t.def.name;
-            let schema = t.def.schema;
+            let def = self.storage.table_def(table as usize, txn.txid);
+            let name = def.name;
+            let schema = def.schema;
             let lsn = self.storage.lsn() + 1;
             let appended = match p.loc {
                 Some(loc) => self.wal.append(
@@ -334,10 +342,11 @@ impl Engine {
             if !self.storage.table(i).serial_dirty || !self.storage.table(i).live {
                 continue;
             }
-            let name = self.storage.table(i).def.name;
-            let schema = self.storage.table(i).def.schema;
-            for c in 0..self.storage.table(i).def.n_columns {
-                if !self.storage.table(i).def.columns()[c].auto_increment {
+            let def = *self.storage.table_def(i, txn.txid);
+            let name = def.name;
+            let schema = def.schema;
+            for c in 0..def.n_columns {
+                if !def.columns()[c].auto_increment {
                     continue;
                 }
                 let last = self.storage.table(i).serial_last[c];
@@ -418,8 +427,33 @@ impl Engine {
         } else {
             Ok(())
         };
+        let mut altered_tables = [(usize::MAX, false); txn::MAX_TXN_DDL];
+        let mut altered_count = 0usize;
+        for undo in txn.ddl() {
+            let DdlUndo::TableAltered(slot) = *undo else {
+                continue;
+            };
+            let slot = slot as usize;
+            if altered_tables[..altered_count]
+                .iter()
+                .any(|&(existing, _)| existing == slot)
+            {
+                continue;
+            }
+            let rewrote_rows = self.storage.commit_table_def(slot, txn.txid);
+            altered_tables[altered_count] = (slot, rewrote_rows);
+            altered_count += 1;
+        }
         for &(table, rowid, _) in txn.touched() {
-            self.storage.commit_row(table as usize, rowid, txn.txid);
+            let table = table as usize;
+            if altered_tables[..altered_count]
+                .iter()
+                .any(|&(altered, _)| altered == table)
+            {
+                self.storage.commit_rewritten_row(table, rowid, txn.txid);
+            } else {
+                self.storage.commit_row(table, rowid, txn.txid);
+            }
         }
         for undo in txn.ddl() {
             match undo {
@@ -434,6 +468,7 @@ impl Engine {
                     self.storage
                         .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
+                DdlUndo::TableAltered(_) => {}
                 DdlUndo::ViewCreated(slot) => self.storage.commit_view_create(*slot as usize),
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
                 DdlUndo::MatviewCreated(slot) => self.storage.commit_matview_create(*slot as usize),
@@ -459,13 +494,21 @@ impl Engine {
                 DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => self.storage.commit_schema_create(*slot as usize),
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
-                // The removal already happened in place; committing keeps it.
-                DdlUndo::FkDropped { .. } => {}
                 // Promote the uncommitted comment overlay to committed; its WAL
                 // record was journaled at exec time (like other DDL).
                 DdlUndo::CommentSet { slot, .. } => {
                     self.storage.commit_comment(*slot as usize, txn.txid);
                 }
+            }
+        }
+        let mut index_result = Ok(());
+        for &(table, rewrote_rows) in &altered_tables[..altered_count] {
+            self.storage.finish_table_def_commit(table, rewrote_rows);
+            if self.storage.table(table).live
+                && let Err(error) = self.storage.refresh_enforcers(table)
+            {
+                index_result = Err(error);
+                break;
             }
         }
         // Past the durability point, so these fire iff the transaction really
@@ -476,7 +519,7 @@ impl Engine {
         let notify_result = self.flush_committed_notifications(txn);
         guc.commit_transaction();
         txn.clear();
-        notify_result.and(upload_result)
+        notify_result.and(index_result).and(upload_result)
     }
 
     /// Applies a committing transaction's buffered LISTEN/UNLISTEN to the shared
@@ -513,6 +556,9 @@ impl Engine {
                     self.storage
                         .rollback_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
+                DdlUndo::TableAltered(slot) => {
+                    self.storage.rollback_table_def(slot as usize, txn.txid);
+                }
                 DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
                 DdlUndo::ViewDropped(slot) => {
                     self.storage.rollback_view_drop(slot as usize, txn.txid)
@@ -582,9 +628,6 @@ impl Engine {
                 }
                 DdlUndo::SchemaDropped(slot) => {
                     self.storage.rollback_schema_drop(slot as usize)
-                }
-                DdlUndo::FkDropped { table, fk } => {
-                    self.storage.restore_fk(table as usize, fk)
                 }
                 DdlUndo::CommentSet { slot, prior } => {
                     self.storage.restore_comment_pending(slot as usize, prior)
@@ -621,6 +664,9 @@ impl Engine {
                     self.storage
                         .rollback_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
+                DdlUndo::TableAltered(slot) => {
+                    self.storage.rollback_table_def(slot as usize, txn.txid);
+                }
                 DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
                 DdlUndo::ViewDropped(slot) => {
                     self.storage.rollback_view_drop(slot as usize, txn.txid)
@@ -690,9 +736,6 @@ impl Engine {
                 }
                 DdlUndo::SchemaDropped(slot) => {
                     self.storage.rollback_schema_drop(slot as usize)
-                }
-                DdlUndo::FkDropped { table, fk } => {
-                    self.storage.restore_fk(table as usize, fk)
                 }
                 DdlUndo::CommentSet { slot, prior } => {
                     self.storage.restore_comment_pending(slot as usize, prior)
@@ -1162,7 +1205,7 @@ impl Engine {
             Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
             _ => return None,
         };
-        let def = &self.storage.table(slot).def;
+        let def = self.storage.table_def(slot, txid);
         let index = def.column_index(col)?;
         Some(def.columns()[index].ctype.oid())
     }
@@ -1190,7 +1233,7 @@ impl Engine {
                     Some(crate::storage::ResolvedRelation::Table(slot)) => Some(slot),
                     _ => None,
                 };
-                let def = slot.map(|s| &self.storage.table(s).def);
+                let def = slot.map(|s| self.storage.table_def(s, txid));
                 for row in ins.rows {
                     for (i, value) in row.iter().enumerate() {
                         let ty = def.and_then(|d| {
@@ -1354,7 +1397,7 @@ impl Engine {
                 return Ok(false);
             }
         };
-        let definition = self.storage.table(table_index).def;
+        let definition = *self.storage.table_def(table_index, txn.txid);
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match query::describe_catalog_items(
             returning,
@@ -1557,7 +1600,7 @@ impl Engine {
                 };
             let idx =
                 crate::sql::exec::resolve_dml_table(&self.storage, &described_target, txn.txid)?;
-            let def = self.storage.table(idx).def;
+            let def = *self.storage.table_def(idx, txn.txid);
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
             let ncols = query::describe_catalog_items(
                 returning,
@@ -2116,10 +2159,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.scratch,
                 names,
                 *if_exists,
                 *cascade,
                 &self.work,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::CreateEnum { name, labels } => exec::create_enum(
@@ -2147,10 +2192,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.scratch,
                 names,
                 *if_exists,
                 *cascade,
                 &self.work,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
@@ -2233,9 +2280,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.scratch,
                 names,
                 *if_exists,
                 *cascade,
+                arena,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::AlterOwner {
@@ -2658,53 +2708,16 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::AlterTable(a) => {
-                if txn.is_explicit() {
-                    return Ok(Err(SqlError {
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                        message: stack_format!(
-                            192,
-                            "ALTER TABLE cannot run inside a transaction block yet"
-                        ),
-                    }));
-                }
-                // ALTER acts as an autocommit barrier: prior implicit work
-                // commits, the rewrite runs and commits by itself.
-                if let Err(e) = self.commit_txn(txn, guc) {
-                    return Ok(Err(e));
-                }
-                // Freeze this statement's clock before anything anchors a
-                // transaction to it.
-                datetime::begin_statement();
-                self.ensure_txn(txn, TxnMode::Implicit, guc);
-                let out = exec::alter_table(
+                exec::alter_table(
                     &mut self.storage,
                     &mut self.wal,
+                    txn,
                     &mut self.scratch,
                     a,
                     arena,
                     guc.seq_session(),
                     responder,
-                )?;
-                match out {
-                    Ok(()) => {
-                        if let Err(e) = self.commit_txn(txn, guc) {
-                            return Ok(Err(e));
-                        }
-                        // Freeze this statement's clock before anything anchors a
-                        // transaction to it.
-                        datetime::begin_statement();
-                        self.ensure_txn(txn, TxnMode::Implicit, guc);
-                        Ok(Ok(()))
-                    }
-                    Err(e) => {
-                        self.rollback_txn(txn, guc);
-                        // Freeze this statement's clock before anything anchors a
-                        // transaction to it.
-                        datetime::begin_statement();
-                        self.ensure_txn(txn, TxnMode::Implicit, guc);
-                        Ok(Err(e))
-                    }
-                }
+                )
             }
             Stmt::Prepare { name, sql, param_types } => {
                 // Resolve declared parameter types up front; an unknown type is

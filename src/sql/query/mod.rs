@@ -149,17 +149,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         col: usize,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::index_def_text(self.storage, oid, col, arena)
+        super::catalog::index_def_text(self.storage, self.txid, oid, col, arena)
     }
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::constraint_def_text(self.storage, oid, arena)
+        super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
     }
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::relname_text(self.storage, oid, arena)
+        super::catalog::relname_text(self.storage, self.txid, oid, arena)
     }
 
     fn reloid(&self, name: &str) -> Option<i32> {
-        super::catalog::reloid_of_name(self.storage, name)
+        super::catalog::reloid_of_name(self.storage, self.txid, name)
     }
 
     fn comment<'a>(
@@ -755,7 +755,7 @@ pub fn resolve_view_for_dml<'a>(
     ) else {
         return Err(not_updatable());
     };
-    let base_def = &storage.table(ti).def;
+    let base_def = storage.table_def(ti, txid);
     let base = QualName {
         schema: Some(arena.alloc_str(base_def.schema.as_str()).map_err(|_| arena_full())?),
         name: arena.alloc_str(base_def.name.as_str()).map_err(|_| arena_full())?,
@@ -765,7 +765,7 @@ pub fn resolve_view_for_dml<'a>(
     for it in sel.items {
         match it {
             SelectItem::Wildcard => {
-                for c in storage.table(ti).def.columns() {
+                for c in base_def.columns() {
                     if n == MAX_PROJ {
                         return Err(not_updatable());
                     }

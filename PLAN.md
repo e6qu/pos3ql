@@ -14,6 +14,16 @@ the wire level (simple and extended query protocol, newest protocol version
 conformance suite (`tests/external/run.sh`) against psql 18.4, psycopg 3, and
 the latest MinIO.
 
+Storage end state: **the durable database lives in object storage**. The
+storage engine depends on one small, provider-neutral object-store contract
+rather than naming or branching on AWS, MinIO, Google Cloud Storage, Azure
+Blob Storage, or any other provider. Provider protocol/authentication adapters
+must implement that contract below the storage engine; checkpointing, WAL,
+compaction, recovery, and query execution must contain no provider-specific
+paths. RAM is the first cache and local disk is the second cache. Both are
+bounded, rebuildable, and disposable: losing either or both must lose no
+acknowledged data in durable mode.
+
 ## Phases
 
 | # | Phase | Milestone | Status |
@@ -55,7 +65,7 @@ psycopg driver suite, the one harness that can see the wire. And the
 coverage-guided function sweep is now a corpus: every dispatch-table function
 no prior corpus called, one canonical call each — its first run found four
 divergences (B-148), all fixed. B-138 is then fixed in the next batch alongside `substring(x SIMILAR p ESCAPE e)` (B-133), which turned out to be a parser gap alone — the extraction already existed under SQL:1999's `FROM p FOR e` spelling, so the two syntaxes now reach one implementation. `json` is then refused as a DISTINCT, GROUP BY or ORDER BY key (B-112), at one site rather than the three the entry expected. Two entries were re-examined against the server and found wider than recorded — range bound quoting is missing on input as well as output, so a range literal copied from PostgreSQL does not load (B-115), and `char(n)`'s padding lives in the value, making `length` and equality wrong rather than only a cast (B-116) — and the second turned up a third: `format_type` ignored its modifier argument, so every column read back as an unconstrained type (B-139) — the entry that recorded it blamed the catalog, which turned out to report `atttypmod` correctly, so checking the claim first is what kept a wide `ColDesc` change from being built on a false premise. Fixing it exposed B-140: the temporal types encode that modifier with a 4-byte header PostgreSQL does not use. B-116 then closes structurally: a `Datum::Bpchar` variant carries the padded text, so PostgreSQL's split falls out of the type — output functions, `LIKE`/regex and `octet_length` see the raw padded value while casts, comparisons and text-taking functions see it stripped — with the storage format unchanged and the behavior pinned by corpus `32_bpchar` (112 divergent lines against its parent commit) and psycopg text+binary wire assertions; bare `char` now means char(1), `character varying` parses, over-length all-space excess truncates silently on the column write path, and DISTINCT/GROUP BY dedup bpchar keys by stripped text. The grouping cluster follows: grouping keys now match by resolved column identity (`a` and `t.a` are one key; stars expand into grouped selects; the 42803 rule reaches HAVING and ORDER BY), aggregates in ORDER BY fold with the group (B-122, B-123), the DDL precision-clamp warning is duplicated as PostgreSQL duplicates it (B-093), `::regtype` resolves names and OIDs to canonical SQL type names (B-146), and the `name` type exists (`ColType::Name`, OID 19, 63-byte truncation, identifier functions infer it; B-103) — with `pg_typeof` preferring the static type whenever it is consistent with the runtime value. B-124 (grouping-set tie order) is re-recorded as unmatchable by design: PostgreSQL's order is hash-table emission under an unstable sort. The sqlstate gate was found blind to rustfmt's multi-line `sql_err!` layout — 56 raw codes had slipped through; all are constants now and the gate catches the bare-code-on-its-own-line form (proven on a plant). The types cluster completes with `Datum::Int2` (B-126: smallint is a real runtime type — narrow arithmetic with its own 22003 bounds, honest OID 21 / 2-byte binary wire, silent-truncating shifts, 42725 for the genuinely ambiguous int2 overloads, and the unary-minus-vs-cast precedence fix `-32768::int2` exposed) and eleven new array element types (B-108: int2/time/timetz/interval/uuid/bytea/json/jsonb/varchar/bpchar/name — `array_agg` reports the static element type, and the two duplicated per-element name tables collapse into one). TRUNCATE lands with the durability it was blocked on (B-098): serial columns are real sequences (`Table.serial_last` — advanced only by default assignment, never rewound, rollback-surviving), journaled as absolute-position WAL records, checkpointed as additive manifest lines, floored against stored rows at startup; TRUNCATE removes rows transactionally, closes over foreign keys (0A000 / CASCADE with NOTICEs), and RESTART IDENTITY resets sequences through the DDL-undo machinery. Sequence survival across kill -9 with an empty table is a run.sh assertion.| in progress |
-| P15 | Differential CI at scale | Wire the existing differential + fuzz machinery into CI as its own workflow (`differential.yml` → `tests/external/ci_diff.sh`): a real PostgreSQL 18 service (C collation, **UTF8** encoding to match pos3ql and vanilla PG) is the oracle; the suite replays the vendored sqllogictest corpus and the generative fuzzer against both engines and diffs rows + SQLSTATEs. Hardened so a pathological query can never wedge CI: **predicate pushdown** removes the O(Nᵏ) multi-way-equi-join blowup that hung the run for 45+ min (B-037, `select5` now seconds, divergence 0), a per-statement `statement_timeout` guard is set where the engine honors it (B-038), and the job carries a hard `timeout-minutes` ceiling. The comparator decodes text-returned-as-bytes losslessly, and both sessions pin `TimeZone='UTC'`, so neither a server-encoding nor a host-timezone quirk can masquerade as a data divergence. The sqllogictest replay and generative fuzzer each run against a freshly-restarted pos3ql: the curated corpora leave catalog objects alive, while a sqllogictest file consumes all 64 configured table and value-index slots, so phase isolation is required for the bounded catalog rather than treating the resulting setup failures as unsupported. Fuzz failures remain loud, and its error-timing/semantic divergences were driven to **zero** (B-039 → B-065: projection postponement, qual-ordering and plan-time-simplification fidelity, correctly-rounded numeric→float8, float8 to_char) — `FUZZ_BUDGET=0`, 9 seeds all clean. CI is deduplicated (one run per ref) and caches the Rust build. | **done** |
+| P15 | Differential CI at scale | Wire the existing differential + fuzz machinery into CI as its own workflow (`differential.yml` → `tests/external/ci_diff.sh`): a real PostgreSQL 18 service (C collation, **UTF8** encoding to match pos3ql and vanilla PG) is the oracle; the suite replays the vendored sqllogictest corpus and the generative fuzzer against both engines and diffs rows + SQLSTATEs. Hardened so a pathological query can never wedge CI: **predicate pushdown** removes the O(Nᵏ) multi-way-equi-join blowup that hung the run for 45+ min (B-037, `select5` now seconds, divergence 0); the cross-join order uses predicate-shape selectivity so an equality-connected component is established before independent broad filters multiply it (B-214); a per-statement `statement_timeout` guard is set where the engine honors it (B-038); and the job carries a hard `timeout-minutes` ceiling. The comparator decodes text-returned-as-bytes losslessly, and both sessions pin `TimeZone='UTC'`, so neither a server-encoding nor a host-timezone quirk can masquerade as a data divergence. The sqllogictest replay and generative fuzzer each run against a freshly-restarted pos3ql: the curated corpora leave catalog objects alive, while a sqllogictest file consumes all 64 configured table and value-index slots, so phase isolation is required for the bounded catalog rather than treating the resulting setup failures as unsupported. Fuzz failures remain loud, and its error-timing/semantic divergences were driven to **zero** (B-039 → B-065: projection postponement, qual-ordering and plan-time-simplification fidelity, correctly-rounded numeric→float8, float8 to_char) — `FUZZ_BUDGET=0`, 9 seeds all clean. CI is deduplicated (one run per ref) and caches the Rust build. | **done** |
 
 Phase discipline: fine-grained commit per task; PLAN.md and BUGS.md updated in
 the same commit series as the phase they describe; no phase numbers or bug IDs
@@ -469,17 +479,20 @@ counts, noted for the day manifests are large.
 ### Stage F — MVCC snapshot reads over object-resident data
 
 Preserve snapshot isolation once the working set spills to the bucket. **This is more
-than "wire the existing snapshots to the LSM."** Today MVCC is **txid-based,
-single-writer, two-version** — each row is `RowState { committed, pending }`, at most
-one committed image plus one uncommitted pending change, visibility by `transaction_id`
-(not LSN), with a second concurrent writer failing fast (`40001`); `lsn` is only a
-write-sequence / WAL position (`storage/mod.rs`). A long-running reader therefore has
-**no historical version to see**, and Stage E's compaction would drop the only version
-it still needs. So Stage F grows a **prerequisite**: genuine **multi-version rows keyed
-by a commit LSN** (append versions instead of repoint-in-place; a read at snapshot `S`
-sees the newest version with `commit_lsn ≤ S`), and compaction must **retain any
-version still visible to the oldest live snapshot** (RocksDB sequence numbers /
-TigerBeetle per-op timestamps are the model). Then a read merges live + frozen memtable
+than "wire the existing snapshots to the LSM."** Today committed MVCC is
+**txid-based, single-writer, one-version**: each row has one committed image plus a
+bounded chain of uncommitted command versions owned by one transaction, visibility
+uses transaction/command IDs (not LSN), and a second concurrent writer fails fast
+(`40001`). The pending chain gives data-modifying CTEs and transactional table-layout
+rewrites exact statement/savepoint semantics, but it is not a historical committed
+snapshot. `lsn` remains only a write-sequence / WAL position (`storage/mod.rs`). A
+long-running reader therefore has **no historical committed version to see**, and
+Stage E's compaction would drop the only version it still needs. So Stage F grows a
+**prerequisite**: genuine **multi-version rows keyed by a commit LSN** (append versions
+instead of repoint-in-place; a read at snapshot `S` sees the newest version with
+`commit_lsn ≤ S`), and compaction must **retain any version still visible to the oldest
+live snapshot** (RocksDB sequence numbers / TigerBeetle per-op timestamps are the
+model). Then a read merges live + frozen memtable
 + level SSTs through a snapshot-aware merge iterator (point via bloom+index, scans via
 streamed blocks with bounded read-ahead), and the executor's scan path
 (`sql/query.rs`) is wired to it transparently. **Milestone:** concurrent sessions show
@@ -496,6 +509,16 @@ of content-addressed blocks written during the run. What remains of Stage F is
 the real multi-session prerequisite: LSN-keyed row versions and the
 snapshot-aware merge read.
 
+**Status (2026-07-28): the transactional versioning foundation landed.**
+Rows retain up to eight command-ID-keyed pending images, and table definitions
+retain up to eight transaction-owned shape/layout versions in a
+startup-budgeted slab. ALTER TABLE transforms rows without hiding the committed
+shape from other sessions, and commit/rollback/savepoints publish or discard
+definition plus row layout atomically. This closes data-modifying-CTE command
+snapshots and pg_restore's explicit-transaction ALTER surface. It deliberately
+does not claim Stage F: the one committed image still needs to become an
+LSN-keyed history with an oldest-live-snapshot retention watermark.
+
 **Deferral, stated loudly (2026-07-24, maturity-roadmap step 3):** the
 LSN-keyed version model is deferred to land *with Stage I's suspendable row
 source*, not because it is hard but because until then it is unobservable:
@@ -509,20 +532,26 @@ read only immutable SSTs. The first construct that lets a reader suspend
 building the two together means the version format is designed against its
 real consumer.
 
-### Stage G — S3 client hardening & multi-provider reach
+### Stage G — object-store client hardening & multi-provider reach
 
-Make the client production-shaped and reach real clouds, not just MinIO. Loki abstracts
-every backend behind one `ObjectClient`; mirror that with a **provider trait** while
-keeping the hand-rolled, static-memory discipline: **TLS** — the one explicitly-deferred
-decision, resolved *here* (isolated `rustls` vs. terminating proxy); **multipart upload**
-for large SSTs; **streaming (non-buffer-bound) response reads** so a large-block GET is
-not capped by a fixed buffer (today's `ResponseTooLarge`); chunked-transfer decoding
-(today a hard `Protocol` error); and **provider quirks** behind the trait — GCS
-(resumable, XML/JSON auth), Azure Blob (shared-key/SAS signing). **Milestone:** the full
-flush/compaction/cold-start pipeline runs against real AWS S3 and GCS over HTTPS —
-extend `tests/minio_it.rs` into a provider matrix. **Risk:** TLS is the single
-dependency-policy exception; keep it isolated behind the trait so the core stays
-`libc`-only.
+Make the client production-shaped and reach real clouds, not just MinIO. The
+core boundary is a minimal **provider-neutral object-store contract**:
+immutable PUT, whole/ranged GET, LIST, DELETE, and conditional compare-and-swap
+of the manifest/root pointer. Checkpointing, WAL, compaction, recovery, and the
+cache hierarchy depend only on those semantics. S3, MinIO, Google Cloud
+Storage, Azure Blob Storage, and future equivalents are selected by
+configuration and implemented below that boundary; provider-specific signing,
+authentication, and transport details must never leak into storage logic.
+Keep the hand-rolled, static-memory discipline: **TLS** — the one
+explicitly-deferred decision, resolved *here* (isolated `rustls` vs.
+terminating proxy); **multipart upload** for large SSTs; **streaming
+(non-buffer-bound) response reads** so a large-block GET is not capped by a
+fixed buffer (today's `ResponseTooLarge`); and chunked-transfer decoding
+(today a hard `Protocol` error). **Milestone:** the full
+flush/compaction/cold-start pipeline runs through the same contract against
+MinIO and representative hosted object stores, with no provider branches above
+the adapter boundary. **Risk:** TLS is the single dependency-policy exception;
+keep it isolated below the contract so the core stays `libc`-only.
 
 **Status (2026-07-24): chunked decoding and streaming WAL-segment replay
 landed.** Chunked-transfer responses (hex-framed chunks with extensions and
@@ -548,16 +577,17 @@ HTTPS — commit, checkpoint, kill -9, wiped disk, cold start entirely over
 TLS. S3 I/O errors now carry the source error's words, so a certificate
 rejection names itself instead of flattening to `InvalidData`.
 
-**Scope decision (2026-07-24) — Stage G is done.** The provider trait, the
-GCS/Azure dialects, and the real-cloud test matrix are dropped, fixed with the
-project owner: **the S3 API is the object-storage interface, and the only
-one.** Object storage presents a uniform S3-like surface — AWS S3, MinIO, and
-every S3-compatible endpoint (GCS interop mode, Cloudflare R2, Ceph RGW, …)
-speak it — so per-provider special cases would be abstraction for its own
-sake, and cloud-hosted test runs add cost without adding a behavior MinIO
-cannot exercise. MinIO is the conformance target; any S3-compatible endpoint
-is reachable by configuration alone. Multipart upload stays deferred until a
-producer exists (no current object exceeds a single PUT).
+**Scope correction (2026-07-28) — transport hardening is done; the
+provider-neutral boundary remains required.** The existing S3-compatible
+client is the first adapter and MinIO remains the always-on conformance target,
+but the S3 wire API is not the storage engine's architectural interface.
+Hosted S3, MinIO, Google Cloud Storage, Azure Blob Storage, and equivalents
+must all satisfy the same object semantics without conditionals in WAL,
+checkpoint, LSM, cache, or query code. A native adapter or a separately
+deployed compatibility gateway may translate a provider's wire/auth protocol;
+that choice is below the contract and cannot change database behavior.
+Multipart upload stays demand-driven until an object producer exceeds a
+single PUT, but the contract must not preclude it.
 
 ### Stage H — deterministic storage simulation (VOPR for the whole stack)
 
@@ -793,7 +823,7 @@ step-wise **server-side cursors**, a **persisted/portable compiled-plan cache** 
 fleet, or a **JIT** to native for CPU-bound execution — none of which the
 storage-aware-planner + async-scheduler + push-based-pipeline approach needs.
 
-## Maturity roadmap — what remains, in order (2026-07-24)
+## Maturity roadmap — what remains, in order (2026-07-28)
 
 A full step-back audit against the founding goal — a mature,
 PostgreSQL-compatible engine whose *primary* storage is object storage, with
@@ -805,11 +835,15 @@ adaptive-execution capstone. This section is the plan of record for all of it.
 
 ### Decisions of record (fixed with the project owner)
 
-- **Object-storage interface: the S3 API, and only it.** AWS S3 and MinIO are
-  the targets. No provider trait, no per-cloud dialects, no cloud-hosted test
-  runs — object storage presents a uniform S3-like interface, MinIO is the
-  conformance target, and any S3-compatible endpoint is reachable by
-  configuration. (Closed Stage G above.)
+- **Object-storage interface: one provider-neutral semantic contract.** The
+  storage engine never branches on a provider. The existing S3-compatible
+  transport serves AWS S3, MinIO, and compatible endpoints; Google Cloud
+  Storage, Azure Blob Storage, and other providers enter through adapters or
+  gateways implementing the same immutable-object, range-read, listing,
+  deletion, and conditional-root semantics. MinIO is the always-on local
+  conformance target; hosted-provider tests verify adapters without creating
+  provider-specific database behavior. RAM and local disk are bounded,
+  disposable caches in front of this durable tier.
 - **"WAL-compatible" means the logical replication protocol.** Physical XLOG
   compatibility would require adopting PostgreSQL's heap page format wholesale
   — re-implementing PostgreSQL's storage engine and defeating the
@@ -831,12 +865,12 @@ adaptive-execution capstone. This section is the plan of record for all of it.
 
 ### The three structural gaps ("disk and RAM are mere caches")
 
-1. **Durability still lives on the local disk.** Commit durability today is
-   the local WAL (`F_FULLFSYNC`); segments upload to the bucket
-   *asynchronously* (`wal_upload_sync` is an opt-in). A machine lost between
-   commit and upload loses acknowledged transactions — the disk is the
-   durability tier, not a cache. Fix: the commit-durable-on-bucket mode above.
-   After it, wiping the disk at any instant loses nothing acknowledged.
+1. **Closed: acknowledged durability moved off local disk.** With object
+   storage enabled, commit-durable-on-bucket is the default: the acknowledged
+   WAL segment is present in the durable object tier before success is
+   reported. Wiping local disk at any instant therefore loses no acknowledged
+   transaction. Local-only mode remains an explicit operating mode, not the
+   target durable architecture.
 2. **RAM is still authoritative for the row map.** Only row *bytes* spill
    (Stage D); the rowid→state map, visibility, uniqueness checks, and every
    per-row bookkeeping entry live in RAM, bounded by `table_rows` — dataset
@@ -846,9 +880,11 @@ adaptive-execution capstone. This section is the plan of record for all of it.
    RAM holds only the memtable plus *cached* blocks. The deepest remaining
    storage change; co-designed with Stage F's LSN-keyed MVCC so the
    row-version format is designed once.
-3. **The checkpoint is synchronous.** Its S3 calls stall every connection in
-   the single-threaded loop. Fix: checkpoint I/O through the reactor — urgent
-   the moment gap 1 puts a PUT on the commit path.
+3. **Closed at the scheduling boundary: checkpoint work is sliced.** Automatic
+   checkpoints and compaction advance through bounded event-loop beats instead
+   of monopolizing a connection. Stage I's suspendable row source will extend
+   the same asynchronous scheduling model to cache misses and large object
+   reads.
 
 ### The compatibility wave (a fresh audit of what real deployments touch)
 
@@ -863,12 +899,12 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   schema/type/domain/table DDL, generated and owned identity sequences, COPY,
   `setval`, constraints/indexes, views and materialized views all restore and
   survive restart. Real pg_restore runs ownerful, with four parallel workers,
-  and replaces a populated database through `--clean --if-exists`. Its cleanup
+  and replaces a populated database through `--clean --if-exists`. It also
+  restores under `--single-transaction` and bounded `--transaction-size`,
+  exercising identity/constraint ALTER TABLE inside explicit transactions. Its cleanup
   surface includes `ALTER TABLE IF EXISTS ONLY`, typed `ALTER ... OWNER`, and a
   transactional DROP SCHEMA sweep of tables, views, materialized views,
-  sequences, domains and enums. `--single-transaction` remains loudly blocked
-  by the transactional table-shape boundary described in BUGS.md. The opposite
-  direction — taking a consistent pg_dump
+  sequences, domains and enums. The opposite direction — taking a consistent pg_dump
   *from* pos3ql and restoring it into PostgreSQL — still requires
   `REPEATABLE READ, READ ONLY` plus table locks. pos3ql rejects those unsupported
   transaction characteristics instead of silently claiming them; the real
@@ -1160,10 +1196,11 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   unchanged; a data-modifying WITH statement lowers it to the command id) so a
   CTE's own writes are invisible to its siblings and the main query. Verified
   byte-for-byte against PostgreSQL (expanded corpus `65_dml_cte`) and through
-  psycopg's Parse/Bind/Describe/Execute path. The DML-main implementation split
+  psycopg's Parse/Bind/Describe/Execute path. The bounded pending-version chain
+  also retains an earlier command's image when a later data-modifying CTE
+  rewrites the same row inside one explicit transaction. The DML-main implementation split
   catalog and arena lifetimes in the CTE substitution graph, so the rebuilt AST
-  releases its immutable catalog borrow before storage mutates; one remaining
-  explicit-transaction row-version limit is documented in BUGS.md (B-174).
+  releases its immutable catalog borrow before storage mutates.
 - **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
   informative once Stage I's cost model exists (the plan it prints should be
   the real one).
@@ -1597,14 +1634,22 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
    its ack-deferral plumbing belongs with the reactor's suspendable
    row-source work (Stage I pillar 2). Per-block beat pacing for a single
    huge table's slice remains Stage E's item in step 3.
+   **Provider-neutral follow-through still remains at this layer:** extract
+   the current S3-compatible client behind the semantic object-store contract,
+   keep it as the first adapter, and qualify native adapters or compatibility
+   gateways for GCS, Azure Blob Storage, and equivalents. No provider name,
+   signing rule, endpoint quirk, or retry dialect may cross into WAL,
+   checkpoint, compaction, recovery, cache, or query code.
 3. **Stage F MVCC + Stage E beat pacing** — LSN-keyed row versions,
    snapshot-aware merge reads, compaction retention above the oldest-snapshot
    watermark, merge work amortized across statements.
-   **Status (2026-07-24): beat pacing landed; the MVCC half is deferred to
-   ride with Stage I's suspendable row source** — see Stage E's status (the
+   **Status (2026-07-28): beat pacing and the transactional
+   command/definition-version foundation landed; committed-history MVCC rides
+   with Stage I's suspendable row source** — see Stage E's status (the
    merge is now a background job bounded to a few block transfers per beat)
-   and Stage F's stated deferral (no reader can observe a version history
-   until a reader can suspend; the two land together).
+   and Stage F's status. Pending versions solve statement snapshots,
+   transactional ALTER, and savepoints; they do not replace the LSN-keyed
+   committed history and retention watermark required by a suspendable reader.
 4. **The map spills (gap 2)** — block-resident row index; secondary indexes
    as the LSM forest; block compression and the multi-block index / sized
    filters (the remaining Stage C refinements) ride along since they touch

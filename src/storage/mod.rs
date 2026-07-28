@@ -469,14 +469,15 @@ pub struct RowLoc {
     pub len: u32,
 }
 
-/// A row's visibility state: the committed image plus at most one
-/// uncommitted change owned by a single transaction (single-threaded
-/// execution means at most one writer holds a row at a time; a second
-/// writer fails fast instead of blocking).
+/// A row's visibility state: the committed image plus a bounded chain of
+/// uncommitted command versions owned by one transaction. Keeping each
+/// command's image is what lets a statement-level snapshot look past a later
+/// write to the image produced by an earlier command in the same transaction.
+/// A second transaction still fails fast instead of blocking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowState {
     pub committed: Option<RowHome>,
-    pub pending: Option<PendingChange>,
+    pub pending: PendingVersions,
 }
 
 /// Where a committed row's bytes live: the RAM heap, or spilled to the
@@ -510,6 +511,93 @@ pub struct PendingChange {
     pub loc: Option<RowLoc>,
 }
 
+/// The most distinct command versions one transaction may retain for one row.
+/// Multiple writes by the same command replace its last image, so this bounds
+/// cross-command history rather than expression-level work. Exhaustion is a
+/// loud static-capacity error.
+pub(crate) const MAX_PENDING_ROW_VERSIONS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingVersions {
+    entries: [PendingChange; MAX_PENDING_ROW_VERSIONS],
+    len: u8,
+}
+
+impl PendingVersions {
+    pub const fn empty() -> Self {
+        Self {
+            entries: [PendingChange {
+                txid: 0,
+                cid: 0,
+                loc: None,
+            }; MAX_PENDING_ROW_VERSIONS],
+            len: 0,
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.len != 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn last(&self) -> Option<PendingChange> {
+        self.len
+            .checked_sub(1)
+            .map(|index| self.entries[index as usize])
+    }
+
+    fn last_mut(&mut self) -> Option<&mut PendingChange> {
+        let index = self.len.checked_sub(1)? as usize;
+        Some(&mut self.entries[index])
+    }
+
+    fn push(&mut self, change: PendingChange) -> Result<(), SqlError> {
+        if self.len() == MAX_PENDING_ROW_VERSIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "one transaction creates more than {} command versions of one row",
+                MAX_PENDING_ROW_VERSIONS
+            ));
+        }
+        self.entries[self.len()] = change;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<PendingChange> {
+        let index = self.len.checked_sub(1)? as usize;
+        self.len -= 1;
+        Some(self.entries[index])
+    }
+
+    fn get(&self, index: usize) -> Option<PendingChange> {
+        (index < self.len()).then_some(self.entries[index])
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut PendingChange> {
+        (index < self.len()).then_some(&mut self.entries[index])
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn visible_at(&self, txid: u32, snapshot: u32) -> Option<Option<RowLoc>> {
+        self.entries[..self.len()]
+            .iter()
+            .rev()
+            .find(|change| change.txid == txid && change.cid < snapshot)
+            .map(|change| change.loc)
+    }
+}
+
 /// The command-id a read that should see *all* of its own transaction's
 /// uncommitted changes uses (the ordinary case: every write so far is visible).
 pub(crate) const SNAPSHOT_ALL: u32 = u32::MAX;
@@ -518,7 +606,7 @@ impl RowState {
     pub fn committed_only(loc: RowLoc) -> Self {
         Self {
             committed: Some(RowHome::Heap(loc)),
-            pending: None,
+            pending: PendingVersions::empty(),
         }
     }
 
@@ -534,15 +622,15 @@ impl RowState {
     /// `snapshot` (`cid < snapshot`); a later/same-command change is not, so the
     /// committed image shows through. `snapshot == SNAPSHOT_ALL` sees everything.
     pub fn visible_at(&self, txid: u32, snapshot: u32) -> Option<RowHome> {
-        match self.pending {
-            Some(p) if p.txid == txid && p.cid < snapshot => p.loc.map(RowHome::Heap),
-            _ => self.committed,
+        match self.pending.visible_at(txid, snapshot) {
+            Some(loc) => loc.map(RowHome::Heap),
+            None => self.committed,
         }
     }
 
     /// Whether another transaction has an uncommitted change here.
     pub fn locked_by_other(&self, txid: u32) -> Option<u32> {
-        match self.pending {
+        match self.pending.last() {
             Some(p) if p.txid != txid => Some(p.txid),
             _ => None,
         }
@@ -596,6 +684,13 @@ impl RowHeap {
 
 pub struct Table {
     pub def: TableDef,
+    /// Transaction-owned table-definition versions. Other transactions keep
+    /// resolving and decoding against `def`; the owner resolves against the
+    /// latest pending definition. RowState's command versions carry the
+    /// matching transformed row encodings.
+    pending_def_slots: [u32; MAX_PENDING_TABLE_DEFS],
+    n_pending_defs: u8,
+    pending_def_txid: Option<u32>,
     /// Monotonic creation stamp (catalog sequence), giving dependency
     /// reports PostgreSQL's OID ordering.
     pub created_at: u64,
@@ -684,6 +779,29 @@ pub struct PendingDdl {
     pub creating: bool,
 }
 
+/// The maximum number of ALTER TABLE commands one transaction may apply to a
+/// single table. This is a static-memory bound, not an accept-and-ignore limit.
+pub(crate) const MAX_PENDING_TABLE_DEFS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingTableDef {
+    pub txid: u32,
+    pub def: TableDef,
+    /// Committed-definition column index → latest column name. `None` means
+    /// the committed column was dropped. This composes across ALTER commands
+    /// and lets sequence ownership rebind once, atomically, at commit.
+    pub column_mapping: [Option<SqlName>; MAX_COLUMNS],
+    /// Every visible row was re-homed into the heap under this definition, so
+    /// the committed spill list becomes obsolete when this version commits.
+    pub rewrites_rows: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingTableDefSlot {
+    used: bool,
+    version: PendingTableDef,
+}
+
 impl Table {
     /// The one place `dirty` is set: every committed change advances the
     /// generation with it, so the sliced checkpoint can tell "dirty since
@@ -704,18 +822,22 @@ impl Table {
     }
 
     /// The txid of an uncommitted CREATE/DROP held by another transaction, if
-    /// any — that transaction has the catalog slot for this name locked.
+    /// any — or of a pending definition version. That transaction has the
+    /// catalog identity locked.
     pub fn ddl_locked_by_other(&self, txid: u32) -> Option<u32> {
         match self.pending_ddl {
             Some(p) if p.txid != txid => Some(p.txid),
-            _ => None,
+            _ => self.pending_def_txid.filter(|&owner| owner != txid),
         }
     }
 
     /// Whether the slot is free for a fresh CREATE: no committed table, no
     /// pending DDL, and no retained rows.
     fn is_free(&self) -> bool {
-        !self.live && self.pending_ddl.is_none() && self.rows.is_empty()
+        !self.live
+            && self.pending_ddl.is_none()
+            && self.n_pending_defs == 0
+            && self.rows.is_empty()
     }
 }
 
@@ -1387,6 +1509,7 @@ pub enum ResolvedRelation {
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
+    pending_table_defs: FixedVec<PendingTableDefSlot>,
     views: FixedVec<ViewDef>,
     matviews: FixedVec<MatviewDef>,
     sequences: FixedVec<SequenceDef>,
@@ -1532,6 +1655,9 @@ impl Storage {
                 + size_of::<ViewDef>()
                 + size_of::<MatviewDef>()
                 + size_of::<IndexDef>())
+            + config.max_tables
+                * MAX_PENDING_TABLE_DEFS
+                * size_of::<PendingTableDefSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
@@ -1546,6 +1672,11 @@ impl Storage {
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
         let mut tables = FixedVec::new(budget, "tables", config.max_tables)?;
+        let pending_table_defs = FixedVec::new(
+            budget,
+            "pending_table_defs",
+            config.max_tables * MAX_PENDING_TABLE_DEFS,
+        )?;
         for _ in 0..config.max_tables {
             tables
                 .push(Table {
@@ -1571,6 +1702,9 @@ impl Storage {
                         n_columns: 0,
                         ..TableDef::empty()
                     },
+                    pending_def_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
+                    n_pending_defs: 0,
+                    pending_def_txid: None,
                     rows: FixedMap::new(budget, "table_rows", config.table_rows)?,
                     created_at: 0,
                     live: false,
@@ -1695,6 +1829,7 @@ impl Storage {
         Ok(Self {
             heap,
             tables,
+            pending_table_defs,
             views,
             matviews,
             sequences,
@@ -2562,7 +2697,7 @@ impl Storage {
                 rowid,
                 RowState {
                     committed: Some(RowHome::Spilled { len, sst: member }),
-                    pending: None,
+                    pending: PendingVersions::empty(),
                 },
             )
         })
@@ -2575,7 +2710,7 @@ impl Storage {
         }
         Ok(self.spill_probe(table_slot, rowid)?.map(|(len, member)| RowState {
             committed: Some(RowHome::Spilled { len, sst: member }),
-            pending: None,
+            pending: PendingVersions::empty(),
         }))
     }
 
@@ -2901,7 +3036,7 @@ impl Storage {
     /// runs at checkpoint. `scratch` must hold every live image.
     pub fn compact_heap(
         &mut self,
-        scratch: &mut FixedVec<(u32, u64, bool, RowLoc)>,
+        scratch: &mut FixedVec<(u32, u64, u8, RowLoc)>,
     ) -> Result<(), SqlError> {
         scratch.clear();
         for (index, table) in self.tables.iter().enumerate() {
@@ -2918,13 +3053,17 @@ impl Storage {
                 };
                 if let Some(RowHome::Heap(loc)) = state.committed {
                     scratch
-                        .push((index as u32, rowid, false, loc))
+                        .push((index as u32, rowid, u8::MAX, loc))
                         .map_err(overflow)?;
                 }
-                if let Some(PendingChange { loc: Some(loc), .. }) = state.pending {
-                    scratch
-                        .push((index as u32, rowid, true, loc))
-                        .map_err(overflow)?;
+                for pending_index in 0..state.pending.len() {
+                    if let Some(PendingChange { loc: Some(loc), .. }) =
+                        state.pending.get(pending_index)
+                    {
+                        scratch
+                            .push((index as u32, rowid, pending_index as u8, loc))
+                            .map_err(overflow)?;
+                    }
                 }
             }
         }
@@ -2935,7 +3074,7 @@ impl Storage {
             .sort_unstable_by_key(|(_, _, _, loc)| loc.offset);
         let mut write_at = 0usize;
         for i in 0..scratch.len() {
-            let (table_index, rowid, is_pending, loc) = scratch[i];
+            let (table_index, rowid, pending_index, loc) = scratch[i];
             let len = loc.len as usize;
             let src = loc.offset as usize;
             debug_assert!(write_at <= src, "targets never overtake sources");
@@ -2951,8 +3090,11 @@ impl Storage {
                 .rows
                 .get_mut(&rowid)
                 .expect("scratch entries come from the maps");
-            if is_pending {
-                let p = state.pending.as_mut().expect("pending image existed");
+            if pending_index != u8::MAX {
+                let p = state
+                    .pending
+                    .get_mut(pending_index as usize)
+                    .expect("pending image existed");
                 p.loc = Some(new_loc);
             } else {
                 state.committed = Some(RowHome::Heap(new_loc));
@@ -2975,6 +3117,15 @@ impl Storage {
         cid: u32,
         loc: Option<RowLoc>,
     ) -> Result<Option<Option<RowLoc>>, SqlError> {
+        if self.tables[table_index]
+            .pending_def_txid
+            .is_some_and(|owner| owner != txid)
+        {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access due to concurrent table definition change"
+            ));
+        }
         let table = &mut self.tables[table_index];
         if let Some(state) = table.rows.get_mut(&rowid) {
             if let Some(other) = state.locked_by_other(txid) {
@@ -2984,9 +3135,15 @@ impl Storage {
                     "could not serialize access due to concurrent update"
                 ));
             }
-            let prior = state.pending.map(|p| p.loc);
-            state.pending = Some(PendingChange { txid, cid, loc });
-            return Ok(prior);
+            if let Some(last) = state.pending.last_mut()
+                && last.cid == cid
+            {
+                let prior = Some(last.loc);
+                last.loc = loc;
+                return Ok(prior);
+            }
+            state.pending.push(PendingChange { txid, cid, loc })?;
+            return Ok(None);
         }
         // An absent entry no longer means an absent row: the spill list may
         // hold its committed image, and that image must ride into the entry
@@ -3015,7 +3172,11 @@ impl Storage {
                 rowid,
                 RowState {
                     committed,
-                    pending: Some(PendingChange { txid, cid, loc }),
+                    pending: {
+                        let mut versions = PendingVersions::empty();
+                        versions.push(PendingChange { txid, cid, loc })?;
+                        versions
+                    },
                 },
             )
             .expect("capacity checked above");
@@ -3099,19 +3260,23 @@ impl Storage {
             return;
         };
         // Only touch a pending change this transaction owns (or an empty slot).
-        if let Some(p) = state.pending
+        if let Some(p) = state.pending.last()
             && p.txid != txid
         {
             return;
         }
         match prior {
             None => {
-                state.pending = None;
-                if state.committed.is_none() {
+                state.pending.pop();
+                if state.committed.is_none() && state.pending.is_none() {
                     table.rows.remove(&rowid);
                 }
             }
-            Some(loc) => state.pending = Some(PendingChange { txid, cid: 0, loc }),
+            Some(loc) => {
+                if let Some(last) = state.pending.last_mut() {
+                    last.loc = loc;
+                }
+            }
         }
     }
 
@@ -3130,7 +3295,13 @@ impl Storage {
         // The spill list may hold this row, so the delete must both
         // tombstone (for the next flush) and leave a shadowing marker (for
         // reads until then) — same discipline as a committed DELETE.
-        let _ = table.rows.insert(rowid, RowState { committed: None, pending: None });
+        let _ = table.rows.insert(
+            rowid,
+            RowState {
+                committed: None,
+                pending: PendingVersions::empty(),
+            },
+        );
         Self::record_tombstone(table, rowid);
         table.mark_dirty();
     }
@@ -3141,7 +3312,7 @@ impl Storage {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
-            match state.pending {
+            match state.pending.last() {
                 Some(p) if p.txid == txid => (state.committed, p.loc),
                 _ => return,
             }
@@ -3154,7 +3325,7 @@ impl Storage {
         let table = &mut self.tables[table_index];
         let state = table.rows.get_mut(&rowid).expect("row present after read");
         state.committed = new_loc.map(RowHome::Heap);
-        state.pending = None;
+        state.pending.clear();
         if state.committed.is_none() {
             // A rowid that ever reached an SST — even if its latest version was
             // heap-resident — must tombstone, or a cold start resurrects the
@@ -3164,6 +3335,33 @@ impl Storage {
             // list, so the marker is what keeps the deleted row invisible right
             // now. `clear_tombstones` purges the markers once an install has
             // made the SSTs themselves say deleted.
+            if table.n_spill_ssts == 0 {
+                table.rows.remove(&rowid);
+            }
+            Self::record_tombstone(table, rowid);
+        }
+        table.mark_dirty();
+    }
+
+    /// Promotes a row rewritten under a pending table definition. Value
+    /// indexes are rebuilt once after every row and the definition are
+    /// promoted, because the old and new encodings cannot share an index
+    /// decoder.
+    pub fn commit_rewritten_row(&mut self, table_index: usize, rowid: u64, txid: u32) {
+        let new_loc = {
+            let Some(state) = self.tables[table_index].rows.get(&rowid) else {
+                return;
+            };
+            match state.pending.last() {
+                Some(pending) if pending.txid == txid => pending.loc,
+                _ => return,
+            }
+        };
+        let table = &mut self.tables[table_index];
+        let state = table.rows.get_mut(&rowid).expect("row present after read");
+        state.committed = new_loc.map(RowHome::Heap);
+        state.pending.clear();
+        if state.committed.is_none() {
             if table.n_spill_ssts == 0 {
                 table.rows.remove(&rowid);
             }
@@ -3465,10 +3663,10 @@ impl Storage {
     /// and every committed table, but not another transaction's uncommitted
     /// DDL.
     pub fn find_visible(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.tables.iter().position(|t| {
-            t.visible_to(txid)
-                && t.def.schema.as_str() == schema
-                && t.def.name.as_str() == name
+        self.tables.iter().enumerate().position(|(index, table)| {
+            table.visible_to(txid)
+                && self.table_def(index, txid).schema.as_str() == schema
+                && self.table_def(index, txid).name.as_str() == name
         })
     }
 
@@ -3478,6 +3676,149 @@ impl Storage {
 
     pub fn table_mut(&mut self, index: usize) -> &mut Table {
         &mut self.tables[index]
+    }
+
+    pub fn table_def(&self, index: usize, txid: u32) -> &TableDef {
+        match self.pending_table_def(index) {
+            Some(pending) if pending.txid == txid => &pending.def,
+            _ => &self.tables[index].def,
+        }
+    }
+
+    pub fn has_pending_table_def(&self, index: usize, txid: u32) -> bool {
+        self.tables[index].pending_def_txid == Some(txid)
+    }
+
+    fn pending_table_def(&self, index: usize) -> Option<&PendingTableDef> {
+        let table = &self.tables[index];
+        let position = table.n_pending_defs.checked_sub(1)? as usize;
+        let slot = table.pending_def_slots[position] as usize;
+        Some(&self.pending_table_defs[slot].version)
+    }
+
+    fn clear_pending_table_defs(&mut self, index: usize) {
+        let count = self.tables[index].n_pending_defs as usize;
+        for position in 0..count {
+            let slot = self.tables[index].pending_def_slots[position] as usize;
+            self.pending_table_defs[slot].used = false;
+            self.tables[index].pending_def_slots[position] = u32::MAX;
+        }
+        self.tables[index].n_pending_defs = 0;
+        self.tables[index].pending_def_txid = None;
+    }
+
+    /// Installs the next transaction-owned table shape. `column_mapping`
+    /// describes the transition from the previously visible definition to
+    /// `def`; the stored mapping is composed back to the committed definition.
+    pub fn write_table_def(
+        &mut self,
+        index: usize,
+        txid: u32,
+        def: TableDef,
+        column_mapping: &[Option<SqlName>; MAX_COLUMNS],
+        rewrites_rows: bool,
+    ) -> Result<(), SqlError> {
+        if let Some(other) = self.tables[index].ddl_locked_by_other(txid) {
+            let _ = other;
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize access due to concurrent DDL on \"{}\"",
+                self.tables[index].def.name.as_str()
+            ));
+        }
+        if self.tables[index].n_pending_defs as usize == MAX_PENDING_TABLE_DEFS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "one transaction applies more than {} table-definition versions to one table",
+                MAX_PENDING_TABLE_DEFS
+            ));
+        }
+        let current = *self.table_def(index, txid);
+        let prior = self.pending_table_def(index).copied();
+        let mut composed = [None; MAX_COLUMNS];
+        for (committed_column, target) in composed
+            .iter_mut()
+            .enumerate()
+            .take(self.tables[index].def.n_columns)
+        {
+            let current_name = match prior {
+                Some(version) if version.txid == txid => version.column_mapping[committed_column],
+                _ => Some(self.tables[index].def.columns()[committed_column].name),
+            };
+            let Some(current_name) = current_name else {
+                continue;
+            };
+            let Some(current_column) = current.column_index(current_name.as_str()) else {
+                continue;
+            };
+            *target = column_mapping[current_column];
+        }
+        let version = PendingTableDef {
+            txid,
+            def,
+            column_mapping: composed,
+            rewrites_rows: rewrites_rows
+                || prior.is_some_and(|version| version.txid == txid && version.rewrites_rows),
+        };
+        let slot = match self.pending_table_defs.iter().position(|entry| !entry.used) {
+            Some(slot) => {
+                self.pending_table_defs[slot] = PendingTableDefSlot { used: true, version };
+                slot
+            }
+            None => {
+                let slot = self.pending_table_defs.len();
+                self.pending_table_defs
+                    .push(PendingTableDefSlot { used: true, version })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "pending table-definition pool is exhausted"
+                        )
+                    })?;
+                slot
+            }
+        };
+        let position = self.tables[index].n_pending_defs as usize;
+        self.tables[index].pending_def_slots[position] = slot as u32;
+        self.tables[index].n_pending_defs += 1;
+        self.tables[index].pending_def_txid = Some(txid);
+        Ok(())
+    }
+
+    pub fn rollback_table_def(&mut self, index: usize, txid: u32) {
+        if self.tables[index].pending_def_txid != Some(txid) {
+            return;
+        }
+        let Some(position) = self.tables[index].n_pending_defs.checked_sub(1) else {
+            return;
+        };
+        let slot = self.tables[index].pending_def_slots[position as usize] as usize;
+        self.pending_table_defs[slot].used = false;
+        self.tables[index].pending_def_slots[position as usize] = u32::MAX;
+        self.tables[index].n_pending_defs = position;
+        if position == 0 {
+            self.tables[index].pending_def_txid = None;
+        }
+    }
+
+    /// Promotes the latest pending definition after its WAL batch is durable.
+    /// Row images are promoted separately by the transaction coordinator.
+    pub fn commit_table_def(&mut self, index: usize, txid: u32) -> bool {
+        let Some(pending) = self.pending_table_def(index).copied() else {
+            return false;
+        };
+        if pending.txid != txid {
+            return false;
+        }
+        self.set_table_def(index, pending.def, &pending.column_mapping);
+        self.clear_pending_table_defs(index);
+        pending.rewrites_rows
+    }
+
+    pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
+        if rewrote_rows {
+            self.set_spill_list(index, &[]);
+        }
     }
 
     /// Allocates a slot for a fresh table. Shared by replay (committed) and
@@ -3493,6 +3834,7 @@ impl Storage {
         };
         // A reused slot must not keep the dropped table's value indexes.
         self.release_enforcers(slot);
+        self.clear_pending_table_defs(slot);
         self.catalog_seq += 1;
         let stamp = self.catalog_seq;
         let table = &mut self.tables[slot];
@@ -3636,8 +3978,14 @@ impl Storage {
     fn ddl_name_locked_by_other(&self, schema: &str, name: &str, txid: u32) -> Option<u32> {
         self.tables
             .iter()
-            .filter(|t| t.def.schema.as_str() == schema && t.def.name.as_str() == name)
-            .find_map(|t| t.ddl_locked_by_other(txid))
+            .enumerate()
+            .filter(|(index, table)| {
+                (table.def.schema.as_str() == schema && table.def.name.as_str() == name)
+                    || self.pending_table_def(*index).is_some_and(|pending| {
+                        pending.def.schema.as_str() == schema && pending.def.name.as_str() == name
+                    })
+            })
+            .find_map(|(_, table)| table.ddl_locked_by_other(txid))
     }
 
     /// Committed drop (journal replay): rows are retained; the slot is freed at
@@ -3647,6 +3995,7 @@ impl Storage {
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.release_enforcers(index);
+        self.clear_pending_table_defs(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].mark_dirty();
@@ -3672,6 +4021,7 @@ impl Storage {
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.release_enforcers(index);
+        self.clear_pending_table_defs(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].rows.clear();
@@ -3680,6 +4030,7 @@ impl Storage {
     /// Rolls back an uncommitted CREATE, freeing the slot.
     pub fn rollback_create(&mut self, index: usize) {
         self.release_enforcers(index);
+        self.clear_pending_table_defs(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].rows.clear();
@@ -4959,8 +5310,16 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = &'a IndexDef> {
+        let committed_binding = self
+            .find_visible(schema, table, txid)
+            .map(|slot| (self.tables[slot].def.schema, self.tables[slot].def.name));
         self.indexes.iter().filter(move |x| {
-            x.visible_to(txid) && x.schema.as_str() == schema && x.table.as_str() == table
+            x.visible_to(txid)
+                && ((x.schema.as_str() == schema && x.table.as_str() == table)
+                    || committed_binding
+                        .is_some_and(|(old_schema, old_table)| {
+                            x.schema == old_schema && x.table == old_table
+                        }))
         })
     }
 
@@ -5038,6 +5397,15 @@ impl Storage {
                 t.mark_dirty();
             }
         }
+        for comment in self.comments.iter_mut() {
+            if comment.used
+                && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
+                && comment.schema == old_schema
+                && comment.name == name
+            {
+                comment.schema = new_schema;
+            }
+        }
     }
 
     /// Removes one foreign key from a table's definition by constraint name
@@ -5055,16 +5423,6 @@ impl Storage {
         Some(removed)
     }
 
-    /// Restores a foreign key removed by [`Self::drop_fk`] (rollback).
-    pub fn restore_fk(&mut self, index: usize, fk: ForeignKey) {
-        let def = &mut self.tables[index].def;
-        if def.n_fkeys < MAX_FKEYS {
-            def.fkeys[def.n_fkeys] = fk;
-            def.n_fkeys += 1;
-            self.tables[index].mark_dirty();
-        }
-    }
-
     /// Replaces a table's definition in place (ALTER TABLE).
     pub fn set_table_def(
         &mut self,
@@ -5073,11 +5431,45 @@ impl Storage {
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
     ) {
         let old = self.tables[index].def;
+        if old.schema != def.schema {
+            self.move_table_schema(index, def.schema);
+        }
+        let current = self.tables[index].def;
+        if current.name != def.name {
+            for index_def in self.indexes.iter_mut() {
+                if index_def.schema == current.schema && index_def.table == current.name {
+                    index_def.table = def.name;
+                }
+            }
+            for table in self.tables.iter_mut() {
+                let mut changed = false;
+                for foreign_key in &mut table.def.fkeys[..table.def.n_fkeys] {
+                    if foreign_key.parent_schema == current.schema
+                        && foreign_key.parent == current.name
+                    {
+                        foreign_key.parent = def.name;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    table.mark_dirty();
+                }
+            }
+            for comment in self.comments.iter_mut() {
+                if comment.used
+                    && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
+                    && comment.schema == current.schema
+                    && comment.name == current.name
+                {
+                    comment.name = def.name;
+                }
+            }
+        }
         for sequence in self.sequences.iter_mut() {
             sequence.owner =
-                rebind_sequence_column(sequence.owner, &old, &def, column_mapping, false);
+                rebind_sequence_column(sequence.owner, &current, &def, column_mapping, false);
             sequence.generator_for =
-                rebind_sequence_column(sequence.generator_for, &old, &def, column_mapping, true);
+                rebind_sequence_column(sequence.generator_for, &current, &def, column_mapping, true);
         }
         self.tables[index].def = def;
         self.tables[index].mark_dirty();

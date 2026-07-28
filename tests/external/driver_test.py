@@ -58,6 +58,23 @@ cur.execute("SELECT count(*) FROM drv")
 assert cur.fetchone()[0] == 3
 print("update/delete ok")
 
+# WITH before a data-modifying main statement travels through Parse/Bind/
+# Describe/Execute with typed parameters and RETURNING metadata intact.
+cur.execute(
+    """
+    WITH supplied(name, score) AS (
+        SELECT %s::text, %s::float8
+    )
+    INSERT INTO drv
+    SELECT %s::int, name, score FROM supplied
+    RETURNING id, name, score
+    """,
+    ("eve", 6.5, 8),
+)
+assert [d.name for d in cur.description] == ["id", "name", "score"]
+assert cur.fetchone() == (8, "eve", 6.5)
+print("with dml extended protocol ok")
+
 # RowDescription atttypmod: a table column carries its declared modifier and a
 # cast its target's, while a computed expression carries none — psycopg derives
 # display_size/precision/scale from it, so a client sees varchar(5) as 5.

@@ -43,7 +43,10 @@ pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
 use cte::expand_set_tree_exec;
-pub use cte::{describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under};
+pub use cte::{
+    describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
+    rewrite_view_dml,
+};
 
 mod aggregate;
 use aggregate::{AggState, fold_aggregates};

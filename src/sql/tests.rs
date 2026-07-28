@@ -4153,6 +4153,12 @@ fn for_update_locking_clause() {
     // OF must name a relation in the FROM clause (42P01); an alias hides the name.
     assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk FOR UPDATE OF nope")).contains("42P01"));
     assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk x FOR UPDATE OF lk")).contains("42P01"));
+    // CTE/view expansion must preserve the main query's locking clause.
+    assert!(err(&run_with(
+        &mut e,
+        &mut b,
+        "WITH rows AS (SELECT id FROM lk) SELECT count(*) FROM rows FOR UPDATE"
+    )).contains("0A000"));
 }
 
 #[test]
@@ -4436,9 +4442,7 @@ fn data_modifying_cte_select_main() {
 }
 
 #[test]
-fn data_modifying_cte_main_dml_rejected_loudly() {
-    // WITH followed by a data-modifying main statement is not yet supported
-    // and must raise a loud error rather than discard the WITH (see BUGS.md).
+fn data_modifying_cte_main_insert() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE dc2 (id int, v text)");
     run_with(&mut e, &mut b, "INSERT INTO dc2 VALUES (1,'a')");
@@ -4448,7 +4452,208 @@ fn data_modifying_cte_main_dml_rejected_loudly() {
         "WITH m AS (DELETE FROM dc2 WHERE id=1 RETURNING id, v) INSERT INTO dc2 SELECT id+100, v FROM m",
     );
     let text = String::from_utf8_lossy(&bytes);
-    assert!(text.contains("ERROR"), "expected a loud error, got {text:?}");
+    assert!(!text.contains("ERROR"), "WITH INSERT failed: {text:?}");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM dc2 ORDER BY id")),
+        ["101|a"]
+    );
+}
+
+#[test]
+fn with_query_ctes_feed_every_data_modification() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE source_rows (id int, value text);\
+         CREATE TABLE target_rows (id int PRIMARY KEY, value text);\
+         INSERT INTO source_rows VALUES (1,'a'),(2,'b'),(3,'c');\
+         INSERT INTO target_rows VALUES (1,'old'),(4,'remove')",
+    );
+
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH picked AS (SELECT id, value FROM source_rows WHERE id IN (2,3)) \
+         INSERT INTO target_rows SELECT * FROM picked RETURNING id, value",
+    );
+    assert_eq!(data_rows(&inserted), ["2|b", "3|c"]);
+
+    let updated = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH picked AS (SELECT id, value FROM source_rows WHERE id=1) \
+         UPDATE target_rows SET value=picked.value FROM picked \
+         WHERE target_rows.id=picked.id RETURNING target_rows.id, target_rows.value",
+    );
+    assert_eq!(data_rows(&updated), ["1|a"]);
+
+    let deleted = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH picked AS (SELECT 4 AS id) \
+         DELETE FROM target_rows USING picked WHERE target_rows.id=picked.id \
+         RETURNING target_rows.id",
+    );
+    assert_eq!(data_rows(&deleted), ["4"]);
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "WITH incoming AS (SELECT 2 AS id, 'B' AS value UNION ALL SELECT 5, 'e') \
+         MERGE INTO target_rows AS target USING incoming AS source \
+         ON target.id=source.id \
+         WHEN MATCHED THEN UPDATE SET value=source.value \
+         WHEN NOT MATCHED THEN INSERT (id,value) VALUES (source.id,source.value)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM target_rows ORDER BY id"
+        )),
+        ["1|a", "2|B", "3|c", "5|e"]
+    );
+
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH supplied AS (SELECT 'six' AS value) \
+         INSERT INTO target_rows VALUES (5, (SELECT value FROM supplied)) \
+         ON CONFLICT (id) DO UPDATE SET value=(SELECT upper(value) FROM supplied) \
+         RETURNING id, value, (SELECT count(*) FROM supplied)",
+    );
+    assert_eq!(
+        data_rows(&response),
+        ["5|SIX|1"],
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+#[test]
+fn data_modifying_ctes_chain_into_ctes_and_main_dml() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE work_items (id int PRIMARY KEY, value text);\
+         CREATE TABLE archive_items (id int PRIMARY KEY, value text);\
+         CREATE TABLE final_items (id int PRIMARY KEY, value text);\
+         INSERT INTO work_items VALUES (1,'a'),(2,'b'),(3,'c')",
+    );
+
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH wanted AS (SELECT id FROM work_items WHERE id <= 2),\
+              moved AS (DELETE FROM work_items USING wanted \
+                        WHERE work_items.id=wanted.id RETURNING work_items.id, work_items.value),\
+              shifted AS (SELECT id+100 AS id, value FROM moved)\
+         INSERT INTO archive_items SELECT * FROM shifted ORDER BY id RETURNING id, value",
+    );
+    assert_eq!(data_rows(&response), ["101|a", "102|b"]);
+
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH removed AS (DELETE FROM work_items WHERE id=3 RETURNING id, value),\
+              copied AS (INSERT INTO archive_items \
+                         SELECT id+100, value FROM removed RETURNING id, value)\
+         INSERT INTO final_items SELECT id, value FROM copied RETURNING id, value",
+    );
+    assert_eq!(data_rows(&response), ["103|c"]);
+}
+
+#[test]
+fn recursive_cte_feeds_data_modifying_main_statement() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE TABLE generated_rows (id int PRIMARY KEY)");
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH RECURSIVE numbers(n) AS (\
+             VALUES (1) UNION ALL SELECT n+1 FROM numbers WHERE n < 4\
+         ) INSERT INTO generated_rows SELECT n FROM numbers RETURNING id",
+    );
+    assert_eq!(data_rows(&response), ["1", "2", "3", "4"]);
+}
+
+#[test]
+fn data_modifying_cte_preflight_and_view_targets() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE cte_view_base (id int PRIMARY KEY, value text, secret text);\
+         INSERT INTO cte_view_base VALUES (1,'a','s1'),(2,'b','s2');\
+         CREATE VIEW cte_view AS SELECT id, value FROM cte_view_base WHERE id <= 2",
+    );
+
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH changed AS (\
+             UPDATE cte_view SET value=upper(value) WHERE id=1 RETURNING id, value\
+         ) DELETE FROM cte_view USING changed \
+         WHERE cte_view.id=changed.id+1 RETURNING cte_view.id, cte_view.value",
+    );
+    assert_eq!(data_rows(&response), ["2|b"]);
+
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH same AS (DELETE FROM cte_view_base RETURNING id),\
+              same AS (SELECT 1) SELECT * FROM same",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("specified more than once"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM cte_view_base ORDER BY id"
+        )),
+        ["1|A"]
+    );
+
+    let hidden_update = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE cte_view SET secret='leak' WHERE id=1",
+    );
+    assert!(String::from_utf8_lossy(&hidden_update)
+        .contains("column \"secret\" of relation \"cte_view\" does not exist"));
+    let hidden_insert = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO cte_view(secret) VALUES ('leak')",
+    );
+    assert!(String::from_utf8_lossy(&hidden_insert)
+        .contains("column \"secret\" of relation \"cte_view\" does not exist"));
+
+    let wildcard = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE cte_view SET value='visible' WHERE id=1 RETURNING *",
+    );
+    assert_eq!(data_rows(&wildcard), ["1|visible"]);
+
+    let aliases = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH changed(one, two) AS (\
+             UPDATE cte_view_base SET value='x' RETURNING id\
+         ) SELECT * FROM changed",
+    );
+    assert!(String::from_utf8_lossy(&aliases).contains("1 columns available but 2 columns"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM cte_view_base ORDER BY id"
+        )),
+        ["1|visible"]
+    );
 }
 
 #[test]

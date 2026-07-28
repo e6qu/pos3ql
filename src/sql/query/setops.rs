@@ -300,6 +300,23 @@ type MaterializedSet<'a> = (&'a [&'a [u8]], &'a [ColType], usize);
 /// Materializes a set-operation body to combined encoded rows plus the unified
 /// column types, ready to decode. Shared by subquery and INSERT-source paths.
 pub(crate) fn materialize_set_body<'a>(
+    storage: &Storage,
+    txid: u32,
+    tree: &'a SetTree<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<MaterializedSet<'a>, SqlError> {
+    let materialized = materialize_set_body_tied(storage, txid, tree, arena, params)?;
+    // `materialize_set_body_tied` ties all inputs to one lifetime because the
+    // row executor may temporarily decode datums borrowed from storage. None
+    // of those datums escape: every output row is projected-encoded into
+    // `arena`, and the target type slice is allocated there too. Express that
+    // provenance at this choke point so callers may release the catalog borrow
+    // before mutating storage.
+    Ok(unsafe { core::mem::transmute::<MaterializedSet<'_>, MaterializedSet<'a>>(materialized) })
+}
+
+fn materialize_set_body_tied<'a>(
     storage: &'a Storage,
     txid: u32,
     tree: &'a SetTree<'a>,

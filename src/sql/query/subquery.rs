@@ -292,7 +292,7 @@ fn eval_subquery_nodes<'a>(
             _ => unreachable!("collector only stores subquery nodes"),
         }
     }
-    let scalars = arena
+    let scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)] = arena
         .alloc_slice_copy(&scalars_tmp[..n_scalars])
         .map_err(|_| arena_full())?;
     let lists = arena
@@ -1144,10 +1144,51 @@ fn build_array_scalar<'a>(
 /// Order helpers exported for update/delete WHERE-subquery support.
 pub fn subquery_hooks<'a>(
     exprs: &[Option<&'a Expr<'a>>],
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    prepare_subqueries(exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)
+    let borrowed =
+        prepare_subqueries(exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
+    let scalars = arena
+        .alloc_slice_with(borrowed.scalars.len(), |_| {
+            (core::ptr::null(), Datum::Null, Datum::Null)
+        })
+        .map_err(|_| arena_full())?;
+    for (index, (node, value, witness)) in borrowed.scalars.iter().enumerate() {
+        scalars[index] = (
+            (*node).cast(),
+            detach_subquery_datum(*value, arena)?,
+            detach_subquery_datum(*witness, arena)?,
+        );
+    }
+    let lists: &mut [(*const Expr<'a>, &'a [Datum<'a>], bool, Datum<'a>)] = arena
+        .alloc_slice_with(borrowed.lists.len(), |_| {
+            (core::ptr::null(), &[][..], false, Datum::Null)
+        })
+        .map_err(|_| arena_full())?;
+    for (index, (node, values, saw_null, witness)) in borrowed.lists.iter().enumerate() {
+        let detached_values = arena
+            .alloc_slice_with(values.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (value_index, value) in values.iter().enumerate() {
+            detached_values[value_index] = detach_subquery_datum(*value, arena)?;
+        }
+        lists[index] = (
+            (*node).cast(),
+            &*detached_values,
+            *saw_null,
+            detach_subquery_datum(*witness, arena)?,
+        );
+    }
+    Ok(SubqueryValues { scalars: &*scalars, lists: &*lists })
+}
+
+/// Copies a subquery result through the projected-row codec so no value keeps
+/// borrowing catalog storage after the read phase. DML can then consume the
+/// detached result and mutably update storage without weakening provenance.
+fn detach_subquery_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+    Ok(crate::sql::exec::decode_projected_pub(encoded, 0))
 }

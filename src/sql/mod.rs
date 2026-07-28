@@ -1175,6 +1175,15 @@ impl Engine {
                 }
         };
         match statement {
+            Stmt::With { ctes, statement } => {
+                for cte in *ctes {
+                    match cte.dml {
+                        Some(dml) => self.infer_stmt_params(dml, txid, oids),
+                        None => self.infer_stmt_params(&Stmt::Select(*cte.query), txid, oids),
+                    }
+                }
+                self.infer_stmt_params(statement, txid, oids);
+            }
             Stmt::Insert(ins) => {
                 let slot = match self.storage.resolve_relation(ins.table.schema, ins.table.name, txid)
                 {
@@ -1285,6 +1294,86 @@ impl Engine {
         }
     }
 
+    fn describe_data_modification(
+        &self,
+        statement: &Stmt,
+        arena: &Arena,
+        txn: &TxnState,
+        responder: &mut Responder,
+    ) -> Result<bool, WireFull> {
+        let (target, returning) = match statement {
+            Stmt::Insert(insert) => (insert.table, insert.returning),
+            Stmt::Update(update) => (update.table, update.returning),
+            Stmt::Delete(delete) => (delete.table, delete.returning),
+            _ => {
+                responder.no_data()?;
+                return Ok(true);
+            }
+        };
+        if returning.is_empty() {
+            responder.no_data()?;
+            return Ok(true);
+        }
+        let (target, returning) =
+            match query::resolve_view_for_dml(&self.storage, target, txn.txid, arena) {
+                Ok(Some(view)) => {
+                    let rewritten = match query::rewrite_view_dml(
+                        statement,
+                        target.name,
+                        view.base.name,
+                        view.base.schema.expect("view base is qualified"),
+                        view.columns,
+                        &self.storage,
+                        txn.txid,
+                        arena,
+                    ) {
+                        Ok(rewritten) => rewritten,
+                        Err(error) => {
+                            responder.error(error.sqlstate, error.message.as_str())?;
+                            return Ok(false);
+                        }
+                    };
+                    let returning = match rewritten {
+                        Stmt::Insert(insert) => insert.returning,
+                        Stmt::Update(update) => update.returning,
+                        Stmt::Delete(delete) => delete.returning,
+                        _ => unreachable!("view rewrite keeps its statement kind"),
+                    };
+                    (view.base, returning)
+                }
+                Ok(None) => (target, returning),
+                Err(error) => {
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    return Ok(false);
+                }
+            };
+        let table_index = match exec::resolve_dml_table(&self.storage, &target, txn.txid) {
+            Ok(table_index) => table_index,
+            Err(error) => {
+                responder.error(error.sqlstate, error.message.as_str())?;
+                return Ok(false);
+            }
+        };
+        let definition = self.storage.table(table_index).def;
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        match query::describe_catalog_items(
+            returning,
+            Some(&definition),
+            &self.storage,
+            txn.txid,
+            &mut columns,
+        ) {
+            Ok(count) => {
+                responder.row_description(&columns[..count])?;
+                Ok(true)
+            }
+            Err(error) => {
+                responder.error(error.sqlstate, error.message.as_str())?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Describe (statement or portal): RowDescription for SELECT/SHOW,
     /// NoData otherwise. Returns whether it succeeded.
     pub fn describe(
@@ -1315,6 +1404,12 @@ impl Engine {
             }
         };
         match &statement {
+            Stmt::With { statement, .. } => {
+                self.describe_data_modification(statement, arena, txn, responder)
+            }
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                self.describe_data_modification(&statement, arena, txn, responder)
+            }
             Stmt::Select(s) => {
                 // Describe the CTE-expanded query so derived columns resolve.
                 let s = match query::expand_ctes(s, &self.storage, txn.txid, arena) {
@@ -1411,13 +1506,37 @@ impl Engine {
         if !with.iter().any(|c| c.dml.is_some()) {
             return Ok(None);
         }
+        // Analysis precedes every side effect: a duplicate name or an
+        // over-wide output rename list must not let an earlier DML CTE run
+        // before the statement fails.
+        for (index, cte) in with.iter().enumerate() {
+            if with[..index].iter().any(|prior| prior.name == cte.name) {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_ALIAS,
+                    "WITH query name \"{}\" specified more than once",
+                    cte.name
+                ));
+            }
+        }
         // All of this statement's sub-parts share one command snapshot.
         self.storage.set_read_snapshot(txn.command_id());
         let mut mats: [(&'a str, &'a ast::MaterializedCte<'a>); parser::MAX_CTES] =
             [("", &EMPTY_DML_CTE); parser::MAX_CTES];
         let mut n = 0;
-        for cte in with {
+        for (cte_index, cte) in with.iter().enumerate() {
             let Some(dml) = cte.dml else { continue };
+            // Earlier ordinary, recursive, and data-modifying CTEs are in
+            // scope inside this CTE body. Expansion finishes its immutable
+            // catalog work before the statement takes a mutable storage borrow.
+            let dml = query::expand_dml_ctes(
+                dml,
+                &with[..cte_index],
+                &self.storage,
+                txn.txid,
+                arena,
+                params,
+                &mats[..n],
+            )?;
             let (target, returning) = match dml {
                 Stmt::Insert(i) => (&i.table, i.returning),
                 Stmt::Update(u) => (&u.table, u.returning),
@@ -1431,7 +1550,13 @@ impl Engine {
             };
             // Describe the RETURNING columns against the target table, applying
             // the CTE's optional rename list.
-            let idx = crate::sql::exec::resolve_dml_table(&self.storage, target, txn.txid)?;
+            let described_target =
+                match query::resolve_view_for_dml(&self.storage, *target, txn.txid, arena)? {
+                    Some(view) => view.base,
+                    None => *target,
+                };
+            let idx =
+                crate::sql::exec::resolve_dml_table(&self.storage, &described_target, txn.txid)?;
             let def = self.storage.table(idx).def;
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
             let ncols = query::describe_catalog_items(
@@ -1441,6 +1566,15 @@ impl Engine {
                 txn.txid,
                 &mut descs,
             )?;
+            if cte.columns.len() > ncols {
+                return Err(sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "WITH query \"{}\" has {} columns available but {} columns specified",
+                    cte.name,
+                    ncols,
+                    cte.columns.len()
+                ));
+            }
             let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
             let mut types = [(0i32, 0i16); MAX_PROJ];
             for i in 0..ncols {
@@ -1474,18 +1608,17 @@ impl Engine {
                 len += 1;
                 Ok(())
             };
-            let outcome = match dml {
-                Stmt::Insert(i) => exec::insert(
-                    &mut self.storage, txn, i, arena, params, guc.seq_session(), responder, Some(&mut sink),
-                ),
-                Stmt::Update(u) => exec::update(
-                    &mut self.storage, txn, &mut self.scratch, u, arena, params, guc.seq_session(), responder, Some(&mut sink),
-                ),
-                Stmt::Delete(d) => exec::delete(
-                    &mut self.storage, txn, &mut self.scratch, d, arena, params, responder, Some(&mut sink),
-                ),
-                _ => unreachable!("checked above"),
-            };
+            let outcome = Self::execute_data_modification(
+                &mut self.storage,
+                &mut self.scratch,
+                &self.work,
+                dml,
+                txn,
+                params,
+                guc,
+                responder,
+                Some(&mut sink),
+            );
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
@@ -1503,6 +1636,174 @@ impl Engine {
             n += 1;
         }
         Ok(Some(arena.alloc_slice_copy(&mats[..n]).map_err(|_| query::arena_full_pub())?))
+    }
+
+    /// Executes one INSERT/UPDATE/DELETE after any enclosing WITH clause has
+    /// been expanded. View rewriting lives here as well, so a data-modifying
+    /// CTE and a main DML statement have exactly the same target semantics.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn execute_data_modification<'a>(
+        storage: &mut Storage,
+        scratch: &mut FixedVec<(u64, RowHome)>,
+        arena: &Arena,
+        statement: &'a Stmt<'a>,
+        txn: &mut TxnState,
+        params: &[Datum<'a>],
+        guc: &mut GucState,
+        responder: &mut Responder,
+        capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        match statement {
+            Stmt::Insert(insert) => {
+                let insert =
+                    match query::resolve_view_for_dml(storage, insert.table, txn.txid, arena) {
+                        Ok(Some(view)) => {
+                            let rewritten = match query::rewrite_view_dml(
+                                statement,
+                                insert.table.name,
+                                view.base.name,
+                                view.base.schema.expect("view base is qualified"),
+                                view.columns,
+                                storage,
+                                txn.txid,
+                                arena,
+                            ) {
+                                Ok(Stmt::Insert(rewritten)) => rewritten,
+                                Ok(_) => unreachable!("insert rewrite keeps its statement kind"),
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            let columns = if rewritten.columns.is_empty() {
+                                view.columns
+                            } else {
+                                rewritten.columns
+                            };
+                            match arena.alloc(Insert {
+                                table: view.base,
+                                columns,
+                                rows: rewritten.rows,
+                                select: rewritten.select,
+                                on_conflict: rewritten.on_conflict,
+                                returning: rewritten.returning,
+                                overriding: rewritten.overriding,
+                            }) {
+                                Ok(rewritten) => &*rewritten,
+                                Err(_) => return Ok(Err(query::arena_full_pub())),
+                            }
+                        }
+                        Ok(None) => insert,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                exec::insert(
+                    storage,
+                    txn,
+                    insert,
+                    arena,
+                    params,
+                    guc.seq_session(),
+                    responder,
+                    capture,
+                )
+            }
+            Stmt::Update(update) => {
+                let update =
+                    match query::resolve_view_for_dml(storage, update.table, txn.txid, arena) {
+                        Ok(Some(view)) => {
+                            let rewritten = match query::rewrite_view_dml(
+                                statement,
+                                update.table.name,
+                                view.base.name,
+                                view.base.schema.expect("view base is qualified"),
+                                view.columns,
+                                storage,
+                                txn.txid,
+                                arena,
+                            ) {
+                                Ok(Stmt::Update(rewritten)) => rewritten,
+                                Ok(_) => unreachable!("update rewrite keeps its statement kind"),
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            let where_clause = match query::and_where(
+                                view.where_clause,
+                                rewritten.where_clause,
+                                arena,
+                            ) {
+                                Ok(where_clause) => where_clause,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            match arena.alloc(Update {
+                                table: view.base,
+                                assignments: rewritten.assignments,
+                                from: rewritten.from,
+                                where_clause,
+                                returning: rewritten.returning,
+                            }) {
+                                Ok(rewritten) => &*rewritten,
+                                Err(_) => return Ok(Err(query::arena_full_pub())),
+                            }
+                        }
+                        Ok(None) => update,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                exec::update(
+                    storage,
+                    txn,
+                    scratch,
+                    update,
+                    arena,
+                    params,
+                    guc.seq_session(),
+                    responder,
+                    capture,
+                )
+            }
+            Stmt::Delete(delete) => {
+                let delete =
+                    match query::resolve_view_for_dml(storage, delete.table, txn.txid, arena) {
+                        Ok(Some(view)) => {
+                            let rewritten = match query::rewrite_view_dml(
+                                statement,
+                                delete.table.name,
+                                view.base.name,
+                                view.base.schema.expect("view base is qualified"),
+                                view.columns,
+                                storage,
+                                txn.txid,
+                                arena,
+                            ) {
+                                Ok(Stmt::Delete(rewritten)) => rewritten,
+                                Ok(_) => unreachable!("delete rewrite keeps its statement kind"),
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            let where_clause = match query::and_where(
+                                view.where_clause,
+                                rewritten.where_clause,
+                                arena,
+                            ) {
+                                Ok(where_clause) => where_clause,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            match arena.alloc(Delete {
+                                table: view.base,
+                                using: rewritten.using,
+                                where_clause,
+                                returning: rewritten.returning,
+                            }) {
+                                Ok(rewritten) => &*rewritten,
+                                Err(_) => return Ok(Err(query::arena_full_pub())),
+                            }
+                        }
+                        Ok(None) => delete,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                exec::delete(
+                    storage, txn, scratch, delete, arena, params, responder, capture,
+                )
+            }
+            _ => Ok(Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "expected a data-modifying statement"
+            ))),
+        }
     }
 
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
@@ -1639,6 +1940,53 @@ impl Engine {
         txn.begin_command();
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         match statement {
+            Stmt::With { ctes, statement } => {
+                let dml_mats = match self.run_dml_ctes(ctes, txn, arena, params, guc, responder) {
+                    Ok(materialized) => materialized.unwrap_or(&[]),
+                    Err(error) => return Ok(Err(error)),
+                };
+                let statement = match query::expand_dml_ctes(
+                    statement,
+                    ctes,
+                    &self.storage,
+                    txn.txid,
+                    &self.work,
+                    params,
+                    dml_mats,
+                ) {
+                    Ok(expanded) => expanded,
+                    Err(error) => return Ok(Err(error)),
+                };
+                match statement {
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                        Self::execute_data_modification(
+                            &mut self.storage,
+                            &mut self.scratch,
+                            &self.work,
+                            statement,
+                            txn,
+                            params,
+                            guc,
+                            responder,
+                            None,
+                        )
+                    }
+                    Stmt::Merge(merge) => exec::merge(
+                        &mut self.storage,
+                        txn,
+                        &mut self.scratch,
+                        merge,
+                        &self.work,
+                        params,
+                        guc.seq_session(),
+                        responder,
+                    ),
+                    _ => Ok(Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "WITH expanded to a non-data-modifying statement"
+                    ))),
+                }
+            }
             Stmt::Select(s) => {
                 // Data-modifying CTEs run once here (capturing RETURNING) under
                 // this statement's command snapshot, before the main query.
@@ -1818,78 +2166,17 @@ impl Engine {
             Stmt::DropIndex { names, if_exists } => {
                 exec::drop_index(&mut self.storage, &mut self.wal, txn, names, *if_exists, responder)
             }
-            Stmt::Insert(i) => {
-                // DML on an auto-updatable view rewrites to its base table.
-                let i = match query::resolve_view_for_dml(&self.storage, i.table, txn.txid, arena) {
-                    Ok(Some(uv)) => {
-                        // Empty target columns default to the view's exposed
-                        // columns, so a base column the view hides is untouched.
-                        let columns = if i.columns.is_empty() { uv.columns } else { i.columns };
-                        match arena.alloc(Insert {
-                            table: uv.base,
-                            columns,
-                            rows: i.rows,
-                            select: i.select,
-                            on_conflict: i.on_conflict,
-                            returning: i.returning,
-                            overriding: i.overriding,
-                        }) {
-                            Ok(ni) => &*ni,
-                            Err(_) => return Ok(Err(query::arena_full_pub())),
-                        }
-                    }
-                    Ok(None) => i,
-                    Err(e) => return Ok(Err(e)),
-                };
-                exec::insert(&mut self.storage, txn, i, arena, params, guc.seq_session(), responder, None)
-            }
-            Stmt::Update(u) => {
-                let u = match query::resolve_view_for_dml(&self.storage, u.table, txn.txid, arena) {
-                    Ok(Some(uv)) => {
-                        let where_clause =
-                            match query::and_where(uv.where_clause, u.where_clause, arena) {
-                                Ok(w) => w,
-                                Err(e) => return Ok(Err(e)),
-                            };
-                        match arena.alloc(Update {
-                            table: uv.base,
-                            assignments: u.assignments,
-                            from: u.from,
-                            where_clause,
-                            returning: u.returning,
-                        }) {
-                            Ok(nu) => &*nu,
-                            Err(_) => return Ok(Err(query::arena_full_pub())),
-                        }
-                    }
-                    Ok(None) => u,
-                    Err(e) => return Ok(Err(e)),
-                };
-                exec::update(&mut self.storage, txn, &mut self.scratch, u, arena, params, guc.seq_session(), responder, None)
-            }
-            Stmt::Delete(d) => {
-                let d = match query::resolve_view_for_dml(&self.storage, d.table, txn.txid, arena) {
-                    Ok(Some(uv)) => {
-                        let where_clause =
-                            match query::and_where(uv.where_clause, d.where_clause, arena) {
-                                Ok(w) => w,
-                                Err(e) => return Ok(Err(e)),
-                            };
-                        match arena.alloc(Delete {
-                            table: uv.base,
-                            using: d.using,
-                            where_clause,
-                            returning: d.returning,
-                        }) {
-                            Ok(nd) => &*nd,
-                            Err(_) => return Ok(Err(query::arena_full_pub())),
-                        }
-                    }
-                    Ok(None) => d,
-                    Err(e) => return Ok(Err(e)),
-                };
-                exec::delete(&mut self.storage, txn, &mut self.scratch, d, arena, params, responder, None)
-            }
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
+                &mut self.storage,
+                &mut self.scratch,
+                &self.work,
+                statement,
+                txn,
+                params,
+                guc,
+                responder,
+                None,
+            ),
             Stmt::Merge(m) => exec::merge(
                 &mut self.storage,
                 txn,

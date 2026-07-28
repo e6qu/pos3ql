@@ -8,8 +8,9 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    Cte, Expr, FromClause, Join, JoinKind, MaterializedCte, OrderBy, Select, SelectItem, SetOp,
-    SetQuery, SetTree, TableRef,
+    Cte, Delete, Expr, FromClause, Insert, Join, JoinKind, MaterializedCte, Merge, MergeAction,
+    MergeWhen, OnConflict, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree, Stmt, TableRef,
+    Update,
 };
 use crate::sql::eval::{sqlstate, SqlError};
 use crate::sql::exec::MAX_PROJ;
@@ -24,7 +25,7 @@ use super::{arena_full, check_timeout, MAX_JOIN_TABLES};
 /// describe path, which needs the shape but not the rows.
 pub fn expand_ctes<'a>(
     sel: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
@@ -46,7 +47,7 @@ pub fn expand_ctes_under<'a>(
 
 fn expand_ctes_with_path<'a>(
     sel: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     path: Option<crate::storage::PathContext>,
     arena: &'a Arena,
@@ -73,6 +74,7 @@ fn expand_ctes_with_path<'a>(
             txid,
             depth: 0,
             path,
+            qualifier: None,
         };
         // A self-referencing recursive CTE cannot be inlined; this schema-only
         // path (Describe / view validation) binds its non-recursive term,
@@ -97,6 +99,7 @@ fn expand_ctes_with_path<'a>(
         txid,
         depth: 0,
         path,
+        qualifier: None,
     };
     subst_select(sel, context, arena)
 }
@@ -107,7 +110,7 @@ fn expand_ctes_with_path<'a>(
 /// resolve to the finished row set.
 pub fn expand_ctes_exec<'a>(
     sel: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -116,20 +119,226 @@ pub fn expand_ctes_exec<'a>(
     if sel.with.is_empty() && !storage.has_any_view() {
         return Ok(sel);
     }
-    if sel.with.len() > crate::sql::parser::MAX_CTES {
+    with_exec_context(
+        sel.with,
+        sel,
+        storage,
+        txid,
+        arena,
+        params,
+        dml_mats,
+        |context| subst_select(sel, context, arena),
+    )
+}
+
+/// Expands a `WITH` list into a data-modifying main statement. The returned
+/// AST borrows only the statement arena and materialized CTE rows, never the
+/// catalog borrow used while resolving names. That separation is what permits
+/// the caller to mutate storage after expansion.
+pub fn expand_dml_ctes<'a>(
+    statement: &'a Stmt<'a>,
+    with: &'a [Cte<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let placeholder = match statement {
+        Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
+        _ => &EMPTY_SELECT,
+    };
+    with_exec_context(
+        with,
+        placeholder,
+        storage,
+        txid,
+        arena,
+        params,
+        dml_mats,
+        |context| {
+            let expanded = match statement {
+                Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+                Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+                Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+                Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "WITH main statement must be INSERT, UPDATE, DELETE, or MERGE"
+                    ));
+                }
+            };
+            Ok(&*arena.alloc(expanded).map_err(|_| arena_full())?)
+        },
+    )
+}
+
+/// Rebinds a data-modifying statement from an auto-updatable view to its base
+/// relation without losing qualified target references or the view's exposed
+/// RETURNING shape.
+#[allow(clippy::too_many_arguments)]
+pub fn rewrite_view_dml<'a>(
+    statement: &'a Stmt<'a>,
+    view_name: &'a str,
+    base_name: &'a str,
+    base_schema: &'a str,
+    exposed_columns: &'a [&'a str],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let context = Subst {
+        ctes: &[],
+        materialized: &[],
+        storage,
+        txid,
+        depth: 0,
+        path: None,
+        qualifier: Some(ViewQualifier {
+            from: view_name,
+            to: base_name,
+            to_schema: base_schema,
+        }),
+    };
+    let expanded_returning =
+        |items| expand_view_returning(items, view_name, exposed_columns, arena);
+    let rewritten = match statement {
+        Stmt::Insert(insert) => {
+            for column in insert.columns {
+                require_view_column(view_name, exposed_columns, column)?;
+            }
+            let adjusted = Insert {
+                returning: expanded_returning(insert.returning)?,
+                ..*insert
+            };
+            let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
+            Stmt::Insert(subst_insert(&*adjusted, context, arena)?)
+        }
+        Stmt::Update(update) => {
+            for (column, _) in update.assignments {
+                require_view_column(view_name, exposed_columns, column)?;
+            }
+            let adjusted = Update {
+                returning: expanded_returning(update.returning)?,
+                ..*update
+            };
+            let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
+            Stmt::Update(subst_update(&*adjusted, context, arena)?)
+        }
+        Stmt::Delete(delete) => {
+            let adjusted = Delete {
+                returning: expanded_returning(delete.returning)?,
+                ..*delete
+            };
+            let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
+            Stmt::Delete(subst_delete(&*adjusted, context, arena)?)
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view rewrite expected INSERT, UPDATE, or DELETE"
+            ));
+        }
+    };
+    Ok(&*arena.alloc(rewritten).map_err(|_| arena_full())?)
+}
+
+fn require_view_column(
+    view_name: &str,
+    exposed_columns: &[&str],
+    column: &str,
+) -> Result<(), SqlError> {
+    if exposed_columns.contains(&column) {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_COLUMN,
+        "column \"{}\" of relation \"{}\" does not exist",
+        column,
+        view_name
+    ))
+}
+
+fn expand_view_returning<'a>(
+    items: &'a [SelectItem<'a>],
+    view_name: &'a str,
+    exposed_columns: &'a [&'a str],
+    arena: &'a Arena,
+) -> Result<&'a [SelectItem<'a>], SqlError> {
+    let extra = items.iter().fold(0usize, |count, item| {
+        count
+            + match item {
+                SelectItem::Wildcard => exposed_columns.len().saturating_sub(1),
+                SelectItem::TableWildcard(qualifier) if *qualifier == view_name => {
+                    exposed_columns.len().saturating_sub(1)
+                }
+                _ => 0,
+            }
+    });
+    let output_len = items.len().saturating_add(extra);
+    if output_len > MAX_PROJ {
+        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "RETURNING list is too wide"));
+    }
+    let mut output = [SelectItem::Wildcard; MAX_PROJ];
+    let mut count = 0usize;
+    for item in items {
+        if matches!(item, SelectItem::Wildcard)
+            || matches!(item, SelectItem::TableWildcard(qualifier) if *qualifier == view_name)
+        {
+            for column in exposed_columns {
+                let expression = arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(view_name),
+                        name: column,
+                    })
+                    .map_err(|_| arena_full())?;
+                output[count] = SelectItem::Expr {
+                    expression: &*expression,
+                    alias: Some(column),
+                };
+                count += 1;
+            }
+        } else {
+            output[count] = *item;
+            count += 1;
+        }
+    }
+    arena
+        .alloc_slice_copy(&output[..count])
+        .map(|items| &*items)
+        .map_err(|_| arena_full())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_exec_context<'a, 's, R>(
+    with: &'a [Cte<'a>],
+    placeholder: &'a Select<'a>,
+    storage: &'s Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
+    build: impl for<'c> FnOnce(Subst<'c, 'a, 's>) -> Result<R, SqlError>,
+) -> Result<R, SqlError> {
+    if with.len() > crate::sql::parser::MAX_CTES {
         return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many WITH entries"));
     }
     let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
-        [("", sel, &[]); crate::sql::parser::MAX_CTES];
+        [("", placeholder, &[]); crate::sql::parser::MAX_CTES];
     let mut n = 0;
     let mut materialized: [(&'a str, &'a MaterializedCte<'a>); crate::sql::parser::MAX_CTES] =
         [("", &EMPTY_CTE); crate::sql::parser::MAX_CTES];
     let mut nm = 0;
-    for cte in sel.with {
+    for cte in with {
         if resolved[..n].iter().any(|(name, _, _)| *name == cte.name)
             || materialized[..nm].iter().any(|(name, _)| *name == cte.name)
         {
-            return Err(sql_err!(sqlstate::DUPLICATE_ALIAS, "WITH query name \"{}\" specified more than once", cte.name));
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "WITH query name \"{}\" specified more than once",
+                cte.name
+            ));
         }
         let context = Subst {
             ctes: &resolved[..n],
@@ -138,14 +347,13 @@ pub fn expand_ctes_exec<'a>(
             txid,
             depth: 0,
             path: None,
+            qualifier: None,
         };
         if cte.dml.is_some() {
-            // A data-modifying CTE was already run and captured (see
-            // `Engine::run_dml_ctes`); bind its RETURNING rows by name.
-            let m = dml_mats
+            let materialized_cte = dml_mats
                 .iter()
                 .find(|(name, _)| *name == cte.name)
-                .map(|(_, m)| *m)
+                .map(|(_, materialized_cte)| *materialized_cte)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -153,15 +361,16 @@ pub fn expand_ctes_exec<'a>(
                         cte.name
                     )
                 })?;
-            materialized[nm] = (cte.name, m);
+            materialized[nm] = (cte.name, materialized_cte);
             nm += 1;
         } else if cte.recursive && select_references(cte.query, cte.name) > 0 {
-            let m = materialize_recursive(cte, context, storage, txid, arena, params)?;
-            materialized[nm] = (cte.name, m);
+            let recursive =
+                materialize_recursive(cte, context, storage, txid, arena, params)?;
+            materialized[nm] = (cte.name, recursive);
             nm += 1;
         } else {
-            let q = subst_select(cte.query, context, arena)?;
-            resolved[n] = (cte.name, q, cte.columns);
+            let query = subst_select(cte.query, context, arena)?;
+            resolved[n] = (cte.name, query, cte.columns);
             n += 1;
         }
     }
@@ -172,8 +381,9 @@ pub fn expand_ctes_exec<'a>(
         txid,
         depth: 0,
         path: None,
+        qualifier: None,
     };
-    subst_select(sel, context, arena)
+    build(context)
 }
 
 /// Describes a whole set-operation query (Describe path): expands CTEs and
@@ -256,6 +466,24 @@ fn wrap_set_tree_with<'a>(
 static EMPTY_CTE: MaterializedCte<'static> =
     MaterializedCte { column_names: &[], column_types: &[], rows: &[] };
 
+static EMPTY_SELECT: Select<'static> = Select {
+    items: &[],
+    distinct: false,
+    distinct_on: &[],
+    from: None,
+    where_clause: None,
+    group_by: &[],
+    grouping_sets: &[],
+    having: None,
+    order_by: &[],
+    limit: None,
+    offset: None,
+    with_ties: false,
+    with: &[],
+    set_body: None,
+    locking: &[],
+};
+
 type CteBindings<'a> = [(&'a str, &'a Select<'a>, &'a [&'a str])];
 
 /// Threaded through the FROM-reference rewrite: CTE bindings in scope (query
@@ -263,10 +491,10 @@ type CteBindings<'a> = [(&'a str, &'a Select<'a>, &'a [&'a str])];
 /// resolve view names), and the current view-expansion depth (a cycle /
 /// runaway-nesting guard).
 #[derive(Clone, Copy)]
-struct Subst<'c, 'a> {
+struct Subst<'c, 'a, 's> {
     ctes: &'c CteBindings<'a>,
     materialized: &'c [(&'a str, &'a MaterializedCte<'a>)],
-    storage: &'a Storage,
+    storage: &'s Storage,
     /// The requesting transaction, for catalog visibility (a view another
     /// transaction created but has not committed is invisible here).
     txid: u32,
@@ -275,6 +503,16 @@ struct Subst<'c, 'a> {
     /// are rewritten fully qualified under it, so the surrounding statement's
     /// path cannot re-bind them. `None` at the statement level.
     path: Option<crate::storage::PathContext>,
+    /// DML on an auto-updatable view is executed against its base table.
+    /// Qualified target references must follow that rewrite too.
+    qualifier: Option<ViewQualifier<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct ViewQualifier<'a> {
+    from: &'a str,
+    to: &'a str,
+    to_schema: &'a str,
 }
 
 const MAX_VIEW_DEPTH: u32 = 12;
@@ -467,8 +705,8 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
 /// with arena exhaustion, and the statement timeout is honored per iteration.
 fn materialize_recursive<'a>(
     cte: &'a Cte<'a>,
-    outer: Subst<'_, 'a>,
-    storage: &'a Storage,
+    outer: Subst<'_, 'a, '_>,
+    storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -510,7 +748,11 @@ fn materialize_recursive<'a>(
     let column_names: &'a [&'a str] = {
         let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
         for (i, slot) in names.iter_mut().enumerate().take(ncols) {
-            *slot = cte.columns.get(i).copied().unwrap_or(described[i].name);
+            let name = cte.columns.get(i).copied().unwrap_or(described[i].name);
+            // A described base-table column name may borrow the catalog.
+            // Recursive CTE metadata survives past that immutable borrow, so
+            // own every output name in the statement arena.
+            *slot = arena.alloc_str(name).map_err(|_| arena_full())?;
         }
         arena.alloc_slice_copy(&names[..ncols]).map_err(|_| arena_full())?
     };
@@ -552,7 +794,15 @@ fn materialize_recursive<'a>(
             .alloc(MaterializedCte { column_names, column_types, rows: working })
             .map_err(|_| arena_full())?;
         let binding = [(cte.name, &*working_cte)];
-        let context = Subst { ctes: &[], materialized: &binding, storage, txid: outer.txid, depth: 0, path: None };
+        let context = Subst {
+            ctes: &[],
+            materialized: &binding,
+            storage,
+            txid: outer.txid,
+            depth: 0,
+            path: None,
+            qualifier: None,
+        };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
         // The recursive term's column types must agree with the non-recursive
         // term's (PostgreSQL unifies them; a mismatch is a loud error).
@@ -613,31 +863,20 @@ fn materialize_recursive<'a>(
 
 fn subst_select<'a>(
     s: &'a Select<'a>,
-    context: Subst<'_, 'a>,
+    mut context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
+    if let (Some(qualifier), Some(from)) = (context.qualifier, s.from)
+        && from_shadows_qualifier(&from, qualifier.from)
+    {
+        context.qualifier = None;
+    }
     let from = match &s.from {
         Some(f) => Some(subst_from(f, context, arena)?),
         None => None,
     };
-    let mut items = [SelectItem::Wildcard; MAX_PROJ];
-    if s.items.len() > MAX_PROJ {
-        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"));
-    }
-    for (i, it) in s.items.iter().enumerate() {
-        items[i] = match it {
-            SelectItem::Wildcard => SelectItem::Wildcard,
-            SelectItem::TableWildcard(q) => SelectItem::TableWildcard(q),
-            SelectItem::RecordStar(base) => {
-                SelectItem::RecordStar(subst_expr(base, context, arena)?)
-            }
-            SelectItem::Expr { expression, alias } => SelectItem::Expr {
-                expression: subst_expr(expression, context, arena)?,
-                alias: *alias,
-            },
-        };
-    }
-    let items = arena.alloc_slice_copy(&items[..s.items.len()]).map_err(|_| arena_full())?;
+    let items = subst_select_items(s.items, context, arena)?;
+    let distinct_on = subst_expr_slice(s.distinct_on, context, arena)?;
     let group_by = subst_expr_slice(s.group_by, context, arena)?;
     // Grouping-set bitmasks index into `group_by`; substitution preserves the
     // column order and count, so they carry over unchanged.
@@ -658,7 +897,7 @@ fn subst_select<'a>(
     let new = Select {
         items,
         distinct: s.distinct,
-        distinct_on: s.distinct_on,
+        distinct_on,
         from,
         where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,
@@ -670,16 +909,203 @@ fn subst_select<'a>(
         with_ties: s.with_ties,
         with: &[],
         set_body,
-        locking: &[],
+        locking: s.locking,
     };
     Ok(&*arena.alloc(new).map_err(|_| arena_full())?)
+}
+
+fn from_shadows_qualifier(from: &FromClause<'_>, qualifier: &str) -> bool {
+    let shadows = |table: &TableRef<'_>| table.alias.unwrap_or(table.table) == qualifier;
+    shadows(&from.base) || from.joins.iter().any(|join| shadows(&join.table))
+}
+
+fn subst_select_items<'a>(
+    source: &'a [SelectItem<'a>],
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<&'a [SelectItem<'a>], SqlError> {
+    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    if source.len() > MAX_PROJ {
+        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"));
+    }
+    for (i, item) in source.iter().enumerate() {
+        items[i] = match item {
+            SelectItem::Wildcard => SelectItem::Wildcard,
+            SelectItem::TableWildcard(qualifier) => {
+                SelectItem::TableWildcard(match context.qualifier {
+                    Some(rewrite) if *qualifier == rewrite.from => rewrite.to,
+                    _ => qualifier,
+                })
+            }
+            SelectItem::RecordStar(base) => {
+                SelectItem::RecordStar(subst_expr(base, context, arena)?)
+            }
+            SelectItem::Expr { expression, alias } => SelectItem::Expr {
+                expression: subst_expr(expression, context, arena)?,
+                alias: *alias,
+            },
+        };
+    }
+    arena
+        .alloc_slice_copy(&items[..source.len()])
+        .map(|items| &*items)
+        .map_err(|_| arena_full())
+}
+
+fn subst_assignments<'a>(
+    source: &'a [(&'a str, &'a Expr<'a>)],
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
+    if source.len() > crate::sql::parser::MAX_LIST {
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "assignment list too long"));
+    }
+    let mut assignments = [("", &Expr::Null); crate::sql::parser::MAX_LIST];
+    for (index, (column, expression)) in source.iter().enumerate() {
+        assignments[index] = (column, subst_expr(expression, context, arena)?);
+    }
+    arena
+        .alloc_slice_copy(&assignments[..source.len()])
+        .map(|assignments| &*assignments)
+        .map_err(|_| arena_full())
+}
+
+fn subst_insert<'a>(
+    statement: &'a Insert<'a>,
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<Insert<'a>, SqlError> {
+    if statement.rows.len() > crate::sql::parser::MAX_LIST {
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "VALUES list too long"));
+    }
+    let mut rows: [&[&Expr]; crate::sql::parser::MAX_LIST] =
+        [&[]; crate::sql::parser::MAX_LIST];
+    for (index, row) in statement.rows.iter().enumerate() {
+        rows[index] = subst_expr_slice(row, context, arena)?;
+    }
+    let rows = arena
+        .alloc_slice_copy(&rows[..statement.rows.len()])
+        .map_err(|_| arena_full())?;
+    let select = match statement.select {
+        Some(select) => Some(subst_select(select, context, arena)?),
+        None => None,
+    };
+    let on_conflict = match statement.on_conflict {
+        Some(conflict) => Some(OnConflict {
+            target: conflict.target,
+            constraint: conflict.constraint,
+            update: match conflict.update {
+                Some(assignments) => Some(subst_assignments(assignments, context, arena)?),
+                None => None,
+            },
+            update_where: opt_subst(conflict.update_where, context, arena)?,
+        }),
+        None => None,
+    };
+    Ok(Insert {
+        table: statement.table,
+        columns: statement.columns,
+        rows,
+        select,
+        on_conflict,
+        returning: subst_select_items(statement.returning, context, arena)?,
+        overriding: statement.overriding,
+    })
+}
+
+fn subst_update<'a>(
+    statement: &'a Update<'a>,
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<Update<'a>, SqlError> {
+    Ok(Update {
+        table: statement.table,
+        assignments: subst_assignments(statement.assignments, context, arena)?,
+        from: match statement.from {
+            Some(from) => Some(
+                &*arena
+                    .alloc(subst_from(from, context, arena)?)
+                    .map_err(|_| arena_full())?,
+            ),
+            None => None,
+        },
+        where_clause: opt_subst(statement.where_clause, context, arena)?,
+        returning: subst_select_items(statement.returning, context, arena)?,
+    })
+}
+
+fn subst_delete<'a>(
+    statement: &'a Delete<'a>,
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<Delete<'a>, SqlError> {
+    Ok(Delete {
+        table: statement.table,
+        using: match statement.using {
+            Some(using) => Some(
+                &*arena
+                    .alloc(subst_from(using, context, arena)?)
+                    .map_err(|_| arena_full())?,
+            ),
+            None => None,
+        },
+        where_clause: opt_subst(statement.where_clause, context, arena)?,
+        returning: subst_select_items(statement.returning, context, arena)?,
+    })
+}
+
+fn subst_merge<'a>(
+    statement: &'a Merge<'a>,
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<Merge<'a>, SqlError> {
+    if statement.whens.len() > crate::sql::parser::MAX_LIST {
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "MERGE action list too long"));
+    }
+    let mut whens = [MergeWhen {
+        matched: false,
+        cond: None,
+        action: MergeAction::DoNothing,
+    }; crate::sql::parser::MAX_LIST];
+    for (index, when) in statement.whens.iter().enumerate() {
+        let action = match when.action {
+            MergeAction::Update(assignments) => {
+                MergeAction::Update(subst_assignments(assignments, context, arena)?)
+            }
+            MergeAction::Delete => MergeAction::Delete,
+            MergeAction::Insert {
+                columns,
+                values,
+                default_values,
+            } => MergeAction::Insert {
+                columns,
+                values: subst_expr_slice(values, context, arena)?,
+                default_values,
+            },
+            MergeAction::DoNothing => MergeAction::DoNothing,
+        };
+        whens[index] = MergeWhen {
+            matched: when.matched,
+            cond: opt_subst(when.cond, context, arena)?,
+            action,
+        };
+    }
+    Ok(Merge {
+        target: statement.target,
+        target_alias: statement.target_alias,
+        source: subst_tableref(&statement.source, context, arena)?,
+        on: subst_expr(statement.on, context, arena)?,
+        whens: arena
+            .alloc_slice_copy(&whens[..statement.whens.len()])
+            .map_err(|_| arena_full())?,
+    })
 }
 
 /// Substitutes parameters through every leaf SELECT of a set-operation tree,
 /// mirroring [`subst_select`] for a set-operator subquery body.
 fn subst_set_tree<'a>(
     tree: &'a SetTree<'a>,
-    context: Subst<'_, 'a>,
+    context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
     let out = match tree {
@@ -696,7 +1122,7 @@ fn subst_set_tree<'a>(
 
 fn subst_from<'a>(
     f: &'a FromClause<'a>,
-    context: Subst<'_, 'a>,
+    context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<FromClause<'a>, SqlError> {
     let base = subst_tableref(&f.base, context, arena)?;
@@ -721,7 +1147,7 @@ fn subst_from<'a>(
 
 fn subst_tableref<'a>(
     t: &TableRef<'a>,
-    context: Subst<'_, 'a>,
+    context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<TableRef<'a>, SqlError> {
     if let Some(sub) = t.subquery {
@@ -807,6 +1233,7 @@ fn subst_tableref<'a>(
             txid: context.txid,
             depth: context.depth + 1,
             path: Some(view_path),
+            qualifier: None,
         };
         let expanded = subst_select(vsel, inner, arena)?;
         return Ok(TableRef {
@@ -838,7 +1265,7 @@ fn subst_tableref<'a>(
 
 fn opt_subst<'a>(
     e: Option<&'a Expr<'a>>,
-    context: Subst<'_, 'a>,
+    context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<Option<&'a Expr<'a>>, SqlError> {
     match e {
@@ -849,10 +1276,10 @@ fn opt_subst<'a>(
 
 fn subst_expr_slice<'a>(
     xs: &'a [&'a Expr<'a>],
-    context: Subst<'_, 'a>,
+    context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [&'a Expr<'a>], SqlError> {
-    if !xs.iter().any(|x| expr_has_subquery(x)) {
+    if context.qualifier.is_none() && !xs.iter().any(|x| expr_has_subquery(x)) {
         return Ok(xs);
     }
     let mut tmp = [&Expr::Null; crate::sql::parser::MAX_LIST];
@@ -875,9 +1302,20 @@ fn expr_has_subquery(e: &Expr) -> bool {
         | Expr::Cast { operand, .. }
         | Expr::IsNull { operand, .. } => expr_has_subquery(operand),
         Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
-        Expr::Call { args, order_by, .. } => {
+        Expr::Call { args, order_by, over, filter, .. } => {
             args.iter().any(|a| expr_has_subquery(a))
                 || order_by.iter().any(|o| expr_has_subquery(o.expression))
+                || filter.is_some_and(expr_has_subquery)
+                || over.is_some_and(|window| {
+                    window.partition_by.iter().any(|expression| expr_has_subquery(expression))
+                        || window.order_by.iter().any(|order| {
+                            expr_has_subquery(order.expression)
+                        })
+                        || window.frame.is_some_and(|frame| {
+                            frame_bound_has_subquery(frame.start)
+                                || frame_bound_has_subquery(frame.end)
+                        })
+                })
         }
         Expr::InList { operand, list, .. } => {
             expr_has_subquery(operand) || list.iter().any(|a| expr_has_subquery(a))
@@ -885,7 +1323,12 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Between { operand, low, high, .. } => {
             expr_has_subquery(operand) || expr_has_subquery(low) || expr_has_subquery(high)
         }
-        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+        Expr::Like { operand, pattern, escape, .. } => {
+            expr_has_subquery(operand)
+                || expr_has_subquery(pattern)
+                || escape.is_some_and(expr_has_subquery)
+        }
+        Expr::Match { operand, pattern, .. } => {
             expr_has_subquery(operand) || expr_has_subquery(pattern)
         }
         Expr::Case { operand, whens, otherwise, .. } => {
@@ -893,16 +1336,51 @@ fn expr_has_subquery(e: &Expr) -> bool {
                 || whens.iter().any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
                 || otherwise.is_some_and(expr_has_subquery)
         }
+        Expr::Array(items) => items.iter().any(|item| expr_has_subquery(item)),
+        Expr::Subscript { base, index } => expr_has_subquery(base) || expr_has_subquery(index),
+        Expr::Slice { base, lower, upper } => {
+            expr_has_subquery(base)
+                || lower.is_some_and(expr_has_subquery)
+                || upper.is_some_and(expr_has_subquery)
+        }
+        Expr::Field { base, .. } => expr_has_subquery(base),
+        Expr::AnyAll { operand, array, .. } => {
+            expr_has_subquery(operand) || expr_has_subquery(array)
+        }
         _ => false,
     }
 }
 
+fn frame_bound_has_subquery(bound: crate::sql::ast::FrameBound<'_>) -> bool {
+    match bound {
+        crate::sql::ast::FrameBound::Preceding(expression)
+        | crate::sql::ast::FrameBound::Following(expression) => expr_has_subquery(expression),
+        _ => false,
+    }
+}
+
+fn subst_frame_bound<'a>(
+    bound: crate::sql::ast::FrameBound<'a>,
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<crate::sql::ast::FrameBound<'a>, SqlError> {
+    Ok(match bound {
+        crate::sql::ast::FrameBound::Preceding(expression) => {
+            crate::sql::ast::FrameBound::Preceding(subst_expr(expression, context, arena)?)
+        }
+        crate::sql::ast::FrameBound::Following(expression) => {
+            crate::sql::ast::FrameBound::Following(subst_expr(expression, context, arena)?)
+        }
+        other => other,
+    })
+}
+
 fn subst_expr<'a>(
     e: &'a Expr<'a>,
-    context: Subst<'_, 'a>,
+    context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    if !expr_has_subquery(e) {
+    if context.qualifier.is_none() && !expr_has_subquery(e) {
         return Ok(e);
     }
     let rebuilt = match e {
@@ -949,13 +1427,27 @@ fn subst_expr<'a>(
                 Some(w) => {
                     let mut ob2 = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
                         crate::sql::parser::MAX_LIST];
+                    if w.order_by.len() > ob2.len() {
+                        return Err(sql_err!(
+                            sqlstate::TOO_MANY_ARGUMENTS,
+                            "window ORDER BY list too long"
+                        ));
+                    }
                     for (i, o) in w.order_by.iter().enumerate() {
                         ob2[i] = OrderBy { expression: subst_expr(o.expression, context, arena)?, ..*o };
                     }
+                    let frame = match w.frame {
+                        Some(frame) => Some(crate::sql::ast::WindowFrame {
+                            start: subst_frame_bound(frame.start, context, arena)?,
+                            end: subst_frame_bound(frame.end, context, arena)?,
+                            ..frame
+                        }),
+                        None => None,
+                    };
                     let spec = crate::sql::ast::WindowSpec {
                         partition_by: subst_expr_slice(w.partition_by, context, arena)?,
                         order_by: arena.alloc_slice_copy(&ob2[..w.order_by.len()]).map_err(|_| arena_full())?,
-                        frame: w.frame,
+                        frame,
                     };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
                 }
@@ -1015,6 +1507,45 @@ fn subst_expr<'a>(
                 synthetic: *synthetic,
             }
         }
+        Expr::Array(items) => Expr::Array(subst_expr_slice(items, context, arena)?),
+        Expr::Subscript { base, index } => Expr::Subscript {
+            base: subst_expr(base, context, arena)?,
+            index: subst_expr(index, context, arena)?,
+        },
+        Expr::Slice { base, lower, upper } => Expr::Slice {
+            base: subst_expr(base, context, arena)?,
+            lower: opt_subst(*lower, context, arena)?,
+            upper: opt_subst(*upper, context, arena)?,
+        },
+        Expr::Field { base, field } => Expr::Field {
+            base: subst_expr(base, context, arena)?,
+            field,
+        },
+        Expr::AnyAll { operand, operator, array, all } => Expr::AnyAll {
+            operand: subst_expr(operand, context, arena)?,
+            operator: *operator,
+            array: subst_expr(array, context, arena)?,
+            all: *all,
+        },
+        Expr::Column { qualifier, name } => Expr::Column {
+            qualifier: match (*qualifier, context.qualifier) {
+                (Some(written), Some(rewrite)) if written == rewrite.from => Some(rewrite.to),
+                _ => *qualifier,
+            },
+            name,
+        },
+        Expr::WholeRow(qualifier) => Expr::WholeRow(match context.qualifier {
+            Some(rewrite) if *qualifier == rewrite.from => rewrite.to,
+            _ => qualifier,
+        }),
+        Expr::SchemaColumn { schema, table, name } => match context.qualifier {
+            Some(rewrite) if *table == rewrite.from => Expr::SchemaColumn {
+                schema: rewrite.to_schema,
+                table: rewrite.to,
+                name,
+            },
+            _ => Expr::SchemaColumn { schema, table, name },
+        },
         // Leaves never reach here (guarded by expr_has_subquery above).
         other => *other,
     };

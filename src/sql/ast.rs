@@ -21,6 +21,14 @@ impl<'a> QualName<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stmt<'a> {
     Select(Select<'a>),
+    /// A `WITH` clause whose main statement modifies data. Query main
+    /// statements carry their CTEs directly on [`Select`] / [`SetQuery`];
+    /// keeping DML in this wrapper avoids four duplicate `with` fields and
+    /// makes it impossible for execution to accept and then lose the clause.
+    With {
+        ctes: &'a [Cte<'a>],
+        statement: &'a Stmt<'a>,
+    },
     CreateTable(CreateTable<'a>),
     Insert(Insert<'a>),
     Update(Update<'a>),

@@ -1172,7 +1172,7 @@ impl<'a> Parser<'a> {
             }
         }
         let ctes = self.arena_slice(&ctes[..n])?;
-        match self.query()? {
+        match self.statement()? {
             Stmt::Select(mut sel) => {
                 sel.with = ctes;
                 Ok(Stmt::Select(sel))
@@ -1181,7 +1181,17 @@ impl<'a> Parser<'a> {
                 q.with = ctes;
                 Ok(Stmt::SetQuery(q))
             }
-            _ => Err(self.err_here("WITH must be followed by SELECT")),
+            statement @ (Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)) => {
+                let statement = self
+                    .arena
+                    .alloc(statement)
+                    .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                Ok(Stmt::With {
+                    ctes,
+                    statement: &*statement,
+                })
+            }
+            _ => Err(self.err_here("WITH must be followed by SELECT, INSERT, UPDATE, DELETE, or MERGE")),
         }
     }
 

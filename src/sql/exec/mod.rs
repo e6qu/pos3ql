@@ -22,7 +22,10 @@ use super::ast::{
     AlterAction, AlterTable, CreateTable, Delete, DropTable, Expr, Insert, LikeClause, Overriding,
     QualName, SelectItem, Update,
 };
-use super::eval::{cast_to, compare_datums, eval, sqlstate, ColumnLookup, NoColumns, SqlError};
+use super::eval::{
+    cast_to, compare_datums, eval, eval_full, sqlstate, ColumnLookup, EvalHooks, NoColumns,
+    SqlError, NO_HOOKS,
+};
 use super::types::{ColDesc, ColType, Datum, TypeMod};
 
 /// Wildcard expansion can double the select list.
@@ -907,8 +910,29 @@ fn handle_conflict<'a>(
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
         rowenc::decode(bytes, schema, &mut existing)?;
         let context = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
+        let mut subquery_expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+        let mut subquery_expression_count = 0usize;
+        if let Some(condition) = oc.update_where {
+            subquery_expressions[subquery_expression_count] = Some(condition);
+            subquery_expression_count += 1;
+        }
+        for (_, expression) in assigns {
+            subquery_expressions[subquery_expression_count] = Some(expression);
+            subquery_expression_count += 1;
+        }
+        let subqueries = super::query::subquery_hooks(
+            &subquery_expressions[..subquery_expression_count],
+            storage,
+            txn.txid,
+            arena,
+            params,
+        )?;
+        let hooks = EvalHooks { subs: Some(&subqueries), ..NO_HOOKS };
         if let Some(cond) = oc.update_where
-            && !matches!(eval(cond, arena, params, &context)?, Datum::Bool(true))
+            && !matches!(
+                eval_full(cond, arena, params, &context, &hooks)?,
+                Datum::Bool(true)
+            )
         {
             return Ok(ConflictOutcome::Skip); // WHERE excluded this row
         }
@@ -923,7 +947,7 @@ fn handle_conflict<'a>(
                     def.name.as_str()
                 ));
             };
-            let v = eval(expression, arena, params, &context)?;
+            let v = eval_full(expression, arena, params, &context, &hooks)?;
             new_values[target] = coerce(v, &def.columns()[target], storage, arena)?;
         }
         check_not_null(def, &new_values)?;
@@ -6994,7 +7018,7 @@ pub fn insert(
                     Ok(ConflictOutcome::Updated(row_bytes)) => {
                         inserted += 1;
                         if !statement.returning.is_empty()
-                            && let Err(e) = emit_conflict_returning(&def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
+                            && let Err(e) = emit_conflict_returning(storage, txn.txid, &def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
                                 return sql_fail(e);
                             }
                         continue;
@@ -7022,7 +7046,7 @@ pub fn insert(
                 return sql_fail(e);
             }
             if !statement.returning.is_empty()
-                && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
+                && let Err(e) = emit_projected(storage, txn.txid, &def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
                     return sql_fail(e);
                 }
             inserted += 1;
@@ -7075,11 +7099,26 @@ pub fn insert(
             // A per-row sequence evaluator (`nextval`/`setval` in a VALUES item
             // or a DEFAULT expression advance once per row). Scoped so its shared
             // `&storage` borrow ends before the row is written mutably below.
+            let mut subquery_expressions: [Option<&Expr>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            for (index, expression) in row_exprs.iter().enumerate() {
+                subquery_expressions[index] = Some(expression);
+            }
+            let subqueries = match super::query::subquery_hooks(
+                &subquery_expressions[..row_exprs.len()],
+                storage,
+                txn.txid,
+                arena,
+                params,
+            ) {
+                Ok(subqueries) => subqueries,
+                Err(error) => return sql_fail(error),
+            };
             let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
             let catalog = super::query::storage_catalog(storage, txn.txid);
             let hooks = super::eval::EvalHooks {
                 catalog: Some(&catalog),
                 sequences: Some(&seq),
+                subs: Some(&subqueries),
                 ..super::eval::NO_HOOKS
             };
             for (i, expression) in row_exprs.iter().enumerate() {
@@ -7149,7 +7188,7 @@ pub fn insert(
                 Ok(ConflictOutcome::Updated(row_bytes)) => {
                     inserted += 1;
                     if !statement.returning.is_empty()
-                        && let Err(e) = emit_conflict_returning(&def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
+                        && let Err(e) = emit_conflict_returning(storage, txn.txid, &def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
                             return sql_fail(e);
                         }
                     continue;
@@ -7177,7 +7216,7 @@ pub fn insert(
             return sql_fail(e);
         }
         if !statement.returning.is_empty()
-            && let Err(e) = emit_projected(&def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
+            && let Err(e) = emit_projected(storage, txn.txid, &def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
                 return sql_fail(e);
             }
         inserted += 1;
@@ -7193,8 +7232,10 @@ pub fn insert(
 /// Emits a `RETURNING` row for the row an `ON CONFLICT DO UPDATE` just wrote,
 /// decoding the arena-encoded updated bytes so the projection sees the
 /// post-update values (matching PostgreSQL, which returns the updated row).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_conflict_returning(
+    storage: &Storage,
+    txid: u32,
     def: &TableDef,
     row_bytes: &[u8],
     items: &[SelectItem],
@@ -7209,11 +7250,23 @@ fn emit_conflict_returning(
     if let Err(e) = rowenc::decode(row_bytes, &schema[..def.n_columns], &mut updated) {
         return Ok(Err(e));
     }
-    emit_projected(def, &updated[..def.n_columns], items, arena, params, responder, capture)
+    emit_projected(
+        storage,
+        txid,
+        def,
+        &updated[..def.n_columns],
+        items,
+        arena,
+        params,
+        responder,
+        capture,
+    )
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_projected(
+    storage: &Storage,
+    txid: u32,
     def: &TableDef,
     values: &[Datum],
     items: &[SelectItem],
@@ -7223,6 +7276,31 @@ fn emit_projected(
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let context = RowCtx { def, values };
+    let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut expression_count = 0usize;
+    for item in items {
+        let expression = match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        };
+        if let Some(expression) = expression {
+            expressions[expression_count] = Some(expression);
+            expression_count += 1;
+        }
+    }
+    let subqueries = match super::query::subquery_hooks(
+        &expressions[..expression_count],
+        storage,
+        txid,
+        arena,
+        params,
+    ) {
+        Ok(subqueries) => subqueries,
+        Err(error) => return Ok(Err(error)),
+    };
+    let hooks = EvalHooks { subs: Some(&subqueries), ..NO_HOOKS };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0;
     for item in items {
@@ -7247,7 +7325,7 @@ fn emit_projected(
                 }
             }
             SelectItem::RecordStar(base) => {
-                match super::eval::record_star_expand(base, arena, params, &context, &super::eval::NO_HOOKS) {
+                match super::eval::record_star_expand(base, arena, params, &context, &hooks) {
                     Ok(fields) => {
                         for f in fields {
                             projected[n] = f.value;
@@ -7257,13 +7335,15 @@ fn emit_projected(
                     Err(e) => return Ok(Err(e)),
                 }
             }
-            SelectItem::Expr { expression, .. } => match eval(expression, arena, params, &context) {
+            SelectItem::Expr { expression, .. } => {
+                match eval_full(expression, arena, params, &context, &hooks) {
                 Ok(v) => {
                     projected[n] = v;
                     n += 1;
                 }
                 Err(e) => return Ok(Err(e)),
-            },
+                }
+            }
         }
     }
     // A data-modifying CTE captures its RETURNING rows in memory instead of
@@ -7568,6 +7648,8 @@ pub fn update(
                 return sql_fail(e);
             }
             if let Err(e) = emit_projected(
+                storage,
+                txn.txid,
                 &def,
                 &new_values[..def.n_columns],
                 statement.returning,
@@ -7712,6 +7794,8 @@ pub fn delete(
             }
             if !statement.returning.is_empty()
                 && let Err(e) = emit_projected(
+                    storage,
+                    txn.txid,
                     &def,
                     &old_values[..def.n_columns],
                     statement.returning,
@@ -8667,7 +8751,7 @@ pub fn alter_table(
         return sql_fail(e);
     }
 
-    // Phase 1: build every rewritten image and validate its content
+    // Build every rewritten image and validate its content
     // (NOT NULL / CHECK / foreign keys), all before any journaling, so a
     // failure — a cast error included — leaves the table untouched.
     let checks = match parse_checks(&new_def, arena) {
@@ -8856,7 +8940,7 @@ pub fn alter_table(
         }
     }
 
-    // Phase 2: journal the shape change and the re-homed rows. Every fallible
+    // Journal the shape change and the re-homed rows. Every fallible
     // content step is already done; only WAL append can fail here, and it does
     // so before any in-memory swap.
     let lsn = storage.bump_lsn();
@@ -8873,7 +8957,7 @@ pub fn alter_table(
     for i in 0..scratch.len() {
         let (rowid, new_home) = scratch[i];
         let RowHome::Heap(new_loc) = new_home else {
-            unreachable!("phase 1 re-homes every row to the heap");
+            unreachable!("the rewrite pass re-homes every row to the heap");
         };
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
@@ -8989,7 +9073,7 @@ pub fn alter_table(
         }
     }
 
-    // Phase 3: swap in memory. Nothing here can fail. Every row now has a heap
+    // Swap in memory. Nothing here can fail. Every row now has a heap
     // image, so the old spill SST no longer serves this table.
     storage.set_table_def(table_index, new_def, &column_mapping);
     for i in 0..scratch.len() {
@@ -8998,7 +9082,7 @@ pub fn alter_table(
             .table_mut(table_index)
             .rows
             .get_mut(&rowid)
-            .expect("row existed in phase 1");
+            .expect("row existed during the rewrite pass");
         state.committed = Some(new_home);
     }
     storage.set_spill_list(table_index, &[]);

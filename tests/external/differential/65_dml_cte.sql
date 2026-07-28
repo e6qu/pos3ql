@@ -51,6 +51,54 @@ INSERT INTO dmc_src VALUES (7, 'g');
 WITH r(the_id, the_v) AS (DELETE FROM dmc_src RETURNING id, v)
 SELECT the_id, the_v FROM r;
 
+-- The main statement may be INSERT/UPDATE/DELETE/MERGE, not only SELECT.
+-- Ordinary and recursive query CTEs bind in every DML source position.
+INSERT INTO dmc_src VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+WITH picked AS (SELECT id, v FROM dmc_src WHERE id <= 2 ORDER BY id)
+INSERT INTO dmc_log SELECT id, v FROM picked RETURNING id, v;
+
+WITH picked AS (SELECT 3 AS id, 'C' AS v)
+UPDATE dmc_src SET v = picked.v FROM picked
+WHERE dmc_src.id = picked.id RETURNING dmc_src.id, dmc_src.v;
+
+WITH picked AS (SELECT 4 AS id)
+DELETE FROM dmc_src USING picked
+WHERE dmc_src.id = picked.id RETURNING dmc_src.id;
+
+WITH RECURSIVE numbers(n) AS (
+    VALUES (10) UNION ALL SELECT n + 1 FROM numbers WHERE n < 12
+)
+INSERT INTO dmc_log SELECT n, 'recursive' FROM numbers RETURNING id, v;
+
+WITH incoming AS (
+    SELECT 1 AS id, 'A' AS v UNION ALL SELECT 5, 'e'
+)
+MERGE INTO dmc_src AS target USING incoming AS source
+ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET v = source.v
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v);
+SELECT id, v FROM dmc_src ORDER BY id;
+
+-- Earlier query and data-modifying CTEs feed later data-modifying CTEs, whose
+-- materialized RETURNING rows in turn feed the main DML statement. The main
+-- statement does not see the CTE writes through the base tables (one command
+-- snapshot); it sees them only through the named RETURNING relations.
+CREATE TABLE dmc_final (id int, v text);
+WITH wanted AS (SELECT id FROM dmc_src WHERE id IN (2,3)),
+     moved AS (
+         DELETE FROM dmc_src USING wanted
+         WHERE dmc_src.id = wanted.id
+         RETURNING dmc_src.id, dmc_src.v
+     ),
+     archived AS (
+         INSERT INTO dmc_log
+         SELECT id + 100, v FROM moved
+         RETURNING id, v
+     )
+INSERT INTO dmc_final SELECT id, v FROM archived;
+SELECT id, v FROM dmc_final ORDER BY id;
+
 -- Cleanup.
 DROP TABLE dmc_src;
 DROP TABLE dmc_log;
+DROP TABLE dmc_final;

@@ -1002,6 +1002,15 @@ pub struct SequenceDef {
     pub start_value: i64,
     pub cache: i64,
     pub cycle: bool,
+    /// The table column whose lifetime owns this sequence. Names, rather than
+    /// slots, keep the dependency stable across checkpoint restore and
+    /// catalog-slot reuse.
+    pub owner: Option<SequenceOwner>,
+    /// The serial/identity column whose omitted values this sequence generates.
+    /// This is deliberately separate from `owner`: PostgreSQL permits a serial
+    /// sequence's OWNED BY dependency to be removed without changing the
+    /// column's `nextval` default.
+    pub generator_for: Option<SequenceOwner>,
     /// The last value handed out (meaningful only when `is_called`); on CREATE /
     /// RESTART it holds the start value with `is_called == false`, so the first
     /// `nextval` returns it unchanged (PostgreSQL's `setval(seq, start, false)`).
@@ -1013,6 +1022,35 @@ pub struct SequenceDef {
     pub dirty: Cell<bool>,
     pub live: bool,
     pub pending: Option<PendingDdl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceOwner {
+    pub table_schema: SqlName,
+    pub table: SqlName,
+    pub column: SqlName,
+}
+
+fn rebind_sequence_column(
+    link: Option<SequenceOwner>,
+    old: &TableDef,
+    new: &TableDef,
+    column_mapping: &[Option<SqlName>; MAX_COLUMNS],
+    require_generator: bool,
+) -> Option<SequenceOwner> {
+    let mut link = link?;
+    if link.table_schema != old.schema || link.table != old.name {
+        return Some(link);
+    }
+    let old_column = old.column_index(link.column.as_str())?;
+    let target_name = column_mapping[old_column]?;
+    let target = new
+        .column_index(target_name.as_str())
+        .filter(|&column| !require_generator || new.columns()[column].auto_increment)?;
+    link.table_schema = new.schema;
+    link.table = new.name;
+    link.column = new.columns()[target].name;
+    Some(link)
 }
 
 /// The tunable parameters of a sequence, computed and validated by the executor
@@ -1594,6 +1632,8 @@ impl Storage {
                     start_value: 1,
                     cache: 1,
                     cycle: false,
+                    owner: None,
+                    generator_for: None,
                     last_value: Cell::new(1),
                     is_called: Cell::new(false),
                     dirty: Cell::new(false),
@@ -3848,6 +3888,25 @@ impl Storage {
         })
     }
 
+    pub fn generated_sequence_slot(
+        &self,
+        table_schema: &str,
+        table: &str,
+        column: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.sequences.iter().position(|sequence| {
+            sequence.visible_to(txid)
+                && matches!(
+                    sequence.generator_for,
+                    Some(owner)
+                        if owner.table_schema.as_str() == table_schema
+                            && owner.table.as_str() == table
+                            && owner.column.as_str() == column
+                )
+        })
+    }
+
     /// Resolves a (possibly unqualified) sequence name to its slot: a qualifier
     /// names the schema directly, otherwise the search path is walked, matching
     /// [`Self::resolve_relation`].
@@ -3887,6 +3946,8 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
         spec: SeqSpec,
+        owner: Option<SequenceOwner>,
+        generator_for: Option<SequenceOwner>,
         txid: u32,
     ) -> Result<usize, SqlError> {
         if self.sequences.iter().any(|s| {
@@ -3923,6 +3984,8 @@ impl Storage {
             start_value: spec.start_value,
             cache: spec.cache,
             cycle: spec.cycle,
+            owner,
+            generator_for,
             last_value: Cell::new(spec.start_value),
             is_called: Cell::new(false),
             dirty: Cell::new(false),
@@ -3934,7 +3997,14 @@ impl Storage {
 
     /// Replaces a live sequence's parameters in place (ALTER SEQUENCE). Value
     /// state (last_value/is_called) is untouched unless `restart` is given.
-    pub fn alter_sequence(&mut self, slot: usize, spec: SeqSpec, restart: Option<i64>) {
+    pub fn alter_sequence(
+        &mut self,
+        slot: usize,
+        spec: SeqSpec,
+        restart: Option<i64>,
+        owner: Option<SequenceOwner>,
+        generator_for: Option<SequenceOwner>,
+    ) {
         let s = &mut self.sequences[slot];
         s.data_type = spec.data_type;
         s.increment = spec.increment;
@@ -3943,6 +4013,8 @@ impl Storage {
         s.start_value = spec.start_value;
         s.cache = spec.cache;
         s.cycle = spec.cycle;
+        s.owner = owner;
+        s.generator_for = generator_for;
         if let Some(r) = restart {
             s.last_value.set(r);
             s.is_called.set(false);
@@ -4910,6 +4982,32 @@ impl Storage {
                 x.schema = new_schema;
             }
         }
+        for sequence in self.sequences.iter_mut() {
+            if !sequence.live {
+                continue;
+            }
+            let moves_with_table = matches!(
+                sequence.owner,
+                Some(owner)
+                    if owner.table_schema == old_schema && owner.table == name
+            );
+            if moves_with_table {
+                sequence.schema = new_schema;
+                let owner = sequence.owner.as_mut().expect("matched Some owner");
+                owner.table_schema = new_schema;
+            }
+            if matches!(
+                sequence.generator_for,
+                Some(generator)
+                    if generator.table_schema == old_schema && generator.table == name
+            ) {
+                let generator = sequence
+                    .generator_for
+                    .as_mut()
+                    .expect("matched Some generator");
+                generator.table_schema = new_schema;
+            }
+        }
         for t in self.tables.iter_mut() {
             if !t.live {
                 continue;
@@ -4956,7 +5054,19 @@ impl Storage {
     }
 
     /// Replaces a table's definition in place (ALTER TABLE).
-    pub fn set_table_def(&mut self, index: usize, def: TableDef) {
+    pub fn set_table_def(
+        &mut self,
+        index: usize,
+        def: TableDef,
+        column_mapping: &[Option<SqlName>; MAX_COLUMNS],
+    ) {
+        let old = self.tables[index].def;
+        for sequence in self.sequences.iter_mut() {
+            sequence.owner =
+                rebind_sequence_column(sequence.owner, &old, &def, column_mapping, false);
+            sequence.generator_for =
+                rebind_sequence_column(sequence.generator_for, &old, &def, column_mapping, true);
+        }
         self.tables[index].def = def;
         self.tables[index].mark_dirty();
     }

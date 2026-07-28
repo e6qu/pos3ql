@@ -232,6 +232,10 @@ struct GucValues {
     row_security: StackStr<4>,
     /// bytea_output = escape (false = hex, the default).
     bytea_escape: bool,
+    /// Whether function bodies are checked at definition time. Function DDL is
+    /// rejected before this matters, but the session value is still observable
+    /// and is emitted by pg_dump.
+    check_function_bodies: bool,
 }
 
 impl GucValues {
@@ -249,6 +253,7 @@ impl GucValues {
             statement_timeout: StackStr::new(),
             row_security: StackStr::new(),
             bytea_escape: false,
+            check_function_bodies: true,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -493,11 +498,16 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.row_security = defaults.row_security;
     } else if name.eq_ignore_ascii_case("bytea_output") {
         values.bytea_escape = defaults.bytea_escape;
+    } else if name.eq_ignore_ascii_case("check_function_bodies") {
+        values.check_function_bodies = defaults.check_function_bodies;
     } else if name.eq_ignore_ascii_case("intervalstyle") {
         // Interval rendering is fixed to PostgreSQL's default style.
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
+        || name.eq_ignore_ascii_case("xmloption")
+        || name.eq_ignore_ascii_case("default_tablespace")
+        || name.eq_ignore_ascii_case("default_table_access_method")
         || name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
         || name.eq_ignore_ascii_case("transaction_timeout")
     {
@@ -577,6 +587,43 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "standard_conforming_strings can only be on (strings always conform)"
+        ));
+    }
+    if name.eq_ignore_ascii_case("check_function_bodies") {
+        values.check_function_bodies = if is_default {
+            true
+        } else {
+            parse_on_off(v).ok_or_else(|| unsupported_value("check_function_bodies", v))?
+        };
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("xmloption") {
+        if is_default || v.eq_ignore_ascii_case("content") {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "xmloption can only be content (XML document validation is not supported)"
+        ));
+    }
+    if name.eq_ignore_ascii_case("default_tablespace") {
+        if is_default || v.is_empty() {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "tablespace \"{}\" is not supported",
+            v
+        ));
+    }
+    if name.eq_ignore_ascii_case("default_table_access_method") {
+        if is_default || v.eq_ignore_ascii_case("heap") {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "table access method \"{}\" is not supported",
+            v
         ));
     }
     if name.eq_ignore_ascii_case("intervalstyle") {
@@ -766,6 +813,18 @@ impl GucState {
             } else {
                 "hex"
             }))
+        } else if name.eq_ignore_ascii_case("check_function_bodies") {
+            Some(StackStr::from_str(if values.check_function_bodies {
+                "on"
+            } else {
+                "off"
+            }))
+        } else if name.eq_ignore_ascii_case("xmloption") {
+            Some(StackStr::from_str("content"))
+        } else if name.eq_ignore_ascii_case("default_tablespace") {
+            Some(StackStr::new())
+        } else if name.eq_ignore_ascii_case("default_table_access_method") {
+            Some(StackStr::from_str("heap"))
         } else if name.eq_ignore_ascii_case("intervalstyle") {
             Some(StackStr::from_str("postgres"))
         } else if name.eq_ignore_ascii_case("synchronize_seqscans") {

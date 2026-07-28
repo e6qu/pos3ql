@@ -229,7 +229,7 @@ pub(super) fn build_column(
                     c.name
                 ));
             }
-            (true, spec.always, spec.increment.unwrap_or(1))
+            (true, spec.always, spec.options.increment.unwrap_or(1))
         }
         None => (false, false, 1),
     };
@@ -251,12 +251,6 @@ pub(super) fn build_column(
         domain,
         user_type_schema,
     })
-}
-
-/// The `START WITH` value of a `GENERATED ... AS IDENTITY` column definition, if
-/// any — applied to the column's initial counter after the table is created.
-pub(super) fn identity_start(c: &ColumnDef) -> Option<i64> {
-    c.identity.and_then(|spec| spec.start)
 }
 
 /// Validates a `GENERATED ALWAYS AS (expr) STORED` expression and returns its

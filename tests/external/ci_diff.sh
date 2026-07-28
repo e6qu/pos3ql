@@ -112,6 +112,47 @@ exec(compile(src, "driver_test.py", "exec"))
 EOF
 then ok "psycopg driver"; else bad "psycopg driver"; cat "$WORK/driver.out"; fi
 
+# --- PostgreSQL 18.4 pg_dump plain-format restore --------------------------
+echo "=== PostgreSQL 18.4 plain dump restore ==="
+# PostgreSQL 18 added \restrict guards to plain dumps. Ubuntu's client package
+# can lag the server image, so remove only those two client-side guard lines;
+# every SQL and COPY byte produced by pg_dump is fed through unchanged.
+sed -e '/^\\restrict /d' -e '/^\\unrestrict /d' \
+  tests/data/postgresql-18.4-plain-dump.sql |
+  psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+    -v ON_ERROR_STOP=1 > "$WORK/pg_dump_restore.out" 2>&1
+restore_status=$?
+if [[ $restore_status -ne 0 ]]; then
+  bad "PostgreSQL 18.4 plain dump restores"; tail -40 "$WORK/pg_dump_restore.out"
+else
+  # Restart before observing the result: table definitions, owned identity
+  # sequences, setval positions, views, matviews, indexes and data must all
+  # come back through WAL replay rather than surviving only in memory.
+  kill "$P3_PID" 2>/dev/null
+  wait "$P3_PID" 2>/dev/null
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  P3_PID=$!
+  wait_up "$P3_PORT"
+  dump_observed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
+    -v ON_ERROR_STOP=1 -c "
+      SELECT count(*) FROM app.entry;
+      SELECT state,n FROM app.entry_counts ORDER BY state;
+      INSERT INTO app.entry(parent_id,state,note,payload,tags,amount)
+        VALUES (1,'sad','third','{\"c\":3}',ARRAY['x','y'],3)
+        RETURNING id,doubled;
+      SELECT nextval('app.ticket_seq');
+    " 2>/dev/null)
+  expected_dump_observed=$'2\nsad|1\nhappy|1\n3|6\nINSERT 0 1\n30'
+  if [[ "$dump_observed" == "$expected_dump_observed" ]]; then
+    ok "PostgreSQL 18.4 plain dump restores and survives restart"
+  else
+    bad "PostgreSQL 18.4 plain dump restore result"
+    printf 'expected:\n%s\nobserved:\n%s\n' "$expected_dump_observed" "$dump_observed"
+  fi
+fi
+# The differential corpora assume an empty pos3ql catalog.
+restart_p3_fresh || exit 1
+
 # --- curated differential SQL corpus (rows + SQLSTATEs must match) ----------
 echo "=== differential SQL corpus (real PostgreSQL vs pos3ql) ==="
 normalize() {

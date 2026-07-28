@@ -223,6 +223,11 @@ pub struct Parser<'a> {
     /// of the clause itself so the query can be reconstructed without it (for
     /// reuse of the CREATE TABLE AS machinery). `None` when there was none.
     into_clause: Option<(QualName<'a>, usize, usize)>,
+    /// A column/domain DEFAULT ends before a following `NOT NULL`. Ordinarily
+    /// `NOT` is an infix-expression prefix (`NOT IN`, `NOT LIKE`, ...), so the
+    /// expression parser needs this narrow bit of grammar context to leave the
+    /// column constraint for its caller.
+    stop_default_at_not_null: bool,
 }
 
 /// Parses a stored view definition (a single SELECT) into a `Select` in the
@@ -309,7 +314,16 @@ impl<'a> Parser<'a> {
             n_warnings: 0,
             allow_into: false,
             into_clause: None,
+            stop_default_at_not_null: false,
         })
+    }
+
+    fn column_default_expression(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let prior = self.stop_default_at_not_null;
+        self.stop_default_at_not_null = true;
+        let parsed = self.expression(0);
+        self.stop_default_at_not_null = prior;
+        parsed
     }
 
     pub fn max_param(&self) -> u32 {
@@ -2038,6 +2052,7 @@ impl<'a> Parser<'a> {
             return self.alter_type();
         }
         self.expect_ident("table")?;
+        let _ = self.eat_ident("only")?;
         let table = self.qual_name("table name")?;
         // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
         // combine them with a comma-separated subcommand list, so they parse to
@@ -2123,7 +2138,7 @@ impl<'a> Parser<'a> {
                     not_null = false;
                 } else if self.eat_ident("default")? {
                     let start = self.peek_at;
-                    default = Some(self.expression(0)?);
+                    default = Some(self.column_default_expression()?);
                     default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("generated")? {
                     match self.generated_clause()? {

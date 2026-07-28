@@ -356,7 +356,7 @@ fn like_source<'s>(
     txid: u32,
 ) -> Result<&'s TableDef, SqlError> {
     match resolve_dml_table(storage, &like.source, txid) {
-        Ok(i) => Ok(&storage.table(i).def),
+        Ok(i) => Ok(storage.table_def(i, txid)),
         Err(e) => Err(e),
     }
 }
@@ -522,7 +522,8 @@ fn copy_like_indexes(
         let mut copied = [CopiedIndex { columns: [0; crate::storage::MAX_INDEX_COLS], n_cols: 0, unique: false };
             MAX_LIKE_INDEXES];
         let mut n_copied = 0;
-        let source_def = storage.table(resolve_dml_table(storage, &like.source, txn.txid)?).def;
+        let source_def =
+            *storage.table_def(resolve_dml_table(storage, &like.source, txn.txid)?, txn.txid);
         for index in storage.indexes_for(
             source_def.schema.as_str(),
             source_def.name.as_str(),
@@ -594,7 +595,7 @@ fn next_auto_value<'x>(
     seq_session: &crate::sql::guc::SeqSession,
     txid: u32,
 ) -> Result<Datum<'x>, SqlError> {
-    let def = storage.table(table_index).def;
+    let def = *storage.table_def(table_index, txid);
     let column = def.columns()[col];
     if let Some(slot) = storage.generated_sequence_slot(
         def.schema.as_str(),
@@ -615,8 +616,8 @@ fn next_auto_value<'x>(
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")),
         };
     }
+    let step = def.columns()[col].auto_increment_step;
     let table = storage.table_mut(table_index);
-    let step = table.def.columns()[col].auto_increment_step;
     let next = table.serial_last[col] + step;
     let bound_error = |what: &'static str| {
         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", what)
@@ -1038,8 +1039,8 @@ pub fn drop_table(
             Some(crate::storage::ResolvedRelation::Table(index))
                 if storage
                     .matview_slot(
-                        storage.table(index).def.schema.as_str(),
-                        storage.table(index).def.name.as_str(),
+                        storage.table_def(index, txn.txid).schema.as_str(),
+                        storage.table_def(index, txn.txid).name.as_str(),
                         txn.txid,
                     )
                     .is_some() =>
@@ -1062,7 +1063,7 @@ pub fn drop_table(
                         name.name
                     ));
                 }
-                let def = storage.table(index).def;
+                let def = *storage.table_def(index, txn.txid);
                 // Owned serial/identity sequences are internal dependencies:
                 // dropping their table drops them in the same transaction.
                 for sequence_index in 0..storage.sequence_count() {
@@ -1264,7 +1265,7 @@ pub fn alter_owner(
         },
         AlterOwnerKind::MaterializedView => match relation() {
             Some(crate::storage::ResolvedRelation::Table(table)) => {
-                let def = storage.table(table).def;
+                let def = *storage.table_def(table, txn.txid);
                 if storage
                     .matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
                     .is_some()
@@ -1346,13 +1347,17 @@ enum SchemaObject {
 /// default) refuses a non-empty schema with PostgreSQL's dependency report;
 /// CASCADE drops every contained catalog object and severs inbound foreign
 /// keys from surviving tables.
+#[allow(clippy::too_many_arguments)]
 pub fn drop_schema(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     names: &[&str],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     use core::fmt::Write as _;
@@ -1417,12 +1422,13 @@ pub fn drop_schema(
         Ok(())
     };
     for t in 0..storage.table_count() {
+        let def = storage.table_def(t, txn.txid);
         if !storage.table(t).visible_to(txn.txid)
-            || !in_listed(storage, storage.table(t).def.schema.as_str())
+            || !in_listed(storage, def.schema.as_str())
         {
             continue;
         }
-        let def = storage.table(t).def;
+        let def = *def;
         let object = match storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid) {
             Some(catalog) => SchemaObject::Matview { table: t, catalog },
             None => SchemaObject::Table(t),
@@ -1496,52 +1502,118 @@ pub fn drop_schema(
                 return sql_fail(error);
             }
         }
-        for table in 0..storage.table_count() {
-            let def = storage.table(table).def;
-            if !storage.table(table).visible_to(txn.txid)
-                || in_listed(storage, def.schema.as_str())
-            {
-                continue;
-            }
-            if let Some(column) = def.columns().iter().find(|column| {
-                if column
-                    .user_type_schema
-                    .is_some_and(|schema| in_listed(storage, schema.as_str()))
-                {
-                    return true;
+        loop {
+            let mut dependent = None;
+            for table in 0..storage.table_count() {
+                if !storage.table(table).visible_to(txn.txid) {
+                    continue;
                 }
-                let Some(domain_name) = column.domain else {
-                    return false;
-                };
-                let Some(domain_schema) = column.user_type_schema else {
-                    return false;
-                };
-                let Some(domain_slot) = storage.domain_slot(
-                    domain_schema.as_str(),
-                    domain_name.as_str(),
-                    txn.txid,
-                ) else {
-                    return false;
-                };
-                let parent_domain_in_schema = (0..storage.domain_count()).any(|parent| {
-                    schema_domains[parent]
-                        && domain_depends_on(storage, domain_slot, parent, txn.txid)
-                });
-                let base_enum_in_schema = match storage.domain(domain_slot).base {
-                    ColType::Enum(slot)
-                    | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                        in_listed(storage, storage.enum_def(slot as usize).schema.as_str())
+                let def = storage.table_def(table, txn.txid);
+                if in_listed(storage, def.schema.as_str()) {
+                    continue;
+                }
+                if !def.columns().iter().any(|column| {
+                    if column
+                        .user_type_schema
+                        .is_some_and(|schema| in_listed(storage, schema.as_str()))
+                    {
+                        return true;
                     }
-                    _ => false,
-                };
-                parent_domain_in_schema || base_enum_in_schema
-            }) {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot cascade schema drop to column \"{}.{}\" without transactional table-shape versions",
-                    def.name.as_str(),
-                    column.name.as_str()
-                ));
+                    let Some(domain_name) = column.domain else {
+                        return false;
+                    };
+                    let Some(domain_schema) = column.user_type_schema else {
+                        return false;
+                    };
+                    let Some(domain_slot) = storage.domain_slot(
+                        domain_schema.as_str(),
+                        domain_name.as_str(),
+                        txn.txid,
+                    ) else {
+                        return false;
+                    };
+                    let parent_domain_in_schema = (0..storage.domain_count()).any(|parent| {
+                        schema_domains[parent]
+                            && domain_depends_on(storage, domain_slot, parent, txn.txid)
+                    });
+                    let base_enum_in_schema = match storage.domain(domain_slot).base {
+                        ColType::Enum(slot)
+                        | ColType::Array(super::types::ArrElem::Enum(slot)) => {
+                            in_listed(storage, storage.enum_def(slot as usize).schema.as_str())
+                        }
+                        _ => false,
+                    };
+                    parent_domain_in_schema || base_enum_in_schema
+                }) {
+                    continue;
+                }
+                dependent = Some(table);
+                break;
+            }
+            let Some(table_slot) = dependent else {
+                break;
+            };
+            let def = storage.table_def(table_slot, txn.txid);
+            let (table_schema, table) = (def.schema, def.name);
+            let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
+            let mut column_count = 0;
+            for column in def.columns() {
+                let directly_in_schema = column
+                    .user_type_schema
+                    .is_some_and(|schema| in_listed(storage, schema.as_str()));
+                let through_domain = column
+                    .domain
+                    .zip(column.user_type_schema)
+                    .and_then(|(domain_name, domain_schema)| {
+                        storage
+                            .domain_slot(
+                                domain_schema.as_str(),
+                                domain_name.as_str(),
+                                txn.txid,
+                            )
+                            .map(|domain_slot| {
+                                let parent_in_schema =
+                                    (0..storage.domain_count()).any(|parent| {
+                                        schema_domains[parent]
+                                            && domain_depends_on(
+                                                storage,
+                                                domain_slot,
+                                                parent,
+                                                txn.txid,
+                                            )
+                                    });
+                                let enum_in_schema = match storage.domain(domain_slot).base {
+                                    ColType::Enum(slot)
+                                    | ColType::Array(super::types::ArrElem::Enum(slot)) => {
+                                        in_listed(
+                                            storage,
+                                            storage.enum_def(slot as usize).schema.as_str(),
+                                        )
+                                    }
+                                    _ => false,
+                                };
+                                parent_in_schema || enum_in_schema
+                            })
+                    })
+                    .unwrap_or(false);
+                if directly_in_schema || through_domain {
+                    columns[column_count] = column.name;
+                    column_count += 1;
+                }
+            }
+            if let Err(error) = cascade_drop_type_column(
+                storage,
+                wal,
+                txn,
+                scratch,
+                table_schema,
+                table,
+                &columns[..column_count],
+                arena,
+                seq_session,
+                responder,
+            ) {
+                return sql_fail(error);
             }
         }
         // A surviving stored query may depend on a table or type being
@@ -1574,13 +1646,14 @@ pub fn drop_schema(
     // Inbound foreign keys: a surviving table referencing a dropped one loses
     // the constraint (PostgreSQL drops the constraint, not the table).
     for t in 0..storage.table_count() {
+        let def = storage.table_def(t, txn.txid);
         if !storage.table(t).visible_to(txn.txid)
-            || in_listed(storage, storage.table(t).def.schema.as_str())
+            || in_listed(storage, def.schema.as_str())
         {
             continue;
         }
-        for f in 0..storage.table(t).def.n_fkeys {
-            if in_listed(storage, storage.table(t).def.fkeys[f].parent_schema.as_str())
+        for f in 0..def.n_fkeys {
+            if in_listed(storage, def.fkeys[f].parent_schema.as_str())
                 && let Err(e) = push(SchemaObject::InboundFk { table: t, fk_index: f }, &mut n_objects)
             {
                 return sql_fail(e);
@@ -1601,8 +1674,9 @@ pub fn drop_schema(
         match o {
             SchemaObject::Table(t) => {
                 let table = storage.table(*t);
+                let def = storage.table_def(*t, txn.txid);
                 (
-                    schema_rank(storage, table.def.schema.as_str()),
+                    schema_rank(storage, def.schema.as_str()),
                     table.created_at,
                     0,
                 )
@@ -1612,10 +1686,11 @@ pub fn drop_schema(
                 (schema_rank(storage, view.schema.as_str()), view.created_at, 0)
             }
             SchemaObject::Matview { table, .. } => {
-                let table = storage.table(*table);
+                let table_state = storage.table(*table);
+                let def = storage.table_def(*table, txn.txid);
                 (
-                    schema_rank(storage, table.def.schema.as_str()),
-                    table.created_at,
+                    schema_rank(storage, def.schema.as_str()),
+                    table_state.created_at,
                     0,
                 )
             }
@@ -1645,10 +1720,11 @@ pub fn drop_schema(
             }
             SchemaObject::InboundFk { table, fk_index } => {
                 let child = storage.table(*table);
+                let def = storage.table_def(*table, txn.txid);
                 (
                     schema_rank(
                         storage,
-                        child.def.fkeys[*fk_index].parent_schema.as_str(),
+                        def.fkeys[*fk_index].parent_schema.as_str(),
                     ),
                     child.created_at,
                     1,
@@ -1680,7 +1756,7 @@ pub fn drop_schema(
         };
         match o {
             SchemaObject::Table(t) => {
-                let def = &storage.table(*t).def;
+                let def = storage.table_def(*t, txn.txid);
                 let _ = write!(out, "table ");
                 write_rel(out, &def.schema, &def.name);
             }
@@ -1690,7 +1766,7 @@ pub fn drop_schema(
                 write_rel(out, &view.schema, &view.name);
             }
             SchemaObject::Matview { table, .. } => {
-                let def = &storage.table(*table).def;
+                let def = storage.table_def(*table, txn.txid);
                 let _ = write!(out, "materialized view ");
                 write_rel(out, &def.schema, &def.name);
             }
@@ -1710,7 +1786,7 @@ pub fn drop_schema(
                 write_rel(out, &enumeration.schema, &enumeration.name);
             }
             SchemaObject::InboundFk { table, fk_index } => {
-                let def = &storage.table(*table).def;
+                let def = storage.table_def(*table, txn.txid);
                 let _ = write!(
                     out,
                     "constraint {} on table ",
@@ -1734,17 +1810,17 @@ pub fn drop_schema(
                 // PostgreSQL's report names the schema each object hangs off;
                 // for a multi-schema drop each line names its own.
                 match o {
-                    SchemaObject::Table(t) => storage.table(*t).def.schema.as_str(),
+                    SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema.as_str(),
                     SchemaObject::View(v) => storage.view(*v).schema.as_str(),
                     SchemaObject::Matview { table, .. } =>
-                        storage.table(*table).def.schema.as_str(),
+                        storage.table_def(*table, txn.txid).schema.as_str(),
                     SchemaObject::Sequence(sequence) =>
                         storage.sequence(*sequence).schema.as_str(),
                     SchemaObject::Domain(domain) => storage.domain(*domain).schema.as_str(),
                     SchemaObject::Enum(enumeration) =>
                         storage.enum_def(*enumeration).schema.as_str(),
                     SchemaObject::InboundFk { table, fk_index } =>
-                        storage.table(*table).def.fkeys[*fk_index].parent_schema.as_str(),
+                        storage.table_def(*table, txn.txid).fkeys[*fk_index].parent_schema.as_str(),
                 }
             );
         }
@@ -1786,7 +1862,7 @@ pub fn drop_schema(
         .iter()
         .flatten()
         .filter_map(|object| match object {
-            SchemaObject::Table(table) => Some(storage.table(*table).def),
+            SchemaObject::Table(table) => Some(*storage.table_def(*table, txn.txid)),
             _ => None,
         })
         .map(|table| {
@@ -1825,7 +1901,7 @@ pub fn drop_schema(
     for o in objects[..n_objects].iter().flatten() {
         match o {
             SchemaObject::InboundFk { table, fk_index } => {
-                let def = &storage.table(*table).def;
+                let def = *storage.table_def(*table, txn.txid);
                 let fk_name = def.fkeys[*fk_index].name;
                 let (schema, tname) = (def.schema, def.name);
                 let lsn = storage.bump_lsn();
@@ -1839,13 +1915,32 @@ pub fn drop_schema(
                 ) {
                     return sql_fail(e);
                 }
-                let Some(fk) = storage.drop_fk(*table, fk_name.as_str()) else {
+                let mut updated = def;
+                if !drop_named_constraint(&mut updated, fk_name.as_str()) {
                     continue;
-                };
-                if let Err(e) =
-                    txn.record_ddl(super::txn::DdlUndo::FkDropped { table: *table as u32, fk })
+                }
+                let mut identity_mapping = [None; MAX_COLUMNS];
+                for (column, target) in identity_mapping
+                    .iter_mut()
+                    .enumerate()
+                    .take(def.n_columns)
                 {
-                    return sql_fail(e);
+                    *target = Some(def.columns()[column].name);
+                }
+                if let Err(error) = storage.write_table_def(
+                    *table,
+                    txn.txid,
+                    updated,
+                    &identity_mapping,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) =
+                    txn.record_ddl(super::txn::DdlUndo::TableAltered(*table as u32))
+                {
+                    storage.rollback_table_def(*table, txn.txid);
+                    return sql_fail(error);
                 }
             }
             SchemaObject::View(v) => {
@@ -1873,7 +1968,7 @@ pub fn drop_schema(
                 }
             }
             SchemaObject::Matview { table, catalog } => {
-                let def = storage.table(*table).def;
+                let def = *storage.table_def(*table, txn.txid);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.append(
                     lsn,
@@ -1993,10 +2088,10 @@ pub fn drop_schema(
                     return sql_fail(sql_err!(
                         crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                         "could not serialize access due to concurrent DDL on \"{}\"",
-                        storage.table(*t).def.name.as_str()
+                        storage.table_def(*t, txn.txid).name.as_str()
                     ));
                 }
-                let def = storage.table(*t).def;
+                let def = *storage.table_def(*t, txn.txid);
                 for sequence_slot in 0..storage.sequence_count() {
                     let sequence = storage.sequence(sequence_slot);
                     if !sequence.visible_to(txn.txid)
@@ -2669,7 +2764,7 @@ pub fn refresh_materialized_view(
         Some(crate::storage::ResolvedRelation::Table(idx)) => idx,
         _ => return sql_fail(undefined_kind("relation", name.name)),
     };
-    let def = storage.table(table_index).def;
+    let def = *storage.table_def(table_index, txn.txid);
     let Some(slot) = storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -2799,8 +2894,8 @@ pub fn drop_materialized_view(
             Some(crate::storage::ResolvedRelation::Table(idx))
                 if storage
                     .matview_slot(
-                        storage.table(idx).def.schema.as_str(),
-                        storage.table(idx).def.name.as_str(),
+                        storage.table_def(idx, txn.txid).schema.as_str(),
+                        storage.table_def(idx, txn.txid).name.as_str(),
                         txn.txid,
                     )
                     .is_some() =>
@@ -2826,7 +2921,7 @@ pub fn drop_materialized_view(
             }
             None => return sql_fail(undefined_kind("materialized view", name.name)),
         };
-        let def = storage.table(idx).def;
+        let def = *storage.table_def(idx, txn.txid);
         // Drop the backing table.
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
@@ -3004,7 +3099,7 @@ fn resolve_sequence_owner(
         Some(crate::storage::ResolvedRelation::Table(index)) => index,
         _ => return Err(undefined_qual(&owner.table)),
     };
-    let table = &storage.table(table_index).def;
+    let table = storage.table_def(table_index, txid);
     if table.schema.as_str() != sequence_schema {
         return Err(sql_err!(
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -3139,12 +3234,15 @@ pub fn alter_sequence(
     if options.owned_by.is_some()
         && let Some(generator) = prior.generator_for
         && let Some(table_slot) =
-            storage.find_table(generator.table_schema.as_str(), generator.table.as_str())
+            storage.find_visible(
+                generator.table_schema.as_str(),
+                generator.table.as_str(),
+                txn.txid,
+            )
         && let Some(column) = storage
-            .table(table_slot)
-            .def
+            .table_def(table_slot, txn.txid)
             .column_index(generator.column.as_str())
-        && storage.table(table_slot).def.columns()[column].is_identity
+        && storage.table_def(table_slot, txn.txid).columns()[column].is_identity
     {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3467,10 +3565,12 @@ pub fn drop_domain(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     let mut selected = [false; crate::storage::MAX_DOMAINS];
@@ -3526,7 +3626,19 @@ pub fn drop_domain(
     }
 
     if let Err(error) =
-        drop_domain_selection(storage, wal, txn, &selected, None, cascade, 0, arena)
+        drop_domain_selection(
+            storage,
+            wal,
+            txn,
+            scratch,
+            &selected,
+            None,
+            cascade,
+            0,
+            arena,
+            seq_session,
+            responder,
+        )
     {
         return sql_fail(error);
     }
@@ -3539,11 +3651,14 @@ fn drop_domain_selection(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     selected: &[bool; crate::storage::MAX_DOMAINS],
     selected_enum: Option<usize>,
     cascade: bool,
     reserved_undo: usize,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
 ) -> Result<(), SqlError> {
     let selected_count = selected.iter().filter(|&&yes| yes).count();
     if selected_count > 0 || selected_enum.is_some() {
@@ -3564,14 +3679,43 @@ fn drop_domain_selection(
         if !*is_selected {
             continue;
         }
-        if let Some((table, column)) = domain_column_in_use(storage, slot, txn.txid) {
+        while let Some((table_schema, table, _)) =
+            domain_column_in_use(storage, slot, txn.txid)
+        {
             if cascade {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot cascade type drop to column \"{}.{}\" without transactional table-shape versions",
-                    table.as_str(),
-                    column.as_str()
-                ));
+                let domain = storage.domain(slot);
+                let (domain_schema, domain_name) = (domain.schema, domain.name);
+                let table_slot = storage
+                    .find_visible(
+                        table_schema.as_str(),
+                        table.as_str(),
+                        txn.txid,
+                    )
+                    .expect("dependent table remains visible");
+                let def = storage.table_def(table_slot, txn.txid);
+                let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
+                let mut column_count = 0;
+                for column in def.columns() {
+                    if column.domain == Some(domain_name)
+                        && column.user_type_schema == Some(domain_schema)
+                    {
+                        columns[column_count] = column.name;
+                        column_count += 1;
+                    }
+                }
+                cascade_drop_type_column(
+                    storage,
+                    wal,
+                    txn,
+                    scratch,
+                    table_schema,
+                    table,
+                    &columns[..column_count],
+                    arena,
+                    seq_session,
+                    responder,
+                )?;
+                continue;
             }
             return Err(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -3639,14 +3783,15 @@ fn domain_column_in_use(
     storage: &Storage,
     domain_slot: usize,
     txid: u32,
-) -> Option<(SqlName, SqlName)> {
+) -> Option<(SqlName, SqlName, SqlName)> {
     let domain = storage.domain(domain_slot);
     for table_index in 0..storage.table_count() {
         let table = storage.table(table_index);
         if !table.visible_to(txid) {
             continue;
         }
-        for column in table.def.columns() {
+        let def = storage.table_def(table_index, txid);
+        for column in def.columns() {
             if column
                 .domain
                 .is_some_and(|name| name == domain.name)
@@ -3654,11 +3799,55 @@ fn domain_column_in_use(
                     .user_type_schema
                     .is_some_and(|schema| schema == domain.schema)
             {
-                return Some((table.def.name, column.name));
+                return Some((def.schema, def.name, column.name));
             }
         }
     }
     None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cascade_drop_type_column(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    table_schema: SqlName,
+    table_name: SqlName,
+    column_names: &[SqlName],
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let mut actions = [AlterAction::DropColumn(""); MAX_COLUMNS];
+    for (index, column) in column_names.iter().enumerate() {
+        actions[index] = AlterAction::DropColumn(column.as_str());
+    }
+    let statement = AlterTable {
+        table: QualName {
+            schema: Some(table_schema.as_str()),
+            name: table_name.as_str(),
+        },
+        if_exists: false,
+        actions: &actions[..column_names.len()],
+    };
+    match alter_table_inner(
+        storage,
+        wal,
+        txn,
+        scratch,
+        &statement,
+        arena,
+        seq_session,
+        responder,
+        false,
+    ) {
+        Ok(result) => result,
+        Err(_) => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "response buffer exhausted during internal type cascade"
+        )),
+    }
 }
 
 pub fn alter_domain(
@@ -4039,10 +4228,12 @@ pub fn drop_enum(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -4068,14 +4259,46 @@ pub fn drop_enum(
             let e = storage.enum_def(slot);
             (e.schema, e.name)
         };
-        if let Some((table, column)) = enum_column_in_use(storage, slot, txn.txid) {
+        while let Some((table_schema, table, _)) =
+            enum_column_in_use(storage, slot, txn.txid)
+        {
             if cascade {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot cascade type drop to column \"{}.{}\" without transactional table-shape versions",
-                    table.as_str(),
-                    column.as_str()
-                ));
+                let table_slot = storage
+                    .find_visible(
+                        table_schema.as_str(),
+                        table.as_str(),
+                        txn.txid,
+                    )
+                    .expect("dependent table remains visible");
+                let def = storage.table_def(table_slot, txn.txid);
+                let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
+                let mut column_count = 0;
+                for column in def.columns() {
+                    if matches!(
+                        column.ctype,
+                        ColType::Enum(enum_slot)
+                            | ColType::Array(super::types::ArrElem::Enum(enum_slot))
+                            if enum_slot as usize == slot
+                    ) {
+                        columns[column_count] = column.name;
+                        column_count += 1;
+                    }
+                }
+                if let Err(error) = cascade_drop_type_column(
+                    storage,
+                    wal,
+                    txn,
+                    scratch,
+                    table_schema,
+                    table,
+                    &columns[..column_count],
+                    arena,
+                    seq_session,
+                    responder,
+                ) {
+                    return sql_fail(error);
+                }
+                continue;
             }
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -4114,11 +4337,14 @@ pub fn drop_enum(
                 storage,
                 wal,
                 txn,
+                scratch,
                 &dependent_domains,
                 Some(slot),
                 cascade,
                 1,
                 arena,
+                seq_session,
+                responder,
             )
         {
             return sql_fail(error);
@@ -4492,13 +4718,14 @@ fn enum_column_in_use(
     storage: &Storage,
     enum_slot: usize,
     txid: u32,
-) -> Option<(SqlName, SqlName)> {
+) -> Option<(SqlName, SqlName, SqlName)> {
     for table_index in 0..storage.table_count() {
         let table = storage.table(table_index);
         if !table.visible_to(txid) {
             continue;
         }
-        for column in table.def.columns() {
+        let def = storage.table_def(table_index, txid);
+        for column in def.columns() {
             if matches!(column.ctype, ColType::Enum(slot) if slot as usize == enum_slot)
                 || matches!(
                     column.ctype,
@@ -4506,7 +4733,7 @@ fn enum_column_in_use(
                         if slot as usize == enum_slot
                 )
             {
-                return Some((table.def.name, column.name));
+                return Some((def.schema, def.name, column.name));
             }
         }
     }
@@ -4712,7 +4939,7 @@ fn rewrite_enum_label(
         if !storage.table(table_index).visible_to(txn.txid) {
             continue;
         }
-        let def = storage.table(table_index).def;
+        let def = *storage.table_def(table_index, txn.txid);
         let mut affected = [false; MAX_COLUMNS];
         let mut any = false;
         for (column_index, column) in def.columns().iter().enumerate() {
@@ -4971,7 +5198,7 @@ pub fn create_index(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    let tdef = storage.table(table_index).def;
+    let tdef = *storage.table_def(table_index, txn.txid);
     if column_names.is_empty() || column_names.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5240,7 +5467,7 @@ pub fn copy_begin(
     txid: u32,
 ) -> Result<CopySetup, SqlError> {
     let table_index = resolve_dml_table(storage, &statement.table, txid)?;
-    let def = &storage.table(table_index).def;
+    let def = storage.table_def(table_index, txid);
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if statement.columns.is_empty() {
         for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
@@ -5335,7 +5562,7 @@ pub fn copy_row(
     line: &[u8],
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let def = storage.table(setup.table_index).def;
+    let def = *storage.table_def(setup.table_index, txn.txid);
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let fmt = &setup.fmt;
     let n_fields = if fmt.csv {
@@ -5424,7 +5651,7 @@ pub fn copy_row_binary(
     row: &[u8],
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let def = storage.table(setup.table_index).def;
+    let def = *storage.table_def(setup.table_index, txn.txid);
     let count = i16::from_be_bytes([row[0], row[1]]);
     if count < 0 || count as usize != setup.n_targets {
         return Err(sql_err!(
@@ -5759,7 +5986,7 @@ pub fn copy_out(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<u64, SqlError> {
-    let def = storage.table(setup.table_index).def;
+    let def = *storage.table_def(setup.table_index, txid);
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let fmt = &setup.fmt;
@@ -6388,7 +6615,7 @@ pub fn merge(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    let def = storage.table(table_index).def;
+    let def = *storage.table_def(table_index, txn.txid);
     let target_alias = statement.target_alias.unwrap_or(statement.target.name);
     let source_alias = statement
         .source
@@ -6822,7 +7049,7 @@ pub fn insert(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    let def = storage.table(table_index).def;
+    let def = *storage.table_def(table_index, txn.txid);
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
@@ -7375,7 +7602,7 @@ pub fn update(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    let def = storage.table(table_index).def;
+    let def = *storage.table_def(table_index, txn.txid);
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
@@ -7684,7 +7911,7 @@ pub fn delete(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    let def = storage.table(table_index).def;
+    let def = *storage.table_def(table_index, txn.txid);
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
@@ -7871,12 +8098,13 @@ pub fn truncate(
     loop {
         let mut grew = false;
         for other in 0..storage.table_count() {
-            if !storage.table(other).live || list[..n].contains(&other) {
+            if !storage.table(other).visible_to(txn.txid) || list[..n].contains(&other) {
                 continue;
             }
-            let refs_listed = storage.table(other).def.fkeys().iter().any(|fk| {
+            let other_def = storage.table_def(other, txn.txid);
+            let refs_listed = other_def.fkeys().iter().any(|fk| {
                 list[..n].iter().any(|&t| {
-                    let tdef = &storage.table(t).def;
+                    let tdef = storage.table_def(t, txn.txid);
                     tdef.schema.as_str() == fk.parent_schema.as_str()
                         && tdef.name.as_str() == fk.parent.as_str()
                 })
@@ -7896,7 +8124,7 @@ pub fn truncate(
                     "too many tables in TRUNCATE"
                 ));
             }
-            let name = storage.table(other).def.name;
+            let name = other_def.name;
             responder.notice(
                 crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(160, "truncate cascades to table \"{}\"", name.as_str()).as_str(),
@@ -7942,7 +8170,7 @@ pub fn truncate(
             }
         }
         if restart_identity {
-            let def = storage.table(table_index).def;
+            let def = *storage.table_def(table_index, txn.txid);
             for c in 0..def.n_columns {
                 if !def.columns()[c].auto_increment {
                     continue;
@@ -8039,6 +8267,7 @@ fn validate_all_rows(
     storage: &Storage,
     table_index: usize,
     new_def: &TableDef,
+    txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let checks = parse_checks(new_def, arena)?;
@@ -8048,7 +8277,7 @@ fn validate_all_rows(
     let mut result = Ok(());
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) = state.committed else {
+        let Some(home) = state.visible_at(txid, crate::storage::SNAPSHOT_ALL) else {
             return Ok(ControlFlow::Continue(()));
         };
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
@@ -8057,7 +8286,7 @@ fn validate_all_rows(
         let values = &values[..new_def.n_columns];
         let check = check_not_null(new_def, values).and_then(|()| {
             enforce_row_constraints(
-                storage, table_index, new_def, schema, values, Some(rowid), u32::MAX, &checks, arena, &[],
+                storage, table_index, new_def, schema, values, Some(rowid), txid, &checks, arena, &[],
             )
         });
         if let Err(e) = check {
@@ -8176,18 +8405,42 @@ enum ColSource<'a> {
 pub fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
+    txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowHome)>,
     statement: &AlterTable,
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
-    // ALTER runs autocommitted, so resolution sees only the committed
-    // catalog (no transaction owns pending DDL here).
+    alter_table_inner(
+        storage,
+        wal,
+        txn,
+        scratch,
+        statement,
+        arena,
+        seq_session,
+        responder,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alter_table_inner(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    statement: &AlterTable,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+    emit_completion: bool,
+) -> Outcome {
     let table_index = match storage.resolve_relation(
         statement.table.schema,
         statement.table.name,
-        u32::MAX,
+        txn.txid,
     ) {
         Some(crate::storage::ResolvedRelation::Table(i)) => i,
         None if statement.if_exists => {
@@ -8200,19 +8453,21 @@ pub fn alter_table(
                 )
                 .as_str(),
             )?;
-            responder.command_complete("ALTER TABLE")?;
+            if emit_completion {
+                responder.command_complete("ALTER TABLE")?;
+            }
             return sql_ok();
         }
         _ => return sql_fail(undefined_qual(&statement.table)),
     };
-    let def = storage.table(table_index).def;
+    let def = *storage.table_def(table_index, txn.txid);
 
     // Any in-flight change on this table blocks ALTER (fail fast).
     if storage
         .table(table_index)
         .rows
         .iter()
-        .any(|(_, state)| state.pending.is_some())
+        .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
     {
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,
@@ -8235,10 +8490,12 @@ pub fn alter_table(
         };
         if new_schema == def.schema.as_str() {
             // Already there: PostgreSQL treats this as a no-op success.
-            responder.command_complete("ALTER TABLE")?;
+            if emit_completion {
+                responder.command_complete("ALTER TABLE")?;
+            }
             return sql_ok();
         }
-        if storage.relation_name_taken(new_schema, def.name.as_str(), u32::MAX) {
+        if storage.relation_name_taken(new_schema, def.name.as_str(), txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists in schema \"{}\"",
@@ -8254,7 +8511,7 @@ pub fn alter_table(
             ) {
                 continue;
             }
-            if storage.relation_name_taken(new_schema, sequence.name.as_str(), u32::MAX) {
+            if storage.relation_name_taken(new_schema, sequence.name.as_str(), txn.txid) {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_TABLE,
                     "relation \"{}\" already exists in schema \"{}\"",
@@ -8278,8 +8535,32 @@ pub fn alter_table(
         ) {
             return sql_fail(e);
         }
-        storage.move_table_schema(table_index, new_name);
-        responder.command_complete("ALTER TABLE")?;
+        let mut new_def = def;
+        new_def.schema = new_name;
+        let mut mapping = [None; MAX_COLUMNS];
+        for (column, target) in mapping.iter_mut().enumerate().take(def.n_columns) {
+            *target = Some(def.columns()[column].name);
+        }
+        if let Err(error) =
+            storage.write_table_def(
+                table_index,
+                txn.txid,
+                new_def,
+                &mapping,
+                false,
+            )
+        {
+            return sql_fail(error);
+        }
+        if let Err(error) =
+            txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32))
+        {
+            storage.rollback_table_def(table_index, txn.txid);
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete("ALTER TABLE")?;
+        }
         return sql_ok();
     }
 
@@ -8292,7 +8573,7 @@ pub fn alter_table(
         let mut overflow = false;
         let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            let Some(loc) = state.committed else {
+            let Some(loc) = state.visible_at(txn.txid, crate::storage::SNAPSHOT_ALL) else {
                 return Ok(ControlFlow::Continue(()));
             };
             if scratch.push((rowid, loc)).is_err() {
@@ -8332,7 +8613,7 @@ pub fn alter_table(
         match action {
             AlterAction::SetSchema(_) => unreachable!("SET SCHEMA is a standalone action"),
             AlterAction::RenameTable(new_name) => {
-                if storage.find_table(def.schema.as_str(), new_name).is_some() {
+                if storage.relation_name_taken(def.schema.as_str(), new_name, txn.txid) {
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_TABLE,
                         "relation \"{}\" already exists",
@@ -8367,9 +8648,7 @@ pub fn alter_table(
                         MAX_COLUMNS
                     ));
                 }
-                // ALTER runs autocommitted, so a domain type resolves against
-                // the committed catalog (txid 0).
-                let meta = match build_column(c, &*storage, 0, arena) {
+                let meta = match build_column(c, &*storage, txn.txid, arena) {
                     Ok(m) => m,
                     Err(e) => return sql_fail(e),
                 };
@@ -8393,12 +8672,6 @@ pub fn alter_table(
                 let Some(i) = new_def.column_index(name) else {
                     return sql_fail(undefined_column(name));
                 };
-                if new_def.n_columns == 1 {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cannot drop the only column of a table"
-                    ));
-                }
                 let original_column = match source[i] {
                     ColSource::Keep(original) | ColSource::Cast { orig: original, .. } => {
                         def.columns()[original].name
@@ -8440,7 +8713,7 @@ pub fn alter_table(
                         ctype,
                         type_mod,
                         storage,
-                        u32::MAX,
+                        txn.txid,
                         arena,
                     ) {
                         Ok(d) => d,
@@ -8491,7 +8764,7 @@ pub fn alter_table(
                 if storage.relation_name_taken(
                     plan.schema.as_str(),
                     plan.name.as_str(),
-                    u32::MAX,
+                    txn.txid,
                 ) || identity_sequences[..n_identity_sequences]
                     .iter()
                     .flatten()
@@ -8541,7 +8814,7 @@ pub fn alter_table(
                     def.schema.as_str(),
                     def.name.as_str(),
                     original_column.as_str(),
-                    u32::MAX,
+                    txn.txid,
                 ) && matches!(
                     storage.sequence(slot).owner,
                     Some(owner)
@@ -8632,8 +8905,7 @@ pub fn alter_table(
                 new_def.columns[i].type_mod = *type_mod;
             }
             AlterAction::AddConstraint(constraint) => {
-                // Build the constraint into the new definition (u32::MAX sees
-                // all committed catalog, e.g. an FK's parent). CHECK/NOT NULL/FK
+                // Build the constraint into the new definition. CHECK/NOT NULL/FK
                 // are validated per rewritten image below; an added uniqueness
                 // constraint is validated across the rewritten images before
                 // anything is journaled.
@@ -8641,7 +8913,7 @@ pub fn alter_table(
                     storage,
                     &mut new_def,
                     core::slice::from_ref(constraint),
-                    u32::MAX,
+                    txn.txid,
                     arena,
                 ) {
                     return sql_fail(e);
@@ -8731,6 +9003,16 @@ pub fn alter_table(
         }
     }
 
+    let relation_moved = def.schema != new_def.schema || def.name != new_def.name;
+    if relation_moved {
+        for foreign_key in &mut new_def.fkeys[..new_def.n_fkeys] {
+            if foreign_key.parent_schema == def.schema && foreign_key.parent == def.name {
+                foreign_key.parent_schema = new_def.schema;
+                foreign_key.parent = new_def.name;
+            }
+        }
+    }
+
     let has_rewrite = added_any || dropped_any || retyped_any;
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
@@ -8746,7 +9028,7 @@ pub fn alter_table(
     // uniqueness — is validated against the stored rows, before anything is
     // journaled. A rewrite validates each transformed image instead, below.
     if !has_rewrite
-        && let Err(e) = validate_all_rows(storage, table_index, &new_def, arena)
+        && let Err(e) = validate_all_rows(storage, table_index, &new_def, txn.txid, arena)
     {
         return sql_fail(e);
     }
@@ -8819,9 +9101,9 @@ pub fn alter_table(
                                 let seq = crate::sql::sequence::SeqEval::new(
                                     storage,
                                     seq_session,
-                                    u32::MAX,
+                                    txn.txid,
                                 );
-                                let catalog = super::query::storage_catalog(storage, u32::MAX);
+                                let catalog = super::query::storage_catalog(storage, txn.txid);
                                 let hooks = super::eval::EvalHooks {
                                     catalog: Some(&catalog),
                                     sequences: Some(&seq),
@@ -8852,7 +9134,7 @@ pub fn alter_table(
                 }
                 let values = &out[..new_def.n_columns];
                 if let Err(e) = crate::sql::exec::constraints::check_row_content(
-                    storage, &new_def, values, &checks, arena, &[], u32::MAX,
+                    storage, &new_def, values, &checks, arena, &[], txn.txid,
                 ) {
                     return sql_fail(e);
                 }
@@ -8974,11 +9256,16 @@ pub fn alter_table(
     }
 
     for plan in identity_sequences[..n_identity_sequences].iter().flatten() {
-        let sequence_slot = match create_owned_sequence(storage, wal, *plan, u32::MAX) {
+        let sequence_slot = match create_owned_sequence(storage, wal, *plan, txn.txid) {
             Ok(sequence_slot) => sequence_slot,
             Err(error) => return sql_fail(error),
         };
-        storage.commit_sequence_create(sequence_slot);
+        if let Err(error) =
+            txn.record_ddl(super::txn::DdlUndo::SequenceCreated(sequence_slot as u32))
+        {
+            storage.rollback_sequence_create(sequence_slot);
+            return sql_fail(error);
+        }
     }
     for &sequence_slot in &owned_sequences_to_drop[..n_owned_sequences_to_drop] {
         let sequence = storage.sequence(sequence_slot);
@@ -8996,9 +9283,16 @@ pub fn alter_table(
         match storage.drop_sequence(
             sequence_schema.as_str(),
             sequence_name.as_str(),
-            u32::MAX,
+            txn.txid,
         ) {
-            Ok(Some(slot)) => storage.commit_sequence_drop(slot),
+            Ok(Some(slot)) => {
+                if let Err(error) =
+                    txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
+                {
+                    storage.rollback_sequence_drop(slot, txn.txid);
+                    return sql_fail(error);
+                }
+            }
             Ok(None) => {}
             Err(error) => return sql_fail(error),
         }
@@ -9073,26 +9367,87 @@ pub fn alter_table(
         }
     }
 
-    // Swap in memory. Nothing here can fail. Every row now has a heap
-    // image, so the old spill SST no longer serves this table.
-    storage.set_table_def(table_index, new_def, &column_mapping);
+    if let Err(error) = storage.write_table_def(
+        table_index,
+        txn.txid,
+        new_def,
+        &column_mapping,
+        true,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
+        storage.rollback_table_def(table_index, txn.txid);
+        return sql_fail(error);
+    }
+    if relation_moved {
+        for dependent_table in 0..storage.table_count() {
+            if dependent_table == table_index || !storage.table(dependent_table).visible_to(txn.txid)
+            {
+                continue;
+            }
+            let current = *storage.table_def(dependent_table, txn.txid);
+            let mut dependent = current;
+            let mut changed = false;
+            for foreign_key in &mut dependent.fkeys[..dependent.n_fkeys] {
+                if foreign_key.parent_schema == def.schema && foreign_key.parent == def.name {
+                    foreign_key.parent_schema = new_def.schema;
+                    foreign_key.parent = new_def.name;
+                    changed = true;
+                }
+            }
+            if !changed {
+                continue;
+            }
+            let mut identity_mapping = [None; MAX_COLUMNS];
+            for (column, target) in identity_mapping
+                .iter_mut()
+                .enumerate()
+                .take(current.n_columns)
+            {
+                *target = Some(current.columns()[column].name);
+            }
+            if let Err(error) = storage.write_table_def(
+                dependent_table,
+                txn.txid,
+                dependent,
+                &identity_mapping,
+                false,
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) =
+                txn.record_ddl(super::txn::DdlUndo::TableAltered(dependent_table as u32))
+            {
+                storage.rollback_table_def(dependent_table, txn.txid);
+                return sql_fail(error);
+            }
+        }
+    }
     for i in 0..scratch.len() {
         let (rowid, new_home) = scratch[i];
-        let state = storage
-            .table_mut(table_index)
-            .rows
-            .get_mut(&rowid)
-            .expect("row existed during the rewrite pass");
-        state.committed = Some(new_home);
+        let RowHome::Heap(new_loc) = new_home else {
+            unreachable!("the rewrite pass re-homes every row to the heap");
+        };
+        match storage.write_pending(
+            table_index,
+            rowid,
+            txn.txid,
+            txn.command_id(),
+            Some(new_loc),
+        ) {
+            Ok(prior) => {
+                if let Err(error) = txn.touch(table_index as u32, rowid, prior) {
+                    storage.restore_pending(table_index, rowid, txn.txid, prior);
+                    return sql_fail(error);
+                }
+            }
+            Err(error) => return sql_fail(error),
+        }
     }
-    storage.set_spill_list(table_index, &[]);
-    // The column layout and/or constraint set changed and the rows were rehomed
-    // outside the per-row commit path, so rebuild this table's value indexes
-    // from the new committed image.
-    if let Err(e) = storage.refresh_enforcers(table_index) {
-        return sql_fail(e);
+    if emit_completion {
+        responder.command_complete("ALTER TABLE")?;
     }
-    responder.command_complete("ALTER TABLE")?;
     sql_ok()
 }
 
@@ -9281,7 +9636,7 @@ fn collect_matches<'a>(
     scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<(), SqlError> {
     scratch.clear();
-    let def = &storage.table(table_index).def;
+    let def = storage.table_def(table_index, txid);
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
         let Some(loc) = state.visible_at(txid, storage.read_snapshot()) else {

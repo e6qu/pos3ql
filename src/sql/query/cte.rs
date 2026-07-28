@@ -1255,7 +1255,7 @@ fn subst_tableref<'a>(
         (context.path, resolved)
         && t.schema.is_none()
     {
-        let def = &context.storage.table(slot).def;
+        let def = context.storage.table_def(slot, context.txid);
         let schema =
             arena.alloc_str(def.schema.as_str()).map_err(|_| arena_full())?;
         return Ok(TableRef { schema: Some(schema), ..*t });

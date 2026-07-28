@@ -93,14 +93,14 @@ pub fn synthesize<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let info = qualifier == Some("information_schema");
     match (info, name) {
-        (false, "pg_class") => pg_class(storage, arena),
-        (false, "pg_attribute") => pg_attribute(storage, arena),
-        (false, "pg_attrdef") => pg_attrdef(storage, arena),
+        (false, "pg_class") => pg_class(storage, txid, arena),
+        (false, "pg_attribute") => pg_attribute(storage, txid, arena),
+        (false, "pg_attrdef") => pg_attrdef(storage, txid, arena),
         (false, "pg_collation") => pg_collation(arena),
         (false, "pg_type") => pg_type(storage, arena),
         (false, "pg_namespace") => pg_namespace(storage, arena),
-        (false, "pg_tables") => pg_tables(storage, arena),
-        (false, "pg_indexes") => pg_indexes(storage, arena),
+        (false, "pg_tables") => pg_tables(storage, txid, arena),
+        (false, "pg_indexes") => pg_indexes(storage, txid, arena),
         (false, "pg_am") => finish(
             def_of(
                 "pg_am",
@@ -117,8 +117,8 @@ pub fn synthesize<'a>(
             ],
             arena,
         ),
-        (false, "pg_constraint") => pg_constraint(storage, arena),
-        (false, "pg_index") => pg_index(storage, arena),
+        (false, "pg_constraint") => pg_constraint(storage, txid, arena),
+        (false, "pg_index") => pg_index(storage, txid, arena),
         (false, "pg_policy") => finish(
             def_of(
                 "pg_policy",
@@ -537,8 +537,8 @@ pub fn synthesize<'a>(
         (false, "pg_views") => {
             empty_like(name, storage, arena)
         }
-        (true, "tables") => info_tables(storage, arena),
-        (true, "columns") => info_columns(storage, arena),
+        (true, "tables") => info_tables(storage, txid, arena),
+        (true, "columns") => info_columns(storage, txid, arena),
         (true, "schemata") => info_schemata(storage, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
@@ -635,7 +635,11 @@ const MAX_SYNTH_INDEXES: usize = 256;
 /// UNIQUE (from column flags), a multi-column PK/UNIQUE (from `uniques`), and
 /// explicit `CREATE INDEX`es. OIDs are assigned by table slot + position so the
 /// same index resolves identically here and in `pg_get_indexdef`.
-fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDEXES]) -> usize {
+fn collect_indexes(
+    storage: &Storage,
+    txid: u32,
+    out: &mut [Option<IdxInfo>; MAX_SYNTH_INDEXES],
+) -> usize {
     let mut n = 0;
     let mut push = |info: IdxInfo, n: &mut usize| {
         if *n < MAX_SYNTH_INDEXES {
@@ -643,8 +647,11 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
             *n += 1;
         }
     };
-    for (slot, table) in storage.live_tables() {
-        let def = &table.def;
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let def = storage.table_def(slot, txid);
         let table_name = def.name.as_str();
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
@@ -680,7 +687,7 @@ fn collect_indexes(storage: &Storage, out: &mut [Option<IdxInfo>; MAX_SYNTH_INDE
             push(mk(uk.columns(), uk.is_primary, true, stack_str_64(uk.name.as_str())), &mut n);
         }
         // Explicit CREATE INDEX on this table.
-        for index in storage.live_indexes().filter(|i| i.table.as_str() == table_name) {
+        for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
             push(
                 mk(&index.columns[..index.n_cols], false, index.unique, stack_str_64(index.name.as_str())),
                 &mut n,
@@ -700,18 +707,24 @@ fn stack_str_64(s: &str) -> StackStr<64> {
 /// ordinary tables, synthesized index relations, sequences and plain views.
 pub fn relname_text<'a>(
     storage: &Storage,
+    txid: u32,
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    for (slot, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
         if table_oid(storage, slot) == oid {
             let bytes =
-                arena.alloc_slice_copy(table.def.name.as_str().as_bytes()).map_err(|_| arena_full())?;
+                arena
+                    .alloc_slice_copy(storage.table_def(slot, txid).name.as_str().as_bytes())
+                    .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
     let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, &mut indices);
+    let n = collect_indexes(storage, txid, &mut indices);
     for info in indices[..n].iter().flatten() {
         if info.oid == oid {
             let bytes =
@@ -719,14 +732,22 @@ pub fn relname_text<'a>(
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
-    for (slot, seq) in storage.sequences_with_slots() {
+    for slot in 0..storage.sequence_count() {
+        let seq = storage.sequence(slot);
+        if !seq.visible_to(txid) {
+            continue;
+        }
         if sequence_oid(slot) == oid {
             let bytes =
                 arena.alloc_slice_copy(seq.name.as_str().as_bytes()).map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
-    for (slot, view) in storage.views_with_slots() {
+    for slot in 0..storage.view_count() {
+        let view = storage.view(slot);
+        if !view.visible_to(txid) {
+            continue;
+        }
         if view_oid(slot) == oid {
             let bytes =
                 arena.alloc_slice_copy(view.name.as_str().as_bytes()).map_err(|_| arena_full())?;
@@ -739,26 +760,30 @@ pub fn relname_text<'a>(
 /// The OID of the relation named `name`, for `'relname'::regclass`. Resolves
 /// ordinary tables, synthesized index relations and sequences; `None` if no
 /// such relation.
-pub fn reloid_of_name(storage: &Storage, name: &str) -> Option<i32> {
-    for (slot, table) in storage.live_tables() {
-        if table.def.name.as_str() == name {
+pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
+    for slot in 0..storage.table_count() {
+        if storage.table(slot).visible_to(txid)
+            && storage.table_def(slot, txid).name.as_str() == name
+        {
             return Some(table_oid(storage, slot));
         }
     }
     let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, &mut indices);
+    let n = collect_indexes(storage, txid, &mut indices);
     if let Some(info) = indices[..n].iter().flatten().find(|info| info.name.as_str() == name) {
         return Some(info.oid);
     }
-    if let Some((slot, _)) =
-        storage.sequences_with_slots().find(|(_, s)| s.name.as_str() == name)
-    {
-        return Some(sequence_oid(slot));
+    for slot in 0..storage.sequence_count() {
+        let sequence = storage.sequence(slot);
+        if sequence.visible_to(txid) && sequence.name.as_str() == name {
+            return Some(sequence_oid(slot));
+        }
     }
-    storage
-        .views_with_slots()
-        .find(|(_, v)| v.name.as_str() == name)
-        .map(|(slot, _)| view_oid(slot))
+    (0..storage.view_count())
+        .find(|&slot| {
+            storage.view(slot).visible_to(txid) && storage.view(slot).name.as_str() == name
+        })
+        .map(view_oid)
 }
 
 /// Stored SELECT text for `pg_get_viewdef`, by relation OID.
@@ -806,7 +831,7 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
         return Ok(Some(0));
     }
     let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let count = collect_indexes(storage, &mut indexes);
+    let count = collect_indexes(storage, txid, &mut indexes);
     if indexes[..count].iter().flatten().any(|index| index.oid == oid) {
         return Ok(Some(0));
     }
@@ -864,10 +889,12 @@ fn pg_description<'a>(
             break;
         }
         let (objoid, classoid) = match class {
-            crate::storage::CommentClass::Relation => match relation_oid_of(storage, schema, name) {
+            crate::storage::CommentClass::Relation => {
+                match relation_oid_of(storage, txid, schema, name) {
                 Some(oid) => (oid, PG_CLASS_OID),
                 None => continue,
-            },
+                }
+            }
             crate::storage::CommentClass::Schema => (namespace_oid(storage, name), PG_NAMESPACE_OID),
             crate::storage::CommentClass::Type => match type_oid_of(storage, schema, name, txid) {
                 Some(oid) => (oid, PG_TYPE_OID),
@@ -891,27 +918,39 @@ fn pg_description<'a>(
 /// The `pg_class` OID of a relation named `name` in `schema`: an ordinary
 /// table or materialized-view backing table, a sequence, a plain view, or an
 /// index.
-fn relation_oid_of(storage: &Storage, schema: &str, name: &str) -> Option<i32> {
-    if let Some(slot) = storage.find_table(schema, name) {
+fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Option<i32> {
+    if let Some(slot) = storage.find_visible(schema, name, txid) {
         return Some(table_oid(storage, slot));
     }
-    if let Some(slot) = storage.sequence_slot(schema, name, 0) {
+    for slot in 0..storage.table_count() {
+        let table = storage.table(slot);
+        if table.visible_to(txid)
+            && table.def.schema.as_str() == schema
+            && table.def.name.as_str() == name
+        {
+            return Some(table_oid(storage, slot));
+        }
+    }
+    if let Some(slot) = storage.sequence_slot(schema, name, txid) {
         return Some(sequence_oid(slot));
     }
-    if let Some((slot, _)) = storage
-        .views_with_slots()
-        .find(|(_, v)| v.schema.as_str() == schema && v.name.as_str() == name)
-    {
-        return Some(view_oid(slot));
+    for slot in 0..storage.view_count() {
+        let view = storage.view(slot);
+        if view.visible_to(txid)
+            && view.schema.as_str() == schema
+            && view.name.as_str() == name
+        {
+            return Some(view_oid(slot));
+        }
     }
     let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, &mut indices);
+    let n = collect_indexes(storage, txid, &mut indices);
     indices[..n]
         .iter()
         .flatten()
         .find(|info| {
             info.name.as_str() == name
-                && storage.table(info.table_slot).def.schema.as_str() == schema
+                && storage.table_def(info.table_slot, txid).schema.as_str() == schema
         })
         .map(|info| info.oid)
 }
@@ -1133,7 +1172,7 @@ pub fn comment_text_for<'a>(
             _ => {
                 class == crate::storage::CommentClass::Relation
                     && csub as i32 == subid
-                    && relation_oid_of(storage, schema, name) == Some(oid)
+                    && relation_oid_of(storage, txid, schema, name) == Some(oid)
             }
         };
         if hit {
@@ -1162,13 +1201,21 @@ const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
 /// Enumerates every foreign-key constraint, resolving each child/parent table to
 /// its OID. A child whose parent no longer exists is skipped (it cannot be
 /// rendered), matching that a dropped parent leaves no referential row.
-fn collect_fkeys(storage: &Storage, out: &mut [Option<FkInfo>; MAX_SYNTH_INDEXES]) -> usize {
+fn collect_fkeys(
+    storage: &Storage,
+    txid: u32,
+    out: &mut [Option<FkInfo>; MAX_SYNTH_INDEXES],
+) -> usize {
     let mut n = 0;
-    for (slot, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let def = storage.table_def(slot, txid);
         let conrelid = table_oid(storage, slot);
-        for (i, fk) in table.def.fkeys().iter().enumerate() {
+        for (i, fk) in def.fkeys().iter().enumerate() {
             let Some(pslot) =
-                storage.find_table(fk.parent_schema.as_str(), fk.parent.as_str())
+                storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
             else {
                 continue;
             };
@@ -1193,23 +1240,24 @@ fn collect_fkeys(storage: &Storage, out: &mut [Option<FkInfo>; MAX_SYNTH_INDEXES
 /// `pg_get_constraintdef` for a foreign-key constraint OID.
 pub fn constraint_def_text<'a>(
     storage: &Storage,
+    txid: u32,
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut fks = [None; MAX_SYNTH_INDEXES];
-    let n = collect_fkeys(storage, &mut fks);
+    let n = collect_fkeys(storage, txid, &mut fks);
     for info in fks[..n].iter().flatten() {
         if info.oid != oid {
             continue;
         }
-        let child = &storage.table(info.child_slot).def;
+        let child = storage.table_def(info.child_slot, txid);
         let fk = &child.fkeys()[info.fk_index];
         let Some(pslot) =
-            storage.find_table(fk.parent_schema.as_str(), fk.parent.as_str())
+            storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
         else {
             return Ok(None);
         };
-        let parent = &storage.table(pslot).def;
+        let parent = storage.table_def(pslot, txid);
         let mut s = StackStr::<1280>::new();
         use core::fmt::Write as _;
         let _ = s.write_str("FOREIGN KEY (");
@@ -1235,8 +1283,16 @@ pub fn constraint_def_text<'a>(
             arena,
         )?));
     }
-    for (slot, table) in storage.live_tables() {
-        for (check_index, check) in table.def.checks().iter().enumerate() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        for (check_index, check) in storage
+            .table_def(slot, txid)
+            .checks()
+            .iter()
+            .enumerate()
+        {
             let check_oid = FIRST_CHECK_OID
                 + slot as i32 * crate::storage::MAX_CHECKS as i32
                 + check_index as i32;
@@ -1272,12 +1328,12 @@ pub fn constraint_def_text<'a>(
         }
     }
     let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let count = collect_indexes(storage, &mut indexes);
+    let count = collect_indexes(storage, txid, &mut indexes);
     for info in indexes[..count].iter().flatten() {
         if oid != info.oid + 500_000 || (!info.is_primary && !info.is_unique) {
             continue;
         }
-        let table = &storage.table(info.table_slot).def;
+        let table = storage.table_def(info.table_slot, txid);
         let mut rendered = StackStr::<640>::new();
         use core::fmt::Write as _;
         let _ = rendered.write_str(if info.is_primary {
@@ -1321,17 +1377,18 @@ fn fk_action_suffix(a: crate::storage::FkAction, event: &str) -> &'static str {
 /// (it takes everything after `USING`, or the whole string when absent).
 pub fn index_def_text<'a>(
     storage: &Storage,
+    txid: u32,
     oid: i32,
     col: usize,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, &mut indices);
+    let n = collect_indexes(storage, txid, &mut indices);
     for info in indices[..n].iter().flatten() {
         if info.oid != oid {
             continue;
         }
-        let def = &storage.table(info.table_slot).def;
+        let def = storage.table_def(info.table_slot, txid);
         let col_name = |ci: usize| def.columns()[info.columns[ci] as usize].name.as_str();
         // `col > 0`: just the name of that 1-based indexed column.
         if col > 0 {
@@ -1419,7 +1476,11 @@ fn describe_view<'a>(
     super::query::describe_query_under(view.sql.as_str(), storage, 0, path, arena, out)
 }
 
-fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_class<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_class",
         &[
@@ -1456,27 +1517,32 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         ],
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let n_idx = collect_indexes(storage, &mut indexes);
+    let n_idx = collect_indexes(storage, txid, &mut indexes);
     let mut foreign_keys = [None; MAX_SYNTH_INDEXES];
-    let n_foreign_keys = collect_fkeys(storage, &mut foreign_keys);
+    let n_foreign_keys = collect_fkeys(storage, txid, &mut foreign_keys);
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
-    for (slot, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        let table = storage.table(slot);
+        if !table.visible_to(txid) {
+            continue;
+        }
+        let table_def = storage.table_def(slot, txid);
         if n == out.len() {
             break;
         }
         let toid = table_oid(storage, slot);
         let has_index = indexes[..n_idx].iter().flatten().any(|i| i.table_oid == toid);
-        let has_triggers = !table.def.fkeys().is_empty()
+        let has_triggers = !table_def.fkeys().is_empty()
             || foreign_keys[..n_foreign_keys]
                 .iter()
                 .flatten()
                 .any(|foreign_key| foreign_key.confrelid == toid);
-        let n_checks = table.def.n_checks as i32;
+        let n_checks = table_def.n_checks as i32;
         // A table that has a matching matview catalog entry is a materialized
         // view (relkind 'm'), not an ordinary table ('r').
         let relkind = if storage
-            .find_matview(table.def.schema.as_str(), table.def.name.as_str(), 0)
+            .find_matview(table_def.schema.as_str(), table_def.name.as_str(), txid)
             .is_some()
         {
             "m"
@@ -1486,10 +1552,10 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         out[n] = row(
             &[
                 Datum::Int4(toid),
-                text(table.def.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, table.def.schema.as_str())),
+                text(table_def.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, table_def.schema.as_str())),
                 text(relkind, arena)?, // relkind: ordinary table 'r' / matview 'm'
-                Datum::Int4(table.def.n_columns as i32),
+                Datum::Int4(table_def.n_columns as i32),
                 Datum::Float8(table.rows.len() as f64),
                 Datum::Int4(0), // relpages
                 Datum::Int4(0),  // relam
@@ -1532,7 +1598,7 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table(info.table_slot).def.schema.as_str(),
+                    storage.table_def(info.table_slot, txid).schema.as_str(),
                 )),
                 text("i", arena)?, // relkind: index
                 Datum::Int4(info.n_cols as i32),
@@ -1658,7 +1724,11 @@ fn pg_class<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
     finish(def, &out[..n], arena)
 }
 
-fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_constraint<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_constraint",
         &[
@@ -1681,7 +1751,7 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
         ],
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let n_idx = collect_indexes(storage, &mut indexes);
+    let n_idx = collect_indexes(storage, txid, &mut indexes);
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
     // A PRIMARY KEY or UNIQUE constraint has a backing index; its `conindid`
@@ -1724,12 +1794,12 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
     // the referenced parent, so psql's "Foreign-key constraints" (child) and
     // "Referenced by" (parent) sections both resolve.
     let mut fks = [None; MAX_SYNTH_INDEXES];
-    let n_fk = collect_fkeys(storage, &mut fks);
+    let n_fk = collect_fkeys(storage, txid, &mut fks);
     for info in fks[..n_fk].iter().flatten() {
         if n == out.len() {
             break;
         }
-        let fk = &storage.table(info.child_slot).def.fkeys()[info.fk_index];
+        let fk = &storage.table_def(info.child_slot, txid).fkeys()[info.fk_index];
         // conindid points at the parent's unique/PK index backing the referenced
         // columns, which JDBC joins to for foreign-key metadata.
         let conindid = indexes[..n_idx]
@@ -1768,8 +1838,16 @@ fn pg_constraint<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
     // preserved by the table definition and reconstructed by
     // pg_get_constraintdef, which is what psql's "Check constraints" section
     // reads.
-    for (slot, table) in storage.live_tables() {
-        for (check_index, check) in table.def.checks().iter().enumerate() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        for (check_index, check) in storage
+            .table_def(slot, txid)
+            .checks()
+            .iter()
+            .enumerate()
+        {
             if n == out.len() {
                 break;
             }
@@ -1870,7 +1948,11 @@ fn empty_int_array<'a>(arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     })
 }
 
-fn pg_index<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_index<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_index",
         &[
@@ -1891,7 +1973,7 @@ fn pg_index<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         ],
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let n_idx = collect_indexes(storage, &mut indexes);
+    let n_idx = collect_indexes(storage, txid, &mut indexes);
     let mut out: [&[Datum]; MAX_SYNTH_INDEXES] = [&[]; MAX_SYNTH_INDEXES];
     let mut n = 0;
     for info in indexes[..n_idx].iter().flatten() {
@@ -1934,7 +2016,7 @@ fn option_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlE
     })
 }
 
-fn column_type_oid(storage: &Storage, column: &ColumnMeta) -> i32 {
+fn column_type_oid(storage: &Storage, column: &ColumnMeta, txid: u32) -> i32 {
     match (column.ctype, column.domain, column.user_type_schema) {
         (
             ColType::Array(super::types::ArrElem::Domain { slot, .. }),
@@ -1946,14 +2028,18 @@ fn column_type_oid(storage: &Storage, column: &ColumnMeta) -> i32 {
             super::types::oid::enum_array_oid(slot)
         }
         (_, Some(name), Some(schema)) => storage
-            .domain_slot(schema.as_str(), name.as_str(), 0)
+            .domain_slot(schema.as_str(), name.as_str(), txid)
             .map(|slot| super::types::oid::domain_oid(slot as u16))
             .unwrap_or_else(|| column.ctype.oid()),
         _ => column.ctype.oid(),
     }
 }
 
-fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_attribute<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_attribute",
         &[
@@ -1977,8 +2063,11 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
     );
     let mut out: [&[Datum]; 1024] = [&[]; 1024];
     let mut n = 0;
-    for (slot, table) in storage.live_tables() {
-        for (i, c) in table.def.columns().iter().enumerate() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        for (i, c) in storage.table_def(slot, txid).columns().iter().enumerate() {
             if n == out.len() {
                 break;
             }
@@ -1986,7 +2075,7 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                 &[
                     Datum::Int4(table_oid(storage, slot)),
                     text(c.name.as_str(), arena)?,
-                    Datum::Int4(column_type_oid(storage, c)),
+                    Datum::Int4(column_type_oid(storage, c, txid)),
                     Datum::Int4(i as i32 + 1),
                     Datum::Bool(c.not_null),
                     Datum::Int4(i32::from(c.ctype.typlen())),
@@ -2018,9 +2107,9 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
         }
     }
     let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let index_count = collect_indexes(storage, &mut indexes);
+    let index_count = collect_indexes(storage, txid, &mut indexes);
     for info in indexes[..index_count].iter().flatten() {
-        let table = &storage.table(info.table_slot).def;
+        let table = storage.table_def(info.table_slot, txid);
         for (attribute, &column_index) in info.columns[..info.n_cols].iter().enumerate() {
             if n == out.len() {
                 break;
@@ -2030,7 +2119,7 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                 &[
                     Datum::Int4(info.oid),
                     text(column.name.as_str(), arena)?,
-                    Datum::Int4(column_type_oid(storage, column)),
+                    Datum::Int4(column_type_oid(storage, column, txid)),
                     Datum::Int4(attribute as i32 + 1),
                     Datum::Bool(false),
                     Datum::Int4(i32::from(column.ctype.typlen())),
@@ -2092,7 +2181,11 @@ fn pg_attribute<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
     finish(def, &out[..n], arena)
 }
 
-fn pg_attrdef<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_attrdef<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_attrdef",
         &[
@@ -2107,9 +2200,13 @@ fn pg_attrdef<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>,
     // pg_get_expr exposes it through the same catalog contract.
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
-    for (slot, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
         let relid = table_oid(storage, slot);
-        for (ci, c) in table.def.columns().iter().enumerate() {
+        for (ci, c) in table.columns().iter().enumerate() {
             let Some(text_expr) = &c.default_expr else {
                 continue;
             };
@@ -2511,7 +2608,11 @@ fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
 /// `pg_indexes`: one row per index relation, with the full `CREATE INDEX`
 /// text PostgreSQL's view reconstructs. The same enumeration as `pg_class`'s
 /// index rows, so psql and this view can never disagree about what exists.
-fn pg_indexes<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_indexes<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_indexes",
         &[
@@ -2523,11 +2624,11 @@ fn pg_indexes<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>,
         ],
     );
     let mut indices = [None; MAX_SYNTH_INDEXES];
-    let count = collect_indexes(storage, &mut indices);
+    let count = collect_indexes(storage, txid, &mut indices);
     let mut out: [&[Datum]; MAX_SYNTH_INDEXES] = [&[]; MAX_SYNTH_INDEXES];
     let mut n = 0;
     for info in indices[..count].iter().flatten() {
-        let table_def = &storage.table(info.table_slot).def;
+        let table_def = storage.table_def(info.table_slot, txid);
         let mut indexdef = StackStr::<896>::new();
         {
             use core::fmt::Write as _;
@@ -2576,7 +2677,11 @@ fn pg_indexes<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>,
     finish(def, &out[..n], arena)
 }
 
-fn pg_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_tables<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_tables",
         &[
@@ -2587,7 +2692,11 @@ fn pg_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, 
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for (_, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
         if n == out.len() {
             break;
         }
@@ -2595,11 +2704,11 @@ fn pg_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, 
             &[
                 text(
                     arena
-                        .alloc_str(table.def.schema.as_str())
+                        .alloc_str(table.schema.as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
-                text(table.def.name.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
                 text(
                     arena.alloc_str(
                         crate::sql::eval::funcs::system::session_user_owned().as_str(),
@@ -2761,7 +2870,11 @@ fn pg_sequence<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
     finish(def, &out[..n], arena)
 }
 
-fn info_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn info_tables<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "tables",
         &[
@@ -2773,7 +2886,11 @@ fn info_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for (_, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
         if n == out.len() {
             break;
         }
@@ -2782,11 +2899,11 @@ fn info_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
                 text("postgres", arena)?,
                 text(
                     arena
-                        .alloc_str(table.def.schema.as_str())
+                        .alloc_str(table.schema.as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
-                text(table.def.name.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
                 text("BASE TABLE", arena)?,
             ],
             arena,
@@ -2821,7 +2938,11 @@ fn info_tables<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
     finish(def, &out[..n], arena)
 }
 
-fn info_columns<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn info_columns<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "columns",
         &[
@@ -2836,8 +2957,12 @@ fn info_columns<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
     );
     let mut out: [&[Datum]; 1024] = [&[]; 1024];
     let mut n = 0;
-    for (_, table) in storage.live_tables() {
-        for (i, c) in table.def.columns().iter().enumerate() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for (i, c) in table.columns().iter().enumerate() {
             if n == out.len() {
                 break;
             }
@@ -2846,11 +2971,11 @@ fn info_columns<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                     text("postgres", arena)?,
                     text(
                         arena
-                            .alloc_str(table.def.schema.as_str())
+                            .alloc_str(table.schema.as_str())
                             .map_err(|_| crate::sql::eval::arena_full())?,
                         arena,
                     )?,
-                    text(table.def.name.as_str(), arena)?,
+                    text(table.name.as_str(), arena)?,
                     text(c.name.as_str(), arena)?,
                     Datum::Int4(i as i32 + 1),
                     text(if c.not_null { "NO" } else { "YES" }, arena)?,

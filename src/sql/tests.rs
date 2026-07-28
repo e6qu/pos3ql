@@ -35,7 +35,7 @@ fn test_engine() -> (Engine, Budget) {
     let n = N.fetch_add(1, Ordering::SeqCst);
     let name = format!("t{n}");
     let config = test_config(&name);
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let engine = Engine::new(&config, &mut budget).unwrap();
     (engine, budget)
 }
@@ -342,6 +342,283 @@ fn uncommitted_drop_stays_visible_to_other_sessions() {
     run_txn(&mut e, &mut b, &mut a, "COMMIT");
     let after = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
     assert!(after.contains("does not exist"), "gone after commit: {after}");
+}
+
+#[test]
+fn transactional_alter_table_versions_shape_and_rows() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE shaped (id int PRIMARY KEY, value text)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "INSERT INTO shaped VALUES (1, 'old')",
+    );
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    let altered = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE shaped ADD COLUMN generation int DEFAULT 7",
+    );
+    assert!(altered.contains("ALTER TABLE"), "{altered}");
+    let owner_rows = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT id, value, generation FROM shaped",
+    ));
+    assert_eq!(owner_rows, ["1|old|7"]);
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'shaped' \
+             ORDER BY ordinal_position",
+        )),
+        ["id", "value", "generation"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'shaped' \
+             ORDER BY ordinal_position",
+        )),
+        ["id", "value"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT a.attname FROM pg_attribute a JOIN pg_class c \
+             ON c.oid = a.attrelid WHERE c.relname = 'shaped' \
+             ORDER BY a.attnum",
+        )),
+        ["id", "value", "generation"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE shaped ADD UNIQUE (generation)",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT pg_get_constraintdef(c.oid, true) \
+             FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
+             WHERE r.relname = 'shaped' AND c.conname = 'shaped_generation_key'",
+        )),
+        ["UNIQUE (generation)"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
+             WHERE r.relname = 'shaped' AND c.conname = 'shaped_generation_key'",
+        )),
+        ["0"]
+    );
+
+    let observer_rows = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT id, value FROM shaped",
+    ));
+    assert_eq!(observer_rows, ["1|old"]);
+    let observer_shape = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT generation FROM shaped",
+    );
+    assert!(observer_shape.contains("42703"), "{observer_shape}");
+
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    let rolled_back = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT generation FROM shaped",
+    );
+    assert!(rolled_back.contains("42703"), "{rolled_back}");
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE shaped ADD COLUMN generation int DEFAULT 9",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "UPDATE shaped SET value = 'new', generation = 10 WHERE id = 1",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    let committed = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT id, value, generation FROM shaped",
+    ));
+    assert_eq!(committed, ["1|new|10"]);
+}
+
+#[test]
+fn transactional_alter_table_savepoint_and_rename_visibility() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE original (id int PRIMARY KEY);
+         CREATE TABLE child (parent_id int REFERENCES original(id));
+         CREATE INDEX original_id_idx ON original(id);
+         COMMENT ON TABLE original IS 'stable identity';
+         INSERT INTO original VALUES (1);
+         INSERT INTO child VALUES (1)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE original ADD COLUMN first int DEFAULT 2",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "SAVEPOINT before_rename");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE original RENAME COLUMN first TO second",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT id, second FROM original",
+        )),
+        ["1|2"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ROLLBACK TO SAVEPOINT before_rename",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT id, first FROM original",
+        )),
+        ["1|2"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE original RENAME TO renamed",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT id, first FROM renamed",
+        )),
+        ["1|2"]
+    );
+    let owner_dependencies = run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "INSERT INTO child VALUES (1);
+         SELECT pg_get_constraintdef(c.oid, true)
+           FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+          WHERE r.relname = 'child' AND c.contype = 'f';
+         SELECT indexname FROM pg_indexes
+          WHERE tablename = 'renamed' AND indexname = 'original_id_idx';
+         SELECT obj_description('renamed'::regclass, 'pg_class')",
+    );
+    assert_eq!(
+        data_rows(&owner_dependencies),
+        [
+            "FOREIGN KEY (parent_id) REFERENCES renamed(id)",
+            "original_id_idx",
+            "stable identity"
+        ],
+        "{}",
+        String::from_utf8_lossy(&owner_dependencies)
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT id FROM original",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT pg_get_constraintdef(c.oid, true)
+               FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+              WHERE r.relname = 'child' AND c.contype = 'f'",
+        )),
+        ["FOREIGN KEY (parent_id) REFERENCES original(id)"]
+    );
+    let observer_new = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT * FROM renamed",
+    );
+    assert!(observer_new.contains("42P01"), "{observer_new}");
+    let committed = run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    assert!(committed.contains("COMMIT"), "{committed}");
+    let visible = run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT id, first FROM renamed",
+    );
+    assert_eq!(
+        data_rows(&visible),
+        ["1|2"],
+        "{}",
+        String::from_utf8_lossy(&visible)
+    );
 }
 
 #[test]
@@ -1322,6 +1599,55 @@ fn multiway_equijoin_prunes_early() {
     let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
         "SELECT count(*) FROM t a, t b WHERE a.id=b.id AND a.v + b.v = 4"));
     assert_eq!(rows, ["8"], "leaf-checked predicate: {rows:?}");
+}
+
+#[test]
+fn selective_join_component_precedes_independent_cross_filters() {
+    // The final cardinality is small, but postponing the t1/t6 equality until
+    // after the six independent filters creates more than sixteen million
+    // nested-loop candidates. Equivalent FROM permutations must all establish
+    // that selective component before multiplying it.
+    let (mut e, mut b) = test_engine();
+    for definition in [
+        "CREATE TABLE t1(a1 int, d1 int)",
+        "CREATE TABLE t2(d2 int)",
+        "CREATE TABLE t3(a3 int)",
+        "CREATE TABLE t4(b4 int)",
+        "CREATE TABLE t5(c5 int)",
+        "CREATE TABLE t6(b6 int, d6 int)",
+        "CREATE TABLE t7(e7 int)",
+        "CREATE TABLE t9(c9 int)",
+    ] {
+        run_with(&mut e, &mut b, definition);
+    }
+    for insert in [
+        "INSERT INTO t1 SELECT g,g FROM generate_series(1,100) g",
+        "INSERT INTO t2 SELECT g FROM generate_series(1,100) g",
+        "INSERT INTO t3 SELECT g FROM generate_series(1,100) g",
+        "INSERT INTO t4 SELECT g FROM generate_series(1,100) g",
+        "INSERT INTO t5 SELECT g FROM generate_series(1,100) g",
+        "INSERT INTO t6 SELECT g,100-g FROM generate_series(1,100) g",
+        "INSERT INTO t7 SELECT g FROM generate_series(1,100) g",
+        "INSERT INTO t9 SELECT g FROM generate_series(1,100) g",
+    ] {
+        run_with(&mut e, &mut b, insert);
+    }
+    let qualification = "t1.a1=t6.b6 AND t1.d1=t6.d6 \
+        AND t2.d2=1 AND t4.b4 IN (1,2) AND t3.a3 IN (1,2,3) \
+        AND t9.c9 IN (1,2,3,4,5) AND t7.e7 IN (1,2,3,4,5,6) \
+        AND t5.c5 IN (1,2,3,4,5,6,7,8,9)";
+    for from in [
+        "t5,t2,t9,t6,t4,t1,t7,t3",
+        "t6,t3,t9,t1,t7,t2,t4,t5",
+        "t1,t4,t5,t7,t9,t3,t2,t6",
+        "t5,t9,t1,t6,t3,t7,t2,t4",
+    ] {
+        let sql = format!(
+            "SET statement_timeout=10000; SELECT count(*) FROM {from} WHERE {qualification}"
+        );
+        let rows = data_rows(&run_with(&mut e, &mut b, &sql));
+        assert_eq!(rows, ["1620"], "FROM {from}");
+    }
 }
 
 #[test]
@@ -2967,31 +3293,103 @@ fn type_cascade_never_leaves_cross_schema_columns_dangling() {
            mood types.mood,
            amount types.positive
          );
-         INSERT INTO public.consumer VALUES ('ok', 1);",
+         CREATE TABLE public.wide_consumer (
+           mood_1 types.mood, mood_2 types.mood, mood_3 types.mood,
+           mood_4 types.mood, mood_5 types.mood, mood_6 types.mood,
+           mood_7 types.mood, mood_8 types.mood, mood_9 types.mood,
+           keep integer
+         );
+         INSERT INTO public.consumer VALUES ('ok', 1);
+         INSERT INTO public.wide_consumer
+           VALUES ('ok','ok','ok','ok','ok','ok','ok','ok','ok',42);",
     );
+    let dropped_type = run_with(&mut e, &mut b, "DROP TYPE types.mood CASCADE");
     assert!(
-        String::from_utf8_lossy(&run_with(
-            &mut e,
-            &mut b,
-            "DROP TYPE types.mood CASCADE"
-        ))
-        .contains("0A000")
+        !message_types(&dropped_type).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped_type)
     );
-    assert!(
-        String::from_utf8_lossy(&run_with(
-            &mut e,
-            &mut b,
-            "DROP SCHEMA types CASCADE"
-        ))
-        .contains("0A000")
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT amount FROM public.consumer")),
+        ["1"]
     );
     assert_eq!(
         data_rows(&run_with(
             &mut e,
             &mut b,
-            "SELECT mood,amount FROM public.consumer"
+            "SELECT keep FROM public.wide_consumer"
         )),
-        ["ok|1"]
+        ["42"],
+        "all dependent columns in one table must be removed by one ALTER version"
+    );
+    let dropped_schema = run_with(&mut e, &mut b, "DROP SCHEMA types CASCADE");
+    assert!(
+        !message_types(&dropped_schema).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped_schema)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT count(*) FROM public.consumer"
+        )),
+        ["1"]
+    );
+}
+
+#[test]
+fn drop_schema_cascade_versions_surviving_foreign_keys() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE SCHEMA doomed;
+         CREATE TABLE doomed.parent (id int PRIMARY KEY);
+         CREATE TABLE child (parent_id int REFERENCES doomed.parent(id))",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    let dropped = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "DROP SCHEMA doomed CASCADE",
+    );
+    assert!(dropped.contains("DROP SCHEMA"), "{dropped}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
+             WHERE r.relname = 'child' AND c.contype = 'f'",
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
+             WHERE r.relname = 'child' AND c.contype = 'f'",
+        )),
+        ["1"],
+        "another transaction must retain the committed inbound constraint"
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
+             WHERE r.relname = 'child' AND c.contype = 'f'",
+        )),
+        ["1"]
     );
 }
 
@@ -4439,6 +4837,31 @@ fn data_modifying_cte_select_main() {
         "WITH r(the_id) AS (DELETE FROM dc WHERE id=10 RETURNING id) SELECT the_id FROM r",
     );
     assert_eq!(data_rows(&bytes), ["10"]);
+}
+
+#[test]
+fn data_modifying_cte_sees_prior_command_version_inside_transaction() {
+    let (mut engine, mut budget) = test_engine();
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE command_versions (id int PRIMARY KEY, value text);\
+         INSERT INTO command_versions VALUES (1, 'committed');\
+         BEGIN;\
+         UPDATE command_versions SET value = 'first' WHERE id = 1;\
+         WITH changed AS (\
+             UPDATE command_versions SET value = 'second' WHERE id = 1 RETURNING value\
+         )\
+         SELECT (SELECT value FROM changed),\
+                (SELECT value FROM command_versions WHERE id = 1);\
+         COMMIT;\
+         SELECT value FROM command_versions WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["second|first", "second"],
+        "the WITH command snapshot must see the preceding command's pending row image"
+    );
 }
 
 #[test]

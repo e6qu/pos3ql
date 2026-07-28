@@ -228,6 +228,19 @@ fn enforce_key_uniqueness(
     if columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
     }
+    if storage.has_pending_table_def(table_index, txid) {
+        return pending_scan_uniqueness(
+            storage,
+            table_index,
+            schema,
+            columns,
+            values,
+            self_rowid,
+            txid,
+            def,
+            name,
+        );
+    }
 
     // A new key (an insert, not an update of the same row) past the enforcer's
     // committed-row cap is a loud error: an in-RAM value index cannot grow.
@@ -315,7 +328,7 @@ fn pending_scan_uniqueness(
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = state.pending else {
+        let Some(pending) = state.pending.last() else {
             continue;
         };
         let Some(loc) = pending.loc else {
@@ -595,7 +608,7 @@ fn check_fk_child(
                 fk.name.as_str()
             ));
         };
-        let pdef = storage.table(pi).def;
+        let pdef = *storage.table_def(pi, txid);
         let mut pschema = [ColType::Bool; MAX_COLUMNS];
         pdef.schema(&mut pschema);
         if !parent_has_key(
@@ -690,7 +703,7 @@ pub(crate) fn apply_fk_parent_actions(
         if !storage.table(child_index).visible_to(txn.txid) {
             continue;
         }
-        let cdef = storage.table(child_index).def;
+        let cdef = *storage.table_def(child_index, txn.txid);
         let mut cschema = [ColType::Bool; MAX_COLUMNS];
         cdef.schema(&mut cschema);
         let cschema = &cschema[..cdef.n_columns];
@@ -894,8 +907,7 @@ pub(crate) fn table_is_referenced(
             continue;
         }
         if storage
-            .table(column_index)
-            .def
+            .table_def(column_index, txid)
             .fkeys()
             .iter()
             .any(|fk| fk.parent_schema.as_str() == schema && fk.parent.as_str() == name)
@@ -920,7 +932,7 @@ pub(crate) fn referenced_key_changed(
         if !storage.table(column_index).visible_to(txid) {
             continue;
         }
-        let cdef = storage.table(column_index).def;
+        let cdef = *storage.table_def(column_index, txid);
         for fk in cdef.fkeys() {
             if fk.parent_schema.as_str() != parent_schema
                 || fk.parent.as_str() != parent_name

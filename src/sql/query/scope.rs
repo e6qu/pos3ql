@@ -527,7 +527,7 @@ impl<'d> QueryScope<'d> {
                 ),
             });
         };
-        let def = &storage.table(slot).def;
+        let def = storage.table_def(slot, txid);
         let exposed = alias.unwrap_or(def.name.as_str());
         // Two same-named entries coexist only when both are *unaliased base
         // tables of different schemas* (their references then need the

@@ -68,17 +68,24 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u16> 
 /// intermediate product and turns a k-way join O(N^k). The greedy heuristic
 /// picks, at each step, the remaining table that "unlocks" the most WHERE
 /// conjuncts (its columns, together with the already-chosen tables, fully bind a
-/// conjunct so pushdown can prune there), breaking ties by FROM order. This
-/// keeps selective and equi-joined tables early and pushes unconstrained tables
-/// last, without changing results (join order is free for inner/cross joins).
+/// conjunct so pushdown can prune there). Predicates carry a bounded
+/// selectivity estimate: equality joins and exact filters establish their
+/// connected component before broad `IN` lists multiply it. This keeps the
+/// plan stable across equivalent FROM permutations without stored statistics,
+/// and pushes unconstrained tables last. Results do not change because join
+/// order is free for inner/cross joins.
 pub(super) fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [usize; MAX_JOIN_TABLES] {
     let mut order = core::array::from_fn(|i| i);
     let n = scope.n;
     if n < 3 {
         return order;
     }
-    // Collect the WHERE conjuncts' table masks (only analyzable ones).
+    // Collect analyzable WHERE conjuncts and their static selectivity. The
+    // estimate is deliberately cardinality-free: live table statistics do not
+    // exist yet, but the predicate shape still distinguishes one equality from
+    // a broad list.
     let mut masks = [0u16; MAX_CONJUNCTS];
+    let mut strengths = [0u32; MAX_CONJUNCTS];
     let mut n_masks = 0;
     if let Some(w) = where_clause {
         let mut conjunct: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
@@ -90,32 +97,38 @@ pub(super) fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [us
                 && n_masks < MAX_CONJUNCTS
             {
                 masks[n_masks] = m;
+                strengths[n_masks] = predicate_strength(c);
                 n_masks += 1;
             }
         }
     }
     let mut chosen_mask = 0u16;
     for slot in order.iter_mut().take(n) {
-        // Among not-yet-chosen tables, pick the one unlocking the most conjuncts
-        // (a conjunct is unlocked when the table is its last unbound one).
+        // A table earns the strength of every predicate component it starts or
+        // extends, and twice the strength when it completes a multi-table
+        // predicate. This makes the second side of a selective equality follow
+        // the first instead of postponing the pair until after independent
+        // filters have multiplied the outer loop.
         let mut best = usize::MAX;
-        let mut best_score = -1i32;
+        let mut best_score = 0u32;
         for t in 0..n {
             if chosen_mask & (1 << t) != 0 {
                 continue;
             }
             let after = chosen_mask | (1 << t);
-            let mut score = 0i32;
-            for &m in &masks[..n_masks] {
-                if m & !chosen_mask == (1 << t) {
-                    score += 1;
+            let mut score = 0u32;
+            for (&mask, &strength) in
+                masks[..n_masks].iter().zip(&strengths[..n_masks])
+            {
+                if mask & (1 << t) == 0 {
+                    continue;
                 }
-                // Slight preference for being connected at all (bounds growth).
-                if m & !after == 0 && m & (1 << t) != 0 {
-                    score += 1;
+                score = score.saturating_add(strength);
+                if mask.count_ones() > 1 && mask & !after == 0 {
+                    score = score.saturating_add(strength);
                 }
             }
-            if score > best_score {
+            if best == usize::MAX || score > best_score {
                 best_score = score;
                 best = t;
             }
@@ -124,6 +137,48 @@ pub(super) fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [us
         chosen_mask |= 1 << best;
     }
     order
+}
+
+/// Static selectivity signal used only to order freely-reorderable cross joins.
+/// Larger means the predicate is expected to discard more candidates.
+fn predicate_strength(expression: &Expr) -> u32 {
+    use crate::sql::ast::BinaryOp;
+
+    const EXACT: u32 = 1024;
+
+    fn equality_alternatives(expression: &Expr) -> Option<u32> {
+        match expression {
+            Expr::Binary { operator: BinaryOp::Or, left, right } => {
+                equality_alternatives(left)?.checked_add(equality_alternatives(right)?)
+            }
+            Expr::Binary { operator: BinaryOp::Eq, left, right }
+                if left.is_constant() != right.is_constant() =>
+            {
+                Some(1)
+            }
+            _ => None,
+        }
+    }
+
+    if let Some(alternatives) = equality_alternatives(expression) {
+        return EXACT / alternatives.max(1);
+    }
+    match expression {
+        Expr::Binary { operator: BinaryOp::Eq, .. } => EXACT,
+        Expr::InList { list, negated: false, .. }
+            if list.iter().all(|item| item.is_constant()) =>
+        {
+            EXACT / (list.len() as u32).max(1)
+        }
+        Expr::IsNull { .. } => EXACT / 4,
+        Expr::Between { .. } => EXACT / 8,
+        Expr::Binary {
+            operator: BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+            ..
+        } => EXACT / 16,
+        Expr::Like { .. } | Expr::Match { .. } => EXACT / 32,
+        _ => 1,
+    }
 }
 
 /// Evaluates one WHERE conjunct to a filter decision (NULL and FALSE both
@@ -827,4 +882,3 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         Subquery(_) | Exists(_) | ArraySubquery(_) | InSubquery { .. } => 1000,
     }
 }
-

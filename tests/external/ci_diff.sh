@@ -190,6 +190,24 @@ else
     bad "pg_restore --clean --if-exists replaces a populated database"
     tail -40 "$WORK/pg_restore_clean.out"
   else
+    pg_restore --exit-on-error --clean --if-exists --single-transaction \
+      -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+      tests/data/postgresql-15.18-pgrestore.dump \
+      > "$WORK/pg_restore_single_transaction.out" 2>&1
+    archive_single_status=$?
+    if [[ $archive_single_status -ne 0 ]]; then
+      bad "pg_restore --single-transaction replaces a populated database"
+      tail -40 "$WORK/pg_restore_single_transaction.out"
+    fi
+    pg_restore --exit-on-error --clean --if-exists --transaction-size=10 \
+      -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+      tests/data/postgresql-15.18-pgrestore.dump \
+      > "$WORK/pg_restore_transaction_size.out" 2>&1
+    archive_sized_status=$?
+    if [[ $archive_sized_status -ne 0 ]]; then
+      bad "pg_restore --transaction-size replaces a populated database"
+      tail -40 "$WORK/pg_restore_transaction_size.out"
+    fi
     restart_p3 || exit 1
     archive_observed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
       -v ON_ERROR_STOP=1 -c "
@@ -198,8 +216,10 @@ else
         SELECT nextval('app.ticket_seq');
       " 2>/dev/null)
     expected_archive_observed=$'2\nsad|1\nhappy|1\n30'
-    if [[ "$archive_observed" == "$expected_archive_observed" ]]; then
-      ok "ownerful parallel pg_restore, clean replacement and restart"
+    if [[ $archive_single_status -eq 0
+          && $archive_sized_status -eq 0
+          && "$archive_observed" == "$expected_archive_observed" ]]; then
+      ok "ownerful parallel/single/sized pg_restore, clean replacement and restart"
     else
       bad "PostgreSQL 15.18 custom archive restore result"
       printf 'expected:\n%s\nobserved:\n%s\n' \

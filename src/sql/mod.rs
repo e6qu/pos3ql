@@ -456,7 +456,7 @@ impl Engine {
                 DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
                 DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
-                DdlUndo::SequenceReset { .. } => {}
+                DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => self.storage.commit_schema_create(*slot as usize),
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
                 // The removal already happened in place; committing keeps it.
@@ -567,6 +567,16 @@ impl Engine {
                     t.serial_last[column as usize] = prior;
                     t.serial_dirty = true;
                 }
+                DdlUndo::OwnedSequenceReset {
+                    sequence,
+                    prior,
+                    prior_called,
+                } => {
+                    let sequence = self.storage.sequence(sequence as usize);
+                    sequence.last_value.set(prior);
+                    sequence.is_called.set(prior_called);
+                    sequence.dirty.set(true);
+                }
                 DdlUndo::SchemaCreated(slot) => {
                     self.storage.rollback_schema_create(slot as usize)
                 }
@@ -664,6 +674,16 @@ impl Engine {
                     let t = self.storage.table_mut(table as usize);
                     t.serial_last[column as usize] = prior;
                     t.serial_dirty = true;
+                }
+                DdlUndo::OwnedSequenceReset {
+                    sequence,
+                    prior,
+                    prior_called,
+                } => {
+                    let sequence = self.storage.sequence(sequence as usize);
+                    sequence.last_value.set(prior);
+                    sequence.is_called.set(prior_called);
+                    sequence.dirty.set(true);
                 }
                 DdlUndo::SchemaCreated(slot) => {
                     self.storage.rollback_schema_create(slot as usize)
@@ -2607,9 +2627,12 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
 pub(crate) const SETTING_NAMES: &[&str] = &[
     "application_name",
     "bytea_output",
+    "check_function_bodies",
     "client_encoding",
     "client_min_messages",
     "DateStyle",
+    "default_table_access_method",
+    "default_tablespace",
     "extra_float_digits",
     "idle_in_transaction_session_timeout",
     "integer_datetimes",
@@ -2627,6 +2650,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "TimeZone",
     "transaction_isolation",
     "transaction_timeout",
+    "xmloption",
 ];
 
 /// Emits the warnings a statement's parse raised, ahead of running it —
@@ -2816,6 +2840,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             start_value,
             cache,
             cycle,
+            owner,
+            generator_for,
         } => {
             let spec = crate::storage::SeqSpec {
                 data_type: crate::storage::SeqType::from_u8(data_type),
@@ -2829,12 +2855,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // An ALTER replays as CreateSequence: if the sequence already exists,
             // redefine it in place; otherwise create it.
             if let Some(slot) = storage.sequence_slot(schema, name, 0) {
-                storage.alter_sequence(slot, spec, None);
+                storage.alter_sequence(slot, spec, None, owner, generator_for);
             } else {
                 let slot = storage.create_sequence(
                     crate::storage::SqlName::parse(schema)?,
                     crate::storage::SqlName::parse(name)?,
                     spec,
+                    owner,
+                    generator_for,
                     0,
                 )?;
                 storage.commit_sequence_create(slot);

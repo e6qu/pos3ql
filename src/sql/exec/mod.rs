@@ -140,6 +140,114 @@ use constraints::{
 };
 pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
 
+#[derive(Clone, Copy)]
+struct OwnedSequencePlan {
+    schema: SqlName,
+    name: SqlName,
+    spec: SeqSpec,
+    owner: crate::storage::SequenceOwner,
+}
+
+fn default_owned_sequence_name(table: &str, column: &str) -> Result<SqlName, SqlError> {
+    use core::fmt::Write as _;
+    let mut name = crate::util::StackStr::<64>::new();
+    let _ = write!(name, "{}_{}_seq", table, column);
+    if name.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "generated sequence name is too long"
+        ));
+    }
+    SqlName::parse(name.as_str())
+}
+
+fn owned_sequence_plan(
+    def: &TableDef,
+    column_index: usize,
+    identity: Option<crate::sql::ast::IdentitySpec<'_>>,
+) -> Result<OwnedSequencePlan, SqlError> {
+    let column = def.columns()[column_index];
+    let mut options = identity.map_or(crate::sql::ast::SeqOptions::EMPTY, |i| i.options);
+    options.data_type = Some(match column.ctype {
+        ColType::Int2 => "smallint",
+        ColType::Int8 => "bigint",
+        _ => "integer",
+    });
+    options.owned_by = None;
+    let (spec, _) = resolve_seq_spec(&options, None)?;
+    let (schema, name) = match identity.and_then(|i| i.sequence_name) {
+        Some(name) => {
+            if let Some(schema) = name.schema
+                && schema != def.schema.as_str()
+            {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "sequence must be in same schema as table it is linked to"
+                ));
+            }
+            (def.schema, SqlName::parse(name.name)?)
+        }
+        None => (
+            def.schema,
+            default_owned_sequence_name(def.name.as_str(), column.name.as_str())?,
+        ),
+    };
+    Ok(OwnedSequencePlan {
+        schema,
+        name,
+        spec,
+        owner: crate::storage::SequenceOwner {
+            table_schema: def.schema,
+            table: def.name,
+            column: column.name,
+        },
+    })
+}
+
+fn create_owned_sequence(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    plan: OwnedSequencePlan,
+    txid: u32,
+) -> Result<usize, SqlError> {
+    if storage.relation_name_taken(plan.schema.as_str(), plan.name.as_str(), txid) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_TABLE,
+            "relation \"{}\" already exists",
+            plan.name.as_str()
+        ));
+    }
+    let slot = storage.create_sequence(
+        plan.schema,
+        plan.name,
+        plan.spec,
+        Some(plan.owner),
+        Some(plan.owner),
+        txid,
+    )?;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.append(
+        lsn,
+        &WalOp::CreateSequence {
+            schema: plan.schema.as_str(),
+            name: plan.name.as_str(),
+            data_type: plan.spec.data_type.to_u8(),
+            increment: plan.spec.increment,
+            min_value: plan.spec.min_value,
+            max_value: plan.spec.max_value,
+            start_value: plan.spec.start_value,
+            cache: plan.spec.cache,
+            cycle: plan.spec.cycle,
+            owner: Some(plan.owner),
+            generator_for: Some(plan.owner),
+        },
+    ) {
+        storage.rollback_sequence_create(slot);
+        return Err(error);
+    }
+    Ok(slot)
+}
+
 pub fn create_table(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -183,17 +291,26 @@ pub fn create_table(
                 storage.rollback_create(slot);
                 return sql_fail(e);
             }
-            // Seed an identity column's counter from its START WITH, so the
-            // first value handed out equals START (the generator advances by the
-            // step before yielding).
             for c in statement.columns {
-                if let Some(start) = ddl::identity_start(c)
-                    && let Some(idx) = def.column_index(c.name)
+                let Some(index) = def.column_index(c.name) else {
+                    continue;
+                };
+                if !def.columns()[index].auto_increment {
+                    continue;
+                }
+                let plan = match owned_sequence_plan(&def, index, c.identity) {
+                    Ok(plan) => plan,
+                    Err(error) => return sql_fail(error),
+                };
+                let sequence_slot = match create_owned_sequence(storage, wal, plan, txn.txid) {
+                    Ok(sequence_slot) => sequence_slot,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(error) =
+                    txn.record_ddl(super::txn::DdlUndo::SequenceCreated(sequence_slot as u32))
                 {
-                    let step = def.columns()[idx].auto_increment_step;
-                    let table = storage.table_mut(slot);
-                    table.serial_last[idx] = start.wrapping_sub(step);
-                    table.serial_dirty = true;
+                    storage.rollback_sequence_create(sequence_slot);
+                    return sql_fail(error);
                 }
             }
         }
@@ -471,7 +588,30 @@ fn next_auto_value<'x>(
     table_index: usize,
     col: usize,
     ctype: ColType,
+    seq_session: &crate::sql::guc::SeqSession,
+    txid: u32,
 ) -> Result<Datum<'x>, SqlError> {
+    let def = storage.table(table_index).def;
+    let column = def.columns()[col];
+    if let Some(slot) = storage.generated_sequence_slot(
+        def.schema.as_str(),
+        def.name.as_str(),
+        column.name.as_str(),
+        txid,
+    ) {
+        let sequence = storage.sequence(slot);
+        let next = sequence.next_value()?;
+        seq_session.record_nextval(slot, sequence.created_at, next);
+        return match ctype {
+            ColType::Int8 => Ok(Datum::Int8(next)),
+            ColType::Int2 => i16::try_from(next)
+                .map(Datum::Int2)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "smallint out of range")),
+            _ => i32::try_from(next)
+                .map(Datum::Int4)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")),
+        };
+    }
     let table = storage.table_mut(table_index);
     let step = table.def.columns()[col].auto_increment_step;
     let next = table.serial_last[col] + step;
@@ -818,6 +958,8 @@ fn fill_auto_increment(
     def: &TableDef,
     values: &mut [Datum],
     explicit: &[bool; MAX_COLUMNS],
+    seq_session: &crate::sql::guc::SeqSession,
+    txid: u32,
 ) -> Result<(), SqlError> {
     if !def.columns().iter().any(|c| c.auto_increment) {
         return Ok(());
@@ -825,7 +967,8 @@ fn fill_auto_increment(
     for i in 0..def.n_columns {
         let col = &def.columns()[i];
         if col.auto_increment && !explicit[i] && values[i].is_null() {
-            values[i] = next_auto_value(storage, table_index, i, col.ctype)?;
+            values[i] =
+                next_auto_value(storage, table_index, i, col.ctype, seq_session, txid)?;
         }
     }
     Ok(())
@@ -896,6 +1039,46 @@ pub fn drop_table(
                     ));
                 }
                 let def = storage.table(index).def;
+                // Owned serial/identity sequences are internal dependencies:
+                // dropping their table drops them in the same transaction.
+                for sequence_index in 0..storage.sequence_count() {
+                    let sequence = storage.sequence(sequence_index);
+                    if !sequence.visible_to(txn.txid)
+                        || !matches!(
+                            sequence.owner,
+                            Some(owner)
+                                if owner.table_schema == def.schema && owner.table == def.name
+                        )
+                    {
+                        continue;
+                    }
+                    let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.append(
+                        lsn,
+                        &WalOp::DropSequence {
+                            schema: sequence_schema.as_str(),
+                            name: sequence_name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
+                    match storage.drop_sequence(
+                        sequence_schema.as_str(),
+                        sequence_name.as_str(),
+                        txn.txid,
+                    ) {
+                        Ok(Some(slot)) => {
+                            if let Err(error) = txn
+                                .record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
+                            {
+                                return sql_fail(error);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 let lsn = storage.bump_lsn();
                 if let Err(e) = wal.append(
                     lsn,
@@ -2269,6 +2452,33 @@ fn resolve_seq_spec(
     ))
 }
 
+fn resolve_sequence_owner(
+    storage: &Storage,
+    owner: crate::sql::ast::SeqOwner<'_>,
+    sequence_schema: &str,
+    txid: u32,
+) -> Result<crate::storage::SequenceOwner, SqlError> {
+    let table_index = match storage.resolve_relation(owner.table.schema, owner.table.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(index)) => index,
+        _ => return Err(undefined_qual(&owner.table)),
+    };
+    let table = &storage.table(table_index).def;
+    if table.schema.as_str() != sequence_schema {
+        return Err(sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "sequence must be in same schema as table it is linked to"
+        ));
+    }
+    let Some(column_index) = table.column_index(owner.column) else {
+        return Err(undefined_column(owner.column));
+    };
+    Ok(crate::storage::SequenceOwner {
+        table_schema: table.schema,
+        table: table.name,
+        column: table.columns()[column_index].name,
+    })
+}
+
 /// CREATE SEQUENCE [IF NOT EXISTS].
 pub fn create_sequence(
     storage: &mut Storage,
@@ -2302,11 +2512,18 @@ pub fn create_sequence(
         Ok(v) => v,
         Err(e) => return sql_fail(e),
     };
+    let owner = match options.owned_by {
+        Some(Some(owner)) => match resolve_sequence_owner(storage, owner, schema.as_str(), txn.txid) {
+            Ok(owner) => Some(owner),
+            Err(error) => return sql_fail(error),
+        },
+        _ => None,
+    };
     let sqlname = match SqlName::parse(name.name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let slot = match storage.create_sequence(schema, sqlname, spec, txn.txid) {
+    let slot = match storage.create_sequence(schema, sqlname, spec, owner, None, txn.txid) {
         Ok(slot) => slot,
         Err(e) => return sql_fail(e),
     };
@@ -2323,6 +2540,8 @@ pub fn create_sequence(
             start_value: spec.start_value,
             cache: spec.cache,
             cycle: spec.cycle,
+            owner,
+            generator_for: None,
         },
     ) {
         storage.rollback_sequence_create(slot);
@@ -2374,7 +2593,35 @@ pub fn alter_sequence(
         Ok(v) => v,
         Err(e) => return sql_fail(e),
     };
-    storage.alter_sequence(slot, spec, restart);
+    let prior = storage.sequence(slot);
+    if options.owned_by.is_some()
+        && let Some(generator) = prior.generator_for
+        && let Some(table_slot) =
+            storage.find_table(generator.table_schema.as_str(), generator.table.as_str())
+        && let Some(column) = storage
+            .table(table_slot)
+            .def
+            .column_index(generator.column.as_str())
+        && storage.table(table_slot).def.columns()[column].is_identity
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot change ownership of identity sequence"
+        ));
+    }
+    let owner = match options.owned_by {
+        None => prior.owner,
+        Some(None) => None,
+        Some(Some(requested)) => {
+            let sequence_schema = storage.sequence(slot).schema;
+            match resolve_sequence_owner(storage, requested, sequence_schema.as_str(), txn.txid) {
+                Ok(owner) => Some(owner),
+                Err(error) => return sql_fail(error),
+            }
+        }
+    };
+    let generator_for = prior.generator_for;
+    storage.alter_sequence(slot, spec, restart, owner, generator_for);
     let (schema, sname) = {
         let s = storage.sequence(slot);
         (s.schema, s.name)
@@ -2393,6 +2640,8 @@ pub fn alter_sequence(
             start_value: spec.start_value,
             cache: spec.cache,
             cycle: spec.cycle,
+            owner,
+            generator_for,
         },
     ) {
         return sql_fail(e);
@@ -2444,6 +2693,16 @@ pub fn drop_sequence(
         };
         let (schema, sname) = {
             let s = storage.sequence(slot);
+            if let Some(owner) = s.owner {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop sequence \"{}\" because column {}.{}.{} requires it",
+                    s.name.as_str(),
+                    owner.table_schema.as_str(),
+                    owner.table.as_str(),
+                    owner.column.as_str()
+                ));
+            }
             (s.schema, s.name)
         };
         let lsn = storage.bump_lsn();
@@ -4018,7 +4277,15 @@ pub fn copy_row(
         &explicit,
         arena,
     )?;
-    fill_auto_increment(storage, setup.table_index, &def, &mut values, &explicit)?;
+    fill_auto_increment(
+        storage,
+        setup.table_index,
+        &def,
+        &mut values,
+        &explicit,
+        seq_session,
+        txn.txid,
+    )?;
     compute_generated(&def, &generated_exprs, &mut values, storage, arena)?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -4091,7 +4358,15 @@ pub fn copy_row_binary(
         &explicit,
         arena,
     )?;
-    fill_auto_increment(storage, setup.table_index, &def, &mut values, &explicit)?;
+    fill_auto_increment(
+        storage,
+        setup.table_index,
+        &def,
+        &mut values,
+        &explicit,
+        seq_session,
+        txn.txid,
+    )?;
     compute_generated(&def, &generated_exprs, &mut values, storage, arena)?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -5403,7 +5678,15 @@ fn merge_insert(
             }
         }
     }
-    fill_auto_increment(storage, table_index, def, &mut row, &explicit)?;
+    fill_auto_increment(
+        storage,
+        table_index,
+        def,
+        &mut row,
+        &explicit,
+        seq_session,
+        txn.txid,
+    )?;
     let mut row_arr = row;
     compute_generated(def, generated, &mut row_arr, storage, arena)?;
     check_not_null(def, &row_arr)?;
@@ -5602,7 +5885,15 @@ pub fn insert(
                     }
                 }
             }
-            if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
+            if let Err(e) = fill_auto_increment(
+                storage,
+                table_index,
+                &def,
+                &mut values,
+                &explicit,
+                seq_session,
+                txn.txid,
+            ) {
                 return sql_fail(e);
             }
             if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, storage, arena) {
@@ -5748,7 +6039,15 @@ pub fn insert(
                 }
             }
         }
-        if let Err(e) = fill_auto_increment(storage, table_index, &def, &mut values, &explicit) {
+        if let Err(e) = fill_auto_increment(
+            storage,
+            table_index,
+            &def,
+            &mut values,
+            &explicit,
+            seq_session,
+            txn.txid,
+        ) {
             return sql_fail(e);
         }
         // Generated columns are computed last, from the now-filled row.
@@ -6481,6 +6780,27 @@ pub fn truncate(
                 if !def.columns()[c].auto_increment {
                     continue;
                 }
+                if let Some(sequence_slot) = storage.generated_sequence_slot(
+                    def.schema.as_str(),
+                    def.name.as_str(),
+                    def.columns()[c].name.as_str(),
+                    txn.txid,
+                ) {
+                    let sequence = storage.sequence(sequence_slot);
+                    if let Err(error) =
+                        txn.record_ddl(crate::sql::txn::DdlUndo::OwnedSequenceReset {
+                            sequence: sequence_slot as u32,
+                            prior: sequence.last_value.get(),
+                            prior_called: sequence.is_called.get(),
+                        })
+                    {
+                        return sql_fail(error);
+                    }
+                    sequence.last_value.set(sequence.start_value);
+                    sequence.is_called.set(false);
+                    sequence.dirty.set(true);
+                    continue;
+                }
                 let prior = storage.table(table_index).serial_last[c];
                 if let Err(e) = txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
                     table: table_index as u32,
@@ -6738,13 +7058,30 @@ pub fn alter_table(
             responder.command_complete("ALTER TABLE")?;
             return sql_ok();
         }
-        if storage.find_table(new_schema, def.name.as_str()).is_some() {
+        if storage.relation_name_taken(new_schema, def.name.as_str(), u32::MAX) {
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists in schema \"{}\"",
                 def.name.as_str(),
                 new_schema
             ));
+        }
+        for sequence_slot in 0..storage.sequence_count() {
+            let sequence = storage.sequence(sequence_slot);
+            if !matches!(
+                sequence.owner,
+                Some(owner) if owner.table_schema == def.schema && owner.table == def.name
+            ) {
+                continue;
+            }
+            if storage.relation_name_taken(new_schema, sequence.name.as_str(), u32::MAX) {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists in schema \"{}\"",
+                    sequence.name.as_str(),
+                    new_schema
+                ));
+            }
         }
         let new_name = match SqlName::parse(new_schema) {
             Ok(n) => n,
@@ -6806,10 +7143,10 @@ pub fn alter_table(
     let mut dropped_any = false;
     let mut retyped_any = false;
     let mut has_added_unique = false;
-    // (column, start) for ADD IDENTITY with a START WITH, applied after the new
-    // definition is installed.
-    let mut identity_seeds = [(0usize, 0i64); MAX_COLUMNS];
-    let mut n_identity_seeds = 0usize;
+    let mut identity_sequences: [Option<OwnedSequencePlan>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let mut n_identity_sequences = 0usize;
+    let mut owned_sequences_to_drop = [usize::MAX; crate::storage::MAX_SEQUENCES];
+    let mut n_owned_sequences_to_drop = 0usize;
 
     for action in statement.actions {
         match action {
@@ -6882,6 +7219,25 @@ pub fn alter_table(
                         "cannot drop the only column of a table"
                     ));
                 }
+                let original_column = match source[i] {
+                    ColSource::Keep(original) | ColSource::Cast { orig: original, .. } => {
+                        def.columns()[original].name
+                    }
+                    ColSource::FillDefault(_) => new_def.columns()[i].name,
+                };
+                for slot in 0..storage.sequence_count() {
+                    if matches!(
+                        storage.sequence(slot).owner,
+                        Some(owner)
+                            if owner.table_schema == def.schema
+                                && owner.table == def.name
+                                && owner.column == original_column
+                    ) && !owned_sequences_to_drop[..n_owned_sequences_to_drop].contains(&slot)
+                    {
+                        owned_sequences_to_drop[n_owned_sequences_to_drop] = slot;
+                        n_owned_sequences_to_drop += 1;
+                    }
+                }
                 for j in i..new_def.n_columns - 1 {
                     new_def.columns[j] = new_def.columns[j + 1];
                     source[j] = source[j + 1];
@@ -6943,15 +7299,32 @@ pub fn alter_table(
                         statement.table.name
                     ));
                 }
-                let step = spec.increment.unwrap_or(1);
+                let step = spec.options.increment.unwrap_or(1);
                 new_def.columns[i].is_identity = true;
                 new_def.columns[i].identity_always = spec.always;
                 new_def.columns[i].auto_increment = true;
                 new_def.columns[i].auto_increment_step = step;
-                if let Some(start) = spec.start {
-                    identity_seeds[n_identity_seeds] = (i, start.wrapping_sub(step));
-                    n_identity_seeds += 1;
+                let plan = match owned_sequence_plan(&new_def, i, Some(*spec)) {
+                    Ok(plan) => plan,
+                    Err(error) => return sql_fail(error),
+                };
+                if storage.relation_name_taken(
+                    plan.schema.as_str(),
+                    plan.name.as_str(),
+                    u32::MAX,
+                ) || identity_sequences[..n_identity_sequences]
+                    .iter()
+                    .flatten()
+                    .any(|other| other.schema == plan.schema && other.name == plan.name)
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_TABLE,
+                        "relation \"{}\" already exists",
+                        plan.name.as_str()
+                    ));
                 }
+                identity_sequences[n_identity_sequences] = Some(plan);
+                n_identity_sequences += 1;
             }
             AlterAction::DropIdentity { column, if_exists } => {
                 let Some(i) = new_def.column_index(column) else {
@@ -6977,6 +7350,28 @@ pub fn alter_table(
                         column,
                         statement.table.name
                     ));
+                }
+                let original_column = match source[i] {
+                    ColSource::Keep(original) | ColSource::Cast { orig: original, .. } => {
+                        def.columns()[original].name
+                    }
+                    ColSource::FillDefault(_) => new_def.columns()[i].name,
+                };
+                if let Some(slot) = storage.generated_sequence_slot(
+                    def.schema.as_str(),
+                    def.name.as_str(),
+                    original_column.as_str(),
+                    u32::MAX,
+                ) && matches!(
+                    storage.sequence(slot).owner,
+                    Some(owner)
+                        if owner.table_schema == def.schema
+                            && owner.table == def.name
+                            && owner.column == original_column
+                ) && !owned_sequences_to_drop[..n_owned_sequences_to_drop].contains(&slot)
+                {
+                    owned_sequences_to_drop[n_owned_sequences_to_drop] = slot;
+                    n_owned_sequences_to_drop += 1;
                 }
                 new_def.columns[i].is_identity = false;
                 new_def.columns[i].identity_always = false;
@@ -7398,15 +7793,109 @@ pub fn alter_table(
         }
     }
 
+    for plan in identity_sequences[..n_identity_sequences].iter().flatten() {
+        let sequence_slot = match create_owned_sequence(storage, wal, *plan, u32::MAX) {
+            Ok(sequence_slot) => sequence_slot,
+            Err(error) => return sql_fail(error),
+        };
+        storage.commit_sequence_create(sequence_slot);
+    }
+    for &sequence_slot in &owned_sequences_to_drop[..n_owned_sequences_to_drop] {
+        let sequence = storage.sequence(sequence_slot);
+        let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.append(
+            lsn,
+            &WalOp::DropSequence {
+                schema: sequence_schema.as_str(),
+                name: sequence_name.as_str(),
+            },
+        ) {
+            return sql_fail(error);
+        }
+        match storage.drop_sequence(
+            sequence_schema.as_str(),
+            sequence_name.as_str(),
+            u32::MAX,
+        ) {
+            Ok(Some(slot)) => storage.commit_sequence_drop(slot),
+            Ok(None) => {}
+            Err(error) => return sql_fail(error),
+        }
+    }
+    let mut column_mapping = [None; MAX_COLUMNS];
+    for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
+        if let ColSource::Keep(old_column) | ColSource::Cast { orig: old_column, .. } = *source {
+            column_mapping[old_column] = Some(new_def.columns()[new_column].name);
+        }
+    }
+    let rebind = |link: Option<crate::storage::SequenceOwner>, require_generator: bool| {
+        let mut link = link?;
+        if link.table_schema != def.schema || link.table != def.name {
+            return Some(link);
+        }
+        // A sequence created for a column added by this same ALTER already
+        // carries the final names and has no source-column mapping.
+        let Some(old_column) = def.column_index(link.column.as_str()) else {
+            return Some(link);
+        };
+        let target_name = column_mapping[old_column]?;
+        let target_column = new_def.column_index(target_name.as_str())?;
+        if require_generator && !new_def.columns()[target_column].auto_increment {
+            return None;
+        }
+        link.table_schema = new_def.schema;
+        link.table = new_def.name;
+        link.column = new_def.columns()[target_column].name;
+        Some(link)
+    };
+    // The table shape WAL record carries no sequence dependencies. Re-journal
+    // every changed ownership/generator edge absolutely so replay observes the
+    // same rename, dropped column, or dropped identity.
+    for sequence_slot in 0..storage.sequence_count() {
+        let sequence = storage.sequence(sequence_slot);
+        if !sequence.live {
+            continue;
+        }
+        let owner = rebind(sequence.owner, false);
+        let generator_for = rebind(sequence.generator_for, true);
+        if owner == sequence.owner && generator_for == sequence.generator_for {
+            continue;
+        }
+        let spec = SeqSpec {
+            data_type: sequence.data_type,
+            increment: sequence.increment,
+            min_value: sequence.min_value,
+            max_value: sequence.max_value,
+            start_value: sequence.start_value,
+            cache: sequence.cache,
+            cycle: sequence.cycle,
+        };
+        let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.append(
+            lsn,
+            &WalOp::CreateSequence {
+                schema: sequence_schema.as_str(),
+                name: sequence_name.as_str(),
+                data_type: spec.data_type.to_u8(),
+                increment: spec.increment,
+                min_value: spec.min_value,
+                max_value: spec.max_value,
+                start_value: spec.start_value,
+                cache: spec.cache,
+                cycle: spec.cycle,
+                owner,
+                generator_for,
+            },
+        ) {
+            return sql_fail(error);
+        }
+    }
+
     // Phase 3: swap in memory. Nothing here can fail. Every row now has a heap
     // image, so the old spill SST no longer serves this table.
-    storage.set_table_def(table_index, new_def);
-    // Seed the counter for any ADD IDENTITY ... (START WITH n).
-    for &(col, seed) in &identity_seeds[..n_identity_seeds] {
-        let table = storage.table_mut(table_index);
-        table.serial_last[col] = seed;
-        table.serial_dirty = true;
-    }
+    storage.set_table_def(table_index, new_def, &column_mapping);
     for i in 0..scratch.len() {
         let (rowid, new_home) = scratch[i];
         let state = storage

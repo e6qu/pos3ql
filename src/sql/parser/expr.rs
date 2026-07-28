@@ -135,6 +135,12 @@ impl<'a> Parser<'a> {
             // IN / BETWEEN / LIKE / ILIKE, optionally NOT-prefixed. They
             // bind like comparisons (precedence 4).
             if min_prec <= 4 {
+                if self.stop_default_at_not_null && self.peeked == Tok::Ident("not") {
+                    let mut lookahead = self.lexer.clone();
+                    if lookahead.next_token()? == Tok::Ident("null") {
+                        return Ok(left);
+                    }
+                }
                 let negated = if self.peeked == Tok::Ident("not") {
                     self.advance()?;
                     // Infix NOT must introduce one of these forms.

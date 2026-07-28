@@ -156,6 +156,14 @@ pub enum DdlUndo {
     /// restoring the prior counter. (A plain advance is *not* undone: a
     /// rolled-back insert still consumes its number, as PostgreSQL has it.)
     SequenceReset { table: u32, column: u16, prior: i64 },
+    /// TRUNCATE ... RESTART IDENTITY reset a catalog sequence. Sequence value
+    /// changes ordinarily survive rollback; this explicit restart is the one
+    /// transactional exception PostgreSQL defines.
+    OwnedSequenceReset {
+        sequence: u32,
+        prior: i64,
+        prior_called: bool,
+    },
     /// CREATE SCHEMA at this slot — undo by dropping it.
     SchemaCreated(u32),
     /// DROP SCHEMA at this slot — undo by reviving it.

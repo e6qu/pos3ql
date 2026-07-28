@@ -127,7 +127,7 @@ impl<'a> Parser<'a> {
                 n_checks += 1;
             } else if cname.is_none() && self.eat_ident("default")? {
                 let start = self.peek_at;
-                let _ = self.expression(0)?;
+                let _ = self.column_default_expression()?;
                 default_text = Some(self.arena_str(self.text[start..self.peek_at].trim_end())?);
             } else if cname.is_some() {
                 return Err(self.err_here("expected NOT NULL or CHECK after CONSTRAINT"));
@@ -316,7 +316,7 @@ impl<'a> Parser<'a> {
         &mut self,
         allow_restart: bool,
     ) -> Result<crate::sql::ast::SeqOptions<'a>, ParseError> {
-        use crate::sql::ast::{SeqBound, SeqOptions};
+        use crate::sql::ast::{QualName, SeqBound, SeqOptions, SeqOwner};
         let mut o = SeqOptions::EMPTY;
         loop {
             if self.eat_ident("as")? {
@@ -345,16 +345,26 @@ impl<'a> Parser<'a> {
                     o.cycle = Some(false);
                 }
             } else if self.eat_ident("owned")? {
-                // OWNED BY { table.column | NONE } — sequence ownership links a
-                // sequence to a column's lifetime. This engine models no such
-                // link, so the clause is parsed and dropped.
                 self.expect_ident("by")?;
-                if !self.eat_ident("none")? {
-                    let _ = self.col_ident("owner column")?;
-                    while self.eat_op(".")? {
-                        let _ = self.col_ident("owner column")?;
+                o.owned_by = if self.eat_ident("none")? {
+                    Some(None)
+                } else {
+                    let first = self.col_ident("owner relation")?;
+                    self.expect_op(".")?;
+                    let second = self.col_ident("owner column")?;
+                    if self.eat_op(".")? {
+                        let third = self.col_ident("owner column")?;
+                        Some(Some(SeqOwner {
+                            table: QualName { schema: Some(first), name: second },
+                            column: third,
+                        }))
+                    } else {
+                        Some(Some(SeqOwner {
+                            table: QualName { schema: None, name: first },
+                            column: second,
+                        }))
                     }
-                }
+                };
             } else if allow_restart && self.eat_ident("restart")? {
                 // RESTART [WITH] n, or bare RESTART (reposition to the start).
                 let value = if self.eat_ident("with")?
@@ -418,26 +428,42 @@ impl<'a> Parser<'a> {
         };
         self.expect_ident("identity")?;
         // Optional `(START WITH n INCREMENT BY n ...)` sequence options.
-        let mut start = None;
-        let mut increment = None;
+        let mut sequence_name = None;
+        let mut options = crate::sql::ast::SeqOptions::EMPTY;
         if self.eat_op("(")? {
             while !self.eat_op(")")? {
-                if self.eat_ident("start")? {
+                if self.eat_ident("sequence")? {
+                    self.expect_ident("name")?;
+                    sequence_name = Some(self.qual_name("identity sequence name")?);
+                } else if self.eat_ident("start")? {
                     let _ = self.eat_ident("with")?;
-                    start = Some(self.seq_int()?);
+                    options.start = Some(self.seq_int()?);
                 } else if self.eat_ident("increment")? {
                     let _ = self.eat_ident("by")?;
-                    increment = Some(self.seq_int()?);
+                    options.increment = Some(self.seq_int()?);
+                } else if self.eat_ident("minvalue")? {
+                    options.min_value = crate::sql::ast::SeqBound::Value(self.seq_int()?);
+                } else if self.eat_ident("maxvalue")? {
+                    options.max_value = crate::sql::ast::SeqBound::Value(self.seq_int()?);
+                } else if self.eat_ident("cache")? {
+                    options.cache = Some(self.seq_int()?);
+                } else if self.eat_ident("cycle")? {
+                    options.cycle = Some(true);
+                } else if self.eat_ident("no")? {
+                    if self.eat_ident("minvalue")? {
+                        options.min_value = crate::sql::ast::SeqBound::NoBound;
+                    } else if self.eat_ident("maxvalue")? {
+                        options.max_value = crate::sql::ast::SeqBound::NoBound;
+                    } else {
+                        self.expect_ident("cycle")?;
+                        options.cycle = Some(false);
+                    }
                 } else {
-                    // MIN/MAXVALUE, CACHE, CYCLE would need the full per-column
-                    // sequence machinery; rejected loudly rather than dropped.
-                    return Err(self.err_here(
-                        "only START and INCREMENT are supported in an identity column's options",
-                    ));
+                    return Err(self.err_here("expected an identity sequence option"));
                 }
             }
         }
-        Ok(ColGen::Identity(IdentitySpec { always, start, increment }))
+        Ok(ColGen::Identity(IdentitySpec { always, sequence_name, options }))
     }
 
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] AS <query>
@@ -543,6 +569,16 @@ impl<'a> Parser<'a> {
         let name = self.col_ident("index name")?;
         self.expect_ident("on")?;
         let table = self.qual_name("table name")?;
+        if self.eat_ident("using")? {
+            let method = self.any_ident("index access method")?;
+            if !method.eq_ignore_ascii_case("btree") {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "index access method \"{}\" is not supported", method),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            }
+        }
         self.expect_op("(")?;
         let mut columns = [""; MAX_LIST];
         let mut n = 0;
@@ -800,7 +836,7 @@ impl<'a> Parser<'a> {
                     not_null = false;
                 } else if self.eat_ident("default")? {
                     let start = self.peek_at;
-                    default = Some(self.expression(0)?);
+                    default = Some(self.column_default_expression()?);
                     default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("unique")? {
                     // An explicitly named single-column UNIQUE desugars to a

@@ -555,7 +555,7 @@ pub enum SeqBound {
 /// Parsed CREATE/ALTER SEQUENCE options, each `None`/`Unset` when the clause was
 /// omitted. The executor computes defaults and validates; for ALTER an omitted
 /// option keeps the sequence's current setting.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeqOptions<'a> {
     /// AS <type> — the raw type name (`smallint`/`integer`/`bigint` and aliases).
     pub data_type: Option<&'a str>,
@@ -569,6 +569,9 @@ pub struct SeqOptions<'a> {
     /// None = no RESTART clause; Some(None) = RESTART (to start value);
     /// Some(Some(n)) = RESTART WITH n. (ALTER only.)
     pub restart: Option<Option<i64>>,
+    /// None = omitted; Some(None) = OWNED BY NONE; Some(Some(owner)) assigns
+    /// the sequence to a table column.
+    pub owned_by: Option<Option<SeqOwner<'a>>>,
 }
 
 impl<'a> SeqOptions<'a> {
@@ -581,7 +584,14 @@ impl<'a> SeqOptions<'a> {
         cache: None,
         cycle: None,
         restart: None,
+        owned_by: None,
     };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqOwner<'a> {
+    pub table: QualName<'a>,
+    pub column: &'a str,
 }
 
 /// A `CREATE DOMAIN name [AS] basetype[(typmod)] [constraint...]`. The base
@@ -666,18 +676,18 @@ pub struct ColumnDef<'a> {
     /// expression, computed from the row's other columns at insert/update.
     pub generated_text: Option<&'a str>,
     /// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
-    pub identity: Option<IdentitySpec>,
+    pub identity: Option<IdentitySpec<'a>>,
 }
 
 /// A `GENERATED ... AS IDENTITY` specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IdentitySpec {
+pub struct IdentitySpec<'a> {
     /// `ALWAYS` (reject explicit inserts) vs `BY DEFAULT` (explicit allowed).
     pub always: bool,
-    /// `START WITH n` — the first value handed out (default 1).
-    pub start: Option<i64>,
-    /// `INCREMENT BY n` — the step (default 1).
-    pub increment: Option<i64>,
+    /// Optional PostgreSQL-generated or user-selected backing sequence name.
+    pub sequence_name: Option<QualName<'a>>,
+    /// The backing sequence's full parameter set.
+    pub options: SeqOptions<'a>,
 }
 
 /// The result of parsing a `GENERATED` column clause.
@@ -685,7 +695,7 @@ pub enum ColGen<'a> {
     /// `ALWAYS AS (expr) STORED`.
     Generated(&'a str),
     /// `{ ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
-    Identity(IdentitySpec),
+    Identity(IdentitySpec<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -916,7 +926,7 @@ pub enum AlterAction<'a> {
     /// ALTER [COLUMN] col DROP DEFAULT.
     DropDefault { column: &'a str },
     /// ALTER [COLUMN] col ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY.
-    AddIdentity { column: &'a str, spec: IdentitySpec },
+    AddIdentity { column: &'a str, spec: IdentitySpec<'a> },
     /// ALTER [COLUMN] col DROP IDENTITY [IF EXISTS].
     DropIdentity { column: &'a str, if_exists: bool },
     /// ALTER [COLUMN] col SET NOT NULL — validated against existing rows.

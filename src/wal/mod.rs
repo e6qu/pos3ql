@@ -166,6 +166,8 @@ pub enum WalOp<'a> {
         start_value: i64,
         cache: i64,
         cycle: bool,
+        owner: Option<crate::storage::SequenceOwner>,
+        generator_for: Option<crate::storage::SequenceOwner>,
     },
     DropSequence {
         schema: &'a str,
@@ -641,10 +643,37 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::SetMatviewPopulated { schema, name, .. } => {
             1 + name.len() + 1 + schema.len() + 1
         }
-        WalOp::CreateSequence { schema, name, .. } => {
+        WalOp::CreateSequence {
+            schema,
+            name,
+            owner,
+            generator_for,
+            ..
+        } => {
             // name, schema, then 1 (data_type) + 5×8 (increment/min/max/start/
             // cache) + 1 (cycle).
-            1 + name.len() + 1 + schema.len() + 1 + 5 * 8 + 1
+            1 + name.len()
+                + 1
+                + schema.len()
+                + 1
+                + 5 * 8
+                + 1
+                + 1
+                + owner.map_or(0, |owner| {
+                    1 + owner.table_schema.as_str().len()
+                        + 1
+                        + owner.table.as_str().len()
+                        + 1
+                        + owner.column.as_str().len()
+                })
+                + 1
+                + generator_for.map_or(0, |generator| {
+                    1 + generator.table_schema.as_str().len()
+                        + 1
+                        + generator.table.as_str().len()
+                        + 1
+                        + generator.column.as_str().len()
+                })
         }
         WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateDomain(def) => {
@@ -853,8 +882,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             start_value,
             cache,
             cycle,
+            owner,
+            generator_for,
         } => {
-            name_bytes(buffer, name)
+            let mut ok = name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&[*data_type])
                 && buffer.append(&increment.to_le_bytes())
@@ -863,6 +894,19 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&start_value.to_le_bytes())
                 && buffer.append(&cache.to_le_bytes())
                 && buffer.append(&[u8::from(*cycle)])
+                && buffer.append(&[u8::from(owner.is_some())]);
+            if let Some(owner) = owner {
+                ok &= name_bytes(buffer, owner.table_schema.as_str())
+                    && name_bytes(buffer, owner.table.as_str())
+                    && name_bytes(buffer, owner.column.as_str());
+            }
+            ok &= buffer.append(&[u8::from(generator_for.is_some())]);
+            if let Some(generator) = generator_for {
+                ok &= name_bytes(buffer, generator.table_schema.as_str())
+                    && name_bytes(buffer, generator.table.as_str())
+                    && name_bytes(buffer, generator.column.as_str());
+            }
+            ok
         }
         WalOp::DropSequence { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
@@ -1299,6 +1343,38 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let cache = take_i64(&mut at)?;
             let cycle = *payload.get(at)? != 0;
             at += 1;
+            // Ownership was added as an optional suffix; old journals end
+            // after `cycle` and replay as unowned sequences.
+            let owner = if at == payload.len() {
+                None
+            } else {
+                let has_owner = *payload.get(at)? != 0;
+                at += 1;
+                if has_owner {
+                    Some(crate::storage::SequenceOwner {
+                        table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                        table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                        column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                    })
+                } else {
+                    None
+                }
+            };
+            let generator_for = if at == payload.len() {
+                None
+            } else {
+                let has_generator = *payload.get(at)? != 0;
+                at += 1;
+                if has_generator {
+                    Some(crate::storage::SequenceOwner {
+                        table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                        table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                        column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                    })
+                } else {
+                    None
+                }
+            };
             (at == payload.len()).then_some(WalOp::CreateSequence {
                 schema,
                 name,
@@ -1309,6 +1385,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 start_value,
                 cache,
                 cycle,
+                owner,
+                generator_for,
             })
         }
         KIND_DROP_SEQUENCE => {
@@ -1806,6 +1884,11 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let config = test_config(&dir);
         let mut budget = Budget::new(1 << 20);
+        let sequence_link = crate::storage::SequenceOwner {
+            table_schema: crate::storage::SqlName::parse("public").unwrap(),
+            table: crate::storage::SqlName::parse("t").unwrap(),
+            column: crate::storage::SqlName::parse("id").unwrap(),
+        };
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
             wal.append(1, &WalOp::CreateTable(sample_def())).unwrap();
@@ -1833,6 +1916,8 @@ mod tests {
                     start_value: 5,
                     cache: 1,
                     cycle: true,
+                    owner: Some(sequence_link),
+                    generator_for: Some(sequence_link),
                 },
             )
             .unwrap();

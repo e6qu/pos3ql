@@ -1162,7 +1162,10 @@ impl Checkpointer {
                         })?;
                     storage.commit_matview_create(slot);
                 }
-                Some("sq2") => {
+                tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
+                    let has_owner = tag == Some("sq3");
+                    let has_links = matches!(tag, Some("sq3") | Some("sq4"));
+                    let has_generator = tag == Some("sq4");
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let read_hex = |w: Option<&str>, what: &'static str| {
                         w.ok_or(CheckpointSetupError::Corrupt(what))
@@ -1179,6 +1182,42 @@ impl Checkpointer {
                     let cycle: u8 = parse_field(words.next(), "sq2 cycle")?;
                     let last_value: i64 = parse_field(words.next(), "sq2 last")?;
                     let is_called: u8 = parse_field(words.next(), "sq2 is_called")?;
+                    let read_link = |words: &mut core::str::Split<'_, char>,
+                                     label: &'static str|
+                     -> Result<Option<crate::storage::SequenceOwner>, CheckpointSetupError> {
+                        let read_owner = |word: Option<&str>, what: &'static str| {
+                            match word.ok_or(CheckpointSetupError::Corrupt(what))? {
+                                "0" => Ok(String::new()),
+                                hex => decode_hex_name(hex),
+                            }
+                        };
+                        let owner_schema = read_owner(words.next(), label)?;
+                        let owner_table = read_owner(words.next(), label)?;
+                        let owner_column = read_owner(words.next(), label)?;
+                        if owner_schema.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(crate::storage::SequenceOwner {
+                                table_schema: sql_name(&owner_schema)?,
+                                table: sql_name(&owner_table)?,
+                                column: sql_name(&owner_column)?,
+                            }))
+                        }
+                    };
+                    let owner = if has_links {
+                        read_link(&mut words, "sequence owner missing")?
+                    } else {
+                        None
+                    };
+                    // sq3 briefly represented ownership and generation as one
+                    // link; preserve that manifest's semantics on upgrade.
+                    let generator_for = if has_generator {
+                        read_link(&mut words, "sequence generator missing")?
+                    } else if has_owner {
+                        owner
+                    } else {
+                        None
+                    };
                     let slot = storage
                         .create_sequence(
                             sql_name(&schema)?,
@@ -1192,6 +1231,8 @@ impl Checkpointer {
                                 cache,
                                 cycle: cycle != 0,
                             },
+                            owner,
+                            generator_for,
                             0,
                         )
                         .map_err(|e| {
@@ -2151,10 +2192,46 @@ Ok(CheckpointStep::Published { lsn })
             for b in seq.name.as_str().as_bytes() {
                 let _ = write!(hname, "{b:02x}");
             }
+            let mut owner_schema = StackStr::<130>::new();
+            let mut owner_table = StackStr::<130>::new();
+            let mut owner_column = StackStr::<130>::new();
+            if let Some(owner) = seq.owner {
+                for byte in owner.table_schema.as_str().as_bytes() {
+                    let _ = write!(owner_schema, "{byte:02x}");
+                }
+                for byte in owner.table.as_str().as_bytes() {
+                    let _ = write!(owner_table, "{byte:02x}");
+                }
+                for byte in owner.column.as_str().as_bytes() {
+                    let _ = write!(owner_column, "{byte:02x}");
+                }
+            } else {
+                let _ = write!(owner_schema, "0");
+                let _ = write!(owner_table, "0");
+                let _ = write!(owner_column, "0");
+            }
+            let mut generator_schema = StackStr::<130>::new();
+            let mut generator_table = StackStr::<130>::new();
+            let mut generator_column = StackStr::<130>::new();
+            if let Some(generator) = seq.generator_for {
+                for byte in generator.table_schema.as_str().as_bytes() {
+                    let _ = write!(generator_schema, "{byte:02x}");
+                }
+                for byte in generator.table.as_str().as_bytes() {
+                    let _ = write!(generator_table, "{byte:02x}");
+                }
+                for byte in generator.column.as_str().as_bytes() {
+                    let _ = write!(generator_column, "{byte:02x}");
+                }
+            } else {
+                let _ = write!(generator_schema, "0");
+                let _ = write!(generator_table, "0");
+                let _ = write!(generator_column, "0");
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "sq2 {} {} {} {} {} {} {} {} {} {} {}",
+                    "sq4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     hschema.as_str(),
                     hname.as_str(),
                     seq.data_type.to_u8(),
@@ -2166,6 +2243,12 @@ Ok(CheckpointStep::Published { lsn })
                     u8::from(seq.cycle),
                     seq.last_value.get(),
                     u8::from(seq.is_called.get()),
+                    owner_schema.as_str(),
+                    owner_table.as_str(),
+                    owner_column.as_str(),
+                    generator_schema.as_str(),
+                    generator_table.as_str(),
+                    generator_column.as_str(),
                 ),
             )?;
         }

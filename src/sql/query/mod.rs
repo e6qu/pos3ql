@@ -815,9 +815,9 @@ pub fn validate_view<'a>(
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    // A view's referents are validated as visible now (committed catalog).
-    describe_query(sql, storage, 0, arena, &mut columns)?;
-    let _ = txid;
+    // A view may reference a table/view created earlier in this transaction;
+    // other sessions still cannot see either pending object.
+    describe_query(sql, storage, txid, arena, &mut columns)?;
     Ok(())
 }
 

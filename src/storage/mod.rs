@@ -3735,6 +3735,10 @@ impl Storage {
         &self.matviews[slot]
     }
 
+    pub(crate) fn matview_count(&self) -> usize {
+        self.matviews.len()
+    }
+
     pub fn find_matview(&self, schema: &str, name: &str, txid: u32) -> Option<&MatviewDef> {
         self.matviews.iter().find(|m| {
             m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
@@ -4181,6 +4185,10 @@ impl Storage {
         &self.domains[slot]
     }
 
+    pub(crate) fn domain_count(&self) -> usize {
+        self.domains.len()
+    }
+
     /// Committed domains carrying their slot indices, for the checkpoint and
     /// `pg_type`.
     pub fn live_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
@@ -4436,6 +4444,10 @@ impl Storage {
 
     pub fn enum_def(&self, slot: usize) -> &EnumDef {
         &self.enums[slot]
+    }
+
+    pub(crate) fn enum_count(&self) -> usize {
+        self.enums.len()
     }
 
     /// Committed enums carrying their slot indices, for the checkpoint,

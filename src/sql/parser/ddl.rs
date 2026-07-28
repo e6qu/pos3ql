@@ -160,6 +160,9 @@ impl<'a> Parser<'a> {
     /// `ALTER DOMAIN name <action>` ("alter domain" consumed).
     pub(super) fn alter_domain(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("domain name")?;
+        if self.peeked == Tok::Ident("owner") {
+            return self.alter_owner(crate::sql::ast::AlterOwnerKind::Domain, name, false);
+        }
         let action = if self.eat_ident("add")? {
             let cname = if self.eat_ident("constraint")? {
                 Some(self.col_ident("constraint name")?)
@@ -250,6 +253,9 @@ impl<'a> Parser<'a> {
     /// `ALTER TYPE name <action>` ("alter type" consumed).
     pub(super) fn alter_type(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("type name")?;
+        if self.peeked == Tok::Ident("owner") {
+            return self.alter_owner(crate::sql::ast::AlterOwnerKind::Type, name, false);
+        }
         let action = if self.eat_ident("add")? {
             self.expect_ident("value")?;
             let if_not_exists = if self.eat_ident("if")? {
@@ -306,6 +312,9 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.qual_name("sequence name")?;
+        if self.peeked == Tok::Ident("owner") {
+            return self.alter_owner(crate::sql::ast::AlterOwnerKind::Sequence, name, if_exists);
+        }
         let options = self.seq_options(true)?;
         Ok(Stmt::AlterSequence { name, if_exists, options })
     }

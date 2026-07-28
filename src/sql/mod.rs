@@ -1771,6 +1771,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                &self.work,
                 responder,
             ),
             Stmt::CreateEnum { name, labels } => exec::create_enum(
@@ -1801,6 +1802,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                &self.work,
                 responder,
             ),
             Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
@@ -1947,6 +1949,20 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                responder,
+            ),
+            Stmt::AlterOwner {
+                kind,
+                name,
+                role,
+                if_exists,
+            } => exec::alter_owner(
+                &self.storage,
+                txn,
+                *kind,
+                name,
+                role,
+                *if_exists,
                 responder,
             ),
             Stmt::DeclareCursor { name, scroll, hold, sql } => {

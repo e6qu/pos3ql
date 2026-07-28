@@ -1176,19 +1176,151 @@ pub fn create_schema(
     sql_ok()
 }
 
+pub fn alter_owner(
+    storage: &Storage,
+    txn: &TxnState,
+    kind: crate::sql::ast::AlterOwnerKind,
+    name: &QualName,
+    role: &str,
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::AlterOwnerKind;
+    let (noun, tag) = match kind {
+        AlterOwnerKind::Schema => ("schema", "ALTER SCHEMA"),
+        AlterOwnerKind::Type => ("type", "ALTER TYPE"),
+        AlterOwnerKind::Domain => ("domain", "ALTER DOMAIN"),
+        AlterOwnerKind::Table => ("table", "ALTER TABLE"),
+        AlterOwnerKind::View => ("view", "ALTER VIEW"),
+        AlterOwnerKind::MaterializedView => ("materialized view", "ALTER MATERIALIZED VIEW"),
+        AlterOwnerKind::Sequence => ("sequence", "ALTER SEQUENCE"),
+    };
+    let relation = || storage.resolve_relation(name.schema, name.name, txn.txid);
+    let found = match kind {
+        AlterOwnerKind::Schema => storage.find_schema_visible(name.name, txn.txid).is_some(),
+        AlterOwnerKind::Type => match name.schema {
+            Some(schema) => storage.enum_slot(schema, name.name, txn.txid).is_some(),
+            None => storage.resolve_enum_slot(name.name, txn.txid).is_some(),
+        },
+        AlterOwnerKind::Domain => match name.schema {
+            Some(schema) => storage.domain_slot(schema, name.name, txn.txid).is_some(),
+            None => storage.resolve_domain_slot(name.name, txn.txid).is_some(),
+        },
+        AlterOwnerKind::Table => match relation() {
+            // PostgreSQL 15 pg_dump spells view, materialized-view and
+            // sequence owner changes as ALTER TABLE; newer clients use their
+            // specific kinds.
+            Some(
+                crate::storage::ResolvedRelation::Table(_)
+                | crate::storage::ResolvedRelation::View(_),
+            ) => true,
+            Some(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a table",
+                    name.name
+                ))
+            }
+            None => match resolve_sequence(storage, name, txn.txid) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(error) => return sql_fail(error),
+            },
+        },
+        AlterOwnerKind::View => match relation() {
+            Some(crate::storage::ResolvedRelation::View(_)) => true,
+            Some(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a view",
+                    name.name
+                ))
+            }
+            None => false,
+        },
+        AlterOwnerKind::MaterializedView => match relation() {
+            Some(crate::storage::ResolvedRelation::Table(table)) => {
+                let def = storage.table(table).def;
+                if storage
+                    .matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
+                    .is_some()
+                {
+                    true
+                } else {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is not a materialized view",
+                        name.name
+                    ));
+                }
+            }
+            Some(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a materialized view",
+                    name.name
+                ))
+            }
+            None => false,
+        },
+        AlterOwnerKind::Sequence => match resolve_sequence(storage, name, txn.txid) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => return sql_fail(error),
+        },
+    };
+    if !found {
+        if if_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(160, "{} \"{}\" does not exist, skipping", noun, name.name).as_str(),
+            )?;
+            responder.command_complete(tag)?;
+            return sql_ok();
+        }
+        return sql_fail(match kind {
+            AlterOwnerKind::Schema => sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                name.name
+            ),
+            AlterOwnerKind::Type | AlterOwnerKind::Domain => {
+                sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", name.name)
+            }
+            AlterOwnerKind::Sequence => undefined_kind("sequence", name.name),
+            _ => undefined_qual(name),
+        });
+    }
+    if !matches!(role, "postgres" | "current_role" | "current_user" | "session_user") {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            role
+        ));
+    }
+    // The catalog has exactly one role and every object is already owned by
+    // it. Reassigning to that same resolved role is the complete state change.
+    responder.command_complete(tag)?;
+    sql_ok()
+}
+
 /// One object a DROP SCHEMA sweeps up, for dependency reports and the
 /// cascaded drops.
 #[derive(Clone, Copy)]
 enum SchemaObject {
     Table(usize),
     View(usize),
+    Matview { table: usize, catalog: usize },
+    Sequence(usize),
+    Domain(usize),
+    Enum(usize),
     /// An inbound foreign key on a table that itself survives.
     InboundFk { table: usize, fk_index: usize },
 }
 
 /// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT]: RESTRICT (the
 /// default) refuses a non-empty schema with PostgreSQL's dependency report;
-/// CASCADE drops the contained tables and views and severs inbound foreign
+/// CASCADE drops every contained catalog object and severs inbound foreign
 /// keys from surviving tables.
 pub fn drop_schema(
     storage: &mut Storage,
@@ -1261,10 +1393,17 @@ pub fn drop_schema(
         Ok(())
     };
     for t in 0..storage.table_count() {
-        if storage.table(t).visible_to(txn.txid)
-            && in_listed(storage, storage.table(t).def.schema.as_str())
-            && let Err(e) = push(SchemaObject::Table(t), &mut n_objects)
+        if !storage.table(t).visible_to(txn.txid)
+            || !in_listed(storage, storage.table(t).def.schema.as_str())
         {
+            continue;
+        }
+        let def = storage.table(t).def;
+        let object = match storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid) {
+            Some(catalog) => SchemaObject::Matview { table: t, catalog },
+            None => SchemaObject::Table(t),
+        };
+        if let Err(e) = push(object, &mut n_objects) {
             return sql_fail(e);
         }
     }
@@ -1274,6 +1413,138 @@ pub fn drop_schema(
             && let Err(e) = push(SchemaObject::View(v), &mut n_objects)
         {
             return sql_fail(e);
+        }
+    }
+    for sequence in 0..storage.sequence_count() {
+        if storage.sequence(sequence).visible_to(txn.txid)
+            && in_listed(storage, storage.sequence(sequence).schema.as_str())
+            && storage.sequence(sequence).owner.is_none()
+            && let Err(e) = push(SchemaObject::Sequence(sequence), &mut n_objects)
+        {
+            return sql_fail(e);
+        }
+    }
+    let mut schema_domains = [false; crate::storage::MAX_DOMAINS];
+    for (domain, selected) in schema_domains
+        .iter_mut()
+        .enumerate()
+        .take(storage.domain_count())
+    {
+        if storage.domain(domain).visible_to(txn.txid)
+            && in_listed(storage, storage.domain(domain).schema.as_str())
+        {
+            *selected = true;
+            if let Err(e) = push(SchemaObject::Domain(domain), &mut n_objects) {
+                return sql_fail(e);
+            }
+        }
+    }
+    for enumeration in 0..storage.enum_count() {
+        if storage.enum_def(enumeration).visible_to(txn.txid)
+            && in_listed(storage, storage.enum_def(enumeration).schema.as_str())
+            && let Err(e) = push(SchemaObject::Enum(enumeration), &mut n_objects)
+        {
+            return sql_fail(e);
+        }
+    }
+    if cascade {
+        // Domains outside the schema can depend on a domain or enum inside it.
+        // They are catalog-only dependents, so include their entire bounded
+        // closure rather than leaving a dangling base type.
+        for domain_slot in 0..storage.domain_count() {
+            let domain = storage.domain(domain_slot);
+            if !domain.visible_to(txn.txid) || schema_domains[domain_slot] {
+                continue;
+            }
+            let parent_in_schema = (0..storage.domain_count()).any(|parent| {
+                schema_domains[parent]
+                    && domain_depends_on(storage, domain_slot, parent, txn.txid)
+            });
+            let enum_in_schema = match domain.base {
+                ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
+                    in_listed(storage, storage.enum_def(slot as usize).schema.as_str())
+                }
+                _ => false,
+            };
+            if (parent_in_schema || enum_in_schema)
+                && let Err(error) = push(SchemaObject::Domain(domain_slot), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
+        }
+        for table in 0..storage.table_count() {
+            let def = storage.table(table).def;
+            if !storage.table(table).visible_to(txn.txid)
+                || in_listed(storage, def.schema.as_str())
+            {
+                continue;
+            }
+            if let Some(column) = def.columns().iter().find(|column| {
+                if column
+                    .user_type_schema
+                    .is_some_and(|schema| in_listed(storage, schema.as_str()))
+                {
+                    return true;
+                }
+                let Some(domain_name) = column.domain else {
+                    return false;
+                };
+                let Some(domain_schema) = column.user_type_schema else {
+                    return false;
+                };
+                let Some(domain_slot) = storage.domain_slot(
+                    domain_schema.as_str(),
+                    domain_name.as_str(),
+                    txn.txid,
+                ) else {
+                    return false;
+                };
+                let parent_domain_in_schema = (0..storage.domain_count()).any(|parent| {
+                    schema_domains[parent]
+                        && domain_depends_on(storage, domain_slot, parent, txn.txid)
+                });
+                let base_enum_in_schema = match storage.domain(domain_slot).base {
+                    ColType::Enum(slot)
+                    | ColType::Array(super::types::ArrElem::Enum(slot)) => {
+                        in_listed(storage, storage.enum_def(slot as usize).schema.as_str())
+                    }
+                    _ => false,
+                };
+                parent_domain_in_schema || base_enum_in_schema
+            }) {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot cascade schema drop to column \"{}.{}\" without transactional table-shape versions",
+                    def.name.as_str(),
+                    column.name.as_str()
+                ));
+            }
+        }
+        // A surviving stored query may depend on a table or type being
+        // removed. Until view dependencies have durable catalog identities,
+        // refuse the ambiguous case loudly instead of preserving a broken
+        // view. Views inside the listed schemas are already in the sweep.
+        if n_objects > 0 {
+            for view_slot in 0..storage.view_count() {
+                let view = storage.view(view_slot);
+                if view.visible_to(txn.txid) && !in_listed(storage, view.schema.as_str()) {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot cascade schema drop while surviving views lack durable dependency identities"
+                    ));
+                }
+            }
+            for matview_slot in 0..storage.matview_count() {
+                let matview = storage.matview(matview_slot);
+                if matview.visible_to(txn.txid)
+                    && !in_listed(storage, matview.schema.as_str())
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot cascade schema drop while surviving materialized views lack durable dependency identities"
+                    ));
+                }
+            }
         }
     }
     // Inbound foreign keys: a surviving table referencing a dropped one loses
@@ -1315,6 +1586,38 @@ pub fn drop_schema(
             SchemaObject::View(v) => {
                 let view = storage.view(*v);
                 (schema_rank(storage, view.schema.as_str()), view.created_at, 0)
+            }
+            SchemaObject::Matview { table, .. } => {
+                let table = storage.table(*table);
+                (
+                    schema_rank(storage, table.def.schema.as_str()),
+                    table.created_at,
+                    0,
+                )
+            }
+            SchemaObject::Sequence(sequence) => {
+                let sequence = storage.sequence(*sequence);
+                (
+                    schema_rank(storage, sequence.schema.as_str()),
+                    sequence.created_at,
+                    0,
+                )
+            }
+            SchemaObject::Domain(domain) => {
+                let domain = storage.domain(*domain);
+                (
+                    schema_rank(storage, domain.schema.as_str()),
+                    domain.created_at,
+                    0,
+                )
+            }
+            SchemaObject::Enum(enumeration) => {
+                let enumeration = storage.enum_def(*enumeration);
+                (
+                    schema_rank(storage, enumeration.schema.as_str()),
+                    enumeration.created_at,
+                    0,
+                )
             }
             SchemaObject::InboundFk { table, fk_index } => {
                 let child = storage.table(*table);
@@ -1362,6 +1665,26 @@ pub fn drop_schema(
                 let _ = write!(out, "view ");
                 write_rel(out, &view.schema, &view.name);
             }
+            SchemaObject::Matview { table, .. } => {
+                let def = &storage.table(*table).def;
+                let _ = write!(out, "materialized view ");
+                write_rel(out, &def.schema, &def.name);
+            }
+            SchemaObject::Sequence(sequence) => {
+                let sequence = storage.sequence(*sequence);
+                let _ = write!(out, "sequence ");
+                write_rel(out, &sequence.schema, &sequence.name);
+            }
+            SchemaObject::Domain(domain) => {
+                let domain = storage.domain(*domain);
+                let _ = write!(out, "type ");
+                write_rel(out, &domain.schema, &domain.name);
+            }
+            SchemaObject::Enum(enumeration) => {
+                let enumeration = storage.enum_def(*enumeration);
+                let _ = write!(out, "type ");
+                write_rel(out, &enumeration.schema, &enumeration.name);
+            }
             SchemaObject::InboundFk { table, fk_index } => {
                 let def = &storage.table(*table).def;
                 let _ = write!(
@@ -1389,6 +1712,13 @@ pub fn drop_schema(
                 match o {
                     SchemaObject::Table(t) => storage.table(*t).def.schema.as_str(),
                     SchemaObject::View(v) => storage.view(*v).schema.as_str(),
+                    SchemaObject::Matview { table, .. } =>
+                        storage.table(*table).def.schema.as_str(),
+                    SchemaObject::Sequence(sequence) =>
+                        storage.sequence(*sequence).schema.as_str(),
+                    SchemaObject::Domain(domain) => storage.domain(*domain).schema.as_str(),
+                    SchemaObject::Enum(enumeration) =>
+                        storage.enum_def(*enumeration).schema.as_str(),
                     SchemaObject::InboundFk { table, fk_index } =>
                         storage.table(*table).def.fkeys[*fk_index].parent_schema.as_str(),
                 }
@@ -1428,8 +1758,46 @@ pub fn drop_schema(
             stack_format!(128, "drop cascades to {} other objects", n_objects).as_str(),
         )?;
     }
-    // Apply the cascade: severed constraints first, then views, then tables,
-    // then the schemas themselves — the order replay reproduces.
+    let owned_sequence_undo = objects[..n_objects]
+        .iter()
+        .flatten()
+        .filter_map(|object| match object {
+            SchemaObject::Table(table) => Some(storage.table(*table).def),
+            _ => None,
+        })
+        .map(|table| {
+            (0..storage.sequence_count())
+                .filter(|sequence_slot| {
+                    let sequence = storage.sequence(*sequence_slot);
+                    sequence.visible_to(txn.txid)
+                        && matches!(
+                            sequence.owner,
+                            Some(owner)
+                                if owner.table_schema == table.schema
+                                    && owner.table == table.name
+                        )
+                })
+                .count()
+        })
+        .sum::<usize>();
+    let undo_needed = n_objects
+        + objects[..n_objects]
+            .iter()
+            .flatten()
+            .filter(|object| matches!(object, SchemaObject::Matview { .. }))
+            .count()
+        + owned_sequence_undo
+        + n_slots;
+    if txn.ddl().len() + undo_needed > super::txn::MAX_TXN_DDL {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "DROP SCHEMA needs {} DDL undo entries but only {} remain",
+            undo_needed,
+            super::txn::MAX_TXN_DDL - txn.ddl().len()
+        ));
+    }
+    // Apply the preflighted catalog plan in its deterministic creation order;
+    // every mutation is journaled before the containing schemas are removed.
     for o in objects[..n_objects].iter().flatten() {
         match o {
             SchemaObject::InboundFk { table, fk_index } => {
@@ -1480,6 +1848,121 @@ pub fn drop_schema(
                     return sql_fail(e);
                 }
             }
+            SchemaObject::Matview { table, catalog } => {
+                let def = storage.table(*table).def;
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.append(
+                    lsn,
+                    &WalOp::DropTable {
+                        schema: def.schema.as_str(),
+                        name: def.name.as_str(),
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::Dropped(*table as u32)) {
+                    return sql_fail(error);
+                }
+                storage.drop_table_in(*table, txn.txid);
+                storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.append(
+                    lsn,
+                    &WalOp::DropMatview {
+                        schema: def.schema.as_str(),
+                        name: def.name.as_str(),
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                match storage.drop_matview(def.schema.as_str(), def.name.as_str(), txn.txid) {
+                    Ok(Some(slot)) => {
+                        debug_assert_eq!(slot, *catalog);
+                        if let Err(error) =
+                            txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32))
+                        {
+                            return sql_fail(error);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            SchemaObject::Sequence(sequence) => {
+                let sequence = storage.sequence(*sequence);
+                let (schema, name) = (sequence.schema, sequence.name);
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.append(
+                    lsn,
+                    &WalOp::DropSequence {
+                        schema: schema.as_str(),
+                        name: name.as_str(),
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
+                    Ok(Some(slot)) => {
+                        if let Err(error) =
+                            txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
+                        {
+                            return sql_fail(error);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            SchemaObject::Domain(domain) => {
+                let domain = storage.domain(*domain);
+                let (schema, name) = (domain.schema, domain.name);
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.append(
+                    lsn,
+                    &WalOp::DropDomain {
+                        schema: schema.as_str(),
+                        name: name.as_str(),
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                match storage.drop_domain(schema.as_str(), name.as_str(), txn.txid) {
+                    Ok(Some(slot)) => {
+                        if let Err(error) =
+                            txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32))
+                        {
+                            return sql_fail(error);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            SchemaObject::Enum(enumeration) => {
+                let enumeration = storage.enum_def(*enumeration);
+                let (schema, name) = (enumeration.schema, enumeration.name);
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.append(
+                    lsn,
+                    &WalOp::DropEnum {
+                        schema: schema.as_str(),
+                        name: name.as_str(),
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                match storage.drop_enum(schema.as_str(), name.as_str(), txn.txid) {
+                    Ok(Some(slot)) => {
+                        if let Err(error) =
+                            txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot as u32))
+                        {
+                            return sql_fail(error);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return sql_fail(error),
+                }
+            }
             SchemaObject::Table(t) => {
                 if let Some(other) = storage.table(*t).ddl_locked_by_other(txn.txid) {
                     let _ = other;
@@ -1490,6 +1973,41 @@ pub fn drop_schema(
                     ));
                 }
                 let def = storage.table(*t).def;
+                for sequence_slot in 0..storage.sequence_count() {
+                    let sequence = storage.sequence(sequence_slot);
+                    if !sequence.visible_to(txn.txid)
+                        || !matches!(
+                            sequence.owner,
+                            Some(owner)
+                                if owner.table_schema == def.schema
+                                    && owner.table == def.name
+                        )
+                    {
+                        continue;
+                    }
+                    let (schema, name) = (sequence.schema, sequence.name);
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.append(
+                        lsn,
+                        &WalOp::DropSequence {
+                            schema: schema.as_str(),
+                            name: name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
+                    match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
+                        Ok(Some(slot)) => {
+                            if let Err(error) =
+                                txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
+                            {
+                                return sql_fail(error);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 let lsn = storage.bump_lsn();
                 if let Err(e) = wal.append(
                     lsn,
@@ -2792,6 +3310,13 @@ fn build_domain_spec(
                 parent.base,
                 parent.default_expr,
             )
+        } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
+            (
+                None,
+                None,
+                ColType::Enum(enum_slot as u16),
+                None,
+            )
         } else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -2913,6 +3438,7 @@ pub fn create_domain(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn drop_domain(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -2920,8 +3446,10 @@ pub fn drop_domain(
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    let mut selected = [false; crate::storage::MAX_DOMAINS];
     for name in names {
         let slot = match name.schema {
             Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
@@ -2941,36 +3469,172 @@ pub fn drop_domain(
                 name.name
             ));
         };
-        let (schema, dname) = {
-            let d = storage.domain(slot);
-            (d.schema, d.name)
-        };
-        // RESTRICT (the default) fails if any column depends on the domain.
-        if !cascade && storage.domain_in_use(schema.as_str(), dname.as_str()).is_some() {
+        selected[slot] = true;
+    }
+
+    // Domains form a bounded parent chain. Resolve the whole closure before
+    // mutating any catalog entry, so CASCADE drops descendant domains too and
+    // a failure cannot leave a dangling base-domain reference.
+    for candidate in 0..storage.domain_count() {
+        if !storage.domain(candidate).visible_to(txn.txid) || selected[candidate] {
+            continue;
+        }
+        let depends_on_selected = (0..storage.domain_count()).any(|target| {
+            selected[target] && domain_depends_on(storage, candidate, target, txn.txid)
+        });
+        if !depends_on_selected {
+            continue;
+        }
+        if !cascade {
+            let target = (0..storage.domain_count())
+                .find(|target| {
+                    selected[*target]
+                        && domain_depends_on(storage, candidate, *target, txn.txid)
+                })
+                .expect("dependency target");
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "cannot drop type {} because other objects depend on it",
-                dname.as_str()
+                storage.domain(target).name.as_str()
             ));
         }
-        let lsn = storage.bump_lsn();
-        if let Err(e) =
-            wal.append(lsn, &WalOp::DropDomain { schema: schema.as_str(), name: dname.as_str() })
-        {
-            return sql_fail(e);
-        }
-        match storage.drop_domain(schema.as_str(), dname.as_str(), txn.txid) {
-            Ok(Some(slot)) => {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32)) {
-                    return sql_fail(e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => return sql_fail(e),
-        }
+        selected[candidate] = true;
+    }
+
+    if let Err(error) =
+        drop_domain_selection(storage, wal, txn, &selected, None, cascade, 0, arena)
+    {
+        return sql_fail(error);
     }
     responder.command_complete("DROP DOMAIN")?;
     sql_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_domain_selection(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    selected: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+    cascade: bool,
+    reserved_undo: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let selected_count = selected.iter().filter(|&&yes| yes).count();
+    if selected_count > 0 || selected_enum.is_some() {
+        reject_type_drop_with_stored_queries(
+            storage,
+            txn.txid,
+            selected,
+            selected_enum,
+            cascade,
+            arena,
+        )?;
+    }
+    for (slot, is_selected) in selected
+        .iter()
+        .enumerate()
+        .take(storage.domain_count())
+    {
+        if !*is_selected {
+            continue;
+        }
+        if let Some((table, column)) = domain_column_in_use(storage, slot, txn.txid) {
+            if cascade {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot cascade type drop to column \"{}.{}\" without transactional table-shape versions",
+                    table.as_str(),
+                    column.as_str()
+                ));
+            }
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop type {} because other objects depend on it",
+                storage.domain(slot).name.as_str()
+            ));
+        }
+    }
+
+    let undo_needed = selected_count + reserved_undo;
+    if txn.ddl().len() + undo_needed > super::txn::MAX_TXN_DDL {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "type drop needs {} DDL undo entries but only {} remain",
+            undo_needed,
+            super::txn::MAX_TXN_DDL - txn.ddl().len()
+        ));
+    }
+
+    // Produce child-before-parent order while every definition is visible.
+    let mut ordered = [usize::MAX; crate::storage::MAX_DOMAINS];
+    let mut ordered_count = 0;
+    while ordered_count < selected_count {
+        let Some(leaf) = (0..storage.domain_count()).find(|candidate| {
+            selected[*candidate]
+                && !ordered[..ordered_count].contains(candidate)
+                && !(0..storage.domain_count()).any(|child| {
+                    child != *candidate
+                        && selected[child]
+                        && !ordered[..ordered_count].contains(&child)
+                        && domain_depends_on(storage, child, *candidate, txn.txid)
+                })
+        }) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "domain dependency cycle detected"
+            ));
+        };
+        ordered[ordered_count] = leaf;
+        ordered_count += 1;
+    }
+
+    for slot in ordered[..ordered_count].iter().copied() {
+        let (schema, dname) = {
+            let domain = storage.domain(slot);
+            (domain.schema, domain.name)
+        };
+        let lsn = storage.bump_lsn();
+        wal.append(lsn, &WalOp::DropDomain {
+            schema: schema.as_str(),
+            name: dname.as_str(),
+        })?;
+        match storage.drop_domain(schema.as_str(), dname.as_str(), txn.txid) {
+            Ok(Some(slot)) => {
+                txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32))?;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn domain_column_in_use(
+    storage: &Storage,
+    domain_slot: usize,
+    txid: u32,
+) -> Option<(SqlName, SqlName)> {
+    let domain = storage.domain(domain_slot);
+    for table_index in 0..storage.table_count() {
+        let table = storage.table(table_index);
+        if !table.visible_to(txid) {
+            continue;
+        }
+        for column in table.def.columns() {
+            if column
+                .domain
+                .is_some_and(|name| name == domain.name)
+                && column
+                    .user_type_schema
+                    .is_some_and(|schema| schema == domain.schema)
+            {
+                return Some((table.def.name, column.name));
+            }
+        }
+    }
+    None
 }
 
 pub fn alter_domain(
@@ -3346,6 +4010,7 @@ pub fn create_enum(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn drop_enum(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -3353,6 +4018,7 @@ pub fn drop_enum(
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -3378,13 +4044,60 @@ pub fn drop_enum(
             let e = storage.enum_def(slot);
             (e.schema, e.name)
         };
-        // RESTRICT (the default) fails if any column is of this enum type.
-        if !cascade && storage.enum_in_use(slot).is_some() {
+        if let Some((table, column)) = enum_column_in_use(storage, slot, txn.txid) {
+            if cascade {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot cascade type drop to column \"{}.{}\" without transactional table-shape versions",
+                    table.as_str(),
+                    column.as_str()
+                ));
+            }
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "cannot drop type {} because other objects depend on it",
                 ename.as_str()
             ));
+        }
+        let mut dependent_domains = [false; crate::storage::MAX_DOMAINS];
+        for (domain_slot, is_dependent) in dependent_domains
+            .iter_mut()
+            .enumerate()
+            .take(storage.domain_count())
+        {
+            let domain = storage.domain(domain_slot);
+            if domain.visible_to(txn.txid)
+                && matches!(
+                    domain.base,
+                    ColType::Enum(enum_slot)
+                        | ColType::Array(super::types::ArrElem::Enum(enum_slot))
+                        if enum_slot as usize == slot
+                )
+            {
+                *is_dependent = true;
+            }
+        }
+        let dependent_count = dependent_domains.iter().filter(|&&yes| yes).count();
+        if dependent_count > 0 && !cascade {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop type {} because other objects depend on it",
+                ename.as_str()
+            ));
+        }
+        if let Err(error) =
+            drop_domain_selection(
+                storage,
+                wal,
+                txn,
+                &dependent_domains,
+                Some(slot),
+                cascade,
+                1,
+                arena,
+            )
+        {
+            return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
         if let Err(e) =
@@ -3404,6 +4117,376 @@ pub fn drop_enum(
     }
     responder.command_complete("DROP TYPE")?;
     sql_ok()
+}
+
+fn reject_type_drop_with_stored_queries(
+    storage: &Storage,
+    txid: u32,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+    cascade: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let user = crate::sql::eval::funcs::system::session_user_owned();
+    for slot in 0..storage.view_count() {
+        let view = storage.view(slot);
+        if !view.visible_to(txid) {
+            continue;
+        }
+        let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+        let select = crate::sql::parser::parse_query(view.sql.as_str(), arena)?;
+        if select_uses_dropped_type(
+            select,
+            storage,
+            txid,
+            &path,
+            selected_domains,
+            selected_enum,
+        ) {
+            return stored_query_type_dependency_error(cascade);
+        }
+    }
+    for slot in 0..storage.matview_count() {
+        let view = storage.matview(slot);
+        if !view.visible_to(txid) {
+            continue;
+        }
+        let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+        let select = crate::sql::parser::parse_query(view.sql.as_str(), arena)?;
+        if select_uses_dropped_type(
+            select,
+            storage,
+            txid,
+            &path,
+            selected_domains,
+            selected_enum,
+        ) {
+            return stored_query_type_dependency_error(cascade);
+        }
+    }
+    Ok(())
+}
+
+fn stored_query_type_dependency_error(cascade: bool) -> Result<(), SqlError> {
+    if cascade {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot cascade type drop while stored queries lack durable dependency identities"
+        ))
+    } else {
+        Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop type because a stored query depends on it"
+        ))
+    }
+}
+
+fn select_uses_dropped_type(
+    select: &super::ast::Select,
+    storage: &Storage,
+    txid: u32,
+    path: &crate::storage::PathContext,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+) -> bool {
+    let expression_uses = |expression: &Expr| {
+        expression_uses_dropped_type(
+            expression,
+            storage,
+            txid,
+            path,
+            selected_domains,
+            selected_enum,
+        )
+    };
+    if select.items.iter().any(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            expression_uses(expression)
+        }
+        _ => false,
+    }) || select.distinct_on.iter().any(|expression| expression_uses(expression))
+        || select.where_clause.is_some_and(&expression_uses)
+        || select.group_by.iter().any(|expression| expression_uses(expression))
+        || select.having.is_some_and(&expression_uses)
+        || select.order_by.iter().any(|order| expression_uses(order.expression))
+        || select.limit.is_some_and(&expression_uses)
+        || select.offset.is_some_and(&expression_uses)
+        || select.with.iter().any(|cte| {
+            select_uses_dropped_type(
+                cte.query,
+                storage,
+                txid,
+                path,
+                selected_domains,
+                selected_enum,
+            )
+        })
+    {
+        return true;
+    }
+    if let Some(tree) = select.set_body
+        && set_tree_uses_dropped_type(
+            tree,
+            storage,
+            txid,
+            path,
+            selected_domains,
+            selected_enum,
+        )
+    {
+        return true;
+    }
+    let Some(from) = select.from else {
+        return false;
+    };
+    table_ref_uses_dropped_type(
+        &from.base,
+        storage,
+        txid,
+        path,
+        selected_domains,
+        selected_enum,
+    ) || from.joins.iter().any(|join| {
+        table_ref_uses_dropped_type(
+            &join.table,
+            storage,
+            txid,
+            path,
+            selected_domains,
+            selected_enum,
+        ) || join.on.is_some_and(&expression_uses)
+    })
+}
+
+fn set_tree_uses_dropped_type(
+    tree: &super::ast::SetTree,
+    storage: &Storage,
+    txid: u32,
+    path: &crate::storage::PathContext,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+) -> bool {
+    match tree {
+        super::ast::SetTree::Select(select) => select_uses_dropped_type(
+            select,
+            storage,
+            txid,
+            path,
+            selected_domains,
+            selected_enum,
+        ),
+        super::ast::SetTree::Op { left, right, .. } => {
+            set_tree_uses_dropped_type(
+                left,
+                storage,
+                txid,
+                path,
+                selected_domains,
+                selected_enum,
+            ) || set_tree_uses_dropped_type(
+                right,
+                storage,
+                txid,
+                path,
+                selected_domains,
+                selected_enum,
+            )
+        }
+    }
+}
+
+fn table_ref_uses_dropped_type(
+    table: &super::ast::TableRef,
+    storage: &Storage,
+    txid: u32,
+    path: &crate::storage::PathContext,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+) -> bool {
+    table.subquery.is_some_and(|select| {
+        select_uses_dropped_type(
+            select,
+            storage,
+            txid,
+            path,
+            selected_domains,
+            selected_enum,
+        )
+    }) || table.func_args.is_some_and(|arguments| {
+        arguments.iter().any(|argument| {
+            expression_uses_dropped_type(
+                argument,
+                storage,
+                txid,
+                path,
+                selected_domains,
+                selected_enum,
+            )
+        })
+    })
+}
+
+fn expression_uses_dropped_type(
+    expression: &Expr,
+    storage: &Storage,
+    txid: u32,
+    path: &crate::storage::PathContext,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+) -> bool {
+    let child = |expression: &Expr| {
+        expression_uses_dropped_type(
+            expression,
+            storage,
+            txid,
+            path,
+            selected_domains,
+            selected_enum,
+        )
+    };
+    match expression {
+        Expr::Cast { operand, type_name, .. } => {
+            cast_resolves_to_dropped_type(
+                storage,
+                txid,
+                path,
+                type_name,
+                selected_domains,
+                selected_enum,
+            ) || child(operand)
+        }
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Field { base: operand, .. } => child(operand),
+        Expr::Binary { left, right, .. }
+        | Expr::Subscript { base: left, index: right }
+        | Expr::AnyAll { operand: left, array: right, .. } => child(left) || child(right),
+        Expr::Call { args, order_by, over, filter, .. } => {
+            args.iter().any(|argument| child(argument))
+                || order_by.iter().any(|order| child(order.expression))
+                || filter.is_some_and(&child)
+                || over.is_some_and(|window| {
+                    window.partition_by.iter().any(|expression| child(expression))
+                        || window.order_by.iter().any(|order| child(order.expression))
+                        || window.frame.is_some_and(|frame| {
+                            use super::ast::FrameBound;
+                            let bound = |bound| match bound {
+                                FrameBound::Preceding(expression)
+                                | FrameBound::Following(expression) => child(expression),
+                                _ => false,
+                            };
+                            bound(frame.start) || bound(frame.end)
+                        })
+                })
+        }
+        Expr::InList { operand, list, .. } => {
+            child(operand) || list.iter().any(|expression| child(expression))
+        }
+        Expr::Between { operand, low, high, .. } => {
+            child(operand) || child(low) || child(high)
+        }
+        Expr::Like { operand, pattern, escape, .. } => {
+            child(operand) || child(pattern) || escape.is_some_and(&child)
+        }
+        Expr::Match { operand, pattern, .. } => child(operand) || child(pattern),
+        Expr::Case { operand, whens, otherwise, .. } => {
+            operand.is_some_and(&child)
+                || whens.iter().any(|(condition, result)| child(condition) || child(result))
+                || otherwise.is_some_and(&child)
+        }
+        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+            select_uses_dropped_type(
+                select,
+                storage,
+                txid,
+                path,
+                selected_domains,
+                selected_enum,
+            )
+        }
+        Expr::InSubquery { operand, select, .. } => {
+            child(operand)
+                || select_uses_dropped_type(
+                    select,
+                    storage,
+                    txid,
+                    path,
+                    selected_domains,
+                    selected_enum,
+                )
+        }
+        Expr::Array(items) => items.iter().any(|expression| child(expression)),
+        Expr::Slice { base, lower, upper } => {
+            child(base) || lower.is_some_and(&child) || upper.is_some_and(&child)
+        }
+        _ => false,
+    }
+}
+
+fn cast_resolves_to_dropped_type(
+    storage: &Storage,
+    txid: u32,
+    path: &crate::storage::PathContext,
+    type_name: &str,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+) -> bool {
+    let bare_type = type_name.strip_suffix("[]").unwrap_or(type_name);
+    let selected_at = |schema: &str, name: &str| {
+        storage
+            .domain_slot(schema, name, txid)
+            .is_some_and(|slot| selected_domains[slot])
+            || storage
+                .enum_slot(schema, name, txid)
+                .is_some_and(|slot| selected_enum == Some(slot))
+    };
+    if let Some((schema, name)) = bare_type.split_once('.') {
+        return selected_at(schema, name);
+    }
+    for entry in path.entries() {
+        match entry {
+            crate::storage::PathEntry::Catalog => {
+                if ColType::from_sql_name(bare_type).is_some() {
+                    return false;
+                }
+            }
+            crate::storage::PathEntry::Schema(slot) => {
+                let schema = storage.schema_def(*slot as usize).name;
+                let domain = storage.domain_slot(schema.as_str(), bare_type, txid);
+                let enumeration = storage.enum_slot(schema.as_str(), bare_type, txid);
+                if domain.is_some() || enumeration.is_some() {
+                    return domain.is_some_and(|slot| selected_domains[slot])
+                        || enumeration.is_some_and(|slot| selected_enum == Some(slot));
+                }
+            }
+        }
+    }
+    false
+}
+
+fn enum_column_in_use(
+    storage: &Storage,
+    enum_slot: usize,
+    txid: u32,
+) -> Option<(SqlName, SqlName)> {
+    for table_index in 0..storage.table_count() {
+        let table = storage.table(table_index);
+        if !table.visible_to(txid) {
+            continue;
+        }
+        for column in table.def.columns() {
+            if matches!(column.ctype, ColType::Enum(slot) if slot as usize == enum_slot)
+                || matches!(
+                    column.ctype,
+                    ColType::Array(super::types::ArrElem::Enum(slot))
+                        if slot as usize == enum_slot
+                )
+            {
+                return Some((table.def.name, column.name));
+            }
+        }
+    }
+    None
 }
 
 pub fn alter_type(
@@ -7023,6 +8106,19 @@ pub fn alter_table(
         u32::MAX,
     ) {
         Some(crate::storage::ResolvedRelation::Table(i)) => i,
+        None if statement.if_exists => {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "relation \"{}\" does not exist, skipping",
+                    statement.table.name
+                )
+                .as_str(),
+            )?;
+            responder.command_complete("ALTER TABLE")?;
+            return sql_ok();
+        }
         _ => return sql_fail(undefined_qual(&statement.table)),
     };
     let def = storage.table(table_index).def;

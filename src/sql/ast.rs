@@ -160,6 +160,26 @@ pub enum Stmt<'a> {
     Notify { channel: &'a str, payload: Option<&'a str> },
     /// COMMENT ON <object> IS { 'text' | NULL }. `text: None` removes it.
     Comment { target: CommentTarget<'a>, text: Option<&'a str> },
+    /// ALTER <supported object> name OWNER TO role. Every catalog object is
+    /// owned by the one modeled role, but the target and requested role are
+    /// still validated exactly.
+    AlterOwner {
+        kind: AlterOwnerKind,
+        name: QualName<'a>,
+        role: &'a str,
+        if_exists: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterOwnerKind {
+    Schema,
+    Type,
+    Domain,
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
 }
 
 /// Which kind of relation a `COMMENT ON` names — PostgreSQL rejects a comment
@@ -905,6 +925,8 @@ pub enum MergeAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AlterTable<'a> {
     pub table: QualName<'a>,
+    /// ALTER TABLE IF EXISTS: a missing target emits a notice and succeeds.
+    pub if_exists: bool,
     /// One or more subcommands. PostgreSQL applies a comma-separated list in a
     /// fixed pass order (drops, then type changes, then adds, then constraints,
     /// then column-attribute changes), not left to right; the parser sorts the

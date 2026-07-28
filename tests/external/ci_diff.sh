@@ -70,17 +70,39 @@ EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 
-wait_up() { # port
+wait_up() { # host port
   for _ in $(seq 1 100); do
-    psql -h "$PGHOST" -p "$1" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && return 0
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && return 0
     sleep 0.1
   done
   return 1
 }
-wait_up "$PGPORT" || { echo "PostgreSQL not reachable on $PGHOST:$PGPORT"; exit 1; }
-psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 \
-  || { for _ in $(seq 1 100); do psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break; sleep 0.1; done; }
+wait_p3() {
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$P3_PID" 2>/dev/null; then
+      echo "pos3ql process $P3_PID exited during startup"
+      tail -40 "$WORK/p3.log"
+      return 1
+    fi
+    psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" \
+      >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+wait_up "$PGHOST" "$PGPORT" || { echo "PostgreSQL not reachable on $PGHOST:$PGPORT"; exit 1; }
+wait_p3 || { echo "pos3ql not reachable on 127.0.0.1:$P3_PORT"; exit 1; }
 echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW server_version')"
+
+restart_p3() {
+  kill "$P3_PID" 2>/dev/null
+  wait "$P3_PID" 2>/dev/null
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  P3_PID=$!
+  wait_p3 && return 0
+  echo "pos3ql did not restart on 127.0.0.1:$P3_PORT"
+  return 1
+}
 
 restart_p3_fresh() {
   kill "$P3_PID" 2>/dev/null
@@ -88,10 +110,7 @@ restart_p3_fresh() {
   rm -rf "${WORK}/p3data"
   "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
   P3_PID=$!
-  for _ in $(seq 1 100); do
-    psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && return 0
-    sleep 0.1
-  done
+  wait_p3 && return 0
   echo "pos3ql did not restart on 127.0.0.1:$P3_PORT"
   return 1
 }
@@ -128,11 +147,7 @@ else
   # Restart before observing the result: table definitions, owned identity
   # sequences, setval positions, views, matviews, indexes and data must all
   # come back through WAL replay rather than surviving only in memory.
-  kill "$P3_PID" 2>/dev/null
-  wait "$P3_PID" 2>/dev/null
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
-  P3_PID=$!
-  wait_up "$P3_PORT"
+  restart_p3 || exit 1
   dump_observed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
     -v ON_ERROR_STOP=1 -c "
       SELECT count(*) FROM app.entry;
@@ -150,6 +165,49 @@ else
     printf 'expected:\n%s\nobserved:\n%s\n' "$expected_dump_observed" "$dump_observed"
   fi
 fi
+
+# --- PostgreSQL 15.18 custom archive through pg_restore --------------------
+echo "=== PostgreSQL 15.18 custom archive restore ==="
+# Version 15's archive format is readable by the client packages on every CI
+# runner we support. The ownerful archive exercises ALTER ... OWNER, while
+# parallel restore exercises independent pg_restore worker connections.
+restart_p3_fresh || exit 1
+pg_restore --exit-on-error --jobs=4 \
+  -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  tests/data/postgresql-15.18-pgrestore.dump \
+  > "$WORK/pg_restore_custom.out" 2>&1
+archive_restore_status=$?
+if [[ $archive_restore_status -ne 0 ]]; then
+  bad "PostgreSQL 15.18 custom archive restores in parallel"
+  tail -40 "$WORK/pg_restore_custom.out"
+else
+  pg_restore --exit-on-error --clean --if-exists --jobs=4 \
+    -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+    tests/data/postgresql-15.18-pgrestore.dump \
+    > "$WORK/pg_restore_clean.out" 2>&1
+  archive_clean_status=$?
+  if [[ $archive_clean_status -ne 0 ]]; then
+    bad "pg_restore --clean --if-exists replaces a populated database"
+    tail -40 "$WORK/pg_restore_clean.out"
+  else
+    restart_p3 || exit 1
+    archive_observed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -At -F '|' \
+      -v ON_ERROR_STOP=1 -c "
+        SELECT count(*) FROM app.entry;
+        SELECT state,n FROM app.entry_counts ORDER BY state;
+        SELECT nextval('app.ticket_seq');
+      " 2>/dev/null)
+    expected_archive_observed=$'2\nsad|1\nhappy|1\n30'
+    if [[ "$archive_observed" == "$expected_archive_observed" ]]; then
+      ok "ownerful parallel pg_restore, clean replacement and restart"
+    else
+      bad "PostgreSQL 15.18 custom archive restore result"
+      printf 'expected:\n%s\nobserved:\n%s\n' \
+        "$expected_archive_observed" "$archive_observed"
+    fi
+  fi
+fi
+
 # The differential corpora assume an empty pos3ql catalog.
 restart_p3_fresh || exit 1
 

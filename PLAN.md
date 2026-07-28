@@ -857,11 +857,18 @@ adaptive-execution capstone. This section is the plan of record for all of it.
   surface, composites included). The extended-protocol sub-flow is complete:
   COPY IN holds its implicit transaction through CopyDone, observes extended
   Sync/error recovery, preserves CopyFail's client reason, and COPY OUT streams
-  independently of Execute's row limit. PostgreSQL 18 plain-format restore into
-  pos3ql is now covered end to end by a checked-in vanilla 18.4 dump: setup
-  GUCs, schema/type/domain/table DDL, generated and owned identity sequences,
-  COPY, `setval`, constraints/indexes, views and materialized views all restore
-  and survive restart. The opposite direction — taking a consistent pg_dump
+  independently of Execute's row limit. PostgreSQL restore into pos3ql is now
+  covered end to end by a checked-in vanilla 18.4 plain dump and a
+  provenance-stamped PostgreSQL 15.18 custom archive: setup GUCs,
+  schema/type/domain/table DDL, generated and owned identity sequences, COPY,
+  `setval`, constraints/indexes, views and materialized views all restore and
+  survive restart. Real pg_restore runs ownerful, with four parallel workers,
+  and replaces a populated database through `--clean --if-exists`. Its cleanup
+  surface includes `ALTER TABLE IF EXISTS ONLY`, typed `ALTER ... OWNER`, and a
+  transactional DROP SCHEMA sweep of tables, views, materialized views,
+  sequences, domains and enums. `--single-transaction` remains loudly blocked
+  by the transactional table-shape boundary described in BUGS.md. The opposite
+  direction — taking a consistent pg_dump
   *from* pos3ql and restoring it into PostgreSQL — still requires
   `REPEATABLE READ, READ ONLY` plus table locks. pos3ql rejects those unsupported
   transaction characteristics instead of silently claiming them; the real
@@ -1756,8 +1763,9 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
    introspection half of the catalog milestone is complete: detailed
    table/view/materialized-view/index/sequence/domain/type displays and the
    standard relation/schema/database/role/function/tablespace/publication/FDW
-   listings execute end-to-end. PostgreSQL 18.4 plain dumps restore into pos3ql
-   and survive restart; outbound pg_dump stays open pending Stage F's
+   listings execute end-to-end. PostgreSQL 18.4 plain dumps and ownerful custom
+   archives restore into pos3ql, including parallel clean replacement, and
+   survive restart; outbound pg_dump stays open pending Stage F's
    repeatable-read snapshots/table locks and any remaining dump-specific catalog
    queries.
 6. **Logical replication** — publisher first, subscriber second.

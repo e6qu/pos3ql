@@ -2042,6 +2042,35 @@ impl<'a> Parser<'a> {
 
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
+        use crate::sql::ast::AlterOwnerKind;
+        if self.eat_ident("schema")? {
+            let name = QualName {
+                schema: None,
+                name: self.col_ident("schema name")?,
+            };
+            return self.alter_owner(AlterOwnerKind::Schema, name, false);
+        }
+        if self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.qual_name("materialized view name")?;
+            return self.alter_owner(AlterOwnerKind::MaterializedView, name, if_exists);
+        }
+        if self.eat_ident("view")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.qual_name("view name")?;
+            return self.alter_owner(AlterOwnerKind::View, name, if_exists);
+        }
         if self.eat_ident("sequence")? {
             return self.alter_sequence();
         }
@@ -2052,15 +2081,28 @@ impl<'a> Parser<'a> {
             return self.alter_type();
         }
         self.expect_ident("table")?;
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
         let _ = self.eat_ident("only")?;
         let table = self.qual_name("table name")?;
+        if self.peeked == Tok::Ident("owner") {
+            return self.alter_owner(AlterOwnerKind::Table, table, if_exists);
+        }
         // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
         // combine them with a comma-separated subcommand list, so they parse to
         // a single-element list on their own.
         if self.eat_ident("set")? {
             self.expect_ident("schema")?;
             let action = AlterAction::SetSchema(self.col_ident("schema name")?);
-            return Ok(Stmt::AlterTable(AlterTable { table, actions: self.arena_slice(&[action])? }));
+            return Ok(Stmt::AlterTable(AlterTable {
+                table,
+                if_exists,
+                actions: self.arena_slice(&[action])?,
+            }));
         }
         if self.eat_ident("rename")? {
             let action = if self.eat_ident("to")? {
@@ -2077,7 +2119,11 @@ impl<'a> Parser<'a> {
                 let to = self.col_ident("new column name")?;
                 AlterAction::RenameColumn { from, to }
             };
-            return Ok(Stmt::AlterTable(AlterTable { table, actions: self.arena_slice(&[action])? }));
+            return Ok(Stmt::AlterTable(AlterTable {
+                table,
+                if_exists,
+                actions: self.arena_slice(&[action])?,
+            }));
         }
         // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
         let mut buffer = [AlterAction::DropDefault { column: "" }; MAX_ALTER_ACTIONS];
@@ -2103,7 +2149,28 @@ impl<'a> Parser<'a> {
                 j -= 1;
             }
         }
-        Ok(Stmt::AlterTable(AlterTable { table, actions: self.arena_slice(&buffer[..count])? }))
+        Ok(Stmt::AlterTable(AlterTable {
+            table,
+            if_exists,
+            actions: self.arena_slice(&buffer[..count])?,
+        }))
+    }
+
+    pub(super) fn alter_owner(
+        &mut self,
+        kind: crate::sql::ast::AlterOwnerKind,
+        name: QualName<'a>,
+        if_exists: bool,
+    ) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("owner")?;
+        self.expect_ident("to")?;
+        let role = self.any_ident("role name")?;
+        Ok(Stmt::AlterOwner {
+            kind,
+            name,
+            role,
+            if_exists,
+        })
     }
 
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable

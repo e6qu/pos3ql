@@ -88,10 +88,12 @@ Working single-node database:
   and full constraint enforcement. The binary format
   is byte-exact against PostgreSQL for the whole type surface, composites
   included (arrays, ranges, multiranges, bit strings, network addresses).
-- PostgreSQL 18 plain-format dumps restore directly, including schemas,
-  enum/domain types, generated and identity columns, owned sequence positions,
-  constraints, btree indexes, views and materialized views; CI restores a
-  vanilla 18.4 fixture and verifies it again after restart.
+- PostgreSQL dumps restore through both psql and pg_restore: PostgreSQL 18
+  plain SQL and ownerful custom archives cover schemas, enum/domain types,
+  generated and identity columns, owned sequence positions, constraints, btree
+  indexes, views and materialized views. CI runs parallel pg_restore, replaces
+  the populated catalog with `--clean --if-exists`, and verifies the result
+  again after restart.
 - Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED snapshot isolation,
   transactional DDL, and fail-fast (`40001`) write-conflict detection.
 - LISTEN / NOTIFY: `LISTEN`/`UNLISTEN`/`NOTIFY channel[, payload]` with

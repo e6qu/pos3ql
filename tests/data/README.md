@@ -12,3 +12,13 @@ reads these files. Generated locally (2026-07-24, 20-year validity) with:
 
 (`CA:FALSE` matters: webpki refuses a CA-flagged certificate presented as the
 server's end entity, while a trust anchor needs no CA bit.)
+
+`postgresql-18.4-plain-dump.sql` is the vanilla PostgreSQL 18.4 plain-format
+restore fixture. Its header records the generator and the only added
+provenance paragraph.
+
+`postgresql-15.18-pgrestore.dump` is the ownerful custom-format companion used
+to exercise real `pg_restore`, including parallel workers and
+`--clean --if-exists`. PostgreSQL 15's archive format is readable by the
+supported CI client versions. Exact source, generation steps and checksums are
+in `postgresql-15.18-pgrestore.dump.provenance`.

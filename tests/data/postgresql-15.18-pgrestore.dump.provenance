@@ -1,0 +1,20 @@
+Artifact: postgresql-15.18-pgrestore.dump
+SHA-256: b01eca32413c8d3ee6e7ac59c141a36412f8c003d580dd898e489ac8e4cc9fbb
+Generated: 2026-07-28
+Generator: pg_dump (PostgreSQL) 15.18 (Homebrew)
+Archive format: PostgreSQL custom archive 1.14
+
+Source: postgresql-18.4-plain-dump.sql
+Source SHA-256: 104e92ad8657d8de41925383d9c468abea5002678cf5cb269a65467cbb0c89e5
+
+The source fixture was loaded into a vanilla PostgreSQL 15.18 cluster after
+removing PostgreSQL 18's two psql-only \restrict/\unrestrict guard lines and
+the PostgreSQL-18-only `SET transaction_timeout = 0` line. No SQL object or
+COPY data was otherwise changed. The fixture objects were reassigned to a
+locally created `postgres` role so the archive retains and tests owner
+statements, then generated with:
+
+    pg_dump --format=custom --file=postgresql-15.18-pgrestore.dump postgres
+
+The archive was listed with PostgreSQL 15.18 pg_restore and restored with
+PostgreSQL 18.4 pg_restore before its checksum was recorded above.

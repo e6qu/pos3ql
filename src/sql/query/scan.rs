@@ -9,8 +9,10 @@
 //! correlated subquery sees the row it is correlated with.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{Expr, FromClause, JoinKind};
-use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
+use crate::sql::ast::{BinaryOp, Expr, FromClause, JoinKind};
+use crate::sql::eval::{
+    ColumnLookup, EvalHooks, SqlError, cast_to, eval_full, hash_key, sqlstate,
+};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{MAX_COLUMNS, Storage, rowenc};
@@ -22,6 +24,133 @@ use super::{
     MAX_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, join_order,
     reorder_qual, simplify_qual, where_passes,
 };
+
+struct NoColumns;
+
+impl<'a> ColumnLookup<'a> for NoColumns {
+    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
+    }
+}
+
+/// A complete equality probe over one base table. The rowids are sorted so
+/// taking the cache path does not make result/error order depend on hash-slot
+/// placement.
+struct IndexedCandidates<'a> {
+    table: usize,
+    rowids: &'a [u64],
+}
+
+/// Finds one single-column `indexed_column = constant` conjunct. This is
+/// intentionally conservative: joins, derived rows, parameters and
+/// multi-column keys stay on the ordinary scan until their access path can
+/// preserve the same visibility and coercion guarantees.
+fn indexed_candidates<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    where_clause: Option<&Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
+    if scope.n != 1
+        || scope.derived[0].is_some()
+        || scope.lateral[0]
+        || storage.has_pending_rows(scope.slots[0])
+    {
+        return Ok(None);
+    }
+    fn find<'a>(expression: &'a Expr<'a>, scope: &QueryScope<'_>) -> Option<(usize, &'a Expr<'a>)> {
+        match expression {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+            } => find(left, scope).or_else(|| find(right, scope)),
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+            } => {
+                let side = |column: &'a Expr<'a>,
+                            constant: &'a Expr<'a>|
+                 -> Option<(usize, &'a Expr<'a>)> {
+                    let Expr::Column { qualifier, name } = column else {
+                        return None;
+                    };
+                    // `is_constant` also admits stable/volatile scalar calls
+                    // for the expression planner. An index key must be
+                    // invariant between candidate selection and the ordinary
+                    // WHERE recheck, so decline every call here.
+                    if !constant.is_constant() || constant.contains_call() {
+                        return None;
+                    }
+                    match scope.find_column(*qualifier, name).ok()? {
+                        ResolvedColumn::Table(0, index) => Some((index, constant)),
+                        _ => None,
+                    }
+                };
+                side(left, right).or_else(|| side(right, left))
+            }
+            _ => None,
+        }
+    }
+    let Some((column, constant)) = where_clause.and_then(|clause| find(clause, scope)) else {
+        return Ok(None);
+    };
+    let columns = [column as u16];
+    let slot = scope.slots[0];
+    if !storage.value_cache_complete(slot, &columns) {
+        return Ok(None);
+    }
+    let target_type = scope.defs[0].expect("physical table has definition").columns()[column].ctype;
+    let raw = eval_full(constant, arena, params, &NoColumns, hooks)?;
+    let raw_type = ColType::from_oid(raw.type_oid());
+    let integer = |column_type: ColType| {
+        matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8)
+    };
+    let integer_compatible = raw_type.is_some_and(integer) && integer(target_type);
+    // An untyped string literal is coerced to the indexed column by the
+    // equality operator. Already-typed constants are safe only when their
+    // representation has the same equality hash (the integer widths share
+    // one canonical hash). Declining other cross-type operators avoids, for
+    // example, turning `integer_column = 1.1::numeric` into an index probe for
+    // a rounded integer.
+    if !matches!(constant, Expr::Str(_))
+        && raw_type != Some(target_type)
+        && !integer_compatible
+    {
+        return Ok(None);
+    }
+    let value = cast_to(raw, target_type, arena)?;
+    if value.is_null() {
+        return Ok(Some(IndexedCandidates {
+            table: 0,
+            rowids: &[],
+        }));
+    }
+    let hash = hash_key(&[value], &[0]);
+    let mut count = 0usize;
+    let complete = storage.probe_value(slot, &columns, hash, |_| count += 1);
+    debug_assert!(complete, "completeness checked before probe");
+    let rowids = arena
+        .alloc_slice_with(count, |_| 0u64)
+        .map_err(|_| arena_full())?;
+    let mut fill = 0usize;
+    storage.probe_value(slot, &columns, hash, |rowid| {
+        rowids[fill] = rowid;
+        fill += 1;
+    });
+    rowids.sort_unstable();
+    Ok(Some(IndexedCandidates {
+        table: 0,
+        rowids,
+    }))
+}
 
 /// One assembled source row: per table, decoded values (empty slice =
 /// LEFT-join null row; None = not yet joined).
@@ -351,6 +480,7 @@ pub(crate) fn scan_source<'a>(
         // Execution order: `order[depth]` is the scope-table joined at this depth
         // (identity unless a cross join was cost-reordered).
         order: &[usize; MAX_JOIN_TABLES],
+        indexed: Option<&IndexedCandidates<'a>>,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -455,6 +585,7 @@ pub(crate) fn scan_source<'a>(
                     matched,
                     pushdown,
                     order,
+                    indexed,
                     f,
                 )? {
                     return Ok(false);
@@ -486,6 +617,7 @@ pub(crate) fn scan_source<'a>(
                     matched,
                     pushdown,
                     order,
+                    indexed,
                     f,
                 )? {
                     return Ok(false);
@@ -500,7 +632,11 @@ pub(crate) fn scan_source<'a>(
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
             let slot = scope.slots[order[depth]];
-            let count = storage.visible_row_count(slot, txid)?;
+            let candidates =
+                indexed.filter(|access| access.table == order[depth]).map(|access| access.rowids);
+            let count = candidates
+                .map(<[u64]>::len)
+                .unwrap_or(storage.visible_row_count(slot, txid)?);
             let ordered = arena
                 .alloc_slice_with(count, |_| {
                     (
@@ -510,22 +646,34 @@ pub(crate) fn scan_source<'a>(
                 })
                 .map_err(|_| arena_full())?;
             let mut fill = 0usize;
-            storage.for_each_row_state(slot, &mut |rowid, state| {
-                if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-                    ordered[fill] = (rowid, home);
-                    fill += 1;
+            if let Some(rowids) = candidates {
+                for &rowid in rowids {
+                    let Some(state) = storage.row_state(slot, rowid)? else {
+                        continue;
+                    };
+                    if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
+                        ordered[fill] = (rowid, home);
+                        fill += 1;
+                    }
                 }
-                Ok(core::ops::ControlFlow::Continue(()))
-            })?;
-            debug_assert_eq!(fill, count, "visible count is stable");
+            } else {
+                storage.for_each_row_state(slot, &mut |rowid, state| {
+                    if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
+                        ordered[fill] = (rowid, home);
+                        fill += 1;
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })?;
+                debug_assert_eq!(fill, count, "visible count is stable");
+            }
             // Spilled rows sort by rowid (their SST order — the physical order
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group.
-            ordered.sort_unstable_by_key(|(rowid, home)| match home {
+            ordered[..fill].sort_unstable_by_key(|(rowid, home)| match home {
                 crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
                 crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
             });
-            for (this, &(rowid, home)) in ordered.iter().enumerate() {
+            for (this, &(rowid, home)) in ordered[..fill].iter().enumerate() {
                 check_timeout()?;
                 bound[order[depth]] =
                     Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
@@ -551,6 +699,7 @@ pub(crate) fn scan_source<'a>(
                     matched,
                     pushdown,
                     order,
+                    indexed,
                     f,
                 )? {
                     return Ok(false);
@@ -591,6 +740,7 @@ pub(crate) fn scan_source<'a>(
                     matched,
                     pushdown,
                     order,
+                    indexed,
                     f,
                 )? {
                     aborted = true;
@@ -621,6 +771,7 @@ pub(crate) fn scan_source<'a>(
                 matched,
                 pushdown,
                 order,
+                indexed,
                 f,
             )? {
                 return Ok(false);
@@ -727,6 +878,7 @@ pub(crate) fn scan_source<'a>(
     let pushdown: [&[&Expr]; MAX_JOIN_TABLES] =
         core::array::from_fn(|d| &pushdown_buffers[d][..pd_n[d]]);
 
+    let indexed = indexed_candidates(storage, scope, where_clause, arena, params, hooks)?;
     let mut bound = [None; MAX_JOIN_TABLES];
     level(
         storage,
@@ -743,6 +895,7 @@ pub(crate) fn scan_source<'a>(
         &matched,
         &pushdown,
         &order,
+        indexed.as_ref(),
         f,
     )?;
 
@@ -784,6 +937,7 @@ pub(crate) fn scan_source<'a>(
                 &matched,
                 &pushdown,
                 &order,
+                indexed.as_ref(),
                 f,
             )
         };

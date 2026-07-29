@@ -26,9 +26,11 @@ engineering discipline.
   the bucket and page back through the caches, so ingest is not bounded by
   RAM *bytes* or total row count. With object storage enabled, synchronous WAL
   upload is the default, so acknowledged data is already in the durable tier
-  and local disk is disposable. The remaining storage bound is the in-RAM uniqueness index
-  on constrained tables; its persistent secondary-index forest is tracked in
-  the *Maturity roadmap* in [PLAN.md](PLAN.md).
+  and local disk is disposable. Value indexes in RAM are bounded acceleration
+  caches, never correctness authorities: once incomplete they fall through to
+  the object-resident row image. The persistent secondary-index forest needed
+  to make those probes scale independently of cache capacity remains tracked
+  in the *Maturity roadmap* in [PLAN.md](PLAN.md).
 - **Static allocation.** All memory is acquired at startup, sized from
   config. No heap allocation after init — enforced by a guarding global
   allocator. Every pool and queue has a fixed limit; exhaustion is a loud
@@ -204,12 +206,13 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   manifest publication. Versioned SSTs in the provider-neutral object store
   retain snapshots across long update/checkpoint churn; RAM and disk cache
   loss changes latency, never visibility or durability.
-- **Uniqueness is value-indexed.** A `PRIMARY KEY` / `UNIQUE` constraint keeps
-  an in-RAM `value → rowid` index, so a duplicate check is a hash seek rather
-  than a scan of the whole spilled dataset. It bounds a constrained table to
-  `value_index_rows` committed rows (a loud error past it) — the price of an
-  in-RAM index; lifting that bound for unboundedly-spilling *constrained* tables
-  is the persistent index forest on the roadmap.
+- **Value indexes are bounded caches.** Primary/unique constraints and named
+  indexes share startup-sized `value → rowid` caches. A complete cache serves
+  uniqueness and single-table equality probes directly; an exhausted cache is
+  marked incomplete and the same operation scans the authoritative row SSTs.
+  `value_index_rows` therefore controls acceleration coverage, not table size
+  or correctness. The persistent value-keyed SST forest that removes the
+  fallback scan at object scale remains on the roadmap.
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.

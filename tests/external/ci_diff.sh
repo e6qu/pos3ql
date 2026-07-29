@@ -9,6 +9,7 @@
 #   PGHOST / PGPORT / PGUSER   PostgreSQL to diff against (default 127.0.0.1 / 5432 / postgres)
 #   P3_PORT                    port pos3ql should listen on (default 15599)
 #   SLT_LIMIT                  max sqllogictest blocks per file (default 20000 = all vendored)
+#   SLT_UNSUPPORTED_BUDGET     maximum unsupported blocks per shard (ratchet)
 #   FUZZ_COUNT / FUZZ_SEED     generative fuzz statements / seed (default 20000 / 1)
 #   FUZZ_BUDGET                allowed fuzz divergences before failing (ratchet; default 0)
 #   RUN_FAST / RUN_SLT / RUN_FUZZ
@@ -30,6 +31,7 @@ PGUSER=${PGUSER:-postgres}
 export PGHOST PGPORT PGUSER
 P3_PORT=${P3_PORT:-15599}
 SLT_LIMIT=${SLT_LIMIT:-20000}
+SLT_UNSUPPORTED_BUDGET=${SLT_UNSUPPORTED_BUDGET:-183}
 FUZZ_COUNT=${FUZZ_COUNT:-20000}
 FUZZ_SEED=${FUZZ_SEED:-1}
 FUZZ_BUDGET=${FUZZ_BUDGET:-0}
@@ -384,6 +386,7 @@ if [[ "$RUN_SLT" == 1 ]]; then
   restart_p3_fresh || exit 1
   echo "=== sqllogictest replay (query shard $SLT_QUERY_SHARD/$SLT_QUERY_SHARDS) ==="
   if "$PY" "$EXT/slt_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --limit "$SLT_LIMIT" \
+       --max-unsupported "$SLT_UNSUPPORTED_BUDGET" \
        --query-shards "$SLT_QUERY_SHARDS" --query-shard "$SLT_QUERY_SHARD" \
        vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
        > "$WORK/slt.out" 2>&1; then

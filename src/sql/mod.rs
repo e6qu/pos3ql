@@ -617,6 +617,8 @@ impl Engine {
         };
         let mut altered_tables = [(usize::MAX, false); txn::MAX_TXN_DDL];
         let mut altered_count = 0usize;
+        let mut index_tables = [usize::MAX; txn::MAX_TXN_DDL];
+        let mut index_table_count = 0usize;
         for undo in txn.ddl() {
             let DdlUndo::TableAltered(slot) = *undo else {
                 continue;
@@ -678,8 +680,26 @@ impl Engine {
                 DdlUndo::EnumValueAdded { .. }
                 | DdlUndo::EnumValueRenamed { .. }
                 | DdlUndo::EnumRenamed { .. } => {}
-                DdlUndo::IndexCreated(slot) => self.storage.commit_index_create(*slot as usize),
-                DdlUndo::IndexDropped(slot) => self.storage.commit_index_drop(*slot as usize),
+                DdlUndo::IndexCreated(slot) => {
+                    let slot = *slot as usize;
+                    self.storage.commit_index_create(slot);
+                    if let Some(table) = self.storage.index_table_slot(slot)
+                        && !index_tables[..index_table_count].contains(&table)
+                    {
+                        index_tables[index_table_count] = table;
+                        index_table_count += 1;
+                    }
+                }
+                DdlUndo::IndexDropped(slot) => {
+                    let slot = *slot as usize;
+                    self.storage.commit_index_drop(slot);
+                    if let Some(table) = self.storage.index_table_slot(slot)
+                        && !index_tables[..index_table_count].contains(&table)
+                    {
+                        index_tables[index_table_count] = table;
+                        index_table_count += 1;
+                    }
+                }
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => self.storage.commit_schema_create(*slot as usize),
@@ -699,6 +719,20 @@ impl Engine {
             {
                 index_result = Err(error);
                 break;
+            }
+        }
+        if index_result.is_ok() {
+            for &table in &index_tables[..index_table_count] {
+                if altered_tables[..altered_count]
+                    .iter()
+                    .any(|&(altered, _)| altered == table)
+                {
+                    continue;
+                }
+                if let Err(error) = self.storage.refresh_enforcers(table) {
+                    index_result = Err(error);
+                    break;
+                }
             }
         }
         // Past the durability point, so these fire iff the transaction really
@@ -786,7 +820,16 @@ impl Engine {
             DdlUndo::EnumRenamed { slot, prior } => {
                 self.storage.rename_enum(slot as usize, prior);
             }
-            DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
+            DdlUndo::IndexCreated(slot) => {
+                let slot = slot as usize;
+                let table = self.storage.index_table_slot(slot);
+                self.storage.rollback_index_create(slot);
+                if let Some(table) = table {
+                    self.storage
+                        .refresh_enforcers(table)
+                        .expect("rolling back CREATE INDEX restores its cache binding");
+                }
+            }
             DdlUndo::IndexDropped(slot) => {
                 self.storage.rollback_index_drop(slot as usize, txid);
             }

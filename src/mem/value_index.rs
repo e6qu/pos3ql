@@ -21,6 +21,11 @@ pub struct ValueIndex {
     mask: usize,
     len: usize,
     max_len: usize,
+    /// Whether this cache contains every committed row. A full cache becomes
+    /// incomplete instead of imposing a correctness limit on the table; its
+    /// callers must then use the authoritative row store for a conclusive
+    /// negative answer.
+    complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +75,7 @@ impl ValueIndex {
             mask: slot_count - 1,
             len: 0,
             max_len: capacity,
+            complete: true,
         })
     }
 
@@ -180,9 +186,18 @@ impl ValueIndex {
         self.max_len
     }
 
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn mark_incomplete(&mut self) {
+        self.complete = false;
+    }
+
     pub fn clear(&mut self) {
         self.slots.fill_with(|| None);
         self.len = 0;
+        self.complete = true;
     }
 }
 
@@ -285,6 +300,20 @@ mod tests {
         assert!(index.remove(0xdead, 0));
         assert!(index.remove(0xdead, 4));
         assert_eq!(collect(&index, 0xdead), [1, 3]);
+    }
+
+    #[test]
+    fn completeness_is_explicit_and_reset_with_the_cache() {
+        let mut budget = Budget::new(1 << 16);
+        let mut index = ValueIndex::new(&mut budget, "test", 1).unwrap();
+        index.insert(7, 1).unwrap();
+        assert!(index.insert(8, 2).is_err());
+        index.mark_incomplete();
+        assert!(!index.is_complete());
+        assert_eq!(collect(&index, 7), [1]);
+        index.clear();
+        assert!(index.is_complete());
+        assert!(index.is_empty());
     }
 
     #[test]

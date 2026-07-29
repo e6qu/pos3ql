@@ -12,8 +12,8 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::{
-    arena_full, bad_text, cast_unsupported, load_array, out_of_range, overflow, parse_bool, session_zone_at,
-    sqlstate, SqlError,
+    SqlError, arena_full, bad_text, cast_unsupported, load_array, out_of_range, overflow,
+    parse_bool, session_zone_at, sqlstate,
 };
 
 pub fn cast<'a>(v: Datum<'a>, type_name: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
@@ -27,11 +27,7 @@ pub fn cast<'a>(v: Datum<'a>, type_name: &str, arena: &'a Arena) -> Result<Datum
     cast_to(v, target, arena)
 }
 
-pub fn cast_to<'a>(
-    v: Datum<'a>,
-    target: ColType,
-    arena: &'a Arena,
-) -> Result<Datum<'a>, SqlError> {
+pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     if v.is_null() {
         return Ok(Datum::Null);
     }
@@ -46,6 +42,10 @@ pub fn cast_to<'a>(
         ColType::Record => match v {
             Datum::Record(_) => v,
             _ => return Err(cast_unsupported(&v, "record")),
+        },
+        ColType::Int2Vector => match v {
+            Datum::Int2Vector(_) => v,
+            _ => return Err(cast_unsupported(&v, "int2vector")),
         },
         // A value-level cast to an enum: only an already-typed enum value can be
         // produced here. Coercing text to an enum member needs the catalog to
@@ -69,7 +69,9 @@ pub fn cast_to<'a>(
             } else if let Datum::Text(s) = v {
                 // Text input names the offending value on overflow, where a
                 // value-to-value cast does not.
-                Datum::Int4(parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer")? as i32)
+                Datum::Int4(
+                    parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer")? as i32,
+                )
             } else {
                 let x = to_i64_for_cast(&v, "integer")?;
                 Datum::Int4(i32::try_from(x).map_err(|_| overflow("integer"))?)
@@ -90,7 +92,11 @@ pub fn cast_to<'a>(
             Datum::Float4(x) => Datum::Float8(f64::from(x)),
             Datum::Float8(_) => v,
             Datum::Numeric(n) => Datum::Float8(n.to_f64()),
-            Datum::Text(s) => Datum::Float8(s.trim().parse().map_err(|_| bad_text(s, "double precision"))?),
+            Datum::Text(s) => Datum::Float8(
+                s.trim()
+                    .parse()
+                    .map_err(|_| bad_text(s, "double precision"))?,
+            ),
             _ => return Err(cast_unsupported(&v, "double precision")),
         },
         // real/float4 rounds every input through single precision. A finite
@@ -101,11 +107,20 @@ pub fn cast_to<'a>(
                 Datum::Float4(_) => return Ok(v),
                 Datum::Int4(x) => x as f32,
                 Datum::Int8(x) => x as f32,
-                Datum::Float8(x) => finite_to_f32(x)
-                    .ok_or_else(|| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "value out of range: overflow"))?,
+                Datum::Float8(x) => finite_to_f32(x).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::NUMERIC_OUT_OF_RANGE,
+                        "value out of range: overflow"
+                    )
+                })?,
                 Datum::Numeric(n) => match finite_to_f32(n.to_f64()) {
                     Some(f) => f,
-                    None => return Err(float_out_of_range(cast_to_text(Datum::Numeric(n), arena)?, "real")),
+                    None => {
+                        return Err(float_out_of_range(
+                            cast_to_text(Datum::Numeric(n), arena)?,
+                            "real",
+                        ));
+                    }
                 },
                 Datum::Text(s) => {
                     let t = s.trim();
@@ -187,12 +202,13 @@ pub fn cast_to<'a>(
                 let local = t + zone as i64 * 1_000_000;
                 Datum::Timetz(local.rem_euclid(86_400_000_000), zone)
             }
-            Datum::Timestamp(t) => {
-                Datum::Timetz(t.rem_euclid(86_400_000_000), session_zone_at(t))
-            }
+            Datum::Timestamp(t) => Datum::Timetz(t.rem_euclid(86_400_000_000), session_zone_at(t)),
             Datum::Text(s) => {
                 let (t, zone) = crate::sql::datetime::parse_timetz(s)?;
-                Datum::Timetz(t, zone.unwrap_or_else(|| session_zone_at(crate::sql::datetime::now_micros())))
+                Datum::Timetz(
+                    t,
+                    zone.unwrap_or_else(|| session_zone_at(crate::sql::datetime::now_micros())),
+                )
             }
             _ => return Err(cast_unsupported(&v, "time with time zone")),
         },
@@ -208,7 +224,10 @@ pub fn cast_to<'a>(
             }
             Datum::Text(s) => {
                 crate::sql::json::validate(s, arena)?;
-                Datum::Json { text: s, jsonb: false }
+                Datum::Json {
+                    text: s,
+                    jsonb: false,
+                }
             }
             _ => return Err(cast_unsupported(&v, "json")),
         },
@@ -217,11 +236,20 @@ pub fn cast_to<'a>(
             Datum::Json { text, jsonb: false } | Datum::Text(text) => {
                 let tree = crate::sql::json::parse(text, arena)?;
                 let mut buffer = crate::util::StackStr::<8192>::new();
-                let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", crate::sql::json::JsonWrite(&tree)));
+                let _ = core::fmt::Write::write_fmt(
+                    &mut buffer,
+                    format_args!("{}", crate::sql::json::JsonWrite(&tree)),
+                );
                 if buffer.is_truncated() {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "jsonb value exceeds the supported size"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "jsonb value exceeds the supported size"
+                    ));
                 }
-                Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb: true }
+                Datum::Json {
+                    text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+                    jsonb: true,
+                }
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
         },
@@ -231,9 +259,15 @@ pub fn cast_to<'a>(
             Datum::Array { element: e, raw } => {
                 let mut items = [Datum::Null; 1024];
                 let n = load_array(raw, e, element, &mut items, 0, arena)?;
-                Datum::Array { element, raw: crate::sql::array::build(&items[..n], arena)? }
+                Datum::Array {
+                    element,
+                    raw: crate::sql::array::build(&items[..n], arena)?,
+                }
             }
-            Datum::Text(s) => Datum::Array { element, raw: crate::sql::array::parse_literal(s, element, arena)? },
+            Datum::Text(s) => Datum::Array {
+                element,
+                raw: crate::sql::array::parse_literal(s, element, arena)?,
+            },
             _ => return Err(cast_unsupported(&v, "array")),
         },
         ColType::Uuid => match v {
@@ -267,28 +301,42 @@ pub fn cast_to<'a>(
             Datum::Range { kind: k, .. } if k == kind => v,
             Datum::Text(s) => {
                 let p = crate::sql::range::parse(s)?;
-                Datum::Range { text: crate::sql::range::canonical(&p, kind, arena)?, kind }
+                Datum::Range {
+                    text: crate::sql::range::canonical(&p, kind, arena)?,
+                    kind,
+                }
             }
             _ => return Err(cast_unsupported(&v, kind.name())),
         },
         ColType::Bit { varying } => match v {
             Datum::Bit { bits, .. } => Datum::Bit { bits, varying },
-            Datum::Text(s) => Datum::Bit { bits: validate_bits(s)?, varying },
+            Datum::Text(s) => Datum::Bit {
+                bits: validate_bits(s)?,
+                varying,
+            },
             // int -> bit yields the two's-complement bits at the type's full
             // width; `apply_cast_typmod` then keeps the low N bits for bit(N).
-            Datum::Int4(x) => Datum::Bit { bits: int_to_bits(x as u32 as u64, 32, arena)?, varying },
-            Datum::Int8(x) => Datum::Bit { bits: int_to_bits(x as u64, 64, arena)?, varying },
+            Datum::Int4(x) => Datum::Bit {
+                bits: int_to_bits(x as u32 as u64, 32, arena)?,
+                varying,
+            },
+            Datum::Int8(x) => Datum::Bit {
+                bits: int_to_bits(x as u64, 64, arena)?,
+                varying,
+            },
             _ => return Err(cast_unsupported(&v, "bit")),
         },
         ColType::Multirange(kind) => match v {
             Datum::Multirange { kind: k, .. } if k == kind => v,
             // A range promotes to a one-element multirange (empty range → {}).
-            Datum::Range { text, kind: k } if k == kind => {
-                Datum::Multirange { text: crate::sql::range::multirange_from_range(text, kind, arena)?, kind }
-            }
-            Datum::Text(s) => {
-                Datum::Multirange { text: crate::sql::range::parse_multirange(s, kind, arena)?, kind }
-            }
+            Datum::Range { text, kind: k } if k == kind => Datum::Multirange {
+                text: crate::sql::range::multirange_from_range(text, kind, arena)?,
+                kind,
+            },
+            Datum::Text(s) => Datum::Multirange {
+                text: crate::sql::range::parse_multirange(s, kind, arena)?,
+                kind,
+            },
             _ => return Err(cast_unsupported(&v, kind.multirange_name())),
         },
         ColType::Inet => match v {
@@ -321,17 +369,15 @@ pub fn cast_to<'a>(
                 }
                 Datum::Macaddr([b[0], b[1], b[2], b[5], b[6], b[7]])
             }
-            Datum::Text(s) => {
-                Datum::Macaddr(crate::sql::net::parse_macaddr(s).ok_or_else(|| bad_text(s, "macaddr"))?)
-            }
+            Datum::Text(s) => Datum::Macaddr(
+                crate::sql::net::parse_macaddr(s).ok_or_else(|| bad_text(s, "macaddr"))?,
+            ),
             _ => return Err(cast_unsupported(&v, "macaddr")),
         },
         ColType::Macaddr8 => match v {
             Datum::Macaddr8(_) => v,
             // macaddr -> macaddr8 widens through EUI-64 (insert ff:fe).
-            Datum::Macaddr(b) => {
-                Datum::Macaddr8([b[0], b[1], b[2], 0xff, 0xfe, b[3], b[4], b[5]])
-            }
+            Datum::Macaddr(b) => Datum::Macaddr8([b[0], b[1], b[2], 0xff, 0xfe, b[3], b[4], b[5]]),
             Datum::Text(s) => Datum::Macaddr8(
                 crate::sql::net::parse_macaddr8(s).ok_or_else(|| bad_text(s, "macaddr8"))?,
             ),
@@ -376,7 +422,11 @@ pub fn int_to_bits(value: u64, width: usize, arena: &Arena) -> Result<&str, SqlE
     let out = arena
         .alloc_slice_with(width, |i| {
             let shift = width - 1 - i;
-            if shift < 64 && (value >> shift) & 1 != 0 { b'1' } else { b'0' }
+            if shift < 64 && (value >> shift) & 1 != 0 {
+                b'1'
+            } else {
+                b'0'
+            }
         })
         .map_err(|_| arena_full())?;
     Ok(unsafe { core::str::from_utf8_unchecked(out) })
@@ -403,7 +453,10 @@ pub fn fit_bits<'a>(
     let out = arena
         .alloc_slice_with(n, |i| if i < len { bits.as_bytes()[i] } else { b'0' })
         .map_err(|_| arena_full())?;
-    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+    Ok(Datum::Bit {
+        bits: unsafe { core::str::from_utf8_unchecked(out) },
+        varying,
+    })
 }
 
 pub(crate) fn parse_uuid(s: &str) -> Result<[u8; 16], SqlError> {
@@ -449,7 +502,9 @@ pub(crate) fn parse_bytea<'a>(s: &str, arena: &'a Arena) -> Result<&'a [u8], Sql
             )
         };
         // Whitespace between hex digits is permitted.
-        let out = arena.alloc_slice_with(hex.len() / 2 + 1, |_| 0u8).map_err(|_| arena_full())?;
+        let out = arena
+            .alloc_slice_with(hex.len() / 2 + 1, |_| 0u8)
+            .map_err(|_| arena_full())?;
         let mut n = 0usize;
         let mut high: Option<u8> = None;
         for &c in hex.as_bytes() {
@@ -610,15 +665,16 @@ fn classify_int_literal(s: &str) -> IntLiteral {
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
     use IntLiteral::{Malformed, Overflow, Value};
-    let (radix, digits) = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-        (16, r)
-    } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
-        (8, r)
-    } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
-        (2, r)
-    } else {
-        (10, rest)
-    };
+    let (radix, digits) =
+        if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+            (16, r)
+        } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+            (8, r)
+        } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+            (2, r)
+        } else {
+            (10, rest)
+        };
     let db = digits.as_bytes();
     if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
         return Malformed;
@@ -686,7 +742,10 @@ mod tests {
         assert_eq!(msg, "value \"3000000000\" is out of range for type integer");
         let (state, msg) = err("99999999999999999999", i64::MIN, i64::MAX, "bigint");
         assert_eq!(state, "22003");
-        assert_eq!(msg, "value \"99999999999999999999\" is out of range for type bigint");
+        assert_eq!(
+            msg,
+            "value \"99999999999999999999\" is out of range for type bigint"
+        );
         let (_, msg) = err("40000", -32768, 32767, "smallint");
         assert_eq!(msg, "value \"40000\" is out of range for type smallint");
     }
@@ -699,13 +758,17 @@ mod tests {
         for bad in ["abc", "12abc", "", "  ", "0xGG", "1__0", "_5", "5_"] {
             let (state, msg) = err(bad, i32::MIN as i64, i32::MAX as i64, "integer");
             assert_eq!(state, "22P02", "{bad:?} should be a syntax error");
-            assert_eq!(msg, format!("invalid input syntax for type integer: \"{bad}\""));
+            assert_eq!(
+                msg,
+                format!("invalid input syntax for type integer: \"{bad}\"")
+            );
         }
     }
 
     #[test]
     fn valid_literals_in_range_parse() {
-        let ok = |s: &str| parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer").unwrap();
+        let ok =
+            |s: &str| parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer").unwrap();
         assert_eq!(ok("42"), 42);
         assert_eq!(ok("-2147483648"), -2147483648);
         assert_eq!(ok("2147483647"), 2147483647);

@@ -4,6 +4,10 @@
 pub mod array;
 pub mod ast;
 pub mod catalog;
+pub mod copy;
+pub mod cursor;
+pub mod datetime;
+pub mod encoding;
 pub mod eval;
 pub mod exec;
 pub mod guc;
@@ -11,27 +15,23 @@ pub mod json;
 pub mod lexer;
 pub mod md5;
 pub mod net;
+pub mod notify;
 pub mod numeric;
 pub mod parser;
-pub mod regex;
-pub mod datetime;
-pub mod encoding;
 pub mod prep;
-pub mod sha512;
 pub mod query;
+pub mod range;
+pub mod regex;
+pub mod ryu;
+pub mod sequence;
+pub mod sha512;
+pub mod timezone;
+pub mod to_char;
 pub mod txn;
 pub mod types;
-pub mod range;
-pub mod ryu;
-pub mod to_char;
-pub mod timezone;
 pub mod tzif;
-pub mod copy;
-pub mod cursor;
-pub mod notify;
-pub mod sequence;
 
-use crate::checkpoint::{CheckpointStep, Checkpointer, CheckpointSetupError};
+use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer};
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
@@ -43,14 +43,14 @@ use crate::stack_format;
 use crate::storage::{RowHome, RowLoc, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError};
 
-use ast::{Delete, Expr, Insert, Stmt, Update};
 use crate::pg::conn::MAX_BIND_PARAMS;
-use eval::{eval, sqlstate, NoColumns, SqlError, NO_PARAMS};
+use ast::{Delete, Expr, Insert, Stmt, Update};
+use eval::{NO_PARAMS, NoColumns, SqlError, eval, sqlstate};
 use exec::MAX_PROJ;
-use parser::{ParseError, Parser};
 use guc::GucState;
+use parser::{ParseError, Parser};
 use prep::SqlPreparedPool;
-use txn::{DdlUndo, TxnMode, TxnState};
+use txn::{DdlUndo, IsolationLevel, TxnMode, TxnState};
 use types::{ColDesc, ColType, Datum};
 
 #[derive(Debug)]
@@ -101,8 +101,11 @@ impl From<WalSetupError> for EngineSetupError {
 }
 
 /// Placeholder for the fixed-size array of data-modifying-CTE materializations.
-static EMPTY_DML_CTE: ast::MaterializedCte<'static> =
-    ast::MaterializedCte { column_names: &[], column_types: &[], rows: &[] };
+static EMPTY_DML_CTE: ast::MaterializedCte<'static> = ast::MaterializedCte {
+    column_names: &[],
+    column_types: &[],
+    rows: &[],
+};
 
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
@@ -145,16 +148,182 @@ pub struct Engine {
     current_conn_id: i32,
 }
 
-fn unsupported_transaction_characteristic(characteristics: &str) -> Option<&str> {
-    characteristics
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .find(|part| {
-            !part.eq_ignore_ascii_case("isolation level read committed")
-                && !part.eq_ignore_ascii_case("read write")
-                && !part.eq_ignore_ascii_case("not deferrable")
-        })
+#[derive(Clone, Copy)]
+struct TransactionCharacteristics {
+    isolation: Option<IsolationLevel>,
+    read_only: Option<bool>,
+    deferrable: Option<bool>,
+}
+
+fn transaction_characteristics(text: &str) -> Result<TransactionCharacteristics, &str> {
+    let mut parsed = TransactionCharacteristics {
+        isolation: None,
+        read_only: None,
+        deferrable: None,
+    };
+    let mut words = text
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .filter(|word| !word.is_empty());
+    while let Some(word) = words.next() {
+        if word.eq_ignore_ascii_case("isolation") {
+            let Some(level) = words.next() else {
+                return Err(word);
+            };
+            let Some(first) = words.next() else {
+                return Err(level);
+            };
+            let Some(second) = words.next() else {
+                return Err(first);
+            };
+            if !level.eq_ignore_ascii_case("level") {
+                return Err(level);
+            }
+            if first.eq_ignore_ascii_case("read") && second.eq_ignore_ascii_case("committed") {
+                parsed.isolation = Some(IsolationLevel::ReadCommitted);
+            } else if first.eq_ignore_ascii_case("repeatable")
+                && second.eq_ignore_ascii_case("read")
+            {
+                parsed.isolation = Some(IsolationLevel::RepeatableRead);
+            } else {
+                return Err(first);
+            }
+        } else if word.eq_ignore_ascii_case("read") {
+            let Some(mode) = words.next() else {
+                return Err(word);
+            };
+            if mode.eq_ignore_ascii_case("only") {
+                parsed.read_only = Some(true);
+            } else if mode.eq_ignore_ascii_case("write") {
+                parsed.read_only = Some(false);
+            } else {
+                return Err(mode);
+            }
+        } else if word.eq_ignore_ascii_case("deferrable") {
+            parsed.deferrable = Some(true);
+        } else if word.eq_ignore_ascii_case("not") {
+            let Some(characteristic) = words.next() else {
+                return Err(word);
+            };
+            if !characteristic.eq_ignore_ascii_case("deferrable") {
+                return Err(characteristic);
+            }
+            parsed.deferrable = Some(false);
+        } else {
+            return Err(word);
+        }
+    }
+    Ok(parsed)
+}
+
+fn statement_writes(statement: &Stmt<'_>) -> bool {
+    match statement {
+        Stmt::Select(_)
+        | Stmt::SetQuery(_)
+        | Stmt::Begin(_)
+        | Stmt::Commit
+        | Stmt::Rollback
+        | Stmt::Savepoint(_)
+        | Stmt::ReleaseSavepoint(_)
+        | Stmt::RollbackToSavepoint(_)
+        | Stmt::LockTable { .. }
+        | Stmt::Set { .. }
+        | Stmt::Reset(_)
+        | Stmt::SetTransaction(_)
+        | Stmt::Show(_)
+        | Stmt::ShowAll
+        | Stmt::Prepare { .. }
+        // EXECUTE recursively dispatches the parsed prepared statement, where
+        // the actual command is checked before it can mutate anything.
+        | Stmt::ExecutePrepared { .. }
+        | Stmt::Deallocate(_)
+        | Stmt::DeclareCursor { .. }
+        | Stmt::FetchCursor { .. }
+        | Stmt::CloseCursor(_)
+        | Stmt::Analyze(_)
+        | Stmt::Listen(_)
+        | Stmt::Unlisten(_) => false,
+        Stmt::Copy(copy) => !copy.to,
+        // A WITH wrapper exists only for a data-modifying main statement.
+        Stmt::With { .. }
+        | Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Merge(_)
+        | Stmt::CreateTable(_)
+        | Stmt::DropTable(_)
+        | Stmt::Truncate { .. }
+        | Stmt::CreateView { .. }
+        | Stmt::DropView { .. }
+        | Stmt::CreateTableAs { .. }
+        | Stmt::RefreshMaterializedView { .. }
+        | Stmt::DropMaterializedView { .. }
+        | Stmt::CreateSequence { .. }
+        | Stmt::AlterSequence { .. }
+        | Stmt::DropSequence { .. }
+        | Stmt::CreateDomain(_)
+        | Stmt::AlterDomain { .. }
+        | Stmt::DropDomain { .. }
+        | Stmt::CreateEnum { .. }
+        | Stmt::AlterType { .. }
+        | Stmt::DropType { .. }
+        | Stmt::CreateIndex { .. }
+        | Stmt::DropIndex { .. }
+        | Stmt::Checkpoint
+        | Stmt::AlterTable(_)
+        | Stmt::CreateSchema { .. }
+        | Stmt::DropSchema { .. }
+        | Stmt::Vacuum { .. }
+        | Stmt::Notify { .. }
+        | Stmt::Comment { .. }
+        | Stmt::AlterOwner { .. } => true,
+    }
+}
+
+fn statement_changes_schema(statement: &Stmt<'_>) -> bool {
+    matches!(
+        statement,
+        Stmt::CreateTable(_)
+            | Stmt::DropTable(_)
+            | Stmt::Truncate { .. }
+            | Stmt::CreateView { .. }
+            | Stmt::DropView { .. }
+            | Stmt::CreateTableAs { .. }
+            | Stmt::RefreshMaterializedView { .. }
+            | Stmt::DropMaterializedView { .. }
+            | Stmt::CreateSequence { .. }
+            | Stmt::AlterSequence { .. }
+            | Stmt::DropSequence { .. }
+            | Stmt::CreateDomain(_)
+            | Stmt::AlterDomain { .. }
+            | Stmt::DropDomain { .. }
+            | Stmt::CreateEnum { .. }
+            | Stmt::AlterType { .. }
+            | Stmt::DropType { .. }
+            | Stmt::CreateIndex { .. }
+            | Stmt::DropIndex { .. }
+            | Stmt::AlterTable(_)
+            | Stmt::CreateSchema { .. }
+            | Stmt::DropSchema { .. }
+            | Stmt::Comment { .. }
+            | Stmt::AlterOwner { .. }
+    )
+}
+
+fn statement_tag(statement: &Stmt<'_>) -> &'static str {
+    match statement {
+        Stmt::With { statement, .. } => statement_tag(statement),
+        Stmt::LockTable { .. } => "LOCK TABLE",
+        Stmt::Insert(_) => "INSERT",
+        Stmt::Update(_) => "UPDATE",
+        Stmt::Delete(_) => "DELETE",
+        Stmt::Merge(_) => "MERGE",
+        Stmt::Copy(_) => "COPY FROM",
+        Stmt::Truncate { .. } => "TRUNCATE",
+        Stmt::Vacuum { .. } => "VACUUM",
+        Stmt::Checkpoint => "CHECKPOINT",
+        Stmt::Notify { .. } => "NOTIFY",
+        _ => "DDL",
+    }
 }
 
 impl Engine {
@@ -172,7 +341,8 @@ impl Engine {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
             + config.table_rows * size_of::<(u64, RowHome)>()
-            + (1 + crate::storage::MAX_PENDING_ROW_VERSIONS)
+            + (1 + crate::storage::MAX_PENDING_ROW_VERSIONS
+                + crate::storage::MAX_COMMITTED_ROW_VERSIONS)
                 * config.max_tables
                 * config.table_rows
                 * size_of::<(u32, u64, u8, RowLoc)>()
@@ -181,8 +351,7 @@ impl Engine {
             + if config.object_store_on {
                 // The checkpointer's fixed parts plus the spilled-row reader's
                 // two scratch sets.
-                Checkpointer::budget_bytes(config)
-                    + crate::storage::SpillReader::budget_bytes()
+                Checkpointer::budget_bytes(config) + crate::storage::SpillReader::budget_bytes()
             } else {
                 0
             }
@@ -209,7 +378,9 @@ impl Engine {
             None => 0,
         };
         let mut wal = Wal::open(config, budget)?;
-        wal.replay(floor, |lsn, operator| apply_wal_op(&mut storage, lsn, operator))?;
+        wal.replay(floor, |lsn, operator| {
+            apply_wal_op(&mut storage, lsn, operator)
+        })?;
         storage.reconcile_serials();
         // RPO=0: replay any WAL segments in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
@@ -251,7 +422,8 @@ impl Engine {
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
-                (1 + crate::storage::MAX_PENDING_ROW_VERSIONS)
+                (1 + crate::storage::MAX_PENDING_ROW_VERSIONS
+                    + crate::storage::MAX_COMMITTED_ROW_VERSIONS)
                     * config.max_tables
                     * config.table_rows,
             )?,
@@ -285,16 +457,17 @@ impl Engine {
 
     /// Commits: journals every touched row, fsyncs once, then promotes the
     /// in-memory images. On failure the transaction rolls back entirely.
-    pub fn commit_txn(
-        &mut self,
-        txn: &mut TxnState,
-        guc: &GucState,
-    ) -> Result<(), SqlError> {
+    pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         if !txn.is_active() {
             return Ok(());
         }
+        // This transaction no longer needs its historical view. Release it
+        // before promotion so only other live snapshots cause old row images
+        // to be retained.
+        self.storage.release_snapshot(txn.txid);
+        self.storage.release_table_locks(txn.txid);
         // A failed synchronous upload keeps its batch marker, so the next
         // commit retries it. Whether *this* transaction added records to
         // that batch decides who owns a retry failure below: the statement
@@ -305,7 +478,10 @@ impl Engine {
             let (table, rowid, _) = txn.touched()[i];
             // A row may be written several times in one transaction; journal
             // its final committed image once.
-            if txn.touched()[..i].iter().any(|&(t, r, _)| t == table && r == rowid) {
+            if txn.touched()[..i]
+                .iter()
+                .any(|&(t, r, _)| t == table && r == rowid)
+            {
                 continue;
             }
             let Some(state) = self.storage.row_state(table as usize, rowid)? else {
@@ -549,104 +725,113 @@ impl Engine {
         Ok(())
     }
 
+    /// Applies one transaction-local catalog undo entry. Full rollback and
+    /// savepoint rollback share this choke point so new DDL cannot accidentally
+    /// acquire different rollback semantics on the two paths.
+    fn rollback_ddl(&mut self, undo: DdlUndo, txid: u32) {
+        match undo {
+            DdlUndo::Created(slot) => self.storage.rollback_create(slot as usize),
+            DdlUndo::Dropped(slot) => {
+                self.storage.rollback_drop(slot as usize);
+                let name = self.storage.table(slot as usize).def.name;
+                let schema = self.storage.table(slot as usize).def.schema;
+                self.storage
+                    .rollback_indexes_for(schema.as_str(), name.as_str(), txid);
+            }
+            DdlUndo::TableAltered(slot) => {
+                self.storage.rollback_table_def(slot as usize, txid);
+            }
+            DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
+            DdlUndo::ViewDropped(slot) => {
+                self.storage.rollback_view_drop(slot as usize, txid);
+            }
+            DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
+            DdlUndo::MatviewDropped(slot) => {
+                self.storage.rollback_matview_drop(slot as usize, txid);
+            }
+            DdlUndo::SequenceCreated(slot) => {
+                self.storage.rollback_sequence_create(slot as usize);
+            }
+            DdlUndo::SequenceDropped(slot) => {
+                self.storage.rollback_sequence_drop(slot as usize, txid);
+            }
+            DdlUndo::DomainCreated(slot) => self.storage.rollback_domain_create(slot as usize),
+            DdlUndo::DomainDropped(slot) => {
+                self.storage.rollback_domain_drop(slot as usize, txid);
+            }
+            DdlUndo::DomainNullabilityAltered { slot, prior } => self
+                .storage
+                .restore_domain_nullability(slot as usize, prior),
+            DdlUndo::DomainDefaultAltered { slot, prior } => {
+                self.storage.restore_domain_default(slot as usize, prior);
+            }
+            DdlUndo::DomainCheckAdded { slot, prior_count } => self
+                .storage
+                .undo_domain_check_add(slot as usize, prior_count as usize),
+            DdlUndo::DomainCheckDropped { slot, index, prior } => {
+                self.storage
+                    .restore_domain_check(slot as usize, index as usize, prior);
+            }
+            DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
+            DdlUndo::EnumDropped(slot) => {
+                self.storage.rollback_enum_drop(slot as usize, txid);
+            }
+            DdlUndo::EnumValueAdded { slot, prior_count } => self
+                .storage
+                .undo_enum_value_add(slot as usize, prior_count as usize),
+            DdlUndo::EnumValueRenamed { slot, index, prior } => {
+                self.storage
+                    .restore_enum_value_name(slot as usize, index as usize, prior);
+            }
+            DdlUndo::EnumRenamed { slot, prior } => {
+                self.storage.rename_enum(slot as usize, prior);
+            }
+            DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
+            DdlUndo::IndexDropped(slot) => {
+                self.storage.rollback_index_drop(slot as usize, txid);
+            }
+            DdlUndo::SequenceReset {
+                table,
+                column,
+                prior,
+            } => {
+                let table = self.storage.table_mut(table as usize);
+                table.serial_last[column as usize] = prior;
+                table.serial_dirty = true;
+            }
+            DdlUndo::OwnedSequenceReset {
+                sequence,
+                prior,
+                prior_called,
+            } => {
+                let sequence = self.storage.sequence(sequence as usize);
+                sequence.last_value.set(prior);
+                sequence.is_called.set(prior_called);
+                sequence.dirty.set(true);
+            }
+            DdlUndo::SchemaCreated(slot) => self.storage.rollback_schema_create(slot as usize),
+            DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize),
+            DdlUndo::CommentSet { slot, prior } => {
+                self.storage.restore_comment_pending(slot as usize, prior);
+            }
+        }
+    }
+
     /// Discards every uncommitted change and journal byte of the
     /// transaction.
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
+        self.storage.release_snapshot(txn.txid);
+        self.storage.release_table_locks(txn.txid);
         // Reverse-replay every write to its prior image (newest first), so a
         // row written multiple times unwinds to its pre-transaction state.
         for &(table, rowid, prior) in txn.touched().iter().rev() {
-            self.storage.restore_pending(table as usize, rowid, txn.txid, prior);
+            self.storage
+                .restore_pending(table as usize, rowid, txn.txid, prior);
         }
-        for undo in txn.ddl().iter().rev() {
-            match *undo {
-                DdlUndo::Created(slot) => self.storage.rollback_create(slot as usize),
-                DdlUndo::Dropped(slot) => {
-                    self.storage.rollback_drop(slot as usize);
-                    // The table's indexes were pending-dropped with it; revert.
-                    let name = self.storage.table(slot as usize).def.name;
-                    let schema = self.storage.table(slot as usize).def.schema;
-                    self.storage
-                        .rollback_indexes_for(schema.as_str(), name.as_str(), txn.txid);
-                }
-                DdlUndo::TableAltered(slot) => {
-                    self.storage.rollback_table_def(slot as usize, txn.txid);
-                }
-                DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
-                DdlUndo::ViewDropped(slot) => {
-                    self.storage.rollback_view_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
-                DdlUndo::MatviewDropped(slot) => {
-                    self.storage.rollback_matview_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::SequenceCreated(slot) => {
-                    self.storage.rollback_sequence_create(slot as usize)
-                }
-                DdlUndo::SequenceDropped(slot) => {
-                    self.storage.rollback_sequence_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::DomainCreated(slot) => {
-                    self.storage.rollback_domain_create(slot as usize)
-                }
-                DdlUndo::DomainDropped(slot) => {
-                    self.storage.rollback_domain_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::DomainNullabilityAltered { slot, prior } => self
-                    .storage
-                    .restore_domain_nullability(slot as usize, prior),
-                DdlUndo::DomainDefaultAltered { slot, prior } => {
-                    self.storage.restore_domain_default(slot as usize, prior)
-                }
-                DdlUndo::DomainCheckAdded { slot, prior_count } => self
-                    .storage
-                    .undo_domain_check_add(slot as usize, prior_count as usize),
-                DdlUndo::DomainCheckDropped { slot, index, prior } => self
-                    .storage
-                    .restore_domain_check(slot as usize, index as usize, prior),
-                DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
-                DdlUndo::EnumDropped(slot) => {
-                    self.storage.rollback_enum_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::EnumValueAdded { slot, prior_count } => self
-                    .storage
-                    .undo_enum_value_add(slot as usize, prior_count as usize),
-                DdlUndo::EnumValueRenamed { slot, index, prior } => self
-                    .storage
-                    .restore_enum_value_name(slot as usize, index as usize, prior),
-                DdlUndo::EnumRenamed { slot, prior } => {
-                    self.storage.rename_enum(slot as usize, prior)
-                }
-                DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
-                DdlUndo::IndexDropped(slot) => {
-                    self.storage.rollback_index_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::SequenceReset { table, column, prior } => {
-                    let t = self.storage.table_mut(table as usize);
-                    t.serial_last[column as usize] = prior;
-                    t.serial_dirty = true;
-                }
-                DdlUndo::OwnedSequenceReset {
-                    sequence,
-                    prior,
-                    prior_called,
-                } => {
-                    let sequence = self.storage.sequence(sequence as usize);
-                    sequence.last_value.set(prior);
-                    sequence.is_called.set(prior_called);
-                    sequence.dirty.set(true);
-                }
-                DdlUndo::SchemaCreated(slot) => {
-                    self.storage.rollback_schema_create(slot as usize)
-                }
-                DdlUndo::SchemaDropped(slot) => {
-                    self.storage.rollback_schema_drop(slot as usize)
-                }
-                DdlUndo::CommentSet { slot, prior } => {
-                    self.storage.restore_comment_pending(slot as usize, prior)
-                }
-            }
+        for &undo in txn.ddl().iter().rev() {
+            self.rollback_ddl(undo, txn.txid);
         }
         self.wal.truncate_to_mark(txn.wal_mark);
         guc.rollback_transaction();
@@ -657,104 +842,15 @@ impl Engine {
     /// performed after it (reverse-replayed), discards the journal tail, and
     /// restores the pre-savepoint failed state — leaving the transaction (and
     /// the savepoint) open for reuse.
-    fn rollback_to_savepoint(
-        &mut self,
-        txn: &mut TxnState,
-        index: usize,
-        guc: &GucState,
-    ) {
+    fn rollback_to_savepoint(&mut self, txn: &mut TxnState, index: usize, guc: &GucState) {
         let sp = txn.savepoint_at(index);
         for i in (sp.touched_mark..txn.touched().len()).rev() {
             let (table, rowid, prior) = txn.touched()[i];
-            self.storage.restore_pending(table as usize, rowid, txn.txid, prior);
+            self.storage
+                .restore_pending(table as usize, rowid, txn.txid, prior);
         }
         for i in (sp.ddl_mark..txn.ddl().len()).rev() {
-            match txn.ddl()[i] {
-                DdlUndo::Created(slot) => self.storage.rollback_create(slot as usize),
-                DdlUndo::Dropped(slot) => {
-                    self.storage.rollback_drop(slot as usize);
-                    let name = self.storage.table(slot as usize).def.name;
-                    let schema = self.storage.table(slot as usize).def.schema;
-                    self.storage
-                        .rollback_indexes_for(schema.as_str(), name.as_str(), txn.txid);
-                }
-                DdlUndo::TableAltered(slot) => {
-                    self.storage.rollback_table_def(slot as usize, txn.txid);
-                }
-                DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
-                DdlUndo::ViewDropped(slot) => {
-                    self.storage.rollback_view_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
-                DdlUndo::MatviewDropped(slot) => {
-                    self.storage.rollback_matview_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::SequenceCreated(slot) => {
-                    self.storage.rollback_sequence_create(slot as usize)
-                }
-                DdlUndo::SequenceDropped(slot) => {
-                    self.storage.rollback_sequence_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::DomainCreated(slot) => {
-                    self.storage.rollback_domain_create(slot as usize)
-                }
-                DdlUndo::DomainDropped(slot) => {
-                    self.storage.rollback_domain_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::DomainNullabilityAltered { slot, prior } => self
-                    .storage
-                    .restore_domain_nullability(slot as usize, prior),
-                DdlUndo::DomainDefaultAltered { slot, prior } => {
-                    self.storage.restore_domain_default(slot as usize, prior)
-                }
-                DdlUndo::DomainCheckAdded { slot, prior_count } => self
-                    .storage
-                    .undo_domain_check_add(slot as usize, prior_count as usize),
-                DdlUndo::DomainCheckDropped { slot, index, prior } => self
-                    .storage
-                    .restore_domain_check(slot as usize, index as usize, prior),
-                DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
-                DdlUndo::EnumDropped(slot) => {
-                    self.storage.rollback_enum_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::EnumValueAdded { slot, prior_count } => self
-                    .storage
-                    .undo_enum_value_add(slot as usize, prior_count as usize),
-                DdlUndo::EnumValueRenamed { slot, index, prior } => self
-                    .storage
-                    .restore_enum_value_name(slot as usize, index as usize, prior),
-                DdlUndo::EnumRenamed { slot, prior } => {
-                    self.storage.rename_enum(slot as usize, prior)
-                }
-                DdlUndo::IndexCreated(slot) => self.storage.rollback_index_create(slot as usize),
-                DdlUndo::IndexDropped(slot) => {
-                    self.storage.rollback_index_drop(slot as usize, txn.txid)
-                }
-                DdlUndo::SequenceReset { table, column, prior } => {
-                    let t = self.storage.table_mut(table as usize);
-                    t.serial_last[column as usize] = prior;
-                    t.serial_dirty = true;
-                }
-                DdlUndo::OwnedSequenceReset {
-                    sequence,
-                    prior,
-                    prior_called,
-                } => {
-                    let sequence = self.storage.sequence(sequence as usize);
-                    sequence.last_value.set(prior);
-                    sequence.is_called.set(prior_called);
-                    sequence.dirty.set(true);
-                }
-                DdlUndo::SchemaCreated(slot) => {
-                    self.storage.rollback_schema_create(slot as usize)
-                }
-                DdlUndo::SchemaDropped(slot) => {
-                    self.storage.rollback_schema_drop(slot as usize)
-                }
-                DdlUndo::CommentSet { slot, prior } => {
-                    self.storage.restore_comment_pending(slot as usize, prior)
-                }
-            }
+            self.rollback_ddl(txn.ddl()[i], txn.txid);
         }
         txn.rewind_touched(sp.touched_mark);
         txn.rewind_ddl(sp.ddl_mark);
@@ -843,6 +939,56 @@ impl Engine {
         self.ckpt.is_some()
     }
 
+    fn analyze_targets(
+        &self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        let mut total_rows = 0usize;
+        if targets.is_empty() {
+            for slot in 0..self.storage.table_count() {
+                if self.storage.table(slot).visible_to(txid) {
+                    total_rows = total_rows
+                        .checked_add(self.storage.visible_row_count(slot, txid)?)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "ANALYZE row count exceeds addressable memory"
+                            )
+                        })?;
+                }
+            }
+            return Ok(total_rows);
+        }
+        for target in targets {
+            let slot = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
+            let definition = self.storage.table_def(slot, txid);
+            for column in target.columns {
+                if !definition
+                    .columns()
+                    .iter()
+                    .any(|metadata| metadata.name.as_str() == *column)
+                {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        column,
+                        target.table.name
+                    ));
+                }
+            }
+            total_rows = total_rows
+                .checked_add(self.storage.visible_row_count(slot, txid)?)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "ANALYZE row count exceeds addressable memory"
+                    )
+                })?;
+        }
+        Ok(total_rows)
+    }
+
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {
@@ -867,11 +1013,14 @@ impl Engine {
     /// restarts and the heap compacts (spilling under memory pressure).
     fn after_publish(&mut self, lsn: u64) -> Result<(), SqlError> {
         self.storage.clear_dirty();
-        if self.wal_upload
-            && let Some(ckpt) = self.ckpt.as_mut() {
+        if !self.storage.has_active_snapshots() {
+            if self.wal_upload
+                && let Some(ckpt) = self.ckpt.as_mut()
+            {
                 let _ = ckpt.prune_wal_segments(lsn);
             }
-        self.wal.reset_after_checkpoint();
+            self.wal.reset_after_checkpoint();
+        }
         // The checkpoint installed each table's spill-SST list as it
         // wrote (full rewrites collapse a list, deltas append).
         self.storage.compact_heap(&mut self.compact_scratch)?;
@@ -958,11 +1107,7 @@ impl Engine {
     /// Ends a successful COPY FROM: an implicit transaction commits here
     /// (this was the statement's end); an explicit one stays open, exactly
     /// as INSERT inside BEGIN would.
-    pub fn copy_finish(
-        &mut self,
-        txn: &mut TxnState,
-        guc: &GucState,
-    ) -> Result<(), SqlError> {
+    pub fn copy_finish(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -1000,10 +1145,7 @@ impl Engine {
         };
         let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
-        if !(ckpt.sweep_active()
-            || ckpt.merge_work_pending(&self.storage)
-            || heap_full
-            || wal_full)
+        if !(ckpt.sweep_active() || ckpt.merge_work_pending(&self.storage) || heap_full || wal_full)
         {
             return true;
         }
@@ -1079,7 +1221,9 @@ impl Engine {
                     }
                     executed_any = true;
                     emit_parse_warnings(&mut parser, responder)?;
-                    if let Err(e) = self.execute_stmt(&statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder)? {
+                    if let Err(e) = self.execute_stmt(
+                        &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
+                    )? {
                         if txn.is_explicit() {
                             txn.failed = true;
                         } else {
@@ -1107,9 +1251,10 @@ impl Engine {
         // FROM in flight, whose statement does not end until CopyDone.
         if txn.mode == TxnMode::Implicit
             && self.pending_copy.is_none()
-            && let Err(e) = self.commit_txn(txn, guc) {
-                responder.error(e.sqlstate, e.message.as_str())?;
-            }
+            && let Err(e) = self.commit_txn(txn, guc)
+        {
+            responder.error(e.sqlstate, e.message.as_str())?;
+        }
         Ok(())
     }
 
@@ -1145,7 +1290,9 @@ impl Engine {
         let outcome = match parser.next_stmt() {
             Ok(Some(statement)) => {
                 emit_parse_warnings(&mut parser, responder)?;
-                self.execute_stmt(&statement, arena, params, txn, sqlprep, cursors, guc, responder)?
+                self.execute_stmt(
+                    &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+                )?
             }
             Ok(None) => {
                 responder.empty_query_response()?;
@@ -1165,10 +1312,11 @@ impl Engine {
             Ok(()) => {
                 if txn.mode == TxnMode::Implicit
                     && self.pending_copy.is_none()
-                    && let Err(e) = self.commit_txn(txn, guc) {
-                        responder.error(e.sqlstate, e.message.as_str())?;
-                        return Ok(false);
-                    }
+                    && let Err(e) = self.commit_txn(txn, guc)
+                {
+                    responder.error(e.sqlstate, e.message.as_str())?;
+                    return Ok(false);
+                }
                 Ok(true)
             }
             Err(e) => {
@@ -1215,7 +1363,10 @@ impl Engine {
 
     /// The OID of a named column of a visible table, if resolvable.
     fn column_oid(&self, table: &ast::QualName, col: &str, txid: u32) -> Option<i32> {
-        let slot = match self.storage.resolve_relation(table.schema, table.name, txid) {
+        let slot = match self
+            .storage
+            .resolve_relation(table.schema, table.name, txid)
+        {
             Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
             _ => return None,
         };
@@ -1227,9 +1378,11 @@ impl Engine {
     fn infer_stmt_params(&self, statement: &Stmt, txid: u32, oids: &mut [i32; MAX_BIND_PARAMS]) {
         let set = |oids: &mut [i32; MAX_BIND_PARAMS], e: &Expr, ty: i32| {
             if let Expr::Param(n) = e
-                && *n >= 1 && (*n as usize) <= MAX_BIND_PARAMS {
-                    oids[*n as usize - 1] = ty;
-                }
+                && *n >= 1
+                && (*n as usize) <= MAX_BIND_PARAMS
+            {
+                oids[*n as usize - 1] = ty;
+            }
         };
         match statement {
             Stmt::With { ctes, statement } => {
@@ -1242,11 +1395,14 @@ impl Engine {
                 self.infer_stmt_params(statement, txid, oids);
             }
             Stmt::Insert(ins) => {
-                let slot = match self.storage.resolve_relation(ins.table.schema, ins.table.name, txid)
-                {
-                    Some(crate::storage::ResolvedRelation::Table(slot)) => Some(slot),
-                    _ => None,
-                };
+                let slot =
+                    match self
+                        .storage
+                        .resolve_relation(ins.table.schema, ins.table.name, txid)
+                    {
+                        Some(crate::storage::ResolvedRelation::Table(slot)) => Some(slot),
+                        _ => None,
+                    };
                 let def = slot.map(|s| self.storage.table_def(s, txid));
                 for row in ins.rows {
                     for (i, value) in row.iter().enumerate() {
@@ -1283,11 +1439,15 @@ impl Engine {
                 // Single-table WHERE comparisons only (joins would need scope
                 // resolution; those params stay text).
                 if let (Some(from), Some(w)) = (&s.from, s.where_clause)
-                    && from.joins.is_empty() && from.base.subquery.is_none() {
-                        let table =
-                            ast::QualName { schema: from.base.schema, name: from.base.table };
-                        self.infer_where_params(&table, w, txid, oids);
-                    }
+                    && from.joins.is_empty()
+                    && from.base.subquery.is_none()
+                {
+                    let table = ast::QualName {
+                        schema: from.base.schema,
+                        name: from.base.table,
+                    };
+                    self.infer_where_params(&table, w, txid, oids);
+                }
                 // A parameter explicitly cast in the select list — `$n::type`
                 // — takes that type, as PostgreSQL resolves an otherwise-unknown
                 // parameter from the cast wrapping it.
@@ -1305,7 +1465,10 @@ impl Engine {
     /// by the innermost cast wrapping it, as PostgreSQL resolves an otherwise-
     /// unknown parameter from the cast.
     fn infer_cast_param(expr: &Expr, oids: &mut [i32; MAX_BIND_PARAMS]) {
-        if let Expr::Cast { operand, type_name, .. } = expr {
+        if let Expr::Cast {
+            operand, type_name, ..
+        } = expr
+        {
             if let Expr::Param(n) = operand {
                 if *n >= 1
                     && (*n as usize) <= MAX_BIND_PARAMS
@@ -1329,7 +1492,12 @@ impl Engine {
         oids: &mut [i32; MAX_BIND_PARAMS],
     ) {
         use ast::BinaryOp::*;
-        if let Expr::Binary { operator, left, right } = expression {
+        if let Expr::Binary {
+            operator,
+            left,
+            right,
+        } = expression
+        {
             match operator {
                 And | Or => {
                     self.infer_where_params(table, left, txid, oids);
@@ -1338,10 +1506,12 @@ impl Engine {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
                     let mut pair = |c: &Expr, p: &Expr| {
                         if let (Expr::Column { name, .. }, Expr::Param(n)) = (c, p)
-                            && *n >= 1 && (*n as usize) <= MAX_BIND_PARAMS
-                                && let Some(ty) = self.column_oid(table, name, txid) {
-                                    oids[*n as usize - 1] = ty;
-                                }
+                            && *n >= 1
+                            && (*n as usize) <= MAX_BIND_PARAMS
+                            && let Some(ty) = self.column_oid(table, name, txid)
+                        {
+                            oids[*n as usize - 1] = ty;
+                        }
                     };
                     pair(left, right);
                     pair(right, left);
@@ -1602,7 +1772,7 @@ impl Engine {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "a data-modifying WITH sub-statement must be INSERT, UPDATE or DELETE"
-                    ))
+                    ));
                 }
             };
             // Describe the RETURNING columns against the target table, applying
@@ -1641,8 +1811,12 @@ impl Engine {
                 names[i] = arena.alloc_str(nm).map_err(|_| query::arena_full_pub())?;
                 types[i] = (descs[i].type_oid, descs[i].typlen);
             }
-            let column_names = arena.alloc_slice_copy(&names[..ncols]).map_err(|_| query::arena_full_pub())?;
-            let column_types = arena.alloc_slice_copy(&types[..ncols]).map_err(|_| query::arena_full_pub())?;
+            let column_names = arena
+                .alloc_slice_copy(&names[..ncols])
+                .map_err(|_| query::arena_full_pub())?;
+            let column_types = arena
+                .alloc_slice_copy(&types[..ncols])
+                .map_err(|_| query::arena_full_pub())?;
             // Run the DML once, capturing RETURNING rows (projected-encoded).
             const EMPTY: &[u8] = &[];
             let mut store: *mut &[u8] = core::ptr::null_mut();
@@ -1652,8 +1826,9 @@ impl Engine {
                 let enc = encode_projected_pub(vals, arena)?;
                 if len == cap {
                     let new_cap = if cap == 0 { 8 } else { cap * 2 };
-                    let fresh: &mut [&[u8]] =
-                        arena.alloc_slice_with(new_cap, |_| EMPTY).map_err(|_| query::arena_full_pub())?;
+                    let fresh: &mut [&[u8]] = arena
+                        .alloc_slice_with(new_cap, |_| EMPTY)
+                        .map_err(|_| query::arena_full_pub())?;
                     if len > 0 {
                         let old = unsafe { core::slice::from_raw_parts(store, len) };
                         fresh[..len].copy_from_slice(old);
@@ -1681,18 +1856,32 @@ impl Engine {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(query::arena_full_pub()),
             }
-            let rows: &'a [&'a [u8]] =
-                if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(store, len) } };
+            let rows: &'a [&'a [u8]] = if len == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(store, len) }
+            };
             let mcte = arena
-                .alloc(ast::MaterializedCte { column_names, column_types, rows })
+                .alloc(ast::MaterializedCte {
+                    column_names,
+                    column_types,
+                    rows,
+                })
                 .map_err(|_| query::arena_full_pub())?;
             if n == parser::MAX_CTES {
-                return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many WITH entries"));
+                return Err(sql_err!(
+                    sqlstate::TOO_MANY_ARGUMENTS,
+                    "too many WITH entries"
+                ));
             }
             mats[n] = (cte.name, &*mcte);
             n += 1;
         }
-        Ok(Some(arena.alloc_slice_copy(&mats[..n]).map_err(|_| query::arena_full_pub())?))
+        Ok(Some(
+            arena
+                .alloc_slice_copy(&mats[..n])
+                .map_err(|_| query::arena_full_pub())?,
+        ))
     }
 
     /// Executes one INSERT/UPDATE/DELETE after any enclosing WITH clause has
@@ -1887,8 +2076,9 @@ impl Engine {
         exec::reset_record_shapes();
         eval::funcs::system::set_session_user(guc.session_user());
         let raw_path = guc.search_path();
-        let path =
-            self.storage.compute_path(raw_path.as_str(), guc.session_user(), txn.txid);
+        let path = self
+            .storage
+            .compute_path(raw_path.as_str(), guc.session_user(), txn.txid);
         self.storage.swap_path(path);
         // Publish the path's schema names for current_schema/current_schemas.
         {
@@ -1958,7 +2148,10 @@ impl Engine {
         // Inside a failed explicit block only COMMIT/ROLLBACK (and ROLLBACK TO
         // SAVEPOINT, which recovers the block) act.
         if txn.failed
-            && !matches!(statement, Stmt::Commit | Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+            && !matches!(
+                statement,
+                Stmt::Commit | Stmt::Rollback | Stmt::RollbackToSavepoint(_)
+            )
         {
             return Ok(Err(SqlError {
                 sqlstate: sqlstate::IN_FAILED_SQL_TRANSACTION,
@@ -1976,19 +2169,35 @@ impl Engine {
         if txn.is_explicit() && matches!(statement, Stmt::Checkpoint) {
             return Ok(Err(SqlError {
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                message: stack_format!(
-                    192,
-                    "CHECKPOINT cannot run inside a transaction block"
-                ),
+                message: stack_format!(192, "CHECKPOINT cannot run inside a transaction block"),
             }));
         }
         // VACUUM is non-transactional (25001); ANALYZE, by contrast, is allowed
         // inside a transaction block.
-        if txn.is_explicit() && matches!(statement, Stmt::Vacuum) {
+        if txn.is_explicit() && matches!(statement, Stmt::Vacuum { .. }) {
             return Ok(Err(SqlError {
                 sqlstate: sqlstate::ACTIVE_SQL_TRANSACTION,
                 message: stack_format!(192, "VACUUM cannot run inside a transaction block"),
             }));
+        }
+        if txn.read_only && statement_writes(statement) {
+            return Ok(Err(sql_err!(
+                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                "cannot execute {} in a read-only transaction",
+                statement_tag(statement)
+            )));
+        }
+        // Historical row images currently share the committed table
+        // definition. Prevent a concurrent definition rewrite from making an
+        // old row undecodable; this is the fail-fast form of PostgreSQL's
+        // ACCESS SHARE versus ACCESS EXCLUSIVE lock conflict.
+        if (self.storage.has_active_snapshots() || self.storage.has_access_share_locks())
+            && statement_changes_schema(statement)
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::LOCK_NOT_AVAILABLE,
+                "could not obtain schema lock while a historical snapshot is active"
+            )));
         }
         // A new command: advance the command-id (so this statement's writes are
         // tagged with it) and reset reads to full own-write visibility. A
@@ -1996,6 +2205,29 @@ impl Engine {
         // reset here guarantees it never leaks into the next statement.
         txn.begin_command();
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
+        let takes_snapshot = !matches!(
+            statement,
+            Stmt::Begin(_)
+                | Stmt::Commit
+                | Stmt::Rollback
+                | Stmt::Savepoint(_)
+                | Stmt::ReleaseSavepoint(_)
+                | Stmt::RollbackToSavepoint(_)
+                | Stmt::LockTable { .. }
+                | Stmt::SetTransaction(_)
+        );
+        let commit_snapshot = if takes_snapshot {
+            let snapshot = txn.statement_snapshot(self.storage.lsn());
+            if txn.isolation == IsolationLevel::RepeatableRead
+                && let Err(error) = self.storage.register_snapshot(txn.txid, snapshot)
+            {
+                return Ok(Err(error));
+            }
+            snapshot
+        } else {
+            self.storage.lsn()
+        };
+        self.storage.set_commit_snapshot(commit_snapshot);
         match statement {
             Stmt::With { ctes, statement } => {
                 let dml_mats = match self.run_dml_ctes(ctes, txn, arena, params, guc, responder) {
@@ -2054,7 +2286,14 @@ impl Engine {
                 // WITH CTEs expand into derived tables before execution; a
                 // recursive CTE is materialized to its fixpoint in the work
                 // arena (reset per statement, sized for row data).
-                let s = match query::expand_ctes_exec(s, &self.storage, txn.txid, &self.work, params, dml_mats) {
+                let s = match query::expand_ctes_exec(
+                    s,
+                    &self.storage,
+                    txn.txid,
+                    &self.work,
+                    params,
+                    dml_mats,
+                ) {
                     Ok(x) => x,
                     Err(e) => return Ok(Err(e)),
                 };
@@ -2069,9 +2308,25 @@ impl Engine {
                 // per statement while the AST persists across the message.
                 let seq = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 if s.from.is_none() {
-                    query::constant_select(&self.storage, txn.txid, s, &self.work, params, Some(&seq), responder)
+                    query::constant_select(
+                        &self.storage,
+                        txn.txid,
+                        s,
+                        &self.work,
+                        params,
+                        Some(&seq),
+                        responder,
+                    )
                 } else {
-                    query::select_query(&self.storage, txn.txid, s, &self.work, params, Some(&seq), responder)
+                    query::select_query(
+                        &self.storage,
+                        txn.txid,
+                        s,
+                        &self.work,
+                        params,
+                        Some(&seq),
+                        responder,
+                    )
                 }
             }
             Stmt::SetQuery(q) => {
@@ -2083,7 +2338,11 @@ impl Engine {
             Stmt::DropTable(d) => {
                 exec::drop_table(&mut self.storage, &mut self.wal, txn, d, responder)
             }
-            Stmt::CreateView { name, or_replace, sql } => exec::create_view(
+            Stmt::CreateView {
+                name,
+                or_replace,
+                sql,
+            } => exec::create_view(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2094,28 +2353,41 @@ impl Engine {
                 arena,
                 responder,
             ),
-            Stmt::DropView { names, if_exists, cascade } => {
-                exec::drop_view(
-                    &mut self.storage, &mut self.wal, txn, names, *if_exists, *cascade, responder,
-                )
-            }
-            Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists, materialized } => {
-                exec::create_table_as(
-                    &mut self.storage,
-                    &mut self.wal,
-                    txn,
-                    name,
-                    columns,
-                    sql,
-                    *with_data,
-                    *if_not_exists,
-                    *materialized,
-                    guc.search_path().as_str(),
-                    arena,
-                    params,
-                    responder,
-                )
-            }
+            Stmt::DropView {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_view(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
+            Stmt::CreateTableAs {
+                name,
+                columns,
+                sql,
+                with_data,
+                if_not_exists,
+                materialized,
+            } => exec::create_table_as(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                columns,
+                sql,
+                *with_data,
+                *if_not_exists,
+                *materialized,
+                guc.search_path().as_str(),
+                arena,
+                params,
+                responder,
+            ),
             Stmt::RefreshMaterializedView { name } => exec::refresh_materialized_view(
                 &mut self.storage,
                 &mut self.wal,
@@ -2125,7 +2397,11 @@ impl Engine {
                 params,
                 responder,
             ),
-            Stmt::DropMaterializedView { names, if_exists, cascade } => exec::drop_materialized_view(
+            Stmt::DropMaterializedView {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_materialized_view(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2134,7 +2410,11 @@ impl Engine {
                 *cascade,
                 responder,
             ),
-            Stmt::CreateSequence { name, if_not_exists, options } => exec::create_sequence(
+            Stmt::CreateSequence {
+                name,
+                if_not_exists,
+                options,
+            } => exec::create_sequence(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2143,7 +2423,11 @@ impl Engine {
                 options,
                 responder,
             ),
-            Stmt::AlterSequence { name, if_exists, options } => exec::alter_sequence(
+            Stmt::AlterSequence {
+                name,
+                if_exists,
+                options,
+            } => exec::alter_sequence(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2152,7 +2436,11 @@ impl Engine {
                 options,
                 responder,
             ),
-            Stmt::DropSequence { names, if_exists, cascade } => exec::drop_sequence(
+            Stmt::DropSequence {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_sequence(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2173,7 +2461,11 @@ impl Engine {
                 arena,
                 responder,
             ),
-            Stmt::DropDomain { names, if_exists, cascade } => exec::drop_domain(
+            Stmt::DropDomain {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_domain(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2218,7 +2510,12 @@ impl Engine {
                 guc.seq_session(),
                 responder,
             ),
-            Stmt::CreateIndex { name, table, columns, unique } => exec::create_index(
+            Stmt::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+            } => exec::create_index(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2228,9 +2525,14 @@ impl Engine {
                 *unique,
                 responder,
             ),
-            Stmt::DropIndex { names, if_exists } => {
-                exec::drop_index(&mut self.storage, &mut self.wal, txn, names, *if_exists, responder)
-            }
+            Stmt::DropIndex { names, if_exists } => exec::drop_index(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                responder,
+            ),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
                 &mut self.scratch,
@@ -2252,21 +2554,32 @@ impl Engine {
                 guc.seq_session(),
                 responder,
             ),
-            Stmt::Comment { target, text } => {
-                exec::comment(
-                    &mut self.storage,
-                    &mut self.wal,
-                    txn,
-                    target,
-                    *text,
-                    arena,
-                    responder,
-                )
-            }
-            Stmt::Truncate { tables, restart_identity, cascade } => {
-                exec::truncate(&mut self.storage, txn, tables, *restart_identity, *cascade, responder)
-            }
-            Stmt::CreateSchema { name, if_not_exists, elements } => {
+            Stmt::Comment { target, text } => exec::comment(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                target,
+                *text,
+                arena,
+                responder,
+            ),
+            Stmt::Truncate {
+                tables,
+                restart_identity,
+                cascade,
+            } => exec::truncate(
+                &mut self.storage,
+                txn,
+                tables,
+                *restart_identity,
+                *cascade,
+                responder,
+            ),
+            Stmt::CreateSchema {
+                name,
+                if_not_exists,
+                elements,
+            } => {
                 let out = exec::create_schema(
                     &mut self.storage,
                     &mut self.wal,
@@ -2286,15 +2599,26 @@ impl Engine {
                         Ok(r) => r,
                         Err(e) => return Ok(Err(e)),
                     };
-                    if let Err(e) = self
-                        .execute_stmt(requalified, arena, params, txn, sqlprep, cursors, guc, responder)?
-                    {
+                    if let Err(e) = self.execute_stmt(
+                        requalified,
+                        arena,
+                        params,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )? {
                         return Ok(Err(e));
                     }
                 }
                 Ok(Ok(()))
             }
-            Stmt::DropSchema { names, if_exists, cascade } => exec::drop_schema(
+            Stmt::DropSchema {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_schema(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -2311,16 +2635,13 @@ impl Engine {
                 name,
                 role,
                 if_exists,
-            } => exec::alter_owner(
-                &self.storage,
-                txn,
-                *kind,
+            } => exec::alter_owner(&self.storage, txn, *kind, name, role, *if_exists, responder),
+            Stmt::DeclareCursor {
                 name,
-                role,
-                *if_exists,
-                responder,
-            ),
-            Stmt::DeclareCursor { name, scroll, hold, sql } => {
+                scroll,
+                hold,
+                sql,
+            } => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
                         crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -2360,7 +2681,12 @@ impl Engine {
                     match &parsed {
                         Stmt::Select(sel) => {
                             let sel = match query::expand_ctes_exec(
-                                sel, &self.storage, txn.txid, &self.work, params, &[],
+                                sel,
+                                &self.storage,
+                                txn.txid,
+                                &self.work,
+                                params,
+                                &[],
                             ) {
                                 Ok(x) => x,
                                 Err(e) => {
@@ -2374,18 +2700,33 @@ impl Engine {
                             }
                             if sel.from.is_none() {
                                 query::constant_select(
-                                    &self.storage, txn.txid, sel, &self.work, params,
-                                    None, &mut capture,
+                                    &self.storage,
+                                    txn.txid,
+                                    sel,
+                                    &self.work,
+                                    params,
+                                    None,
+                                    &mut capture,
                                 )
                             } else {
                                 query::select_query(
-                                    &self.storage, txn.txid, sel, &self.work, params,
-                                    None, &mut capture,
+                                    &self.storage,
+                                    txn.txid,
+                                    sel,
+                                    &self.work,
+                                    params,
+                                    None,
+                                    &mut capture,
                                 )
                             }
                         }
                         Stmt::SetQuery(q) => query::set_query(
-                            &self.storage, txn.txid, q, &self.work, params, &mut capture,
+                            &self.storage,
+                            txn.txid,
+                            q,
+                            &self.work,
+                            params,
+                            &mut capture,
                         ),
                         _ => {
                             cursors.abandon(at);
@@ -2417,14 +2758,17 @@ impl Engine {
                 responder.command_complete("DECLARE CURSOR")?;
                 Ok(Ok(()))
             }
-            Stmt::FetchCursor { name, motion, move_only } => {
+            Stmt::FetchCursor {
+                name,
+                motion,
+                move_only,
+            } => {
                 let count = match cursors.fetch(name, *motion) {
                     Ok(c) => c,
                     Err(e) => return Ok(Err(e)),
                 };
                 if !*move_only {
-                    let (description, rows) =
-                        cursors.wire_parts(name).expect("fetch found it");
+                    let (description, rows) = cursors.wire_parts(name).expect("fetch found it");
                     responder.raw(description)?;
                     for &(offset, len) in cursors.emitted() {
                         let (offset, len) = (offset as usize, len as usize);
@@ -2453,15 +2797,16 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::Begin(characteristics) => {
-                if let Some(characteristic) =
-                    unsupported_transaction_characteristic(characteristics)
-                {
-                    return Ok(Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "transaction characteristic \"{}\" is not supported",
-                        characteristic
-                    )));
-                }
+                let characteristics = match transaction_characteristics(characteristics) {
+                    Ok(characteristics) => characteristics,
+                    Err(characteristic) => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "transaction characteristic \"{}\" is not supported",
+                            characteristic
+                        )));
+                    }
+                };
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
                     responder.warning(
@@ -2470,6 +2815,11 @@ impl Engine {
                     )?;
                 }
                 self.ensure_txn(txn, TxnMode::Explicit, guc);
+                txn.set_characteristics(
+                    characteristics.isolation.unwrap_or(txn.isolation),
+                    characteristics.read_only.unwrap_or(txn.read_only),
+                    characteristics.deferrable.unwrap_or(txn.deferrable),
+                );
                 responder.command_complete("BEGIN")?;
                 Ok(Ok(()))
             }
@@ -2506,6 +2856,28 @@ impl Engine {
                 // transaction to it.
                 datetime::begin_statement();
                 self.ensure_txn(txn, TxnMode::Implicit, guc);
+                Ok(Ok(()))
+            }
+            Stmt::LockTable { tables, nowait: _ } => {
+                if !txn.is_explicit() {
+                    return Ok(Err(sql_err!(
+                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                        "LOCK TABLE can only be used in transaction blocks"
+                    )));
+                }
+                let mut slots = [usize::MAX; 32];
+                for (index, table) in tables.iter().enumerate() {
+                    slots[index] = match exec::resolve_dml_table(&self.storage, table, txn.txid) {
+                        Ok(slot) => slot,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                }
+                for &slot in &slots[..tables.len()] {
+                    if let Err(error) = self.storage.lock_table_access_share(txn.txid, slot) {
+                        return Ok(Err(error));
+                    }
+                }
+                responder.command_complete("LOCK TABLE")?;
                 Ok(Ok(()))
             }
             Stmt::Savepoint(name) => {
@@ -2594,15 +2966,35 @@ impl Engine {
                 }
             }
             Stmt::SetTransaction(characteristics) => {
-                if let Some(characteristic) =
-                    unsupported_transaction_characteristic(characteristics)
-                {
+                let characteristics = match transaction_characteristics(characteristics) {
+                    Ok(characteristics) => characteristics,
+                    Err(characteristic) => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "transaction characteristic \"{}\" is not supported",
+                            characteristic
+                        )));
+                    }
+                };
+                if !txn.is_explicit() {
+                    responder.warning(
+                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                        "SET TRANSACTION can only be used in transaction blocks",
+                    )?;
+                    responder.command_complete("SET")?;
+                    return Ok(Ok(()));
+                }
+                if characteristics.isolation.is_some() && txn.snapshot_taken() {
                     return Ok(Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "transaction characteristic \"{}\" is not supported",
-                        characteristic
+                        sqlstate::ACTIVE_SQL_TRANSACTION,
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query"
                     )));
                 }
+                txn.set_characteristics(
+                    characteristics.isolation.unwrap_or(txn.isolation),
+                    characteristics.read_only.unwrap_or(txn.read_only),
+                    characteristics.deferrable.unwrap_or(txn.deferrable),
+                );
                 responder.command_complete("SET")?;
                 Ok(Ok(()))
             }
@@ -2614,7 +3006,13 @@ impl Engine {
                     let seq = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                     return Ok(
                         match exec::copy_out_query(
-                            &self.storage, txn.txid, sql, &c.options, Some(&seq), arena, params,
+                            &self.storage,
+                            txn.txid,
+                            sql,
+                            &c.options,
+                            Some(&seq),
+                            arena,
+                            params,
                             responder,
                         ) {
                             Ok(count) => {
@@ -2634,8 +3032,9 @@ impl Engine {
                 if c.to {
                     match exec::copy_out(&self.storage, txn.txid, &setup, arena, responder) {
                         Ok(count) => {
-                            responder
-                                .command_complete(crate::stack_format!(32, "COPY {count}").as_str())?;
+                            responder.command_complete(
+                                crate::stack_format!(32, "COPY {count}").as_str(),
+                            )?;
                             Ok(Ok(()))
                         }
                         Err(e) => Ok(Err(e)),
@@ -2664,7 +3063,13 @@ impl Engine {
             // the whole store, which subsumes any named table. Without object
             // storage there is nothing to compact to, and — as VACUUM on a
             // table with nothing to reclaim does in PostgreSQL — it succeeds.
-            Stmt::Vacuum => {
+            Stmt::Vacuum {
+                targets,
+                analyze: _,
+            } => {
+                if let Err(error) = self.analyze_targets(targets, txn.txid) {
+                    return Ok(Err(error));
+                }
                 if self.ckpt.is_some()
                     && let Err(e) = self.checkpoint()
                 {
@@ -2673,11 +3078,15 @@ impl Engine {
                 responder.command_complete("VACUUM")?;
                 Ok(Ok(()))
             }
-            // ANALYZE collects planner statistics. This planner reads live
-            // table state rather than a stored statistics catalog, so there is
-            // nothing to compute and nothing a client can observe — the command
-            // succeeds with its tag.
-            Stmt::Analyze => {
+            // Cardinalities are exact live state rather than sampled,
+            // periodically stale statistics. ANALYZE still resolves every
+            // requested relation/column and walks its visible row state, so it
+            // detects inaccessible/corrupt backing data instead of silently
+            // accepting and ignoring the command.
+            Stmt::Analyze(targets) => {
+                if let Err(error) = self.analyze_targets(targets, txn.txid) {
+                    return Ok(Err(error));
+                }
                 responder.command_complete("ANALYZE")?;
                 Ok(Ok(()))
             }
@@ -2728,19 +3137,21 @@ impl Engine {
                 responder.command_complete("NOTIFY")?;
                 Ok(Ok(()))
             }
-            Stmt::AlterTable(a) => {
-                exec::alter_table(
-                    &mut self.storage,
-                    &mut self.wal,
-                    txn,
-                    &mut self.scratch,
-                    a,
-                    arena,
-                    guc.seq_session(),
-                    responder,
-                )
-            }
-            Stmt::Prepare { name, sql, param_types } => {
+            Stmt::AlterTable(a) => exec::alter_table(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                &mut self.scratch,
+                a,
+                arena,
+                guc.seq_session(),
+                responder,
+            ),
+            Stmt::Prepare {
+                name,
+                sql,
+                param_types,
+            } => {
                 // Resolve declared parameter types up front; an unknown type is
                 // an error, never quietly ignored.
                 let mut types = [ColType::Bool; parser::MAX_LIST];
@@ -2751,7 +3162,7 @@ impl Engine {
                             return Ok(Err(SqlError {
                                 sqlstate: sqlstate::UNDEFINED_OBJECT,
                                 message: stack_format!(192, "type \"{}\" does not exist", tn),
-                            }))
+                            }));
                         }
                     }
                 }
@@ -2792,7 +3203,7 @@ impl Engine {
                         return Ok(Err(SqlError {
                             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             message: stack_format!(192, "statement too large for SQL arena"),
-                        }))
+                        }));
                     }
                 };
                 // If the statement declared parameter types, the argument count
@@ -2832,7 +3243,7 @@ impl Engine {
                         return Ok(Err(SqlError {
                             sqlstate: sqlstate::SYNTAX_ERROR,
                             message: stack_format!(192, "{}", e.message.as_str()),
-                        }))
+                        }));
                     }
                 };
                 match inner.next_stmt() {
@@ -2889,14 +3300,10 @@ impl Engine {
         } else if let Some(value) = owned.as_ref() {
             value.as_str()
         } else {
-                return Ok(Err(SqlError {
-                    sqlstate: sqlstate::UNDEFINED_OBJECT,
-                    message: stack_format!(
-                        192,
-                        "unrecognized configuration parameter \"{}\"",
-                        name
-                    ),
-                }));
+            return Ok(Err(SqlError {
+                sqlstate: sqlstate::UNDEFINED_OBJECT,
+                message: stack_format!(192, "unrecognized configuration parameter \"{}\"", name),
+            }));
         };
         // The column titles as PostgreSQL canonicalizes them: most parameters
         // are lowercase, but a few keep their registered mixed case.
@@ -2932,11 +3339,7 @@ impl Engine {
             if let Some(value) =
                 fixed_setting(name).or_else(|| owned.as_ref().map(|value| value.as_str()))
             {
-                responder.data_row(&[
-                    Datum::Text(name),
-                    Datum::Text(value),
-                    Datum::Text(""),
-                ])?;
+                responder.data_row(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])?;
             }
         }
         responder.command_complete("SHOW")?;
@@ -3017,7 +3420,10 @@ fn requalify_schema_element<'a>(
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let requalify = |name: ast::QualName<'a>| -> Result<ast::QualName<'a>, SqlError> {
         match name.schema {
-            None => Ok(ast::QualName { schema: Some(schema), name: name.name }),
+            None => Ok(ast::QualName {
+                schema: Some(schema),
+                name: name.name,
+            }),
             Some(s) if s == schema => Ok(name),
             Some(s) => Err(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_SCHEMA_DEFINITION,
@@ -3028,15 +3434,25 @@ fn requalify_schema_element<'a>(
         }
     };
     let rewritten = match element {
-        Stmt::CreateTable(c) => {
-            Stmt::CreateTable(ast::CreateTable { name: requalify(c.name)?, ..*c })
-        }
-        Stmt::CreateView { name, or_replace, sql } => Stmt::CreateView {
+        Stmt::CreateTable(c) => Stmt::CreateTable(ast::CreateTable {
+            name: requalify(c.name)?,
+            ..*c
+        }),
+        Stmt::CreateView {
+            name,
+            or_replace,
+            sql,
+        } => Stmt::CreateView {
             name: requalify(*name)?,
             or_replace: *or_replace,
             sql,
         },
-        Stmt::CreateIndex { name, table, columns, unique } => Stmt::CreateIndex {
+        Stmt::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        } => Stmt::CreateIndex {
             name,
             table: requalify(*table)?,
             columns,
@@ -3065,11 +3481,20 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // journal names only public, which always exists.
             storage.create_table(def)?;
         }
-        WalOp::SequenceSet { schema, table, column, last } => {
+        WalOp::SequenceSet {
+            schema,
+            table,
+            column,
+            last,
+        } => {
             let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
-                    message: stack_format!(192, "journal sets a sequence of unknown table \"{}\"", table),
+                    message: stack_format!(
+                        192,
+                        "journal sets a sequence of unknown table \"{}\"",
+                        table
+                    ),
                 });
             };
             let t = storage.table_mut(index);
@@ -3088,7 +3513,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.drop_indexes_for(schema, name, 0);
             storage.commit_indexes_for(schema, name, 0);
         }
-        WalOp::Upsert { schema, table, rowid, row } => {
+        WalOp::Upsert {
+            schema,
+            table,
+            rowid,
+            row,
+        } => {
             let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
@@ -3101,16 +3531,17 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage
                 .table_mut(index)
                 .rows
-                .insert(
-                    rowid,
-                    crate::storage::RowState::committed_only_at(loc, lsn),
-                )
+                .insert(rowid, crate::storage::RowState::committed_only_at(loc, lsn))
                 .map_err(|e| SqlError {
                     sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     message: stack_format!(192, "journal replay overflows {}", e.what),
                 })?;
         }
-        WalOp::Delete { schema, table, rowid } => {
+        WalOp::Delete {
+            schema,
+            table,
+            rowid,
+        } => {
             let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
@@ -3119,7 +3550,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             storage.remove_committed(index, rowid, lsn);
         }
-        WalOp::CreateView { schema, name, sql, path, dependencies } => {
+        WalOp::CreateView {
+            schema,
+            name,
+            sql,
+            path,
+            dependencies,
+        } => {
             // Replay reconstructs committed state: create then promote.
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             use core::fmt::Write;
@@ -3149,7 +3586,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_view_drop(slot);
             }
         }
-        WalOp::CreateMatview { schema, name, sql, path, dependencies, populated } => {
+        WalOp::CreateMatview {
+            schema,
+            name,
+            sql,
+            path,
+            dependencies,
+            populated,
+        } => {
             use core::fmt::Write;
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             let _ = write!(buffer, "{sql}");
@@ -3175,7 +3619,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_matview_drop(slot);
             }
         }
-        WalOp::SetMatviewPopulated { schema, name, populated } => {
+        WalOp::SetMatviewPopulated {
+            schema,
+            name,
+            populated,
+        } => {
             if let Some(slot) = storage.matview_slot(schema, name, 0) {
                 storage.set_matview_populated(slot, populated);
             }
@@ -3223,7 +3671,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_sequence_drop(slot);
             }
         }
-        WalOp::SequenceAdvance { schema, name, last, is_called } => {
+        WalOp::SequenceAdvance {
+            schema,
+            name,
+            last,
+            is_called,
+        } => {
             storage.apply_sequence_advance(schema, name, last, is_called);
         }
         WalOp::CreateDomain(def) => {
@@ -3253,7 +3706,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::CreateEnum(def) => {
             // An ALTER ... ADD VALUE replays as a redefinition: redefine in
             // place if the enum exists, else create it committed (txid 0).
-            let spec = crate::storage::EnumSpec { members: def.members, n_members: def.n_members };
+            let spec = crate::storage::EnumSpec {
+                members: def.members,
+                n_members: def.n_members,
+            };
             if let Some(slot) = storage.enum_slot(def.schema.as_str(), def.name.as_str(), 0) {
                 storage.alter_enum(slot, spec);
             } else {
@@ -3302,7 +3758,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 stored,
             )?;
         }
-        WalOp::CreateIndex { schema, name, table, columns, n_cols, unique } => {
+        WalOp::CreateIndex {
+            schema,
+            name,
+            table,
+            columns,
+            n_cols,
+            unique,
+        } => {
             let slot = storage.create_index(
                 crate::storage::IndexDef {
                     schema: crate::storage::SqlName::parse(schema)?,
@@ -3331,7 +3794,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.drop_schema(slot);
             }
         }
-        WalOp::SetTableSchema { schema, name, new_schema } => {
+        WalOp::SetTableSchema {
+            schema,
+            name,
+            new_schema,
+        } => {
             let Some(index) = storage.find_table(schema, name) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
@@ -3340,11 +3807,19 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             storage.move_table_schema(index, crate::storage::SqlName::parse(new_schema)?);
         }
-        WalOp::DropTableFk { schema, table, fk_name } => {
+        WalOp::DropTableFk {
+            schema,
+            table,
+            fk_name,
+        } => {
             let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
                     sqlstate: sqlstate::UNDEFINED_TABLE,
-                    message: stack_format!(192, "journal severs a key of unknown table \"{}\"", table),
+                    message: stack_format!(
+                        192,
+                        "journal severs a key of unknown table \"{}\"",
+                        table
+                    ),
                 });
             };
             let _ = storage.drop_fk(index, fk_name);

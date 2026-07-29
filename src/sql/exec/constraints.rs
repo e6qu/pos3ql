@@ -9,13 +9,13 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
-use crate::sql::eval::{compare_datums, eval, hash_key, sqlstate, ColumnLookup, SqlError};
+use crate::sql::eval::{ColumnLookup, SqlError, compare_datums, eval, hash_key, sqlstate};
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{rowenc, RowHome, Storage, TableDef, MAX_COLUMNS};
+use crate::storage::{MAX_COLUMNS, RowHome, Storage, TableDef, rowenc};
 
-use super::{check_not_null, RowCtx};
+use super::{RowCtx, check_not_null};
 
 /// A one-column lookup binding PostgreSQL's `VALUE` placeholder to a domain's
 /// candidate input, for evaluating that domain's CHECK predicates.
@@ -28,7 +28,11 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
         if name.eq_ignore_ascii_case("value") {
             Ok(self.value)
         } else {
-            Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name))
+            Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            ))
         }
     }
 }
@@ -201,7 +205,9 @@ fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> bool {
     columns.iter().all(|&c| {
         let i = c as usize;
         !other[i].is_null()
-            && compare_datums(&values[i], &other[i]).map(|o| o.is_eq()).unwrap_or(false)
+            && compare_datums(&values[i], &other[i])
+                .map(|o| o.is_eq())
+                .unwrap_or(false)
     })
 }
 
@@ -267,9 +273,28 @@ fn enforce_key_uniqueness(
     });
     result?;
     if !served {
-        committed_scan_uniqueness(storage, table_index, schema, columns, values, self_rowid, def, name)?;
+        committed_scan_uniqueness(
+            storage,
+            table_index,
+            schema,
+            columns,
+            values,
+            self_rowid,
+            def,
+            name,
+        )?;
     }
-    pending_scan_uniqueness(storage, table_index, schema, columns, values, self_rowid, txid, def, name)
+    pending_scan_uniqueness(
+        storage,
+        table_index,
+        schema,
+        columns,
+        values,
+        self_rowid,
+        txid,
+        def,
+        name,
+    )
 }
 
 /// The committed-image fallback when a table has no value index for `columns`
@@ -468,10 +493,16 @@ fn check_unique_keys(
 pub(crate) type ParsedChecks<'a> = [Option<&'a Expr<'a>>; crate::storage::MAX_CHECKS];
 
 /// Re-parses every stored CHECK predicate once per statement into the arena.
-pub(crate) fn parse_checks<'a>(def: &'a TableDef, arena: &'a Arena) -> Result<ParsedChecks<'a>, SqlError> {
+pub(crate) fn parse_checks<'a>(
+    def: &'a TableDef,
+    arena: &'a Arena,
+) -> Result<ParsedChecks<'a>, SqlError> {
     let mut out: ParsedChecks<'a> = [None; crate::storage::MAX_CHECKS];
     for (i, c) in def.checks().iter().enumerate() {
-        out[i] = Some(crate::sql::parser::parse_expr(c.expression.as_str(), arena)?);
+        out[i] = Some(crate::sql::parser::parse_expr(
+            c.expression.as_str(),
+            arena,
+        )?);
     }
     Ok(out)
 }
@@ -574,8 +605,13 @@ fn check_row_checks(
 ) -> Result<(), SqlError> {
     let context = RowCtx { def, values };
     for (i, c) in def.checks().iter().enumerate() {
-        let Some(expression) = checks[i] else { continue };
-        if matches!(eval(expression, arena, params, &context)?, Datum::Bool(false)) {
+        let Some(expression) = checks[i] else {
+            continue;
+        };
+        if matches!(
+            eval(expression, arena, params, &context)?,
+            Datum::Bool(false)
+        ) {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::CHECK_VIOLATION,
                 "new row for relation \"{}\" violates check constraint \"{}\"",
@@ -600,7 +636,8 @@ fn check_fk_child(
         if fk.columns().iter().any(|&c| values[c as usize].is_null()) {
             continue;
         }
-        let Some(pi) = storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid) else {
+        let Some(pi) = storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
+        else {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::FOREIGN_KEY_VIOLATION,
                 "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
@@ -646,7 +683,9 @@ fn parent_has_key(
     let mut found = false;
     storage.for_each_row_state(parent_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
+        let Some(home) =
+            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+        else {
             return Ok(ControlFlow::Continue(()));
         };
         let all_eq = storage.with_row_bytes(parent_index, rowid, home, |bytes| {
@@ -655,8 +694,7 @@ fn parent_has_key(
             Ok(parent_cols.iter().zip(child_cols).all(|(&pc, &cc)| {
                 let pv = &prow[pc as usize];
                 let cv = &child_values[cc as usize];
-                !pv.is_null()
-                    && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
+                !pv.is_null() && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
             }))
         })?;
         if all_eq {
@@ -709,9 +747,7 @@ pub(crate) fn apply_fk_parent_actions(
         let cschema = &cschema[..cdef.n_columns];
         for fk_index in 0..cdef.n_fkeys {
             let fk = cdef.fkeys[fk_index];
-            if fk.parent_schema.as_str() != parent_schema
-                || fk.parent.as_str() != parent_name
-            {
+            if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
                 continue;
             }
             // An update triggers this key's action only when the key changed.
@@ -721,16 +757,18 @@ pub(crate) fn apply_fk_parent_actions(
                     match (a.is_null(), b.is_null()) {
                         (true, true) => false,
                         (true, false) | (false, true) => true,
-                        (false, false) => {
-                            !compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false)
-                        }
+                        (false, false) => !compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false),
                     }
                 });
                 if !changed {
                     continue;
                 }
             }
-            let action = if new_parent.is_none() { fk.on_delete } else { fk.on_update };
+            let action = if new_parent.is_none() {
+                fk.on_delete
+            } else {
+                fk.on_update
+            };
 
             // Collect the referencing rows first: the rewrites below mutate
             // the row map, so the scan must complete before them.
@@ -738,14 +776,17 @@ pub(crate) fn apply_fk_parent_actions(
                 !fk.columns().iter().any(|&c| crow[c as usize].is_null())
                     && fk.columns().iter().zip(fk.parent_cols()).all(|(&cc, &pc)| {
                         let (cv, pv) = (&crow[cc as usize], &old_parent[pc as usize]);
-                        !pv.is_null()
-                            && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
+                        !pv.is_null() && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
                     })
             };
             let mut n_match = 0usize;
             storage.for_each_row_state(child_index, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                let Some(home) = state.visible_at(txn.txid, storage.read_snapshot()) else {
+                let Some(home) = state.visible_at_lsn(
+                    txn.txid,
+                    storage.read_snapshot(),
+                    storage.commit_snapshot(),
+                ) else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 let is_match = storage.with_row_bytes(child_index, rowid, home, |bytes| {
@@ -762,11 +803,17 @@ pub(crate) fn apply_fk_parent_actions(
                 continue;
             }
             use crate::storage::FkAction as StorageFkAction;
-            if matches!(action, StorageFkAction::NoAction | StorageFkAction::Restrict) {
+            if matches!(
+                action,
+                StorageFkAction::NoAction | StorageFkAction::Restrict
+            ) {
                 // NO ACTION raises 23503; RESTRICT the distinct 23001, as
                 // PostgreSQL (same message, different SQLSTATE).
-                let code =
-                    if action == StorageFkAction::Restrict { "23001" } else { "23503" };
+                let code = if action == StorageFkAction::Restrict {
+                    "23001"
+                } else {
+                    "23503"
+                };
                 return Err(sql_err!(
                     code,
                     "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
@@ -787,7 +834,11 @@ pub(crate) fn apply_fk_parent_actions(
                 let mut at = 0usize;
                 storage.for_each_row_state(child_index, &mut |rowid, state| {
                     use core::ops::ControlFlow;
-                    let Some(home) = state.visible_at(txn.txid, storage.read_snapshot()) else {
+                    let Some(home) = state.visible_at_lsn(
+                        txn.txid,
+                        storage.read_snapshot(),
+                        storage.commit_snapshot(),
+                    ) else {
                         return Ok(ControlFlow::Continue(()));
                     };
                     // The cascade mutates storage below, so a matching row is
@@ -818,10 +869,23 @@ pub(crate) fn apply_fk_parent_actions(
                 if new_parent.is_none() && action == StorageFkAction::Cascade {
                     // Cascade the delete: grandchildren first, then this row.
                     apply_fk_parent_actions(
-                        storage, txn, child_schema, child_name, crow, None, arena, params,
+                        storage,
+                        txn,
+                        child_schema,
+                        child_name,
+                        crow,
+                        None,
+                        arena,
+                        params,
                         depth - 1,
                     )?;
-                    let prior = storage.write_pending(child_index, rowid, txn.txid, txn.command_id(), None)?;
+                    let prior = storage.write_pending(
+                        child_index,
+                        rowid,
+                        txn.txid,
+                        txn.command_id(),
+                        None,
+                    )?;
                     if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
                         storage.restore_pending(child_index, rowid, txn.txid, prior);
                         return Err(e);
@@ -884,7 +948,13 @@ pub(crate) fn apply_fk_parent_actions(
                 rowenc::encode(new_child, out);
                 let (new_loc, slice) = storage.heap.append(out.len())?;
                 slice.copy_from_slice(out);
-                let prior = storage.write_pending(child_index, rowid, txn.txid, txn.command_id(), Some(new_loc))?;
+                let prior = storage.write_pending(
+                    child_index,
+                    rowid,
+                    txn.txid,
+                    txn.command_id(),
+                    Some(new_loc),
+                )?;
                 if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
                     storage.restore_pending(child_index, rowid, txn.txid, prior);
                     return Err(e);
@@ -896,12 +966,7 @@ pub(crate) fn apply_fk_parent_actions(
 }
 
 /// Whether any visible table has a foreign key referencing `name`.
-pub(crate) fn table_is_referenced(
-    storage: &Storage,
-    schema: &str,
-    name: &str,
-    txid: u32,
-) -> bool {
+pub(crate) fn table_is_referenced(storage: &Storage, schema: &str, name: &str, txid: u32) -> bool {
     for column_index in 0..storage.table_count() {
         if !storage.table(column_index).visible_to(txid) {
             continue;
@@ -934,9 +999,7 @@ pub(crate) fn referenced_key_changed(
         }
         let cdef = *storage.table_def(column_index, txid);
         for fk in cdef.fkeys() {
-            if fk.parent_schema.as_str() != parent_schema
-                || fk.parent.as_str() != parent_name
-            {
+            if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
                 continue;
             }
             for &pc in fk.parent_cols() {

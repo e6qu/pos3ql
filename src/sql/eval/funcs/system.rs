@@ -16,7 +16,7 @@ use crate::sql::types::{ArrElem, ColType, Datum, TypeMod};
 use crate::sql_err;
 use crate::stack_format;
 
-use super::super::{arena_full, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
+use super::super::{ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate};
 
 std::thread_local! {
     /// The session's startup user, published per statement (like the session
@@ -90,7 +90,10 @@ pub fn set_session_settings(
     values: &[crate::util::StackStr<256>],
 ) -> Result<(), SqlError> {
     if names.len() != values.len() {
-        return Err(sql_err!(sqlstate::INTERNAL_ERROR, "session setting snapshot is misaligned"));
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "session setting snapshot is misaligned"
+        ));
     }
     if names.len() > MAX_SESSION_SETTINGS {
         return Err(sql_err!(
@@ -262,11 +265,14 @@ pub(crate) fn dispatch<'a>(
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "current_setting() requires a text setting name"
-                        ))
+                        ));
                     }
                 };
                 let missing_ok = args.len() == 2
-                    && matches!(eval_full(args[1], arena, params, row, hooks)?, Datum::Bool(true));
+                    && matches!(
+                        eval_full(args[1], arena, params, row, hooks)?,
+                        Datum::Bool(true)
+                    );
                 match session_setting(name_value) {
                     Some(v) => Ok(Datum::Text(
                         arena.alloc_str(v.as_str()).map_err(|_| arena_full())?,
@@ -293,13 +299,13 @@ pub(crate) fn dispatch<'a>(
                         return Err(sql_err!(
                             sqlstate::NULL_VALUE_NOT_ALLOWED,
                             "SET requires parameter name"
-                        ))
+                        ));
                     }
                     _ => {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "set_config() requires a text setting name"
-                        ))
+                        ));
                     }
                 };
                 let value = match eval_full(args[1], arena, params, row, hooks)? {
@@ -309,7 +315,7 @@ pub(crate) fn dispatch<'a>(
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "set_config() requires a text setting value"
-                        ))
+                        ));
                     }
                 };
                 let local = match eval_full(args[2], arena, params, row, hooks)? {
@@ -319,13 +325,15 @@ pub(crate) fn dispatch<'a>(
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "set_config() requires a boolean is_local argument"
-                        ))
+                        ));
                     }
                 };
                 let configured = crate::sql::guc::set_active_config(name, value, local)?;
                 update_session_setting(name, configured);
                 Ok(Datum::Text(
-                    arena.alloc_str(configured.as_str()).map_err(|_| arena_full())?,
+                    arena
+                        .alloc_str(configured.as_str())
+                        .map_err(|_| arena_full())?,
                 ))
             }
             "current_schema" => {
@@ -335,7 +343,9 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 }
                 Ok(Datum::Text(
-                    arena.alloc_str(schemas.names[0].as_str()).map_err(|_| arena_full())?,
+                    arena
+                        .alloc_str(schemas.names[0].as_str())
+                        .map_err(|_| arena_full())?,
                 ))
             }
             // `current_schemas(bool)` returns the search-path schemas as a text[];
@@ -343,8 +353,10 @@ pub(crate) fn dispatch<'a>(
             // position.
             "current_schemas" => {
                 arity(1)?;
-                let include_implicit =
-                    matches!(eval_full(args[0], arena, params, row, hooks)?, Datum::Bool(true));
+                let include_implicit = matches!(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    Datum::Bool(true)
+                );
                 let schemas = session_schemas();
                 let mut elems = [Datum::Null; 18];
                 let mut n = 0;
@@ -385,12 +397,15 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 eval_full(args[0], arena, params, row, hooks)
             }
-            "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible"
+            "pg_table_is_visible"
+            | "pg_type_is_visible"
+            | "pg_function_is_visible"
             | "pg_collation_is_visible"
-            | "has_table_privilege" | "has_column_privilege" | "has_schema_privilege"
-            | "has_database_privilege" | "pg_relation_is_publishable" => {
-                Ok(Datum::Bool(true))
-            }
+            | "has_table_privilege"
+            | "has_column_privilege"
+            | "has_schema_privilege"
+            | "has_database_privilege"
+            | "pg_relation_is_publishable" => Ok(Datum::Bool(true)),
             "pg_get_indexdef" => {
                 // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole
                 // `btree (columns)` definition; `(oid, n, _)` with n>0 returns the name
@@ -412,7 +427,10 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     0
                 };
-                Ok(cat.index_def(oid, col, arena)?.map(Datum::Text).unwrap_or(Datum::Null))
+                Ok(cat
+                    .index_def(oid, col, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             "pg_get_constraintdef" => {
                 // psql `\d` calls this with a constraint OID; reconstruct a
@@ -425,7 +443,10 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(v) => v as i32,
                     _ => return Ok(Datum::Null),
                 };
-                Ok(cat.constraint_def(oid, arena)?.map(Datum::Text).unwrap_or(Datum::Null))
+                Ok(cat
+                    .constraint_def(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             "obj_description" => {
                 // obj_description(objoid [, catalog]): the object's comment.
@@ -555,8 +576,7 @@ pub(crate) fn dispatch<'a>(
                     _ => Ok(Datum::Null),
                 }
             }
-            "pg_get_functiondef"
-            | "shobj_description" | "pg_get_statisticsobjdef_columns" => {
+            "pg_get_functiondef" | "shobj_description" | "pg_get_statisticsobjdef_columns" => {
                 // Definitions/comments we do not reconstruct render as empty/NULL,
                 // as PostgreSQL does for an absent comment.
                 Ok(Datum::Null)
@@ -606,16 +626,20 @@ pub(crate) fn dispatch<'a>(
                             None => stack_format!(64, "{}({})", name, p),
                         }
                     }
-                    TypeMod::IntervalMod { precision: Some(p), .. } => {
+                    TypeMod::IntervalMod {
+                        precision: Some(p), ..
+                    } => {
                         stack_format!(64, "interval({})", p)
                     }
                     // A range form with no precision renders bare; naming the
                     // field range (`interval hour to minute`) is not built yet.
-                    TypeMod::IntervalMod { precision: None, .. } => {
-                        return Ok(Datum::Text(name))
-                    }
+                    TypeMod::IntervalMod {
+                        precision: None, ..
+                    } => return Ok(Datum::Text(name)),
                 };
-                Ok(Datum::Text(arena.alloc_str(text.as_str()).map_err(|_| arena_full())?))
+                Ok(Datum::Text(
+                    arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
+                ))
             }
             "pg_encoding_to_char" => {
                 arity(1)?;
@@ -709,6 +733,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Json { jsonb: false, .. } => "json",
                     Datum::Json { jsonb: true, .. } => "jsonb",
                     Datum::Array { element, .. } => element.typeof_name(),
+                    Datum::Int2Vector(_) => "int2vector",
                     Datum::Uuid(_) => "uuid",
                     Datum::Bytea(_) => "bytea",
                     Datum::Numeric(_) => "numeric",

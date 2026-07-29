@@ -6,13 +6,8 @@
 
 use super::*;
 
-
 fn test_config(name: &str) -> Config {
-    let dir = std::env::temp_dir().join(format!(
-        "pos3ql-engine-{}-{}",
-        std::process::id(),
-        name
-    ));
+    let dir = std::env::temp_dir().join(format!("pos3ql-engine-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_dir_all(&dir);
     let mut config = Config::default_dev();
     config.data_dir = dir.to_str().unwrap().to_string();
@@ -48,7 +43,16 @@ fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8>
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, 1)
+        .execute_simple(
+            sql_text,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut test_cursors(budget),
+            &mut guc,
+            &mut responder,
+            1,
+        )
         .unwrap();
     buffer.readable().to_vec()
 }
@@ -63,7 +67,16 @@ fn run_as(engine: &mut Engine, budget: &mut Budget, conn_id: i32, sql_text: &str
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, conn_id)
+        .execute_simple(
+            sql_text,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut test_cursors(budget),
+            &mut guc,
+            &mut responder,
+            conn_id,
+        )
         .unwrap();
     buffer.readable().to_vec()
 }
@@ -109,15 +122,12 @@ fn data_rows(bytes: &[u8]) -> Vec<String> {
                 if c > 0 {
                     row.push('|');
                 }
-                let vlen =
-                    i32::from_be_bytes(payload[at..at + 4].try_into().unwrap());
+                let vlen = i32::from_be_bytes(payload[at..at + 4].try_into().unwrap());
                 at += 4;
                 if vlen < 0 {
                     row.push_str("NULL");
                 } else {
-                    row.push_str(
-                        core::str::from_utf8(&payload[at..at + vlen as usize]).unwrap(),
-                    );
+                    row.push_str(core::str::from_utf8(&payload[at..at + vlen as usize]).unwrap());
                     at += vlen as usize;
                 }
             }
@@ -131,7 +141,11 @@ fn data_rows(bytes: &[u8]) -> Vec<String> {
 #[test]
 fn create_insert_select_roundtrip() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TABLE t (id int NOT NULL, name text, score float8)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE t (id int NOT NULL, name text, score float8)",
+    );
     let bytes = run_with(
         &mut e,
         &mut b,
@@ -155,7 +169,11 @@ fn create_insert_select_roundtrip() {
 fn update_and_delete() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int, v text)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')",
+    );
     let bytes = run_with(&mut e, &mut b, "UPDATE t SET v = v || '!' WHERE id > 1");
     let types = message_types(&bytes);
     assert_eq!(types, [b'C']);
@@ -225,11 +243,7 @@ fn large_sort_materializes_in_shared_work_arena() {
         );
     }
     // Materialize all 900 wide rows to sort, emit only the top 3.
-    let bytes = run_with(
-        &mut e,
-        &mut b,
-        "SELECT id, pad FROM t ORDER BY id LIMIT 3",
-    );
+    let bytes = run_with(&mut e, &mut b, "SELECT id, pad FROM t ORDER BY id LIMIT 3");
     assert!(
         !message_types(&bytes).contains(&b'E'),
         "large sort errored: {}",
@@ -265,19 +279,23 @@ fn select_one_still_works() {
 
 /// Like run_with but with a caller-owned TxnState, so explicit
 /// transactions span calls (one call ≈ one wire message).
-fn run_txn(
-    engine: &mut Engine,
-    budget: &mut Budget,
-    txn: &mut TxnState,
-    sql_text: &str,
-) -> String {
+fn run_txn(engine: &mut Engine, budget: &mut Budget, txn: &mut TxnState, sql_text: &str) -> String {
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
     let mut pool = test_pool(budget);
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, 1)
+        .execute_simple(
+            sql_text,
+            &arena,
+            txn,
+            &mut pool,
+            &mut test_cursors(budget),
+            &mut guc,
+            &mut responder,
+            1,
+        )
         .unwrap();
     String::from_utf8_lossy(buffer.readable()).to_string()
 }
@@ -291,7 +309,12 @@ fn explicit_rollback_discards_writes() {
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
     assert_eq!(t.status_byte(), b'T');
     run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES (2,'discard')");
-    run_txn(&mut e, &mut b, &mut t, "UPDATE t SET v = 'changed' WHERE id = 1");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t SET v = 'changed' WHERE id = 1",
+    );
     run_txn(&mut e, &mut b, &mut t, "DELETE FROM t WHERE id = 1");
     // Inside the txn, the changes are visible to itself.
     let out = run_txn(&mut e, &mut b, &mut t, "SELECT count(*) FROM t");
@@ -299,7 +322,10 @@ fn explicit_rollback_discards_writes() {
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
     assert_eq!(t.status_byte(), b'I');
     let out = run_txn(&mut e, &mut b, &mut t, "SELECT id, v FROM t ORDER BY id");
-    assert!(out.contains("keep") && !out.contains("discard") && !out.contains("changed"), "{out}");
+    assert!(
+        out.contains("keep") && !out.contains("discard") && !out.contains("changed"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -312,13 +338,22 @@ fn uncommitted_create_is_invisible_to_other_sessions() {
     run_txn(&mut e, &mut b, &mut a, "INSERT INTO t VALUES (1)");
     // The creator sees its own uncommitted table.
     let own = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM t");
-    assert!(own.contains("SELECT 1"), "creator sees its own table: {own}");
+    assert!(
+        own.contains("SELECT 1"),
+        "creator sees its own table: {own}"
+    );
     // Another session does not.
     let other = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
-    assert!(other.contains("does not exist"), "other must not see it: {other}");
+    assert!(
+        other.contains("does not exist"),
+        "other must not see it: {other}"
+    );
     // Nor can it create the same name concurrently.
     let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE TABLE t (x int)");
-    assert!(conflict.contains("40001"), "concurrent create conflicts: {conflict}");
+    assert!(
+        conflict.contains("40001"),
+        "concurrent create conflicts: {conflict}"
+    );
     // After commit it becomes visible to everyone.
     run_txn(&mut e, &mut b, &mut a, "COMMIT");
     let now = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
@@ -338,10 +373,16 @@ fn uncommitted_drop_stays_visible_to_other_sessions() {
     // Another session still sees the committed table and its rows (the
     // drop is not visible until it commits).
     let other = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
-    assert!(other.contains("SELECT 1") && other.contains('7'), "other still sees it: {other}");
+    assert!(
+        other.contains("SELECT 1") && other.contains('7'),
+        "other still sees it: {other}"
+    );
     run_txn(&mut e, &mut b, &mut a, "COMMIT");
     let after = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
-    assert!(after.contains("does not exist"), "gone after commit: {after}");
+    assert!(
+        after.contains("does not exist"),
+        "gone after commit: {after}"
+    );
 }
 
 #[test]
@@ -508,7 +549,12 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
         &mut owner,
         "ALTER TABLE original ADD COLUMN first int DEFAULT 2",
     );
-    run_txn(&mut engine, &mut budget, &mut owner, "SAVEPOINT before_rename");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SAVEPOINT before_rename",
+    );
     run_txn(
         &mut engine,
         &mut budget,
@@ -631,7 +677,10 @@ fn dropper_does_not_see_its_own_dropped_table() {
     // Referencing the just-dropped table errors and, as in PostgreSQL,
     // aborts the transaction (so a later COMMIT rolls back).
     let own = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM t");
-    assert!(own.contains("does not exist"), "dropper does not see it: {own}");
+    assert!(
+        own.contains("does not exist"),
+        "dropper does not see it: {own}"
+    );
     assert_eq!(a.status_byte(), b'E', "the failed reference aborts the txn");
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
 }
@@ -647,17 +696,29 @@ fn uncommitted_create_view_is_invisible_to_other_sessions() {
     run_txn(&mut e, &mut b, &mut a, "CREATE VIEW v AS SELECT id FROM t");
     // The creator sees its own uncommitted view.
     let own = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM v");
-    assert!(own.contains("SELECT 1") && own.contains('3'), "creator sees its own view: {own}");
+    assert!(
+        own.contains("SELECT 1") && own.contains('3'),
+        "creator sees its own view: {own}"
+    );
     // Another session does not.
     let other = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
-    assert!(other.contains("does not exist"), "other must not see it: {other}");
+    assert!(
+        other.contains("does not exist"),
+        "other must not see it: {other}"
+    );
     // Nor can it create the same name concurrently.
     let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE VIEW v AS SELECT id FROM t");
-    assert!(conflict.contains("40001"), "concurrent create conflicts: {conflict}");
+    assert!(
+        conflict.contains("40001"),
+        "concurrent create conflicts: {conflict}"
+    );
     // After commit it becomes visible to everyone.
     run_txn(&mut e, &mut b, &mut a, "COMMIT");
     let now = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
-    assert!(now.contains("SELECT 1") && now.contains('3'), "visible after commit: {now}");
+    assert!(
+        now.contains("SELECT 1") && now.contains('3'),
+        "visible after commit: {now}"
+    );
 }
 
 #[test]
@@ -670,10 +731,16 @@ fn rolled_back_create_view_never_appears() {
     run_txn(&mut e, &mut b, &mut a, "CREATE VIEW v AS SELECT id FROM t");
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
     let gone = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
-    assert!(gone.contains("does not exist"), "rolled-back view never appears: {gone}");
+    assert!(
+        gone.contains("does not exist"),
+        "rolled-back view never appears: {gone}"
+    );
     // The name (and slot) is free again for anyone.
     let reuse = run_txn(&mut e, &mut b, &mut s, "CREATE VIEW v AS SELECT id FROM t");
-    assert!(reuse.contains("CREATE VIEW"), "slot freed after rollback: {reuse}");
+    assert!(
+        reuse.contains("CREATE VIEW"),
+        "slot freed after rollback: {reuse}"
+    );
 }
 
 #[test]
@@ -689,14 +756,23 @@ fn uncommitted_drop_view_stays_visible_to_other_sessions() {
     assert!(dropped.contains("DROP VIEW"), "drop succeeds: {dropped}");
     // The dropper no longer sees it; others still do until commit.
     let own = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM v");
-    assert!(own.contains("does not exist"), "dropper does not see it: {own}");
+    assert!(
+        own.contains("does not exist"),
+        "dropper does not see it: {own}"
+    );
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
     let other = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
-    assert!(other.contains("SELECT 1") && other.contains('9'), "still visible after rollback: {other}");
+    assert!(
+        other.contains("SELECT 1") && other.contains('9'),
+        "still visible after rollback: {other}"
+    );
     // Now commit an actual drop and it disappears for everyone.
     run_txn(&mut e, &mut b, &mut a, "DROP VIEW v");
     let after = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
-    assert!(after.contains("does not exist"), "gone after committed drop: {after}");
+    assert!(
+        after.contains("does not exist"),
+        "gone after committed drop: {after}"
+    );
 }
 
 #[test]
@@ -710,20 +786,32 @@ fn uncommitted_create_index_is_invisible_to_other_sessions() {
     run_txn(&mut e, &mut b, &mut a, "CREATE UNIQUE INDEX t_id ON t (id)");
     // The pending unique index binds its creator...
     let own = run_txn(&mut e, &mut b, &mut a, "INSERT INTO t VALUES (1)");
-    assert!(own.contains("23505"), "creator is bound by its own pending index: {own}");
+    assert!(
+        own.contains("23505"),
+        "creator is bound by its own pending index: {own}"
+    );
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
     // ...but another session must not be bound by an uncommitted index.
     run_txn(&mut e, &mut b, &mut a, "BEGIN");
     run_txn(&mut e, &mut b, &mut a, "CREATE UNIQUE INDEX t_id ON t (id)");
     let other = run_txn(&mut e, &mut b, &mut s, "INSERT INTO t VALUES (1)");
-    assert!(other.contains("INSERT 0 1"), "other unbound by pending index: {other}");
+    assert!(
+        other.contains("INSERT 0 1"),
+        "other unbound by pending index: {other}"
+    );
     // Concurrent creation of the same index name conflicts.
     let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
-    assert!(conflict.contains("40001"), "concurrent create conflicts: {conflict}");
+    assert!(
+        conflict.contains("40001"),
+        "concurrent create conflicts: {conflict}"
+    );
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
     // After rollback the name is free.
     let reuse = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
-    assert!(reuse.contains("CREATE INDEX"), "name freed after rollback: {reuse}");
+    assert!(
+        reuse.contains("CREATE INDEX"),
+        "name freed after rollback: {reuse}"
+    );
 }
 
 #[test]
@@ -735,10 +823,16 @@ fn rolled_back_create_never_appears_and_frees_the_slot() {
     run_txn(&mut e, &mut b, &mut a, "CREATE TABLE r (id int)");
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
     let gone = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM r");
-    assert!(gone.contains("does not exist"), "rolled-back create is gone: {gone}");
+    assert!(
+        gone.contains("does not exist"),
+        "rolled-back create is gone: {gone}"
+    );
     // The freed slot is reusable by a fresh create of the same name.
     let recreate = run_txn(&mut e, &mut b, &mut s, "CREATE TABLE r (x int)");
-    assert!(recreate.contains("CREATE TABLE"), "slot reusable: {recreate}");
+    assert!(
+        recreate.contains("CREATE TABLE"),
+        "slot reusable: {recreate}"
+    );
 }
 
 #[test]
@@ -751,7 +845,10 @@ fn rolled_back_drop_keeps_the_table() {
     run_txn(&mut e, &mut b, &mut a, "DROP TABLE t");
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
     let out = run_txn(&mut e, &mut b, &mut a, "SELECT id FROM t");
-    assert!(out.contains("SELECT 1") && out.contains('5'), "table survives rolled-back drop: {out}");
+    assert!(
+        out.contains("SELECT 1") && out.contains('5'),
+        "table survives rolled-back drop: {out}"
+    );
 }
 
 #[test]
@@ -760,7 +857,10 @@ fn client_min_messages_filters_by_severity() {
     let mut t = TxnState::new(&mut b, 256).unwrap();
     // Default (notice): a DROP IF EXISTS on a missing table emits a NOTICE.
     let out = run_txn(&mut e, &mut b, &mut t, "DROP TABLE IF EXISTS nope");
-    assert!(out.contains("NOTICE") && out.contains("does not exist"), "{out}");
+    assert!(
+        out.contains("NOTICE") && out.contains("does not exist"),
+        "{out}"
+    );
     // At `warning`, the NOTICE is suppressed but a WARNING survives.
     let out = run_txn(
         &mut e,
@@ -768,7 +868,10 @@ fn client_min_messages_filters_by_severity() {
         &mut t,
         "SET client_min_messages = warning; DROP TABLE IF EXISTS nope; ROLLBACK",
     );
-    assert!(!out.contains("does not exist"), "NOTICE must be filtered: {out}");
+    assert!(
+        !out.contains("does not exist"),
+        "NOTICE must be filtered: {out}"
+    );
     assert!(
         out.contains("WARNING") && out.contains("no transaction in progress"),
         "WARNING must survive: {out}"
@@ -812,23 +915,47 @@ fn session_gucs_honored_or_rejected_faithfully() {
     assert!(run("SET check_function_bodies = false; SHOW check_function_bodies").contains("off"));
     assert!(run("SET xmloption = content; SHOW xmloption").contains("content"));
     assert!(run("SET default_tablespace = ''; SHOW default_tablespace").contains("SHOW"));
-    assert!(run("SET default_table_access_method = heap; SHOW default_table_access_method").contains("heap"));
+    assert!(
+        run("SET default_table_access_method = heap; SHOW default_table_access_method")
+            .contains("heap")
+    );
     // Rejected loudly — never accepted-and-ignored.
-    assert!(run("SET extra_float_digits = 9").contains("22023"), "out of range");
+    assert!(
+        run("SET extra_float_digits = 9").contains("22023"),
+        "out of range"
+    );
     // statement_timeout is now accepted (enforced at scan boundaries); a
     // malformed value is still rejected loudly.
     assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5000"));
-    assert!(run("SET statement_timeout = 'bogus'").contains("22023"), "bad timeout");
+    assert!(
+        run("SET statement_timeout = 'bogus'").contains("22023"),
+        "bad timeout"
+    );
     // bytea_output escape is honored (verified against PostgreSQL 18.4);
     // an unknown format is rejected loudly. The GUC store is per-batch in
     // this harness, so SET and SELECT share one statement string.
     let escaped = run("SET bytea_output = 'escape'; SELECT '\\x5c00'::bytea");
     assert!(escaped.contains("\\\\000"), "escape rendering: {escaped}");
-    assert!(run("SET bytea_output = 'bogus'").contains("22023"), "unknown format");
-    assert!(run("SET intervalstyle = sql_standard").contains("0A000"), "unsupported style");
-    assert!(run("SET synchronize_seqscans = on").contains("0A000"), "unsupported scan mode");
-    assert!(run("SET xmloption = document").contains("0A000"), "unsupported XML mode");
-    assert!(run("SET default_tablespace = fast").contains("0A000"), "unsupported tablespace");
+    assert!(
+        run("SET bytea_output = 'bogus'").contains("22023"),
+        "unknown format"
+    );
+    assert!(
+        run("SET intervalstyle = sql_standard").contains("0A000"),
+        "unsupported style"
+    );
+    assert!(
+        run("SET synchronize_seqscans = on").contains("0A000"),
+        "unsupported scan mode"
+    );
+    assert!(
+        run("SET xmloption = document").contains("0A000"),
+        "unsupported XML mode"
+    );
+    assert!(
+        run("SET default_tablespace = fast").contains("0A000"),
+        "unsupported tablespace"
+    );
     assert!(
         run("SET default_table_access_method = columnar").contains("0A000"),
         "unsupported table access method"
@@ -841,13 +968,25 @@ fn cast_with_type_modifier() {
     let mut t = TxnState::new(&mut b, 256).unwrap();
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
     // numeric cast rounds to scale
-    assert!(run("SELECT 12.345::numeric(5,1)").contains("12.3"), "numeric scale");
+    assert!(
+        run("SELECT 12.345::numeric(5,1)").contains("12.3"),
+        "numeric scale"
+    );
     // varchar cast TRUNCATES (not error), unlike column assignment — matches PG
-    assert!(run("SELECT 'hello'::varchar(3)").contains("hel"), "varchar truncate");
+    assert!(
+        run("SELECT 'hello'::varchar(3)").contains("hel"),
+        "varchar truncate"
+    );
     // SQL-standard CAST(x AS type(mod)) form
-    assert!(run("SELECT CAST(1.5 AS numeric(10,2))").contains("1.50"), "CAST form");
+    assert!(
+        run("SELECT CAST(1.5 AS numeric(10,2))").contains("1.50"),
+        "CAST form"
+    );
     // numeric precision overflow errors (22003)
-    assert!(run("SELECT 123.45::numeric(3,1)").contains("22003"), "overflow");
+    assert!(
+        run("SELECT 123.45::numeric(3,1)").contains("22003"),
+        "overflow"
+    );
     // a cast without a modifier still parses
     assert!(run("SELECT 5::int8").contains('5'), "plain cast");
 }
@@ -860,18 +999,16 @@ fn set_show_transaction_and_show_all() {
     // Transaction-control SET forms that JDBC/tools send (one isolation
     // level, as BEGIN provides — the clause is acknowledged).
     assert!(run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").contains("0A000"));
-    assert!(run("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
-        .contains("SET"));
-    assert!(run("SET TRANSACTION READ ONLY").contains("0A000"));
+    assert!(
+        run("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .contains("SET")
+    );
+    assert!(run("SET TRANSACTION READ ONLY").contains("SET"));
     assert!(run("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE").contains("SET"));
-    assert!(
-        run("BEGIN ISOLATION LEVEL REPEATABLE READ").contains("0A000"),
-        "unsupported BEGIN isolation must return 0A000"
-    );
-    assert!(
-        run("START TRANSACTION READ ONLY").contains("0A000"),
-        "unsupported START TRANSACTION access mode must return 0A000"
-    );
+    assert!(run("BEGIN ISOLATION LEVEL REPEATABLE READ").contains("BEGIN"));
+    assert!(run("ROLLBACK").contains("ROLLBACK"));
+    assert!(run("START TRANSACTION READ ONLY").contains("BEGIN"));
+    assert!(run("ROLLBACK").contains("ROLLBACK"));
     assert!(
         run("BEGIN ISOLATION LEVEL READ COMMITTED, READ WRITE, NOT DEFERRABLE").contains("BEGIN")
     );
@@ -890,7 +1027,10 @@ fn smallint_varchar_char_type_fidelity() {
     // smallint enforces ±32767 — the previously-silent out-of-range case.
     assert!(run("INSERT INTO ty(s) VALUES (40000)").contains("smallint out of range"));
     assert!(run("INSERT INTO ty(s) VALUES (32767)").contains("INSERT"));
-    assert!(run("SELECT s FROM ty WHERE s = 32767").contains("32767"), "round-trips");
+    assert!(
+        run("SELECT s FROM ty WHERE s = 32767").contains("32767"),
+        "round-trips"
+    );
     // varchar length errors; char(n) padding is *not* part of the value —
     // PostgreSQL strips it through operators, so concatenation sees "hi".
     assert!(run("INSERT INTO ty(v) VALUES ('toolong')").contains("22001"));
@@ -921,7 +1061,10 @@ fn join_using_clause() {
     // JOIN ... USING (id) is desugared to ON a.id = bb.id.
     let out = run("SELECT a.x, bb.y FROM a JOIN bb USING (id)");
     assert!(out.contains("a1") && out.contains("b1"), "match: {out}");
-    assert!(!out.contains("a2") && !out.contains("b3"), "non-match dropped: {out}");
+    assert!(
+        !out.contains("a2") && !out.contains("b3"),
+        "non-match dropped: {out}"
+    );
 }
 
 #[test]
@@ -960,22 +1103,31 @@ fn on_conflict_do_nothing() {
     run("INSERT INTO kv VALUES (1,'a'),(2,'b')");
     // The conflicting row is skipped, the new one inserted; the count
     // excludes skips (INSERT 0 1), matching PostgreSQL.
-    assert!(run("INSERT INTO kv VALUES (1,'x'),(3,'c') ON CONFLICT DO NOTHING")
-        .contains("INSERT 0 1"));
+    assert!(
+        run("INSERT INTO kv VALUES (1,'x'),(3,'c') ON CONFLICT DO NOTHING").contains("INSERT 0 1")
+    );
     let out = run("SELECT k, v FROM kv ORDER BY k");
     // k=1 keeps its original 'a' (the conflicting 'x' was skipped); k=3 added.
     assert!(out.contains("SELECT 3"), "three rows: {out}");
-    assert!(out.contains('a') && out.contains('c') && !out.contains('x'), "kept original: {out}");
+    assert!(
+        out.contains('a') && out.contains('c') && !out.contains('x'),
+        "kept original: {out}"
+    );
     // A fully-conflicting insert stores nothing.
-    assert!(run("INSERT INTO kv VALUES (2,'y') ON CONFLICT (k) DO NOTHING")
-        .contains("INSERT 0 0"));
+    assert!(run("INSERT INTO kv VALUES (2,'y') ON CONFLICT (k) DO NOTHING").contains("INSERT 0 0"));
     // DO UPDATE is a real upsert; assignments can reference the existing
     // row and excluded.<col> (the proposed row).
     run("INSERT INTO kv VALUES (1,'z') ON CONFLICT (k) DO UPDATE SET v = excluded.v");
-    assert!(run("SELECT v FROM kv WHERE k = 1").contains('z'), "upserted");
+    assert!(
+        run("SELECT v FROM kv WHERE k = 1").contains('z'),
+        "upserted"
+    );
     // DO UPDATE ... WHERE can veto the update.
     run("INSERT INTO kv VALUES (1,'q') ON CONFLICT (k) DO UPDATE SET v = 'q' WHERE FALSE");
-    assert!(!run("SELECT v FROM kv WHERE k = 1").contains('q'), "WHERE vetoed");
+    assert!(
+        !run("SELECT v FROM kv WHERE k = 1").contains('q'),
+        "WHERE vetoed"
+    );
 }
 
 #[test]
@@ -994,29 +1146,67 @@ fn on_conflict_arbiter_and_returning() {
     run!("INSERT INTO oc VALUES (1,10,'x'),(2,20,'y')");
 
     // DO UPDATE ... RETURNING returns the updated row's post-update values.
-    let out = run!("INSERT INTO oc VALUES (1,10,'z') ON CONFLICT (a) DO UPDATE SET note='upd' RETURNING a,b,note");
+    let out = run!(
+        "INSERT INTO oc VALUES (1,10,'z') ON CONFLICT (a) DO UPDATE SET note='upd' RETURNING a,b,note"
+    );
     assert_eq!(data_rows(&out), ["1|10|upd"]);
 
     // ON CONSTRAINT names the arbiter directly (auto-named single-col unique).
-    let out = run!("INSERT INTO oc VALUES (99,20,'z') ON CONFLICT ON CONSTRAINT oc_b_key DO UPDATE SET note='byname' RETURNING a,b,note");
+    let out = run!(
+        "INSERT INTO oc VALUES (99,20,'z') ON CONFLICT ON CONSTRAINT oc_b_key DO UPDATE SET note='byname' RETURNING a,b,note"
+    );
     assert_eq!(data_rows(&out), ["2|20|byname"]);
 
     // A conflict on a DIFFERENT unique than the arbiter is not caught — it
     // falls through to a normal duplicate-key error.
-    assert!(err(&run!("INSERT INTO oc VALUES (1,999,'d') ON CONFLICT (b) DO UPDATE SET note='no'")).contains("23505"), "non-arbiter conflict is 23505");
+    assert!(
+        err(&run!(
+            "INSERT INTO oc VALUES (1,999,'d') ON CONFLICT (b) DO UPDATE SET note='no'"
+        ))
+        .contains("23505"),
+        "non-arbiter conflict is 23505"
+    );
 
     // Analysis errors, independent of whether a row conflicts:
-    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT DO UPDATE SET note='q'")).contains("42601"), "DO UPDATE needs an arbiter");
-    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT (note) DO NOTHING")).contains("42P10"), "target must be unique");
-    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT (nope) DO NOTHING")).contains("42703"), "target column must exist");
-    assert!(err(&run!("INSERT INTO oc VALUES (1,10,'q') ON CONFLICT ON CONSTRAINT nope DO NOTHING")).contains("42704"), "named constraint must exist");
+    assert!(
+        err(&run!(
+            "INSERT INTO oc VALUES (1,10,'q') ON CONFLICT DO UPDATE SET note='q'"
+        ))
+        .contains("42601"),
+        "DO UPDATE needs an arbiter"
+    );
+    assert!(
+        err(&run!(
+            "INSERT INTO oc VALUES (1,10,'q') ON CONFLICT (note) DO NOTHING"
+        ))
+        .contains("42P10"),
+        "target must be unique"
+    );
+    assert!(
+        err(&run!(
+            "INSERT INTO oc VALUES (1,10,'q') ON CONFLICT (nope) DO NOTHING"
+        ))
+        .contains("42703"),
+        "target column must exist"
+    );
+    assert!(
+        err(&run!(
+            "INSERT INTO oc VALUES (1,10,'q') ON CONFLICT ON CONSTRAINT nope DO NOTHING"
+        ))
+        .contains("42704"),
+        "named constraint must exist"
+    );
 
     // Composite-key arbiter matches order-independently; ON CONSTRAINT by pkey.
     run!("CREATE TABLE cc (x int, y int, v text, PRIMARY KEY (x,y))");
     run!("INSERT INTO cc VALUES (1,2,'a')");
-    let out = run!("INSERT INTO cc VALUES (1,2,'b') ON CONFLICT (y,x) DO UPDATE SET v=excluded.v RETURNING x,y,v");
+    let out = run!(
+        "INSERT INTO cc VALUES (1,2,'b') ON CONFLICT (y,x) DO UPDATE SET v=excluded.v RETURNING x,y,v"
+    );
     assert_eq!(data_rows(&out), ["1|2|b"]);
-    let out = run!("INSERT INTO cc VALUES (1,2,'multi'),(3,4,'fresh') ON CONFLICT ON CONSTRAINT cc_pkey DO UPDATE SET v=excluded.v RETURNING x,y,v");
+    let out = run!(
+        "INSERT INTO cc VALUES (1,2,'multi'),(3,4,'fresh') ON CONFLICT ON CONSTRAINT cc_pkey DO UPDATE SET v=excluded.v RETURNING x,y,v"
+    );
     assert_eq!(data_rows(&out), ["1|2|multi", "3|4|fresh"]);
 }
 
@@ -1030,16 +1220,31 @@ fn multi_column_unique_and_primary_key() {
     run("CREATE TABLE t (a int, b int, c text, PRIMARY KEY (a, b))");
     assert!(run("INSERT INTO t VALUES (1, 2, 'x')").contains("INSERT 0 1"));
     // Same (a,b) tuple conflicts; a different tuple is fine.
-    assert!(run("INSERT INTO t VALUES (1, 2, 'y')").contains("23505"), "dup PK");
-    assert!(run("INSERT INTO t VALUES (1, 3, 'y')").contains("INSERT 0 1"), "distinct");
+    assert!(
+        run("INSERT INTO t VALUES (1, 2, 'y')").contains("23505"),
+        "dup PK"
+    );
+    assert!(
+        run("INSERT INTO t VALUES (1, 3, 'y')").contains("INSERT 0 1"),
+        "distinct"
+    );
     // A PRIMARY KEY column is NOT NULL.
-    assert!(run("INSERT INTO t VALUES (NULL, 4, 'z')").contains("23502"), "PK not null");
+    assert!(
+        run("INSERT INTO t VALUES (NULL, 4, 'z')").contains("23502"),
+        "PK not null"
+    );
     // Multi-column UNIQUE allows NULLs (distinct), rejects full duplicates.
     run("CREATE TABLE u (a int, b int, UNIQUE (a, b))");
     assert!(run("INSERT INTO u VALUES (1, NULL)").contains("INSERT 0 1"));
-    assert!(run("INSERT INTO u VALUES (1, NULL)").contains("INSERT 0 1"), "NULL distinct");
+    assert!(
+        run("INSERT INTO u VALUES (1, NULL)").contains("INSERT 0 1"),
+        "NULL distinct"
+    );
     assert!(run("INSERT INTO u VALUES (5, 6)").contains("INSERT 0 1"));
-    assert!(run("INSERT INTO u VALUES (5, 6)").contains("23505"), "dup UNIQUE");
+    assert!(
+        run("INSERT INTO u VALUES (5, 6)").contains("23505"),
+        "dup UNIQUE"
+    );
 }
 
 #[test]
@@ -1050,12 +1255,24 @@ fn check_constraints_enforced() {
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
     run("CREATE TABLE c (x int CHECK (x > 0), y int, CHECK (y < 100))");
     assert!(run("INSERT INTO c VALUES (5, 10)").contains("INSERT 0 1"));
-    assert!(run("INSERT INTO c VALUES (-1, 10)").contains("23514"), "x>0 violated");
-    assert!(run("INSERT INTO c VALUES (5, 200)").contains("23514"), "y<100 violated");
+    assert!(
+        run("INSERT INTO c VALUES (-1, 10)").contains("23514"),
+        "x>0 violated"
+    );
+    assert!(
+        run("INSERT INTO c VALUES (5, 200)").contains("23514"),
+        "y<100 violated"
+    );
     // A NULL makes the predicate NULL, which passes.
-    assert!(run("INSERT INTO c VALUES (NULL, 10)").contains("INSERT 0 1"), "null passes");
+    assert!(
+        run("INSERT INTO c VALUES (NULL, 10)").contains("INSERT 0 1"),
+        "null passes"
+    );
     // UPDATE is checked too.
-    assert!(run("UPDATE c SET x = -5 WHERE x = 5").contains("23514"), "update checked");
+    assert!(
+        run("UPDATE c SET x = -5 WHERE x = 5").contains("23514"),
+        "update checked"
+    );
     // A CHECK referencing an unknown column is rejected at creation (42703).
     assert!(run("CREATE TABLE bad (x int CHECK (nope > 0))").contains("42703"));
 }
@@ -1069,31 +1286,58 @@ fn foreign_key_referential_integrity() {
     run("CREATE TABLE p (id int PRIMARY KEY, name text)");
     run("CREATE TABLE ch (pid int REFERENCES p(id), note text)");
     // A referencing row with no parent is rejected (23503).
-    assert!(run("INSERT INTO ch VALUES (5, 'orphan')").contains("23503"), "missing parent");
+    assert!(
+        run("INSERT INTO ch VALUES (5, 'orphan')").contains("23503"),
+        "missing parent"
+    );
     // A NULL foreign key passes (MATCH SIMPLE).
-    assert!(run("INSERT INTO ch VALUES (NULL, 'ok')").contains("INSERT 0 1"), "null fk");
+    assert!(
+        run("INSERT INTO ch VALUES (NULL, 'ok')").contains("INSERT 0 1"),
+        "null fk"
+    );
     // With the parent present, the child inserts.
     run("INSERT INTO p VALUES (1, 'a')");
     assert!(run("INSERT INTO ch VALUES (1, 'child')").contains("INSERT 0 1"));
     // Deleting a referenced parent row is blocked (23503).
-    assert!(run("DELETE FROM p WHERE id = 1").contains("23503"), "delete blocked");
+    assert!(
+        run("DELETE FROM p WHERE id = 1").contains("23503"),
+        "delete blocked"
+    );
     // Changing the referenced key of a referenced parent is blocked.
-    assert!(run("UPDATE p SET id = 2 WHERE id = 1").contains("23503"), "key change blocked");
+    assert!(
+        run("UPDATE p SET id = 2 WHERE id = 1").contains("23503"),
+        "key change blocked"
+    );
     // An unreferenced parent row can be deleted.
     run("INSERT INTO p VALUES (9, 'free')");
-    assert!(run("DELETE FROM p WHERE id = 9").contains("DELETE 1"), "free delete");
+    assert!(
+        run("DELETE FROM p WHERE id = 9").contains("DELETE 1"),
+        "free delete"
+    );
     // A foreign key must reference a unique/PK column set (42830).
     run("CREATE TABLE nu (a int)");
-    assert!(run("CREATE TABLE nc (a int REFERENCES nu(a))").contains("42830"), "non-unique");
+    assert!(
+        run("CREATE TABLE nc (a int REFERENCES nu(a))").contains("42830"),
+        "non-unique"
+    );
     // Referencing a missing table is 42P01.
-    assert!(run("CREATE TABLE nt (a int REFERENCES nope(a))").contains("42P01"), "missing tbl");
+    assert!(
+        run("CREATE TABLE nt (a int REFERENCES nope(a))").contains("42P01"),
+        "missing tbl"
+    );
     // Referential actions rewrite the referencing rows (verified against
     // PostgreSQL 18.4): CASCADE removes them with the parent.
-    assert!(run("CREATE TABLE cc (pid int REFERENCES p(id) ON DELETE CASCADE)")
-        .contains("CREATE TABLE"), "cascade accepted");
+    assert!(
+        run("CREATE TABLE cc (pid int REFERENCES p(id) ON DELETE CASCADE)")
+            .contains("CREATE TABLE"),
+        "cascade accepted"
+    );
     run("INSERT INTO p VALUES (5, 'x')");
     run("INSERT INTO cc VALUES (5)");
-    assert!(run("DELETE FROM p WHERE id = 5").contains("DELETE 1"), "cascade delete");
+    assert!(
+        run("DELETE FROM p WHERE id = 5").contains("DELETE 1"),
+        "cascade delete"
+    );
     let left = run("SELECT pid FROM cc");
     assert!(left.contains("SELECT 0"), "child cascaded: {left}");
 }
@@ -1105,17 +1349,35 @@ fn right_and_full_outer_joins() {
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE a (id int, x text)");
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE bt (id int, y text)");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO a VALUES (1,'a1'),(2,'a2'),(3,'a3')");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO bt VALUES (2,'b2'),(3,'b3'),(4,'b4')");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO a VALUES (1,'a1'),(2,'a2'),(3,'a3')",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO bt VALUES (2,'b2'),(3,'b3'),(4,'b4')",
+    );
     // RIGHT JOIN preserves the right side; the unmatched b4 nulls a.x.
     let rows = data_rows(&run_with_txn_bytes(
-        &mut e, &mut b, &mut t,
+        &mut e,
+        &mut b,
+        &mut t,
         "SELECT a.x FROM a RIGHT JOIN bt ON a.id=bt.id ORDER BY bt.id",
     ));
-    assert_eq!(rows, ["a2", "a3", "NULL"], "right unmatched nulls left: {rows:?}");
+    assert_eq!(
+        rows,
+        ["a2", "a3", "NULL"],
+        "right unmatched nulls left: {rows:?}"
+    );
     // FULL JOIN preserves both: unmatched a1 (left) and unmatched b4 (right).
     let full = data_rows(&run_with_txn_bytes(
-        &mut e, &mut b, &mut t,
+        &mut e,
+        &mut b,
+        &mut t,
         "SELECT coalesce(a.x,'-'), coalesce(bt.y,'-') FROM a FULL JOIN bt ON a.id=bt.id ORDER BY a.id NULLS LAST, bt.id",
     ));
     assert_eq!(full, ["a1|-", "a2|b2", "a3|b3", "-|b4"], "full: {full:?}");
@@ -1127,13 +1389,34 @@ fn time_type() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (id int, tm time)");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES (1,'12:34:56'),(2,'09:00:00'),(3,'23:59:59.5')");
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT id, tm FROM t ORDER BY tm"));
-    assert_eq!(rows, ["2|09:00:00", "1|12:34:56", "3|23:59:59.5"], "ordered: {rows:?}");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO t VALUES (1,'12:34:56'),(2,'09:00:00'),(3,'23:59:59.5')",
+    );
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT id, tm FROM t ORDER BY tm",
+    ));
+    assert_eq!(
+        rows,
+        ["2|09:00:00", "1|12:34:56", "3|23:59:59.5"],
+        "ordered: {rows:?}"
+    );
     // Casts: text -> time, and the time-of-day of a timestamp.
     assert!(run_txn(&mut e, &mut b, &mut t, "SELECT '08:30'::time").contains("08:30:00"));
-    assert!(run_txn(&mut e, &mut b, &mut t,
-        "SELECT '2024-01-15 14:30:00'::timestamp::time").contains("14:30:00"));
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT '2024-01-15 14:30:00'::timestamp::time"
+        )
+        .contains("14:30:00")
+    );
 }
 
 #[test]
@@ -1142,9 +1425,19 @@ fn array_type() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (a int[])");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES ('{1,2,3}'),(ARRAY[4,5])");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO t VALUES ('{1,2,3}'),(ARRAY[4,5])",
+    );
     // Literal output and storage roundtrip with ORDER BY (element-wise).
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT a FROM t ORDER BY a"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT a FROM t ORDER BY a",
+    ));
     assert_eq!(rows, ["{1,2,3}", "{4,5}"], "array storage/order: {rows:?}");
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
     assert!(run("SELECT ARRAY[1,2,3]").contains("{1,2,3}"));
@@ -1176,7 +1469,10 @@ fn json_and_jsonb_types() {
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
     // json is verbatim; jsonb normalizes (sorted keys, last-wins dedup,
     // canonical spacing and numbers).
-    assert!(run("SELECT '{\"b\": 1,  \"a\":2, \"b\":3}'::json").contains("{\"b\": 1,  \"a\":2, \"b\":3}"));
+    assert!(
+        run("SELECT '{\"b\": 1,  \"a\":2, \"b\":3}'::json")
+            .contains("{\"b\": 1,  \"a\":2, \"b\":3}")
+    );
     assert!(run("SELECT '{\"b\": 1,  \"a\":2, \"b\":3}'::jsonb").contains("{\"a\": 2, \"b\": 3}"));
     assert!(run("SELECT '[1, 2,   3]'::jsonb").contains("[1, 2, 3]"));
     assert!(run("SELECT '1e2'::jsonb").contains("100"));
@@ -1188,10 +1484,21 @@ fn json_and_jsonb_types() {
     assert!(run("SELECT '{bad}'::jsonb").contains("22P02"));
     // Date-time types render in ISO 8601 inside JSON (a `T` separator, and a
     // `+00:00` offset for timestamptz), not the space-separated `::text` form.
-    assert!(run("SELECT to_json('2020-01-01 12:30:45'::timestamp)").contains("\"2020-01-01T12:30:45\""));
-    assert!(run("SELECT to_json('2020-01-01 12:30:45.1'::timestamp)").contains("\"2020-01-01T12:30:45.1\""));
-    assert!(run("SELECT to_json('2020-01-01 12:30:45+00'::timestamptz)").contains("\"2020-01-01T12:30:45+00:00\""));
-    assert!(run("SELECT to_jsonb('2020-06-15 08:00:00+00'::timestamptz)").contains("\"2020-06-15T08:00:00+00:00\""));
+    assert!(
+        run("SELECT to_json('2020-01-01 12:30:45'::timestamp)").contains("\"2020-01-01T12:30:45\"")
+    );
+    assert!(
+        run("SELECT to_json('2020-01-01 12:30:45.1'::timestamp)")
+            .contains("\"2020-01-01T12:30:45.1\"")
+    );
+    assert!(
+        run("SELECT to_json('2020-01-01 12:30:45+00'::timestamptz)")
+            .contains("\"2020-01-01T12:30:45+00:00\"")
+    );
+    assert!(
+        run("SELECT to_jsonb('2020-06-15 08:00:00+00'::timestamptz)")
+            .contains("\"2020-06-15T08:00:00+00:00\"")
+    );
     // date / time keep their ordinary text form.
     assert!(run("SELECT to_json('2020-06-15'::date)").contains("\"2020-06-15\""));
     // jsonb deep containment @> / <@ (object subset, array membership incl. the
@@ -1220,10 +1527,18 @@ fn interval_type() {
     assert!(run("SELECT '-5 days'::interval").contains("-5 days"));
     // Arithmetic: date/timestamp + interval, month clamping.
     assert!(run("SELECT date '2024-01-15' + '1 day'::interval").contains("2024-01-16 00:00:00"));
-    assert!(run("SELECT timestamp '2024-01-15 10:00' + '2 hours'::interval").contains("2024-01-15 12:00:00"));
-    assert!(run("SELECT timestamp '2024-03-31 10:00' + '1 month'::interval").contains("2024-04-30 10:00:00"));
+    assert!(
+        run("SELECT timestamp '2024-01-15 10:00' + '2 hours'::interval")
+            .contains("2024-01-15 12:00:00")
+    );
+    assert!(
+        run("SELECT timestamp '2024-03-31 10:00' + '1 month'::interval")
+            .contains("2024-04-30 10:00:00")
+    );
     // interval - interval.
-    assert!(run("SELECT '1 day 2 hours'::interval - '3 hours'::interval").contains("1 day -01:00:00"));
+    assert!(
+        run("SELECT '1 day 2 hours'::interval - '3 hours'::interval").contains("1 day -01:00:00")
+    );
 }
 
 #[test]
@@ -1238,12 +1553,24 @@ fn correlated_subquery_over_aliased_table_and_values_setop() {
     run("CREATE TABLE ch (pid int)");
     run("INSERT INTO p VALUES (1),(2)");
     run("INSERT INTO ch VALUES (1),(1),(2)");
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT x.id, (SELECT count(*) FROM ch WHERE ch.pid = x.id) FROM p x ORDER BY x.id"));
-    assert_eq!(rows, ["1|2", "2|1"], "aliased correlated subquery: {rows:?}");
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT x.id, (SELECT count(*) FROM ch WHERE ch.pid = x.id) FROM p x ORDER BY x.id",
+    ));
+    assert_eq!(
+        rows,
+        ["1|2", "2|1"],
+        "aliased correlated subquery: {rows:?}"
+    );
     // VALUES in a UNION branch.
-    let vals = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT 1 UNION ALL VALUES (2),(3) ORDER BY 1"));
+    let vals = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT 1 UNION ALL VALUES (2),(3) ORDER BY 1",
+    ));
     assert_eq!(vals, ["1", "2", "3"], "values in union: {vals:?}");
 }
 
@@ -1261,17 +1588,42 @@ fn set_operations_in_subqueries() {
     assert!(run("SELECT (SELECT 5 UNION SELECT 5)").contains('5'));
     // Derived table over a UNION ALL.
     assert_eq!(
-        data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-            "SELECT sum(x) FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3) t")),
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT sum(x) FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3) t"
+        )),
         ["6"]
     );
     // EXISTS and INTERSECT / EXCEPT.
-    assert!(run_txn(&mut e, &mut b, &mut t,
-        "SELECT 9 WHERE EXISTS (SELECT 1 UNION ALL SELECT 2)").contains('9'));
-    assert!(run_txn(&mut e, &mut b, &mut t,
-        "SELECT 7 WHERE 2 IN (SELECT 2 INTERSECT SELECT 2)").contains('7'));
-    assert!(!run_txn(&mut e, &mut b, &mut t,
-        "SELECT 7 WHERE 2 IN (SELECT 2 EXCEPT SELECT 2)").contains('7'));
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT 9 WHERE EXISTS (SELECT 1 UNION ALL SELECT 2)"
+        )
+        .contains('9')
+    );
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT 7 WHERE 2 IN (SELECT 2 INTERSECT SELECT 2)"
+        )
+        .contains('7')
+    );
+    assert!(
+        !run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT 7 WHERE 2 IN (SELECT 2 EXCEPT SELECT 2)"
+        )
+        .contains('7')
+    );
 }
 
 #[test]
@@ -1280,26 +1632,53 @@ fn array_from_subquery_and_array_to_string() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (x int)");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES (10),(20),(30)");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO t VALUES (10),(20),(30)",
+    );
     // Elements follow the table's physical (insertion) scan order, matching
     // PostgreSQL. (ORDER BY inside a subquery is not yet honored — tracked
     // separately — so it is deliberately not exercised here.)
     assert_eq!(
-        data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-            "SELECT array(SELECT x FROM t)")),
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT array(SELECT x FROM t)"
+        )),
         ["{10,20,30}"]
     );
     // Empty subquery yields an empty array, not NULL.
     assert_eq!(
-        data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-            "SELECT array(SELECT x FROM t WHERE x > 100)")),
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT array(SELECT x FROM t WHERE x > 100)"
+        )),
         ["{}"]
     );
     // array_to_string joins, with and without a null replacement.
-    assert!(run_txn(&mut e, &mut b, &mut t,
-        "SELECT array_to_string(ARRAY[1,NULL,3], ',', '*')").contains("1,*,3"));
-    assert!(run_txn(&mut e, &mut b, &mut t,
-        "SELECT array_to_string(ARRAY[1,NULL,3], ',')").contains("1,3"));
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT array_to_string(ARRAY[1,NULL,3], ',', '*')"
+        )
+        .contains("1,*,3")
+    );
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT array_to_string(ARRAY[1,NULL,3], ',')"
+        )
+        .contains("1,3")
+    );
 }
 
 #[test]
@@ -1308,23 +1687,39 @@ fn generate_series_table_function() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     assert_eq!(
-        data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-            "SELECT s FROM generate_series(0,3) s ORDER BY s")),
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM generate_series(0,3) s ORDER BY s"
+        )),
         ["0", "1", "2", "3"]
     );
     assert_eq!(
-        data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-            "SELECT s FROM generate_series(1,10,2) s ORDER BY s")),
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM generate_series(1,10,2) s ORDER BY s"
+        )),
         ["1", "3", "5", "7", "9"]
     );
     assert_eq!(
-        data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-            "SELECT s FROM generate_series(5,1,-2) s ORDER BY s DESC")),
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM generate_series(5,1,-2) s ORDER BY s DESC"
+        )),
         ["5", "3", "1"]
     );
     assert_eq!(
-        data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-            "SELECT count(*) FROM generate_series(1,100) g")),
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT count(*) FROM generate_series(1,100) g"
+        )),
         ["100"]
     );
 }
@@ -1338,25 +1733,51 @@ fn catalog_indexes_and_constraints_for_psql_d() {
     let mut t = TxnState::new(&mut b, 256).unwrap();
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
     run("CREATE TABLE parent (a int, b int, PRIMARY KEY (a,b))");
-    run("CREATE TABLE child (id int PRIMARY KEY, pa int, pb int, email text UNIQUE, \
-         FOREIGN KEY (pa,pb) REFERENCES parent(a,b))");
+    run(
+        "CREATE TABLE child (id int PRIMARY KEY, pa int, pb int, email text UNIQUE, \
+         FOREIGN KEY (pa,pb) REFERENCES parent(a,b))",
+    );
     // Index relations exist with PostgreSQL-style names.
-    let index = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT relname FROM pg_class WHERE relkind = 'i' ORDER BY relname"));
-    assert_eq!(index, ["child_email_key", "child_pkey", "parent_pkey"], "index rels: {index:?}");
+    let index = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT relname FROM pg_class WHERE relkind = 'i' ORDER BY relname",
+    ));
+    assert_eq!(
+        index,
+        ["child_email_key", "child_pkey", "parent_pkey"],
+        "index rels: {index:?}"
+    );
     // pg_get_indexdef reconstructs the btree column list.
-    let pk = run_txn(&mut e, &mut b, &mut t,
+    let pk = run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
         "SELECT pg_get_indexdef(indexrelid, 0, true) FROM pg_index i \
-         JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'parent_pkey'");
+         JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'parent_pkey'",
+    );
     assert!(pk.contains("btree (a, b)"), "indexdef: {pk}");
     // The foreign key: constraint def + parent name via oid::regclass.
-    let fk = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+    let fk = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
         "SELECT confrelid::regclass, pg_get_constraintdef(oid, true) \
-         FROM pg_constraint WHERE contype = 'f'"));
-    assert_eq!(fk, ["parent|FOREIGN KEY (pa, pb) REFERENCES parent(a, b)"], "fk: {fk:?}");
+         FROM pg_constraint WHERE contype = 'f'",
+    ));
+    assert_eq!(
+        fk,
+        ["parent|FOREIGN KEY (pa, pb) REFERENCES parent(a, b)"],
+        "fk: {fk:?}"
+    );
     // A UNIQUE constraint is backed by an index (conindid links them).
-    let uq = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT conname FROM pg_constraint WHERE contype = 'u' ORDER BY conname"));
+    let uq = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT conname FROM pg_constraint WHERE contype = 'u' ORDER BY conname",
+    ));
     assert_eq!(uq, ["child_email_key"], "unique constraints: {uq:?}");
 }
 
@@ -1449,22 +1870,39 @@ fn expandarray_and_composite_field_access() {
     // driving JDBC getPrimaryKeys. A single-column PK expands to one row.
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
-    run_txn(&mut e, &mut b, &mut t, "CREATE TABLE pk1 (id int PRIMARY KEY, v text)");
-    run_txn(&mut e, &mut b, &mut t,
-        "CREATE TABLE pk2 (a int, b int, PRIMARY KEY (a, b))");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE pk1 (id int PRIMARY KEY, v text)",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE pk2 (a int, b int, PRIMARY KEY (a, b))",
+    );
     // Single-column: one (x=1, n=1) row.
-    let r1 = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+    let r1 = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
         "SELECT (information_schema._pg_expandarray(i.indkey)).n AS seq, \
          (information_schema._pg_expandarray(i.indkey)).x AS att \
          FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
-         WHERE c.relname = 'pk1_pkey'"));
+         WHERE c.relname = 'pk1_pkey'",
+    ));
     assert_eq!(r1, ["1|1"], "single-col expand: {r1:?}");
     // Two-column PK: the SRF expands into two rows (ordinals 1 and 2). Sort
     // in a wrapping subquery, as JDBC's getPrimaryKeys does.
-    let mut r2 = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+    let mut r2 = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
         "SELECT (information_schema._pg_expandarray(i.indkey)).n AS seq \
          FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
-         WHERE c.relname = 'pk2_pkey'"));
+         WHERE c.relname = 'pk2_pkey'",
+    ));
     r2.sort();
     assert_eq!(r2, ["1", "2"], "multi-col expand: {r2:?}");
 }
@@ -1475,19 +1913,44 @@ fn regex_match_operators_and_operator_syntax() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (s text)");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES ('pg_toast'),('public'),('pg_temp_1'),('foo')");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO t VALUES ('pg_toast'),('public'),('pg_temp_1'),('foo')",
+    );
     // `~` and `!~` filter rows; `~*` is case-insensitive.
-    assert_eq!(data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT s FROM t WHERE s ~ '^pg_' ORDER BY s")), ["pg_temp_1", "pg_toast"]);
-    assert_eq!(data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT s FROM t WHERE s !~ '^pg_' ORDER BY s")), ["foo", "public"]);
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM t WHERE s ~ '^pg_' ORDER BY s"
+        )),
+        ["pg_temp_1", "pg_toast"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM t WHERE s !~ '^pg_' ORDER BY s"
+        )),
+        ["foo", "public"]
+    );
     assert!(run_txn(&mut e, &mut b, &mut t, "SELECT 'ABC' ~* '^abc'").contains('t'));
     assert!(run_txn(&mut e, &mut b, &mut t, "SELECT 'ABC' ~ '^abc'").contains('f'));
     // Grouping + alternation, and the explicit OPERATOR(...) syntax psql
     // emits, plus COLLATE (accepted, default collation).
-    assert_eq!(data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT s FROM t WHERE s OPERATOR(pg_catalog.~) '^(foo|public)$' COLLATE \"C\" ORDER BY s")),
-        ["foo", "public"]);
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM t WHERE s OPERATOR(pg_catalog.~) '^(foo|public)$' COLLATE \"C\" ORDER BY s"
+        )),
+        ["foo", "public"]
+    );
 }
 
 #[test]
@@ -1495,22 +1958,73 @@ fn window_functions() {
     // All outputs verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
-    run_txn(&mut e, &mut b, &mut t, "CREATE TABLE s (dept text, name text, sal int)");
-    run_txn(&mut e, &mut b, &mut t,
-        "INSERT INTO s VALUES ('a','w1',100),('a','w2',200),('a','w3',200),('b','w4',50),('b','w5',75)");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE s (dept text, name text, sal int)",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO s VALUES ('a','w1',100),('a','w2',200),('a','w3',200),('b','w4',50),('b','w5',75)",
+    );
     // row_number / rank / dense_rank with PARTITION BY + ORDER BY. Ranks
     // share for the tied 200/200 rows; row_number does not.
-    let r = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT dept, sal, row_number() OVER (PARTITION BY dept ORDER BY sal, name), rank() OVER (PARTITION BY dept ORDER BY sal), dense_rank() OVER (PARTITION BY dept ORDER BY sal) FROM s ORDER BY dept, sal, name"));
-    assert_eq!(r, ["a|100|1|1|1", "a|200|2|2|2", "a|200|3|2|2", "b|50|1|1|1", "b|75|2|2|2"], "rankings: {r:?}");
+    let r = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT dept, sal, row_number() OVER (PARTITION BY dept ORDER BY sal, name), rank() OVER (PARTITION BY dept ORDER BY sal), dense_rank() OVER (PARTITION BY dept ORDER BY sal) FROM s ORDER BY dept, sal, name",
+    ));
+    assert_eq!(
+        r,
+        [
+            "a|100|1|1|1",
+            "a|200|2|2|2",
+            "a|200|3|2|2",
+            "b|50|1|1|1",
+            "b|75|2|2|2"
+        ],
+        "rankings: {r:?}"
+    );
     // Running sum (peers share) vs whole-partition sum.
-    let s = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT sal, sum(sal) OVER (PARTITION BY dept ORDER BY sal), sum(sal) OVER (PARTITION BY dept) FROM s ORDER BY dept, sal, name"));
-    assert_eq!(s, ["100|100|500", "200|500|500", "200|500|500", "50|50|125", "75|125|125"], "sums: {s:?}");
+    let s = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT sal, sum(sal) OVER (PARTITION BY dept ORDER BY sal), sum(sal) OVER (PARTITION BY dept) FROM s ORDER BY dept, sal, name",
+    ));
+    assert_eq!(
+        s,
+        [
+            "100|100|500",
+            "200|500|500",
+            "200|500|500",
+            "50|50|125",
+            "75|125|125"
+        ],
+        "sums: {s:?}"
+    );
     // lag / lead with a default.
-    let l = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT sal, lag(sal) OVER (ORDER BY sal), lead(sal,1,-1) OVER (ORDER BY sal) FROM s ORDER BY sal"));
-    assert_eq!(l, ["50|NULL|75", "75|50|100", "100|75|200", "200|100|200", "200|200|-1"], "lag/lead: {l:?}");
+    let l = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT sal, lag(sal) OVER (ORDER BY sal), lead(sal,1,-1) OVER (ORDER BY sal) FROM s ORDER BY sal",
+    ));
+    assert_eq!(
+        l,
+        [
+            "50|NULL|75",
+            "75|50|100",
+            "100|75|200",
+            "200|100|200",
+            "200|200|-1"
+        ],
+        "lag/lead: {l:?}"
+    );
 }
 
 #[test]
@@ -1528,7 +2042,12 @@ fn savepoints_rollback_and_release() {
     // ROLLBACK TO restores row 1 to 'a' and removes row 2 — the reverse
     // replay reconstructs the savepoint-time image.
     assert!(run_txn(&mut e, &mut b, &mut t, "ROLLBACK TO SAVEPOINT s1").contains("ROLLBACK"));
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT id, v FROM t ORDER BY id"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT id, v FROM t ORDER BY id",
+    ));
     assert_eq!(rows, ["1|a"], "rollback to savepoint: {rows:?}");
     run_txn(&mut e, &mut b, &mut t, "COMMIT");
     // RELEASE keeps the subtransaction's changes.
@@ -1538,7 +2057,12 @@ fn savepoints_rollback_and_release() {
     run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES (4,'d')");
     assert!(run_txn(&mut e, &mut b, &mut t, "RELEASE SAVEPOINT s2").contains("RELEASE"));
     run_txn(&mut e, &mut b, &mut t, "COMMIT");
-    let all = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT id FROM t ORDER BY id"));
+    let all = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT id FROM t ORDER BY id",
+    ));
     assert_eq!(all, ["1", "3", "4"], "release kept changes: {all:?}");
     // ROLLBACK TO recovers a failed subtransaction.
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
@@ -1547,7 +2071,10 @@ fn savepoints_rollback_and_release() {
     assert_eq!(t.status_byte(), b'E', "aborted after error");
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK TO SAVEPOINT s3");
     assert_eq!(t.status_byte(), b'T', "recovered by rollback to savepoint");
-    assert!(run_txn(&mut e, &mut b, &mut t, "SELECT 42").contains("42"), "works after recovery");
+    assert!(
+        run_txn(&mut e, &mut b, &mut t, "SELECT 42").contains("42"),
+        "works after recovery"
+    );
     run_txn(&mut e, &mut b, &mut t, "COMMIT");
     // A nonexistent savepoint errors 3B001.
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
@@ -1560,27 +2087,75 @@ fn update_from_and_delete_using() {
     // Row images verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
-    run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (id int, v int, label text)");
-    run_txn(&mut e, &mut b, &mut t, "CREATE TABLE s (id int, delta int, lbl text)");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO t VALUES (1,10,'x'),(2,20,'y'),(3,30,'z')");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO s VALUES (1,100,'one'),(2,200,'two')");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE t (id int, v int, label text)",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE s (id int, delta int, lbl text)",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO t VALUES (1,10,'x'),(2,20,'y'),(3,30,'z')",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO s VALUES (1,100,'one'),(2,200,'two')",
+    );
     // UPDATE ... FROM: the SET may reference both target and source columns.
-    assert!(run_txn(&mut e, &mut b, &mut t,
-        "UPDATE t SET v = t.v + s.delta, label = s.lbl FROM s WHERE t.id = s.id")
-        .contains("UPDATE 2"));
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "UPDATE t SET v = t.v + s.delta, label = s.lbl FROM s WHERE t.id = s.id"
+        )
+        .contains("UPDATE 2")
+    );
     let rows = data_rows(&run_with_txn_bytes(
-        &mut e, &mut b, &mut t, "SELECT id, v, label FROM t ORDER BY id",
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT id, v, label FROM t ORDER BY id",
     ));
-    assert_eq!(rows, ["1|110|one", "2|220|two", "3|30|z"], "update from: {rows:?}");
+    assert_eq!(
+        rows,
+        ["1|110|one", "2|220|two", "3|30|z"],
+        "update from: {rows:?}"
+    );
     // DELETE ... USING removes the joined target rows.
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE d (id int, v int)");
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE k (id int)");
-    run_txn(&mut e, &mut b, &mut t, "INSERT INTO d VALUES (1,1),(2,2),(3,3)");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO d VALUES (1,1),(2,2),(3,3)",
+    );
     run_txn(&mut e, &mut b, &mut t, "INSERT INTO k VALUES (2),(3)");
-    assert!(run_txn(&mut e, &mut b, &mut t, "DELETE FROM d USING k WHERE d.id = k.id")
-        .contains("DELETE 2"));
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "DELETE FROM d USING k WHERE d.id = k.id"
+        )
+        .contains("DELETE 2")
+    );
     let left = data_rows(&run_with_txn_bytes(
-        &mut e, &mut b, &mut t, "SELECT id FROM d ORDER BY id",
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT id FROM d ORDER BY id",
     ));
     assert_eq!(left, ["1"], "delete using: {left:?}");
 }
@@ -1595,21 +2170,37 @@ fn multiway_equijoin_prunes_early() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (id int, v int)");
-    run_txn(&mut e, &mut b, &mut t,
-        "INSERT INTO t SELECT g, g % 10 FROM generate_series(1, 80) g");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "INSERT INTO t SELECT g, g % 10 FROM generate_series(1, 80) g",
+    );
     // Six-way self-join chained on a unique key: N distinct chains.
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
         "SELECT count(*) FROM t a, t b, t c, t d, t e, t f \
-         WHERE a.id=b.id AND b.id=c.id AND c.id=d.id AND d.id=e.id AND e.id=f.id"));
+         WHERE a.id=b.id AND b.id=c.id AND c.id=d.id AND d.id=e.id AND e.id=f.id",
+    ));
     assert_eq!(rows, ["80"], "6-way chained equi-join: {rows:?}");
     // A constant equality on a middle table prunes every chain but one.
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT count(*) FROM t a, t b, t c WHERE a.id=b.id AND b.id=c.id AND b.id=7"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT count(*) FROM t a, t b, t c WHERE a.id=b.id AND b.id=c.id AND b.id=7",
+    ));
     assert_eq!(rows, ["1"], "constant-pruned join: {rows:?}");
     // Pushdown must not change results: the leaf still checks the full WHERE,
     // so a non-key predicate that only the leaf can evaluate still filters.
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t,
-        "SELECT count(*) FROM t a, t b WHERE a.id=b.id AND a.v + b.v = 4"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT count(*) FROM t a, t b WHERE a.id=b.id AND a.v + b.v = 4",
+    ));
     assert_eq!(rows, ["8"], "leaf-checked predicate: {rows:?}");
 }
 
@@ -1668,14 +2259,19 @@ fn named_timezone_dst_rendering() {
     let mut t = TxnState::new(&mut b, 256).unwrap();
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
     // America/New_York: EST (-05) in winter, EDT (-04) in summer — DST honored.
-    let out = run("SET timezone='America/New_York'; SELECT '2021-01-15 12:00:00+00'::timestamptz, '2021-07-15 12:00:00+00'::timestamptz");
+    let out = run(
+        "SET timezone='America/New_York'; SELECT '2021-01-15 12:00:00+00'::timestamptz, '2021-07-15 12:00:00+00'::timestamptz",
+    );
     assert!(out.contains("07:00:00-05"), "winter EST: {out}");
     assert!(out.contains("08:00:00-04"), "summer EDT: {out}");
     // Southern hemisphere: DST in the local summer (January).
     let out = run("SET timezone='Australia/Sydney'; SELECT '2021-01-15 00:00:00+00'::timestamptz");
     assert!(out.contains("+11"), "AEDT: {out}");
     // An unknown zone is rejected loudly, not accepted.
-    assert!(!run("SET timezone='Mars/Olympus'").contains("SET\0"), "unknown zone rejected");
+    assert!(
+        !run("SET timezone='Mars/Olympus'").contains("SET\0"),
+        "unknown zone rejected"
+    );
 }
 
 #[test]
@@ -1686,8 +2282,18 @@ fn commit_makes_writes_visible_and_durable() {
         let mut e = Engine::new(&config, &mut b).unwrap();
         let mut t = TxnState::new(&mut b, 256).unwrap();
         run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (id int)");
-        run_txn(&mut e, &mut b, &mut t, "BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT");
-        run_txn(&mut e, &mut b, &mut t, "BEGIN; INSERT INTO t VALUES (3); ROLLBACK");
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT",
+        );
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "BEGIN; INSERT INTO t VALUES (3); ROLLBACK",
+        );
         let slot = e.storage.find_table("public", "t").unwrap();
         let mut stamped = 0;
         e.storage
@@ -1703,12 +2309,18 @@ fn commit_makes_writes_visible_and_durable() {
     let mut e = Engine::new(&config, &mut b2).unwrap();
     let mut t = TxnState::new(&mut b2, 256).unwrap();
     let out = run_txn(&mut e, &mut b2, &mut t, "SELECT id FROM t ORDER BY id");
-    assert!(out.contains("SELECT 2"), "committed rows must replay: {out}");
+    assert!(
+        out.contains("SELECT 2"),
+        "committed rows must replay: {out}"
+    );
     assert!(!out.contains('3'), "rolled-back row must not replay: {out}");
     let slot = e.storage.find_table("public", "t").unwrap();
     e.storage
         .for_each_row_state(slot, &mut |_, state| {
-            assert!(state.committed_lsn > 0, "WAL replay must retain commit LSNs");
+            assert!(
+                state.committed_lsn > 0,
+                "WAL replay must retain commit LSNs"
+            );
             Ok(core::ops::ControlFlow::Continue(()))
         })
         .unwrap();
@@ -1729,7 +2341,12 @@ fn implicit_transaction_rolls_back_whole_message() {
     assert!(out.contains("22012"), "{out}");
     let out = run_txn(&mut e, &mut b, &mut t, "SELECT count(*) FROM t");
     assert!(out.contains("count") || out.contains('0'), "{out}");
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT count(*) FROM t"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT count(*) FROM t",
+    ));
     assert_eq!(rows, ["0"], "inserts before the error must be undone");
 }
 
@@ -1748,7 +2365,16 @@ fn run_session(
     let mut pool = test_pool(budget);
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut test_cursors(budget), guc, &mut responder, 1)
+        .execute_simple(
+            sql_text,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut test_cursors(budget),
+            guc,
+            &mut responder,
+            1,
+        )
         .unwrap();
     buffer.readable().to_vec()
 }
@@ -1791,7 +2417,16 @@ fn run_with_txn_bytes(
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
-        .execute_simple(sql_text, &arena, txn, &mut pool, &mut test_cursors(budget), &mut guc, &mut responder, 1)
+        .execute_simple(
+            sql_text,
+            &arena,
+            txn,
+            &mut pool,
+            &mut test_cursors(budget),
+            &mut guc,
+            &mut responder,
+            1,
+        )
         .unwrap();
     buffer.readable().to_vec()
 }
@@ -1812,7 +2447,12 @@ fn failed_transaction_blocks_until_end() {
     let out = run_txn(&mut e, &mut b, &mut t, "COMMIT");
     assert!(out.contains("ROLLBACK"), "{out}");
     assert_eq!(t.status_byte(), b'I');
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT count(*) FROM t"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT count(*) FROM t",
+    ));
     assert_eq!(rows, ["0"]);
 }
 
@@ -1821,23 +2461,58 @@ fn isolation_and_write_conflicts() {
     let (mut e, mut b) = test_engine();
     let mut alice = TxnState::new(&mut b, 256).unwrap();
     let mut bob = TxnState::new(&mut b, 256).unwrap();
-    run_txn(&mut e, &mut b, &mut alice, "CREATE TABLE t (id int, v text)");
-    run_txn(&mut e, &mut b, &mut alice, "INSERT INTO t VALUES (1,'base')");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut alice,
+        "CREATE TABLE t (id int, v text)",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut alice,
+        "INSERT INTO t VALUES (1,'base')",
+    );
 
     run_txn(&mut e, &mut b, &mut alice, "BEGIN");
-    run_txn(&mut e, &mut b, &mut alice, "UPDATE t SET v = 'alice' WHERE id = 1");
-    run_txn(&mut e, &mut b, &mut alice, "INSERT INTO t VALUES (2,'alice-new')");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut alice,
+        "UPDATE t SET v = 'alice' WHERE id = 1",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut alice,
+        "INSERT INTO t VALUES (2,'alice-new')",
+    );
 
     // Bob sees only committed state.
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut bob, "SELECT v FROM t ORDER BY id"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut bob,
+        "SELECT v FROM t ORDER BY id",
+    ));
     assert_eq!(rows, ["base"], "uncommitted changes must be invisible");
 
     // Bob's write to Alice's row conflicts immediately.
-    let out = run_txn(&mut e, &mut b, &mut bob, "UPDATE t SET v = 'bob' WHERE id = 1");
+    let out = run_txn(
+        &mut e,
+        &mut b,
+        &mut bob,
+        "UPDATE t SET v = 'bob' WHERE id = 1",
+    );
     assert!(out.contains("40001"), "{out}");
 
     run_txn(&mut e, &mut b, &mut alice, "COMMIT");
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut bob, "SELECT v FROM t ORDER BY id"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut bob,
+        "SELECT v FROM t ORDER BY id",
+    ));
     assert_eq!(rows, ["alice", "alice-new"]);
 }
 
@@ -1853,7 +2528,10 @@ fn ddl_rolls_back_with_implicit_transaction() {
     );
     assert!(out.contains("22012"), "{out}");
     let out = run_txn(&mut e, &mut b, &mut t, "SELECT * FROM brand_new");
-    assert!(out.contains("42P01"), "created table must be rolled back: {out}");
+    assert!(
+        out.contains("42P01"),
+        "created table must be rolled back: {out}"
+    );
     // DDL inside explicit blocks is transactional.
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE txn_ddl (id int)");
@@ -1871,7 +2549,12 @@ fn ddl_rolls_back_with_implicit_transaction() {
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
     run_txn(&mut e, &mut b, &mut t, "DROP TABLE txn_ddl");
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
-    let rows = data_rows(&run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT id FROM txn_ddl"));
+    let rows = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT id FROM txn_ddl",
+    ));
     assert_eq!(rows, ["7"], "dropped table must revive with its rows");
     // CHECKPOINT stays outside transaction blocks.
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
@@ -1887,7 +2570,11 @@ fn data_survives_engine_restart() {
         let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v text)");
-        run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')");
+        run_with(
+            &mut e,
+            &mut budget,
+            "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')",
+        );
         run_with(&mut e, &mut budget, "UPDATE t SET v = 'B' WHERE id = 2");
         run_with(&mut e, &mut budget, "DELETE FROM t WHERE id = 3");
         run_with(&mut e, &mut budget, "CREATE TABLE gone (x int)");
@@ -1922,11 +2609,13 @@ fn indexes_survive_restart() {
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The UNIQUE index survived: a conflicting insert is rejected.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1)"))
-        .contains("23505"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1)"))
+            .contains("23505")
+    );
     // A non-conflicting insert works.
-    let out =
-        String::from_utf8_lossy(&run_with(&mut e, &mut budget, "INSERT INTO t VALUES (3,3)")).to_string();
+    let out = String::from_utf8_lossy(&run_with(&mut e, &mut budget, "INSERT INTO t VALUES (3,3)"))
+        .to_string();
     assert!(!out.contains("23505"), "{out}");
 }
 
@@ -1938,8 +2627,16 @@ fn views_survive_restart() {
         let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
-        run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
-        run_with(&mut e, &mut budget, "CREATE VIEW big AS SELECT id FROM t WHERE v > 15");
+        run_with(
+            &mut e,
+            &mut budget,
+            "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
+        );
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE VIEW big AS SELECT id FROM t WHERE v > 15",
+        );
         run_with(&mut e, &mut budget, "CREATE VIEW gone AS SELECT 1");
         run_with(&mut e, &mut budget, "DROP VIEW gone");
         e.commit_wal();
@@ -1948,12 +2645,18 @@ fn views_survive_restart() {
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The surviving view still expands and queries.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut budget, "SELECT id FROM big ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT id FROM big ORDER BY id"
+        )),
         ["2", "3"]
     );
     // The dropped view is gone.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "SELECT * FROM gone"))
-        .contains("42P01"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut budget, "SELECT * FROM gone"))
+            .contains("42P01")
+    );
 }
 
 #[test]
@@ -1966,42 +2669,67 @@ fn matview_survives_restart() {
         let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
-        run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
-        run_with(&mut e, &mut budget, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE v > 15");
+        run_with(
+            &mut e,
+            &mut budget,
+            "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
+        );
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE v > 15",
+        );
         e.commit_wal();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The materialized rows survived the restart.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut budget, "SELECT id FROM mv ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT id FROM mv ORDER BY id"
+        )),
         ["2", "3"]
     );
     // It is reported as a materialized view (relkind 'm'), not a table.
-    assert!(String::from_utf8_lossy(&run_with(
-        &mut e,
-        &mut budget,
-        "SELECT relkind FROM pg_class WHERE relname = 'mv'"
-    ))
-    .contains('m'));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT relkind FROM pg_class WHERE relname = 'mv'"
+        ))
+        .contains('m')
+    );
     // DROP TABLE is refused (42809).
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "DROP TABLE mv"))
-        .contains("42809"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut budget, "DROP TABLE mv")).contains("42809")
+    );
     // A base change is invisible until REFRESH, which the stored query drives.
     run_with(&mut e, &mut budget, "INSERT INTO t VALUES (4,40)");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut budget, "SELECT id FROM mv ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT id FROM mv ORDER BY id"
+        )),
         ["2", "3"]
     );
     run_with(&mut e, &mut budget, "REFRESH MATERIALIZED VIEW mv");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut budget, "SELECT id FROM mv ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT id FROM mv ORDER BY id"
+        )),
         ["2", "3", "4"]
     );
     // DROP MATERIALIZED VIEW removes it.
     run_with(&mut e, &mut budget, "DROP MATERIALIZED VIEW mv");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut budget, "SELECT * FROM mv"))
-        .contains("42P01"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut budget, "SELECT * FROM mv"))
+            .contains("42P01")
+    );
 }
 
 #[test]
@@ -2009,42 +2737,97 @@ fn sequence_basics() {
     let (mut e, mut b) = test_engine();
     // A persistent session GucState so currval/lastval survive across statements.
     let mut g = GucState::new();
-    run_session(&mut e, &mut b, &mut g, "CREATE SEQUENCE s START 5 INCREMENT 2");
-    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")), ["5"]);
-    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")), ["7"]);
-    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")), ["7"]);
-    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT lastval()")), ["7"]);
-    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT setval('s', 100)")), ["100"]);
-    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")), ["100"]);
-    assert_eq!(data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")), ["102"]);
-    // relkind 'S' in pg_class; pg_sequences lists it.
-    assert!(String::from_utf8_lossy(&run_with(
-        &mut e, &mut b, "SELECT relkind FROM pg_class WHERE relname='s'"
-    ))
-    .contains('S'));
+    run_session(
+        &mut e,
+        &mut b,
+        &mut g,
+        "CREATE SEQUENCE s START 5 INCREMENT 2",
+    );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT last_value FROM pg_sequences WHERE sequencename='s'")),
+        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        ["5"]
+    );
+    assert_eq!(
+        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        ["7"]
+    );
+    assert_eq!(
+        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")),
+        ["7"]
+    );
+    assert_eq!(
+        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT lastval()")),
+        ["7"]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut e,
+            &mut b,
+            &mut g,
+            "SELECT setval('s', 100)"
+        )),
+        ["100"]
+    );
+    assert_eq!(
+        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")),
+        ["100"]
+    );
+    assert_eq!(
+        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        ["102"]
+    );
+    // relkind 'S' in pg_class; pg_sequences lists it.
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT relkind FROM pg_class WHERE relname='s'"
+        ))
+        .contains('S')
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT last_value FROM pg_sequences WHERE sequencename='s'"
+        )),
         ["102"]
     );
     // INSERT ... VALUES(nextval) advances once per row.
     run_with(&mut e, &mut b, "CREATE TABLE t (id bigint)");
     run_with(&mut e, &mut b, "CREATE SEQUENCE q");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (nextval('q')), (nextval('q')), (nextval('q'))");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id FROM t ORDER BY id")), ["1", "2", "3"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (nextval('q')), (nextval('q')), (nextval('q'))",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM t ORDER BY id")),
+        ["1", "2", "3"]
+    );
     // UPDATE SET = nextval advances once per updated row.
     run_with(&mut e, &mut b, "UPDATE t SET id = nextval('q')");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id FROM t ORDER BY id")), ["4", "5", "6"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM t ORDER BY id")),
+        ["4", "5", "6"]
+    );
     // currval is undefined before the first nextval in a session (55000).
     run_with(&mut e, &mut b, "CREATE SEQUENCE u");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT currval('u')")).contains("55000"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT currval('u')")).contains("55000")
+    );
     // Overflow on a non-cycling sequence (2200H).
     run_with(&mut e, &mut b, "CREATE SEQUENCE o MAXVALUE 2 NO CYCLE");
     run_with(&mut e, &mut b, "SELECT nextval('o')");
     run_with(&mut e, &mut b, "SELECT nextval('o')");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('o')")).contains("2200H"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('o')")).contains("2200H")
+    );
     // DROP SEQUENCE removes it.
     run_with(&mut e, &mut b, "DROP SEQUENCE s");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('s')")).contains("42P01"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('s')")).contains("42P01")
+    );
 }
 
 #[test]
@@ -2053,7 +2836,11 @@ fn sequence_survives_restart() {
     {
         let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
-        run_with(&mut e, &mut budget, "CREATE SEQUENCE s START 10 INCREMENT 5 MAXVALUE 100 CYCLE");
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE SEQUENCE s START 10 INCREMENT 5 MAXVALUE 100 CYCLE",
+        );
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 10
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 15
         e.commit_wal();
@@ -2061,10 +2848,17 @@ fn sequence_survives_restart() {
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // Value state (last=15, is_called) survived replay: the next value is 20.
-    assert_eq!(data_rows(&run_with(&mut e, &mut budget, "SELECT nextval('s')")), ["20"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut budget, "SELECT nextval('s')")),
+        ["20"]
+    );
     // Parameters survived too (increment 5, cycle).
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut budget, "SELECT increment_by, cycle FROM pg_sequences WHERE sequencename='s'")),
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT increment_by, cycle FROM pg_sequences WHERE sequencename='s'"
+        )),
         ["5|t"]
     );
 }
@@ -2082,21 +2876,41 @@ fn expression_defaults() {
     // default folds; an explicit value does not advance the sequence.
     run_with(&mut e, &mut b, "INSERT INTO d (note) VALUES ('a'), ('b')");
     run_with(&mut e, &mut b, "INSERT INTO d DEFAULT VALUES");
-    run_with(&mut e, &mut b, "INSERT INTO d (id, note) VALUES (100, 'explicit')");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO d (id, note) VALUES (100, 'explicit')",
+    );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT id, n, note FROM d ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, n, note FROM d ORDER BY id"
+        )),
         ["1|5|a", "2|5|b", "3|5|x", "100|5|explicit"]
     );
     // DEFAULT now() is evaluated per insert, not folded to CREATE-TABLE time:
     // two rows inserted after a fresh statement clock share the statement's now.
-    run_with(&mut e, &mut b, "CREATE TABLE t (ts timestamptz DEFAULT now(), v int)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE t (ts timestamptz DEFAULT now(), v int)",
+    );
     run_with(&mut e, &mut b, "INSERT INTO t (v) VALUES (1)");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT count(*) FROM t WHERE ts IS NOT NULL")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT count(*) FROM t WHERE ts IS NOT NULL"
+        )),
         ["1"]
     );
     // ALTER COLUMN SET DEFAULT with an expression, then ADD COLUMN with one.
-    run_with(&mut e, &mut b, "ALTER TABLE t ALTER COLUMN v SET DEFAULT nextval('dseq')");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE t ALTER COLUMN v SET DEFAULT nextval('dseq')",
+    );
     run_with(&mut e, &mut b, "INSERT INTO t (v) VALUES (DEFAULT)");
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT v FROM t ORDER BY v")),
@@ -2111,7 +2925,11 @@ fn expression_default_survives_restart() {
         let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE SEQUENCE s");
-        run_with(&mut e, &mut budget, "CREATE TABLE t (id bigint DEFAULT nextval('s'), v int)");
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE TABLE t (id bigint DEFAULT nextval('s'), v int)",
+        );
         run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (10)");
         e.commit_wal();
     }
@@ -2121,7 +2939,11 @@ fn expression_default_survives_restart() {
     // nextval (continuing the sequence).
     run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (20)");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut budget, "SELECT id, v FROM t ORDER BY v")),
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT id, v FROM t ORDER BY v"
+        )),
         ["1|10", "2|20"]
     );
 }
@@ -2135,39 +2957,89 @@ fn generated_columns() {
         "CREATE TABLE g (a int, b int, c int GENERATED ALWAYS AS (a + b) STORED, \
          label text GENERATED ALWAYS AS (a::text || '-' || b::text) STORED)",
     );
-    run_with(&mut e, &mut b, "INSERT INTO g (a, b) VALUES (2, 3), (10, 20)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO g (a, b) VALUES (2, 3), (10, 20)",
+    );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT a, b, c, label FROM g ORDER BY a")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT a, b, c, label FROM g ORDER BY a"
+        )),
         ["2|3|5|2-3", "10|20|30|10-20"]
     );
     // Cannot insert a non-DEFAULT value into a generated column (428C9).
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO g (a, b, c) VALUES (1, 1, 5)"))
-        .contains("428C9"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO g (a, b, c) VALUES (1, 1, 5)"
+        ))
+        .contains("428C9")
+    );
     // DEFAULT is allowed and recomputes.
-    run_with(&mut e, &mut b, "INSERT INTO g (a, b, c) VALUES (1, 1, DEFAULT)");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 1")), ["2"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO g (a, b, c) VALUES (1, 1, DEFAULT)",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 1")),
+        ["2"]
+    );
     // UPDATE of a dependency recomputes; direct update rejected except DEFAULT.
     run_with(&mut e, &mut b, "UPDATE g SET b = 100 WHERE a = 2");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 2")), ["102"]);
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "UPDATE g SET c = 99 WHERE a = 10"))
-        .contains("428C9"));
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 2")),
+        ["102"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "UPDATE g SET c = 99 WHERE a = 10"
+        ))
+        .contains("428C9")
+    );
     run_with(&mut e, &mut b, "UPDATE g SET c = DEFAULT WHERE a = 10");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 10")), ["30"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT c FROM g WHERE a = 10")),
+        ["30"]
+    );
     // attgenerated is 's'.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT attgenerated FROM pg_attribute WHERE attrelid='g'::regclass AND attname='c'")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attgenerated FROM pg_attribute WHERE attrelid='g'::regclass AND attname='c'"
+        )),
         ["s"]
     );
     // Restrictions.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad1 (a int, x int GENERATED ALWAYS AS (now()) STORED)"))
-        .contains("42P17"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "CREATE TABLE bad1 (a int, x int GENERATED ALWAYS AS (now()) STORED)"
+        ))
+        .contains("42P17")
+    );
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad2 (a int, x int GENERATED ALWAYS AS (a) STORED, y int GENERATED ALWAYS AS (x) STORED)"))
         .contains("42P17"));
     // ADD COLUMN generated backfills existing rows.
     run_with(&mut e, &mut b, "CREATE TABLE h (a int)");
     run_with(&mut e, &mut b, "INSERT INTO h VALUES (5), (7)");
-    run_with(&mut e, &mut b, "ALTER TABLE h ADD COLUMN d int GENERATED ALWAYS AS (a * 10) STORED");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT a, d FROM h ORDER BY a")), ["5|50", "7|70"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE h ADD COLUMN d int GENERATED ALWAYS AS (a * 10) STORED",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT a, d FROM h ORDER BY a")),
+        ["5|50", "7|70"]
+    );
 }
 
 #[test]
@@ -2176,7 +3048,11 @@ fn generated_column_survives_restart() {
     {
         let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
-        run_with(&mut e, &mut budget, "CREATE TABLE g (a int, c int GENERATED ALWAYS AS (a + 1) STORED)");
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE TABLE g (a int, c int GENERATED ALWAYS AS (a + 1) STORED)",
+        );
         run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (10)");
         e.commit_wal();
     }
@@ -2185,7 +3061,11 @@ fn generated_column_survives_restart() {
     // The generation expression survived replay: a new insert still computes it.
     run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (20)");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut budget, "SELECT a, c FROM g ORDER BY a")),
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT a, c FROM g ORDER BY a"
+        )),
         ["10|11", "20|21"]
     );
 }
@@ -2193,38 +3073,134 @@ fn generated_column_survives_restart() {
 #[test]
 fn identity_columns() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TABLE ia (id int GENERATED ALWAYS AS IDENTITY, v text)");
-    run_with(&mut e, &mut b, "CREATE TABLE ib (id int GENERATED BY DEFAULT AS IDENTITY, v text)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE ia (id int GENERATED ALWAYS AS IDENTITY, v text)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE ib (id int GENERATED BY DEFAULT AS IDENTITY, v text)",
+    );
     run_with(&mut e, &mut b, "INSERT INTO ia (v) VALUES ('a'), ('b')");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM ia ORDER BY id")), ["1|a", "2|b"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, v FROM ia ORDER BY id"
+        )),
+        ["1|a", "2|b"]
+    );
     // ALWAYS rejects an explicit value (428C9) unless OVERRIDING SYSTEM VALUE.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO ia (id, v) VALUES (100, 'x')"))
-        .contains("428C9"));
-    run_with(&mut e, &mut b, "INSERT INTO ia (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'x')");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id FROM ia ORDER BY id")), ["1", "2", "100"]);
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO ia (id, v) VALUES (100, 'x')"
+        ))
+        .contains("428C9")
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO ia (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'x')",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM ia ORDER BY id")),
+        ["1", "2", "100"]
+    );
     // BY DEFAULT accepts an explicit value; OVERRIDING USER VALUE ignores it.
     run_with(&mut e, &mut b, "INSERT INTO ib (id, v) VALUES (50, 'y')");
     run_with(&mut e, &mut b, "INSERT INTO ib (v) VALUES ('z')");
-    run_with(&mut e, &mut b, "INSERT INTO ib (id, v) OVERRIDING USER VALUE VALUES (999, 'uv')");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM ib ORDER BY id")), ["1|z", "2|uv", "50|y"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO ib (id, v) OVERRIDING USER VALUE VALUES (999, 'uv')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, v FROM ib ORDER BY id"
+        )),
+        ["1|z", "2|uv", "50|y"]
+    );
     // attidentity 'a' / 'd'.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT attidentity FROM pg_attribute WHERE attrelid='ia'::regclass AND attname='id'")), ["a"]);
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT attidentity FROM pg_attribute WHERE attrelid='ib'::regclass AND attname='id'")), ["d"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attidentity FROM pg_attribute WHERE attrelid='ia'::regclass AND attname='id'"
+        )),
+        ["a"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attidentity FROM pg_attribute WHERE attrelid='ib'::regclass AND attname='id'"
+        )),
+        ["d"]
+    );
     // Identity with START/INCREMENT options.
-    run_with(&mut e, &mut b, "CREATE TABLE ic (id int GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5), v text)");
-    run_with(&mut e, &mut b, "INSERT INTO ic (v) VALUES ('a'), ('b'), ('c')");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id FROM ic ORDER BY id")), ["10", "15", "20"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE ic (id int GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5), v text)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO ic (v) VALUES ('a'), ('b'), ('c')",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM ic ORDER BY id")),
+        ["10", "15", "20"]
+    );
     // ALTER ADD IDENTITY requires NOT NULL; DROP IDENTITY removes it.
     run_with(&mut e, &mut b, "CREATE TABLE id2 (id int NOT NULL, v text)");
-    run_with(&mut e, &mut b, "ALTER TABLE id2 ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE id2 ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY",
+    );
     run_with(&mut e, &mut b, "INSERT INTO id2 (v) VALUES ('a')");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM id2")), ["1|a"]);
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT attidentity FROM pg_attribute WHERE attrelid='id2'::regclass AND attname='id'")), ["a"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM id2")),
+        ["1|a"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attidentity FROM pg_attribute WHERE attrelid='id2'::regclass AND attname='id'"
+        )),
+        ["a"]
+    );
     // ADD IDENTITY on a nullable column is 55000.
     run_with(&mut e, &mut b, "CREATE TABLE id3 (id int, v text)");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TABLE id3 ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY")).contains("55000"));
-    run_with(&mut e, &mut b, "ALTER TABLE id2 ALTER COLUMN id DROP IDENTITY");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT attidentity FROM pg_attribute WHERE attrelid='id2'::regclass AND attname='id'")), [""]);
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "ALTER TABLE id3 ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY"
+        ))
+        .contains("55000")
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE id2 ALTER COLUMN id DROP IDENTITY",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attidentity FROM pg_attribute WHERE attrelid='id2'::regclass AND attname='id'"
+        )),
+        [""]
+    );
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('id2_id_seq')"))
             .contains("42P01"),
@@ -2252,7 +3228,11 @@ fn identity_columns() {
          CREATE INDEX dump_entry_state_idx ON dump_entry USING btree (state);
          SELECT setval('dump_entry_custom_seq', 2, true);",
     );
-    run_with(&mut e, &mut b, "INSERT INTO dump_entry(parent_id) VALUES (NULL)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO dump_entry(parent_id) VALUES (NULL)",
+    );
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT id,state FROM dump_entry")),
         ["3|ok"]
@@ -2297,7 +3277,11 @@ fn sequence_ownership_is_distinct_from_generation() {
         ["10"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT nextval('owner_split_extra')")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT nextval('owner_split_extra')"
+        )),
         ["100"]
     );
     assert!(
@@ -2323,7 +3307,11 @@ fn sequence_ownership_is_distinct_from_generation() {
         .contains("42P01")
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT nextval('owner_split_extra')")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT nextval('owner_split_extra')"
+        )),
         ["101"]
     );
     run_with(&mut e, &mut b, "DROP TABLE owner_split");
@@ -2389,11 +3377,27 @@ fn identity_survives_restart() {
     {
         let mut budget = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut budget).unwrap();
-        run_with(&mut e, &mut budget, "CREATE TABLE ic (id int GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5), v text)");
-        run_with(&mut e, &mut budget, "CREATE SEQUENCE ic_v_seq OWNED BY ic.v");
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE TABLE ic (id int GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5), v text)",
+        );
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE SEQUENCE ic_v_seq OWNED BY ic.v",
+        );
         run_with(&mut e, &mut budget, "INSERT INTO ic (v) VALUES ('a')");
-        run_with(&mut e, &mut budget, "ALTER TABLE ic RENAME COLUMN id TO key");
-        run_with(&mut e, &mut budget, "ALTER TABLE ic RENAME COLUMN v TO value");
+        run_with(
+            &mut e,
+            &mut budget,
+            "ALTER TABLE ic RENAME COLUMN id TO key",
+        );
+        run_with(
+            &mut e,
+            &mut budget,
+            "ALTER TABLE ic RENAME COLUMN v TO value",
+        );
         run_with(&mut e, &mut budget, "ALTER TABLE ic RENAME TO ic2");
         e.commit_wal();
     }
@@ -2420,46 +3424,105 @@ fn identity_survives_restart() {
 #[test]
 fn merge_statement() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TABLE tgt (id int PRIMARY KEY, v text, n int)");
-    run_with(&mut e, &mut b, "INSERT INTO tgt VALUES (1,'a',10),(2,'b',20),(3,'c',30)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE tgt (id int PRIMARY KEY, v text, n int)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO tgt VALUES (1,'a',10),(2,'b',20),(3,'c',30)",
+    );
     run_with(&mut e, &mut b, "CREATE TABLE src (id int, v text)");
-    run_with(&mut e, &mut b, "INSERT INTO src VALUES (2,'B'),(3,'C'),(4,'D'),(5,'E')");
-    let out = run_with(&mut e, &mut b,
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO src VALUES (2,'B'),(3,'C'),(4,'D'),(5,'E')",
+    );
+    let out = run_with(
+        &mut e,
+        &mut b,
         "MERGE INTO tgt t USING src s ON t.id = s.id \
          WHEN MATCHED AND s.id = 3 THEN DELETE \
          WHEN MATCHED THEN UPDATE SET v = s.v, n = t.n + 1 \
          WHEN NOT MATCHED AND s.id = 5 THEN DO NOTHING \
-         WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, s.v, 0)");
+         WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, s.v, 0)",
+    );
     assert!(String::from_utf8_lossy(&out).contains("MERGE 3"));
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT id, v, n FROM tgt ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, v, n FROM tgt ORDER BY id"
+        )),
         ["1|a|10", "2|B|21", "4|D|0"]
     );
     // Cardinality: a target row matched by two source rows → 21000.
     run_with(&mut e, &mut b, "INSERT INTO src VALUES (2,'dup')");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b,
-        "MERGE INTO tgt t USING src s ON t.id=s.id WHEN MATCHED THEN UPDATE SET v=s.v"))
-        .contains("21000"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "MERGE INTO tgt t USING src s ON t.id=s.id WHEN MATCHED THEN UPDATE SET v=s.v"
+        ))
+        .contains("21000")
+    );
     // VALUES source.
-    run_with(&mut e, &mut b, "MERGE INTO tgt t USING (VALUES (10,'x')) s(id,v) ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,v,n) VALUES (s.id, s.v, 99)");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT v, n FROM tgt WHERE id=10")), ["x|99"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "MERGE INTO tgt t USING (VALUES (10,'x')) s(id,v) ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,v,n) VALUES (s.id, s.v, 99)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT v, n FROM tgt WHERE id=10"
+        )),
+        ["x|99"]
+    );
 }
 
 #[test]
 fn sql_surface_batch() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TABLE s (id int, name text DEFAULT 'x', qty int DEFAULT 3)");
-    let bytes = run_with(&mut e, &mut b, "INSERT INTO s (id) VALUES (1), (2) RETURNING id, name, qty");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE s (id int, name text DEFAULT 'x', qty int DEFAULT 3)",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO s (id) VALUES (1), (2) RETURNING id, name, qty",
+    );
     assert_eq!(data_rows(&bytes), ["1|x|3", "2|x|3"]);
-    run_with(&mut e, &mut b, "INSERT INTO s VALUES (3, DEFAULT, 9), (4, 'y', 1)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO s VALUES (3, DEFAULT, 9), (4, 'y', 1)",
+    );
 
-    let bytes = run_with(&mut e, &mut b, "SELECT id FROM s WHERE id IN (2,4) ORDER BY 1");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id FROM s WHERE id IN (2,4) ORDER BY 1",
+    );
     assert_eq!(data_rows(&bytes), ["2", "4"]);
-    let bytes = run_with(&mut e, &mut b, "SELECT id FROM s WHERE qty BETWEEN 2 AND 5 ORDER BY id");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id FROM s WHERE qty BETWEEN 2 AND 5 ORDER BY id",
+    );
     assert_eq!(data_rows(&bytes), ["1", "2"]);
     let bytes = run_with(&mut e, &mut b, "SELECT DISTINCT name FROM s ORDER BY name");
     assert_eq!(data_rows(&bytes), ["x", "y"]);
-    let bytes = run_with(&mut e, &mut b, "SELECT id FROM s ORDER BY id OFFSET 1 LIMIT 2");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id FROM s ORDER BY id OFFSET 1 LIMIT 2",
+    );
     assert_eq!(data_rows(&bytes), ["2", "3"]);
     let bytes = run_with(
         &mut e,
@@ -2467,18 +3530,34 @@ fn sql_surface_batch() {
         "SELECT CASE WHEN qty > 5 THEN 'hi' ELSE 'lo' END FROM s ORDER BY id",
     );
     assert_eq!(data_rows(&bytes), ["lo", "lo", "hi", "lo"]);
-    let bytes = run_with(&mut e, &mut b, "SELECT name FROM s WHERE name LIKE '_' AND name NOT LIKE 'x' ORDER BY id LIMIT 1");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT name FROM s WHERE name LIKE '_' AND name NOT LIKE 'x' ORDER BY id LIMIT 1",
+    );
     assert_eq!(data_rows(&bytes), ["y"]);
-    let bytes = run_with(&mut e, &mut b, "UPDATE s SET qty = 0 WHERE id = 4 RETURNING qty");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "UPDATE s SET qty = 0 WHERE id = 4 RETURNING qty",
+    );
     assert_eq!(data_rows(&bytes), ["0"]);
     let bytes = run_with(&mut e, &mut b, "DELETE FROM s WHERE id = 1 RETURNING name");
     assert_eq!(data_rows(&bytes), ["x"]);
 
-    run_with(&mut e, &mut b, "ALTER TABLE s ADD COLUMN price float8 DEFAULT 1.5");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE s ADD COLUMN price float8 DEFAULT 1.5",
+    );
     run_with(&mut e, &mut b, "ALTER TABLE s RENAME COLUMN name TO title");
     run_with(&mut e, &mut b, "ALTER TABLE s DROP COLUMN qty");
     run_with(&mut e, &mut b, "ALTER TABLE s RENAME TO stock");
-    let bytes = run_with(&mut e, &mut b, "SELECT id, title, price FROM stock ORDER BY id");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id, title, price FROM stock ORDER BY id",
+    );
     assert_eq!(data_rows(&bytes), ["2|x|1.5", "3|x|1.5", "4|y|1.5"]);
 
     // The pool is per-connection; one message keeps one pool here.
@@ -2518,24 +3597,46 @@ fn alter_column_default_and_not_null() {
     run_with(&mut e, &mut b, "CREATE TABLE ac (id int, a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO ac VALUES (1, NULL, 'x')");
     // SET DEFAULT (COLUMN keyword optional) fills omitted columns on INSERT.
-    run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN b SET DEFAULT 'd'");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE ac ALTER COLUMN b SET DEFAULT 'd'",
+    );
     run_with(&mut e, &mut b, "ALTER TABLE ac ALTER a SET DEFAULT 7");
-    let bytes = run_with(&mut e, &mut b, "INSERT INTO ac (id) VALUES (2) RETURNING a, b");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO ac (id) VALUES (2) RETURNING a, b",
+    );
     assert_eq!(data_rows(&bytes), ["7|d"]);
     // DROP DEFAULT: the column falls back to NULL.
     run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a DROP DEFAULT");
-    let bytes = run_with(&mut e, &mut b, "INSERT INTO ac (id) VALUES (3) RETURNING coalesce(a, -1)");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO ac (id) VALUES (3) RETURNING coalesce(a, -1)",
+    );
     assert_eq!(data_rows(&bytes), ["-1"]);
     // SET NOT NULL is refused while a NULL is present (23502).
     let bytes = run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a SET NOT NULL");
-    assert!(String::from_utf8_lossy(&bytes).contains("23502"), "expected not-null violation");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("23502"),
+        "expected not-null violation"
+    );
     run_with(&mut e, &mut b, "UPDATE ac SET a = 0 WHERE a IS NULL");
     run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a SET NOT NULL");
     // Now enforced on new inserts.
     let bytes = run_with(&mut e, &mut b, "INSERT INTO ac (id, b) VALUES (4, 'z')");
-    assert!(String::from_utf8_lossy(&bytes).contains("23502"), "expected enforcement");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("23502"),
+        "expected enforcement"
+    );
     // DROP NOT NULL lifts it; a NULL then inserts.
-    run_with(&mut e, &mut b, "ALTER TABLE ac ALTER COLUMN a DROP NOT NULL");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE ac ALTER COLUMN a DROP NOT NULL",
+    );
     run_with(&mut e, &mut b, "INSERT INTO ac (id, b) VALUES (5, 'w')");
     // Rows 1,2,3,5 — the id=4 insert was rejected above, so four remain.
     let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM ac");
@@ -2549,21 +3650,40 @@ fn alter_column_type_rewrites_and_persists() {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a int, b text)");
-        run_with(&mut e, &mut b, "INSERT INTO ct VALUES (1, 42, 'hello'), (2, 100, 'yo')");
+        run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO ct VALUES (1, 42, 'hello'), (2, 100, 'yo')",
+        );
         // Assignment cast (int -> text) needs no USING.
         run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN a TYPE text");
         // Explicit-only cast without USING is refused (42804).
         let bytes = run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN b TYPE int");
-        assert!(String::from_utf8_lossy(&bytes).contains("42804"), "expected cast-automatically error");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("42804"),
+            "expected cast-automatically error"
+        );
         // USING evaluates over the old row.
-        run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN b TYPE int USING length(b)");
-        let bytes = run_with(&mut e, &mut b, "SELECT a, pg_typeof(a), b FROM ct ORDER BY id");
+        run_with(
+            &mut e,
+            &mut b,
+            "ALTER TABLE ct ALTER COLUMN b TYPE int USING length(b)",
+        );
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT a, pg_typeof(a), b FROM ct ORDER BY id",
+        );
         assert_eq!(data_rows(&bytes), ["42|text|5", "100|text|2"]);
     }
     // The rewritten shape and values survive a restart.
     let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
-    let bytes = run_with(&mut e, &mut b, "SELECT a, pg_typeof(b), b FROM ct ORDER BY id");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT a, pg_typeof(b), b FROM ct ORDER BY id",
+    );
     assert_eq!(data_rows(&bytes), ["42|integer|5", "100|integer|2"]);
 }
 
@@ -2574,29 +3694,56 @@ fn alter_add_drop_constraint() {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ch (id int, a int, b int)");
-        run_with(&mut e, &mut b, "INSERT INTO ch VALUES (1, 5, 10), (2, 7, 20)");
+        run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO ch VALUES (1, 5, 10), (2, 7, 20)",
+        );
         // ADD CHECK: violated by an existing row is refused (23514).
-        let bytes = run_with(&mut e, &mut b, "ALTER TABLE ch ADD CONSTRAINT ck CHECK (a > 6)");
-        assert!(String::from_utf8_lossy(&bytes).contains("23514"), "expected check violation on add");
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "ALTER TABLE ch ADD CONSTRAINT ck CHECK (a > 6)",
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("23514"),
+            "expected check violation on add"
+        );
         // A satisfied one attaches and is then enforced.
-        run_with(&mut e, &mut b, "ALTER TABLE ch ADD CONSTRAINT ck CHECK (a > 0)");
+        run_with(
+            &mut e,
+            &mut b,
+            "ALTER TABLE ch ADD CONSTRAINT ck CHECK (a > 0)",
+        );
         let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (3, -1, 30)");
-        assert!(String::from_utf8_lossy(&bytes).contains("23514"), "expected check enforced");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("23514"),
+            "expected check enforced"
+        );
         // ADD UNIQUE, then DROP by the generated name lifts enforcement.
         run_with(&mut e, &mut b, "ALTER TABLE ch ADD UNIQUE (b)");
         let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (4, 8, 10)");
-        assert!(String::from_utf8_lossy(&bytes).contains("23505"), "expected unique enforced");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("23505"),
+            "expected unique enforced"
+        );
         run_with(&mut e, &mut b, "ALTER TABLE ch DROP CONSTRAINT ch_b_key");
         run_with(&mut e, &mut b, "INSERT INTO ch VALUES (5, 9, 10)");
         // DROP of a missing constraint errors (42704).
         let bytes = run_with(&mut e, &mut b, "ALTER TABLE ch DROP CONSTRAINT nope");
-        assert!(String::from_utf8_lossy(&bytes).contains("42704"), "expected undefined constraint");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("42704"),
+            "expected undefined constraint"
+        );
     }
     // The CHECK constraint survives a restart and stays enforced.
     let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (6, -5, 60)");
-    assert!(String::from_utf8_lossy(&bytes).contains("23514"), "check survives restart");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("23514"),
+        "check survives restart"
+    );
     let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM ch");
     assert_eq!(data_rows(&bytes), ["3"]);
 }
@@ -2607,20 +3754,43 @@ fn alter_rename_constraint() {
     let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE rc (id int, a int, b int)");
-    run_with(&mut e, &mut b, "ALTER TABLE rc ADD CONSTRAINT ck0 CHECK (a > 0)");
-    run_with(&mut e, &mut b, "ALTER TABLE rc ADD CONSTRAINT u UNIQUE (b, id)");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE rc ADD CONSTRAINT ck0 CHECK (a > 0)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE rc ADD CONSTRAINT u UNIQUE (b, id)",
+    );
     run_with(&mut e, &mut b, "ALTER TABLE rc RENAME CONSTRAINT ck0 TO ck");
     run_with(&mut e, &mut b, "ALTER TABLE rc RENAME CONSTRAINT u TO u2");
     // Onto an existing name is 42710; a missing old name is 42704.
     let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TABLE rc ADD CONSTRAINT keep CHECK (a < 9); ALTER TABLE rc RENAME CONSTRAINT ck TO keep")).to_string();
     assert!(text.contains("42710"), "{text}");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TABLE rc RENAME CONSTRAINT nope TO whatever")).to_string();
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE rc RENAME CONSTRAINT nope TO whatever",
+    ))
+    .to_string();
     assert!(text.contains("42704"), "{text}");
     // The renamed CHECK is still enforced and droppable by its new name.
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO rc VALUES (1, -1, 1)")).to_string();
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO rc VALUES (1, -1, 1)",
+    ))
+    .to_string();
     assert!(text.contains("23514"), "{text}");
     run_with(&mut e, &mut b, "ALTER TABLE rc DROP CONSTRAINT ck");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO rc VALUES (2, -1, 2)")).to_string();
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO rc VALUES (2, -1, 2)",
+    ))
+    .to_string();
     assert!(!text.contains("ERROR"), "{text}");
 }
 
@@ -2646,26 +3816,48 @@ fn check_constraint_auto_naming() {
         ("INSERT INTO cn VALUES (50, 0)", "cn_a_check2\""),
     ] {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, sql)).to_string();
-        assert!(text.contains("23514") && text.contains(name), "{sql} => {text}");
+        assert!(
+            text.contains("23514") && text.contains(name),
+            "{sql} => {text}"
+        );
     }
     // A column-level CHECK naming only another column is keyed off that column.
-    run_with(&mut e, &mut b, "CREATE TABLE cm (a int CHECK (b > 0), b int)");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (1, -1)")).to_string();
-    assert!(text.contains("23514") && text.contains("cm_b_check\""), "{text}");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE cm (a int CHECK (b > 0), b int)",
+    );
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (1, -1)"))
+        .to_string();
+    assert!(
+        text.contains("23514") && text.contains("cm_b_check\""),
+        "{text}"
+    );
     // An explicit name wins and is not disambiguated; the later unnamed CHECK on
     // the same column takes the base generated name.
-    run_with(&mut e, &mut b, "CREATE TABLE ck (a int CONSTRAINT keep_me CHECK (a > 0), CHECK (a < 100))");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO ck VALUES (-1)")).to_string();
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE ck (a int CONSTRAINT keep_me CHECK (a > 0), CHECK (a < 100))",
+    );
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO ck VALUES (-1)"))
+        .to_string();
     assert!(text.contains("keep_me\""), "{text}");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO ck VALUES (200)")).to_string();
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO ck VALUES (200)"))
+        .to_string();
     assert!(text.contains("ck_a_check\""), "{text}");
     // ALTER TABLE ADD CHECK auto-names identically and the generated name is
     // what DROP CONSTRAINT uses.
     run_with(&mut e, &mut b, "ALTER TABLE cm ADD CHECK (a < 10)");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (20, 1)")).to_string();
-    assert!(text.contains("23514") && text.contains("cm_a_check\""), "{text}");
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (20, 1)"))
+        .to_string();
+    assert!(
+        text.contains("23514") && text.contains("cm_a_check\""),
+        "{text}"
+    );
     run_with(&mut e, &mut b, "ALTER TABLE cm DROP CONSTRAINT cm_a_check");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (20, 1)")).to_string();
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO cm VALUES (20, 1)"))
+        .to_string();
     assert!(!text.contains("ERROR"), "{text}");
 }
 
@@ -2699,7 +3891,10 @@ fn value_index_matches_uniqueness_oracle() {
             let key = (next() % 50) as i64;
             match next() % 3 {
                 0 => {
-                    let out = run(&mut e, &format!("INSERT INTO t VALUES ({}, {})", key, next() % 1000));
+                    let out = run(
+                        &mut e,
+                        &format!("INSERT INTO t VALUES ({}, {})", key, next() % 1000),
+                    );
                     if present.contains(&key) {
                         assert!(out.contains("23505"), "dup insert {key}: {out}");
                     } else {
@@ -2754,30 +3949,58 @@ fn named_single_column_key_retains_name() {
     let mut e = Engine::new(&config, &mut b).unwrap();
     // An explicit name on a single-column UNIQUE is kept: the violation names it
     // and DROP CONSTRAINT finds it.
-    run_with(&mut e, &mut b, "CREATE TABLE t (a int CONSTRAINT myc UNIQUE, b int)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE t (a int CONSTRAINT myc UNIQUE, b int)",
+    );
     run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 1)");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 2)")).to_string();
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 2)"))
+        .to_string();
     assert!(text.contains("23505") && text.contains("myc\""), "{text}");
     run_with(&mut e, &mut b, "ALTER TABLE t DROP CONSTRAINT myc");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 3)")).to_string();
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1, 3)"))
+        .to_string();
     assert!(!text.contains("ERROR"), "drop by name: {text}");
     // A named single-column PRIMARY KEY: the violation names it, and DROP NOT
     // NULL on its column is rejected (the key implies NOT NULL).
-    run_with(&mut e, &mut b, "CREATE TABLE p (id int CONSTRAINT p_id PRIMARY KEY, v int)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE p (id int CONSTRAINT p_id PRIMARY KEY, v int)",
+    );
     run_with(&mut e, &mut b, "INSERT INTO p VALUES (1, 1)");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO p VALUES (1, 2)")).to_string();
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO p VALUES (1, 2)"))
+        .to_string();
     assert!(text.contains("23505") && text.contains("p_id\""), "{text}");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "ALTER TABLE p ALTER COLUMN id DROP NOT NULL")).to_string();
-    assert!(text.contains("42P16") && text.contains("primary key"), "{text}");
+    let text = String::from_utf8_lossy(&run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE p ALTER COLUMN id DROP NOT NULL",
+    ))
+    .to_string();
+    assert!(
+        text.contains("42P16") && text.contains("primary key"),
+        "{text}"
+    );
     // Renaming an unnamed single-column key by its synthesized name materializes
     // it as a named key; the new name then enforces and drops.
     run_with(&mut e, &mut b, "CREATE TABLE u (x int UNIQUE)");
-    run_with(&mut e, &mut b, "ALTER TABLE u RENAME CONSTRAINT u_x_key TO xkey");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE u RENAME CONSTRAINT u_x_key TO xkey",
+    );
     run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)")).to_string();
-    assert!(text.contains("23505") && text.contains("xkey\""), "rename materialize: {text}");
+    let text =
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)")).to_string();
+    assert!(
+        text.contains("23505") && text.contains("xkey\""),
+        "rename materialize: {text}"
+    );
     run_with(&mut e, &mut b, "ALTER TABLE u DROP CONSTRAINT xkey");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)")).to_string();
+    let text =
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u VALUES (5)")).to_string();
     assert!(!text.contains("ERROR"), "drop renamed: {text}");
 }
 
@@ -2789,7 +4012,11 @@ fn alter_table_multi_action() {
     run_with(&mut e, &mut b, "CREATE TABLE m (a int)");
     run_with(&mut e, &mut b, "INSERT INTO m VALUES (1), (2), (3)");
     // Several ADD COLUMNs with defaults applied in one statement.
-    run_with(&mut e, &mut b, "ALTER TABLE m ADD COLUMN b int DEFAULT 10, ADD COLUMN c text DEFAULT 'x'");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE m ADD COLUMN b int DEFAULT 10, ADD COLUMN c text DEFAULT 'x'",
+    );
     let bytes = run_with(&mut e, &mut b, "SELECT a, b, c FROM m ORDER BY a");
     assert_eq!(data_rows(&bytes), ["1|10|x", "2|10|x", "3|10|x"]);
     // Pass ordering: an ADD CONSTRAINT can reference a column ADDed later in the
@@ -2832,7 +4059,11 @@ fn alter_table_multi_action() {
     let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT g FROM m")).to_string();
     assert!(text.contains("42703"), "g should not exist: {text}");
     // DROP one column and ADD another in one statement.
-    run_with(&mut e, &mut b, "ALTER TABLE m DROP COLUMN c, ADD COLUMN h int DEFAULT 99");
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE m DROP COLUMN c, ADD COLUMN h int DEFAULT 99",
+    );
     let bytes = run_with(&mut e, &mut b, "SELECT a, b, d, h FROM m ORDER BY a");
     assert_eq!(data_rows(&bytes), ["1|10|1|99", "2|10|1|99", "3|10|1|99"]);
 }
@@ -2859,13 +4090,27 @@ fn vacuum_and_analyze() {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
         assert!(text.contains("ANALYZE"), "{cmd}: {text}");
     }
+    let missing_table = run_with(&mut e, &mut b, "ANALYZE missing_table");
+    assert!(
+        String::from_utf8_lossy(&missing_table).contains("42P01"),
+        "{}",
+        String::from_utf8_lossy(&missing_table)
+    );
+    let missing_column = run_with(&mut e, &mut b, "ANALYZE vt (missing_column)");
+    assert!(
+        String::from_utf8_lossy(&missing_column).contains("42703"),
+        "{}",
+        String::from_utf8_lossy(&missing_column)
+    );
     // The data is untouched.
     let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM vt");
     assert_eq!(data_rows(&bytes), ["2"]);
     // VACUUM is non-transactional (25001); ANALYZE is allowed.
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "BEGIN; VACUUM vt; ROLLBACK")).to_string();
+    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "BEGIN; VACUUM vt; ROLLBACK"))
+        .to_string();
     assert!(text.contains("25001"), "{text}");
-    let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, "BEGIN; ANALYZE vt; COMMIT")).to_string();
+    let text =
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "BEGIN; ANALYZE vt; COMMIT")).to_string();
     assert!(!text.contains("25001") && !text.contains("ERROR"), "{text}");
 }
 
@@ -2873,8 +4118,16 @@ fn vacuum_and_analyze() {
 fn joins_group_by_subqueries() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE d (id int, name text)");
-    run_with(&mut e, &mut b, "CREATE TABLE emp (id int, did int, name text, pay int)");
-    run_with(&mut e, &mut b, "INSERT INTO d VALUES (1,'eng'),(2,'ops'),(3,'none')");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE emp (id int, did int, name text, pay int)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO d VALUES (1,'eng'),(2,'ops'),(3,'none')",
+    );
     run_with(
         &mut e,
         &mut b,
@@ -2893,7 +4146,10 @@ fn joins_group_by_subqueries() {
         &mut b,
         "SELECT e.name, d.name FROM emp e LEFT JOIN d ON e.did = d.id ORDER BY e.id",
     );
-    assert_eq!(data_rows(&bytes), ["ada|eng", "bob|eng", "cyd|ops", "dee|NULL"]);
+    assert_eq!(
+        data_rows(&bytes),
+        ["ada|eng", "bob|eng", "cyd|ops", "dee|NULL"]
+    );
 
     let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM emp, d");
     assert_eq!(data_rows(&bytes), ["12"]);
@@ -2951,7 +4207,11 @@ fn datetime_uuid_bytea_types() {
     {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
-        run_with(&mut e, &mut b, "CREATE TABLE ev (d date, t timestamptz, u uuid, raw bytea)");
+        run_with(
+            &mut e,
+            &mut b,
+            "CREATE TABLE ev (d date, t timestamptz, u uuid, raw bytea)",
+        );
         run_with(
             &mut e,
             &mut b,
@@ -2963,7 +4223,11 @@ fn datetime_uuid_bytea_types() {
             data_rows(&bytes),
             ["2024-02-29|2024-02-29 10:00:00+00|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|\\xdeadbeef"]
         );
-        let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM ev WHERE d = '2024-02-29' AND t < '2025-01-01'");
+        let bytes = run_with(
+            &mut e,
+            &mut b,
+            "SELECT count(*) FROM ev WHERE d = '2024-02-29' AND t < '2025-01-01'",
+        );
         assert_eq!(data_rows(&bytes), ["1"]);
     }
     // Types survive WAL replay.
@@ -2978,10 +4242,22 @@ fn datetime_uuid_bytea_types() {
 #[test]
 fn comment_roundtrip_and_removal() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TABLE ct (id int PRIMARY KEY, a text)");
-    run_with(&mut e, &mut b, "CREATE VIEW cv AS SELECT a AS renamed FROM ct");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE ct (id int PRIMARY KEY, a text)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE VIEW cv AS SELECT a AS renamed FROM ct",
+    );
     run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
-    run_with(&mut e, &mut b, "CREATE DOMAIN positive AS int CHECK (VALUE > 0)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE DOMAIN positive AS int CHECK (VALUE > 0)",
+    );
     run_with(&mut e, &mut b, "CREATE SCHEMA cs");
     run_with(&mut e, &mut b, "CREATE TABLE cs.source (value int)");
     let mut guc = GucState::new();
@@ -3109,19 +4385,74 @@ fn comment_errors_match_postgres() {
     run_with(&mut e, &mut b, "CREATE SEQUENCE cs");
     run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
     // Missing relation, wrong kind, missing column, missing schema.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE nope IS 'x'")).contains("42P01"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE cv IS 'x'")).contains("42809"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON VIEW ct IS 'x'")).contains("42809"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.nope IS 'x'")).contains("42703"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN cv.nope IS 'x'")).contains("42703"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN ci.a IS 'x'")).contains("42809"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN cs.last_value IS 'x'")).contains("42809"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON SCHEMA nope IS 'x'")).contains("3F000"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE nope IS 'x'")).contains("42704"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE pg_catalog.integer IS 'x'")).contains("42704"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE serial IS 'x'")).contains("42704"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN mood IS 'x'")).contains("42809"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN ct IS 'x'")).contains("42809"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE nope IS 'x'"))
+            .contains("42P01")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE cv IS 'x'"))
+            .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON VIEW ct IS 'x'"))
+            .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON COLUMN ct.nope IS 'x'"
+        ))
+        .contains("42703")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON COLUMN cv.nope IS 'x'"
+        ))
+        .contains("42703")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON COLUMN ci.a IS 'x'"))
+            .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON COLUMN cs.last_value IS 'x'"
+        ))
+        .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON SCHEMA nope IS 'x'"))
+            .contains("3F000")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE nope IS 'x'"))
+            .contains("42704")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON TYPE pg_catalog.integer IS 'x'"
+        ))
+        .contains("42704")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TYPE serial IS 'x'"))
+            .contains("42704")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN mood IS 'x'"))
+            .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN ct IS 'x'"))
+            .contains("42809")
+    );
 }
 
 #[test]
@@ -3129,27 +4460,52 @@ fn comment_rolls_back() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE ct (a int)");
-    run_txn(&mut e, &mut b, &mut t, "CREATE TYPE mood AS ENUM ('low', 'high')");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TYPE mood AS ENUM ('low', 'high')",
+    );
     run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS 'committed'");
     // A rolled-back overwrite restores the committed comment.
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
     run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS 'doomed'");
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
-    let bytes = run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT obj_description('ct'::regclass)");
+    let bytes = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT obj_description('ct'::regclass)",
+    );
     assert_eq!(data_rows(&bytes), ["committed"]);
     // A rolled-back fresh comment leaves none.
     run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS NULL");
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
     run_txn(&mut e, &mut b, &mut t, "COMMENT ON TABLE ct IS 'doomed'");
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
-    let bytes = run_with_txn_bytes(&mut e, &mut b, &mut t, "SELECT obj_description('ct'::regclass)");
+    let bytes = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT obj_description('ct'::regclass)",
+    );
     assert_eq!(data_rows(&bytes), ["NULL"]);
 
     // Catalog scans and helper functions both see the transaction's own
     // comment overlay, then return to the committed value after rollback.
-    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TYPE mood IS 'committed type'");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "COMMENT ON TYPE mood IS 'committed type'",
+    );
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
-    run_txn(&mut e, &mut b, &mut t, "COMMENT ON TYPE mood IS 'doomed type'");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "COMMENT ON TYPE mood IS 'doomed type'",
+    );
     let bytes = run_with_txn_bytes(
         &mut e,
         &mut b,
@@ -3259,8 +4615,7 @@ fn pg_restore_clean_owner_and_schema_cascade_surface() {
     assert!(String::from_utf8_lossy(&existing).contains("ALTER TABLE"));
 
     assert!(
-        String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP SCHEMA restore"))
-            .contains("2BP01")
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP SCHEMA restore")).contains("2BP01")
     );
     run_with(
         &mut e,
@@ -3339,7 +4694,11 @@ fn type_cascade_never_leaves_cross_schema_columns_dangling() {
         String::from_utf8_lossy(&dropped_type)
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT amount FROM public.consumer")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT amount FROM public.consumer"
+        )),
         ["1"]
     );
     assert_eq!(
@@ -3433,11 +4792,7 @@ fn drop_domain_cascade_removes_the_bounded_descendant_closure() {
          CREATE DOMAIN domain_tree.branch AS domain_tree.root;
          CREATE DOMAIN domain_tree.leaf AS domain_tree.branch;",
     );
-    let restricted = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP DOMAIN domain_tree.root",
-    );
+    let restricted = run_with(&mut engine, &mut budget, "DROP DOMAIN domain_tree.root");
     assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
     let dropped = run_with(
         &mut engine,
@@ -3462,13 +4817,15 @@ fn drop_domain_cascade_removes_the_bounded_descendant_closure() {
         &mut budget,
         "DROP DOMAIN domain_tree.root CASCADE",
     );
-    assert!(data_rows(&run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT typname FROM pg_type
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type
          WHERE typname IN ('root','branch','leaf')"
-    ))
-    .is_empty());
+        ))
+        .is_empty()
+    );
     let recreated = run_with(
         &mut engine,
         &mut budget,
@@ -3495,11 +4852,7 @@ fn drop_enum_cascade_removes_dependent_domains() {
         "{}",
         String::from_utf8_lossy(&created)
     );
-    let restricted = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP TYPE enum_tree.root"
-    );
+    let restricted = run_with(&mut engine, &mut budget, "DROP TYPE enum_tree.root");
     assert!(
         String::from_utf8_lossy(&restricted).contains("2BP01"),
         "{}",
@@ -3521,18 +4874,16 @@ fn drop_enum_cascade_removes_dependent_domains() {
         )),
         ["branch", "leaf", "root"]
     );
-    let dropped = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP TYPE enum_tree.root CASCADE",
-    );
+    let dropped = run_with(&mut engine, &mut budget, "DROP TYPE enum_tree.root CASCADE");
     assert!(!message_types(&dropped).contains(&b'E'));
-    assert!(data_rows(&run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT typname FROM pg_type WHERE typname IN ('root','branch','leaf')"
-    ))
-    .is_empty());
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type WHERE typname IN ('root','branch','leaf')"
+        ))
+        .is_empty()
+    );
 }
 
 #[test]
@@ -3569,19 +4920,17 @@ fn drop_schema_cascade_handles_cross_schema_type_dependents_without_corruption()
         )),
         ["mood", "mood_domain", "positive", "positive_domain"]
     );
-    let dropped = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP SCHEMA type_roots CASCADE",
-    );
+    let dropped = run_with(&mut engine, &mut budget, "DROP SCHEMA type_roots CASCADE");
     assert!(!message_types(&dropped).contains(&b'E'));
-    assert!(data_rows(&run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT typname FROM pg_type
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type
          WHERE typname IN ('mood','positive','mood_domain','positive_domain')"
-    ))
-    .is_empty());
+        ))
+        .is_empty()
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -3603,17 +4952,16 @@ fn drop_schema_cascade_drops_external_stored_query_dependents() {
          CREATE TABLE view_source.items (id integer);
          CREATE VIEW view_consumer.items AS SELECT id FROM view_source.items;",
     );
-    let dropped = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP SCHEMA view_source CASCADE",
-    );
+    let dropped = run_with(&mut engine, &mut budget, "DROP SCHEMA view_source CASCADE");
     assert!(!message_types(&dropped).contains(&b'E'));
-    assert!(String::from_utf8_lossy(&run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT count(*) FROM view_consumer.items"
-    )).contains("42P01"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM view_consumer.items"
+        ))
+        .contains("42P01")
+    );
 }
 
 #[test]
@@ -3631,19 +4979,28 @@ fn type_drop_cascades_to_stored_query_dependents() {
         "{}",
         String::from_utf8_lossy(&created)
     );
-    assert!(String::from_utf8_lossy(&run_with(
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "DROP TYPE view_types.mood"
+        ))
+        .contains("2BP01")
+    );
+    let dropped = run_with(
         &mut engine,
         &mut budget,
-        "DROP TYPE view_types.mood"
-    ))
-    .contains("2BP01"));
-    let dropped = run_with(&mut engine, &mut budget, "DROP TYPE view_types.mood CASCADE");
+        "DROP TYPE view_types.mood CASCADE",
+    );
     assert!(!message_types(&dropped).contains(&b'E'));
-    assert!(String::from_utf8_lossy(&run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT mood FROM public.mood_view"
-    )).contains("42P01"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT mood FROM public.mood_view"
+        ))
+        .contains("42P01")
+    );
 }
 
 #[test]
@@ -3663,16 +5020,13 @@ fn relation_drop_cascades_through_stored_query_dependency_closure() {
         "{}",
         String::from_utf8_lossy(&created)
     );
-    let restricted = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP TABLE dependency_root",
-    );
+    let restricted = run_with(&mut engine, &mut budget, "DROP TABLE dependency_root");
     let restricted_text = String::from_utf8_lossy(&restricted);
     assert!(restricted_text.contains("2BP01"));
-    assert!(restricted_text.contains(
-        "materialized view dependency_matview depends on view dependency_view"
-    ));
+    assert!(
+        restricted_text
+            .contains("materialized view dependency_matview depends on view dependency_view")
+    );
     let dropped = run_with(
         &mut engine,
         &mut budget,
@@ -3748,9 +5102,10 @@ fn sequence_drop_cascades_to_stored_query_dependents() {
     );
     let restricted_text = String::from_utf8_lossy(&restricted);
     assert!(restricted_text.contains("2BP01"));
-    assert!(restricted_text.contains(
-        "view dependency_sequence_view depends on sequence dependency_sequence"
-    ));
+    assert!(
+        restricted_text
+            .contains("view dependency_sequence_view depends on sequence dependency_sequence")
+    );
     let dropped = run_with(
         &mut engine,
         &mut budget,
@@ -3914,7 +5269,6 @@ fn materialized_view_refresh_uses_captured_dependencies_after_rename() {
     );
 }
 
-
 #[test]
 fn comment_survives_restart_and_drop_clears_it() {
     let config = test_config("comment-durable");
@@ -3974,7 +5328,11 @@ fn comment_survives_restart_and_drop_clears_it() {
 #[test]
 fn network_types_roundtrip_and_order() {
     let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TABLE net (a inet, c cidr, m macaddr, m8 macaddr8)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE net (a inet, c cidr, m macaddr, m8 macaddr8)",
+    );
     run_with(
         &mut e,
         &mut b,
@@ -3990,11 +5348,19 @@ fn network_types_roundtrip_and_order() {
         ]
     );
     // Casts and pg_typeof.
-    let bytes = run_with(&mut e, &mut b, "SELECT '192.168.1.5/24'::inet::cidr, pg_typeof('10.0.0.1'::inet)");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT '192.168.1.5/24'::inet::cidr, pg_typeof('10.0.0.1'::inet)",
+    );
     assert_eq!(data_rows(&bytes), ["192.168.1.0/24|inet"]);
     // A bad literal errors 22P02.
     let bytes = run_with(&mut e, &mut b, "SELECT '999.1.1.1'::inet");
-    assert!(String::from_utf8_lossy(&bytes).contains("22P02"), "{}", String::from_utf8_lossy(&bytes));
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("22P02"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
 }
 
 #[test]
@@ -4013,7 +5379,9 @@ fn network_functions_match_postgres() {
     );
     assert_eq!(
         data_rows(&bytes),
-        ["4|192.168.1.5|24|192.168.1.255/24|255.255.255.0|0.0.0.255|192.168.1.0/24|10.1/16|192.168.1.5/24|192.168.1.5/16|f|192.168.0.0/22|08:00:2b:00:00:00|08:00:2b:00:00:00:00:00|02:00:2b:01:02:03:04:05"]
+        [
+            "4|192.168.1.5|24|192.168.1.255/24|255.255.255.0|0.0.0.255|192.168.1.0/24|10.1/16|192.168.1.5/24|192.168.1.5/16|f|192.168.0.0/22|08:00:2b:00:00:00|08:00:2b:00:00:00:00:00|02:00:2b:01:02:03:04:05"
+        ]
     );
 }
 
@@ -4023,7 +5391,11 @@ fn network_types_survive_restart() {
     {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
-        run_with(&mut e, &mut b, "CREATE TABLE nd (a inet, c cidr, m macaddr, m8 macaddr8)");
+        run_with(
+            &mut e,
+            &mut b,
+            "CREATE TABLE nd (a inet, c cidr, m macaddr, m8 macaddr8)",
+        );
         run_with(
             &mut e,
             &mut b,
@@ -4307,7 +5679,11 @@ fn domains_survive_restart() {
     {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
-        run_with(&mut e, &mut b, "CREATE DOMAIN posint AS int NOT NULL CHECK (VALUE > 0) CHECK (VALUE < 100)");
+        run_with(
+            &mut e,
+            &mut b,
+            "CREATE DOMAIN posint AS int NOT NULL CHECK (VALUE > 0) CHECK (VALUE < 100)",
+        );
         run_with(&mut e, &mut b, "CREATE TABLE dt (a posint DEFAULT 7)");
         run_with(&mut e, &mut b, "INSERT INTO dt VALUES (42)");
         e.commit_wal();
@@ -4319,8 +5695,14 @@ fn domains_survive_restart() {
         let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(a), a FROM dt");
         assert_eq!(data_rows(&bytes), ["posint|42"]);
         // The domain still enforces after replay.
-        assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (0)")).contains("23514"));
-        assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (NULL)")).contains("23502"));
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (0)"))
+                .contains("23514")
+        );
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO dt VALUES (NULL)"))
+                .contains("23502")
+        );
         // The domain default is baked into the column.
         run_with(&mut e, &mut b, "INSERT INTO dt DEFAULT VALUES");
         let bytes = run_with(&mut e, &mut b, "SELECT a FROM dt ORDER BY a");
@@ -4493,10 +5875,22 @@ fn enums_survive_restart() {
     {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
-        run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
-        run_with(&mut e, &mut b, "ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'");
+        run_with(
+            &mut e,
+            &mut b,
+            "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+        );
+        run_with(
+            &mut e,
+            &mut b,
+            "ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'",
+        );
         run_with(&mut e, &mut b, "CREATE TABLE et (id int, m mood)");
-        run_with(&mut e, &mut b, "INSERT INTO et VALUES (1,'happy'),(2,'meh'),(3,'sad')");
+        run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO et VALUES (1,'happy'),(2,'meh'),(3,'sad')",
+        );
         run_with(&mut e, &mut b, "ALTER TYPE mood RENAME TO feeling");
         e.commit_wal();
     }
@@ -4515,12 +5909,16 @@ fn enums_survive_restart() {
             "SELECT pg_typeof(m), string_agg(id::text, ',' ORDER BY id) \
              FROM et GROUP BY m ORDER BY m",
         );
-        assert_eq!(
-            data_rows(&bytes),
-            ["feeling|3", "feeling|2", "feeling|1"]
-        );
+        assert_eq!(data_rows(&bytes), ["feeling|3", "feeling|2", "feeling|1"]);
         // Still enforces its labels after replay.
-        assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO et VALUES (9,'bogus')")).contains("22P02"));
+        assert!(
+            String::from_utf8_lossy(&run_with(
+                &mut e,
+                &mut b,
+                "INSERT INTO et VALUES (9,'bogus')"
+            ))
+            .contains("22P02")
+        );
         // The added value is usable.
         run_with(&mut e, &mut b, "INSERT INTO et VALUES (4,'ok'::feeling)");
         let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
@@ -4630,23 +6028,47 @@ fn lateral_joins() {
     run_with(&mut e, &mut b, "CREATE TABLE lt (id int, n int)");
     run_with(&mut e, &mut b, "INSERT INTO lt VALUES (1,2),(2,3),(3,0)");
     run_with(&mut e, &mut b, "CREATE TABLE lu (tid int, v text)");
-    run_with(&mut e, &mut b, "INSERT INTO lu VALUES (1,'a'),(1,'b'),(2,'c')");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO lu VALUES (1,'a'),(1,'b'),(2,'c')",
+    );
     // A FROM-less lateral body projects an outer expression per row.
-    let bytes = run_with(&mut e, &mut b, "SELECT id, d FROM lt, LATERAL (SELECT lt.n*2 AS d) s ORDER BY id");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id, d FROM lt, LATERAL (SELECT lt.n*2 AS d) s ORDER BY id",
+    );
     assert_eq!(data_rows(&bytes), ["1|4", "2|6", "3|0"]);
     // CROSS JOIN LATERAL over a correlated subquery (correlation in WHERE);
     // rows with no match drop out.
-    let bytes = run_with(&mut e, &mut b, "SELECT t.id, s.v FROM lt t CROSS JOIN LATERAL (SELECT v FROM lu WHERE lu.tid=t.id) s ORDER BY t.id, s.v");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT t.id, s.v FROM lt t CROSS JOIN LATERAL (SELECT v FROM lu WHERE lu.tid=t.id) s ORDER BY t.id, s.v",
+    );
     assert_eq!(data_rows(&bytes), ["1|a", "1|b", "2|c"]);
     // LEFT JOIN LATERAL preserves a left row whose lateral side is empty.
-    let bytes = run_with(&mut e, &mut b, "SELECT t.id, s.v FROM lt t LEFT JOIN LATERAL (SELECT v FROM lu WHERE lu.tid=t.id) s ON true ORDER BY t.id, s.v");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT t.id, s.v FROM lt t LEFT JOIN LATERAL (SELECT v FROM lu WHERE lu.tid=t.id) s ON true ORDER BY t.id, s.v",
+    );
     assert_eq!(data_rows(&bytes), ["1|a", "1|b", "2|c", "3|NULL"]);
     // An aggregate inside the lateral body — one row per outer row, 0 for none.
-    let bytes = run_with(&mut e, &mut b, "SELECT t.id, s.c FROM lt t, LATERAL (SELECT count(*) AS c FROM lu WHERE lu.tid=t.id) s ORDER BY t.id");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT t.id, s.c FROM lt t, LATERAL (SELECT count(*) AS c FROM lu WHERE lu.tid=t.id) s ORDER BY t.id",
+    );
     assert_eq!(data_rows(&bytes), ["1|2", "2|1", "3|0"]);
     // A set-returning function taking an outer argument; an empty series (n=0)
     // contributes no rows.
-    let bytes = run_with(&mut e, &mut b, "SELECT id, g FROM lt, LATERAL generate_series(1, lt.n) g ORDER BY id, g");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id, g FROM lt, LATERAL generate_series(1, lt.n) g ORDER BY id, g",
+    );
     assert_eq!(data_rows(&bytes), ["1|1", "1|2", "2|1", "2|2", "2|3"]);
     // The LATERAL keyword is optional for functions: arguments may reference
     // preceding FROM items, and WITH ORDINALITY restarts for every left row.
@@ -4674,10 +6096,24 @@ fn lateral_joins() {
     );
     assert_eq!(data_rows(&bytes), ["1|{x.a,x.b}", "2|{}", "3|{x.c}"]);
     // Two lateral items, the second referencing the first's output.
-    let bytes = run_with(&mut e, &mut b, "SELECT t.id, a.g, b.d FROM lt t, LATERAL generate_series(1,t.n) a(g), LATERAL (SELECT a.g*10 AS d) b ORDER BY t.id, a.g");
-    assert_eq!(data_rows(&bytes), ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT t.id, a.g, b.d FROM lt t, LATERAL generate_series(1,t.n) a(g), LATERAL (SELECT a.g*10 AS d) b ORDER BY t.id, a.g",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]
+    );
     // RIGHT JOIN LATERAL is rejected loudly.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT 1) s ON true")).contains("0A000"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT 1) s ON true"
+        ))
+        .contains("0A000")
+    );
 }
 
 #[test]
@@ -4725,13 +6161,21 @@ fn correlated_scalar_subquery_streaming() {
 #[test]
 fn where_filters_before_correlated_projection() {
     let (mut engine, mut budget) = test_engine();
-    run_with(&mut engine, &mut budget, "CREATE TABLE outer_rows (id integer)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE outer_rows (id integer)",
+    );
     run_with(
         &mut engine,
         &mut budget,
         "CREATE TABLE inner_rows (outer_id integer, value integer)",
     );
-    run_with(&mut engine, &mut budget, "INSERT INTO outer_rows VALUES (1), (2)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO outer_rows VALUES (1), (2)",
+    );
     run_with(
         &mut engine,
         &mut budget,
@@ -4793,11 +6237,18 @@ fn exists_uncorrelated() {
     run_with(&mut e, &mut b, "CREATE TABLE u (k int)");
     run_with(&mut e, &mut b, "INSERT INTO t VALUES (1),(2)");
     // u empty: EXISTS is false for all rows, NOT EXISTS true for all.
-    let bytes = run_with(&mut e, &mut b, "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)",
+    );
     assert_eq!(data_rows(&bytes), Vec::<String>::new());
     run_with(&mut e, &mut b, "INSERT INTO u VALUES (9)");
-    let bytes =
-        run_with(&mut e, &mut b, "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u) ORDER BY a");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u) ORDER BY a",
+    );
     assert_eq!(data_rows(&bytes), ["1", "2"]);
 }
 
@@ -4820,27 +6271,86 @@ fn for_update_locking_clause() {
         "SELECT id FROM lk ORDER BY id FOR UPDATE SKIP LOCKED",
         "SELECT id FROM lk t1 ORDER BY id FOR UPDATE OF t1",
     ] {
-        assert_eq!(data_rows(&run_with(&mut e, &mut b, sql)), ["1", "2", "3"], "{sql}");
+        assert_eq!(
+            data_rows(&run_with(&mut e, &mut b, sql)),
+            ["1", "2", "3"],
+            "{sql}"
+        );
     }
     // A FROM-less SELECT may carry the clause (it locks nothing).
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT 1 FOR UPDATE")), ["1"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT 1 FOR UPDATE")),
+        ["1"]
+    );
 
     // Analysis-time restrictions, each with the clause's own keyword and SQLSTATE.
     let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
-    assert!(err(&run_with(&mut e, &mut b, "SELECT count(*) FROM lk FOR UPDATE")).contains("0A000"));
-    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk GROUP BY id FOR UPDATE")).contains("0A000"));
-    assert!(err(&run_with(&mut e, &mut b, "SELECT DISTINCT id FROM lk FOR UPDATE")).contains("0A000"));
-    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk UNION SELECT v FROM lk FOR UPDATE")).contains("0A000"));
-    assert!(err(&run_with(&mut e, &mut b, "SELECT id, row_number() OVER () FROM lk FOR UPDATE")).contains("0A000"));
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT count(*) FROM lk FOR UPDATE"
+        ))
+        .contains("0A000")
+    );
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id FROM lk GROUP BY id FOR UPDATE"
+        ))
+        .contains("0A000")
+    );
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT DISTINCT id FROM lk FOR UPDATE"
+        ))
+        .contains("0A000")
+    );
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id FROM lk UNION SELECT v FROM lk FOR UPDATE"
+        ))
+        .contains("0A000")
+    );
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, row_number() OVER () FROM lk FOR UPDATE"
+        ))
+        .contains("0A000")
+    );
     // OF must name a relation in the FROM clause (42P01); an alias hides the name.
-    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk FOR UPDATE OF nope")).contains("42P01"));
-    assert!(err(&run_with(&mut e, &mut b, "SELECT id FROM lk x FOR UPDATE OF lk")).contains("42P01"));
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id FROM lk FOR UPDATE OF nope"
+        ))
+        .contains("42P01")
+    );
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id FROM lk x FOR UPDATE OF lk"
+        ))
+        .contains("42P01")
+    );
     // CTE/view expansion must preserve the main query's locking clause.
-    assert!(err(&run_with(
-        &mut e,
-        &mut b,
-        "WITH rows AS (SELECT id FROM lk) SELECT count(*) FROM rows FOR UPDATE"
-    )).contains("0A000"));
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "WITH rows AS (SELECT id FROM lk) SELECT count(*) FROM rows FOR UPDATE"
+        ))
+        .contains("0A000")
+    );
 }
 
 #[test]
@@ -4848,24 +6358,52 @@ fn select_into_creates_table() {
     // SELECT ... INTO table is CREATE TABLE AS spelled the old way.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE si (id int, v int, s text)");
-    run_with(&mut e, &mut b, "INSERT INTO si VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO si VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')",
+    );
 
     // Basic projection + WHERE materialize into a new table.
     run_with(&mut e, &mut b, "SELECT id, v INTO t1 FROM si WHERE id < 3");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM t1 ORDER BY id")), ["1|10", "2|20"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, v FROM t1 ORDER BY id"
+        )),
+        ["1|10", "2|20"]
+    );
 
     // INTO TABLE, computed/renamed columns, trailing ORDER BY.
-    run_with(&mut e, &mut b, "SELECT id AS k, v*2 AS d INTO TABLE t2 FROM si ORDER BY id");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT k, d FROM t2 ORDER BY k")), ["1|20", "2|40", "3|60"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "SELECT id AS k, v*2 AS d INTO TABLE t2 FROM si ORDER BY id",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT k, d FROM t2 ORDER BY k")),
+        ["1|20", "2|40", "3|60"]
+    );
 
     // Re-running into an existing table errors (42P07).
     let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
     assert!(err(&run_with(&mut e, &mut b, "SELECT id INTO t1 FROM si")).contains("42P07"));
 
     // INTO inside a subquery is rejected (42601), and never as a bare alias.
-    assert!(err(&run_with(&mut e, &mut b, "SELECT * FROM (SELECT 1 INTO nope) x")).contains("42601"));
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT * FROM (SELECT 1 INTO nope) x"
+        ))
+        .contains("42601")
+    );
     // `into` remains usable as an explicit column alias.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT 1 AS into")), ["1"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT 1 AS into")),
+        ["1"]
+    );
 }
 
 #[test]
@@ -4873,19 +6411,58 @@ fn current_setting_reads_gucs() {
     // current_setting(name [, missing_ok]) returns a setting's value as text —
     // the same value SHOW reports — and composes in expressions.
     let (mut e, mut b) = test_engine();
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT current_setting('client_encoding')")), ["UTF8"]);
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT current_setting('server_version_num')")), ["180004"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT current_setting('client_encoding')"
+        )),
+        ["UTF8"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT current_setting('server_version_num')"
+        )),
+        ["180004"]
+    );
     // Case-insensitive name; composes under another function.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT lower(current_setting('SERVER_ENCODING'))")), ["utf8"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT lower(current_setting('SERVER_ENCODING'))"
+        )),
+        ["utf8"]
+    );
     // Reflects a SET earlier in the same message.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SET search_path = myschema, public; SELECT current_setting('search_path')")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SET search_path = myschema, public; SELECT current_setting('search_path')"
+        )),
         ["myschema, public"]
     );
     // Unknown setting: 42704, or NULL with missing_ok = true.
     let err = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
-    assert!(err(&run_with(&mut e, &mut b, "SELECT current_setting('no_such_xyz')")).contains("42704"));
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT current_setting('no_such_xyz', true) IS NULL")), ["t"]);
+    assert!(
+        err(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT current_setting('no_such_xyz')"
+        ))
+        .contains("42704")
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT current_setting('no_such_xyz', true) IS NULL"
+        )),
+        ["t"]
+    );
 }
 
 #[test]
@@ -5068,7 +6645,11 @@ fn fromless_select_with_subquery() {
     let bytes = run_with(&mut e, &mut b, "SELECT (SELECT count(*) FROM t1) AS c");
     assert_eq!(data_rows(&bytes), ["3"]);
     // EXISTS in a FROM-less SELECT.
-    let bytes = run_with(&mut e, &mut b, "SELECT EXISTS (SELECT 1 FROM t1 WHERE x > 2)");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT EXISTS (SELECT 1 FROM t1 WHERE x > 2)",
+    );
     assert_eq!(data_rows(&bytes), ["t"]);
 }
 
@@ -5076,7 +6657,11 @@ fn fromless_select_with_subquery() {
 fn data_modifying_cte_select_main() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE dc (id int, v text)");
-    run_with(&mut e, &mut b, "INSERT INTO dc VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO dc VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')",
+    );
 
     // DELETE ... RETURNING is a relation the main query reads.
     let bytes = run_with(
@@ -5161,7 +6746,11 @@ fn data_modifying_cte_main_insert() {
     let text = String::from_utf8_lossy(&bytes);
     assert!(!text.contains("ERROR"), "WITH INSERT failed: {text:?}");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM dc2 ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, v FROM dc2 ORDER BY id"
+        )),
         ["101|a"]
     );
 }
@@ -5275,7 +6864,11 @@ fn data_modifying_ctes_chain_into_ctes_and_main_dml() {
 #[test]
 fn recursive_cte_feeds_data_modifying_main_statement() {
     let (mut engine, mut budget) = test_engine();
-    run_with(&mut engine, &mut budget, "CREATE TABLE generated_rows (id int PRIMARY KEY)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE generated_rows (id int PRIMARY KEY)",
+    );
     let response = run_with(
         &mut engine,
         &mut budget,
@@ -5328,15 +6921,19 @@ fn data_modifying_cte_preflight_and_view_targets() {
         &mut budget,
         "UPDATE cte_view SET secret='leak' WHERE id=1",
     );
-    assert!(String::from_utf8_lossy(&hidden_update)
-        .contains("column \"secret\" of relation \"cte_view\" does not exist"));
+    assert!(
+        String::from_utf8_lossy(&hidden_update)
+            .contains("column \"secret\" of relation \"cte_view\" does not exist")
+    );
     let hidden_insert = run_with(
         &mut engine,
         &mut budget,
         "INSERT INTO cte_view(secret) VALUES ('leak')",
     );
-    assert!(String::from_utf8_lossy(&hidden_insert)
-        .contains("column \"secret\" of relation \"cte_view\" does not exist"));
+    assert!(
+        String::from_utf8_lossy(&hidden_insert)
+            .contains("column \"secret\" of relation \"cte_view\" does not exist")
+    );
 
     let wildcard = run_with(
         &mut engine,
@@ -5371,19 +6968,35 @@ fn srf_in_value_subquery() {
     run_with(&mut e, &mut b, "CREATE TABLE sr (id int)");
     run_with(&mut e, &mut b, "INSERT INTO sr VALUES (1),(2),(3)");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM sr WHERE id IN (SELECT unnest(ARRAY[1,3])) ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id FROM sr WHERE id IN (SELECT unnest(ARRAY[1,3])) ORDER BY id"
+        )),
         ["1", "3"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM sr WHERE id = ANY (SELECT generate_series(2,3)) ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id FROM sr WHERE id = ANY (SELECT generate_series(2,3)) ORDER BY id"
+        )),
         ["2", "3"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM sr WHERE id NOT IN (SELECT unnest(ARRAY[2])) ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id FROM sr WHERE id NOT IN (SELECT unnest(ARRAY[2])) ORDER BY id"
+        )),
         ["1", "3"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT array(SELECT unnest(ARRAY[5,6]) ORDER BY 1)")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT array(SELECT unnest(ARRAY[5,6]) ORDER BY 1)"
+        )),
         ["{5,6}"]
     );
 }
@@ -5395,18 +7008,37 @@ fn in_subquery_empty_and_null_semantics() {
     run_with(&mut e, &mut b, "CREATE TABLE nn (x int)");
     run_with(&mut e, &mut b, "INSERT INTO nn VALUES (NULL)");
     // Over an empty set, IN is FALSE and NOT IN is TRUE even for NULL.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT 1 IN (SELECT * FROM empt)")), ["f"]);
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT NULL IN (SELECT * FROM empt)")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT 1 IN (SELECT * FROM empt)"
+        )),
         ["f"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT NULL NOT IN (SELECT * FROM empt)")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT NULL IN (SELECT * FROM empt)"
+        )),
+        ["f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT NULL NOT IN (SELECT * FROM empt)"
+        )),
         ["t"]
     );
     // A NULL operand against a non-empty set is unknown (NULL).
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT NULL IN (SELECT * FROM nn)")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT NULL IN (SELECT * FROM nn)"
+        )),
         ["NULL"]
     );
     // A value absent from a set that contains NULL is unknown (NULL).
@@ -5423,7 +7055,11 @@ fn in_subquery_operand_type_check() {
     // A string literal that cannot become the column type errors even over
     // an empty set, as PostgreSQL does (invalid_text_representation).
     let bytes = run_with(&mut e, &mut b, "SELECT 'hello' IN (SELECT * FROM ti)");
-    assert!(String::from_utf8_lossy(&bytes).contains("22P02"), "{:?}", String::from_utf8_lossy(&bytes));
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("22P02"),
+        "{:?}",
+        String::from_utf8_lossy(&bytes)
+    );
     // A numeric string still coerces fine and is simply not present.
     run_with(&mut e, &mut b, "INSERT INTO ti VALUES (NULL)");
     let bytes = run_with(&mut e, &mut b, "SELECT 'hello' NOT IN (SELECT * FROM ti)");
@@ -5451,7 +7087,10 @@ fn scalar_functions() {
     assert_eq!(r(&mut e, &mut b, "SELECT substr('hello', 2, 3)"), ["ell"]);
     assert_eq!(r(&mut e, &mut b, "SELECT substr('hello', 2)"), ["ello"]);
     assert_eq!(r(&mut e, &mut b, "SELECT substr('hello', -1, 3)"), ["h"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT replace('a-b-c', '-', '+')"), ["a+b+c"]);
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT replace('a-b-c', '-', '+')"),
+        ["a+b+c"]
+    );
     assert_eq!(r(&mut e, &mut b, "SELECT repeat('ab', 3)"), ["ababab"]);
     assert_eq!(r(&mut e, &mut b, "SELECT reverse('abc')"), ["cba"]);
     assert_eq!(r(&mut e, &mut b, "SELECT left('hello', 3)"), ["hel"]);
@@ -5460,9 +7099,18 @@ fn scalar_functions() {
     assert_eq!(r(&mut e, &mut b, "SELECT right('hello', -2)"), ["llo"]);
     assert_eq!(r(&mut e, &mut b, "SELECT strpos('hello', 'll')"), ["3"]);
     assert_eq!(r(&mut e, &mut b, "SELECT strpos('hello', 'z')"), ["0"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT concat('a', NULL, 'b', 1)"), ["ab1"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT concat_ws(',', 'a', NULL, 'b')"), ["a,b"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT initcap('hello world')"), ["Hello World"]);
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT concat('a', NULL, 'b', 1)"),
+        ["ab1"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT concat_ws(',', 'a', NULL, 'b')"),
+        ["a,b"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT initcap('hello world')"),
+        ["Hello World"]
+    );
     assert_eq!(r(&mut e, &mut b, "SELECT ascii('A')"), ["65"]);
     assert_eq!(r(&mut e, &mut b, "SELECT chr(65)"), ["A"]);
     assert_eq!(r(&mut e, &mut b, "SELECT octet_length('héllo')"), ["6"]);
@@ -5480,24 +7128,54 @@ fn padding_and_split_functions() {
     assert_eq!(r(&mut e, &mut b, "SELECT lpad('hi', 5, 'ab')"), ["abahi"]);
     assert_eq!(r(&mut e, &mut b, "SELECT lpad('hello', 3)"), ["hel"]);
     assert_eq!(r(&mut e, &mut b, "SELECT rpad('hi', 5, '*')"), ["hi***"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT split_part('a,b,c', ',', 2)"), ["b"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT split_part('a,b,c', ',', -1)"), ["c"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT split_part('a,b,c', ',', 5)"), [""]);
-    assert_eq!(r(&mut e, &mut b, "SELECT translate('hello', 'el', 'ip')"), ["hippo"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT translate('hello', 'l', '')"), ["heo"]);
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT split_part('a,b,c', ',', 2)"),
+        ["b"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT split_part('a,b,c', ',', -1)"),
+        ["c"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT split_part('a,b,c', ',', 5)"),
+        [""]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT translate('hello', 'el', 'ip')"),
+        ["hippo"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT translate('hello', 'l', '')"),
+        ["heo"]
+    );
 }
 
 #[test]
 fn bool_aggregates() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (g int, flag bool)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,true),(1,true),(2,true),(2,false),(3,NULL)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,true),(1,true),(2,true),(2,false),(3,NULL)",
+    );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT g, bool_and(flag), bool_or(flag) FROM t GROUP BY g ORDER BY g")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT g, bool_and(flag), bool_or(flag) FROM t GROUP BY g ORDER BY g"
+        )),
         ["1|t|t", "2|f|t", "3|NULL|NULL"]
     );
     // Whole-table aggregate + `every` alias for bool_and.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT bool_or(flag), every(flag) FROM t")), ["t|f"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT bool_or(flag), every(flag) FROM t"
+        )),
+        ["t|f"]
+    );
 }
 
 #[test]
@@ -5505,24 +7183,40 @@ fn create_index_and_unique() {
     // Validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (a int, b int, c int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,10),(1,2,20),(2,1,30)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,1,10),(1,2,20),(2,1,30)",
+    );
     // A non-unique index: succeeds, results unchanged (no acceleration).
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE INDEX i1 ON t(c)"))
-        .contains("CREATE INDEX"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE INDEX i1 ON t(c)"))
+            .contains("CREATE INDEX")
+    );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT a,b,c FROM t ORDER BY a,b")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT a,b,c FROM t ORDER BY a,b"
+        )),
         ["1|1|10", "1|2|20", "2|1|30"]
     );
     // Duplicate index name errors; unknown column errors.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE INDEX i1 ON t(a)"))
-        .contains("42P07"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE INDEX i2 ON t(nope)"))
-        .contains("42703"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE INDEX i1 ON t(a)"))
+            .contains("42P07")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE INDEX i2 ON t(nope)"))
+            .contains("42703")
+    );
     // A composite UNIQUE index over non-duplicate data succeeds and then
     // enforces the constraint on inserts.
     run_with(&mut e, &mut b, "CREATE UNIQUE INDEX u1 ON t(a,b)");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,99)"))
-        .contains("23505"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,99)"))
+            .contains("23505")
+    );
     // A distinct (a,b) tuple is fine.
     run_with(&mut e, &mut b, "INSERT INTO t VALUES (2,2,40)");
     // NULLs in a unique index do not conflict (SQL semantics).
@@ -5530,8 +7224,10 @@ fn create_index_and_unique() {
     // CREATE UNIQUE INDEX over duplicate existing rows fails.
     run_with(&mut e, &mut b, "CREATE TABLE d (x int)");
     run_with(&mut e, &mut b, "INSERT INTO d VALUES (5),(5)");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE UNIQUE INDEX ud ON d(x)"))
-        .contains("23505"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE UNIQUE INDEX ud ON d(x)"))
+            .contains("23505")
+    );
     // DROP INDEX removes the constraint: the once-conflicting insert works.
     run_with(&mut e, &mut b, "DROP INDEX u1");
     let out = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,7)"))
@@ -5544,8 +7240,16 @@ fn updatable_view_dml() {
     // DML on an auto-updatable view rewrites to the base table (PG 18.4).
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t1 (x int, y text)");
-    run_with(&mut e, &mut b, "INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c'),(-1,'neg')");
-    run_with(&mut e, &mut b, "CREATE VIEW v AS SELECT x FROM t1 WHERE x>0");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c'),(-1,'neg')",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE VIEW v AS SELECT x FROM t1 WHERE x>0",
+    );
     run_with(&mut e, &mut b, "DELETE FROM v WHERE x=2");
     run_with(&mut e, &mut b, "UPDATE v SET x=5 WHERE x=1");
     run_with(&mut e, &mut b, "INSERT INTO v VALUES (9)");
@@ -5554,8 +7258,10 @@ fn updatable_view_dml() {
         ["-1|neg", "3|c", "5|a", "9|NULL"]
     );
     // Too many values for the view's exposed columns errors like PG.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO v VALUES (2,'z')"))
-        .contains("42601"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO v VALUES (2,'z')"))
+            .contains("42601")
+    );
     // The view itself still reads correctly (base filtered).
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT x FROM v ORDER BY x")),
@@ -5573,19 +7279,27 @@ fn where_error_safe_conjuncts_first() {
     run_with(&mut e, &mut b, "INSERT INTO t VALUES (1),(2),(0),(3)");
     // The x=0 row is filtered by x>0 before 100/x evaluates — no error.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT x FROM t WHERE 100/x>10 AND x>0 ORDER BY x")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT x FROM t WHERE 100/x>10 AND x>0 ORDER BY x"
+        )),
         ["1", "2", "3"]
     );
     // Order of the conjuncts does not matter.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT x FROM t WHERE x<>0 AND 100/x>=33 ORDER BY x")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT x FROM t WHERE x<>0 AND 100/x>=33 ORDER BY x"
+        )),
         ["1", "2", "3"]
     );
     // With no filtering conjunct, the error still surfaces (as in PG).
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT x FROM t WHERE 100/x>10"))
-        .contains("22012"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT x FROM t WHERE 100/x>10"))
+            .contains("22012")
+    );
 }
 
 #[test]
@@ -5595,29 +7309,56 @@ fn transactional_ddl_rollback() {
     run_with(&mut e, &mut b, "CREATE TABLE t (a int, c int)");
     run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,10),(2,20)");
     // CREATE VIEW rolled back → the view is gone.
-    run_with(&mut e, &mut b, "BEGIN; CREATE VIEW v AS SELECT a FROM t; ROLLBACK");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM v"))
-        .contains("42P01"));
+    run_with(
+        &mut e,
+        &mut b,
+        "BEGIN; CREATE VIEW v AS SELECT a FROM t; ROLLBACK",
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM v")).contains("42P01")
+    );
     // CREATE VIEW committed → persists; DROP VIEW rolled back → survives.
-    run_with(&mut e, &mut b, "BEGIN; CREATE VIEW v AS SELECT a FROM t; COMMIT");
+    run_with(
+        &mut e,
+        &mut b,
+        "BEGIN; CREATE VIEW v AS SELECT a FROM t; COMMIT",
+    );
     run_with(&mut e, &mut b, "BEGIN; DROP VIEW v; ROLLBACK");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT a FROM v ORDER BY a")), ["1", "2"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT a FROM v ORDER BY a")),
+        ["1", "2"]
+    );
     // CREATE OR REPLACE rolled back → the original definition is restored.
-    run_with(&mut e, &mut b,
-        "BEGIN; CREATE OR REPLACE VIEW v AS SELECT a FROM t WHERE a>1; ROLLBACK");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT a FROM v ORDER BY a")), ["1", "2"]);
+    run_with(
+        &mut e,
+        &mut b,
+        "BEGIN; CREATE OR REPLACE VIEW v AS SELECT a FROM t WHERE a>1; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT a FROM v ORDER BY a")),
+        ["1", "2"]
+    );
     // CREATE UNIQUE INDEX rolled back → the constraint is gone.
-    run_with(&mut e, &mut b, "BEGIN; CREATE UNIQUE INDEX u ON t(a); ROLLBACK");
+    run_with(
+        &mut e,
+        &mut b,
+        "BEGIN; CREATE UNIQUE INDEX u ON t(a); ROLLBACK",
+    );
     let out = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,99)"))
         .to_string();
-    assert!(!out.contains("23505"), "index constraint should be gone: {out}");
+    assert!(
+        !out.contains("23505"),
+        "index constraint should be gone: {out}"
+    );
     // DROP TABLE rolled back → the table and its UNIQUE index both revive.
     run_with(&mut e, &mut b, "CREATE TABLE u2 (k int)");
     run_with(&mut e, &mut b, "INSERT INTO u2 VALUES (1),(2)");
     run_with(&mut e, &mut b, "CREATE UNIQUE INDEX uk ON u2(k)");
     run_with(&mut e, &mut b, "BEGIN; DROP TABLE u2; ROLLBACK");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u2 VALUES (1)"))
-        .contains("23505"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO u2 VALUES (1)"))
+            .contains("23505")
+    );
 }
 
 #[test]
@@ -5627,17 +7368,23 @@ fn catalog_joins_and_subqueries() {
     run_with(&mut e, &mut b, "CREATE TABLE demo (a int, b text)");
     // pg_class JOIN pg_attribute on oid = attrelid.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "SELECT c.relname, a.attname FROM pg_class c \
              JOIN pg_attribute a ON a.attrelid = c.oid \
-             WHERE c.relname='demo' AND a.attnum > 0 ORDER BY a.attnum")),
+             WHERE c.relname='demo' AND a.attnum > 0 ORDER BY a.attnum"
+        )),
         ["demo|a", "demo|b"]
     );
     // A catalog relation inside a subquery.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "SELECT count(*) FROM pg_attribute \
-             WHERE attrelid IN (SELECT oid FROM pg_class WHERE relname='demo') AND attnum>0")),
+             WHERE attrelid IN (SELECT oid FROM pg_class WHERE relname='demo') AND attnum>0"
+        )),
         ["2"]
     );
 }
@@ -5727,12 +7474,229 @@ fn pg_dump_bootstrap_surface() {
         )),
         ["0"]
     );
-    assert!(String::from_utf8_lossy(&run_with(
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+        ))
+        .contains("SET")
+    );
+}
+
+#[test]
+fn set_transaction_changes_only_named_characteristics() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+
+    let outside = run_txn(
         &mut engine,
         &mut budget,
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-    ))
-    .contains("0A000"));
+        &mut transaction,
+        "SET TRANSACTION READ ONLY",
+    );
+    assert!(outside.contains("25P01"), "{outside}");
+    assert!(!transaction.read_only);
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ WRITE NOT DEFERRABLE",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SET TRANSACTION READ ONLY",
+    );
+    assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
+    assert!(transaction.read_only);
+    assert!(!transaction.deferrable);
+    let nested = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "BEGIN",
+    );
+    assert!(nested.contains("25001"), "{nested}");
+    assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
+    assert!(transaction.read_only);
+    assert!(!transaction.deferrable);
+    run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
+
+    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
+    run_txn(&mut engine, &mut budget, &mut transaction, "SELECT 1");
+    let late_isolation = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    );
+    assert!(late_isolation.contains("25001"), "{late_isolation}");
+    run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
+}
+
+#[test]
+fn repeatable_read_retains_committed_row_history() {
+    let (mut engine, mut budget) = test_engine();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE snapshot_rows (id int PRIMARY KEY, value text)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "INSERT INTO snapshot_rows VALUES (1, 'before')",
+    );
+
+    let begun = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    );
+    assert!(begun.contains("BEGIN"), "{begun}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM snapshot_rows WHERE id = 1",
+        )),
+        ["before"]
+    );
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "UPDATE snapshot_rows SET value = 'after' WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM snapshot_rows WHERE id = 1",
+        )),
+        ["before"],
+        "repeatable-read snapshot must ignore a later commit"
+    );
+    let read_only = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "DELETE FROM snapshot_rows WHERE id = 1",
+    );
+    assert!(read_only.contains("25006"), "{read_only}");
+    run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
+
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "SELECT value FROM snapshot_rows WHERE id = 1",
+        )),
+        ["after"]
+    );
+}
+
+#[test]
+fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("object-snapshot-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-object-snapshot-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.block_cache_bytes = 512 * 1024;
+    config.disk_cache_bytes = 1 << 20;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE snapshot_rows (id int PRIMARY KEY, value text)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "INSERT INTO snapshot_rows VALUES (1, 'before')",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM snapshot_rows",
+        )),
+        ["before"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "UPDATE snapshot_rows SET value = 'after' WHERE id = 1",
+    );
+
+    assert!(
+        engine.checkpoint().unwrap(),
+        "the latest generation must publish while the historical snapshot is pinned"
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM snapshot_rows",
+        )),
+        ["before"],
+        "checkpointing must not collapse a pinned historical generation"
+    );
+    run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT value FROM snapshot_rows",
+        )),
+        ["after"],
+        "a cold RAM-and-disk cache must recover the authoritative object-store generation"
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -5740,30 +7704,59 @@ fn create_view_basic() {
     // Values validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int, v int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)");
-    run_with(&mut e, &mut b, "CREATE VIEW big AS SELECT id, v FROM t WHERE v > 15");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE VIEW big AS SELECT id, v FROM t WHERE v > 15",
+    );
     // Query the view.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT id, v FROM big ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT id, v FROM big ORDER BY id"
+        )),
         ["2|20", "3|30", "4|40"]
     );
     // Aggregate over the view.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT sum(v) FROM big")), ["90"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT sum(v) FROM big")),
+        ["90"]
+    );
     // A view over a view.
-    run_with(&mut e, &mut b, "CREATE VIEW big2 AS SELECT id FROM big WHERE v > 25");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE VIEW big2 AS SELECT id FROM big WHERE v > 25",
+    );
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT id FROM big2 ORDER BY id")),
         ["3", "4"]
     );
     // Duplicate view name errors; OR REPLACE succeeds.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE VIEW big AS SELECT 1"))
-        .contains("42P07"));
-    run_with(&mut e, &mut b, "CREATE OR REPLACE VIEW big AS SELECT id FROM t WHERE id = 1");
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT id FROM big")), ["1"]);
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE VIEW big AS SELECT 1"))
+            .contains("42P07")
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE OR REPLACE VIEW big AS SELECT id FROM t WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM big")),
+        ["1"]
+    );
     // DROP VIEW; then querying it errors.
     run_with(&mut e, &mut b, "DROP VIEW big2");
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM big2"))
-        .contains("42P01"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM big2")).contains("42P01")
+    );
 }
 
 #[test]
@@ -5771,33 +7764,64 @@ fn distinct_aggregates() {
     // Values validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (g int, x int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,10),(1,10),(1,20),(2,5),(2,NULL),(3,NULL)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,10),(1,10),(1,20),(2,5),(2,NULL),(3,NULL)",
+    );
     // Per group: DISTINCT drops duplicate 10 in group 1; NULLs never count.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "SELECT g, count(distinct x), sum(distinct x), min(distinct x), max(distinct x) \
-             FROM t GROUP BY g ORDER BY g")),
+             FROM t GROUP BY g ORDER BY g"
+        )),
         ["1|2|30|10|20", "2|1|5|5|5", "3|0|NULL|NULL|NULL"]
     );
     // Whole-table: distinct set {10,20,5}, plus non-distinct for contrast.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT count(distinct x), sum(distinct x), count(x), count(*) FROM t")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT count(distinct x), sum(distinct x), count(x), count(*) FROM t"
+        )),
         ["3|35|4|6"]
     );
     // All-NULL input: count(DISTINCT) is 0, not NULL.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT count(distinct x) FROM t WHERE x IS NULL")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT count(distinct x) FROM t WHERE x IS NULL"
+        )),
         ["0"]
     );
     // avg(DISTINCT int) -> numeric with PG's 16-digit scale.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT avg(distinct x) FROM t WHERE g = 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT avg(distinct x) FROM t WHERE g = 1"
+        )),
         ["15.0000000000000000"]
     );
+    // Empty ordered/distinct aggregate buffers never acquire arena storage.
+    // They still return PostgreSQL's NULL result without constructing a slice
+    // from the sentinel pointer.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT array_agg(x ORDER BY x), array_agg(distinct x) FROM t WHERE false"
+        )),
+        ["NULL|NULL"]
+    );
     // DISTINCT outside an aggregate is rejected loudly.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT length(distinct 'x')"))
-        .contains("42883"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT length(distinct 'x')"))
+            .contains("42883")
+    );
 }
 
 #[test]
@@ -5813,22 +7837,46 @@ fn more_scalar_functions() {
     assert_eq!(r(&mut e, &mut b, "SELECT lcm(4, 6)"), ["12"]);
     assert_eq!(r(&mut e, &mut b, "SELECT lcm(0, 5)"), ["0"]);
     assert_eq!(r(&mut e, &mut b, "SELECT bit_length('abc')"), ["24"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT md5('abc')"), ["900150983cd24fb0d6963f7d28e17f72"]);
     assert_eq!(
-        r(&mut e, &mut b, "SELECT md5('The quick brown fox jumps over the lazy dog')"),
+        r(&mut e, &mut b, "SELECT md5('abc')"),
+        ["900150983cd24fb0d6963f7d28e17f72"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT md5('The quick brown fox jumps over the lazy dog')"
+        ),
         ["9e107d9d372bb6826bd81d3542a419d6"]
     );
-    assert_eq!(r(&mut e, &mut b, "SELECT starts_with('foobar', 'foo')"), ["t"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT starts_with('foobar', 'bar')"), ["f"]);
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT starts_with('foobar', 'foo')"),
+        ["t"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT starts_with('foobar', 'bar')"),
+        ["f"]
+    );
     assert_eq!(r(&mut e, &mut b, "SELECT cbrt(27)"), ["3"]);
     assert_eq!(r(&mut e, &mut b, "SELECT factorial(0)"), ["1"]);
     assert_eq!(r(&mut e, &mut b, "SELECT factorial(5)"), ["120"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT factorial(20)"), ["2432902008176640000"]);
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT factorial(-1)"))
-        .contains("22003"));
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT factorial(20)"),
+        ["2432902008176640000"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT factorial(-1)"))
+            .contains("22003")
+    );
     // lcm overflow errors (22003).
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b,
-        "SELECT lcm(1000000000000000000, 999999999999999999)")).contains("22003"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT lcm(1000000000000000000, 999999999999999999)"
+        ))
+        .contains("22003")
+    );
 }
 
 #[test]
@@ -5845,7 +7893,9 @@ fn trig_and_rounding_functions() {
     // Transcendental results differ in the last bits across platform libms
     // (as PostgreSQL's own float8 output does), so compare with tolerance.
     let approx = |e: &mut Engine, b: &mut Budget, sql: &str, want: f64| {
-        let got: f64 = data_rows(&run_with(e, b, sql))[0].parse().expect("float output");
+        let got: f64 = data_rows(&run_with(e, b, sql))[0]
+            .parse()
+            .expect("float output");
         assert!((got - want).abs() < 1e-12, "{sql}: got {got}, want {want}");
     };
     approx(&mut e, &mut b, "SELECT sinh(1)", 1.175_201_193_643_801_4);
@@ -5862,29 +7912,45 @@ fn ordered_and_distinct_row_sources() {
     // honored (top-N, dedup), not dropped. Validated against PG 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (v int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (5),(3),(1),(4),(2),(3),(1)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (5),(3),(1),(4),(2),(3),(1)",
+    );
     // ORDER BY ... LIMIT inside a derived table (top-3 smallest).
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT s.v FROM (SELECT v FROM t ORDER BY v LIMIT 3) s ORDER BY s.v")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT s.v FROM (SELECT v FROM t ORDER BY v LIMIT 3) s ORDER BY s.v"
+        )),
         ["1", "1", "2"]
     );
     // DISTINCT inside a derived table.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT s.v FROM (SELECT DISTINCT v FROM t) s ORDER BY s.v")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT s.v FROM (SELECT DISTINCT v FROM t) s ORDER BY s.v"
+        )),
         ["1", "2", "3", "4", "5"]
     );
     // DISTINCT + ORDER BY + LIMIT inside a CTE.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "WITH c AS (SELECT DISTINCT v FROM t ORDER BY v LIMIT 2) SELECT v FROM c ORDER BY v")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH c AS (SELECT DISTINCT v FROM t ORDER BY v LIMIT 2) SELECT v FROM c ORDER BY v"
+        )),
         ["1", "2"]
     );
     // A SELECT DISTINCT set-operation branch.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT DISTINCT v FROM t UNION SELECT 9 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT DISTINCT v FROM t UNION SELECT 9 ORDER BY 1"
+        )),
         ["1", "2", "3", "4", "5", "9"]
     );
 }
@@ -5895,31 +7961,53 @@ fn grouped_row_sources() {
     // branches, and INSERT ... SELECT. Values validated against PG 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (g int, v int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,10),(1,20),(2,30),(2,40),(3,50)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,10),(1,20),(2,30),(2,40),(3,50)",
+    );
     // Derived table over a grouped subquery.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "SELECT s.g, s.total FROM (SELECT g, sum(v) AS total FROM t GROUP BY g) s \
-             ORDER BY s.g")),
+             ORDER BY s.g"
+        )),
         ["1|30", "2|70", "3|50"]
     );
     // CTE over a grouped query.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "WITH gs AS (SELECT g, count(*) AS c FROM t GROUP BY g) \
-             SELECT g, c FROM gs ORDER BY g")),
+             SELECT g, c FROM gs ORDER BY g"
+        )),
         ["1|2", "2|2", "3|1"]
     );
     // Set-operation branch with an aggregate.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT count(*) FROM t UNION SELECT 1 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT count(*) FROM t UNION SELECT 1 ORDER BY 1"
+        )),
         ["1", "5"]
     );
     // INSERT ... SELECT with GROUP BY.
     run_with(&mut e, &mut b, "CREATE TABLE dst (g int, total int)");
-    run_with(&mut e, &mut b, "INSERT INTO dst SELECT g, sum(v) FROM t GROUP BY g");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO dst SELECT g, sum(v) FROM t GROUP BY g",
+    );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT g, total FROM dst ORDER BY g")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT g, total FROM dst ORDER BY g"
+        )),
         ["1|30", "2|70", "3|50"]
     );
 }
@@ -5929,67 +8017,97 @@ fn common_table_expressions() {
     // Values validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int, v int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)",
+    );
     // Single CTE referenced in the main query.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "WITH big AS (SELECT id, v FROM t WHERE v > 15) SELECT id, v FROM big ORDER BY id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH big AS (SELECT id, v FROM t WHERE v > 15) SELECT id, v FROM big ORDER BY id"
+        )),
         ["2|20", "3|30", "4|40"]
     );
     // Aggregate over a CTE.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "WITH big AS (SELECT id, v FROM t WHERE v > 15) SELECT sum(v) FROM big")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH big AS (SELECT id, v FROM t WHERE v > 15) SELECT sum(v) FROM big"
+        )),
         ["90"]
     );
     // A CTE that references an earlier CTE.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "WITH a AS (SELECT id, v FROM t), b AS (SELECT id, v*2 AS w FROM a WHERE v > 20) \
-             SELECT id, w FROM b ORDER BY id")),
+             SELECT id, w FROM b ORDER BY id"
+        )),
         ["3|60", "4|80"]
     );
     // A CTE referenced inside a subquery.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "WITH big AS (SELECT id FROM t WHERE v > 25) \
-             SELECT count(*) FROM t WHERE id IN (SELECT id FROM big)")),
+             SELECT count(*) FROM t WHERE id IN (SELECT id FROM big)"
+        )),
         ["2"]
     );
     // A CTE joined against a physical table.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "WITH j AS (SELECT id, v FROM t WHERE v >= 30) \
-             SELECT t.id, j.v FROM t JOIN j ON t.id = j.id ORDER BY t.id")),
+             SELECT t.id, j.v FROM t JOIN j ON t.id = j.id ORDER BY t.id"
+        )),
         ["3|30", "4|40"]
     );
     // WITH RECURSIVE: a non-self-referencing CTE behaves like a plain one.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r"
+        )),
         ["1"]
     );
     // A self-referencing CTE iterates to its fixpoint.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) \
-             SELECT * FROM c ORDER BY n")),
+             SELECT * FROM c ORDER BY n"
+        )),
         ["1", "2", "3", "4"]
     );
     // UNION (deduplicating) terminates a cyclic recursion.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT (n % 3) + 1 FROM c) \
-             SELECT * FROM c ORDER BY n")),
+             SELECT * FROM c ORDER BY n"
+        )),
         ["1", "2", "3"]
     );
     // The required shape is enforced loudly.
-    assert!(String::from_utf8_lossy(&run_with(
-        &mut e,
-        &mut b,
-        "WITH RECURSIVE r(n) AS (SELECT n + 1 FROM r) SELECT * FROM r"
-    ))
-    .contains("42P19"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE r(n) AS (SELECT n + 1 FROM r) SELECT * FROM r"
+        ))
+        .contains("42P19")
+    );
 }
 
 #[test]
@@ -5997,57 +8115,87 @@ fn derived_tables() {
     // Values validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int, v int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)",
+    );
     // Simple derived table with a WHERE inside and outside.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT s.id, s.v FROM (SELECT id, v FROM t WHERE v > 15) s ORDER BY s.id")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT s.id, s.v FROM (SELECT id, v FROM t WHERE v > 15) s ORDER BY s.id"
+        )),
         ["2|20", "3|30", "4|40"]
     );
     // Aggregate over a derived table.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT sum(s.v) FROM (SELECT id, v FROM t WHERE v > 15) s")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT sum(s.v) FROM (SELECT id, v FROM t WHERE v > 15) s"
+        )),
         ["90"]
     );
     // Computed column with an alias, filtered by the outer query.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "SELECT s.id, s.doubled FROM (SELECT id, v*2 AS doubled FROM t) s \
-             WHERE s.doubled > 40 ORDER BY s.id")),
+             WHERE s.doubled > 40 ORDER BY s.id"
+        )),
         ["3|60", "4|80"]
     );
     // Join a physical table against a derived table.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "SELECT a.id, b.v FROM t a JOIN (SELECT id, v FROM t WHERE v > 25) b \
-             ON a.id = b.id ORDER BY a.id")),
+             ON a.id = b.id ORDER BY a.id"
+        )),
         ["3|30", "4|40"]
     );
     // A derived table must have an alias.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM (SELECT 1)"))
-        .contains("42601"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM (SELECT 1)"))
+            .contains("42601")
+    );
     // A derived table as a set-operation branch (exercises describe_leaf).
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT 1 UNION SELECT * FROM (SELECT 2) s ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT 1 UNION SELECT * FROM (SELECT 2) s ORDER BY 1"
+        )),
         ["1", "2"]
     );
     // Derived tables also work inside EXISTS / IN / scalar subqueries.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT 1 WHERE EXISTS (SELECT 1 FROM (SELECT id FROM t WHERE v > 25) s)")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM (SELECT id FROM t WHERE v > 25) s)"
+        )),
         ["1"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
             "SELECT id FROM t WHERE v IN (SELECT s.v FROM (SELECT v FROM t WHERE v > 25) s) \
-             ORDER BY id")),
+             ORDER BY id"
+        )),
         ["3", "4"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT (SELECT max(s.v) FROM (SELECT v FROM t) s)")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT (SELECT max(s.v) FROM (SELECT v FROM t) s)"
+        )),
         ["40"]
     );
 }
@@ -6057,32 +8205,59 @@ fn date_arithmetic() {
     // Values validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     let r = |e: &mut Engine, b: &mut Budget, sql: &str| data_rows(&run_with(e, b, sql));
-    assert_eq!(r(&mut e, &mut b, "SELECT date '2024-01-10' + 5"), ["2024-01-15"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT date '2024-01-10' - 5"), ["2024-01-05"]);
-    assert_eq!(r(&mut e, &mut b, "SELECT 5 + date '2024-01-10'"), ["2024-01-15"]);
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT date '2024-01-10' + 5"),
+        ["2024-01-15"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT date '2024-01-10' - 5"),
+        ["2024-01-05"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT 5 + date '2024-01-10'"),
+        ["2024-01-15"]
+    );
     // date - date -> integer days.
-    assert_eq!(r(&mut e, &mut b, "SELECT date '2024-03-01' - date '2024-01-01'"), ["60"]);
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT date '2024-03-01' - date '2024-01-01'"
+        ),
+        ["60"]
+    );
     // Crossing a month boundary and a leap day.
-    assert_eq!(r(&mut e, &mut b, "SELECT date '2024-02-28' + 1"), ["2024-02-29"]);
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT date '2024-02-28' + 1"),
+        ["2024-02-29"]
+    );
     // int - date is not defined in PostgreSQL.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT 5 - date '2024-01-10'"))
-        .contains("42883"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT 5 - date '2024-01-10'"))
+            .contains("42883")
+    );
 }
 
 #[test]
 fn statement_timeout_cancels_long_statement() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE big (n int)");
-    run_with(&mut e, &mut b, "INSERT INTO big SELECT * FROM generate_series(1, 300)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO big SELECT * FROM generate_series(1, 300)",
+    );
     // A three-way cross join is ~27M iterations — far longer than 1 ms.
     // (SET and the query share one batch: the test harness makes a fresh
     // session per call, and a SET takes effect within its batch.)
-    assert!(String::from_utf8_lossy(&run_with(
-        &mut e,
-        &mut b,
-        "SET statement_timeout = 1; SELECT count(*) FROM big a, big b, big c"
-    ))
-    .contains("57014"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "SET statement_timeout = 1; SELECT count(*) FROM big a, big b, big c"
+        ))
+        .contains("57014")
+    );
     // With the timeout disabled the same query shape runs normally.
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT count(*) FROM big")),
@@ -6098,10 +8273,17 @@ fn string_agg_aggregate() {
     // check the multiset of elements rather than a fixed sequence.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE s (g int, v text)");
-    run_with(&mut e, &mut b, "INSERT INTO s VALUES (1,'b'),(1,'a'),(1,NULL),(1,'a'),(2,'z')");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO s VALUES (1,'b'),(1,'a'),(1,NULL),(1,'a'),(2,'z')",
+    );
     // Per group: NULL skipped, duplicates kept (order unspecified).
-    let rows = data_rows(&run_with(&mut e, &mut b,
-        "SELECT g, string_agg(v, ',') FROM s GROUP BY g ORDER BY g"));
+    let rows = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT g, string_agg(v, ',') FROM s GROUP BY g ORDER BY g",
+    ));
     let g1: Vec<&str> = rows[0].strip_prefix("1|").unwrap().split(',').collect();
     let mut g1s = g1.clone();
     g1s.sort_unstable();
@@ -6109,31 +8291,49 @@ fn string_agg_aggregate() {
     assert_eq!(rows[1], "2|z");
     // All-NULL input yields NULL, not an empty string.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT string_agg(v, ',') FROM s WHERE v IS NULL")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT string_agg(v, ',') FROM s WHERE v IS NULL"
+        )),
         ["NULL"]
     );
     // DISTINCT deduplicates and emits the values in sorted order (PG).
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT string_agg(distinct v, ',') FROM s WHERE g = 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT string_agg(distinct v, ',') FROM s WHERE g = 1"
+        )),
         ["a,b"]
     );
     // DISTINCT + ORDER BY on the aggregated expression (values validated
     // against PostgreSQL 18.4), ascending and descending.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT string_agg(distinct v, ',' ORDER BY v) FROM s")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT string_agg(distinct v, ',' ORDER BY v) FROM s"
+        )),
         ["a,b,z"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT string_agg(distinct v, ',' ORDER BY v DESC) FROM s")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT string_agg(distinct v, ',' ORDER BY v DESC) FROM s"
+        )),
         ["z,b,a"]
     );
     // DISTINCT with a different sort key errors, as PostgreSQL does.
-    assert!(String::from_utf8_lossy(
-        &run_with(&mut e, &mut b, "SELECT string_agg(distinct v, ',' ORDER BY g) FROM s")
-    )
-    .contains("42P10"));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT string_agg(distinct v, ',' ORDER BY g) FROM s"
+        ))
+        .contains("42P10")
+    );
 }
 
 #[test]
@@ -6141,17 +8341,27 @@ fn string_agg_ordered() {
     // string_agg(x, sep ORDER BY key) — values validated against PG 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE s (g int, v text, ord int)");
-    run_with(&mut e, &mut b, "INSERT INTO s VALUES (1,'b',2),(1,'a',1),(1,'c',3),(2,'z',1)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO s VALUES (1,'b',2),(1,'a',1),(1,'c',3),(2,'z',1)",
+    );
     // ORDER BY a separate key column.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT g, string_agg(v, ',' ORDER BY ord) FROM s GROUP BY g ORDER BY g")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT g, string_agg(v, ',' ORDER BY ord) FROM s GROUP BY g ORDER BY g"
+        )),
         ["1|a,b,c", "2|z"]
     );
     // ORDER BY the value, descending.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b,
-            "SELECT g, string_agg(v, ',' ORDER BY v DESC) FROM s GROUP BY g ORDER BY g")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT g, string_agg(v, ',' ORDER BY v DESC) FROM s GROUP BY g ORDER BY g"
+        )),
         ["1|c,b,a", "2|z"]
     );
 }
@@ -6182,8 +8392,12 @@ fn math_functions() {
     assert_eq!(r(&mut e, &mut b, "SELECT mod(7, 3)"), ["1"]);
     assert_eq!(r(&mut e, &mut b, "SELECT mod(-7, 3)"), ["-1"]);
     // Errors.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT sqrt(-1)")).contains("2201F"));
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT mod(1, 0)")).contains("22012"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT sqrt(-1)")).contains("2201F")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT mod(1, 0)")).contains("22012")
+    );
 }
 
 #[test]
@@ -6193,25 +8407,84 @@ fn datetime_functions() {
     let (mut e, mut b) = test_engine();
     let r = |e: &mut Engine, b: &mut Budget, sql: &str| data_rows(&run_with(e, b, sql));
     let ts = "timestamp '2024-03-15 14:30:45.5'";
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(year from {ts})")), ["2024"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(month from {ts})")), ["3"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(day from {ts})")), ["15"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(hour from {ts})")), ["14"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(dow from {ts})")), ["5"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(doy from {ts})")), ["75"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(quarter from {ts})")), ["1"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(week from {ts})")), ["11"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(isodow from {ts})")), ["5"]);
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(year from {ts})")),
+        ["2024"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(month from {ts})")),
+        ["3"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(day from {ts})")),
+        ["15"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(hour from {ts})")),
+        ["14"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(dow from {ts})")),
+        ["5"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(doy from {ts})")),
+        ["75"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            &format!("SELECT extract(quarter from {ts})")
+        ),
+        ["1"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(week from {ts})")),
+        ["11"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(isodow from {ts})")),
+        ["5"]
+    );
     // extract returns numeric (second/epoch keep 6 decimals); date_part is float.
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(second from {ts})")), ["45.500000"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT date_part('second', {ts})")), ["45.5"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT extract(epoch from {ts})")), ["1710513045.500000"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT date_part('epoch', {ts})")), ["1710513045.5"]);
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(second from {ts})")),
+        ["45.500000"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT date_part('second', {ts})")),
+        ["45.5"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT extract(epoch from {ts})")),
+        ["1710513045.500000"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT date_part('epoch', {ts})")),
+        ["1710513045.5"]
+    );
     // date_trunc.
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT date_trunc('year', {ts})")), ["2024-01-01 00:00:00"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT date_trunc('month', {ts})")), ["2024-03-01 00:00:00"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT date_trunc('hour', {ts})")), ["2024-03-15 14:00:00"]);
-    assert_eq!(r(&mut e, &mut b, &format!("SELECT date_trunc('minute', {ts})")), ["2024-03-15 14:30:00"]);
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT date_trunc('year', {ts})")),
+        ["2024-01-01 00:00:00"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT date_trunc('month', {ts})")),
+        ["2024-03-01 00:00:00"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, &format!("SELECT date_trunc('hour', {ts})")),
+        ["2024-03-15 14:00:00"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            &format!("SELECT date_trunc('minute', {ts})")
+        ),
+        ["2024-03-15 14:30:00"]
+    );
 }
 
 #[test]
@@ -6223,35 +8496,63 @@ fn set_operations() {
     run_with(&mut e, &mut b, "INSERT INTO u VALUES (2),(3),(4)");
     // UNION deduplicates and sorts by the trailing ORDER BY.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT a FROM t UNION SELECT b FROM u ORDER BY a")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT a FROM t UNION SELECT b FROM u ORDER BY a"
+        )),
         ["1", "2", "3", "4"]
     );
     // UNION ALL keeps duplicates.
-    let mut all = data_rows(&run_with(&mut e, &mut b, "SELECT a FROM t UNION ALL SELECT b FROM u"));
+    let mut all = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT a FROM t UNION ALL SELECT b FROM u",
+    ));
     all.sort();
     assert_eq!(all, ["1", "2", "2", "3", "3", "4"]);
     // INTERSECT and EXCEPT.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT a FROM t INTERSECT SELECT b FROM u ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT a FROM t INTERSECT SELECT b FROM u ORDER BY 1"
+        )),
         ["2", "3"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT a FROM t EXCEPT SELECT b FROM u ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT a FROM t EXCEPT SELECT b FROM u ORDER BY 1"
+        )),
         ["1"]
     );
     // Literal branches, dedup, LIMIT.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 2 UNION SELECT 1 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT 1 UNION SELECT 2 UNION SELECT 1 ORDER BY 1"
+        )),
         ["1", "2"]
     );
     // INTERSECT binds tighter than UNION: 1 UNION (2 INTERSECT 2) = {1,2}.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 2 INTERSECT SELECT 2 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 2 ORDER BY 1"
+        )),
         ["1", "2"]
     );
     // Numeric-tower unification (int + numeric -> numeric).
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 2.5 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT 1 UNION SELECT 2.5 ORDER BY 1"
+        )),
         ["1", "2.5"]
     );
     // Multiset ALL variants (validated against PostgreSQL 18.4).
@@ -6262,20 +8563,36 @@ fn set_operations() {
     run_with(&mut e, &mut b, "INSERT INTO m2 VALUES (1),(2),(2)");
     run_with(&mut e, &mut b, "INSERT INTO m3 VALUES (1)");
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT x FROM m1 INTERSECT ALL SELECT y FROM m2 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT x FROM m1 INTERSECT ALL SELECT y FROM m2 ORDER BY 1"
+        )),
         ["1", "2"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT x FROM m1 EXCEPT ALL SELECT z FROM m3 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT x FROM m1 EXCEPT ALL SELECT z FROM m3 ORDER BY 1"
+        )),
         ["1", "2"]
     );
     // Parenthesized branches override precedence: (1 UNION 2) INTERSECT 2 = {2}.
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2 ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2 ORDER BY 1"
+        )),
         ["2"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "(SELECT 1) UNION (SELECT 2) ORDER BY 1")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "(SELECT 1) UNION (SELECT 2) ORDER BY 1"
+        )),
         ["1", "2"]
     );
 }
@@ -6285,15 +8602,27 @@ fn set_operation_errors() {
     let (mut e, mut b) = test_engine();
     // Column-count mismatch.
     let a = run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 1, 2");
-    assert!(String::from_utf8_lossy(&a).contains("42601"), "{:?}", String::from_utf8_lossy(&a));
+    assert!(
+        String::from_utf8_lossy(&a).contains("42601"),
+        "{:?}",
+        String::from_utf8_lossy(&a)
+    );
     // An untyped literal adopts the other branch's type, then fails to
     // coerce (22P02) — matching PostgreSQL, which resolves the unknown
     // `'x'` to integer before parsing it.
     let c = run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 'x'");
-    assert!(String::from_utf8_lossy(&c).contains("22P02"), "{:?}", String::from_utf8_lossy(&c));
+    assert!(
+        String::from_utf8_lossy(&c).contains("22P02"),
+        "{:?}",
+        String::from_utf8_lossy(&c)
+    );
     // A concretely-typed incompatible column is the type-mismatch error.
     let d = run_with(&mut e, &mut b, "SELECT 1 UNION SELECT 'x'::text");
-    assert!(String::from_utf8_lossy(&d).contains("42804"), "{:?}", String::from_utf8_lossy(&d));
+    assert!(
+        String::from_utf8_lossy(&d).contains("42804"),
+        "{:?}",
+        String::from_utf8_lossy(&d)
+    );
 }
 
 #[test]
@@ -6304,28 +8633,83 @@ fn timezone_offset_affects_timestamptz() {
     let tstz = "timestamptz '2024-01-15 14:30:00+00'";
     let go = |e: &mut Engine, b: &mut Budget, sql: String| data_rows(&run_with(e, b, &sql));
     // ISO output with fixed offsets (note PostgreSQL's inverted signs).
-    assert_eq!(go(&mut e, &mut b, format!("SET timezone='Etc/GMT+5'; SELECT {tstz}")), ["2024-01-15 09:30:00-05"]);
-    assert_eq!(go(&mut e, &mut b, format!("SET timezone='-08:00'; SELECT {tstz}")), ["2024-01-15 22:30:00+08"]);
-    assert_eq!(go(&mut e, &mut b, format!("SET timezone='+05:30'; SELECT {tstz}")), ["2024-01-15 09:00:00-05:30"]);
+    assert_eq!(
+        go(
+            &mut e,
+            &mut b,
+            format!("SET timezone='Etc/GMT+5'; SELECT {tstz}")
+        ),
+        ["2024-01-15 09:30:00-05"]
+    );
+    assert_eq!(
+        go(
+            &mut e,
+            &mut b,
+            format!("SET timezone='-08:00'; SELECT {tstz}")
+        ),
+        ["2024-01-15 22:30:00+08"]
+    );
+    assert_eq!(
+        go(
+            &mut e,
+            &mut b,
+            format!("SET timezone='+05:30'; SELECT {tstz}")
+        ),
+        ["2024-01-15 09:00:00-05:30"]
+    );
     // Non-ISO zone abbreviation: Etc zones show the offset, bare offsets show
     // nothing (a trailing space), exactly as PostgreSQL does.
-    assert_eq!(go(&mut e, &mut b, format!("SET datestyle='SQL'; SET timezone='Etc/GMT+5'; SELECT {tstz}")), ["01/15/2024 09:30:00 -05"]);
-    assert_eq!(go(&mut e, &mut b, format!("SET datestyle='Postgres'; SET timezone='-08:00'; SELECT {tstz}")), ["Mon Jan 15 22:30:00 2024 "]);
+    assert_eq!(
+        go(
+            &mut e,
+            &mut b,
+            format!("SET datestyle='SQL'; SET timezone='Etc/GMT+5'; SELECT {tstz}")
+        ),
+        ["01/15/2024 09:30:00 -05"]
+    );
+    assert_eq!(
+        go(
+            &mut e,
+            &mut b,
+            format!("SET datestyle='Postgres'; SET timezone='-08:00'; SELECT {tstz}")
+        ),
+        ["Mon Jan 15 22:30:00 2024 "]
+    );
     // Named zones with DST are modeled: the winter timestamp above falls in
     // standard time, so New York is -05 (matches PostgreSQL 18.4).
-    assert_eq!(go(&mut e, &mut b, format!("SET timezone='America/New_York'; SELECT {tstz}")), ["2024-01-15 09:30:00-05"]);
+    assert_eq!(
+        go(
+            &mut e,
+            &mut b,
+            format!("SET timezone='America/New_York'; SELECT {tstz}")
+        ),
+        ["2024-01-15 09:30:00-05"]
+    );
     // A summer timestamp in the same zone shows daylight time (-04).
     let summer = "timestamptz '2024-07-15 14:30:00+00'";
-    assert_eq!(go(&mut e, &mut b, format!("SET timezone='America/New_York'; SELECT {summer}")), ["2024-07-15 10:30:00-04"]);
+    assert_eq!(
+        go(
+            &mut e,
+            &mut b,
+            format!("SET timezone='America/New_York'; SELECT {summer}")
+        ),
+        ["2024-07-15 10:30:00-04"]
+    );
     // An unknown zone name is still rejected loudly.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone='Mars/Olympus'")).contains("22023"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone='Mars/Olympus'"))
+            .contains("22023")
+    );
 }
 
 #[test]
 fn datestyle_affects_date_output() {
     let (mut e, mut b) = test_engine();
     // ISO is the default.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT date '2024-01-15'")), ["2024-01-15"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT date '2024-01-15'")),
+        ["2024-01-15"]
+    );
     // A SET earlier in the batch changes a later SELECT's rendering.
     let r = run_with(
         &mut e,
@@ -6333,13 +8717,25 @@ fn datestyle_affects_date_output() {
         "SET datestyle='SQL, DMY'; SELECT date '2024-01-15', timestamp '2024-01-15 14:30:00'",
     );
     assert_eq!(data_rows(&r), ["15/01/2024|15/01/2024 14:30:00"]);
-    let r = run_with(&mut e, &mut b, "SET datestyle='Postgres'; SELECT timestamp '2024-01-15 14:30:00'");
+    let r = run_with(
+        &mut e,
+        &mut b,
+        "SET datestyle='Postgres'; SELECT timestamp '2024-01-15 14:30:00'",
+    );
     assert_eq!(data_rows(&r), ["Mon Jan 15 14:30:00 2024"]);
-    let r = run_with(&mut e, &mut b, "SET datestyle='German'; SELECT date '2024-01-15'");
+    let r = run_with(
+        &mut e,
+        &mut b,
+        "SET datestyle='German'; SELECT date '2024-01-15'",
+    );
     assert_eq!(data_rows(&r), ["15.01.2024"]);
     // Cumulative canonical form in SHOW (German defaults to DMY).
     assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SET datestyle='ISO,MDY'; SET datestyle='German'; SHOW datestyle")),
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SET datestyle='ISO,MDY'; SET datestyle='German'; SHOW datestyle"
+        )),
         ["German, DMY"]
     );
 }
@@ -6349,24 +8745,56 @@ fn set_and_show_session_gucs() {
     // GucState is per run_with call, so SET and SHOW share one call.
     let (mut e, mut b) = test_engine();
     // A supported value is stored and reflected by SHOW.
-    let r = run_with(&mut e, &mut b, "SET application_name = 'myapp'; SHOW application_name");
+    let r = run_with(
+        &mut e,
+        &mut b,
+        "SET application_name = 'myapp'; SHOW application_name",
+    );
     assert_eq!(data_rows(&r), ["myapp"]);
     // client_encoding accepts UTF8 (and synonyms) and rejects others.
-    assert_eq!(message_types(&run_with(&mut e, &mut b, "SET client_encoding = 'UTF8'")), [b'C']);
+    assert_eq!(
+        message_types(&run_with(&mut e, &mut b, "SET client_encoding = 'UTF8'")),
+        [b'C']
+    );
     let bad = run_with(&mut e, &mut b, "SET client_encoding = 'LATIN1'");
-    assert!(String::from_utf8_lossy(&bad).contains("0A000"), "{:?}", String::from_utf8_lossy(&bad));
+    assert!(
+        String::from_utf8_lossy(&bad).contains("0A000"),
+        "{:?}",
+        String::from_utf8_lossy(&bad)
+    );
     // A named IANA time zone is now accepted.
-    assert_eq!(message_types(&run_with(&mut e, &mut b, "SET timezone = 'America/New_York'")), [b'C']);
+    assert_eq!(
+        message_types(&run_with(
+            &mut e,
+            &mut b,
+            "SET timezone = 'America/New_York'"
+        )),
+        [b'C']
+    );
     // An unknown zone name is still rejected loudly.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone = 'Mars/Olympus'")).contains("22023"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone = 'Mars/Olympus'"))
+            .contains("22023")
+    );
     // DateStyle values are now honored (see datestyle_affects_date_output).
-    assert_eq!(message_types(&run_with(&mut e, &mut b, "SET DateStyle = 'German'")), [b'C']);
+    assert_eq!(
+        message_types(&run_with(&mut e, &mut b, "SET DateStyle = 'German'")),
+        [b'C']
+    );
     // SET TIME ZONE spelling maps to timezone; UTC is accepted.
-    assert_eq!(message_types(&run_with(&mut e, &mut b, "SET TIME ZONE 'UTC'")), [b'C']);
+    assert_eq!(
+        message_types(&run_with(&mut e, &mut b, "SET TIME ZONE 'UTC'")),
+        [b'C']
+    );
     // An unknown parameter is rejected.
-    assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET no_such_guc = 1")).contains("42704"));
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET no_such_guc = 1")).contains("42704")
+    );
     // SHOW of a fixed server parameter still works.
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SHOW server_encoding")), ["UTF8"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SHOW server_encoding")),
+        ["UTF8"]
+    );
 }
 
 #[test]
@@ -6384,11 +8812,27 @@ fn prepare_coerces_args_to_declared_types() {
     );
     assert_eq!(data_rows(&r), ["5"]);
     // An argument that cannot become the declared type errors (not ignored).
-    let bad = run_with(&mut e, &mut b, "PREPARE p2 (int) AS SELECT $1; EXECUTE p2('nope')");
-    assert!(String::from_utf8_lossy(&bad).contains("22P02"), "{:?}", String::from_utf8_lossy(&bad));
+    let bad = run_with(
+        &mut e,
+        &mut b,
+        "PREPARE p2 (int) AS SELECT $1; EXECUTE p2('nope')",
+    );
+    assert!(
+        String::from_utf8_lossy(&bad).contains("22P02"),
+        "{:?}",
+        String::from_utf8_lossy(&bad)
+    );
     // Wrong argument count is rejected.
-    let count = run_with(&mut e, &mut b, "PREPARE p3 (int) AS SELECT $1; EXECUTE p3(1, 2)");
-    assert!(String::from_utf8_lossy(&count).contains("08P01"), "{:?}", String::from_utf8_lossy(&count));
+    let count = run_with(
+        &mut e,
+        &mut b,
+        "PREPARE p3 (int) AS SELECT $1; EXECUTE p3(1, 2)",
+    );
+    assert!(
+        String::from_utf8_lossy(&count).contains("08P01"),
+        "{:?}",
+        String::from_utf8_lossy(&count)
+    );
     // An unknown declared type is rejected at PREPARE.
     let unk = run_with(&mut e, &mut b, "PREPARE q (nosuchtype) AS SELECT $1");
     assert!(String::from_utf8_lossy(&unk).contains("42704"));
@@ -6398,11 +8842,21 @@ fn prepare_coerces_args_to_declared_types() {
 fn varchar_length_is_enforced() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (s varchar(3))");
-    assert_eq!(message_types(&run_with(&mut e, &mut b, "INSERT INTO t VALUES ('abc')")), [b'C']);
+    assert_eq!(
+        message_types(&run_with(&mut e, &mut b, "INSERT INTO t VALUES ('abc')")),
+        [b'C']
+    );
     let over = run_with(&mut e, &mut b, "INSERT INTO t VALUES ('abcd')");
-    assert!(String::from_utf8_lossy(&over).contains("22001"), "{:?}", String::from_utf8_lossy(&over));
+    assert!(
+        String::from_utf8_lossy(&over).contains("22001"),
+        "{:?}",
+        String::from_utf8_lossy(&over)
+    );
     // The stored value is unchanged (not truncated).
-    assert_eq!(data_rows(&run_with(&mut e, &mut b, "SELECT s FROM t")), ["abc"]);
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT s FROM t")),
+        ["abc"]
+    );
 }
 
 #[test]
@@ -6417,7 +8871,11 @@ fn numeric_scale_and_precision_enforced() {
     );
     // Too many integer digits (p - s = 3) overflows.
     let over = run_with(&mut e, &mut b, "INSERT INTO t VALUES (1234.5)");
-    assert!(String::from_utf8_lossy(&over).contains("22003"), "{:?}", String::from_utf8_lossy(&over));
+    assert!(
+        String::from_utf8_lossy(&over).contains("22003"),
+        "{:?}",
+        String::from_utf8_lossy(&over)
+    );
     // Rounding that carries into a new integer digit also overflows.
     let carry = run_with(&mut e, &mut b, "INSERT INTO t VALUES (999.999)");
     assert!(String::from_utf8_lossy(&carry).contains("22003"));
@@ -6429,9 +8887,17 @@ fn type_modifier_on_wrong_type_is_rejected() {
     // A modifier on a type that does not take one errors loudly, in both a
     // column definition and a cast — rejected, not accepted.
     let bad = run_with(&mut e, &mut b, "CREATE TABLE t (x int(4))");
-    assert!(String::from_utf8_lossy(&bad).contains("42601"), "{:?}", String::from_utf8_lossy(&bad));
+    assert!(
+        String::from_utf8_lossy(&bad).contains("42601"),
+        "{:?}",
+        String::from_utf8_lossy(&bad)
+    );
     let bad2 = run_with(&mut e, &mut b, "SELECT 1::int(4)");
-    assert!(String::from_utf8_lossy(&bad2).contains("42601"), "{:?}", String::from_utf8_lossy(&bad2));
+    assert!(
+        String::from_utf8_lossy(&bad2).contains("42601"),
+        "{:?}",
+        String::from_utf8_lossy(&bad2)
+    );
 }
 
 #[test]
@@ -6439,16 +8905,28 @@ fn insert_select() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE src (a int, b text)");
     run_with(&mut e, &mut b, "CREATE TABLE dst (a int, b text)");
-    run_with(&mut e, &mut b, "INSERT INTO src VALUES (1,'x'),(2,'y'),(3,'z')");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO src VALUES (1,'x'),(2,'y'),(3,'z')",
+    );
     // INSERT ... SELECT with a WHERE filter and projection.
-    let bytes = run_with(&mut e, &mut b, "INSERT INTO dst SELECT a, b FROM src WHERE a >= 2");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO dst SELECT a, b FROM src WHERE a >= 2",
+    );
     assert_eq!(message_types(&bytes), [b'C']);
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT a, b FROM dst ORDER BY a")),
         ["2|y", "3|z"]
     );
     // SELECT * source.
-    run_with(&mut e, &mut b, "INSERT INTO dst SELECT * FROM src WHERE a = 1");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO dst SELECT * FROM src WHERE a = 1",
+    );
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT a FROM dst ORDER BY a")),
         ["1", "2", "3"]
@@ -6485,7 +8963,11 @@ fn correlated_in_subquery() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (a int, g int)");
     run_with(&mut e, &mut b, "CREATE TABLE u (v int, g int)");
-    run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,100),(2,100),(3,200)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO t VALUES (1,100),(2,100),(3,200)",
+    );
     run_with(&mut e, &mut b, "INSERT INTO u VALUES (1,100),(3,200)");
     // a IN (values of u.v sharing t's group g)
     let bytes = run_with(
@@ -6520,15 +9002,27 @@ fn copy_formats_and_unsupported() {
     }
     // Binary of a scalar table now succeeds and emits the PGCOPY signature.
     let out = run_with(&mut engine, &mut budget, "COPY c TO STDOUT (FORMAT binary)");
-    assert!(!message_types(&out).contains(&b'E'), "{:?}", String::from_utf8_lossy(&out));
+    assert!(
+        !message_types(&out).contains(&b'E'),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
     assert!(
         out.windows(6).any(|w| w == b"PGCOPY"),
         "binary output should carry the signature"
     );
     // Binary of an array column now succeeds and carries the signature.
     run_with(&mut engine, &mut budget, "CREATE TABLE arr (a int[])");
-    let out = run_with(&mut engine, &mut budget, "COPY arr TO STDOUT (FORMAT binary)");
-    assert!(!message_types(&out).contains(&b'E'), "{:?}", String::from_utf8_lossy(&out));
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY arr TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&out).contains(&b'E'),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
     assert!(
         out.windows(6).any(|w| w == b"PGCOPY"),
         "binary array output should carry the signature"
@@ -6585,7 +9079,9 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
             )
             .unwrap();
     }
-    let setup = engine.take_pending_copy().expect("COPY enters streaming mode");
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters streaming mode");
     arena.reset();
     engine
         .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"5")
@@ -6610,28 +9106,61 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
 fn copy_query_to_stdout() {
     // COPY (query) TO STDOUT streams a query's rows in COPY's formats.
     let (mut engine, mut budget) = test_engine();
-    run_with(&mut engine, &mut budget, "CREATE TABLE cq (id int, v int, s text)");
-    run_with(&mut engine, &mut budget, "INSERT INTO cq VALUES (1,10,'a'),(2,20,'b,x')");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE cq (id int, v int, s text)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO cq VALUES (1,10,'a'),(2,20,'b,x')",
+    );
 
     // Default text format: tab-delimited rows for the projected columns.
-    let out = run_with(&mut engine, &mut budget, "COPY (SELECT id, s FROM cq ORDER BY id) TO STDOUT");
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT id, s FROM cq ORDER BY id) TO STDOUT",
+    );
     let text = String::from_utf8_lossy(&out);
     assert!(!message_types(&out).contains(&b'E'), "{text}");
-    assert!(text.contains("1\ta") && text.contains("2\tb,x"), "text rows: {text}");
+    assert!(
+        text.contains("1\ta") && text.contains("2\tb,x"),
+        "text rows: {text}"
+    );
     assert!(text.contains("COPY 2"), "command tag: {text}");
 
     // CSV with a header quotes the embedded comma.
-    let out = run_with(&mut engine, &mut budget, "COPY (SELECT id, s FROM cq ORDER BY id) TO STDOUT WITH CSV HEADER");
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT id, s FROM cq ORDER BY id) TO STDOUT WITH CSV HEADER",
+    );
     let text = String::from_utf8_lossy(&out);
-    assert!(text.contains("id,s") && text.contains("2,\"b,x\""), "csv: {text}");
+    assert!(
+        text.contains("id,s") && text.contains("2,\"b,x\""),
+        "csv: {text}"
+    );
 
     // An aggregate query streams its single row.
-    let out = run_with(&mut engine, &mut budget, "COPY (SELECT count(*) FROM cq) TO STDOUT");
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT count(*) FROM cq) TO STDOUT",
+    );
     assert!(String::from_utf8_lossy(&out).contains('2'), "aggregate");
 
     // A query source is TO-only; FROM STDIN is rejected.
-    let out = run_with(&mut engine, &mut budget, "COPY (SELECT id FROM cq) FROM STDIN");
-    assert!(message_types(&out).contains(&b'E'), "COPY (query) FROM STDIN must error");
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT id FROM cq) FROM STDIN",
+    );
+    assert!(
+        message_types(&out).contains(&b'E'),
+        "COPY (query) FROM STDIN must error"
+    );
 }
 
 #[test]
@@ -6660,9 +9189,19 @@ fn listen_notify_engine_semantics() {
 
     // A rolled-back NOTIFY is discarded; a committed one fires; a duplicate
     // (channel, payload) within one transaction collapses to a single entry.
-    run_as(&mut engine, &mut budget, 2, "BEGIN; NOTIFY b, 'x'; ROLLBACK");
+    run_as(
+        &mut engine,
+        &mut budget,
+        2,
+        "BEGIN; NOTIFY b, 'x'; ROLLBACK",
+    );
     assert_eq!(engine.notifications().len(), 0);
-    run_as(&mut engine, &mut budget, 2, "BEGIN; NOTIFY b, 'y'; NOTIFY b, 'y'; NOTIFY b, 'z'; COMMIT");
+    run_as(
+        &mut engine,
+        &mut budget,
+        2,
+        "BEGIN; NOTIFY b, 'y'; NOTIFY b, 'y'; NOTIFY b, 'z'; COMMIT",
+    );
     assert_eq!(engine.notifications().len(), 2);
     engine.clear_notifications();
 
@@ -6681,29 +9220,65 @@ fn listen_notify_engine_semantics() {
 #[test]
 fn create_table_as_builds_and_populates() {
     let (mut engine, mut budget) = test_engine();
-    run_with(&mut engine, &mut budget, "CREATE TABLE src (id int, name text)");
-    run_with(&mut engine, &mut budget, "INSERT INTO src VALUES (1,'a'),(2,'b'),(3,'c')");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE src (id int, name text)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO src VALUES (1,'a'),(2,'b'),(3,'c')",
+    );
 
     // Basic CTAS: the command tag is SELECT <count>, and the rows land.
-    let out = run_with(&mut engine, &mut budget, "CREATE TABLE t AS SELECT id, name FROM src WHERE id > 1");
-    assert!(String::from_utf8_lossy(&out).contains("SELECT 2"), "{:?}", String::from_utf8_lossy(&out));
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE t AS SELECT id, name FROM src WHERE id > 1",
+    );
+    assert!(
+        String::from_utf8_lossy(&out).contains("SELECT 2"),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
     let out = run_with(&mut engine, &mut budget, "SELECT id FROM t ORDER BY id");
     let s = String::from_utf8_lossy(&out);
     assert!(!s.contains("ERROR") && s.contains('2') && s.contains('3'));
 
     // WITH NO DATA creates the table empty.
-    run_with(&mut engine, &mut budget, "CREATE TABLE e AS SELECT id FROM src WITH NO DATA");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE e AS SELECT id FROM src WITH NO DATA",
+    );
     let out = run_with(&mut engine, &mut budget, "SELECT count(*) FROM e");
     assert!(String::from_utf8_lossy(&out).contains('0'));
 
     // A column-name list renames the query's output columns.
-    run_with(&mut engine, &mut budget, "CREATE TABLE r (x, y) AS SELECT id, name FROM src");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE r (x, y) AS SELECT id, name FROM src",
+    );
     let out = run_with(&mut engine, &mut budget, "SELECT x, y FROM r ORDER BY x");
-    assert!(!String::from_utf8_lossy(&out).contains("ERROR"), "{:?}", String::from_utf8_lossy(&out));
+    assert!(
+        !String::from_utf8_lossy(&out).contains("ERROR"),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
 
     // IF NOT EXISTS skips the second create, keeping the first table's data.
-    run_with(&mut engine, &mut budget, "CREATE TABLE IF NOT EXISTS n AS SELECT 1 AS v");
-    run_with(&mut engine, &mut budget, "CREATE TABLE IF NOT EXISTS n AS SELECT 2 AS v");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE IF NOT EXISTS n AS SELECT 1 AS v",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE IF NOT EXISTS n AS SELECT 2 AS v",
+    );
     let out = run_with(&mut engine, &mut budget, "SELECT v FROM n");
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains('1') && !s.contains('2'), "{s:?}");
@@ -6712,7 +9287,11 @@ fn create_table_as_builds_and_populates() {
     run_with(&mut engine, &mut budget, "INSERT INTO t VALUES (5, 'e')");
     let out = run_with(&mut engine, &mut budget, "SELECT count(*) FROM t");
     assert!(String::from_utf8_lossy(&out).contains('3'));
-    let out = run_with(&mut engine, &mut budget, "INSERT INTO t VALUES ('bad', 'x')");
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO t VALUES ('bad', 'x')",
+    );
     assert!(String::from_utf8_lossy(&out).contains("22P02"));
 
     // User-defined enum identity survives both CTAS and materialized-view

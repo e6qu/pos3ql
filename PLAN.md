@@ -37,7 +37,7 @@ acknowledged data in durable mode.
 | P6 | Driver compatibility | Extended query protocol incl. binary parameters, named statements/portals; functions & aggregates; psycopg 3 suite passes | **done** (`pg_catalog` tables themselves still absent) |
 | P7 | Object storage is the database | CHECKPOINT + auto-checkpoint snapshot SSTs + CAS'd manifest; cold start from a wiped disk; WAL truncation; heap compaction; object GC | **done** (snapshot model — see "Deviations") |
 | P8 | External conformance suite | psql 18 golden tests (dialect, SQLSTATEs, extended), raw wire probes, psycopg, durability + cold-start scenarios; 12/12 pass | **done** |
-| P9 | Transactions | BEGIN/COMMIT/ROLLBACK, READ COMMITTED, per-row pending/committed with fail-fast 40001 conflicts, WAL-batch-at-commit, transactional DDL | **done** |
+| P9 | Transactions | BEGIN/COMMIT/ROLLBACK, READ COMMITTED and REPEATABLE READ snapshots, READ ONLY enforcement, per-row pending/committed history with fail-fast 40001 conflicts, WAL-batch-at-commit, transactional DDL | **done** |
 | P10 | VSR multi-replica | Sans-io Replica state machine (normal op + view change), TCP transport (`vsr::cluster`), wire codec; 3-node cluster replicates and fails over | **done** (live psql write-routing into the cluster is the remaining productionization step) |
 | P11 | VOPR hardening | Deterministic whole-cluster simulator (`sim`) with loss/reorder/dup/delay/crash/partition; found and fixed two real consensus bugs (B-009, B-010); reproducible from a seed | **done** |
 | P12 | Compatibility polish | SCRAM-SHA-256 + cleartext auth, GROUP BY/HAVING/joins/subqueries, `pg_catalog` + `information_schema`, binary result format, portal max_rows, NOTICE, more types (date/timestamp/uuid/bytea), differential suite vs real PostgreSQL 18. | **done** (the TLS decision, deferred here, was later resolved in Stage G: isolated rustls to the object store) |
@@ -481,27 +481,21 @@ counts, noted for the day manifests are large.
 
 ### Stage F — MVCC snapshot reads over object-resident data
 
-Preserve snapshot isolation once the working set spills to the bucket. **This is more
-than "wire the existing snapshots to the LSM."** Today committed MVCC is
-**single-writer, one-committed-version**: each row has one committed image plus a
-bounded chain of uncommitted command versions owned by one transaction, and a second
-concurrent writer fails fast (`40001`). The pending chain gives data-modifying CTEs
-and transactional table-layout rewrites exact statement/savepoint semantics, but it
-is not a historical committed snapshot. The current committed image now carries the
-transaction's final WAL LSN and the visibility choke point accepts an LSN snapshot;
-there is still no older image to return when that current image is too new. A
-long-running reader therefore has **no historical committed version to see**, and
-Stage E's compaction would drop the only version it still needs. So Stage F grows a
-**prerequisite**: genuine **multi-version rows keyed by a commit LSN** (append versions
-instead of repoint-in-place; a read at snapshot `S` sees the newest version with
-`commit_lsn ≤ S`), and compaction must **retain any version still visible to the oldest
-live snapshot** (RocksDB sequence numbers / TigerBeetle per-op timestamps are the
-model). Then a read merges live + frozen memtable
-+ level SSTs through a snapshot-aware merge iterator (point via bloom+index, scans via
-streamed blocks with bounded read-ahead), and the executor's scan path
-(`sql/query.rs`) is wired to it transparently. **Milestone:** concurrent sessions show
-identical SI semantics whether data is in RAM or on the bucket; the *full differential
-suite is green with `memtable_bytes` shrunk tiny* — a powerful new forced-spill CI mode.
+Preserve snapshot isolation once the working set spills to the bucket. Committed
+rows now retain a bounded LSN-keyed history: a read at snapshot `S` sees the newest
+version whose `commit_lsn ≤ S`. REPEATABLE READ pins that snapshot across statements,
+READ ONLY is enforced recursively through prepared statements, and a fixed active-
+snapshot registry exposes the oldest retention watermark. Checkpoint publication may
+continue while a reader is pinned, but merge installation, history collapse, heap
+reclamation, and WAL pruning cannot destroy the pinned generation. A second writer
+still fails fast (`40001`).
+
+The scalable end state remains a snapshot-aware merge iterator over live/frozen
+memtables and level SSTs, with historical versions resident in immutable objects
+rather than retained only in the bounded in-process history while a snapshot is
+active. **Milestone:** concurrent sessions show identical snapshot semantics whether
+data is in RAM or on the bucket; the full differential suite stays green with
+`memtable_bytes` shrunk tiny.
 
 **Status (2026-07-24): the forced-spill differential mode landed early** — the
 single-session half of the milestone needs no MVCC change, so it now runs as a
@@ -532,6 +526,22 @@ too-new-image branch. It is deliberately not historical MVCC yet: checkpoint
 SST entries still reload as legacy pre-versioned images, the map retains only
 one committed image, and there is no active-snapshot registry or compaction
 retention watermark.
+
+**Status (2026-07-29): historical snapshots are live.** Up to eight committed
+images per resident row are retained by commit LSN; REPEATABLE READ and READ ONLY
+transaction characteristics work in combined PostgreSQL spellings; every scan,
+constraint check, catalog lookup, and subquery uses the statement/transaction
+snapshot; and ACCESS SHARE table locks protect pg_dump's schema view. A deterministic
+object-store test pins an old reader, publishes the newer generation through
+CHECKPOINT, proves the reader still sees the old image, wipes both cache tiers, and
+cold-starts the latest image from the same bucket. This closes the pg_dump
+consistency prerequisite without changing the durable hierarchy: the provider-neutral
+object store is authoritative, and RAM/local disk remain disposable caches.
+
+**Remaining Stage F work:** move historical versions into the SST format and merge
+them by `(rowid, commit_lsn)` so snapshot duration and update churn are bounded by
+object capacity rather than the eight-version resident history. The current bound
+fails loudly instead of discarding a visible version.
 
 **Remaining integration constraint:** committed-history MVCC and Stage I's
 suspendable row source share one lifetime boundary and must use the same
@@ -755,7 +765,8 @@ key compression** shrink keys, and per-block **compression** (lz4/zstd class) tr
 CPU for the bytes/cost that dominate on object storage. A point lookup is then
 **bloom → index → one ranged GET of one data block → decode the row**; a scan
 streams the covering blocks. The sparse index and filters are *small* and stay in
-RAM — you never pay an S3 round-trip to learn *where* data is, only to fetch it.
+RAM — you never pay an object-store round-trip to learn *where* data is, only
+to fetch it.
 
 **The in-RAM root and index (Stages A, D).** The manifest log + superblock (the
 only CAS'd object) names every live SST, its key range, and its level — small
@@ -850,7 +861,7 @@ step-wise **server-side cursors**, a **persisted/portable compiled-plan cache** 
 fleet, or a **JIT** to native for CPU-bound execution — none of which the
 storage-aware-planner + async-scheduler + push-based-pipeline approach needs.
 
-## Maturity roadmap — what remains, in order (2026-07-28)
+## Maturity roadmap — what remains, in order (2026-07-29)
 
 A full step-back audit against the founding goal — a mature,
 PostgreSQL-compatible engine whose *primary* storage is object storage, with
@@ -899,15 +910,13 @@ capstone. This section is the plan of record for all of it.
    reported. Wiping local disk at any instant therefore loses no acknowledged
    transaction. Local-only mode remains an explicit operating mode, not the
    target durable architecture.
-2. **RAM is still authoritative for the row map.** Only row *bytes* spill
-   (Stage D); the rowid→state map, visibility, uniqueness checks, and every
-   per-row bookkeeping entry live in RAM, bounded by `table_rows` — dataset
-   size is RAM-bounded in row *count* rather than bytes. Fix: the map itself
-   becomes block-resident — real key-ordered LSM levels where the index of
-   record is the SSTs' sparse-index/bloom blocks (already built, Stage C), and
-   RAM holds only the memtable plus *cached* blocks. The deepest remaining
-   storage change; co-designed with Stage F's LSN-keyed MVCC so the
-   row-version format is designed once.
+2. **Closed: the row map is a cache overlay.** Cold committed entries and row
+   bytes live only in immutable SST objects and are synthesized through
+   bloom-gated point probes or merged walks; map and heap pressure evict them,
+   and cold start installs no per-row entries. `table_rows` bounds the working
+   set, not the durable dataset. The remaining related bound is the in-RAM
+   uniqueness value index on constrained tables; its persistent value-keyed
+   SST forest belongs with the historical-version SST format.
 3. **Closed at the scheduling boundary: checkpoint work is sliced.** Automatic
    checkpoints and compaction advance through bounded event-loop beats instead
    of monopolizing a connection. Stage I's suspendable row source will extend
@@ -932,13 +941,13 @@ capstone. This section is the plan of record for all of it.
   exercising identity/constraint ALTER TABLE inside explicit transactions. Its cleanup
   surface includes `ALTER TABLE IF EXISTS ONLY`, typed `ALTER ... OWNER`, and a
   transactional DROP SCHEMA sweep of tables, views, materialized views,
-  sequences, domains and enums. The opposite direction — taking a consistent pg_dump
-  *from* pos3ql and restoring it into PostgreSQL — still requires
-  `REPEATABLE READ, READ ONLY` plus table locks. pos3ql rejects those unsupported
-  transaction characteristics instead of silently claiming them; the real
-  implementation is gated by Stage F's multi-version LSN snapshots and any
-  remaining pg_dump catalog discovery. Milestone: *a pg_dump of a pos3ql
-  database restores into real PostgreSQL*.
+  sequences, domains and enums. The opposite direction is now gated too:
+  PostgreSQL 18.4 pg_dump takes a REPEATABLE READ, READ ONLY snapshot, acquires
+  ACCESS SHARE locks, completes catalog discovery, emits
+  schema/data/view/identity state, and its plain dump restores into vanilla
+  PostgreSQL with sequence continuation intact. CI runs this outbound round
+  trip. Remaining pg_dump work expands breadth for object kinds not yet
+  implemented; it is no longer blocked on consistency.
 - **Server-side TLS for clients** — done. With `tls_on` (plus `tls_cert_file`
   and `tls_key_file`), the SSLRequest probe is answered `S` and the connection
   negotiates TLS; a client that does not ask for TLS still connects in the
@@ -1687,13 +1696,12 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
 3. **Stage F MVCC + Stage E beat pacing** — LSN-keyed row versions,
    snapshot-aware merge reads, compaction retention above the oldest-snapshot
    watermark, merge work amortized across statements.
-   **Status (2026-07-29): beat pacing, transactional command/definition
-   versions, and commit-LSN-stamped current row images landed;
-   committed-history MVCC rides with Stage I's suspendable row source** — see
-   Stage E's status (the merge is now a background job bounded to a few block transfers per beat)
-   and Stage F's status. The common visibility choke point can reject a
-   too-new committed image, but the LSN-keyed history, snapshot registry, and
-   retention watermark required to recover the older image remain.
+   **Status (2026-07-29): beat pacing and bounded historical MVCC landed.**
+   The merge is a background job bounded to a few block transfers per beat;
+   committed histories are keyed by LSN; REPEATABLE READ registers an
+   oldest-live-snapshot watermark; and checkpoint/compaction retention respects
+   it. Remaining: encode the histories into SSTs and make the versioned merge
+   iterator object-resident so the eight-version in-process bound can disappear.
 4. **The map spills (gap 2)** — block-resident row index; secondary indexes
    as the LSM forest; block compression and the multi-block index / sized
    filters (the remaining Stage C refinements) ride along since they touch
@@ -1854,9 +1862,11 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
    standard relation/schema/database/role/function/tablespace/publication/FDW
    listings execute end-to-end. PostgreSQL 18.4 plain dumps and ownerful custom
    archives restore into pos3ql, including parallel clean replacement, and
-   survive restart; outbound pg_dump stays open pending Stage F's
-   repeatable-read snapshots/table locks and any remaining dump-specific catalog
-   queries.
+   survive restart. Outbound PostgreSQL 18.4 pg_dump now completes under its
+   real repeatable-read/read-only/ACCESS SHARE workflow and restores into
+   vanilla PostgreSQL with data, a dependent view, identity metadata, and
+   sequence continuation. Remaining tooling work is breadth across additional
+   object kinds, not a consistency shortcut.
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;
@@ -1885,7 +1895,7 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
 
 ## Verification
 
-- `cargo test` — 481 unit/property tests plus the integration suites
+- `cargo test` — 484 unit/property tests plus the integration suites
   (memory guard incl. unwind safety and the TLS budget scope, differential
   FixedMap vs std, PCG32/CRC-32C/SHA-256/SHA-512/HMAC/SigV4 official vectors,
   row codec fuzz-by-truncation, WAL corruption/floor/stale-tail, engine
@@ -1901,8 +1911,10 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
   256 KiB memtable on MinIO). All green as of 2026-07-24.
 - `tests/external/differential.sh` — 78 corpora + 3 exact-error corpora +
   3205/3205 matching sqllogictest blocks (zero unsupported/divergence) against
-  real PostgreSQL 18.4, plus the generative
-  fuzzer; also run sharded in CI with a hermetic PostgreSQL service.
+  real PostgreSQL 18.4, plus the generative fuzzer. CI runs the deterministic
+  wire/tooling/corpus gates once, four query-balanced sqllogictest slices, and
+  the full zero-budget fuzzer as separate jobs against a hermetic PostgreSQL
+  service, keeping every phase within the fixed 15-minute ceiling.
 - `cargo clippy --lib --bins --tests -- -D warnings` — zero warnings.
 - `tools/coverage.sh` — line coverage across both test layers (~78–80%,
   CI floor 70%).

@@ -79,13 +79,27 @@ pub enum OwnedDatum {
     Int4(i32),
     Int8(i64),
     Float8(f64),
-    Text { len: u8, bytes: [u8; MAX_DEFAULT_TEXT] },
-    Numeric { sign: u8, weight: i16, dscale: u16, nbytes: u8, digits: [u8; MAX_DEFAULT_TEXT] },
+    Text {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
+    Numeric {
+        sign: u8,
+        weight: i16,
+        dscale: u16,
+        nbytes: u8,
+        digits: [u8; MAX_DEFAULT_TEXT],
+    },
     Inet(crate::sql::net::NetAddr),
     Cidr(crate::sql::net::NetAddr),
     Macaddr([u8; 6]),
     Macaddr8([u8; 8]),
-    Enum { slot: u16, sort: f64, len: u8, bytes: [u8; MAX_DEFAULT_TEXT] },
+    Enum {
+        slot: u16,
+        sort: f64,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
 }
 
 pub(crate) const MAX_DEFAULT_TEXT: usize = 48;
@@ -98,7 +112,13 @@ impl OwnedDatum {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot store a composite (record) value in a column"
-                ))
+                ));
+            }
+            Datum::Int2Vector(_) => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot store an int2vector value in a column"
+                ));
             }
             Datum::Null => Self::Null,
             Datum::Bool(b) => Self::Bool(*b),
@@ -125,7 +145,7 @@ impl OwnedDatum {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "defaults of this type are not supported yet (store as text)"
-                ))
+                ));
             }
             Datum::Inet(n) => Self::Inet(*n),
             Datum::Cidr(n) => Self::Cidr(*n),
@@ -141,11 +161,19 @@ impl OwnedDatum {
                 }
                 let mut bytes = [0u8; MAX_DEFAULT_TEXT];
                 bytes[..label.len()].copy_from_slice(label.as_bytes());
-                Self::Enum { slot: *slot, sort: *sort, len: label.len() as u8, bytes }
+                Self::Enum {
+                    slot: *slot,
+                    sort: *sort,
+                    len: label.len() as u8,
+                    bytes,
+                }
             }
             Datum::Numeric(n) => {
                 if n.digits.len() > MAX_DEFAULT_TEXT {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "numeric default too large"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "numeric default too large"
+                    ));
                 }
                 let mut digits = [0u8; MAX_DEFAULT_TEXT];
                 digits[..n.digits.len()].copy_from_slice(n.digits);
@@ -171,7 +199,10 @@ impl OwnedDatum {
                 }
                 let mut bytes = [0u8; MAX_DEFAULT_TEXT];
                 bytes[..s.len()].copy_from_slice(s.as_bytes());
-                Self::Text { len: s.len() as u8, bytes }
+                Self::Text {
+                    len: s.len() as u8,
+                    bytes,
+                }
             }
         })
     }
@@ -187,26 +218,36 @@ impl OwnedDatum {
             Self::Text { len, bytes } => Datum::Text(
                 core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
             ),
-            Self::Numeric { sign, weight, dscale, nbytes, digits } => {
-                Datum::Numeric(crate::sql::numeric::Numeric {
-                    sign: match sign {
-                        0 => crate::sql::numeric::Sign::Pos,
-                        1 => crate::sql::numeric::Sign::Neg,
-                        _ => crate::sql::numeric::Sign::NaN,
-                    },
-                    weight: *weight,
-                    dscale: *dscale,
-                    digits: &digits[..*nbytes as usize],
-                })
-            }
+            Self::Numeric {
+                sign,
+                weight,
+                dscale,
+                nbytes,
+                digits,
+            } => Datum::Numeric(crate::sql::numeric::Numeric {
+                sign: match sign {
+                    0 => crate::sql::numeric::Sign::Pos,
+                    1 => crate::sql::numeric::Sign::Neg,
+                    _ => crate::sql::numeric::Sign::NaN,
+                },
+                weight: *weight,
+                dscale: *dscale,
+                digits: &digits[..*nbytes as usize],
+            }),
             Self::Inet(n) => Datum::Inet(*n),
             Self::Cidr(n) => Datum::Cidr(*n),
             Self::Macaddr(b) => Datum::Macaddr(*b),
             Self::Macaddr8(b) => Datum::Macaddr8(*b),
-            Self::Enum { slot, sort, len, bytes } => Datum::Enum {
+            Self::Enum {
+                slot,
+                sort,
+                len,
+                bytes,
+            } => Datum::Enum {
                 slot: *slot,
                 sort: *sort,
-                label: core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
+                label: core::str::from_utf8(&bytes[..*len as usize])
+                    .expect("stored from valid UTF-8"),
             },
         }
     }
@@ -482,13 +523,18 @@ pub struct RowState {
     /// predates LSN-versioned row metadata (legacy checkpoint/cold start) and
     /// is therefore visible to every later snapshot.
     pub committed_lsn: u64,
+    /// Older committed images retained while a repeatable-read snapshot can
+    /// still see them. Their bytes remain in the heap or in immutable SST
+    /// generations; WAL/SST objects, not this metadata, are the durable copy.
+    pub history: CommittedHistory,
     pub pending: PendingVersions,
 }
 
 /// Where a committed row's bytes live: the RAM heap, or spilled to the
 /// table's checkpoint SST in the block store (fetched back through the cache
-/// tiers on read). The rows *map* stays in RAM either way — it is the
-/// authoritative index — so spilling moves bytes, never visibility.
+/// tiers on read). The resident row map is a bounded overlay: cold committed
+/// rows remain indexed by immutable SST objects and are synthesized into the
+/// overlay on demand, so RAM and local disk are caches rather than authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowHome {
     Heap(RowLoc),
@@ -501,6 +547,84 @@ impl RowHome {
             RowHome::Heap(loc) => Some(loc),
             RowHome::Spilled { .. } => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedVersion {
+    pub home: Option<RowHome>,
+    pub lsn: u64,
+}
+
+/// The per-row committed history needed by active snapshots. Static memory
+/// discipline makes the bound explicit; exhaustion is rejected before WAL
+/// durability rather than losing a version after commit.
+pub(crate) const MAX_COMMITTED_ROW_VERSIONS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedHistory {
+    entries: [CommittedVersion; MAX_COMMITTED_ROW_VERSIONS],
+    len: u8,
+}
+
+impl CommittedHistory {
+    pub const fn empty() -> Self {
+        Self {
+            entries: [CommittedVersion { home: None, lsn: 0 }; MAX_COMMITTED_ROW_VERSIONS],
+            len: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn get(&self, index: usize) -> Option<CommittedVersion> {
+        (index < self.len()).then_some(self.entries[index])
+    }
+
+    fn push_newest(&mut self, version: CommittedVersion) -> Result<(), SqlError> {
+        if self.len() == MAX_COMMITTED_ROW_VERSIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "active snapshots retain more than {} committed versions of one row",
+                MAX_COMMITTED_ROW_VERSIONS
+            ));
+        }
+        let len = self.len();
+        self.entries.copy_within(0..len, 1);
+        self.entries[0] = version;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Keeps every version newer than the oldest snapshot and the first
+    /// version at or before it. That is the minimal chain that can answer all
+    /// active snapshots.
+    fn prune(&mut self, oldest_snapshot: Option<u64>) {
+        let Some(oldest) = oldest_snapshot else {
+            self.len = 0;
+            return;
+        };
+        let mut keep = self.len();
+        for (index, version) in self.entries[..self.len()].iter().enumerate() {
+            if version.lsn <= oldest {
+                keep = index + 1;
+                break;
+            }
+        }
+        self.len = keep as u8;
+    }
+
+    fn visible_at(&self, commit_snapshot: u64) -> Option<Option<RowHome>> {
+        self.entries[..self.len()]
+            .iter()
+            .find(|version| version.lsn <= commit_snapshot)
+            .map(|version| version.home)
     }
 }
 
@@ -616,10 +740,10 @@ impl RowState {
         Self {
             committed: Some(RowHome::Heap(loc)),
             committed_lsn: commit_lsn,
+            history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         }
     }
-
 
     /// What transaction `txid` sees with all its own changes visible (the
     /// ordinary snapshot). `None` = row invisible.
@@ -648,7 +772,7 @@ impl RowState {
         match self.pending.visible_at(txid, command_snapshot) {
             Some(loc) => loc.map(RowHome::Heap),
             None if self.committed_lsn <= commit_snapshot => self.committed,
-            None => None,
+            None => self.history.visible_at(commit_snapshot).flatten(),
         }
     }
 
@@ -858,10 +982,7 @@ impl Table {
     /// Whether the slot is free for a fresh CREATE: no committed table, no
     /// pending DDL, and no retained rows.
     fn is_free(&self) -> bool {
-        !self.live
-            && self.pending_ddl.is_none()
-            && self.n_pending_defs == 0
-            && self.rows.is_empty()
+        !self.live && self.pending_ddl.is_none() && self.n_pending_defs == 0 && self.rows.is_empty()
     }
 }
 
@@ -952,7 +1073,9 @@ impl StoredQueryDependencies {
     }
 
     pub fn depends_on(&self, class: DependencyClass, slot: usize) -> bool {
-        self.entries().iter().any(|entry| entry.class == class && entry.slot as usize == slot)
+        self.entries()
+            .iter()
+            .any(|entry| entry.class == class && entry.slot as usize == slot)
     }
 
     pub fn serialized_push(
@@ -1173,7 +1296,10 @@ pub struct EnumMember {
 }
 
 impl EnumMember {
-    pub(crate) const EMPTY: Self = EnumMember { label: SqlName::EMPTY, sort: 0.0 };
+    pub(crate) const EMPTY: Self = EnumMember {
+        label: SqlName::EMPTY,
+        sort: 0.0,
+    };
 }
 
 /// A `CREATE TYPE ... AS ENUM (...)` type: an ordered set of string labels. Its
@@ -1215,7 +1341,10 @@ impl EnumDef {
 
     /// The sort key of a label, or `None` if the label is not a member.
     pub fn sort_of(&self, label: &str) -> Option<f64> {
-        self.members().iter().find(|m| m.label.as_str() == label).map(|m| m.sort)
+        self.members()
+            .iter()
+            .find(|m| m.label.as_str() == label)
+            .map(|m| m.sort)
     }
 }
 
@@ -1394,7 +1523,7 @@ impl SequenceDef {
                         "nextval: reached maximum value of sequence \"{}\" ({})",
                         self.name.as_str(),
                         self.max_value
-                    ))
+                    ));
                 }
             }
         } else {
@@ -1407,7 +1536,7 @@ impl SequenceDef {
                         "nextval: reached minimum value of sequence \"{}\" ({})",
                         self.name.as_str(),
                         self.min_value
-                    ))
+                    ));
                 }
             }
         };
@@ -1652,7 +1781,11 @@ impl PathContext {
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
         entries[0] = PathEntry::Catalog;
         entries[1] = PathEntry::Schema(0);
-        PathContext { entries, n: 2, explicit_catalog: false }
+        PathContext {
+            entries,
+            n: 2,
+            explicit_catalog: false,
+        }
     }
 
     pub fn entries(&self) -> &[PathEntry] {
@@ -1708,6 +1841,15 @@ pub struct Storage {
     /// data-modifying `WITH` statement lowers it to that statement's command-id
     /// so its main query does not see its CTEs' changes.
     read_snapshot: u32,
+    /// Durable commit-LSN snapshot for the running statement.
+    commit_snapshot: u64,
+    /// Repeatable-read snapshots held by live connections. This registry is
+    /// startup-sized to max_connections and drives version/WAL/SST retention.
+    active_snapshots: FixedVec<(u32, u64)>,
+    /// ACCESS SHARE table locks held until transaction end. The current
+    /// execution core fails conflicting DDL fast instead of parking it, but
+    /// the lock is real and cross-connection rather than accepted-and-ignored.
+    table_locks: FixedVec<(u32, u32)>,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
     /// The read path for spilled rows: the tiered block stack shared with the
@@ -1729,7 +1871,8 @@ pub struct Storage {
 /// and startup-reserved; the stack is shared with the checkpointer through a
 /// `RefCell` (single-threaded engine, short borrows).
 pub(crate) struct SpillReader {
-    blocks: std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
+    blocks:
+        std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
@@ -1783,7 +1926,9 @@ impl SpillReader {
     /// Startup-only: reserves the reader scratch from the budget.
     pub(crate) fn new(
         budget: &mut Budget,
-        blocks: std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
+        blocks: std::rc::Rc<
+            std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+        >,
     ) -> Result<Self, BudgetError> {
         budget.draw(
             2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
@@ -1859,12 +2004,14 @@ impl Storage {
                 DependencyClass::Enum => self.enum_slot(schema, name, txid),
                 DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
             }
-            .ok_or_else(|| sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "stored-query dependency {}.{} does not exist",
-                schema,
-                name
-            ))?;
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "stored-query dependency {}.{} does not exist",
+                    schema,
+                    name
+                )
+            })?;
             rebound.push(StoredQueryDependency {
                 class: dependency.class,
                 slot: slot as u16,
@@ -1946,14 +2093,14 @@ impl Storage {
                 + size_of::<MatviewDef>()
                 + size_of::<StoredQueryDependencies>()
                 + size_of::<IndexDef>())
-            + config.max_tables
-                * MAX_PENDING_TABLE_DEFS
-                * size_of::<PendingTableDefSlot>()
+            + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
+            + config.max_connections as usize * size_of::<(u32, u64)>()
+            + config.max_connections as usize * config.max_tables * size_of::<(u32, u32)>()
             + ValueIndexPool::budget_bytes(
                 config.max_value_indexes,
                 config.value_index_rows + config.table_rows,
@@ -2073,7 +2220,9 @@ impl Storage {
         }
         let mut domains = FixedVec::new(budget, "domains", MAX_DOMAINS)?;
         for _ in 0..MAX_DOMAINS {
-            domains.push(DomainDef::EMPTY).expect("sized to MAX_DOMAINS");
+            domains
+                .push(DomainDef::EMPTY)
+                .expect("sized to MAX_DOMAINS");
         }
         let mut enums = FixedVec::new(budget, "enums", MAX_ENUMS)?;
         for _ in 0..MAX_ENUMS {
@@ -2095,7 +2244,9 @@ impl Storage {
         }
         let mut comments = FixedVec::new(budget, "comments", MAX_COMMENTS)?;
         for _ in 0..MAX_COMMENTS {
-            comments.push(CommentEntry::empty()).expect("sized to MAX_COMMENTS");
+            comments
+                .push(CommentEntry::empty())
+                .expect("sized to MAX_COMMENTS");
         }
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
         for _ in 0..config.max_tables {
@@ -2121,6 +2272,13 @@ impl Storage {
             config.max_value_indexes,
             config.value_index_rows + config.table_rows,
         )?;
+        let active_snapshots =
+            FixedVec::new(budget, "active_snapshots", config.max_connections as usize)?;
+        let table_locks = FixedVec::new(
+            budget,
+            "table_locks",
+            config.max_connections as usize * config.max_tables,
+        )?;
         Ok(Self {
             heap,
             tables,
@@ -2138,6 +2296,9 @@ impl Storage {
             path: PathContext::public_only(),
             catalog_seq: 0,
             read_snapshot: SNAPSHOT_ALL,
+            commit_snapshot: u64::MAX,
+            active_snapshots,
+            table_locks,
             next_rowid: 1,
             lsn: 0,
             spill: None,
@@ -2169,10 +2330,7 @@ impl Storage {
     /// Committed schemas with their slot indices, for checkpoint and catalog
     /// output.
     pub fn live_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
-        self.schemas
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.live)
+        self.schemas.iter().enumerate().filter(|(_, n)| n.live)
     }
 
     /// Schemas visible to `txid`, for catalog output inside a transaction.
@@ -2277,13 +2435,25 @@ impl Storage {
         &mut self,
         slot: usize,
         txid: u32,
-    ) -> Option<(CommentClass, SqlName, SqlName, u32, Option<StackStr<COMMENT_MAX>>)> {
+    ) -> Option<(
+        CommentClass,
+        SqlName,
+        SqlName,
+        u32,
+        Option<StackStr<COMMENT_MAX>>,
+    )> {
         let entry = &mut self.comments[slot];
         match entry.pending {
             Some(p) if p.txid == txid => {
                 entry.pending = None;
                 entry.live = p.text;
-                let out = (entry.class, entry.schema, entry.name, entry.subid, entry.live);
+                let out = (
+                    entry.class,
+                    entry.schema,
+                    entry.name,
+                    entry.subid,
+                    entry.live,
+                );
                 self.reap_comment(slot);
                 Some(out)
             }
@@ -2389,10 +2559,20 @@ impl Storage {
                 name.as_str()
             ));
         }
-        self.alloc_schema(name, Some(PendingDdl { txid, creating: true }))
+        self.alloc_schema(
+            name,
+            Some(PendingDdl {
+                txid,
+                creating: true,
+            }),
+        )
     }
 
-    fn alloc_schema(&mut self, name: SqlName, pending: Option<PendingDdl>) -> Result<usize, SqlError> {
+    fn alloc_schema(
+        &mut self,
+        name: SqlName,
+        pending: Option<PendingDdl>,
+    ) -> Result<usize, SqlError> {
         let Some(slot) = self
             .schemas
             .iter()
@@ -2404,7 +2584,11 @@ impl Storage {
                 self.schemas.len()
             ));
         };
-        self.schemas[slot] = SchemaDef { name, live: pending.is_none(), pending };
+        self.schemas[slot] = SchemaDef {
+            name,
+            live: pending.is_none(),
+            pending,
+        };
         Ok(slot)
     }
 
@@ -2424,7 +2608,10 @@ impl Storage {
             n.live = false;
             n.pending = None;
         } else {
-            n.pending = Some(PendingDdl { txid, creating: false });
+            n.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
         }
     }
 
@@ -2526,9 +2713,17 @@ impl Storage {
             let mut shifted = [PathEntry::Catalog; MAX_PATH_ENTRIES];
             shifted[1..=n.min(MAX_PATH_ENTRIES - 1)]
                 .copy_from_slice(&entries[..n.min(MAX_PATH_ENTRIES - 1)]);
-            return PathContext { entries: shifted, n: n + 1, explicit_catalog: false };
+            return PathContext {
+                entries: shifted,
+                n: n + 1,
+                explicit_catalog: false,
+            };
         }
-        PathContext { entries, n, explicit_catalog: true }
+        PathContext {
+            entries,
+            n,
+            explicit_catalog: true,
+        }
     }
 
     pub fn path(&self) -> &PathContext {
@@ -2690,9 +2885,7 @@ impl Storage {
         }
         // An explicit pg_catalog at the head of the path is the creation
         // target, which PostgreSQL then refuses.
-        if self.path.explicit_catalog
-            && self.path.entries().first() == Some(&PathEntry::Catalog)
-        {
+        if self.path.explicit_catalog && self.path.entries().first() == Some(&PathEntry::Catalog) {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied to create \"pg_catalog.{}\"",
@@ -2710,10 +2903,7 @@ impl Storage {
 
     /// Live tables with their slot indices.
     pub fn live_tables(&self) -> impl Iterator<Item = (usize, &Table)> {
-        self.tables
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.live)
+        self.tables.iter().enumerate().filter(|(_, t)| t.live)
     }
 
     /// Floors every serial column's sequence at the maximum value stored in
@@ -2817,7 +3007,10 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let Some(mut context) = spill.scan_contexts.iter().find_map(|c| c.try_borrow_mut().ok())
+        let Some(mut context) = spill
+            .scan_contexts
+            .iter()
+            .find_map(|c| c.try_borrow_mut().ok())
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2938,8 +3131,7 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
-        else {
+        let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok()) else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "spill fetches nested deeper than the reader scratch"
@@ -2995,6 +3187,7 @@ impl Storage {
                 RowState {
                     committed: Some(RowHome::Spilled { len, sst: member }),
                     committed_lsn: 0,
+                    history: CommittedHistory::empty(),
                     pending: PendingVersions::empty(),
                 },
             )
@@ -3006,11 +3199,14 @@ impl Storage {
         if let Some(state) = self.tables[table_slot].rows.get(&rowid) {
             return Ok(Some(*state));
         }
-        Ok(self.spill_probe(table_slot, rowid)?.map(|(len, member)| RowState {
-            committed: Some(RowHome::Spilled { len, sst: member }),
-            committed_lsn: 0,
-            pending: PendingVersions::empty(),
-        }))
+        Ok(self
+            .spill_probe(table_slot, rowid)?
+            .map(|(len, member)| RowState {
+                committed: Some(RowHome::Spilled { len, sst: member }),
+                committed_lsn: 0,
+                history: CommittedHistory::empty(),
+                pending: PendingVersions::empty(),
+            }))
     }
 
     /// How many rows `txid` sees, through the same seam — under the current
@@ -3019,7 +3215,10 @@ impl Storage {
         let snapshot = self.read_snapshot;
         let mut count = 0usize;
         self.for_each_row_state(table_slot, &mut |_, state| {
-            if state.visible_at(txid, snapshot).is_some() {
+            if state
+                .visible_at_lsn(txid, snapshot, self.commit_snapshot)
+                .is_some()
+            {
                 count += 1;
             }
             Ok(core::ops::ControlFlow::Continue(()))
@@ -3043,8 +3242,7 @@ impl Storage {
                         "row is spilled but no spill reader is attached"
                     ));
                 };
-                let Some(handle) = self
-                    .tables[table_slot]
+                let Some(handle) = self.tables[table_slot]
                     .spill_ssts
                     .get(sst as usize)
                     .copied()
@@ -3055,16 +3253,15 @@ impl Storage {
                         "row is spilled but its table has no spill SST"
                     ));
                 };
-                let out = arena
-                    .alloc_slice_with(len as usize, |_| 0u8)
-                    .map_err(|_| sql_err!(
+                let out = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+                    sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "spilled rows exceed the statement arena; raise work_arena_bytes"
-                    ))?;
+                    )
+                })?;
                 // Both borrows are per-fetch; the copy into the arena ends
                 // them before returning.
-                let Some(mut scratch) =
-                    spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
+                let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
                 else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -3072,16 +3269,26 @@ impl Storage {
                     ));
                 };
                 let mut blocks = spill.blocks.borrow_mut();
-                let SpillScratch { index_buf, data_buf, assembly_buf, .. } = &mut *scratch;
-                let mut reader =
-                    crate::store::SstReader::over(index_buf, data_buf, assembly_buf);
+                let SpillScratch {
+                    index_buf,
+                    data_buf,
+                    assembly_buf,
+                    ..
+                } = &mut *scratch;
+                let mut reader = crate::store::SstReader::over(index_buf, data_buf, assembly_buf);
                 let got = reader
                     .get(&mut *blocks, &handle, rowid, out)
                     .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
                 match got {
                     Some(n) if n == len as usize => Ok(&out[..n]),
-                    Some(_) => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row length mismatch")),
-                    None => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row missing from its SST")),
+                    Some(_) => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "spilled row length mismatch"
+                    )),
+                    None => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "spilled row missing from its SST"
+                    )),
                 }
             }
         }
@@ -3108,8 +3315,7 @@ impl Storage {
                         "row is spilled but no spill reader is attached"
                     ));
                 };
-                let Some(handle) = self
-                    .tables[table_slot]
+                let Some(handle) = self.tables[table_slot]
                     .spill_ssts
                     .get(sst as usize)
                     .copied()
@@ -3120,16 +3326,19 @@ impl Storage {
                         "row is spilled but its table has no spill SST"
                     ));
                 };
-                let Some(mut scratch) =
-                    spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
+                let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
                 else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "spilled-row fetches nested deeper than the reader supports"
                     ));
                 };
-                let SpillScratch { index_buf, data_buf, assembly_buf, bounce_buf } =
-                    &mut *scratch;
+                let SpillScratch {
+                    index_buf,
+                    data_buf,
+                    assembly_buf,
+                    bounce_buf,
+                } = &mut *scratch;
                 // The assembly buffer doubles as the row destination: `get`
                 // assembles a chained row into the caller buffer directly, so
                 // the two uses never overlap. The reader's own staging slot is
@@ -3138,16 +3347,21 @@ impl Storage {
                 let row_buf = &mut assembly_buf[..len as usize];
                 let got = {
                     let mut blocks = spill.blocks.borrow_mut();
-                    let mut reader =
-                        crate::store::SstReader::over(index_buf, data_buf, bounce_buf);
+                    let mut reader = crate::store::SstReader::over(index_buf, data_buf, bounce_buf);
                     reader
                         .get(&mut *blocks, &handle, rowid, row_buf)
                         .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?
                 };
                 match got {
                     Some(n) if n == len as usize => f(&row_buf[..n]),
-                    Some(_) => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row length mismatch")),
-                    None => Err(sql_err!(sqlstate::INTERNAL_ERROR, "spilled row missing from its SST")),
+                    Some(_) => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "spilled row length mismatch"
+                    )),
+                    None => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "spilled row missing from its SST"
+                    )),
                 }
             }
         }
@@ -3168,7 +3382,10 @@ impl Storage {
             let newest = (table.n_spill_ssts - 1) as u8;
             for (_, state) in table.rows.iter_mut() {
                 if let Some(RowHome::Heap(loc)) = state.committed {
-                    state.committed = Some(RowHome::Spilled { len: loc.len, sst: newest });
+                    state.committed = Some(RowHome::Spilled {
+                        len: loc.len,
+                        sst: newest,
+                    });
                 }
             }
         }
@@ -3238,7 +3455,10 @@ impl Storage {
     /// tombstones. The caller guarantees the list has room.
     pub(crate) fn append_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
         let table = &mut self.tables[slot];
-        assert!(table.n_spill_ssts < MAX_SPILL_SSTS, "delta flush into a full list");
+        assert!(
+            table.n_spill_ssts < MAX_SPILL_SSTS,
+            "delta flush into a full list"
+        );
         table.spill_ssts[table.n_spill_ssts] = Some(handle);
         table.n_spill_ssts += 1;
     }
@@ -3271,7 +3491,8 @@ impl Storage {
             let mut batch = [0u64; 512];
             let mut n = 0usize;
             for (&rowid, state) in table.rows.iter() {
-                if state.committed.is_none() && state.pending.is_none() {
+                if state.committed.is_none() && state.history.is_empty() && state.pending.is_none()
+                {
                     batch[n] = rowid;
                     n += 1;
                     if n == batch.len() {
@@ -3355,6 +3576,17 @@ impl Storage {
                         .push((index as u32, rowid, u8::MAX, loc))
                         .map_err(overflow)?;
                 }
+                for history_index in 0..state.history.len() {
+                    if let Some(CommittedVersion {
+                        home: Some(RowHome::Heap(loc)),
+                        ..
+                    }) = state.history.get(history_index)
+                    {
+                        scratch
+                            .push((index as u32, rowid, 0x80 | history_index as u8, loc))
+                            .map_err(overflow)?;
+                    }
+                }
                 for pending_index in 0..state.pending.len() {
                     if let Some(PendingChange { loc: Some(loc), .. }) =
                         state.pending.get(pending_index)
@@ -3389,14 +3621,17 @@ impl Storage {
                 .rows
                 .get_mut(&rowid)
                 .expect("scratch entries come from the maps");
-            if pending_index != u8::MAX {
+            if pending_index == u8::MAX {
+                state.committed = Some(RowHome::Heap(new_loc));
+            } else if pending_index & 0x80 != 0 {
+                let history_index = (pending_index & 0x7f) as usize;
+                state.history.entries[history_index].home = Some(RowHome::Heap(new_loc));
+            } else {
                 let p = state
                     .pending
                     .get_mut(pending_index as usize)
                     .expect("pending image existed");
                 p.loc = Some(new_loc);
-            } else {
-                state.committed = Some(RowHome::Heap(new_loc));
             }
             write_at += len;
         }
@@ -3425,6 +3660,7 @@ impl Storage {
                 "could not serialize access due to concurrent table definition change"
             ));
         }
+        let oldest_snapshot = self.oldest_snapshot();
         let table = &mut self.tables[table_index];
         if let Some(state) = table.rows.get_mut(&rowid) {
             if let Some(other) = state.locked_by_other(txid) {
@@ -3441,6 +3677,18 @@ impl Storage {
                 last.loc = loc;
                 return Ok(prior);
             }
+            state.history.prune(oldest_snapshot);
+            if oldest_snapshot.is_some()
+                && state.pending.is_none()
+                && (state.committed.is_some() || state.committed_lsn != 0)
+                && state.history.len() == MAX_COMMITTED_ROW_VERSIONS
+            {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "active snapshot history for row {} is full; end the old snapshot or raise the compiled version bound",
+                    rowid
+                ));
+            }
             state.pending.push(PendingChange { txid, cid, loc })?;
             return Ok(None);
         }
@@ -3455,9 +3703,7 @@ impl Storage {
         if table.rows.len() == table.rows.capacity() {
             // Entries the spill lists reproduce are droppable on demand.
             self.evict_redundant_entries(table_index);
-            if self.tables[table_index].rows.len()
-                == self.tables[table_index].rows.capacity()
-            {
+            if self.tables[table_index].rows.len() == self.tables[table_index].rows.capacity() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table row limit reached ({} rows in memtable)",
@@ -3472,6 +3718,7 @@ impl Storage {
                 RowState {
                     committed,
                     committed_lsn: 0,
+                    history: CommittedHistory::empty(),
                     pending: {
                         let mut versions = PendingVersions::empty();
                         versions.push(PendingChange { txid, cid, loc })?;
@@ -3500,6 +3747,7 @@ impl Storage {
             let mut n = 0usize;
             for (&rowid, state) in table.rows.iter() {
                 if matches!(state.committed, Some(RowHome::Spilled { .. }))
+                    && state.history.is_empty()
                     && state.pending.is_none()
                 {
                     batch[n] = rowid;
@@ -3522,11 +3770,9 @@ impl Storage {
     /// analogue of heap pressure. Rows are counted against entries, not
     /// bytes: a table of tiny rows fills its map long before its heap.
     pub fn map_pressure(&self) -> bool {
-        self.tables.iter().any(|t| {
-            t.live
-                && t.n_spill_ssts > 0
-                && t.rows.len() * 100 >= t.rows.capacity() * 50
-        })
+        self.tables
+            .iter()
+            .any(|t| t.live && t.n_spill_ssts > 0 && t.rows.len() * 100 >= t.rows.capacity() * 50)
     }
 
     /// The map-occupancy pass after a publish: any table whose overlay is
@@ -3568,7 +3814,8 @@ impl Storage {
         match prior {
             None => {
                 state.pending.pop();
-                if state.committed.is_none() && state.pending.is_none() {
+                if state.committed.is_none() && state.history.is_empty() && state.pending.is_none()
+                {
                     table.rows.remove(&rowid);
                 }
             }
@@ -3600,6 +3847,7 @@ impl Storage {
             RowState {
                 committed: None,
                 committed_lsn: commit_lsn,
+                history: CommittedHistory::empty(),
                 pending: PendingVersions::empty(),
             },
         );
@@ -3607,20 +3855,14 @@ impl Storage {
         table.mark_dirty();
     }
 
-    pub fn commit_row(
-        &mut self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        commit_lsn: u64,
-    ) {
+    pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32, commit_lsn: u64) {
         // Read the transition without holding a mutable borrow.
-        let (old_committed, new_loc) = {
+        let (old_committed, old_lsn, new_loc) = {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
             match state.pending.last() {
-                Some(p) if p.txid == txid => (state.committed, p.loc),
+                Some(p) if p.txid == txid => (state.committed, state.committed_lsn, p.loc),
                 _ => return,
             }
         };
@@ -3629,8 +3871,20 @@ impl Storage {
         // repointed, new bytes already in the heap).
         self.maintain_indexes_on_commit(table_index, rowid, old_committed, new_loc);
 
+        let retain_history = !self.active_snapshots.is_empty();
         let table = &mut self.tables[table_index];
         let state = table.rows.get_mut(&rowid).expect("row present after read");
+        if retain_history && (old_committed.is_some() || old_lsn != 0) {
+            state
+                .history
+                .push_newest(CommittedVersion {
+                    home: old_committed,
+                    lsn: old_lsn,
+                })
+                .expect("write_pending reserved historical-version capacity");
+        } else if !retain_history {
+            state.history.prune(None);
+        }
         state.committed = new_loc.map(RowHome::Heap);
         state.committed_lsn = commit_lsn;
         state.pending.clear();
@@ -3673,6 +3927,9 @@ impl Storage {
         };
         let table = &mut self.tables[table_index];
         let state = table.rows.get_mut(&rowid).expect("row present after read");
+        // Definition rewrites are rejected while a historical snapshot is
+        // active, so no old-schema row image can be retained here.
+        state.history.prune(None);
         state.committed = new_loc.map(RowHome::Heap);
         state.committed_lsn = commit_lsn;
         state.pending.clear();
@@ -3753,10 +4010,19 @@ impl Storage {
             None => 0,
         };
         let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
-        for (i, s) in slots.iter_mut().enumerate().take(self.tables[table_index].n_enforcers) {
-            *s = self.tables[table_index].enforcers[i].expect("enforcer").slot;
+        for (i, s) in slots
+            .iter_mut()
+            .enumerate()
+            .take(self.tables[table_index].n_enforcers)
+        {
+            *s = self.tables[table_index].enforcers[i]
+                .expect("enforcer")
+                .slot;
         }
-        let pool = self.value_indexes.as_mut().expect("value index pool present");
+        let pool = self
+            .value_indexes
+            .as_mut()
+            .expect("value index pool present");
         for &(ei, hash) in &removals[..n_removals] {
             pool.get_mut(slots[ei]).remove(hash, rowid);
         }
@@ -3910,8 +4176,11 @@ impl Storage {
                     ));
                 }
             };
-            self.tables[table_index].enforcers[w] =
-                Some(Enforcer { slot, columns: want[w].0, n_cols: want[w].1 });
+            self.tables[table_index].enforcers[w] = Some(Enforcer {
+                slot,
+                columns: want[w].0,
+                n_cols: want[w].1,
+            });
         }
         self.tables[table_index].n_enforcers = n_want;
         self.populate_enforcers(table_index)
@@ -3934,7 +4203,9 @@ impl Storage {
         let n_enf = self.tables[table_index].n_enforcers;
         let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
-            *s = self.tables[table_index].enforcers[i].expect("enforcer").slot;
+            *s = self.tables[table_index].enforcers[i]
+                .expect("enforcer")
+                .slot;
         }
         let mut error: Result<(), SqlError> = Ok(());
         let mut buf = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
@@ -3969,9 +4240,9 @@ impl Storage {
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
     /// replay and any context that operates on the durable image.
     pub fn find_table(&self, schema: &str, name: &str) -> Option<usize> {
-        self.tables.iter().position(|t| {
-            t.live && t.def.schema.as_str() == schema && t.def.name.as_str() == name
-        })
+        self.tables
+            .iter()
+            .position(|t| t.live && t.def.schema.as_str() == schema && t.def.name.as_str() == name)
     }
 
     /// Transaction-scoped lookup: `txid` sees its own uncommitted CREATE/DROP
@@ -4077,13 +4348,19 @@ impl Storage {
         };
         let slot = match self.pending_table_defs.iter().position(|entry| !entry.used) {
             Some(slot) => {
-                self.pending_table_defs[slot] = PendingTableDefSlot { used: true, version };
+                self.pending_table_defs[slot] = PendingTableDefSlot {
+                    used: true,
+                    version,
+                };
                 slot
             }
             None => {
                 let slot = self.pending_table_defs.len();
                 self.pending_table_defs
-                    .push(PendingTableDefSlot { used: true, version })
+                    .push(PendingTableDefSlot {
+                        used: true,
+                        version,
+                    })
                     .map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -4145,7 +4422,11 @@ impl Storage {
     /// Allocates a slot for a fresh table. Shared by replay (committed) and
     /// the executor (pending); `pending` overlays the uncommitted-CREATE
     /// state so the table is invisible to other transactions until commit.
-    fn alloc_table(&mut self, def: TableDef, pending: Option<PendingDdl>) -> Result<usize, SqlError> {
+    fn alloc_table(
+        &mut self,
+        def: TableDef,
+        pending: Option<PendingDdl>,
+    ) -> Result<usize, SqlError> {
         let Some(slot) = self.tables.iter().position(Table::is_free) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -4252,7 +4533,10 @@ impl Storage {
     }
 
     pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
-        if self.find_table(def.schema.as_str(), def.name.as_str()).is_some() {
+        if self
+            .find_table(def.schema.as_str(), def.name.as_str())
+            .is_some()
+        {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -4274,7 +4558,10 @@ impl Storage {
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL is a conflict (40001).
     pub fn create_table_in(&mut self, def: TableDef, txid: u32) -> Result<usize, SqlError> {
-        if self.find_visible(def.schema.as_str(), def.name.as_str(), txid).is_some() {
+        if self
+            .find_visible(def.schema.as_str(), def.name.as_str(), txid)
+            .is_some()
+        {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -4291,7 +4578,13 @@ impl Storage {
                 def.name.as_str()
             ));
         }
-        let slot = self.alloc_table(def, Some(PendingDdl { txid, creating: true }))?;
+        let slot = self.alloc_table(
+            def,
+            Some(PendingDdl {
+                txid,
+                creating: true,
+            }),
+        )?;
         // Build the enforcers now (fallible pool acquire surfaces at CREATE, not
         // at commit); this transaction's inserts maintain them at commit.
         self.refresh_enforcers(slot)?;
@@ -4328,7 +4621,10 @@ impl Storage {
     /// Transactional drop: the table stays visible to every other transaction
     /// (committed baseline) until `txid` commits.
     pub fn drop_table_in(&mut self, index: usize, txid: u32) {
-        self.tables[index].pending_ddl = Some(PendingDdl { txid, creating: false });
+        self.tables[index].pending_ddl = Some(PendingDdl {
+            txid,
+            creating: false,
+        });
         self.tables[index].mark_dirty();
     }
 
@@ -4366,7 +4662,6 @@ impl Storage {
         self.tables[index].pending_ddl = None;
     }
 
-
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
         self.views.iter().any(|v| v.live || v.pending.is_some())
@@ -4397,9 +4692,9 @@ impl Storage {
     /// The stored SELECT text of a view visible to `txid`, if `name` names one
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<&ViewDef> {
-        self.views.iter().find(|v| {
-            v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
-        })
+        self.views
+            .iter()
+            .find(|v| v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name)
     }
 
     // --- Materialized-view catalog (parallel to views; data lives in a
@@ -4411,7 +4706,10 @@ impl Storage {
     }
 
     pub fn matviews_with_slots(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
-        self.matviews.iter().enumerate().filter(|(_, matview)| matview.live)
+        self.matviews
+            .iter()
+            .enumerate()
+            .filter(|(_, matview)| matview.live)
     }
 
     pub(crate) fn matview(&self, slot: usize) -> &MatviewDef {
@@ -4427,9 +4725,9 @@ impl Storage {
     }
 
     pub fn find_matview(&self, schema: &str, name: &str, txid: u32) -> Option<&MatviewDef> {
-        self.matviews.iter().find(|m| {
-            m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
-        })
+        self.matviews
+            .iter()
+            .find(|m| m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name)
     }
 
     /// The slot of a materialized view visible to `txid`, for later mutation
@@ -4486,13 +4784,21 @@ impl Storage {
             creation_path: query.creation_path,
             populated,
             live: false,
-            pending: Some(PendingDdl { txid, creating: true }),
+            pending: Some(PendingDdl {
+                txid,
+                creating: true,
+            }),
         };
         self.matview_dependencies[new] = query.dependencies;
         Ok(new)
     }
 
-    pub fn drop_matview(&mut self, schema: &str, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+    pub fn drop_matview(
+        &mut self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
         if self.matviews.iter().any(|m| {
             m.schema.as_str() == schema
                 && m.name.as_str() == name
@@ -4519,7 +4825,10 @@ impl Storage {
             m.live = false;
             m.pending = None;
         } else {
-            m.pending = Some(PendingDdl { txid, creating: false });
+            m.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
         }
     }
 
@@ -4545,7 +4854,10 @@ impl Storage {
         if m.live {
             m.pending = None;
         } else if matches!(m.pending, Some(p) if p.txid == txid) {
-            m.pending = Some(PendingDdl { txid, creating: true });
+            m.pending = Some(PendingDdl {
+                txid,
+                creating: true,
+            });
         }
     }
 
@@ -4568,9 +4880,9 @@ impl Storage {
     }
 
     pub fn find_sequence(&self, schema: &str, name: &str, txid: u32) -> Option<&SequenceDef> {
-        self.sequences.iter().find(|s| {
-            s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name
-        })
+        self.sequences
+            .iter()
+            .find(|s| s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name)
     }
 
     pub fn sequence_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
@@ -4681,7 +4993,10 @@ impl Storage {
             is_called: Cell::new(false),
             dirty: Cell::new(false),
             live: false,
-            pending: Some(PendingDdl { txid, creating: true }),
+            pending: Some(PendingDdl {
+                txid,
+                creating: true,
+            }),
         };
         Ok(new)
     }
@@ -4740,7 +5055,10 @@ impl Storage {
             s.live = false;
             s.pending = None;
         } else {
-            s.pending = Some(PendingDdl { txid, creating: false });
+            s.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
         }
         Ok(Some(i))
     }
@@ -4767,7 +5085,10 @@ impl Storage {
         if s.live {
             s.pending = None;
         } else if matches!(s.pending, Some(p) if p.txid == txid) {
-            s.pending = Some(PendingDdl { txid, creating: true });
+            s.pending = Some(PendingDdl {
+                txid,
+                creating: true,
+            });
         }
     }
 
@@ -4795,7 +5116,8 @@ impl Storage {
             Some((q, n)) => (Some(q), n),
             None => (None, type_name),
         };
-        self.find_domain_slot(qualifier, name, txid).map(|slot| &self.domains[slot])
+        self.find_domain_slot(qualifier, name, txid)
+            .map(|slot| &self.domains[slot])
     }
 
     fn find_domain_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
@@ -4920,7 +5242,11 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(new) = self.domains.iter().position(|d| !d.live && d.pending.is_none()) else {
+        let Some(new) = self
+            .domains
+            .iter()
+            .position(|d| !d.live && d.pending.is_none())
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many domains (limit {})",
@@ -4928,7 +5254,10 @@ impl Storage {
             ));
         };
         self.catalog_seq += 1;
-        let pending = (txid != 0).then_some(PendingDdl { txid, creating: true });
+        let pending = (txid != 0).then_some(PendingDdl {
+            txid,
+            creating: true,
+        });
         self.domains[new] = DomainDef {
             created_at: self.catalog_seq,
             schema,
@@ -5020,7 +5349,10 @@ impl Storage {
             d.live = false;
             d.pending = None;
         } else {
-            d.pending = Some(PendingDdl { txid, creating: false });
+            d.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
         }
         Ok(Some(i))
     }
@@ -5047,7 +5379,10 @@ impl Storage {
         if d.live {
             d.pending = None;
         } else if matches!(d.pending, Some(p) if p.txid == txid) {
-            d.pending = Some(PendingDdl { txid, creating: true });
+            d.pending = Some(PendingDdl {
+                txid,
+                creating: true,
+            });
         }
     }
 
@@ -5182,7 +5517,11 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(new) = self.enums.iter().position(|e| !e.live && e.pending.is_none()) else {
+        let Some(new) = self
+            .enums
+            .iter()
+            .position(|e| !e.live && e.pending.is_none())
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many enum types (limit {})",
@@ -5190,7 +5529,10 @@ impl Storage {
             ));
         };
         self.catalog_seq += 1;
-        let pending = (txid != 0).then_some(PendingDdl { txid, creating: true });
+        let pending = (txid != 0).then_some(PendingDdl {
+            txid,
+            creating: true,
+        });
         self.enums[new] = EnumDef {
             created_at: self.catalog_seq,
             schema,
@@ -5296,7 +5638,10 @@ impl Storage {
             e.live = false;
             e.pending = None;
         } else {
-            e.pending = Some(PendingDdl { txid, creating: false });
+            e.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
         }
         Ok(Some(i))
     }
@@ -5323,7 +5668,10 @@ impl Storage {
         if e.live {
             e.pending = None;
         } else if matches!(e.pending, Some(p) if p.txid == txid) {
-            e.pending = Some(PendingDdl { txid, creating: true });
+            e.pending = Some(PendingDdl {
+                txid,
+                creating: true,
+            });
         }
     }
 
@@ -5395,7 +5743,10 @@ impl Storage {
             sql: query.sql,
             creation_path: query.creation_path,
             live: false,
-            pending: Some(PendingDdl { txid, creating: true }),
+            pending: Some(PendingDdl {
+                txid,
+                creating: true,
+            }),
         };
         self.view_dependencies[new] = query.dependencies;
         Ok((new, existing))
@@ -5404,7 +5755,12 @@ impl Storage {
     /// Marks the view visible to `txid` pending-dropped; returns its slot (for
     /// undo). None if absent. Errors if another transaction's uncommitted DDL
     /// holds the name.
-    pub fn drop_view(&mut self, schema: &str, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+    pub fn drop_view(
+        &mut self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
         if self.views.iter().any(|v| {
             v.schema.as_str() == schema
                 && v.name.as_str() == name
@@ -5433,7 +5789,10 @@ impl Storage {
             v.live = false;
             v.pending = None;
         } else {
-            v.pending = Some(PendingDdl { txid, creating: false });
+            v.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
         }
     }
 
@@ -5464,10 +5823,7 @@ impl Storage {
         // slot. Comments belong to the logical same-named object and survive;
         // an ordinary DROP has no replacement and removes them.
         let replaced = self.views.iter().enumerate().any(|(other, view)| {
-            other != slot
-                && view.live
-                && view.schema == schema
-                && view.name == name
+            other != slot && view.live && view.schema == schema && view.name == name
         });
         if !replaced {
             self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
@@ -5491,14 +5847,17 @@ impl Storage {
         if v.live {
             v.pending = None;
         } else {
-            v.pending = Some(PendingDdl { txid, creating: true });
+            v.pending = Some(PendingDdl {
+                txid,
+                creating: true,
+            });
         }
     }
 
     pub fn index_exists(&self, schema: &str, name: &str, txid: u32) -> bool {
-        self.indexes.iter().any(|x| {
-            x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name
-        })
+        self.indexes
+            .iter()
+            .any(|x| x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name)
     }
 
     /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
@@ -5536,7 +5895,10 @@ impl Storage {
         };
         self.indexes[i] = IndexDef {
             live: false,
-            pending: Some(PendingDdl { txid, creating: true }),
+            pending: Some(PendingDdl {
+                txid,
+                creating: true,
+            }),
             ..def
         };
         Ok(i)
@@ -5587,7 +5949,12 @@ impl Storage {
     /// Marks the index visible to `txid` pending-dropped; returns its slot
     /// (for undo). None if absent. Errors if another transaction's uncommitted
     /// DDL holds the name.
-    pub fn drop_index(&mut self, schema: &str, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+    pub fn drop_index(
+        &mut self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
         if self.indexes.iter().any(|x| {
             x.schema.as_str() == schema
                 && x.name.as_str() == name
@@ -5616,7 +5983,10 @@ impl Storage {
             x.live = false;
             x.pending = None;
         } else {
-            x.pending = Some(PendingDdl { txid, creating: false });
+            x.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
         }
     }
 
@@ -5647,7 +6017,10 @@ impl Storage {
         if x.live {
             x.pending = None;
         } else {
-            x.pending = Some(PendingDdl { txid, creating: true });
+            x.pending = Some(PendingDdl {
+                txid,
+                creating: true,
+            });
         }
     }
 
@@ -5667,10 +6040,9 @@ impl Storage {
         self.indexes.iter().filter(move |x| {
             x.visible_to(txid)
                 && ((x.schema.as_str() == schema && x.table.as_str() == table)
-                    || committed_binding
-                        .is_some_and(|(old_schema, old_table)| {
-                            x.schema == old_schema && x.table == old_table
-                        }))
+                    || committed_binding.is_some_and(|(old_schema, old_table)| {
+                        x.schema == old_schema && x.table == old_table
+                    }))
         })
     }
 
@@ -5819,8 +6191,13 @@ impl Storage {
         for sequence in self.sequences.iter_mut() {
             sequence.owner =
                 rebind_sequence_column(sequence.owner, &current, &def, column_mapping, false);
-            sequence.generator_for =
-                rebind_sequence_column(sequence.generator_for, &current, &def, column_mapping, true);
+            sequence.generator_for = rebind_sequence_column(
+                sequence.generator_for,
+                &current,
+                &def,
+                column_mapping,
+                true,
+            );
         }
         self.tables[index].def = def;
         self.tables[index].mark_dirty();
@@ -5848,6 +6225,91 @@ impl Storage {
     /// The current command read snapshot (see [`Storage::read_snapshot`] field).
     pub fn read_snapshot(&self) -> u32 {
         self.read_snapshot
+    }
+
+    pub fn commit_snapshot(&self) -> u64 {
+        self.commit_snapshot
+    }
+
+    pub fn set_commit_snapshot(&mut self, snapshot: u64) {
+        self.commit_snapshot = snapshot;
+    }
+
+    pub fn register_snapshot(&mut self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
+        if let Some((_, existing)) = self
+            .active_snapshots
+            .iter_mut()
+            .find(|(owner, _)| *owner == txid)
+        {
+            *existing = snapshot;
+            return Ok(());
+        }
+        self.active_snapshots.push((txid, snapshot)).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "more than {} active historical snapshots",
+                self.active_snapshots.capacity()
+            )
+        })
+    }
+
+    pub fn release_snapshot(&mut self, txid: u32) {
+        if let Some(index) = self
+            .active_snapshots
+            .iter()
+            .position(|(owner, _)| *owner == txid)
+        {
+            self.active_snapshots.swap_remove(index);
+        }
+        let oldest = self.oldest_snapshot();
+        for table in self.tables.iter_mut() {
+            for (_, state) in table.rows.iter_mut() {
+                state.history.prune(oldest);
+            }
+        }
+    }
+
+    pub fn oldest_snapshot(&self) -> Option<u64> {
+        self.active_snapshots
+            .iter()
+            .map(|(_, snapshot)| *snapshot)
+            .min()
+    }
+
+    pub fn has_active_snapshots(&self) -> bool {
+        !self.active_snapshots.is_empty()
+    }
+
+    pub fn lock_table_access_share(&mut self, txid: u32, table: usize) -> Result<(), SqlError> {
+        if self
+            .table_locks
+            .iter()
+            .any(|(owner, slot)| *owner == txid && *slot == table as u32)
+        {
+            return Ok(());
+        }
+        self.table_locks.push((txid, table as u32)).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table-lock registry is full ({} locks)",
+                self.table_locks.capacity()
+            )
+        })
+    }
+
+    pub fn release_table_locks(&mut self, txid: u32) {
+        let mut index = 0usize;
+        while index < self.table_locks.len() {
+            if self.table_locks[index].0 == txid {
+                self.table_locks.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    pub fn has_access_share_locks(&self) -> bool {
+        !self.table_locks.is_empty()
     }
 
     /// Lowers reads to a command snapshot (a data-modifying `WITH` statement) or

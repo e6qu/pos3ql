@@ -38,6 +38,8 @@ pub(super) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("regexp_split_to_table")
         || name.eq_ignore_ascii_case("string_to_table")
         || name.eq_ignore_ascii_case("generate_subscripts")
+        || name.eq_ignore_ascii_case("pg_options_to_table")
+        || name.eq_ignore_ascii_case("pg_get_sequence_data")
         || is_json_each_name(name)
 }
 
@@ -111,7 +113,10 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     };
     if name.eq_ignore_ascii_case("generate_series") {
         if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "generate_series(...) argument count"));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "generate_series(...) argument count"
+            ));
         }
         let start = crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?);
         let stop = crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?);
@@ -125,7 +130,10 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         }
         if let (Some(s), Some(e), Some(st)) = (as_i64(&start), as_i64(&stop), as_i64(&step)) {
             if st == 0 {
-                return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "step size cannot equal zero"
+                ));
             }
             let n = if st > 0 {
                 if e < s { 0 } else { (e - s) / st + 1 }
@@ -156,7 +164,10 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     } else if name.eq_ignore_ascii_case("regexp_matches") {
         // Number of matches: 0/1 without the `g` flag, else all non-overlapping.
         if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "regexp_matches(...) argument count"));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "regexp_matches(...) argument count"
+            ));
         }
         let string = crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?);
         let pattern = crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?);
@@ -192,11 +203,17 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     } else if name.eq_ignore_ascii_case("jsonb_object_keys")
         || name.eq_ignore_ascii_case("json_object_keys")
     {
-        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
+        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
+        {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
-            _ => return Err(crate::sql::json::object_keys_error(name, crate::sql::json::Kind::Scalar)),
+            _ => {
+                return Err(crate::sql::json::object_keys_error(
+                    name,
+                    crate::sql::json::Kind::Scalar,
+                ));
+            }
         };
         let kind = crate::sql::json::kind_of(text);
         if kind != crate::sql::json::Kind::Object {
@@ -216,11 +233,18 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     {
         let jsonb = name.eq_ignore_ascii_case("jsonb_array_elements")
             || name.eq_ignore_ascii_case("jsonb_array_elements_text");
-        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
+        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
+        {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
-            _ => return Err(crate::sql::json::array_elements_error(name, jsonb, crate::sql::json::Kind::Scalar)),
+            _ => {
+                return Err(crate::sql::json::array_elements_error(
+                    name,
+                    jsonb,
+                    crate::sql::json::Kind::Scalar,
+                ));
+            }
         };
         let kind = crate::sql::json::kind_of(text);
         if kind != crate::sql::json::Kind::Array {
@@ -234,15 +258,21 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         }
         Ok(crate::sql::json::array_elements_source(text, arena)?.len())
     } else if is_json_each_name(name) {
-        let jsonb = name.eq_ignore_ascii_case("jsonb_each")
-            || name.eq_ignore_ascii_case("jsonb_each_text");
+        let jsonb =
+            name.eq_ignore_ascii_case("jsonb_each") || name.eq_ignore_ascii_case("jsonb_each_text");
         let as_text = name.eq_ignore_ascii_case("json_each_text")
             || name.eq_ignore_ascii_case("jsonb_each_text");
-        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
+        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
+        {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
-            _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct a scalar")),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "cannot deconstruct a scalar"
+                ));
+            }
         };
         Ok(crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?.len())
     } else if name.eq_ignore_ascii_case("regexp_split_to_table") {
@@ -275,20 +305,27 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         let mut pieces: [&str; MAX_PIECES] = [""; MAX_PIECES];
         Ok(crate::sql::eval::split_pieces(src, delimiter, &mut pieces)?)
     } else if name.eq_ignore_ascii_case("generate_subscripts") {
-        let raw = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
+        let raw = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
+        {
             Datum::Array { raw, .. } => raw,
             _ => return Ok(0),
         };
-        let dim = match crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?) {
+        let dim = match crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?)
+        {
             Datum::Int4(v) => v as i64,
             Datum::Int8(v) => v,
             _ => return Ok(0),
         };
-        Ok(if dim == 1 { crate::sql::array::len(raw) } else { 0 })
+        Ok(if dim == 1 {
+            crate::sql::array::len(raw)
+        } else {
+            0
+        })
     } else {
         // unnest / _pg_expandarray over an array.
         match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
             Datum::Array { raw, .. } => Ok(crate::sql::array::len(raw)),
+            Datum::Int2Vector(raw) => Ok(raw.len() / 2),
             Datum::Null => Ok(0),
             _ => Ok(1),
         }
@@ -347,8 +384,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                             // the column's type_mod carries the handle so
                             // later field access is typed statically.
                             if slot < n
-                                && descriptors[slot].type_oid
-                                    == crate::sql::types::oid::RECORD
+                                && descriptors[slot].type_oid == crate::sql::types::oid::RECORD
                                 && let Some(handle) = crate::sql::exec::register_shape_for(
                                     expression,
                                     &super::ScopeCols(&ss),
@@ -359,16 +395,15 @@ pub(crate) fn synth_derived_def_outer<'a>(
                             if slot < n
                                 && descriptors[slot].type_oid == crate::sql::types::oid::TEXT
                                 && let Expr::Subquery(inner_sub) = &**expression
-                                && let Some(SelectItem::Expr { expression: inner, .. }) =
-                                    inner_sub.items.first()
+                                && let Some(SelectItem::Expr {
+                                    expression: inner, ..
+                                }) = inner_sub.items.first()
                             {
                                 let inner_scope = inner_sub.from.as_ref().and_then(|inf| {
                                     QueryScope::resolve_schema(storage, inf, txid, arena).ok()
                                 });
-                                let witness = subquery_witness(
-                                    inner,
-                                    inner_scope.as_ref().or(Some(&ss)),
-                                );
+                                let witness =
+                                    subquery_witness(inner, inner_scope.as_ref().or(Some(&ss)));
                                 if !witness.is_null() {
                                     descriptors[slot] = ColDesc::new(
                                         descriptors[slot].name,
@@ -519,7 +554,19 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_rstt = tref.table.eq_ignore_ascii_case("regexp_split_to_table");
     let is_gsub = tref.table.eq_ignore_ascii_case("generate_subscripts");
     let is_stt = tref.table.eq_ignore_ascii_case("string_to_table");
-    if !is_gs && !is_unnest && !is_re && !is_keys && !is_elems && !is_each && !is_rstt && !is_gsub && !is_stt
+    let is_options = tref.table.eq_ignore_ascii_case("pg_options_to_table");
+    let is_sequence_data = tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
+    if !is_gs
+        && !is_unnest
+        && !is_re
+        && !is_keys
+        && !is_elems
+        && !is_each
+        && !is_rstt
+        && !is_gsub
+        && !is_stt
+        && !is_options
+        && !is_sequence_data
     {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -531,7 +578,15 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         "generate_series"
     } else if is_re {
         "regexp_matches"
-    } else if is_keys || is_elems || is_each || is_rstt || is_gsub || is_stt {
+    } else if is_keys
+        || is_elems
+        || is_each
+        || is_rstt
+        || is_gsub
+        || is_stt
+        || is_options
+        || is_sequence_data
+    {
         tref.table
     } else {
         "unnest"
@@ -559,7 +614,15 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // generate_series yields int8; regexp_matches yields text[]; unnest yields
     // the array's element type; array_elements' default column is `value`.
     let mut default_cols: [(&str, ColType); 2] = [("", ColType::Bool); 2];
-    let n_default = if is_each {
+    let n_default = if is_sequence_data {
+        default_cols[0] = ("last_value", ColType::Int8);
+        default_cols[1] = ("is_called", ColType::Bool);
+        2
+    } else if is_options {
+        default_cols[0] = ("option_name", ColType::Text);
+        default_cols[1] = ("option_value", ColType::Text);
+        2
+    } else if is_each {
         let value_type = if tref.table.eq_ignore_ascii_case("json_each") {
             ColType::Json
         } else if tref.table.eq_ignore_ascii_case("jsonb_each") {
@@ -620,7 +683,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         1
     };
     // `WITH ORDINALITY` appends a `bigint` ordinality column.
-    let n_out = if tref.with_ordinality { n_default + 1 } else { n_default };
+    let n_out = if tref.with_ordinality {
+        n_default + 1
+    } else {
+        n_default
+    };
     // Column aliases rename the columns positionally; too many is an error.
     if let Some(aliases) = tref.col_alias
         && aliases.len() > n_out
@@ -639,14 +706,22 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             .col_alias
             .and_then(|a| a.get(i).copied())
             .unwrap_or(default_name);
-        columns[i] = ColumnMeta { name: SqlName::parse(col_name)?, ctype: *ctype, ..blank };
+        columns[i] = ColumnMeta {
+            name: SqlName::parse(col_name)?,
+            ctype: *ctype,
+            ..blank
+        };
     }
     if tref.with_ordinality {
         let col_name = tref
             .col_alias
             .and_then(|a| a.get(n_default).copied())
             .unwrap_or("ordinality");
-        columns[n_default] = ColumnMeta { name: SqlName::parse(col_name)?, ctype: ColType::Int8, ..blank };
+        columns[n_default] = ColumnMeta {
+            name: SqlName::parse(col_name)?,
+            ctype: ColType::Int8,
+            ..blank
+        };
     }
     let def = TableDef {
         name: SqlName::parse(name)?,
@@ -671,28 +746,32 @@ pub(super) fn is_json_each_name(name: &str) -> bool {
 /// column). Each row is one `int8` value, projected-encoded.
 pub(super) fn table_func_rows<'a>(
     tref: &'a TableRef<'a>,
+    storage: &'a Storage,
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    table_func_rows_outer(tref, arena, params, &crate::sql::eval::NoColumns)
+    table_func_rows_outer(tref, storage, arena, params, &crate::sql::eval::NoColumns)
 }
 
 /// [`table_func_rows`] evaluating the function's arguments against `columns` — an
 /// outer row, for a `LATERAL func(outer.col)`.
 pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
+    storage: &'a Storage,
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let rows = table_func_base_rows_outer(tref, arena, params, columns)?;
+    let rows = table_func_base_rows_outer(tref, storage, arena, params, columns)?;
     if !tref.with_ordinality {
         return Ok(rows);
     }
     let def = table_func_def_outer(tref, arena, params, columns)?;
     let base_columns = def.n_columns - 1;
     const EMPTY: &[u8] = &[];
-    let wrapped = arena.alloc_slice_with(rows.len(), |_| EMPTY).map_err(|_| arena_full())?;
+    let wrapped = arena
+        .alloc_slice_with(rows.len(), |_| EMPTY)
+        .map_err(|_| arena_full())?;
     for (index, row) in rows.iter().enumerate() {
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (column, slot) in values[..base_columns].iter_mut().enumerate() {
@@ -707,26 +786,114 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
 
 fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
+    storage: &'a Storage,
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
+    if tref.table.eq_ignore_ascii_case("pg_get_sequence_data") {
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "pg_get_sequence_data(...) argument count"
+            ));
+        }
+        let oid = match crate::sql::eval::eval(args[0], arena, params, columns)? {
+            Datum::Int4(oid) => oid,
+            Datum::Null => return Ok(&[]),
+            other => {
+                return Err(crate::sql::eval::type_mismatch_pub(
+                    "pg_get_sequence_data",
+                    &other,
+                ));
+            }
+        };
+        let Some((last_value, is_called)) =
+            crate::sql::catalog::sequence_state_by_oid(storage, oid)
+        else {
+            return Ok(&[]);
+        };
+        let encoded = crate::sql::exec::encode_projected_pub(
+            &[Datum::Int8(last_value), Datum::Bool(is_called)],
+            arena,
+        )?;
+        return arena
+            .alloc_slice_copy(&[encoded])
+            .map(|rows| &*rows)
+            .map_err(|_| arena_full());
+    }
+    // pg_options_to_table(text[]): split each `name=value` option into the
+    // two catalog columns used by pg_dump for FDW and per-column options.
+    if tref.table.eq_ignore_ascii_case("pg_options_to_table") {
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "pg_options_to_table(...) argument count"
+            ));
+        }
+        let raw = match crate::sql::eval::eval(args[0], arena, params, columns)? {
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Text,
+                raw,
+            } => raw,
+            Datum::Null => return Ok(&[]),
+            other => {
+                return Err(crate::sql::eval::type_mismatch_pub(
+                    "pg_options_to_table",
+                    &other,
+                ));
+            }
+        };
+        let count = crate::sql::array::len(raw);
+        const EMPTY: &[u8] = &[];
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (index, slot) in rows.iter_mut().enumerate() {
+            let option = match crate::sql::array::get(raw, crate::sql::types::ArrElem::Text, index)
+            {
+                Some(Datum::Text(option)) => option,
+                Some(Datum::Null) | None => "",
+                Some(other) => {
+                    return Err(crate::sql::eval::type_mismatch_pub(
+                        "pg_options_to_table",
+                        &other,
+                    ));
+                }
+            };
+            let (name, value) = option.split_once('=').unwrap_or((option, ""));
+            *slot = crate::sql::exec::encode_projected_pub(
+                &[Datum::Text(name), Datum::Text(value)],
+                arena,
+            )?;
+        }
+        return Ok(&*rows);
+    }
     // json_each / jsonb_each[_text]: one (key, value) row per object member.
     if is_json_each_name(tref.table) {
         let jsonb = tref.table.eq_ignore_ascii_case("jsonb_each")
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
         let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
+        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(
+            args[0], arena, params, columns,
+        )?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
-            _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct a scalar")),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "cannot deconstruct a scalar"
+                ));
+            }
         };
         let pairs = crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?;
         const EMPTY: &[u8] = &[];
-        let rows = arena.alloc_slice_with(pairs.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(pairs.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
         for (slot, (key, value)) in rows.iter_mut().zip(pairs.iter()) {
             *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key), *value], arena)?;
         }
@@ -745,8 +912,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             ));
         }
         let evaluate = |i: usize| {
-            crate::sql::eval::eval(args[i], arena, params, columns)
-                .map(crate::sql::eval::text_view)
+            crate::sql::eval::eval(args[i], arena, params, columns).map(crate::sql::eval::text_view)
         };
         let source = match evaluate(0)? {
             Datum::Text(s) => s,
@@ -770,7 +936,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let mut pieces: [&str; MAX_PIECES] = [""; MAX_PIECES];
         let n = crate::sql::eval::split_pieces(source, delimiter, &mut pieces)?;
         const EMPTY: &[u8] = &[];
-        let rows = arena.alloc_slice_with(n, |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(n, |_| EMPTY)
+            .map_err(|_| arena_full())?;
         for (slot, piece) in rows.iter_mut().zip(pieces[..n].iter()) {
             let value = if null_string == Some(*piece) {
                 Datum::Null
@@ -784,7 +952,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     // regexp_split_to_table(string, pattern [, flags]): one text row per piece.
     if tref.table.eq_ignore_ascii_case("regexp_split_to_table") {
         if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "regexp_split_to_table(...) argument count"));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "regexp_split_to_table(...) argument count"
+            ));
         }
         let (src, pat) = match (
             crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?),
@@ -792,10 +963,17 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         ) {
             (Datum::Text(s), Datum::Text(p)) => (s, p),
             (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
-            (a, _) => return Err(crate::sql::eval::type_mismatch_pub("regexp_split_to_table", &a)),
+            (a, _) => {
+                return Err(crate::sql::eval::type_mismatch_pub(
+                    "regexp_split_to_table",
+                    &a,
+                ));
+            }
         };
         let case_insensitive = if args.len() == 3 {
-            match crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, columns)?) {
+            match crate::sql::eval::text_view(crate::sql::eval::eval(
+                args[2], arena, params, columns,
+            )?) {
                 Datum::Text(f) => crate::sql::eval::regexp_flags(f)?.1,
                 Datum::Null => return Ok(&[]),
                 _ => false,
@@ -805,7 +983,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         };
         let pieces = crate::sql::eval::regex_split_pub(src, pat, case_insensitive, arena)?;
         const EMPTY: &[u8] = &[];
-        let rows = arena.alloc_slice_with(pieces.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(pieces.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
         for (slot, piece) in rows.iter_mut().zip(pieces.iter()) {
             *slot = crate::sql::exec::encode_projected_pub(&[*piece], arena)?;
         }
@@ -815,22 +995,45 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     // `dim`; empty for a dim other than 1 (arrays are one-dimensional here).
     if tref.table.eq_ignore_ascii_case("generate_subscripts") {
         if args.len() != 2 {
-            return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "generate_subscripts(...) argument count"));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "generate_subscripts(...) argument count"
+            ));
         }
-        let raw = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
+        let raw = match crate::sql::eval::text_view(crate::sql::eval::eval(
+            args[0], arena, params, columns,
+        )?) {
             Datum::Array { raw, .. } => raw,
             Datum::Null => return Ok(&[]),
-            a => return Err(crate::sql::eval::type_mismatch_pub("generate_subscripts", &a)),
+            a => {
+                return Err(crate::sql::eval::type_mismatch_pub(
+                    "generate_subscripts",
+                    &a,
+                ));
+            }
         };
-        let dim = match crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?) {
+        let dim = match crate::sql::eval::text_view(crate::sql::eval::eval(
+            args[1], arena, params, columns,
+        )?) {
             Datum::Int4(v) => v as i64,
             Datum::Int8(v) => v,
             Datum::Null => return Ok(&[]),
-            a => return Err(crate::sql::eval::type_mismatch_pub("generate_subscripts", &a)),
+            a => {
+                return Err(crate::sql::eval::type_mismatch_pub(
+                    "generate_subscripts",
+                    &a,
+                ));
+            }
         };
-        let count = if dim == 1 { crate::sql::array::len(raw) } else { 0 };
+        let count = if dim == 1 {
+            crate::sql::array::len(raw)
+        } else {
+            0
+        };
         const EMPTY: &[u8] = &[];
-        let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
         for (i, slot) in rows.iter_mut().enumerate() {
             *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int4((i + 1) as i32)], arena)?;
         }
@@ -840,15 +1043,22 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     // text[] of the capture groups (or the whole match when there are no groups).
     if tref.table.eq_ignore_ascii_case("regexp_matches") {
         if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "regexp_matches(...) argument count"));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "regexp_matches(...) argument count"
+            ));
         }
-        let string = crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
-        let pattern = crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?);
+        let string =
+            crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
+        let pattern =
+            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?);
         let (Datum::Text(string), Datum::Text(pattern)) = (string, pattern) else {
             return Ok(&[]);
         };
         let flags = if args.len() == 3 {
-            match crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, columns)?) {
+            match crate::sql::eval::text_view(crate::sql::eval::eval(
+                args[2], arena, params, columns,
+            )?) {
                 Datum::Text(f) => f,
                 Datum::Null => return Ok(&[]),
                 _ => "",
@@ -885,7 +1095,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 raw: crate::sql::array::build(&elems[..count], arena)?,
             };
             if n == crate::sql::parser::MAX_LIST {
-                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many regexp_matches rows"));
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many regexp_matches rows"
+                ));
             }
             rows[n] = crate::sql::exec::encode_projected_pub(&[arr], arena)?;
             n += 1;
@@ -897,7 +1110,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 break;
             }
         }
-        let out = arena.alloc_slice_with(n, |i| rows[i]).map_err(|_| arena_full())?;
+        let out = arena
+            .alloc_slice_with(n, |i| rows[i])
+            .map_err(|_| arena_full())?;
         return Ok(&*out);
     }
     // jsonb_object_keys(obj) / json_object_keys(obj): one text row per key.
@@ -905,11 +1120,18 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         || tref.table.eq_ignore_ascii_case("json_object_keys")
     {
         let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
+        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(
+            args[0], arena, params, columns,
+        )?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
-            _ => return Err(crate::sql::json::object_keys_error(tref.table, crate::sql::json::Kind::Scalar)),
+            _ => {
+                return Err(crate::sql::json::object_keys_error(
+                    tref.table,
+                    crate::sql::json::Kind::Scalar,
+                ));
+            }
         };
         let kind = crate::sql::json::kind_of(text);
         if kind != crate::sql::json::Kind::Object {
@@ -918,17 +1140,22 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         const EMPTY: &[u8] = &[];
         // jsonb: normalized/sorted keys; json: source order with duplicates.
         if jsonb {
-            let crate::sql::json::Json::Object(members) = crate::sql::json::parse(text, arena)? else {
+            let crate::sql::json::Json::Object(members) = crate::sql::json::parse(text, arena)?
+            else {
                 return Err(crate::sql::json::object_keys_error(tref.table, kind));
             };
-            let rows = arena.alloc_slice_with(members.len(), |_| EMPTY).map_err(|_| arena_full())?;
+            let rows = arena
+                .alloc_slice_with(members.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
             for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
                 *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
             }
             return Ok(&*rows);
         }
         let members = crate::sql::json::object_members_source(text, arena)?;
-        let rows = arena.alloc_slice_with(members.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(members.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
         for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
             *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
         }
@@ -944,22 +1171,36 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
         let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
             || tref.table.eq_ignore_ascii_case("json_array_elements_text");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
+        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(
+            args[0], arena, params, columns,
+        )?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
-            _ => return Err(crate::sql::json::array_elements_error(tref.table, jsonb, crate::sql::json::Kind::Scalar)),
+            _ => {
+                return Err(crate::sql::json::array_elements_error(
+                    tref.table,
+                    jsonb,
+                    crate::sql::json::Kind::Scalar,
+                ));
+            }
         };
         let kind = crate::sql::json::kind_of(text);
         if kind != crate::sql::json::Kind::Array {
-            return Err(crate::sql::json::array_elements_error(tref.table, jsonb, kind));
+            return Err(crate::sql::json::array_elements_error(
+                tref.table, jsonb, kind,
+            ));
         }
         const EMPTY: &[u8] = &[];
         if jsonb {
             let crate::sql::json::Json::Array(items) = crate::sql::json::parse(text, arena)? else {
-                return Err(crate::sql::json::array_elements_error(tref.table, jsonb, kind));
+                return Err(crate::sql::json::array_elements_error(
+                    tref.table, jsonb, kind,
+                ));
             };
-            let rows = arena.alloc_slice_with(items.len(), |_| EMPTY).map_err(|_| arena_full())?;
+            let rows = arena
+                .alloc_slice_with(items.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
             for (slot, element) in rows.iter_mut().zip(items.iter()) {
                 let datum = if as_text {
                     match *element {
@@ -970,7 +1211,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         _ => Datum::Text(crate::sql::eval::json_to_text_pub(element, arena)?),
                     }
                 } else {
-                    Datum::Json { text: crate::sql::eval::json_to_text_pub(element, arena)?, jsonb }
+                    Datum::Json {
+                        text: crate::sql::eval::json_to_text_pub(element, arena)?,
+                        jsonb,
+                    }
                 };
                 *slot = crate::sql::exec::encode_projected_pub(&[datum], arena)?;
             }
@@ -978,16 +1222,23 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         }
         // json: each element's verbatim source text.
         let items = crate::sql::json::array_elements_source(text, arena)?;
-        let rows = arena.alloc_slice_with(items.len(), |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(items.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
         for (slot, element) in rows.iter_mut().zip(items.iter()) {
             let datum = if as_text {
                 match crate::sql::json::parse(element, arena)? {
-                    crate::sql::json::Json::Str(s) => Datum::Text(crate::sql::json::decode_string(s, arena)?),
+                    crate::sql::json::Json::Str(s) => {
+                        Datum::Text(crate::sql::json::decode_string(s, arena)?)
+                    }
                     crate::sql::json::Json::Null => Datum::Null,
                     _ => Datum::Text(element),
                 }
             } else {
-                Datum::Json { text: element, jsonb }
+                Datum::Json {
+                    text: element,
+                    jsonb,
+                }
             };
             *slot = crate::sql::exec::encode_projected_pub(&[datum], arena)?;
         }
@@ -995,14 +1246,23 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     }
     // unnest(array): one row per element.
     if tref.table.eq_ignore_ascii_case("unnest") {
-        let (element, raw) = match crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?) {
+        let (element, raw) = match crate::sql::eval::text_view(crate::sql::eval::eval(
+            args[0], arena, params, columns,
+        )?) {
             Datum::Array { element, raw } => (element, raw),
             Datum::Null => return Ok(&[]),
-            _ => return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "unnest requires an array argument")),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "unnest requires an array argument"
+                ));
+            }
         };
         let count = crate::sql::array::len(raw);
         const EMPTY: &[u8] = &[];
-        let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
         for (i, slot) in rows.iter_mut().enumerate() {
             let v = crate::sql::array::get(raw, element, i).unwrap_or(Datum::Null);
             *slot = crate::sql::exec::encode_projected_pub(&[v], arena)?;
@@ -1016,10 +1276,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         ));
     }
     // Temporal series: a date/timestamp start with an interval step.
-    let start_val = crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
+    let start_val =
+        crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
     if let Some((base, kind)) = crate::sql::eval::timestamp_series_start(&start_val) {
         if args.len() != 3 {
-            return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "generate_series over timestamps requires a step"));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "generate_series over timestamps requires a step"
+            ));
         }
         // Coerce bare string literals for the stop and step (function resolution).
         let stop_val = crate::sql::eval::cast_to(
@@ -1032,14 +1296,17 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             ColType::Interval,
             arena,
         )?;
-        let (Some((stop_micros, _)), Datum::Interval(step_iv)) =
-            (crate::sql::eval::timestamp_series_start(&stop_val), step_val)
-        else {
+        let (Some((stop_micros, _)), Datum::Interval(step_iv)) = (
+            crate::sql::eval::timestamp_series_start(&stop_val),
+            step_val,
+        ) else {
             return Ok(&[]);
         };
         let count = crate::sql::eval::timestamp_series_count(base, stop_micros, step_iv)?;
         const EMPTY: &[u8] = &[];
-        let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
         let mut v = base;
         for slot in rows.iter_mut() {
             *slot = crate::sql::exec::encode_projected_pub(&[kind.datum(v)], arena)?;
@@ -1054,24 +1321,36 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         match crate::sql::eval::eval(e, arena, params, columns)? {
             Datum::Int4(v) => Ok(v as i64),
             Datum::Int8(v) => Ok(v),
-            _ => Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "generate_series requires integer arguments")),
+            _ => Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "generate_series requires integer arguments"
+            )),
         }
     };
     let start = as_i64(args[0])?;
     let stop = as_i64(args[1])?;
     let step = if args.len() == 3 { as_i64(args[2])? } else { 1 };
     if step == 0 {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "step size cannot equal zero"
+        ));
     }
     let count = if step > 0 {
-        if stop < start { 0 } else { ((stop - start) / step) as usize + 1 }
+        if stop < start {
+            0
+        } else {
+            ((stop - start) / step) as usize + 1
+        }
     } else if stop > start {
         0
     } else {
         ((start - stop) / (-step)) as usize + 1
     };
     const EMPTY: &[u8] = &[];
-    let rows = arena.alloc_slice_with(count, |_| EMPTY).map_err(|_| arena_full())?;
+    let rows = arena
+        .alloc_slice_with(count, |_| EMPTY)
+        .map_err(|_| arena_full())?;
     let mut v = start;
     for slot in rows.iter_mut() {
         *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int8(v)], arena)?;

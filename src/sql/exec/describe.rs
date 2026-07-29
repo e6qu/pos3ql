@@ -9,8 +9,8 @@
 //! here rather than part-way through a scan.
 
 use crate::sql::ast::{Expr, SelectItem};
-use crate::sql::eval::{sqlstate, SqlError};
-use crate::sql::types::{oid, ColDesc, ColType};
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::types::{ColDesc, ColType, oid};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, TableDef};
 
@@ -61,8 +61,7 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                let matches =
-                    def.is_some_and(|d| crate::sql::eval::qualifier_answers_single(d, q));
+                let matches = def.is_some_and(|d| crate::sql::eval::qualifier_answers_single(d, q));
                 if !matches {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
@@ -119,12 +118,17 @@ fn describe_record_star<'q>(
         }
         Expr::Call { name, .. } if json_each_value_type(name).is_some() => {
             push(ColDesc::of_type("key", ColType::Text))?;
-            push(ColDesc::of_type("value", json_each_value_type(name).expect("checked")))?;
+            push(ColDesc::of_type(
+                "value",
+                json_each_value_type(name).expect("checked"),
+            ))?;
             Ok(())
         }
-        Expr::WholeRow(table) | Expr::Column { qualifier: None, name: table }
-            if def.is_some_and(|d| d.name.as_str() == *table) =>
-        {
+        Expr::WholeRow(table)
+        | Expr::Column {
+            qualifier: None,
+            name: table,
+        } if def.is_some_and(|d| d.name.as_str() == *table) => {
             for c in def.expect("matched").columns() {
                 push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
             }
@@ -275,7 +279,13 @@ fn array_promoted(array_oid: Option<i32>, elem_oid: Option<i32>) -> (i32, i16) {
 pub(crate) fn unify_numeric_tower(a: ColType, b: ColType) -> ColType {
     use ColType::*;
     let rank = |t: ColType| match t {
-        Int2 => 1, Int4 => 2, Int8 => 3, Numeric => 4, Float4 => 5, Float8 => 6, _ => 0,
+        Int2 => 1,
+        Int4 => 2,
+        Int8 => 3,
+        Numeric => 4,
+        Float4 => 5,
+        Float8 => 6,
+        _ => 0,
     };
     let (ra, rb) = (rank(a), rank(b));
     if ra > 0 && rb > 0 {
@@ -288,7 +298,9 @@ pub(crate) fn unify_numeric_tower(a: ColType, b: ColType) -> ColType {
 /// PostgreSQL's error when an aggregate has no signature for the argument
 /// type (e.g. sum(text), max(boolean)).
 fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
-    let table_name = coltype_of_oid(arg_oid).map(|t| t.name()).unwrap_or("unknown");
+    let table_name = coltype_of_oid(arg_oid)
+        .map(|t| t.name())
+        .unwrap_or("unknown");
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "function {}({}) does not exist",
@@ -306,8 +318,14 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // The desugarings of syntax-only constructs must not be labelled with
         // the internal name they carry: `SIMILAR TO` is an operator, so its
         // column is anonymous, while PostgreSQL does label OVERLAPS.
-        Expr::Call { name: crate::sql::parser::SIMILAR_TO, .. } => None,
-        Expr::Call { name: crate::sql::parser::OVERLAPS_PERIODS, .. } => Some("overlaps"),
+        Expr::Call {
+            name: crate::sql::parser::SIMILAR_TO,
+            ..
+        } => None,
+        Expr::Call {
+            name: crate::sql::parser::OVERLAPS_PERIODS,
+            ..
+        } => Some("overlaps"),
         Expr::Call { name, .. } => Some(name),
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
@@ -316,7 +334,9 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // column, a function call, an array constructor. It does not chain
         // through another cast: `'x'::int4range::int4multirange` is named for
         // the outer type, so forwarding indiscriminately gets it wrong.
-        Expr::Cast { operand, type_name, .. } => match operand {
+        Expr::Cast {
+            operand, type_name, ..
+        } => match operand {
             Expr::Column { .. } | Expr::Call { .. } | Expr::Array(_) | Expr::ArraySubquery(_) => {
                 name_of(operand)
             }
@@ -361,14 +381,19 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
         return n;
     }
     match expression {
-        Expr::Case { synthetic: false, .. } => "case",
+        Expr::Case {
+            synthetic: false, ..
+        } => "case",
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
         Expr::ArraySubquery(_) | Expr::Array(_) => "array",
         // A scalar subquery is named by its single output column.
         Expr::Subquery(s) => match s.items.first() {
             Some(SelectItem::Expr { alias: Some(a), .. }) => a,
-            Some(SelectItem::Expr { expression, alias: None }) => derived_name(expression),
+            Some(SelectItem::Expr {
+                expression,
+                alias: None,
+            }) => derived_name(expression),
             _ => "?column?",
         },
         _ => "?column?",
@@ -405,7 +430,6 @@ pub trait ColTypeResolver {
     fn record_column_handle(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
         None
     }
-
 }
 
 /// One field of a registered record shape (see [`register_record_shape`]).
@@ -543,15 +567,17 @@ pub fn expr_record_handle(base: &Expr, columns: &dyn ColTypeResolver) -> Option<
             // (`(v).r` where `r` is a record column of `v`).
             let table = match inner {
                 Expr::WholeRow(table) => table,
-                Expr::Column { qualifier: None, name } if columns.is_whole_row(name) => name,
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } if columns.is_whole_row(name) => name,
                 _ => return None,
             };
             let column = columns
                 .table_columns(table)?
                 .iter()
                 .find(|c| c.name.as_str().eq_ignore_ascii_case(field))?;
-            (column.ctype == ColType::Record && column.type_mod >= 0)
-                .then_some(column.type_mod)
+            (column.ctype == ColType::Record && column.type_mod >= 0).then_some(column.type_mod)
         }
         _ => None,
     }
@@ -597,7 +623,11 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 };
                 let mut field_name = crate::util::StackStr::new();
                 let _ = core::fmt::Write::write_str(&mut field_name, RECORD_FIELD_NAMES[i]);
-                fields[i] = RecordShapeField { name: field_name, ctype, nested };
+                fields[i] = RecordShapeField {
+                    name: field_name,
+                    ctype,
+                    nested,
+                };
                 n += 1;
             }
         }
@@ -606,7 +636,11 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
             let _ = core::fmt::Write::write_str(&mut key, "key");
             let mut value = crate::util::StackStr::new();
             let _ = core::fmt::Write::write_str(&mut value, "value");
-            fields[0] = RecordShapeField { name: key, ctype: ColType::Text, nested: -1 };
+            fields[0] = RecordShapeField {
+                name: key,
+                ctype: ColType::Text,
+                nested: -1,
+            };
             fields[1] = RecordShapeField {
                 name: value,
                 ctype: json_each_value_type(name)?,
@@ -622,12 +656,18 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
             for (i, c) in cols.iter().enumerate() {
                 let mut field_name = crate::util::StackStr::new();
                 let _ = core::fmt::Write::write_str(&mut field_name, c.name.as_str());
-                fields[i] =
-                    RecordShapeField { name: field_name, ctype: c.ctype, nested: -1 };
+                fields[i] = RecordShapeField {
+                    name: field_name,
+                    ctype: c.ctype,
+                    nested: -1,
+                };
                 n += 1;
             }
         }
-        Expr::Column { qualifier: None, name } if columns.is_whole_row(name) => {
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if columns.is_whole_row(name) => {
             let cols = columns.table_columns(name)?;
             if cols.len() > MAX_SHAPE_FIELDS {
                 return None;
@@ -635,8 +675,11 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
             for (i, c) in cols.iter().enumerate() {
                 let mut field_name = crate::util::StackStr::new();
                 let _ = core::fmt::Write::write_str(&mut field_name, c.name.as_str());
-                fields[i] =
-                    RecordShapeField { name: field_name, ctype: c.ctype, nested: -1 };
+                fields[i] = RecordShapeField {
+                    name: field_name,
+                    ctype: c.ctype,
+                    nested: -1,
+                };
                 n += 1;
             }
         }
@@ -648,11 +691,11 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
 /// Static field names PostgreSQL assigns an anonymous record (`ROW(...)`):
 /// `f1`, `f2`, … Indexed 1-based by the caller.
 pub const RECORD_FIELD_NAMES: [&str; 64] = [
-    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14",
-    "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24", "f25", "f26", "f27",
-    "f28", "f29", "f30", "f31", "f32", "f33", "f34", "f35", "f36", "f37", "f38", "f39", "f40",
-    "f41", "f42", "f43", "f44", "f45", "f46", "f47", "f48", "f49", "f50", "f51", "f52", "f53",
-    "f54", "f55", "f56", "f57", "f58", "f59", "f60", "f61", "f62", "f63", "f64",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
+    "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24", "f25", "f26", "f27", "f28",
+    "f29", "f30", "f31", "f32", "f33", "f34", "f35", "f36", "f37", "f38", "f39", "f40", "f41",
+    "f42", "f43", "f44", "f45", "f46", "f47", "f48", "f49", "f50", "f51", "f52", "f53", "f54",
+    "f55", "f56", "f57", "f58", "f59", "f60", "f61", "f62", "f63", "f64",
 ];
 
 /// The value type of `json_each`-family output's `value` column, for callers
@@ -667,7 +710,9 @@ fn json_each_value_type(name: &str) -> Option<ColType> {
         Some(ColType::Json)
     } else if name.eq_ignore_ascii_case("jsonb_each") {
         Some(ColType::Jsonb)
-    } else if name.eq_ignore_ascii_case("json_each_text") || name.eq_ignore_ascii_case("jsonb_each_text") {
+    } else if name.eq_ignore_ascii_case("json_each_text")
+        || name.eq_ignore_ascii_case("jsonb_each_text")
+    {
         Some(ColType::Text)
     } else {
         None
@@ -689,7 +734,10 @@ pub fn record_shape(
             let n = args.len().min(RECORD_FIELD_NAMES.len());
             for (i, arg) in args[..n].iter().enumerate() {
                 let oid = infer_type_res(arg, columns).ok()?.0;
-                visit(RECORD_FIELD_NAMES[i], coltype_of_oid(oid).unwrap_or(ColType::Text));
+                visit(
+                    RECORD_FIELD_NAMES[i],
+                    coltype_of_oid(oid).unwrap_or(ColType::Text),
+                );
             }
             Some(n)
         }
@@ -701,14 +749,13 @@ pub fn record_shape(
         Expr::WholeRow(table) => shape_from_columns(columns.table_columns(table)?, visit),
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.
-        Expr::Column { .. } | Expr::Field { .. }
-            if expr_record_handle(base, columns).is_some() =>
-        {
+        Expr::Column { .. } | Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
             visit_record_shape(expr_record_handle(base, columns)?, visit)
         }
-        Expr::Column { qualifier: None, name } if columns.is_whole_row(name) => {
-            shape_from_columns(columns.table_columns(name)?, visit)
-        }
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if columns.is_whole_row(name) => shape_from_columns(columns.table_columns(name)?, visit),
         _ => None,
     }
 }
@@ -790,7 +837,10 @@ pub fn record_field_type(
             table,
             field
         ),
-        Expr::Column { qualifier: None, name: table } if columns.is_whole_row(table) => {
+        Expr::Column {
+            qualifier: None,
+            name: table,
+        } if columns.is_whole_row(table) => {
             sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column {}.{} does not exist",
@@ -821,13 +871,15 @@ pub fn not_composite(field: &str, type_name: &str) -> SqlError {
     )
 }
 
-
-
 /// No FROM clause: any column reference is an error.
 pub struct NoCols;
 impl ColTypeResolver for NoCols {
     fn resolve(&self, _q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name))
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
     }
 }
 
@@ -836,12 +888,21 @@ pub struct DefCols<'d>(pub &'d TableDef);
 impl ColTypeResolver for DefCols<'_> {
     fn resolve(&self, q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(q) = q
-            && !crate::sql::eval::qualifier_answers_single(self.0, q) {
-                return Err(sql_err!(sqlstate::UNDEFINED_TABLE, "missing FROM-clause entry for table \"{}\"", q));
-            }
+            && !crate::sql::eval::qualifier_answers_single(self.0, q)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                q
+            ));
+        }
         match self.0.column_index(name) {
             Some(i) => Ok(self.0.columns()[i].ctype),
-            None => Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name)),
+            None => Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            )),
         }
     }
 
@@ -850,8 +911,6 @@ impl ColTypeResolver for DefCols<'_> {
         let column = &self.0.columns()[i];
         (column.ctype == ColType::Record).then_some(column.type_mod)
     }
-
-
 
     fn is_whole_row(&self, name: &str) -> bool {
         name == self.0.name.as_str()
@@ -869,7 +928,11 @@ struct RowCols<'r, 'a>(&'r dyn crate::sql::eval::ColumnLookup<'a>);
 impl<'a> ColTypeResolver for RowCols<'_, 'a> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         self.0.col_type(qualifier, name).ok_or_else(|| {
-            sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name)
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            )
         })
     }
 }
@@ -911,7 +974,10 @@ fn is_multirange_oid(oid: i32) -> bool {
 }
 
 fn is_network_oid(oid: i32) -> bool {
-    matches!(oid, crate::sql::types::oid::INET | crate::sql::types::oid::CIDR)
+    matches!(
+        oid,
+        crate::sql::types::oid::INET | crate::sql::types::oid::CIDR
+    )
 }
 
 fn comparable(a: ColType, b: ColType) -> bool {
@@ -958,7 +1024,10 @@ pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32,
 /// PostgreSQL's plan-time analysis: comparisons and arithmetic over
 /// incompatible types raise 42883 here, before any row is scanned. String
 /// literals and parameters are UNKNOWN and coerce to the other operand.
-pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Result<(i32, i16), SqlError> {
+pub fn infer_type_res(
+    expression: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
     Ok(match expression {
         Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
@@ -968,20 +1037,25 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             Some(ty) => of(ty),
             None => (oid::RECORD, -1),
         },
-        Expr::SchemaColumn { schema, table, name } => {
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
             // Composed-qualifier resolution, as the evaluator binds it: only
             // an unaliased base table of that schema answers.
             let mut composed = crate::util::StackStr::<130>::new();
-            let _ = core::fmt::Write::write_fmt(
-                &mut composed,
-                format_args!("{schema}.{table}"),
-            );
+            let _ = core::fmt::Write::write_fmt(&mut composed, format_args!("{schema}.{table}"));
             of(columns.resolve(Some(composed.as_str()), name)?)
         }
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
         Expr::Int(v) => {
-            if i32::try_from(*v).is_ok() { of(ColType::Int4) } else { of(ColType::Int8) }
+            if i32::try_from(*v).is_ok() {
+                of(ColType::Int4)
+            } else {
+                of(ColType::Int8)
+            }
         }
         Expr::Float(_) => of(ColType::Float8),
         Expr::NumericLit(_) => of(ColType::Numeric),
@@ -1001,13 +1075,19 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
         },
         Expr::Unary { operator, operand } => match operator {
             crate::sql::ast::UnaryOp::Not => of(ColType::Bool),
-            crate::sql::ast::UnaryOp::Neg | crate::sql::ast::UnaryOp::BitNot => infer_type_res(operand, columns)?,
+            crate::sql::ast::UnaryOp::Neg | crate::sql::ast::UnaryOp::BitNot => {
+                infer_type_res(operand, columns)?
+            }
             crate::sql::ast::UnaryOp::SquareRoot | crate::sql::ast::UnaryOp::CubeRoot => {
                 of(ColType::Float8)
             }
             crate::sql::ast::UnaryOp::AbsoluteValue => infer_type_res(operand, columns)?,
         },
-        Expr::Binary { operator, left, right } => {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+        } => {
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
@@ -1015,15 +1095,21 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             match operator {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
                     // Unknown coerces; two concrete types must be comparable.
-                    if lo != oid::UNKNOWN && ro != oid::UNKNOWN
+                    if lo != oid::UNKNOWN
+                        && ro != oid::UNKNOWN
                         && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
-                            && !comparable(a, b) {
-                                let sym = match operator {
-                                    Eq => "=", NotEq => "<>", Lt => "<",
-                                    LtEq => "<=", Gt => ">", _ => ">=",
-                                };
-                                return Err(operator_undefined(a, sym, b));
-                            }
+                        && !comparable(a, b)
+                    {
+                        let sym = match operator {
+                            Eq => "=",
+                            NotEq => "<>",
+                            Lt => "<",
+                            LtEq => "<=",
+                            Gt => ">",
+                            _ => ">=",
+                        };
+                        return Err(operator_undefined(a, sym, b));
+                    }
                     of(ColType::Bool)
                 }
                 And | Or | Like | ILike => of(ColType::Bool),
@@ -1084,7 +1170,14 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     }
                 }
                 // `json -> k` keeps the json/jsonb type; `->>` yields text.
-                JsonGet | JsonPath => (if lo == oid::JSONB { oid::JSONB } else { oid::JSON }, -1),
+                JsonGet | JsonPath => (
+                    if lo == oid::JSONB {
+                        oid::JSONB
+                    } else {
+                        oid::JSON
+                    },
+                    -1,
+                ),
                 JsonGetText | JsonPathText => (oid::TEXT, -1),
                 JsonDeletePath => (oid::JSONB, -1),
                 JsonExists | JsonExistsAny | JsonExistsAll => of(ColType::Bool),
@@ -1092,7 +1185,14 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 // string; on integers they keep the wider integer width.
                 BitAnd | BitOr | BitXor | Shl | Shr => {
                     if is_bit(lo) || is_bit(ro) {
-                        (if lo == oid::VARBIT || ro == oid::VARBIT { oid::VARBIT } else { oid::BIT }, -1)
+                        (
+                            if lo == oid::VARBIT || ro == oid::VARBIT {
+                                oid::VARBIT
+                            } else {
+                                oid::BIT
+                            },
+                            -1,
+                        )
                     } else if matches!(operator, Shl | Shr) {
                         // A shift keeps its left operand's type.
                         match lo {
@@ -1110,9 +1210,18 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
                 Add | Sub | Mul | Div | Mod => {
                     let numeric = |o: i32| {
-                        matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
+                        matches!(
+                            o,
+                            oid::INT2
+                                | oid::INT4
+                                | oid::INT8
+                                | oid::NUMERIC
+                                | oid::FLOAT4
+                                | oid::FLOAT8
+                        )
                     };
-                    let int_like = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
+                    let int_like =
+                        |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
                     // Date arithmetic: date - date -> int4; date +/- int -> date;
                     // int + date -> date.
                     if lo == oid::DATE && ro == oid::DATE && matches!(operator, Sub) {
@@ -1139,19 +1248,35 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                             return Ok(of(ColType::Interval));
                         }
                         if is_dt(lo) && ro == oid::INTERVAL {
-                            return Ok(of(if lo == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
+                            return Ok(of(if lo == oid::TIMESTAMPTZ {
+                                ColType::Timestamptz
+                            } else {
+                                ColType::Timestamp
+                            }));
                         }
                         if matches!(operator, Add) && lo == oid::INTERVAL && is_dt(ro) {
-                            return Ok(of(if ro == oid::TIMESTAMPTZ { ColType::Timestamptz } else { ColType::Timestamp }));
+                            return Ok(of(if ro == oid::TIMESTAMPTZ {
+                                ColType::Timestamptz
+                            } else {
+                                ColType::Timestamp
+                            }));
                         }
                         // A time of day keeps its own type, and its zone; the
                         // result wraps within the day.
                         let time_of_day = |o: i32| matches!(o, oid::TIME | oid::TIMETZ);
                         if time_of_day(lo) && ro == oid::INTERVAL {
-                            return Ok(of(if lo == oid::TIMETZ { ColType::Timetz } else { ColType::Time }));
+                            return Ok(of(if lo == oid::TIMETZ {
+                                ColType::Timetz
+                            } else {
+                                ColType::Time
+                            }));
                         }
                         if matches!(operator, Add) && lo == oid::INTERVAL && time_of_day(ro) {
-                            return Ok(of(if ro == oid::TIMETZ { ColType::Timetz } else { ColType::Time }));
+                            return Ok(of(if ro == oid::TIMETZ {
+                                ColType::Timetz
+                            } else {
+                                ColType::Time
+                            }));
                         }
                     }
                     // interval * number / number * interval / interval / number.
@@ -1169,12 +1294,17 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     let is_float = |o: i32| matches!(o, oid::FLOAT4 | oid::FLOAT8);
                     let mod_on_float = matches!(operator, Mod) && (is_float(lo) || is_float(ro));
                     if (!l_ok || !r_ok || mod_on_float)
-                        && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro)) {
-                            let sym = match operator {
-                                Add => "+", Sub => "-", Mul => "*", Div => "/", _ => "%",
-                            };
-                            return Err(operator_undefined(a, sym, b));
-                        }
+                        && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
+                    {
+                        let sym = match operator {
+                            Add => "+",
+                            Sub => "-",
+                            Mul => "*",
+                            Div => "/",
+                            _ => "%",
+                        };
+                        return Err(operator_undefined(a, sym, b));
+                    }
                     // Promotion: float8 > real > numeric > int8 > int4; unknown
                     // is absorbed by the concrete side. real op real stays real;
                     // real mixed with int/numeric widens to double precision.
@@ -1203,7 +1333,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
             }
         }
-        Expr::Cast { operand, type_name, .. } => {
+        Expr::Cast {
+            operand, type_name, ..
+        } => {
             // `regclass` is oid-based: `'relname'::regclass` yields the relation
             // OID (so `attrelid = 'tbl'::regclass` compares OIDs, as pgx and
             // most tools introspect), while `oid::regclass` renders as the name.
@@ -1225,8 +1357,12 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
         }
         Expr::IsNull { .. } => of(ColType::Bool),
-        Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } | Expr::Match { .. } => of(ColType::Bool),
-        Expr::Case { whens, otherwise, .. } => {
+        Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } | Expr::Match { .. } => {
+            of(ColType::Bool)
+        }
+        Expr::Case {
+            whens, otherwise, ..
+        } => {
             let mut acc: Option<ColType> = None;
             let mut consider = |e: &Expr| -> Result<(), SqlError> {
                 let (o, _) = infer_type_res(e, columns)?;
@@ -1270,12 +1406,11 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 .unwrap_or(crate::sql::types::ArrElem::Text);
             of(ColType::Array(element))
         }
-        Expr::Subscript { base, .. } => {
-            match coltype_of_oid(infer_type_res(base, columns)?.0) {
-                Some(ColType::Array(e)) => of(e.to_coltype()),
-                _ => (oid::UNKNOWN, -2),
-            }
-        }
+        Expr::Subscript { base, .. } => match coltype_of_oid(infer_type_res(base, columns)?.0) {
+            Some(ColType::Array(e)) => of(e.to_coltype()),
+            Some(ColType::Name) => of(ColType::Bpchar),
+            _ => (oid::UNKNOWN, -2),
+        },
         // An array slice keeps the array type (unlike a subscript, which yields
         // the element type).
         Expr::Slice { base, .. } => infer_type_res(base, columns)?,
@@ -1289,18 +1424,33 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             Err(e) if e.sqlstate == "42809" => of(ColType::Int4),
             Err(e) => return Err(e),
         },
-        Expr::Call { name, args, order_by, .. } => match *name {
+        Expr::Call {
+            name,
+            args,
+            order_by,
+            ..
+        } => match *name {
             // Catalog-introspection helpers (for psql \d).
-            "pg_get_userbyid" | "format_type" | "pg_get_expr" | "pg_get_indexdef"
-            | "pg_get_constraintdef" | "pg_get_viewdef" | "pg_get_functiondef"
-            | "col_description" | "obj_description" | "shobj_description"
-            | "pg_encoding_to_char" | "array_to_string"
+            "pg_get_userbyid"
+            | "format_type"
+            | "pg_get_expr"
+            | "pg_get_indexdef"
+            | "pg_get_constraintdef"
+            | "pg_get_viewdef"
+            | "pg_get_functiondef"
+            | "col_description"
+            | "obj_description"
+            | "shobj_description"
+            | "pg_encoding_to_char"
+            | "array_to_string"
             | "pg_get_statisticsobjdef_columns" => (oid::TEXT, -1),
-            "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible"
-            | "has_table_privilege" | "has_column_privilege" | "has_schema_privilege"
-            | "pg_relation_is_publishable" => {
-                of(ColType::Bool)
-            }
+            "pg_table_is_visible"
+            | "pg_type_is_visible"
+            | "pg_function_is_visible"
+            | "has_table_privilege"
+            | "has_column_privilege"
+            | "has_schema_privilege"
+            | "pg_relation_is_publishable" => of(ColType::Bool),
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
                 of(ColType::Int4)
             }
@@ -1317,38 +1467,79 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             // promote its element type to hold a wider new/replacement element
             // (PostgreSQL's polymorphic anyarray/anyelement resolution).
             "array_append" => {
-                let array_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                let elem_oid = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let array_oid = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                let elem_oid = args
+                    .get(1)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 array_promoted(array_oid, elem_oid)
             }
             "array_prepend" => {
-                let elem_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                let array_oid = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let elem_oid = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                let array_oid = args
+                    .get(1)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 array_promoted(array_oid, elem_oid)
             }
             "array_replace" => {
-                let array_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                let to_oid = args.get(2).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let array_oid = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                let to_oid = args
+                    .get(2)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 array_promoted(array_oid, to_oid)
             }
             "array_cat" => {
-                let a_oid = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                let b_oid = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let a_oid = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                let b_oid = args
+                    .get(1)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 // Element-type promotion across the two arrays.
-                match (a_oid.and_then(coltype_of_oid), b_oid.and_then(coltype_of_oid)) {
+                match (
+                    a_oid.and_then(coltype_of_oid),
+                    b_oid.and_then(coltype_of_oid),
+                ) {
                     (Some(ColType::Array(ae)), Some(ColType::Array(be))) => {
                         let e = unify_numeric_tower(ae.to_coltype(), be.to_coltype());
-                        of(ColType::Array(crate::sql::types::ArrElem::from_coltype(e).unwrap_or(ae)))
+                        of(ColType::Array(
+                            crate::sql::types::ArrElem::from_coltype(e).unwrap_or(ae),
+                        ))
                     }
                     _ => (a_oid.unwrap_or(oid::TEXT), -1),
                 }
             }
-            "array_remove" | "trim_array" => {
-                args.first().map(|a| infer_type_res(a, columns)).transpose()?.unwrap_or((oid::TEXT, -1))
-            }
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
-                args.first().map(|a| infer_type_res(a, columns)).transpose()?.unwrap_or((oid::INT4, 4))
-            }
+            "array_remove" | "trim_array" => args
+                .first()
+                .map(|a| infer_type_res(a, columns))
+                .transpose()?
+                .unwrap_or((oid::TEXT, -1)),
+            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => args
+                .first()
+                .map(|a| infer_type_res(a, columns))
+                .transpose()?
+                .unwrap_or((oid::INT4, 4)),
             // Window-only functions.
             "row_number" | "rank" | "dense_rank" | "ntile" => of(ColType::Int8),
             "percent_rank" | "cume_dist" => of(ColType::Float8),
@@ -1364,7 +1555,11 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "to_jsonb" | "jsonb_build_object" | "jsonb_build_array" => of(ColType::Jsonb),
             "row" => (oid::RECORD, -1),
             "sum" | "avg" => {
-                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let a = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 match a {
                     Some(oid::INT2 | oid::INT4) if *name == "sum" => of(ColType::Int8),
                     Some(oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC) => of(ColType::Numeric),
@@ -1383,7 +1578,10 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 // uuid, json or jsonb, bit strings, ranges or multiranges —
                 // this engine can order most of those internally, but ordering
                 // them is not the same as PostgreSQL offering the aggregate.
-                let t = args.first().map(|a| infer_type_res(a, columns)).transpose()?;
+                let t = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?;
                 if let Some((o, _)) = t {
                     let unordered = o == oid::BOOL
                         || o == oid::UUID
@@ -1479,12 +1677,16 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                         _ => {}
                     }
                 }
-                if numeric && !float { of(ColType::Numeric) } else { of(ColType::Float8) }
+                if numeric && !float {
+                    of(ColType::Numeric)
+                } else {
+                    of(ColType::Float8)
+                }
             }
             "div" | "trim_scale" | "to_number" => of(ColType::Numeric),
             "scale" | "min_scale" | "width_bucket" | "regexp_count" | "regexp_instr"
-            | "array_position" | "jsonb_array_length" | "json_array_length"
-            | "num_nonnulls" | "num_nulls" => of(ColType::Int4),
+            | "array_position" | "jsonb_array_length" | "json_array_length" | "num_nonnulls"
+            | "num_nulls" => of(ColType::Int4),
             "array_positions" => of(ColType::Array(crate::sql::types::ArrElem::Int4)),
             // array_fill returns an array of its value argument's element type.
             "array_fill" => {
@@ -1497,7 +1699,9 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                     .unwrap_or(crate::sql::types::ArrElem::Int4);
                 of(ColType::Array(elem))
             }
-            "jsonb_typeof" | "json_typeof" | "json_extract_path_text"
+            "jsonb_typeof"
+            | "json_typeof"
+            | "json_extract_path_text"
             | "jsonb_extract_path_text" => of(ColType::Text),
             "json_extract_path" => of(ColType::Json),
             "jsonb_extract_path" => of(ColType::Jsonb),
@@ -1508,14 +1712,26 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             "format" | "overlay" | "regexp_replace" => of(ColType::Text),
             "floor" | "ceil" | "ceiling" | "sign" => {
-                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                if a == Some(oid::NUMERIC) { of(ColType::Numeric) } else { of(ColType::Float8) }
+                let a = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                if a == Some(oid::NUMERIC) {
+                    of(ColType::Numeric)
+                } else {
+                    of(ColType::Float8)
+                }
             }
             "round" | "trunc" => {
                 if args.len() == 2 {
                     of(ColType::Numeric)
                 } else {
-                    let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                    let a = args
+                        .first()
+                        .map(|a| infer_type_res(a, columns))
+                        .transpose()?
+                        .map(|t| t.0);
                     match a {
                         // trunc(macaddr)/trunc(macaddr8) keep their type.
                         Some(oid::MACADDR) if *name == "trunc" => of(ColType::Macaddr),
@@ -1526,8 +1742,16 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
                 }
             }
             "mod" | "gcd" | "lcm" => {
-                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                let b = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let a = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                let b = args
+                    .get(1)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 // `mod` keeps a numeric operand's type; gcd/lcm are integer-only.
                 if *name == "mod" && (a == Some(oid::NUMERIC) || b == Some(oid::NUMERIC)) {
                     of(ColType::Numeric)
@@ -1541,20 +1765,25 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "factorial" => of(ColType::Numeric),
             "bit_length" => of(ColType::Int4),
             "starts_with" => of(ColType::Bool),
-            "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2" | "sinh"
-            | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians" | "pi" => {
-                of(ColType::Float8)
-            }
+            "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2"
+            | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
+            | "pi" => of(ColType::Float8),
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
             // Bitwise aggregates preserve the argument's (integer or bit) type.
-            "bit_and" | "bit_or" | "bit_xor" => {
-                args.first().map(|a| infer_type_res(a, columns)).transpose()?.unwrap_or(of(ColType::Int4))
-            }
+            "bit_and" | "bit_or" | "bit_xor" => args
+                .first()
+                .map(|a| infer_type_res(a, columns))
+                .transpose()?
+                .unwrap_or(of(ColType::Int4)),
             // Single-argument variance/stddev mirror the input class: numeric for
             // integer/numeric inputs, double precision for float8 (PostgreSQL's
             // aggregate signatures).
             "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" => {
-                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let a = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 match a {
                     Some(oid::FLOAT8) | Some(oid::FLOAT4) => of(ColType::Float8),
                     _ => of(ColType::Numeric),
@@ -1604,12 +1833,25 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "to_date" => of(ColType::Date),
             "to_timestamp" => of(ColType::Timestamptz),
             "generate_series" => {
-                let a = args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
-                if a == Some(oid::INT8) { of(ColType::Int8) } else { of(ColType::Int4) }
+                let a = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
+                if a == Some(oid::INT8) {
+                    of(ColType::Int8)
+                } else {
+                    of(ColType::Int4)
+                }
             }
             "unnest" => {
                 // The element type of the array argument.
-                match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {
+                match args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0)
+                {
                     Some(o) => match coltype_of_oid(o) {
                         Some(ColType::Array(element)) => of(element.to_coltype()),
                         _ => of(ColType::Text),
@@ -1621,14 +1863,14 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "regexp_matches" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "regexp_split_to_table" | "string_to_table" => of(ColType::Text),
             "generate_subscripts" => of(ColType::Int4),
-            "jsonb_object_keys" | "json_object_keys" | "jsonb_array_elements_text"
+            "jsonb_object_keys"
+            | "json_object_keys"
+            | "jsonb_array_elements_text"
             | "json_array_elements_text" => of(ColType::Text),
             "jsonb_array_elements" => of(ColType::Jsonb),
             "json_array_elements" => of(ColType::Json),
             // The `each` family yields a `(key, value)` composite per member.
-            "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => {
-                (oid::RECORD, -1)
-            }
+            "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => (oid::RECORD, -1),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),
@@ -1647,7 +1889,11 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "parse_ident" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             // date_bin returns the type of its source timestamp (arg 1).
             "date_bin" => {
-                let src = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let src = args
+                    .get(1)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 if src == Some(oid::TIMESTAMPTZ) {
                     of(ColType::Timestamptz)
                 } else {
@@ -1659,30 +1905,46 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             }
             // timezone(zone, ts) == ts AT TIME ZONE zone: timestamptz <-> timestamp.
             "timezone" => {
-                let arg = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let arg = args
+                    .get(1)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 match arg {
                     Some(oid::TIMESTAMPTZ) => of(ColType::Timestamp),
                     _ => of(ColType::Timestamptz),
                 }
             }
-            "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
-                of(ColType::Range(crate::sql::types::RangeKind::from_name(name).expect("range name")))
-            }
+            "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => of(
+                ColType::Range(crate::sql::types::RangeKind::from_name(name).expect("range name")),
+            ),
             "int4multirange" | "int8multirange" | "nummultirange" | "datemultirange"
             | "tsmultirange" | "tstzmultirange" => of(ColType::Multirange(
                 crate::sql::types::RangeKind::from_multirange_name(name).expect("multirange name"),
             )),
-            "similar_to" | "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => of(ColType::Bool),
+            "similar_to" | "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => {
+                of(ColType::Bool)
+            }
             "range_merge" => {
                 // Same range type as its arguments.
-                match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {
+                match args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0)
+                {
                     Some(o) if is_range_oid(o) => (o, -1),
                     _ => (oid::TEXT, -1),
                 }
             }
             "lower" | "upper" => {
                 // A range argument yields its element type; otherwise text.
-                match args.first().map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0) {
+                match args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0)
+                {
                     Some(o) => match coltype_of_oid(o) {
                         Some(ColType::Range(kind)) | Some(ColType::Multirange(kind)) => {
                             of(kind.elem_type())
@@ -1702,13 +1964,20 @@ pub fn infer_type_res(expression: &Expr, columns: &dyn ColTypeResolver) -> Resul
             "current_time" => of(ColType::Timetz),
             "localtime" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),
-            "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp"
+            "now"
+            | "current_timestamp"
+            | "transaction_timestamp"
+            | "statement_timestamp"
             | "clock_timestamp" => of(ColType::Timestamptz),
             // Sequence functions return bigint.
             "nextval" | "currval" | "lastval" | "setval" => of(ColType::Int8),
             "date_trunc" => {
                 // Returns the timestamp type of its second argument.
-                let a = args.get(1).map(|a| infer_type_res(a, columns)).transpose()?.map(|t| t.0);
+                let a = args
+                    .get(1)
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .map(|t| t.0);
                 if a == Some(oid::TIMESTAMPTZ) {
                     of(ColType::Timestamptz)
                 } else {

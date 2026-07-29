@@ -17,21 +17,19 @@
 //! CAS on the manifest means a second writer pointed at the same bucket
 //! fails loudly instead of corrupting anything.
 
-
 use crate::config::Config;
+use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
-use crate::sql::eval::{sqlstate, SqlError};
+use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
-use crate::mem::arena::Arena;
-use crate::storage::{ColumnMeta, OwnedDatum, RowHome, SqlName, Storage, TableDef, MAX_COLUMNS};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, OwnedDatum, RowHome, SqlName, Storage, TableDef};
 use crate::store::{
-    BlockId, BlockStore, OwnedObjectStore, SstHandle, SstReader, SstWriter, StackPlan,
-    TieredStore,
+    BlockId, BlockStore, OwnedObjectStore, SstHandle, SstReader, SstWriter, StackPlan, TieredStore,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -56,7 +54,10 @@ enum SlotInstall {
     /// Paced compaction merged the adjacent pair at list positions
     /// (`at`, `at + 1`) into one (`None` when everything in the pair was
     /// deleted): remap in-memory spill indexes.
-    MergePair { at: usize, handle: Option<SstHandle> },
+    MergePair {
+        at: usize,
+        handle: Option<SstHandle>,
+    },
 }
 
 /// A prior checkpoint's SST reference for one table slot.
@@ -76,7 +77,10 @@ struct SlotList {
 }
 
 impl SlotList {
-    const EMPTY: SlotList = SlotList { ssts: [None; crate::storage::MAX_SPILL_SSTS], n: 0 };
+    const EMPTY: SlotList = SlotList {
+        ssts: [None; crate::storage::MAX_SPILL_SSTS],
+        n: 0,
+    };
 
     fn push(&mut self, p: PrevSst) -> bool {
         if self.n == crate::storage::MAX_SPILL_SSTS {
@@ -285,9 +289,10 @@ impl Checkpointer {
         };
         // The published list must still hold the pair where the job left
         // it; a collapse or full rewrite replaced it, and with it the merge.
-        let valid = self.prev_ssts.get(job.slot).is_some_and(|list| {
-            pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle))
-        });
+        let valid = self
+            .prev_ssts
+            .get(job.slot)
+            .is_some_and(|list| pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle)));
         if !valid {
             return Ok(());
         }
@@ -320,21 +325,22 @@ impl Checkpointer {
     /// rewrite stays the safety net) and pairs whose scans previously
     /// overflowed it.
     fn merge_candidate(&self, storage: &Storage) -> Option<MergeJob> {
-        if self.merge_job.is_some() || self.merge_done.is_some() {
+        if storage.has_active_snapshots() || self.merge_job.is_some() || self.merge_done.is_some() {
             return None;
         }
         for slot in 0..storage.table_count().min(MAX_CKPT_TABLES) {
             if !storage.table(slot).live {
                 continue;
             }
-            let Some(list) = self.prev_ssts.get(slot) else { continue };
+            let Some(list) = self.prev_ssts.get(slot) else {
+                continue;
+            };
             if list.n < MERGE_TRIGGER {
                 continue;
             }
             let at = (0..list.n - 1)
                 .min_by_key(|&i| {
-                    list.ssts[i].expect("counted").count
-                        + list.ssts[i + 1].expect("counted").count
+                    list.ssts[i].expect("counted").count + list.ssts[i + 1].expect("counted").count
                 })
                 .expect("trigger implies at least one pair");
             let old0 = list.ssts[at].expect("counted");
@@ -353,7 +359,10 @@ impl Checkpointer {
                 old0,
                 old1,
                 drop_tombstones: at == 0,
-                phase: MergePhase::Schedule { rank: 0, resume_lo: 0 },
+                phase: MergePhase::Schedule {
+                    rank: 0,
+                    resume_lo: 0,
+                },
                 schedule_len: 0,
                 count: 0,
                 crc: Crc32c::new(),
@@ -412,8 +421,14 @@ impl Checkpointer {
             return Ok(MergeBeatOutcome::Cancel);
         }
         job.phase = match (next, rank) {
-            (Some(lo), _) => MergePhase::Schedule { rank, resume_lo: lo },
-            (None, 0) => MergePhase::Schedule { rank: 1, resume_lo: 0 },
+            (Some(lo), _) => MergePhase::Schedule {
+                rank,
+                resume_lo: lo,
+            },
+            (None, 0) => MergePhase::Schedule {
+                rank: 1,
+                resume_lo: 0,
+            },
             (None, _) => {
                 // Newer-wins dedup: sort by (rowid, rank), keep each rowid's
                 // last. In-place and allocation-free (unstable sort).
@@ -488,7 +503,11 @@ impl Checkpointer {
                 .get(&mut *blocks.borrow_mut(), &member.handle, rowid, row_buf)
                 .map_err(sst_to_sql)?
                 .ok_or_else(|| {
-                    sql_err!(SQLSTATE_IO, "merge lost row {} between scan and read", rowid)
+                    sql_err!(
+                        SQLSTATE_IO,
+                        "merge lost row {} between scan and read",
+                        rowid
+                    )
                 })?;
             let mut header = [0u8; SST_ENTRY_HEADER];
             header[0..8].copy_from_slice(&rowid.to_le_bytes());
@@ -534,8 +553,9 @@ impl Checkpointer {
             .map_err(|e| CheckpointSetupError::ObjectStore(format!("create data_dir: {e}")))?;
         let cache_dir = std::path::Path::new(&config.data_dir);
         let blocks = std::rc::Rc::new(std::cell::RefCell::new(
-            crate::store::build_tiers(budget, base, plan, cache_dir)
-                .map_err(|e| CheckpointSetupError::ObjectStore(format!("block cache stack: {e:?}")))?,
+            crate::store::build_tiers(budget, base, plan, cache_dir).map_err(|e| {
+                CheckpointSetupError::ObjectStore(format!("block cache stack: {e:?}"))
+            })?,
         ));
         Ok(Self {
             client: ObjectStore::new(config, budget)
@@ -577,11 +597,14 @@ impl Checkpointer {
         std::rc::Rc::clone(&self.blocks)
     }
 
-
     /// Uploads a committed WAL batch as a segment keyed by its first LSN,
     /// so a lost-disk cold start can replay everything past the manifest.
     /// Called with the raw journal bytes of one commit.
-    pub(crate) fn upload_wal_segment(&mut self, first_lsn: u64, bytes: &[u8]) -> Result<(), SqlError> {
+    pub(crate) fn upload_wal_segment(
+        &mut self,
+        first_lsn: u64,
+        bytes: &[u8],
+    ) -> Result<(), SqlError> {
         let key = stack_format!(48, "wal/{:020}.seg", first_lsn);
         self.client
             .put(key.as_str(), bytes, Precondition::None)
@@ -605,7 +628,9 @@ impl Checkpointer {
         let mut last_lsn = floor;
         for key in &keys {
             // Key is wal/<20-digit first lsn>.seg
-            let Some(digits) = key.strip_prefix("wal/").and_then(|k| k.strip_suffix(".seg"))
+            let Some(digits) = key
+                .strip_prefix("wal/")
+                .and_then(|k| k.strip_suffix(".seg"))
             else {
                 continue;
             };
@@ -628,7 +653,7 @@ impl Checkpointer {
                     Err(e) => {
                         return Err(CheckpointSetupError::ObjectStore(format!(
                             "get wal segment: {e}"
-                        )))
+                        )));
                     }
                 }
                 let body = self.client.body_bytes();
@@ -696,7 +721,9 @@ impl Checkpointer {
             if key.as_str() == max_key.as_str() {
                 continue;
             }
-            self.client.delete(key.as_str()).map_err(object_store_to_sql)?;
+            self.client
+                .delete(key.as_str())
+                .map_err(object_store_to_sql)?;
         }
         if overflow {
             eprintln!("pos3ql: wal segments exceed one sweep; continuing next checkpoint");
@@ -716,7 +743,7 @@ impl Checkpointer {
             Err(e) => {
                 return Err(CheckpointSetupError::ObjectStore(format!(
                     "load manifest: {e}"
-                )))
+                )));
             }
         }
         let text = core::str::from_utf8(self.client.body_bytes())
@@ -992,9 +1019,15 @@ impl Checkpointer {
                     let mindex: usize = parse_field(words.next(), "bsst table")?;
                     let count: u64 = parse_field(words.next(), "bsst count")?;
                     let crc: u32 = parse_field(words.next(), "bsst crc")?;
-                    let index = words.next().ok_or(CheckpointSetupError::Corrupt("bsst index"))?;
-                    let filter = words.next().ok_or(CheckpointSetupError::Corrupt("bsst filter"))?;
-                    let roster = words.next().ok_or(CheckpointSetupError::Corrupt("bsst roster"))?;
+                    let index = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("bsst index"))?;
+                    let filter = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("bsst filter"))?;
+                    let roster = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("bsst roster"))?;
                     let handle = if index == "-" {
                         None
                     } else {
@@ -1012,9 +1045,15 @@ impl Checkpointer {
                     let idx: usize = parse_field(words.next(), "dsst list index")?;
                     let count: u64 = parse_field(words.next(), "dsst count")?;
                     let crc: u32 = parse_field(words.next(), "dsst crc")?;
-                    let index = words.next().ok_or(CheckpointSetupError::Corrupt("dsst index"))?;
-                    let filter = words.next().ok_or(CheckpointSetupError::Corrupt("dsst filter"))?;
-                    let roster = words.next().ok_or(CheckpointSetupError::Corrupt("dsst roster"))?;
+                    let index = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("dsst index"))?;
+                    let filter = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("dsst filter"))?;
+                    let roster = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("dsst roster"))?;
                     let handle = if index == "-" {
                         None
                     } else {
@@ -1070,12 +1109,15 @@ impl Checkpointer {
                     let is_called: u8 = parse_field(words.next(), "sq2 is_called")?;
                     let read_link = |words: &mut core::str::Split<'_, char>,
                                      label: &'static str|
-                     -> Result<Option<crate::storage::SequenceOwner>, CheckpointSetupError> {
-                        let read_owner = |word: Option<&str>, what: &'static str| {
-                            match word.ok_or(CheckpointSetupError::Corrupt(what))? {
-                                "0" => Ok(String::new()),
-                                hex => decode_hex_name(hex),
-                            }
+                     -> Result<
+                        Option<crate::storage::SequenceOwner>,
+                        CheckpointSetupError,
+                    > {
+                        let read_owner = |word: Option<&str>, what: &'static str| match word
+                            .ok_or(CheckpointSetupError::Corrupt(what))?
+                        {
+                            "0" => Ok(String::new()),
+                            hex => decode_hex_name(hex),
                         };
                         let owner_schema = read_owner(words.next(), label)?;
                         let owner_table = read_owner(words.next(), label)?;
@@ -1138,7 +1180,9 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
-                    let hexstr = |w: Option<&str>, what: &'static str| -> Result<String, CheckpointSetupError> {
+                    let hexstr = |w: Option<&str>,
+                                  what: &'static str|
+                     -> Result<String, CheckpointSetupError> {
                         match w.ok_or(CheckpointSetupError::Corrupt(what))? {
                             "0" => Ok(String::new()),
                             h => decode_hex_name(h),
@@ -1200,7 +1244,9 @@ impl Checkpointer {
                 }
                 Some("enm") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
-                    let hexstr = |w: Option<&str>, what: &'static str| -> Result<String, CheckpointSetupError> {
+                    let hexstr = |w: Option<&str>,
+                                  what: &'static str|
+                     -> Result<String, CheckpointSetupError> {
                         match w.ok_or(CheckpointSetupError::Corrupt(what))? {
                             "0" => Ok(String::new()),
                             h => decode_hex_name(h),
@@ -1328,11 +1374,14 @@ impl Checkpointer {
         }
 
         for (key, mindex, count, bytes, crc) in &ssts {
-            let slot = slot_of
-                .get(*mindex)
-                .copied()
-                .flatten()
-                .ok_or(CheckpointSetupError::Corrupt("sst references unknown table"))?;
+            let slot =
+                slot_of
+                    .get(*mindex)
+                    .copied()
+                    .flatten()
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "sst references unknown table",
+                    ))?;
             self.rehydrate_sst(storage, key, slot, *count, *bytes, *crc)?;
             // An old whole-object SST loads but is not carried forward: the
             // next checkpoint rewrites the table as a block SST, after which
@@ -1349,18 +1398,23 @@ impl Checkpointer {
         // remove — the same shadowing the deltas were written under.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
         for (mindex, idx, count, crc, handle) in &bssts {
-            let slot = slot_of
-                .get(*mindex)
-                .copied()
-                .flatten()
-                .ok_or(CheckpointSetupError::Corrupt("dsst references unknown table"))?;
+            let slot =
+                slot_of
+                    .get(*mindex)
+                    .copied()
+                    .flatten()
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "dsst references unknown table",
+                    ))?;
             if self.prev_ssts.len() <= slot {
                 self.prev_ssts.resize(slot + 1, SlotList::EMPTY);
             }
             let expect = self.prev_ssts[slot].n;
             if let Some(handle) = handle {
                 if *idx != expect {
-                    return Err(CheckpointSetupError::Corrupt("dsst list index out of order"));
+                    return Err(CheckpointSetupError::Corrupt(
+                        "dsst list index out of order",
+                    ));
                 }
                 self.rehydrate_block_sst(storage, slot, *idx as u8, *count, handle)?;
                 if !self.prev_ssts[slot].push(PrevSst {
@@ -1383,23 +1437,27 @@ impl Checkpointer {
                     n += 1;
                 }
                 let handles: [SstHandle; crate::storage::MAX_SPILL_SSTS] =
-                    core::array::from_fn(|i| handles[i].unwrap_or(list.ssts[0].expect("non-empty").handle));
+                    core::array::from_fn(|i| {
+                        handles[i].unwrap_or(list.ssts[0].expect("non-empty").handle)
+                    });
                 storage.set_spill_list(slot, &handles[..n]);
             }
         }
 
         storage
             .rebind_all_stored_query_dependencies()
-            .map_err(|error| CheckpointSetupError::ObjectStore(format!(
-                "manifest stored-query dependency rejected: {}",
-                error.message.as_str()
-            )))?;
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest stored-query dependency rejected: {}",
+                    error.message.as_str()
+                ))
+            })?;
         storage.set_lsn(lsn);
         if next_rowid > 0 {
             storage.observe_rowid(next_rowid - 1);
         }
         self.manifest_lsn = lsn;
-Ok(lsn)
+        Ok(lsn)
     }
 
     /// Rehydrates one block-grid SST in list order: rows install *spilled*
@@ -1442,13 +1500,16 @@ Ok(lsn)
         if block_count == 0 {
             return Err(CheckpointSetupError::Corrupt("sst index names no blocks"));
         }
-        let last_id =
-            crate::store::locate_data_block(&mut *blocks, &handle.index, index_buf, block_count - 1)
-                .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?
-                .ok_or(CheckpointSetupError::Corrupt("sst index names no blocks"))?;
-        let data_len =
-            crate::store::read_data_block(&mut *blocks, &last_id, data_buf, index_buf)
-                .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
+        let last_id = crate::store::locate_data_block(
+            &mut *blocks,
+            &handle.index,
+            index_buf,
+            block_count - 1,
+        )
+        .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?
+        .ok_or(CheckpointSetupError::Corrupt("sst index names no blocks"))?;
+        let data_len = crate::store::read_data_block(&mut *blocks, &last_id, data_buf, index_buf)
+            .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
         let mut at = 0usize;
         let mut max_rowid: Option<u64> = None;
         while let Some((rowid, _, _, next)) = crate::store::block_keys_at(&data_buf[..data_len], at)
@@ -1516,13 +1577,9 @@ Ok(lsn)
                 }
                 let row = &data[SST_ENTRY_HEADER..SST_ENTRY_HEADER + len];
                 crc.update(&data[..SST_ENTRY_HEADER + len]);
-                let (loc, slice) = storage
-                    .heap
-                    .append(len)
-                    .map_err(|e| CheckpointSetupError::ObjectStore(format!(
-                        "rehydrate: {}",
-                        e.message.as_str()
-                    )))?;
+                let (loc, slice) = storage.heap.append(len).map_err(|e| {
+                    CheckpointSetupError::ObjectStore(format!("rehydrate: {}", e.message.as_str()))
+                })?;
                 slice.copy_from_slice(row);
                 storage.observe_rowid(rowid);
                 storage
@@ -1588,6 +1645,18 @@ Ok(lsn)
         storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
+        if storage.has_active_snapshots() && (self.merge_job.is_some() || self.merge_done.is_some())
+        {
+            // A snapshot may begin between merge beats. The unpublished
+            // output is an orphan, so abandon it before it can replace the
+            // immutable generations that historical readers still reference.
+            self.merge_job = None;
+            self.merge_done = None;
+            self.merge_writer.reset();
+            self.merge_scratch.clear();
+            self.pending_installs
+                .retain(|(_, install)| !matches!(install, SlotInstall::MergePair { .. }));
+        }
         // Merge beats interleave with sweep work — alternating when both
         // want the engine, so a hot sweep cannot starve compaction and a
         // long merge cannot starve publishes. A finished merge makes a
@@ -1621,12 +1690,12 @@ Ok(lsn)
             self.build_table_list(storage, sort_scratch, slot)?;
             self.sliced_generation[slot] = generation;
             self.sliced_this_sweep[slot] = true;
-return Ok(CheckpointStep::Working);
+            return Ok(CheckpointStep::Working);
         }
         let lsn = storage.lsn();
-self.publish(storage, lsn)?;
+        self.publish(storage, lsn)?;
         self.sweeping = false;
-Ok(CheckpointStep::Published { lsn })
+        Ok(CheckpointStep::Published { lsn })
     }
 
     /// Whether `slot` still needs a slice this sweep: it changed since its
@@ -1946,7 +2015,11 @@ Ok(CheckpointStep::Published { lsn })
                 self.prev_scratch[slot] =
                     self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
             }
-            let mut new_list = self.prev_scratch.get(slot).copied().unwrap_or(SlotList::EMPTY);
+            let mut new_list = self
+                .prev_scratch
+                .get(slot)
+                .copied()
+                .unwrap_or(SlotList::EMPTY);
             // A merge finished since the last publish composes here: its
             // pair still present at its position (a delta only appends at
             // the tail, so positions are stable under it) means the merged
@@ -2003,7 +2076,10 @@ Ok(CheckpointStep::Published { lsn })
             if new_list.n == 0 {
                 // An empty table still records its (zero-row) state so the
                 // loader creates it.
-                write_manifest(&mut self.manifest_buf, format_args!("dsst {slot} 0 0 0 - - -"))?;
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!("dsst {slot} 0 0 0 - - -"),
+                )?;
             }
         }
         // Views: `vw2 <hex-SELECT> <hex-schema> <hex-creation-path> <hex-name>`
@@ -2269,9 +2345,7 @@ Ok(CheckpointStep::Published { lsn })
             match install {
                 SlotInstall::Append(h) => storage.append_spill(slot, h),
                 SlotInstall::Collapse(h) => storage.collapse_spill(slot, h),
-                SlotInstall::MergePair { at, handle } => {
-                    storage.merge_spill_pair(slot, at, handle)
-                }
+                SlotInstall::MergePair { at, handle } => storage.merge_spill_pair(slot, at, handle),
             }
             storage.clear_tombstones(slot);
         }
@@ -2324,125 +2398,148 @@ Ok(CheckpointStep::Published { lsn })
         slot: usize,
     ) -> Result<(), SqlError> {
         self.pending_installs.retain(|(s, _)| *s != slot);
-            // A clean table carries its whole SST list forward untouched.
-            let clean = !storage.table(slot).dirty
-                && self.prev_ssts.get(slot).is_some_and(|l| l.n > 0);
-            // A dirty table with spilled SSTs and room flushes a *delta*:
-            // its heap-resident committed rows plus the tombstones recorded
-            // since the last checkpoint. Otherwise it rewrites fully.
-            let delta = !clean && storage.delta_eligible(slot) && storage.table(slot).dirty;
+        // A clean table carries its whole SST list forward untouched.
+        let clean = !storage.table(slot).dirty && self.prev_ssts.get(slot).is_some_and(|l| l.n > 0);
+        // A dirty table with spilled SSTs and room flushes a *delta*:
+        // its heap-resident committed rows plus the tombstones recorded
+        // since the last checkpoint. Otherwise it rewrites fully.
+        let delta = !clean && storage.delta_eligible(slot) && storage.table(slot).dirty;
+        if storage.has_active_snapshots()
+            && !clean
+            && storage.table(slot).n_spill_ssts > 0
+            && !delta
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "historical snapshot pins a full SST generation list for table \"{}\"",
+                storage.table(slot).def.name.as_str()
+            ));
+        }
 
-            let new_list: SlotList = if clean {
-                self.prev_ssts[slot]
-            } else {
-                // Collect the rows this SST will hold.
-                sort_scratch.clear();
-                storage.for_each_row_state(slot, &mut |rowid, state| {
-                    use core::ops::ControlFlow;
-                    let Some(home) = state.committed else {
-                        return Ok(ControlFlow::Continue(()));
-                    };
-                    if delta && !matches!(home, RowHome::Heap(_)) {
-                        // Already durable in an earlier list member.
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    sort_scratch.push((rowid, home)).map_err(|e| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "checkpoint scratch: {}", e)
-                    })?;
-                    Ok(ControlFlow::Continue(()))
+        let new_list: SlotList = if clean {
+            self.prev_ssts[slot]
+        } else {
+            // Collect the rows this SST will hold.
+            sort_scratch.clear();
+            storage.for_each_row_state(slot, &mut |rowid, state| {
+                use core::ops::ControlFlow;
+                let Some(home) = state.committed else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                if delta && !matches!(home, RowHome::Heap(_)) {
+                    // Already durable in an earlier list member.
+                    return Ok(ControlFlow::Continue(()));
+                }
+                sort_scratch.push((rowid, home)).map_err(|e| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "checkpoint scratch: {}",
+                        e
+                    )
                 })?;
-                sort_scratch.as_mut_slice().sort_unstable_by_key(|(rowid, _)| *rowid);
-                self.tomb_scratch.clear();
-                if delta {
-                    // Within the reserved capacity: MAX_TOMBSTONES entries.
-                    self.tomb_scratch.extend_from_slice(storage.tombstones(slot));
-                }
-                self.tomb_scratch.sort_unstable();
-                self.tomb_scratch.dedup();
-                let tomb_sorted = &self.tomb_scratch;
+                Ok(ControlFlow::Continue(()))
+            })?;
+            sort_scratch
+                .as_mut_slice()
+                .sort_unstable_by_key(|(rowid, _)| *rowid);
+            self.tomb_scratch.clear();
+            if delta {
+                // Within the reserved capacity: MAX_TOMBSTONES entries.
+                self.tomb_scratch
+                    .extend_from_slice(storage.tombstones(slot));
+            }
+            self.tomb_scratch.sort_unstable();
+            self.tomb_scratch.dedup();
+            let tomb_sorted = &self.tomb_scratch;
 
-                let count = (sort_scratch.len() + tomb_sorted.len()) as u64;
-                let mut crc = Crc32c::new();
+            let count = (sort_scratch.len() + tomb_sorted.len()) as u64;
+            let mut crc = Crc32c::new();
+            for &(rowid, home) in sort_scratch.iter() {
+                storage.with_row_bytes(slot, rowid, home, |row| {
+                    let mut header = [0u8; SST_ENTRY_HEADER];
+                    header[0..8].copy_from_slice(&rowid.to_le_bytes());
+                    header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
+                    crc.update(&header);
+                    crc.update(row);
+                    Ok(())
+                })?;
+            }
+            for &t in tomb_sorted.iter() {
+                crc.update(&t.to_le_bytes());
+            }
+            let crc = crc.finish();
+
+            let handle = if count == 0 {
+                None
+            } else {
+                // Rows and tombstones merge in rowid order into the block
+                // grid: sorted data blocks, sparse index, bloom filter,
+                // roster. A spilled row's bytes come back through the
+                // cache on the way into a full rewrite.
+                self.sst_arena.reset();
+                self.slice_writer.reset();
+                let writer = &mut self.slice_writer;
+                let blocks = &self.blocks;
+                let mut ti = 0usize;
                 for &(rowid, home) in sort_scratch.iter() {
-                    storage.with_row_bytes(slot, rowid, home, |row| {
-                        let mut header = [0u8; SST_ENTRY_HEADER];
-                        header[0..8].copy_from_slice(&rowid.to_le_bytes());
-                        header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
-                        crc.update(&header);
-                        crc.update(row);
-                        Ok(())
-                    })?;
-                }
-                for &t in tomb_sorted.iter() {
-                    crc.update(&t.to_le_bytes());
-                }
-                let crc = crc.finish();
-
-                let handle = if count == 0 {
-                    None
-                } else {
-                    // Rows and tombstones merge in rowid order into the block
-                    // grid: sorted data blocks, sparse index, bloom filter,
-                    // roster. A spilled row's bytes come back through the
-                    // cache on the way into a full rewrite.
-                    self.sst_arena.reset();
-                    self.slice_writer.reset();
-                    let writer = &mut self.slice_writer;
-                    let blocks = &self.blocks;
-                    let mut ti = 0usize;
-                    for &(rowid, home) in sort_scratch.iter() {
-                        while ti < tomb_sorted.len() && tomb_sorted[ti] < rowid {
-                            writer
-                                .append_tombstone(&mut *blocks.borrow_mut(), tomb_sorted[ti])
-                                .map_err(sst_to_sql)?;
-                            ti += 1;
-                        }
-                        storage.with_row_bytes(slot, rowid, home, |row| {
-                            writer
-                                .append(&mut *blocks.borrow_mut(), rowid, row)
-                                .map_err(sst_to_sql)
-                        })?;
-                    }
-                    while ti < tomb_sorted.len() {
+                    while ti < tomb_sorted.len() && tomb_sorted[ti] < rowid {
                         writer
                             .append_tombstone(&mut *blocks.borrow_mut(), tomb_sorted[ti])
                             .map_err(sst_to_sql)?;
                         ti += 1;
                     }
-                    writer.finish(&mut *blocks.borrow_mut()).map_err(sst_to_sql)?
-                };
-
-                // Storage is not touched yet: the list installs (and the
-                // entry remap a collapse implies) apply only after the
-                // manifest CAS lands, so a failed publish leaves memory
-                // consistent with the still-current manifest.
-                match (delta, handle) {
-                    (true, Some(h)) => {
-                        let mut list =
-                            self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
-                        if !list.push(PrevSst { handle: h, count, crc }) {
-                            return Err(sql_err!(
-                                SQLSTATE_IO,
-                                "delta flush into a full spill list"
-                            ));
-                        }
-                        self.pending_installs.push((slot, SlotInstall::Append(h)));
-                        list
-                    }
-                    (true, None) => {
-                        // Dirty but nothing new to flush (e.g. the change was
-                        // rolled back): the list stands.
-                        self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY)
-                    }
-                    (false, Some(h)) => {
-                        self.pending_installs.push((slot, SlotInstall::Collapse(h)));
-                        let mut list = SlotList::EMPTY;
-                        let _ = list.push(PrevSst { handle: h, count, crc });
-                        list
-                    }
-                    (false, None) => SlotList::EMPTY,
+                    storage.with_row_bytes(slot, rowid, home, |row| {
+                        writer
+                            .append(&mut *blocks.borrow_mut(), rowid, row)
+                            .map_err(sst_to_sql)
+                    })?;
                 }
+                while ti < tomb_sorted.len() {
+                    writer
+                        .append_tombstone(&mut *blocks.borrow_mut(), tomb_sorted[ti])
+                        .map_err(sst_to_sql)?;
+                    ti += 1;
+                }
+                writer
+                    .finish(&mut *blocks.borrow_mut())
+                    .map_err(sst_to_sql)?
             };
+
+            // Storage is not touched yet: the list installs (and the
+            // entry remap a collapse implies) apply only after the
+            // manifest CAS lands, so a failed publish leaves memory
+            // consistent with the still-current manifest.
+            match (delta, handle) {
+                (true, Some(h)) => {
+                    let mut list = self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
+                    if !list.push(PrevSst {
+                        handle: h,
+                        count,
+                        crc,
+                    }) {
+                        return Err(sql_err!(SQLSTATE_IO, "delta flush into a full spill list"));
+                    }
+                    self.pending_installs.push((slot, SlotInstall::Append(h)));
+                    list
+                }
+                (true, None) => {
+                    // Dirty but nothing new to flush (e.g. the change was
+                    // rolled back): the list stands.
+                    self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY)
+                }
+                (false, Some(h)) => {
+                    self.pending_installs.push((slot, SlotInstall::Collapse(h)));
+                    let mut list = SlotList::EMPTY;
+                    let _ = list.push(PrevSst {
+                        handle: h,
+                        count,
+                        crc,
+                    });
+                    list
+                }
+                (false, None) => SlotList::EMPTY,
+            }
+        };
 
         if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
             self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
@@ -2492,7 +2589,10 @@ Ok(CheckpointStep::Published { lsn })
                 .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
             for id_bytes in scratch[..n].chunks(32) {
                 if id_bytes.len() != 32 {
-                    return Err(sql_err!(SQLSTATE_IO, "gc roster is not a multiple of 32 bytes"));
+                    return Err(sql_err!(
+                        SQLSTATE_IO,
+                        "gc roster is not a multiple of 32 bytes"
+                    ));
                 }
                 if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
                     eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
@@ -2524,7 +2624,9 @@ Ok(CheckpointStep::Published { lsn })
             .map_err(object_store_to_sql)?;
         for i in 0..self.doomed_blocks.len() {
             let key = self.doomed_blocks[i];
-            self.client.delete(key.as_str()).map_err(object_store_to_sql)?;
+            self.client
+                .delete(key.as_str())
+                .map_err(object_store_to_sql)?;
         }
         if overflow {
             eprintln!("pos3ql: block garbage exceeds one sweep; continuing next checkpoint");
@@ -2552,7 +2654,9 @@ Ok(CheckpointStep::Published { lsn })
             .map_err(object_store_to_sql)?;
         for i in 0..self.doomed_scratch.len() {
             let key = self.doomed_scratch[i];
-            self.client.delete(key.as_str()).map_err(object_store_to_sql)?;
+            self.client
+                .delete(key.as_str())
+                .map_err(object_store_to_sql)?;
         }
         if overflow {
             eprintln!("pos3ql: sst garbage exceeds one sweep; continuing next checkpoint");
@@ -2564,13 +2668,17 @@ Ok(CheckpointStep::Published { lsn })
 fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
     let bytes = hex.as_bytes();
     if bytes.len() != 64 {
-        return Err(CheckpointSetupError::Corrupt("block id is not 64 hex chars"));
+        return Err(CheckpointSetupError::Corrupt(
+            "block id is not 64 hex chars",
+        ));
     }
     let nibble = |b: u8| -> Result<u8, CheckpointSetupError> {
         match b {
             b'0'..=b'9' => Ok(b - b'0'),
             b'a'..=b'f' => Ok(b - b'a' + 10),
-            _ => Err(CheckpointSetupError::Corrupt("block id is not lowercase hex")),
+            _ => Err(CheckpointSetupError::Corrupt(
+                "block id is not lowercase hex",
+            )),
         }
     };
     let mut id = [0u8; 32];
@@ -2912,23 +3020,22 @@ fn parse_stored_query_dependencies(
 ) -> Result<crate::storage::StoredQueryDependencies, CheckpointSetupError> {
     let count: usize = parse_field(words.next(), "stored-query dependency count")?;
     if count > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
-        return Err(CheckpointSetupError::Corrupt("too many stored-query dependencies"));
+        return Err(CheckpointSetupError::Corrupt(
+            "too many stored-query dependencies",
+        ));
     }
     let mut dependencies = crate::storage::StoredQueryDependencies::EMPTY;
     for _ in 0..count {
         let code: u8 = parse_field(words.next(), "stored-query dependency class")?;
-        let class = crate::storage::DependencyClass::from_code(code)
-            .ok_or(CheckpointSetupError::Corrupt("unknown stored-query dependency class"))?;
-        let schema = decode_hex_name(
-            words.next().ok_or(CheckpointSetupError::Corrupt(
-                "stored-query dependency schema missing",
-            ))?,
+        let class = crate::storage::DependencyClass::from_code(code).ok_or(
+            CheckpointSetupError::Corrupt("unknown stored-query dependency class"),
         )?;
-        let name = decode_hex_name(
-            words.next().ok_or(CheckpointSetupError::Corrupt(
-                "stored-query dependency name missing",
-            ))?,
-        )?;
+        let schema = decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
+            "stored-query dependency schema missing",
+        ))?)?;
+        let name = decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
+            "stored-query dependency name missing",
+        ))?)?;
         let (referenced_schema, referenced_name) = if has_referenced_names {
             (
                 decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
@@ -2941,13 +3048,15 @@ fn parse_stored_query_dependencies(
         } else {
             (schema.clone(), name.clone())
         };
-        dependencies.serialized_push(
-            class,
-            sql_name(&schema)?,
-            sql_name(&name)?,
-            sql_name(&referenced_schema)?,
-            sql_name(&referenced_name)?,
-        ).map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
+        dependencies
+            .serialized_push(
+                class,
+                sql_name(&schema)?,
+                sql_name(&name)?,
+                sql_name(&referenced_schema)?,
+                sql_name(&referenced_name)?,
+            )
+            .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
     Ok(dependencies)
 }
@@ -2997,8 +3106,7 @@ fn default_from_hex(hex: &str) -> Result<Option<OwnedDatum>, CheckpointSetupErro
     let mut bytes = [0u8; 128];
     let n = hex.len() / 2;
     for i in 0..n {
-        bytes[i] =
-            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| corrupt())?;
+        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| corrupt())?;
     }
     let mut at = 0usize;
     let d = crate::wal::decode_default(&bytes[..n], &mut at).ok_or_else(corrupt)?;

@@ -11,26 +11,26 @@ use super::ast::{BinaryOp, Expr, UnaryOp};
 use super::numeric::Numeric;
 use super::types::{ColType, Datum};
 
-pub mod funcs;
 mod cast;
+pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
     cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_uuid, validate_bits,
 };
 
-mod operators;
 mod args;
+mod operators;
 pub(crate) use args::*;
 
 mod pattern;
-pub use pattern::{like_match, regex_split_pub, regexp_flags};
 pub(crate) use pattern::regex_split;
+pub use pattern::{like_match, regex_split_pub, regexp_flags};
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
-pub use operators::{compare_datums, hash_key};
-pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
 pub(crate) use operators::arithmetic;
+pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
 use operators::{binary, coerce_unknown, logic, membership_eq, range_mismatch, unary};
+pub use operators::{compare_datums, hash_key};
 
 /// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
 /// constructed at ~60 sites and stays two fields; the rare errors that carry
@@ -137,6 +137,7 @@ pub mod sqlstate {
     pub const IO_ERROR: &str = "58030";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
+    pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
     pub const AMBIGUOUS_COLUMN: &str = "42702";
     pub const AMBIGUOUS_FUNCTION: &str = "42725";
     pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
@@ -168,8 +169,16 @@ pub mod sqlstate {
 /// are one key. False whenever either side is not a column or the lookup
 /// cannot resolve identities.
 fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> bool {
-    let (Expr::Column { qualifier: qa, name: na }, Expr::Column { qualifier: qb, name: nb }) =
-        (a, b)
+    let (
+        Expr::Column {
+            qualifier: qa,
+            name: na,
+        },
+        Expr::Column {
+            qualifier: qb,
+            name: nb,
+        },
+    ) = (a, b)
     else {
         return false;
     };
@@ -190,8 +199,6 @@ pub trait ColumnLookup<'a> {
     fn column_identity(&self, _qualifier: Option<&str>, _name: &str) -> Option<(u32, u32)> {
         None
     }
-
-
 
     /// The named table's row as record fields (name + type + value), or None
     /// for an outer-join null row. Used to build a `Datum::Record` for a
@@ -228,7 +235,11 @@ pub trait ColumnLookup<'a> {
     /// The domain type name a bare column was declared with, if any — so
     /// `pg_typeof(domain_col)` reports the domain rather than its base type.
     /// Defaults to none (an ordinary base-typed column).
-    fn column_domain(&self, _qualifier: Option<&str>, _name: &str) -> Option<crate::storage::SqlName> {
+    fn column_domain(
+        &self,
+        _qualifier: Option<&str>,
+        _name: &str,
+    ) -> Option<crate::storage::SqlName> {
         None
     }
 
@@ -360,8 +371,7 @@ pub trait CatalogAccess {
     ) -> Result<Option<&'a str>, SqlError>;
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
     /// this OID, or `None` if no such foreign-key constraint is known.
-    fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena)
-        -> Result<Option<&'a str>, SqlError>;
+    fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
     /// The relation name for an OID, for rendering `oid::regclass`.
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
     /// The OID of the relation named `name`, for `'relname'::regclass`.
@@ -458,7 +468,11 @@ pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     group: None,
     aggs: None,
     subs: None,
-    windows: None, catalog: None, srf_index: None, sequences: None };
+    windows: None,
+    catalog: None,
+    srf_index: None,
+    sequences: None,
+};
 
 pub fn eval<'a>(
     expression: &Expr<'a>,
@@ -502,14 +516,26 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         });
     }
     match expression {
-        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
-        | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. }
-        | Expr::WholeRow(_) | Expr::SchemaColumn { .. }
-        | Expr::Param(_) | Expr::DefaultMarker => Ok(None),
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BitLit(_)
+        | Expr::Column { .. }
+        | Expr::WholeRow(_)
+        | Expr::SchemaColumn { .. }
+        | Expr::Param(_)
+        | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
         // so the sibling's constant errors are never surfaced.
-        Expr::Binary { operator: BinaryOp::And, left, right } => {
+        Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+        } => {
             // FALSE settles AND; otherwise the result is known only when both
             // sides fold to TRUE (`TRUE AND TRUE` = TRUE).
             let l = fold_check(left, arena)?;
@@ -525,7 +551,11 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
                 _ => None,
             })
         }
-        Expr::Binary { operator: BinaryOp::Or, left, right } => {
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+        } => {
             // TRUE settles OR; otherwise the result is known only when both
             // sides fold to FALSE (`FALSE OR FALSE` = FALSE) — so a constant
             // OR of dead predicates lets a CASE arm drop.
@@ -545,12 +575,11 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         // NOT propagates a folded boolean, so `NOT (x AND FALSE)` simplifies to
         // TRUE — which lets a CASE truncate exactly as PostgreSQL's plan-time
         // simplification does.
-        Expr::Unary { operator: super::ast::UnaryOp::Not, operand } => {
-            Ok(fold_check(operand, arena)?.map(|b| !b))
-        }
-        Expr::Unary { operand, .. }
-        | Expr::Cast { operand, .. }
-        | Expr::IsNull { operand, .. } => {
+        Expr::Unary {
+            operator: super::ast::UnaryOp::Not,
+            operand,
+        } => Ok(fold_check(operand, arena)?.map(|b| !b)),
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
             fold_check(operand, arena)?;
             Ok(None)
         }
@@ -566,18 +595,30 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
-        Expr::Between { operand, low, high, .. } => {
+        Expr::Between {
+            operand, low, high, ..
+        } => {
             fold_check(operand, arena)?;
             fold_check(low, arena)?;
             fold_check(high, arena)?;
             Ok(None)
         }
-        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+        Expr::Like {
+            operand, pattern, ..
+        }
+        | Expr::Match {
+            operand, pattern, ..
+        } => {
             fold_check(operand, arena)?;
             fold_check(pattern, arena)?;
             Ok(None)
         }
-        Expr::Case { operand, whens, otherwise, .. } => {
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
             if let Some(o) = operand {
                 // Operand form (`CASE x WHEN v ...`): the WHENs are compared to
                 // x, not boolean conditions, so no arm is dropped by folding.
@@ -615,8 +656,9 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Ok(None),
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
+            Ok(None)
+        }
         Expr::Array(items) => {
             for e in *items {
                 fold_check(e, arena)?;
@@ -666,7 +708,10 @@ pub(crate) fn escape_char(d: Datum<'_>) -> Result<Option<char>, SqlError> {
     match (chars.next(), chars.next()) {
         (None, _) => Ok(None),
         (Some(c), None) => Ok(Some(c)),
-        _ => Err(sql_err!(sqlstate::INVALID_ESCAPE_SEQUENCE, "invalid escape string")),
+        _ => Err(sql_err!(
+            sqlstate::INVALID_ESCAPE_SEQUENCE,
+            "invalid escape string"
+        )),
     }
 }
 
@@ -732,7 +777,10 @@ pub fn eval_full<'a>(
         Expr::Float(v) => Ok(Datum::Float8(v)),
         Expr::NumericLit(s) => Ok(Datum::Numeric(Numeric::parse(s, arena)?)),
         Expr::Str(s) => Ok(Datum::Text(s)),
-        Expr::BitLit(s) => Ok(Datum::Bit { bits: s, varying: false }),
+        Expr::BitLit(s) => Ok(Datum::Bit {
+            bits: s,
+            varying: false,
+        }),
         Expr::Column { qualifier, name } => match row.lookup(qualifier, name) {
             Ok(v) => Ok(v),
             // A bare name that is not a column but names a FROM item is a
@@ -749,7 +797,11 @@ pub fn eval_full<'a>(
             }
             Err(e) => Err(e),
         },
-        Expr::SchemaColumn { schema, table, name } => {
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
             // A three-part reference resolves through a composed
             // `schema.table` qualifier: only an unaliased FROM entry whose
             // base table really lives in that schema answers to it, exactly
@@ -760,14 +812,13 @@ pub fn eval_full<'a>(
                 .map_err(|_| arena_full())?;
             row.lookup(Some(composed), name)
         }
-        Expr::Param(n) => params
-            .get(n as usize - 1)
-            .copied()
-            .ok_or_else(|| sql_err!(
+        Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
+            sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "there is no parameter ${}",
                 n
-            )),
+            )
+        }),
         Expr::Unary { operator, operand } => {
             // The prefix arithmetic operators compute exactly what their
             // functions do, so they run the same code rather than a second copy.
@@ -777,7 +828,11 @@ pub fn eval_full<'a>(
             let v = eval_full(operand, arena, params, row, hooks)?;
             unary(operator, v, arena)
         }
-        Expr::Binary { operator: BinaryOp::And, left, right } => {
+        Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+        } => {
             // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
             // scan qual in a cost order that is not fixed, so a FALSE operand
             // determines the result even when the *other* operand would error at
@@ -787,12 +842,20 @@ pub fn eval_full<'a>(
             // we get here, so anything that reaches this point is per-row.
             eval_logic_short_circuit(BinaryOp::And, left, right, arena, params, row, hooks)
         }
-        Expr::Binary { operator: BinaryOp::Or, left, right } => {
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+        } => {
             // Dual of AND: a definite TRUE on either side yields TRUE and
             // absorbs the sibling's runtime error (PostgreSQL's `x OR TRUE`).
             eval_logic_short_circuit(BinaryOp::Or, left, right, arena, params, row, hooks)
         }
-        Expr::Binary { operator, left, right } => {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+        } => {
             let l = eval_full(left, arena, params, row, hooks)?;
             let r = eval_full(right, arena, params, row, hooks)?;
             // `array || NULL` resolution depends on the NULL operand's static
@@ -814,7 +877,11 @@ pub fn eval_full<'a>(
             let (l, r) = coerce_enum_literal(l, r, l_unknown, r_unknown, hooks, arena)?;
             binary(operator, l, r, l_unknown, r_unknown, arena)
         }
-        Expr::Cast { operand, type_name, type_mod } => {
+        Expr::Cast {
+            operand,
+            type_name,
+            type_mod,
+        } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
             // `oid::regclass` displays as the relation name (needs catalog
             // access); other reg-type casts fall through to the generic path.
@@ -824,7 +891,13 @@ pub fn eval_full<'a>(
                 match v {
                     // `oid::regclass` renders as the relation name.
                     Datum::Int4(_) | Datum::Int8(_) => {
-                        let oid = if let Datum::Int8(x) = v { x as i32 } else if let Datum::Int4(x) = v { x } else { 0 };
+                        let oid = if let Datum::Int8(x) = v {
+                            x as i32
+                        } else if let Datum::Int4(x) = v {
+                            x
+                        } else {
+                            0
+                        };
                         if let Some(name) = cat.relname(oid, arena)? {
                             return Ok(Datum::Text(name));
                         }
@@ -933,7 +1006,14 @@ pub fn eval_full<'a>(
             }
             Ok(Datum::Bool(v.is_null() != negated))
         }
-        Expr::Call { name, args, star, distinct, over, .. } => {
+        Expr::Call {
+            name,
+            args,
+            star,
+            distinct,
+            over,
+            ..
+        } => {
             // A window-function call resolves to this row's precomputed value.
             if over.is_some()
                 && let Some((nodes, values)) = hooks.windows
@@ -959,7 +1039,11 @@ pub fn eval_full<'a>(
             }
             call(name, args, star, arena, params, row, hooks)
         }
-        Expr::InList { operand, list, negated } => {
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
             if v.is_null() {
                 return Ok(Datum::Null);
@@ -987,7 +1071,12 @@ pub fn eval_full<'a>(
                 Datum::Bool(negated)
             })
         }
-        Expr::Between { operand, low, high, negated } => {
+        Expr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
             let lo = eval_full(low, arena, params, row, hooks)?;
             let hi = eval_full(high, arena, params, row, hooks)?;
@@ -1000,7 +1089,13 @@ pub fn eval_full<'a>(
             let inside = compare_datums(&a, &lo)?.is_ge() && compare_datums(&a, &hi)?.is_le();
             Ok(Datum::Bool(inside != negated))
         }
-        Expr::Like { operand, pattern, negated, case_insensitive, escape } => {
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            escape,
+        } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
             let p = eval_full(pattern, arena, params, row, hooks)?;
             let escape = match escape {
@@ -1012,11 +1107,9 @@ pub fn eval_full<'a>(
             };
             match (v, p) {
                 (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
-                (
-                    Datum::Text(s) | Datum::Bpchar(s),
-                    Datum::Text(pat) | Datum::Bpchar(pat),
-                ) => {
-                    let matched = like_match(s, pat, case_insensitive, escape.unwrap_or(Some('\\')));
+                (Datum::Text(s) | Datum::Bpchar(s), Datum::Text(pat) | Datum::Bpchar(pat)) => {
+                    let matched =
+                        like_match(s, pat, case_insensitive, escape.unwrap_or(Some('\\')));
                     Ok(Datum::Bool(matched != negated))
                 }
                 (l, r) => Err(sql_err!(
@@ -1027,15 +1120,17 @@ pub fn eval_full<'a>(
                 )),
             }
         }
-        Expr::Match { operand, pattern, negated, case_insensitive } => {
+        Expr::Match {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
             let p = eval_full(pattern, arena, params, row, hooks)?;
             match (v, p) {
                 (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
-                (
-                    Datum::Text(s) | Datum::Bpchar(s),
-                    Datum::Text(pat) | Datum::Bpchar(pat),
-                ) => {
+                (Datum::Text(s) | Datum::Bpchar(s), Datum::Text(pat) | Datum::Bpchar(pat)) => {
                     let matched = super::regex::regex_search(pat, s, case_insensitive)?;
                     Ok(Datum::Bool(matched != negated))
                 }
@@ -1047,7 +1142,12 @@ pub fn eval_full<'a>(
                 )),
             }
         }
-        Expr::Case { operand, whens, otherwise, .. } => {
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
             let scrutinee = match operand {
                 Some(operator) => Some(eval_full(operator, arena, params, row, hooks)?),
                 None => None,
@@ -1108,7 +1208,9 @@ pub fn eval_full<'a>(
                 "subqueries are not allowed in this context (or are correlated)"
             ))
         }
-        Expr::InSubquery { operand, negated, .. } => {
+        Expr::InSubquery {
+            operand, negated, ..
+        } => {
             let Some(subs) = hooks.subs else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1137,7 +1239,8 @@ pub fn eval_full<'a>(
             // A bit string is comparable only to another bit string; reject a
             // bit-vs-other membership test up front (PostgreSQL type-checks the
             // operand against the column type even over an empty set).
-            if matches!(v, Datum::Bit { .. }) && !matches!(witness, Datum::Bit { .. } | Datum::Null) {
+            if matches!(v, Datum::Bit { .. }) && !matches!(witness, Datum::Bit { .. } | Datum::Null)
+            {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
                     "operator does not exist: bit = {}",
@@ -1165,7 +1268,11 @@ pub fn eval_full<'a>(
                     None => saw_null = true,
                 }
             }
-            Ok(if saw_null { Datum::Null } else { Datum::Bool(negated) })
+            Ok(if saw_null {
+                Datum::Null
+            } else {
+                Datum::Bool(negated)
+            })
         }
         Expr::Exists(_) => {
             // EXISTS results are pre-evaluated (uncorrelated) or evaluated per
@@ -1187,7 +1294,10 @@ pub fn eval_full<'a>(
             // Evaluate each element, unify to a common element type, build blob.
             let mut vals = [Datum::Null; 256];
             if items.len() > vals.len() {
-                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array constructor too large"));
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "array constructor too large"
+                ));
             }
             let mut element: Option<super::types::ArrElem> = None;
             for (i, e) in items.iter().enumerate() {
@@ -1210,7 +1320,10 @@ pub fn eval_full<'a>(
                     };
                 }
             }
-            Ok(Datum::Array { element, raw: super::array::build(&vals[..items.len()], arena)? })
+            Ok(Datum::Array {
+                element,
+                raw: super::array::build(&vals[..items.len()], arena)?,
+            })
         }
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
@@ -1228,7 +1341,36 @@ pub fn eval_full<'a>(
                     if index < 1 {
                         return Ok(Datum::Null);
                     }
-                    Ok(super::array::get(raw, element, (index - 1) as usize).unwrap_or(Datum::Null))
+                    Ok(
+                        super::array::get(raw, element, (index - 1) as usize)
+                            .unwrap_or(Datum::Null),
+                    )
+                }
+                Datum::Text(value)
+                    if matches!(
+                        base,
+                        Expr::Column { qualifier, name }
+                            if row.col_type(*qualifier, name) == Some(ColType::Name)
+                    ) =>
+                {
+                    // PostgreSQL's fixed-width `name` type exposes its
+                    // underlying character array with zero-based subscripts.
+                    // SQL text remains non-subscriptable.
+                    if index < 0 {
+                        return Ok(Datum::Null);
+                    }
+                    match value.as_bytes().get(index as usize) {
+                        Some(byte) if byte.is_ascii() => {
+                            let character = arena.alloc_slice_copy(&[*byte]).map_err(|_| {
+                                sql_err!(sqlstate::OUT_OF_MEMORY, "statement arena exhausted")
+                            })?;
+                            Ok(Datum::Text(unsafe {
+                                core::str::from_utf8_unchecked(character)
+                            }))
+                        }
+                        Some(_) => Ok(Datum::Null),
+                        None => Ok(Datum::Null),
+                    }
                 }
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
@@ -1275,11 +1417,15 @@ pub fn eval_full<'a>(
             } else {
                 arena
                     .alloc_slice_with((hi - lo + 1) as usize, |i| {
-                        super::array::get(raw, element, (lo as usize - 1) + i).unwrap_or(Datum::Null)
+                        super::array::get(raw, element, (lo as usize - 1) + i)
+                            .unwrap_or(Datum::Null)
                     })
                     .map_err(|_| arena_full())?
             };
-            Ok(Datum::Array { element, raw: super::array::build(items, arena)? })
+            Ok(Datum::Array {
+                element,
+                raw: super::array::build(items, arena)?,
+            })
         }
         Expr::Field { base, field } => {
             // A `.*` that survived to a value position was not a top-level
@@ -1319,11 +1465,13 @@ pub fn eval_full<'a>(
                 }
             }
             let anonymous_source = match base {
-                Expr::Call { name, .. } => !(name.eq_ignore_ascii_case("row")
-                    || name.eq_ignore_ascii_case("json_each")
-                    || name.eq_ignore_ascii_case("jsonb_each")
-                    || name.eq_ignore_ascii_case("json_each_text")
-                    || name.eq_ignore_ascii_case("jsonb_each_text")),
+                Expr::Call { name, .. } => {
+                    !(name.eq_ignore_ascii_case("row")
+                        || name.eq_ignore_ascii_case("json_each")
+                        || name.eq_ignore_ascii_case("jsonb_each")
+                        || name.eq_ignore_ascii_case("json_each_text")
+                        || name.eq_ignore_ascii_case("jsonb_each_text"))
+                }
                 Expr::Case { .. } | Expr::Subquery(_) => true,
                 Expr::Field { .. } => matches!(
                     chain_root(base),
@@ -1338,23 +1486,29 @@ pub fn eval_full<'a>(
                 Datum::Null => Ok(Datum::Null),
                 // A record: select the field by name (records carry lowercase
                 // field names — `f1,f2,…` for ROW(), column names for a row).
-                Datum::Record(fields) => match fields.iter().find(|f| f.name.eq_ignore_ascii_case(field)) {
-                    Some(f) => Ok(f.value),
-                    None => Err(match base {
-                        Expr::WholeRow(table)
-                        | Expr::Column { qualifier: None, name: table } => sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column {}.{} does not exist",
-                            table,
-                            field
-                        ),
-                        _ => crate::sql::exec::could_not_identify(field),
-                    }),
-                },
+                Datum::Record(fields) => {
+                    match fields.iter().find(|f| f.name.eq_ignore_ascii_case(field)) {
+                        Some(f) => Ok(f.value),
+                        None => Err(match base {
+                            Expr::WholeRow(table)
+                            | Expr::Column {
+                                qualifier: None,
+                                name: table,
+                            } => sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column {}.{} does not exist",
+                                table,
+                                field
+                            ),
+                            _ => crate::sql::exec::could_not_identify(field),
+                        }),
+                    }
+                }
                 // The `_pg_expandarray` result is encoded as the 2-element array
                 // `[x, n]`; `.x`/`.f1` is the element and `.n`/`.f2` the ordinal.
                 Datum::Array { element, raw } => {
-                    let index = if field.eq_ignore_ascii_case("x") || field.eq_ignore_ascii_case("f1")
+                    let index = if field.eq_ignore_ascii_case("x")
+                        || field.eq_ignore_ascii_case("f1")
                     {
                         0
                     } else if field.eq_ignore_ascii_case("n") || field.eq_ignore_ascii_case("f2") {
@@ -1371,7 +1525,12 @@ pub fn eval_full<'a>(
                 _ => Err(crate::sql::exec::not_composite(field, type_name_of(&b))),
             }
         }
-        Expr::AnyAll { operand, operator, array, all } => {
+        Expr::AnyAll {
+            operand,
+            operator,
+            array,
+            all,
+        } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let array = eval_full(array, arena, params, row, hooks)?;
             let (element, raw) = match array {
@@ -1381,8 +1540,8 @@ pub fn eval_full<'a>(
                 // to an array of the left operand's element type, as PostgreSQL
                 // resolves it.
                 Datum::Text(s) => {
-                    let element =
-                        super::types::ArrElem::from_datum(&lhs).unwrap_or(super::types::ArrElem::Text);
+                    let element = super::types::ArrElem::from_datum(&lhs)
+                        .unwrap_or(super::types::ArrElem::Text);
                     let raw = super::array::parse_literal(s, element, arena)?;
                     (element, raw)
                 }
@@ -1427,11 +1586,7 @@ fn unify_arr_elem(a: super::types::ArrElem, b: super::types::ArrElem) -> super::
 /// `nosuchfunc(integer)`, not `nosuchfunc()`. The types are the static ones —
 /// an argument is never evaluated to build an error about a function that will
 /// not run — so an untyped literal is `unknown`, exactly as PostgreSQL has it.
-fn undefined_function<'a>(
-    name: &str,
-    args: &[&Expr<'a>],
-    row: &impl ColumnLookup<'a>,
-) -> SqlError {
+fn undefined_function<'a>(name: &str, args: &[&Expr<'a>], row: &impl ColumnLookup<'a>) -> SqlError {
     use core::fmt::Write as _;
     let mut list = StackStr::<256>::new();
     for (i, argument) in args.iter().enumerate() {
@@ -1512,7 +1667,8 @@ fn call<'a>(
     if let Some(result) = funcs::system::dispatch(name, args, star, arena, params, row, hooks) {
         return result;
     }
-    if let Some(result) = funcs::conditional::dispatch(name, args, star, arena, params, row, hooks) {
+    if let Some(result) = funcs::conditional::dispatch(name, args, star, arena, params, row, hooks)
+    {
         return result;
     }
     if let Some(result) = funcs::misc::dispatch(name, args, star, arena, params, row, hooks) {
@@ -1592,19 +1748,24 @@ fn call<'a>(
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("unnest requires an array", &a)),
             };
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
         }
         "generate_series" => {
             if !(2..=3).contains(&args.len()) {
                 return Err(arity_err(name, args.len()));
             }
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?
-                as i64;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })? as i64;
             let start = eval_full(args[0], arena, params, row, hooks)?;
             let stop = eval_full(args[1], arena, params, row, hooks)?;
             let step = if args.len() == 3 {
@@ -1637,7 +1798,8 @@ fn call<'a>(
                     "generate_series is supported for integer and timestamp arguments"
                 ));
             };
-            let stop_micros = timestamp_series_start(&cast_to(stop, kind.coltype(), arena)?).map(|(m, _)| m);
+            let stop_micros =
+                timestamp_series_start(&cast_to(stop, kind.coltype(), arena)?).map(|(m, _)| m);
             // The step is an interval — coerce a bare string literal, as
             // PostgreSQL's function resolution does.
             let Datum::Interval(step_iv) = cast_to(step, ColType::Interval, arena)? else {
@@ -1666,9 +1828,12 @@ fn call<'a>(
             if !(2..=3).contains(&args.len()) {
                 return Err(arity_err(name, args.len()));
             }
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             let (Some(string), Some(pattern)) = (
                 text_arg(name, args, 0, arena, params, row, hooks)?,
                 text_arg(name, args, 1, arena, params, row, hooks)?,
@@ -1726,13 +1891,19 @@ fn call<'a>(
         "_pg_expandarray" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
-            let (element, raw) = match a {
-                Datum::Array { element, raw } => (element, raw),
+            let k = hooks.srf_index.unwrap_or(1);
+            let x = match a {
+                Datum::Array { element, raw } => {
+                    super::array::get(raw, element, k - 1).unwrap_or(Datum::Null)
+                }
+                Datum::Int2Vector(raw) => raw
+                    .chunks_exact(2)
+                    .nth(k - 1)
+                    .map(|bytes| Datum::Int4(i16::from_le_bytes([bytes[0], bytes[1]]) as i32))
+                    .unwrap_or(Datum::Null),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("_pg_expandarray requires an array", &a)),
             };
-            let k = hooks.srf_index.unwrap_or(1);
-            let x = super::array::get(raw, element, k - 1).unwrap_or(Datum::Null);
             let comp = [x, Datum::Int4(k as i32)];
             Ok(Datum::Array {
                 element: super::types::ArrElem::Int4,
@@ -1762,9 +1933,12 @@ fn call<'a>(
                 false
             };
             let pieces = regex_split_pub(src, pat, case_insensitive, arena)?;
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             Ok(pieces.get(k - 1).copied().unwrap_or(Datum::Null))
         }
         // Set-returning `string_to_table(string, delimiter [, null_string])`:
@@ -1786,9 +1960,12 @@ fn call<'a>(
             };
             let mut pieces = [""; crate::sql::parser::MAX_LIST * 16];
             let n = split_pieces(source, delimiter, &mut pieces)?;
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             Ok(match pieces[..n].get(k - 1) {
                 Some(piece) if null_string == Some(*piece) => Datum::Null,
                 Some(piece) => Datum::Text(arena.alloc_str(piece).map_err(|_| arena_full())?),
@@ -1802,18 +1979,31 @@ fn call<'a>(
             let raw = match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Array { raw, .. } => raw,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("generate_subscripts requires an array", &other)),
+                other => {
+                    return Err(type_mismatch(
+                        "generate_subscripts requires an array",
+                        &other,
+                    ));
+                }
             };
             let dim = match eval_full(args[1], arena, params, row, hooks)? {
                 Datum::Int2(v) => v as i64,
                 Datum::Int4(v) => v as i64,
                 Datum::Int8(v) => v,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("generate_subscripts dim must be an integer", &other)),
+                other => {
+                    return Err(type_mismatch(
+                        "generate_subscripts dim must be an integer",
+                        &other,
+                    ));
+                }
             };
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             if dim == 1 && k <= super::array::len(raw) {
                 Ok(Datum::Int4(k as i32))
             } else {
@@ -1829,9 +2019,12 @@ fn call<'a>(
                 Datum::Null => return Ok(Datum::Null),
                 other => return Err(type_mismatch("object_keys requires an object", &other)),
             };
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             let kind = super::json::kind_of(text);
             if kind != super::json::Kind::Object {
                 return Err(super::json::object_keys_error(name, kind));
@@ -1841,15 +2034,23 @@ fn call<'a>(
                 let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
                     return Err(super::json::object_keys_error(name, kind));
                 };
-                return Ok(members.get(k - 1).map(|(key, _)| Datum::Text(key)).unwrap_or(Datum::Null));
+                return Ok(members
+                    .get(k - 1)
+                    .map(|(key, _)| Datum::Text(key))
+                    .unwrap_or(Datum::Null));
             }
             // json keys: original source order, duplicates kept.
             let members = super::json::object_members_source(text, arena)?;
-            Ok(members.get(k - 1).map(|(key, _)| Datum::Text(key)).unwrap_or(Datum::Null))
+            Ok(members
+                .get(k - 1)
+                .map(|(key, _)| Datum::Text(key))
+                .unwrap_or(Datum::Null))
         }
         // Set-returning `jsonb_array_elements` / `json_array_elements` yield each
         // array element as a json/jsonb row; the `_text` variants yield text.
-        "jsonb_array_elements" | "json_array_elements" | "jsonb_array_elements_text"
+        "jsonb_array_elements"
+        | "json_array_elements"
+        | "jsonb_array_elements_text"
         | "json_array_elements_text" => {
             arity(1)?;
             let jsonb = name.starts_with("jsonb");
@@ -1860,9 +2061,12 @@ fn call<'a>(
                 Datum::Null => return Ok(Datum::Null),
                 other => return Err(type_mismatch("array_elements requires an array", &other)),
             };
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             let kind = super::json::kind_of(text);
             if kind != super::json::Kind::Array {
                 return Err(super::json::array_elements_error(name, jsonb, kind));
@@ -1877,12 +2081,17 @@ fn call<'a>(
                 };
                 if as_text {
                     return Ok(match *element {
-                        super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                        super::json::Json::Str(s) => {
+                            Datum::Text(super::json::decode_string(s, arena)?)
+                        }
                         super::json::Json::Null => Datum::Null,
                         _ => Datum::Text(json_to_text(element, arena)?),
                     });
                 }
-                return Ok(Datum::Json { text: json_to_text(element, arena)?, jsonb });
+                return Ok(Datum::Json {
+                    text: json_to_text(element, arena)?,
+                    jsonb,
+                });
             }
             // json elements: verbatim source text (interior whitespace kept).
             let items = super::json::array_elements_source(text, arena)?;
@@ -1899,7 +2108,10 @@ fn call<'a>(
                     _ => Datum::Text(element),
                 });
             }
-            Ok(Datum::Json { text: element, jsonb })
+            Ok(Datum::Json {
+                text: element,
+                jsonb,
+            })
         }
         // Set-returning `json_each` / `jsonb_each[_text]` yield, for the current
         // expansion index k, the composite `(key, value)` of the k-th object
@@ -1920,12 +2132,20 @@ fn call<'a>(
                 Datum::Json { text, .. } => text,
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct a scalar")),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "cannot deconstruct a scalar"
+                    ));
+                }
             };
             let pairs = json_each_pairs(text, jsonb, as_text, arena)?;
-            let k = hooks
-                .srf_index
-                .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "set-returning function called where not allowed"))?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
             let Some((key, value)) = pairs.get(k - 1) else {
                 return Ok(Datum::Null);
             };
@@ -1979,11 +2199,7 @@ fn case_result_type<'a>(
     if let Some(e) = otherwise {
         consider(e);
     }
-    if mixed {
-        None
-    } else {
-        acc
-    }
+    if mixed { None } else { acc }
 }
 
 /// Numeric-tower unification (int4 < int8 < numeric < float8); same type
@@ -2015,19 +2231,43 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
     match e {
         Expr::Null | Expr::Param(_) => None,
         Expr::Bool(_) => Some(ColType::Bool),
-        Expr::Int(v) => Some(if i32::try_from(*v).is_ok() { ColType::Int4 } else { ColType::Int8 }),
+        Expr::Int(v) => Some(if i32::try_from(*v).is_ok() {
+            ColType::Int4
+        } else {
+            ColType::Int8
+        }),
         Expr::Float(_) => Some(ColType::Float8),
         Expr::NumericLit(_) => Some(ColType::Numeric),
         Expr::Str(_) => Some(ColType::Text),
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
         Expr::SchemaColumn { table, name, .. } => row.col_type(Some(table), name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
-        Expr::Unary { operator: UnaryOp::Neg, operand } => static_type(operand, row),
-        Expr::Unary { operator: UnaryOp::Not, .. } | Expr::IsNull { .. }
-        | Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } | Expr::Match { .. } => Some(ColType::Bool),
-        Expr::Binary { operator, left, right } => match operator {
-            BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
-            | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or => Some(ColType::Bool),
+        Expr::Unary {
+            operator: UnaryOp::Neg,
+            operand,
+        } => static_type(operand, row),
+        Expr::Unary {
+            operator: UnaryOp::Not,
+            ..
+        }
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::Match { .. } => Some(ColType::Bool),
+        Expr::Binary {
+            operator,
+            left,
+            right,
+        } => match operator {
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::And
+            | BinaryOp::Or => Some(ColType::Bool),
             BinaryOp::Concat => Some(ColType::Text),
             _ => {
                 let l = static_type(left, row)?;
@@ -2035,7 +2275,9 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
                 unify_types(l, r)
             }
         },
-        Expr::Case { whens, otherwise, .. } => case_result_type(whens, otherwise, row),
+        Expr::Case {
+            whens, otherwise, ..
+        } => case_result_type(whens, otherwise, row),
         _ => None,
     }
 }
@@ -2103,7 +2345,10 @@ pub fn timestamp_series_count(
     step: super::types::Interval,
 ) -> Result<usize, SqlError> {
     if step.months == 0 && step.days == 0 && step.micros == 0 {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "step size cannot equal zero"
+        ));
     }
     let positive = interval_is_positive(step);
     let mut v = base;
@@ -2113,7 +2358,10 @@ pub fn timestamp_series_count(
         // A generous backstop against a pathologically large series; real limits
         // come from the row arena when the values are materialized.
         if n > 100_000_000 {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "generate_series produces too many rows"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "generate_series produces too many rows"
+            ));
         }
         v = super::datetime::add_interval(v, step);
     }
@@ -2166,12 +2414,23 @@ fn json_get<'a>(
             return Ok(Datum::Text(super::json::decode_string(s, arena)?));
         }
         let mut buffer = crate::util::StackStr::<8192>::new();
-        let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
-        return Ok(Datum::Text(arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?));
+        let _ = core::fmt::Write::write_fmt(
+            &mut buffer,
+            format_args!("{}", super::json::JsonWrite(&child)),
+        );
+        return Ok(Datum::Text(
+            arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+        ));
     }
     let mut buffer = crate::util::StackStr::<8192>::new();
-    let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{}", super::json::JsonWrite(&child)));
-    Ok(Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb })
+    let _ = core::fmt::Write::write_fmt(
+        &mut buffer,
+        format_args!("{}", super::json::JsonWrite(&child)),
+    );
+    Ok(Datum::Json {
+        text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+        jsonb,
+    })
 }
 
 /// Renders a `Json` value to canonical jsonb text in the arena.
@@ -2199,10 +2458,17 @@ fn load_array<'a>(
     let to_coltype = to.to_coltype();
     for i in 0..super::array::len(raw) {
         if n == items.len() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "array value too large"
+            ));
         }
         let el = super::array::get(raw, from, i).unwrap_or(Datum::Null);
-        items[n] = if el.is_null() || from == to { el } else { cast_to(el, to_coltype, arena)? };
+        items[n] = if el.is_null() || from == to {
+            el
+        } else {
+            cast_to(el, to_coltype, arena)?
+        };
         n += 1;
     }
     Ok(n)
@@ -2211,7 +2477,9 @@ fn load_array<'a>(
 fn json_to_text<'a>(v: &super::json::Json<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     // Render straight into the arena at exact length — a jsonb value can be
     // larger than any fixed scratch buffer, and truncating it would corrupt it.
-    arena.alloc_str_display(super::json::JsonWrite(v)).map_err(|_| arena_full())
+    arena
+        .alloc_str_display(super::json::JsonWrite(v))
+        .map_err(|_| arena_full())
 }
 
 /// [`json_to_text`] in the compact form a `json`-typed result carries.
@@ -2238,7 +2506,10 @@ pub fn record_star_expand<'a>(
 ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
     match eval_full(base, arena, params, row, hooks)? {
         Datum::Record(fields) => Ok(fields),
-        other => Err(type_mismatch("record expansion of a non-composite value", &other)),
+        other => Err(type_mismatch(
+            "record expansion of a non-composite value",
+            &other,
+        )),
     }
 }
 
@@ -2256,15 +2527,24 @@ pub fn json_each_pairs<'a>(
     match super::json::kind_of(text) {
         super::json::Kind::Object => {}
         super::json::Kind::Array => {
-            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct an array as an object"));
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot deconstruct an array as an object"
+            ));
         }
         super::json::Kind::Scalar => {
-            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct a scalar"));
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot deconstruct a scalar"
+            ));
         }
     }
     if jsonb {
         let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
-            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot deconstruct an array as an object"));
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot deconstruct an array as an object"
+            ));
         };
         let out = arena
             .alloc_slice_with(members.len(), |_| ("", Datum::Null))
@@ -2277,7 +2557,10 @@ pub fn json_each_pairs<'a>(
                     _ => Datum::Text(json_to_text(value, arena)?),
                 }
             } else {
-                Datum::Json { text: json_to_text(value, arena)?, jsonb: true }
+                Datum::Json {
+                    text: json_to_text(value, arena)?,
+                    jsonb: true,
+                }
             };
             *slot = (*key, datum);
         }
@@ -2296,7 +2579,10 @@ pub fn json_each_pairs<'a>(
                 _ => Datum::Text(value),
             }
         } else {
-            Datum::Json { text: value, jsonb: false }
+            Datum::Json {
+                text: value,
+                jsonb: false,
+            }
         };
         *slot = (*key, datum);
     }
@@ -2342,7 +2628,10 @@ fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             }
             let _ = core::fmt::Write::write_str(&mut buffer, "}");
             let owned = arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?;
-            return Ok(Datum::Json { text: json_to_text(&super::json::parse(owned, arena)?, arena)?, jsonb: true });
+            return Ok(Datum::Json {
+                text: json_to_text(&super::json::parse(owned, arena)?, arena)?,
+                jsonb: true,
+            });
         }
         (Json::Array(a), Json::Array(b)) => {
             let items = arena
@@ -2370,7 +2659,10 @@ fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             Json::Array(items)
         }
     };
-    Ok(Datum::Json { text: json_to_text(&merged, arena)?, jsonb: true })
+    Ok(Datum::Json {
+        text: json_to_text(&merged, arena)?,
+        jsonb: true,
+    })
 }
 
 /// `json #> path` / `#>>`: extract the value at a `text[]` path.
@@ -2387,16 +2679,26 @@ fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], 
     };
     let n = super::array::len(raw);
     if n > 64 {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON path too long"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "JSON path too long"
+        ));
     }
     let mut buffer = [""; 64];
     for (i, slot) in buffer[..n].iter_mut().enumerate() {
         *slot = match super::array::get(raw, element, i) {
             Some(Datum::Text(s)) => s,
-            _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "path element is not text")),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "path element is not text"
+                ));
+            }
         };
     }
-    Ok(&*arena.alloc_slice_copy(&buffer[..n]).map_err(|_| arena_full())?)
+    Ok(&*arena
+        .alloc_slice_copy(&buffer[..n])
+        .map_err(|_| arena_full())?)
 }
 
 /// `jsonb - text`/`text[]`/`integer`: delete a key, several keys, or an element.
@@ -2423,11 +2725,18 @@ fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
         }
         other => return Err(type_mismatch("- requires text, text[], or integer", &other)),
     };
-    Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+    Ok(Datum::Json {
+        text: json_to_text(&result, arena)?,
+        jsonb: true,
+    })
 }
 
 /// `jsonb #- text[]`: delete the value at a path.
-fn jsonb_delete_path<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn jsonb_delete_path<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let text = match l {
         Datum::Json { text, .. } => text,
         Datum::Null => return Ok(Datum::Null),
@@ -2439,7 +2748,10 @@ fn jsonb_delete_path<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result
     let root = super::json::parse(text, arena)?;
     let path = json_path_parts(r, arena)?;
     let result = super::json::delete_path(root, path, arena)?;
-    Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+    Ok(Datum::Json {
+        text: json_to_text(&result, arena)?,
+        jsonb: true,
+    })
 }
 
 /// Parses a json/jsonb argument (or unknown text literal) into a tree.
@@ -2498,7 +2810,10 @@ fn json_path<'a>(
         }
         return Ok(Datum::Text(json_to_text(&node, arena)?));
     }
-    Ok(Datum::Json { text: json_to_text(&node, arena)?, jsonb })
+    Ok(Datum::Json {
+        text: json_to_text(&node, arena)?,
+        jsonb,
+    })
 }
 
 /// `jsonb ? key` / `?|` / `?&`: key/element existence tests.
@@ -2520,7 +2835,9 @@ fn json_exists<'a>(
     let has = |key: &str| -> bool {
         match &node {
             Json::Object(members) => members.iter().any(|(k, _)| *k == key),
-            Json::Array(items) => items.iter().any(|it| matches!(it, Json::Str(s) if *s == key)),
+            Json::Array(items) => items
+                .iter()
+                .any(|it| matches!(it, Json::Str(s) if *s == key)),
             _ => false,
         }
     };
@@ -2588,18 +2905,14 @@ fn eval_logic_short_circuit<'a>(
     check_boolean_operand(right, row, context)?;
     match fold_check(left, arena)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
-        Some(_) => {
-            return boolean_argument(eval_full(right, arena, params, row, hooks)?, context)
-        }
+        Some(_) => return boolean_argument(eval_full(right, arena, params, row, hooks)?, context),
         None => {}
     }
     // Left is runtime; if the right statically folds to the absorbing value it
     // settles the result and drops the (possibly-erroring) left.
     match fold_check(right, arena)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
-        Some(_) => {
-            return boolean_argument(eval_full(left, arena, params, row, hooks)?, context)
-        }
+        Some(_) => return boolean_argument(eval_full(left, arena, params, row, hooks)?, context),
         None => {}
     }
     let l = boolean_argument(eval_full(left, arena, params, row, hooks)?, context)?;
@@ -2666,9 +2979,10 @@ fn concat<'a>(
     if let Some(element) = arr_elem {
         let coerce = |d: Datum<'a>, unknown: bool| -> Result<Datum<'a>, SqlError> {
             match d {
-                Datum::Text(s) if unknown => {
-                    Ok(Datum::Array { element, raw: super::array::parse_literal(s, element, arena)? })
-                }
+                Datum::Text(s) if unknown => Ok(Datum::Array {
+                    element,
+                    raw: super::array::parse_literal(s, element, arena)?,
+                }),
                 other => Ok(other),
             }
         };
@@ -2704,7 +3018,10 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             Datum::Array { raw, element: e } => {
                 for i in 0..super::array::len(raw) {
                     if n >= items.len() {
-                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array size exceeds the maximum allowed"));
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "array size exceeds the maximum allowed"
+                        ));
                     }
                     items[n] = super::array::get(raw, e, i).ok_or_else(|| {
                         sql_err!(sqlstate::INTERNAL_ERROR, "corrupt array element")
@@ -2714,16 +3031,21 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             }
             scalar => {
                 if n >= items.len() {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array size exceeds the maximum allowed"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "array size exceeds the maximum allowed"
+                    ));
                 }
                 items[n] = scalar;
                 n += 1;
             }
         }
     }
-    Ok(Datum::Array { element, raw: super::array::build(&items[..n], arena)? })
+    Ok(Datum::Array {
+        element,
+        raw: super::array::build(&items[..n], arena)?,
+    })
 }
-
 
 /// Converts a temporal datum to microseconds from the PostgreSQL epoch, as the
 /// symbolic-age functions need. A date is taken at midnight.
@@ -2799,9 +3121,15 @@ pub(crate) fn boolean_argument<'a>(v: Datum<'a>, context: &str) -> Result<Datum<
 fn parse_bool(s: &str) -> Result<bool, SqlError> {
     // Accepted spellings per PostgreSQL's boolean input, case-insensitive.
     let t = s.trim();
-    if ["t", "true", "yes", "on", "1"].iter().any(|w| t.eq_ignore_ascii_case(w)) {
+    if ["t", "true", "yes", "on", "1"]
+        .iter()
+        .any(|w| t.eq_ignore_ascii_case(w))
+    {
         Ok(true)
-    } else if ["f", "false", "no", "off", "0"].iter().any(|w| t.eq_ignore_ascii_case(w)) {
+    } else if ["f", "false", "no", "off", "0"]
+        .iter()
+        .any(|w| t.eq_ignore_ascii_case(w))
+    {
         Ok(false)
     } else {
         Err(bad_text(s, "boolean"))
@@ -2816,7 +3144,9 @@ fn to_numeric<'a>(d: &Datum, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> 
             weight: n.weight,
             dscale: n.dscale,
             // Re-alloc digit bytes into this arena scope.
-            digits: arena.alloc_slice_copy(n.digits).map_err(|_| overflow("numeric"))?,
+            digits: arena
+                .alloc_slice_copy(n.digits)
+                .map_err(|_| overflow("numeric"))?,
         }),
         Datum::Int2(x) => Numeric::from_i64(*x as i64, arena),
         Datum::Int4(x) => Numeric::from_i64(*x as i64, arena),
@@ -2958,7 +3288,10 @@ fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     {
         return Ok(Datum::Text(ct.name()));
     }
-    arena.alloc_str_display(o).map(Datum::Text).map_err(|_| arena_full())
+    arena
+        .alloc_str_display(o)
+        .map(Datum::Text)
+        .map_err(|_| arena_full())
 }
 
 /// `'typename'::regtype`: resolves a spelled type name — with any `(...)`
@@ -2981,7 +3314,11 @@ fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
         let _ = lowered.write_char(c.to_ascii_lowercase());
     }
     let unknown = || {
-        sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", spelled.trim())
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "type \"{}\" does not exist",
+            spelled.trim()
+        )
     };
     if lowered.is_truncated() {
         return Err(unknown());
@@ -3003,7 +3340,7 @@ fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
     let canonical = match collapsed.as_str() {
         // These spell types the engine models; render via the one name table.
         "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial" => {
-            return Err(unknown())
+            return Err(unknown());
         }
         "timestamp without time zone" | "timestamp" => "timestamp without time zone",
         "timestamp with time zone" | "timestamptz" => "timestamp with time zone",
@@ -3011,8 +3348,8 @@ fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
         "time with time zone" | "timetz" => "time with time zone",
         // Identifier/object types render as themselves.
         "oid" => "oid",
-        s @ ("regtype" | "regclass" | "regproc" | "regprocedure" | "regrole"
-        | "regnamespace" | "regoper" | "regoperator") => match s {
+        s @ ("regtype" | "regclass" | "regproc" | "regprocedure" | "regrole" | "regnamespace"
+        | "regoper" | "regoperator") => match s {
             "regtype" => "regtype",
             "regclass" => "regclass",
             "regproc" => "regproc",
@@ -3053,7 +3390,11 @@ fn coerce_enum_literal<'a>(
             _ => return Ok(text),
         };
         let cat = hooks.catalog.ok_or_else(|| {
-            sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid input value for enum: \"{}\"", label)
+            sql_err!(
+                sqlstate::INVALID_TEXT_REPRESENTATION,
+                "invalid input value for enum: \"{}\"",
+                label
+            )
         })?;
         let Some(sort) = cat.enum_label_sort(slot, label) else {
             return Err(sql_err!(
@@ -3062,7 +3403,11 @@ fn coerce_enum_literal<'a>(
                 label
             ));
         };
-        Ok(Datum::Enum { slot, sort, label: arena.alloc_str(label).map_err(|_| arena_full())? })
+        Ok(Datum::Enum {
+            slot,
+            sort,
+            label: arena.alloc_str(label).map_err(|_| arena_full())?,
+        })
     };
     match (l, r) {
         (Datum::Enum { slot, .. }, _) if r_unknown => Ok((l, resolve(slot, r)?)),
@@ -3074,6 +3419,7 @@ fn coerce_enum_literal<'a>(
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Array { element, .. } => element.array_name(),
+        Datum::Int2Vector(_) => "int2vector",
         Datum::Null => "unknown",
         Datum::Bool(_) => "boolean",
         Datum::Int2(_) => "smallint",
@@ -3196,15 +3542,17 @@ pub(crate) fn arena_full() -> SqlError {
 mod tests {
     use super::*;
     use crate::mem::Budget;
-    use crate::sql::parser::Parser;
     use crate::sql::ast::{SelectItem, Stmt};
+    use crate::sql::parser::Parser;
 
     fn eval_one<'a>(arena: &'a Arena, text: &'a str) -> Result<Datum<'a>, SqlError> {
         let mut p = Parser::new(text, arena).unwrap();
         let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
             panic!()
         };
-        let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
+        let SelectItem::Expr { expression, .. } = s.items[0] else {
+            panic!()
+        };
         eval(expression, arena, NO_PARAMS, &NoColumns)
     }
 
@@ -3226,7 +3574,10 @@ mod tests {
                 eval_one(a, "SELECT 7.0 / 2").unwrap().to_string(),
                 "3.5000000000000000"
             );
-            assert_eq!(eval_one(a, "SELECT 7.0::float8 / 2").unwrap(), Datum::Float8(3.5));
+            assert_eq!(
+                eval_one(a, "SELECT 7.0::float8 / 2").unwrap(),
+                Datum::Float8(3.5)
+            );
             assert_eq!(eval_one(a, "SELECT -(-5)").unwrap(), Datum::Int4(5));
             // int4 + int4 overflows like PostgreSQL (no silent widening);
             // int8 arithmetic carries the value.
@@ -3262,13 +3613,22 @@ mod tests {
     #[test]
     fn three_valued_logic() {
         with_arena(|a| {
-            assert_eq!(eval_one(a, "SELECT NULL AND FALSE").unwrap(), Datum::Bool(false));
+            assert_eq!(
+                eval_one(a, "SELECT NULL AND FALSE").unwrap(),
+                Datum::Bool(false)
+            );
             assert_eq!(eval_one(a, "SELECT NULL AND TRUE").unwrap(), Datum::Null);
-            assert_eq!(eval_one(a, "SELECT NULL OR TRUE").unwrap(), Datum::Bool(true));
+            assert_eq!(
+                eval_one(a, "SELECT NULL OR TRUE").unwrap(),
+                Datum::Bool(true)
+            );
             assert_eq!(eval_one(a, "SELECT NULL OR FALSE").unwrap(), Datum::Null);
             assert_eq!(eval_one(a, "SELECT NOT NULL::bool").unwrap(), Datum::Null);
             assert_eq!(eval_one(a, "SELECT 1 = NULL").unwrap(), Datum::Null);
-            assert_eq!(eval_one(a, "SELECT NULL IS NULL").unwrap(), Datum::Bool(true));
+            assert_eq!(
+                eval_one(a, "SELECT NULL IS NULL").unwrap(),
+                Datum::Bool(true)
+            );
         });
     }
 
@@ -3277,9 +3637,18 @@ mod tests {
         with_arena(|a| {
             assert_eq!(eval_one(a, "SELECT 1 < 2").unwrap(), Datum::Bool(true));
             assert_eq!(eval_one(a, "SELECT 2.5 >= 2").unwrap(), Datum::Bool(true));
-            assert_eq!(eval_one(a, "SELECT 'abc' < 'abd'").unwrap(), Datum::Bool(true));
-            assert_eq!(eval_one(a, "SELECT 'a' || 'b' || 'c'").unwrap(), Datum::Text("abc"));
-            assert_eq!(eval_one(a, "SELECT 'n=' || 42").unwrap(), Datum::Text("n=42"));
+            assert_eq!(
+                eval_one(a, "SELECT 'abc' < 'abd'").unwrap(),
+                Datum::Bool(true)
+            );
+            assert_eq!(
+                eval_one(a, "SELECT 'a' || 'b' || 'c'").unwrap(),
+                Datum::Text("abc")
+            );
+            assert_eq!(
+                eval_one(a, "SELECT 'n=' || 42").unwrap(),
+                Datum::Text("n=42")
+            );
             assert_eq!(eval_one(a, "SELECT 'x' || NULL").unwrap(), Datum::Null);
         });
     }
@@ -3290,9 +3659,15 @@ mod tests {
             assert_eq!(eval_one(a, "SELECT '42'::int").unwrap(), Datum::Int4(42));
             assert_eq!(eval_one(a, "SELECT 42::bigint").unwrap(), Datum::Int8(42));
             assert_eq!(eval_one(a, "SELECT 2.7::int").unwrap(), Datum::Int4(3));
-            assert_eq!(eval_one(a, "SELECT true::text").unwrap(), Datum::Text("true"));
+            assert_eq!(
+                eval_one(a, "SELECT true::text").unwrap(),
+                Datum::Text("true")
+            );
             assert_eq!(eval_one(a, "SELECT 'on'::bool").unwrap(), Datum::Bool(true));
-            assert_eq!(eval_one(a, "SELECT '2.5'::float8").unwrap(), Datum::Float8(2.5));
+            assert_eq!(
+                eval_one(a, "SELECT '2.5'::float8").unwrap(),
+                Datum::Float8(2.5)
+            );
             let err = eval_one(a, "SELECT 'zap'::int").unwrap_err();
             assert_eq!(err.sqlstate, "22P02");
             let err = eval_one(a, "SELECT 1::geometry").unwrap_err();

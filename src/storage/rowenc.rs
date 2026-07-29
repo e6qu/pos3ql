@@ -8,7 +8,7 @@
 //! text is `u32 len` + UTF-8 bytes. The same encoding will be written
 //! into SSTs, so it is versioned by the column count against the schema.
 
-use crate::sql::eval::{sqlstate, SqlError};
+use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
@@ -21,12 +21,18 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             // Records are transient values, never stored in a row (a column
             // cannot be composite-typed here).
             Datum::Record(_) => unreachable!("record cannot be a stored column value"),
+            Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
             Datum::Null => 0,
             Datum::Bool(_) => 1,
             Datum::Int2(_) | Datum::Int4(_) | Datum::Date(_) => 4,
             // float4 keeps the historical 8-byte float8 layout (see the decode
             // side); the schema narrows it back to f32.
-            Datum::Int8(_) | Datum::Float4(_) | Datum::Float8(_) | Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Time(_) => 8,
+            Datum::Int8(_)
+            | Datum::Float4(_)
+            | Datum::Float8(_)
+            | Datum::Timestamp(_)
+            | Datum::Timestamptz(_)
+            | Datum::Time(_) => 8,
             Datum::Timetz(..) => 12,
             Datum::Interval(_) => 16,
             Datum::Uuid(_) => 16,
@@ -35,7 +41,9 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Macaddr(_) => 6,
             Datum::Macaddr8(_) => 8,
             Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
-            Datum::Json { text, .. } | Datum::Range { text, .. } | Datum::Multirange { text, .. } => 4 + text.len(),
+            Datum::Json { text, .. }
+            | Datum::Range { text, .. }
+            | Datum::Multirange { text, .. } => 4 + text.len(),
             // 4-byte payload length, 1 flag byte (varying), then the bit chars.
             Datum::Bit { bits, .. } => 5 + bits.len(),
             Datum::Array { raw, .. } => 5 + raw.len(),
@@ -66,6 +74,7 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
         let take;
         match v {
             Datum::Record(_) => unreachable!("record cannot be a stored column value"),
+            Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
             Datum::Bool(b) => {
                 rest[0] = u8::from(*b);
                 take = 1;
@@ -97,7 +106,9 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[4..4 + s.len()].copy_from_slice(s.as_bytes());
                 take = 4 + s.len();
             }
-            Datum::Json { text, .. } | Datum::Range { text, .. } | Datum::Multirange { text, .. } => {
+            Datum::Json { text, .. }
+            | Datum::Range { text, .. }
+            | Datum::Multirange { text, .. } => {
                 rest[..4].copy_from_slice(&(text.len() as u32).to_le_bytes());
                 rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
                 take = 4 + text.len();
@@ -211,6 +222,12 @@ pub(crate) fn decode<'a>(
         // int2/float4/varchar/bpchar share the byte layout of their storage
         // type (int4/float8/text), so they decode through the same arm.
         match schema[i] {
+            ColType::Int2Vector => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "int2vector cannot be decoded as a stored column"
+                ));
+            }
             ColType::Bool => {
                 let b = bytes.get(at..at + 1).ok_or_else(corrupt)?;
                 out[i] = Datum::Bool(b[0] != 0);
@@ -306,7 +323,10 @@ pub(crate) fn decode<'a>(
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
                 at += len;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
-                out[i] = Datum::Json { text: s, jsonb: matches!(schema[i], ColType::Jsonb) };
+                out[i] = Datum::Json {
+                    text: s,
+                    jsonb: matches!(schema[i], ColType::Jsonb),
+                };
             }
             ColType::Range(kind) => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
@@ -406,7 +426,10 @@ pub(crate) fn decode<'a>(
                 let raw = bytes.get(at..at + ndigits * 2).ok_or_else(corrupt)?;
                 at += ndigits * 2;
                 out[i] = Datum::Numeric(crate::sql::numeric::Numeric {
-                    sign, weight, dscale, digits: raw,
+                    sign,
+                    weight,
+                    dscale,
+                    digits: raw,
                 });
             }
             ColType::Enum(slot) => {
@@ -463,7 +486,10 @@ mod tests {
         encode(&values, &mut buffer);
         for cut in 0..buffer.len() {
             let mut out = [Datum::Null; 1];
-            assert!(decode(&buffer[..cut], &schema, &mut out).is_err(), "cut={cut}");
+            assert!(
+                decode(&buffer[..cut], &schema, &mut out).is_err(),
+                "cut={cut}"
+            );
         }
     }
 

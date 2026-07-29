@@ -280,7 +280,7 @@ def test_extended_copy():
     s.settimeout(0.1)
     try:
         unexpected = read_message(s)
-    except TimeoutError:
+    except (TimeoutError, socket.timeout):
         unexpected = None
     check(
         "extended COPY IN: no ReadyForQuery before post-COPY Sync",

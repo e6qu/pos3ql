@@ -3,14 +3,14 @@
 //! Fixed limits, checked loudly: at most [`MAX_LIST`] items per select
 //! list / column list / VALUES row, and [`MAX_ROWS`] rows per INSERT.
 
-use crate::sql::eval::sqlstate;
 use crate::mem::arena::Arena;
+use crate::sql::eval::sqlstate;
 use crate::stack_format;
 use crate::util::StackStr;
 
 use super::ast::*;
 use super::lexer::{LexError, Lexer, Tok};
-use super::types::{TypeMod, INTERVAL_FULL_RANGE};
+use super::types::{INTERVAL_FULL_RANGE, TypeMod};
 
 /// Names for the calls a desugaring produces, for syntax PostgreSQL does not
 /// also expose as a function. A space cannot appear in an identifier, so a
@@ -85,7 +85,9 @@ pub const MAX_ROWS: usize = 256;
 /// Whether `text` mentions the word `window` in any case — the cheap pre-filter
 /// that keeps the WINDOW-clause lookahead off the path of ordinary queries.
 fn mentions_window(text: &str) -> bool {
-    text.as_bytes().windows(6).any(|w| w.eq_ignore_ascii_case(b"window"))
+    text.as_bytes()
+        .windows(6)
+        .any(|w| w.eq_ignore_ascii_case(b"window"))
 }
 
 fn is_base_prefixed(text: &str) -> bool {
@@ -114,31 +116,33 @@ pub(crate) enum Keyword {
 /// Categorizes `word`, or `None` when it is unreserved or not a keyword at all.
 pub(crate) fn keyword_category(word: &str) -> Option<Keyword> {
     Some(match word {
-            "between" | "bigint" | "bit" | "boolean" | "char" | "character" | "coalesce" | "dec"
-                | "decimal" | "exists" | "extract" | "float" | "greatest" | "grouping" | "inout"
-                | "int" | "integer" | "interval" | "json" | "json_array" | "json_arrayagg"
-                | "json_exists" | "json_object" | "json_objectagg" | "json_query" | "json_scalar"
-                | "json_serialize" | "json_table" | "json_value" | "least" | "merge_action"
-                | "national" | "nchar" | "none" | "normalize" | "nullif" | "numeric" | "out"
-                | "overlay" | "position" | "precision" | "real" | "row" | "setof" | "smallint"
-                | "substring" | "time" | "timestamp" | "treat" | "trim" | "values" | "varchar"
-                | "xmlattributes" | "xmlconcat" | "xmlelement" | "xmlexists" | "xmlforest"
-                | "xmlnamespaces" | "xmlparse" | "xmlpi" | "xmlroot" | "xmlserialize" | "xmltable" => Keyword::ColumnName,
-            "authorization" | "binary" | "collation" | "concurrently" | "cross"
-                | "current_schema" | "freeze" | "full" | "ilike" | "inner" | "is" | "isnull" | "join"
-                | "left" | "like" | "natural" | "notnull" | "outer" | "overlaps" | "right" | "similar"
-                | "tablesample" | "verbose" => Keyword::TypeFuncName,
-            "all" | "analyse" | "analyze" | "and" | "any" | "array" | "as" | "asc"
-                | "asymmetric" | "both" | "case" | "cast" | "check" | "collate" | "column"
-                | "constraint" | "create" | "current_catalog" | "current_date" | "current_role"
-                | "current_time" | "current_timestamp" | "current_user" | "default" | "deferrable"
-                | "desc" | "distinct" | "do" | "else" | "end" | "except" | "false" | "fetch" | "for"
-                | "foreign" | "from" | "grant" | "group" | "having" | "in" | "initially" | "intersect"
-                | "into" | "lateral" | "leading" | "limit" | "localtime" | "localtimestamp" | "not"
-                | "null" | "offset" | "on" | "only" | "or" | "order" | "placing" | "primary"
-                | "references" | "returning" | "select" | "session_user" | "some" | "symmetric"
-                | "system_user" | "table" | "then" | "to" | "trailing" | "true" | "union" | "unique"
-                | "user" | "using" | "variadic" | "when" | "where" | "window" | "with" => Keyword::Reserved,
+        "between" | "bigint" | "bit" | "boolean" | "char" | "character" | "coalesce" | "dec"
+        | "decimal" | "exists" | "extract" | "float" | "greatest" | "grouping" | "inout"
+        | "int" | "integer" | "interval" | "json" | "json_array" | "json_arrayagg"
+        | "json_exists" | "json_object" | "json_objectagg" | "json_query" | "json_scalar"
+        | "json_serialize" | "json_table" | "json_value" | "least" | "merge_action"
+        | "national" | "nchar" | "none" | "normalize" | "nullif" | "numeric" | "out"
+        | "overlay" | "position" | "precision" | "real" | "row" | "setof" | "smallint"
+        | "substring" | "time" | "timestamp" | "treat" | "trim" | "values" | "varchar"
+        | "xmlattributes" | "xmlconcat" | "xmlelement" | "xmlexists" | "xmlforest"
+        | "xmlnamespaces" | "xmlparse" | "xmlpi" | "xmlroot" | "xmlserialize" | "xmltable" => {
+            Keyword::ColumnName
+        }
+        "authorization" | "binary" | "collation" | "concurrently" | "cross" | "current_schema"
+        | "freeze" | "full" | "ilike" | "inner" | "is" | "isnull" | "join" | "left" | "like"
+        | "natural" | "notnull" | "outer" | "overlaps" | "right" | "similar" | "tablesample"
+        | "verbose" => Keyword::TypeFuncName,
+        "all" | "analyse" | "analyze" | "and" | "any" | "array" | "as" | "asc" | "asymmetric"
+        | "both" | "case" | "cast" | "check" | "collate" | "column" | "constraint" | "create"
+        | "current_catalog" | "current_date" | "current_role" | "current_time"
+        | "current_timestamp" | "current_user" | "default" | "deferrable" | "desc" | "distinct"
+        | "do" | "else" | "end" | "except" | "false" | "fetch" | "for" | "foreign" | "from"
+        | "grant" | "group" | "having" | "in" | "initially" | "intersect" | "into" | "lateral"
+        | "leading" | "limit" | "localtime" | "localtimestamp" | "not" | "null" | "offset"
+        | "on" | "only" | "or" | "order" | "placing" | "primary" | "references" | "returning"
+        | "select" | "session_user" | "some" | "symmetric" | "system_user" | "table" | "then"
+        | "to" | "trailing" | "true" | "union" | "unique" | "user" | "using" | "variadic"
+        | "when" | "where" | "window" | "with" => Keyword::Reserved,
         _ => return None,
     })
 }
@@ -148,7 +152,10 @@ pub(crate) fn keyword_category(word: &str) -> Option<Keyword> {
 /// are rejected there; the unreserved ones are accepted — `begin`, `values` and
 /// `set` are all perfectly legal column names.
 pub(crate) fn is_column_name_keyword(word: &str) -> bool {
-    matches!(keyword_category(word), Some(Keyword::TypeFuncName | Keyword::Reserved))
+    matches!(
+        keyword_category(word),
+        Some(Keyword::TypeFuncName | Keyword::Reserved)
+    )
 }
 
 /// Whether `word` is one of PostgreSQL's fully `reserved` keywords — the ones
@@ -247,10 +254,13 @@ pub fn parse_view_select<'a>(
         .map_err(|e| to_sql(e.message.as_str()))?
         .ok_or_else(|| to_sql("empty"))?;
     match statement {
-        Stmt::Select(s) => arena.alloc(s).map(|r| &*r).map_err(|_| super::eval::SqlError {
-            sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            message: crate::stack_format!(192, "view too large for SQL arena"),
-        }),
+        Stmt::Select(s) => arena
+            .alloc(s)
+            .map(|r| &*r)
+            .map_err(|_| super::eval::SqlError {
+                sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                message: crate::stack_format!(192, "view too large for SQL arena"),
+            }),
         _ => Err(to_sql("view body must be a plain SELECT")),
     }
 }
@@ -272,10 +282,13 @@ pub fn parse_query<'a>(
     if parser.peeked != Tok::Eof {
         return Err(to_sql("trailing tokens after query"));
     }
-    arena.alloc(sel).map(|r| &*r).map_err(|_| super::eval::SqlError {
-        sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        message: crate::stack_format!(192, "query too large for SQL arena"),
-    })
+    arena
+        .alloc(sel)
+        .map(|r| &*r)
+        .map_err(|_| super::eval::SqlError {
+            sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            message: crate::stack_format!(192, "query too large for SQL arena"),
+        })
 }
 
 /// Parses a single scalar expression (e.g. a stored CHECK predicate) into the
@@ -289,7 +302,9 @@ pub fn parse_expr<'a>(
         message: crate::stack_format!(192, "invalid expression: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
-    let expression = parser.expression(0).map_err(|e| to_sql(e.message.as_str()))?;
+    let expression = parser
+        .expression(0)
+        .map_err(|e| to_sql(e.message.as_str()))?;
     if parser.peeked != Tok::Eof {
         return Err(to_sql("trailing tokens after expression"));
     }
@@ -353,7 +368,10 @@ impl<'a> Parser<'a> {
     fn qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
         let first = self.col_ident(what)?;
         if self.eat_op(".")? {
-            Ok(QualName { schema: Some(first), name: self.col_ident(what)? })
+            Ok(QualName {
+                schema: Some(first),
+                name: self.col_ident(what)?,
+            })
         } else {
             Ok(QualName::bare(first))
         }
@@ -400,7 +418,12 @@ impl<'a> Parser<'a> {
         let _ = self.query()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
-        Ok(Stmt::DeclareCursor { name, scroll, hold, sql })
+        Ok(Stmt::DeclareCursor {
+            name,
+            scroll,
+            hold,
+            sql,
+        })
     }
 
     /// FETCH/MOVE [direction] [FROM|IN] cursor ("fetch"/"move" not consumed).
@@ -459,7 +482,11 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("in")?;
         }
         let name = self.col_ident("cursor name")?;
-        Ok(Stmt::FetchCursor { name, motion, move_only })
+        Ok(Stmt::FetchCursor {
+            name,
+            motion,
+            move_only,
+        })
     }
 
     fn truncate(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -502,7 +529,48 @@ impl<'a> Parser<'a> {
             .arena
             .alloc_slice_copy(&names[..n])
             .map_err(|_| self.err_here("statement too large"))?;
-        Ok(Stmt::Truncate { tables, restart_identity, cascade })
+        Ok(Stmt::Truncate {
+            tables,
+            restart_identity,
+            cascade,
+        })
+    }
+
+    fn lock_table(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.advance()?; // lock
+        let _ = self.eat_ident("table")?;
+        let mut names = [QualName::bare(""); 32];
+        let mut count = 0usize;
+        loop {
+            let _ = self.eat_ident("only")?;
+            if count == names.len() {
+                return Err(self.err_here("too many tables in LOCK TABLE"));
+            }
+            names[count] = self.qual_name("table name")?;
+            count += 1;
+            if self.peeked == Tok::Op("*") {
+                self.advance()?;
+            }
+            if self.peeked == Tok::Op(",") {
+                self.advance()?;
+                continue;
+            }
+            break;
+        }
+        if !self.eat_ident("in")? {
+            return Err(self.err_here(
+                "LOCK TABLE without an explicit mode requires ACCESS EXCLUSIVE MODE, which is not supported",
+            ));
+        }
+        self.expect_ident("access")?;
+        self.expect_ident("share")?;
+        self.expect_ident("mode")?;
+        let nowait = self.eat_ident("nowait")?;
+        let tables = self
+            .arena
+            .alloc_slice_copy(&names[..count])
+            .map_err(|_| self.err_here("statement too large"))?;
+        Ok(Stmt::LockTable { tables, nowait })
     }
 
     fn statement(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -517,6 +585,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("merge") => self.merge(),
             Tok::Ident("comment") => self.comment(),
             Tok::Ident("truncate") => self.truncate(),
+            Tok::Ident("lock") => self.lock_table(),
             Tok::Ident("declare") => self.declare_cursor(),
             Tok::Ident("fetch") => self.fetch_cursor(false),
             Tok::Ident("move") => self.fetch_cursor(true),
@@ -622,7 +691,9 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("all")? {
                     Ok(Stmt::Reset(None))
                 } else {
-                    Ok(Stmt::Reset(Some(self.any_ident("configuration parameter")?)))
+                    Ok(Stmt::Reset(Some(
+                        self.any_ident("configuration parameter")?,
+                    )))
                 }
             }
             Tok::Ident("show") => {
@@ -723,9 +794,7 @@ impl<'a> Parser<'a> {
                 // inside a larger expression (`(t.*)::text`, `row_to_json(t.*)`)
                 // does it stay a record.
                 match expression {
-                    Expr::WholeRow(table) if alias.is_none() => {
-                        SelectItem::TableWildcard(table)
-                    }
+                    Expr::WholeRow(table) if alias.is_none() => SelectItem::TableWildcard(table),
                     // `(record).*` parsed as the `*`-sentinel field access.
                     Expr::Field { base, field: "*" } if alias.is_none() => {
                         SelectItem::RecordStar(base)
@@ -920,9 +989,20 @@ impl<'a> Parser<'a> {
     #[allow(clippy::type_complexity)]
     fn order_limit(
         &mut self,
-    ) -> Result<(&'a [OrderBy<'a>], Option<&'a Expr<'a>>, Option<&'a Expr<'a>>, bool), ParseError>
-    {
-        let mut order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false }; MAX_LIST];
+    ) -> Result<
+        (
+            &'a [OrderBy<'a>],
+            Option<&'a Expr<'a>>,
+            Option<&'a Expr<'a>>,
+            bool,
+        ),
+        ParseError,
+    > {
+        let mut order = [OrderBy {
+            expression: &Expr::Null,
+            descending: false,
+            nulls_first: false,
+        }; MAX_LIST];
         let mut n_order = 0;
         if self.eat_ident("order")? {
             self.expect_ident("by")?;
@@ -949,7 +1029,11 @@ impl<'a> Parser<'a> {
                 } else {
                     descending
                 };
-                order[n_order] = OrderBy { expression, descending, nulls_first };
+                order[n_order] = OrderBy {
+                    expression,
+                    descending,
+                    nulls_first,
+                };
                 n_order += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -1075,7 +1159,9 @@ impl<'a> Parser<'a> {
                 self.expect_ident("share")?;
                 LockStrength::KeyShare
             } else {
-                return Err(self.err_here("expected UPDATE, NO KEY UPDATE, SHARE, or KEY SHARE after FOR"));
+                return Err(
+                    self.err_here("expected UPDATE, NO KEY UPDATE, SHARE, or KEY SHARE after FOR")
+                );
             };
             let mut of = [""; MAX_LIST];
             let mut nof = 0;
@@ -1099,7 +1185,11 @@ impl<'a> Parser<'a> {
             } else {
                 LockWait::Wait
             };
-            clauses[n] = LockClause { strength, of: self.arena_slice(&of[..nof])?, wait };
+            clauses[n] = LockClause {
+                strength,
+                of: self.arena_slice(&of[..nof])?,
+                wait,
+            };
             n += 1;
         }
         self.arena_slice(&clauses[..n])
@@ -1132,8 +1222,13 @@ impl<'a> Parser<'a> {
                 locking: &[],
             })
             .map_err(|_| self.err_here("statement too large for SQL arena"))?;
-        let mut ctes =
-            [Cte { name: "", columns: &[], recursive: false, query: placeholder, dml: None }; MAX_CTES];
+        let mut ctes = [Cte {
+            name: "",
+            columns: &[],
+            recursive: false,
+            query: placeholder,
+            dml: None,
+        }; MAX_CTES];
         let mut n = 0;
         loop {
             if n == MAX_CTES {
@@ -1165,7 +1260,13 @@ impl<'a> Parser<'a> {
                 (&*boxed, None)
             };
             self.expect_op(")")?;
-            ctes[n] = Cte { name, columns, recursive, query: boxed, dml };
+            ctes[n] = Cte {
+                name,
+                columns,
+                recursive,
+                query: boxed,
+                dml,
+            };
             n += 1;
             if !self.eat_op(",")? {
                 break;
@@ -1191,7 +1292,10 @@ impl<'a> Parser<'a> {
                     statement: &*statement,
                 })
             }
-            _ => Err(self.err_here("WITH must be followed by SELECT, INSERT, UPDATE, DELETE, or MERGE")),
+            _ => {
+                Err(self
+                    .err_here("WITH must be followed by SELECT, INSERT, UPDATE, DELETE, or MERGE"))
+            }
         }
     }
 
@@ -1240,7 +1344,15 @@ impl<'a> Parser<'a> {
             sel.locking = locking;
             return Ok(Stmt::Select(sel));
         }
-        Ok(Stmt::SetQuery(SetQuery { with: &[], body, order_by, limit, offset, with_ties, locking }))
+        Ok(Stmt::SetQuery(SetQuery {
+            with: &[],
+            body,
+            order_by,
+            limit,
+            offset,
+            with_ties,
+            locking,
+        }))
     }
 
     /// UNION / EXCEPT level (lowest precedence, left-associative).
@@ -1256,7 +1368,12 @@ impl<'a> Parser<'a> {
             };
             let all = self.set_all()?;
             let right = self.set_intersect()?;
-            left = self.alloc_set(SetTree::Op { operator, all, left, right })?;
+            left = self.alloc_set(SetTree::Op {
+                operator,
+                all,
+                left,
+                right,
+            })?;
         }
         Ok(left)
     }
@@ -1267,7 +1384,12 @@ impl<'a> Parser<'a> {
         while self.eat_ident("intersect")? {
             let all = self.set_all()?;
             let right = self.set_leaf()?;
-            left = self.alloc_set(SetTree::Op { operator: SetOp::Intersect, all, left, right })?;
+            left = self.alloc_set(SetTree::Op {
+                operator: SetOp::Intersect,
+                all,
+                left,
+                right,
+            })?;
         }
         Ok(left)
     }
@@ -1340,7 +1462,10 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc_str_display(format_args!("column{}", n + 1))
                         .map_err(|_| self.err_here("VALUES too large"))?;
-                    items[n] = SelectItem::Expr { expression, alias: Some(alias) };
+                    items[n] = SelectItem::Expr {
+                        expression,
+                        alias: Some(alias),
+                    };
                     n += 1;
                     if !self.eat_op(",")? {
                         break;
@@ -1365,7 +1490,9 @@ impl<'a> Parser<'a> {
                     locking: &[],
                 };
                 let leaf = self.alloc_set(SetTree::Select(
-                    self.arena.alloc(sel).map_err(|_| self.err_here("VALUES too large"))?,
+                    self.arena
+                        .alloc(sel)
+                        .map_err(|_| self.err_here("VALUES too large"))?,
                 ))?;
                 tree = Some(match tree {
                     None => leaf,
@@ -1537,11 +1664,24 @@ impl<'a> Parser<'a> {
         Ok(Some(self.arena_slice(&columns[..n])?))
     }
 
-    #[expect(clippy::wrong_self_convention, reason = "parses the FROM clause; not a conversion")]
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "parses the FROM clause; not a conversion"
+    )]
     fn from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
         let base = self.table_ref()?;
         let dummy = Join {
-            table: TableRef { schema: None, table: "", alias: None, subquery: None, func_args: None, col_alias: None, cte: None, with_ordinality: false, lateral: false },
+            table: TableRef {
+                schema: None,
+                table: "",
+                alias: None,
+                subquery: None,
+                func_args: None,
+                col_alias: None,
+                cte: None,
+                with_ordinality: false,
+                lateral: false,
+            },
             kind: JoinKind::Inner,
             on: None,
             using_columns: None,
@@ -1627,7 +1767,13 @@ impl<'a> Parser<'a> {
                 self.expect_ident("on")?;
                 Some(self.expression(0)?)
             };
-            joins[n] = Join { table, kind, on, using_columns, natural };
+            joins[n] = Join {
+                table,
+                kind,
+                on,
+                using_columns,
+                natural,
+            };
             n += 1;
         }
         Ok(FromClause {
@@ -1658,7 +1804,10 @@ impl<'a> Parser<'a> {
             let options = self.copy_options()?;
             self.validate_copy_options(&options)?;
             return Ok(Stmt::Copy(crate::sql::ast::CopyStmt {
-                table: QualName { schema: None, name: "" },
+                table: QualName {
+                    schema: None,
+                    name: "",
+                },
                 columns: &[],
                 query: Some(query),
                 to: true,
@@ -1701,7 +1850,13 @@ impl<'a> Parser<'a> {
         let options = self.copy_options()?;
         self.validate_copy_options(&options)?;
         let columns = self.arena_slice(&columns[..n_columns])?;
-        Ok(Stmt::Copy(crate::sql::ast::CopyStmt { table, columns, query: None, to, options }))
+        Ok(Stmt::Copy(crate::sql::ast::CopyStmt {
+            table,
+            columns,
+            query: None,
+            to,
+            options,
+        }))
     }
 
     /// The COPY option list: both the modern `WITH (FORMAT csv, HEADER, ...)`
@@ -1746,7 +1901,7 @@ impl<'a> Parser<'a> {
                             at: self.peek_at,
                             message: stack_format!(96, "COPY format \"{}\" does not exist", other),
                             sqlstate: sqlstate::UNDEFINED_OBJECT,
-                        })
+                        });
                     }
                 };
             }
@@ -1766,7 +1921,7 @@ impl<'a> Parser<'a> {
             "force_not_null" => options.force_not_null = self.copy_column_list()?,
             "force_null" => options.force_null = self.copy_column_list()?,
             "freeze" | "oids" | "on_error" | "log_verbosity" | "default" => {
-                return Err(self.copy_unsupported_option(option))
+                return Err(self.copy_unsupported_option(option));
             }
             _ => return Err(self.copy_unsupported_option(option)),
         }
@@ -1996,21 +2151,30 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(AlterAction::AlterColumnType { column, type_name, type_mod, using })
+        Ok(AlterAction::AlterColumnType {
+            column,
+            type_name,
+            type_mod,
+            using,
+        })
     }
 
     /// VACUUM / ANALYZE with their shared shape: an optional parenthesized or
     /// bare option list, then an optional comma-separated table list, each
-    /// table with an optional column list. Options and targets are consumed;
-    /// the command's behavior does not depend on them here.
+    /// table with an optional column list.
     fn vacuum_or_analyze(&mut self, is_vacuum: bool) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // the VACUUM / ANALYZE keyword
+        let mut run_analyze = !is_vacuum;
         if self.eat_op("(")? {
             // A parenthesized option list — consume up to the matching ')'.
             let mut depth = 1;
             while depth > 0 {
                 if self.peeked == Tok::Eof {
                     return Err(self.unexpected("unterminated option list"));
+                }
+                if matches!(self.peeked, Tok::Ident(word) if word.eq_ignore_ascii_case("analyze") || word.eq_ignore_ascii_case("analyse"))
+                {
+                    run_analyze = true;
                 }
                 if self.eat_op("(")? {
                     depth += 1;
@@ -2022,32 +2186,67 @@ impl<'a> Parser<'a> {
             }
         } else {
             // The bare-keyword form: FULL / FREEZE / VERBOSE / ANALYZE.
-            while self.eat_ident("full")?
-                || self.eat_ident("freeze")?
-                || self.eat_ident("verbose")?
-                || self.eat_ident("analyze")?
-                || self.eat_ident("analyse")?
-            {}
+            loop {
+                if self.eat_ident("full")?
+                    || self.eat_ident("freeze")?
+                    || self.eat_ident("verbose")?
+                {
+                    continue;
+                }
+                if self.eat_ident("analyze")? || self.eat_ident("analyse")? {
+                    run_analyze = true;
+                    continue;
+                }
+                break;
+            }
         }
         // An optional table list, each with an optional column list.
+        let empty_target = crate::sql::ast::MaintenanceTarget {
+            table: QualName::bare(""),
+            columns: &[],
+        };
+        let mut targets = [empty_target; 64];
+        let mut target_count = 0usize;
         if !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             loop {
-                let _ = self.qual_name("table name")?;
+                if target_count == targets.len() {
+                    return Err(self.unexpected("too many maintenance targets"));
+                }
+                let table = self.qual_name("table name")?;
+                let mut column_names = [""; crate::storage::MAX_COLUMNS];
+                let mut column_count = 0usize;
                 if self.eat_op("(")? {
                     loop {
-                        let _ = self.col_ident("column name")?;
+                        if column_count == column_names.len() {
+                            return Err(self.unexpected("too many maintenance columns"));
+                        }
+                        column_names[column_count] = self.col_ident("column name")?;
+                        column_count += 1;
                         if !self.eat_op(",")? {
                             break;
                         }
                     }
                     self.expect_op(")")?;
                 }
+                targets[target_count] = crate::sql::ast::MaintenanceTarget {
+                    table,
+                    columns: self.arena_slice(&column_names[..column_count])?,
+                };
+                target_count += 1;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
         }
-        Ok(if is_vacuum { Stmt::Vacuum } else { Stmt::Analyze })
+        let targets = self.arena_slice(&targets[..target_count])?;
+        Ok(if is_vacuum {
+            Stmt::Vacuum {
+                targets,
+                analyze: run_analyze,
+            }
+        } else {
+            Stmt::Analyze(targets)
+        })
     }
 
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -2190,11 +2389,16 @@ impl<'a> Parser<'a> {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
-                return Ok(AlterAction::AddConstraint(self.table_constraint(Some(cname))?));
+                return Ok(AlterAction::AddConstraint(
+                    self.table_constraint(Some(cname))?,
+                ));
             }
             if matches!(
                 self.peeked,
-                Tok::Ident("primary") | Tok::Ident("unique") | Tok::Ident("check") | Tok::Ident("foreign")
+                Tok::Ident("primary")
+                    | Tok::Ident("unique")
+                    | Tok::Ident("check")
+                    | Tok::Ident("foreign")
             ) {
                 return Ok(AlterAction::AddConstraint(self.table_constraint(None)?));
             }
@@ -2274,7 +2478,11 @@ impl<'a> Parser<'a> {
                     let start = self.peek_at;
                     let value = self.expression(0)?;
                     let value_text = self.text[start..self.peek_at].trim_end();
-                    Ok(AlterAction::SetDefault { column, value, value_text })
+                    Ok(AlterAction::SetDefault {
+                        column,
+                        value,
+                        value_text,
+                    })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;
@@ -2341,7 +2549,11 @@ impl<'a> Parser<'a> {
         let _ = self.statement()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
-        Ok(Stmt::Prepare { name, sql, param_types: self.arena_slice(&ptypes[..np])? })
+        Ok(Stmt::Prepare {
+            name,
+            sql,
+            param_types: self.arena_slice(&ptypes[..np])?,
+        })
     }
 
     fn execute_prepared(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -2366,9 +2578,11 @@ impl<'a> Parser<'a> {
             }
             self.expect_op(")")?;
         }
-        Ok(Stmt::ExecutePrepared { name, args: self.arena_slice(&args[..n])? })
+        Ok(Stmt::ExecutePrepared {
+            name,
+            args: self.arena_slice(&args[..n])?,
+        })
     }
-
 
     fn insert(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("insert")?;
@@ -2548,7 +2762,12 @@ impl<'a> Parser<'a> {
         }
         let from = if self.eat_ident("from")? {
             let fc = self.from_clause()?;
-            Some(&*self.arena.alloc(fc).map_err(|_| self.err_here("FROM too large for SQL arena"))?)
+            Some(
+                &*self
+                    .arena
+                    .alloc(fc)
+                    .map_err(|_| self.err_here("FROM too large for SQL arena"))?,
+            )
         } else {
             None
         };
@@ -2570,18 +2789,21 @@ impl<'a> Parser<'a> {
         self.expect_ident("merge")?;
         self.expect_ident("into")?;
         let target = self.qual_name("target table")?;
-        let target_alias = if self.eat_ident("as")?
-            || matches!(self.peeked, Tok::Ident(w) if w != "using")
-        {
-            Some(self.col_ident("target alias")?)
-        } else {
-            None
-        };
+        let target_alias =
+            if self.eat_ident("as")? || matches!(self.peeked, Tok::Ident(w) if w != "using") {
+                Some(self.col_ident("target alias")?)
+            } else {
+                None
+            };
         self.expect_ident("using")?;
         let source = self.table_ref()?;
         self.expect_ident("on")?;
         let on = self.expression(0)?;
-        let dummy = MergeWhen { matched: true, cond: None, action: crate::sql::ast::MergeAction::Delete };
+        let dummy = MergeWhen {
+            matched: true,
+            cond: None,
+            action: crate::sql::ast::MergeAction::Delete,
+        };
         let mut whens = [dummy; MAX_LIST];
         let mut n = 0;
         while self.eat_ident("when")? {
@@ -2602,7 +2824,11 @@ impl<'a> Parser<'a> {
             };
             self.expect_ident("then")?;
             let action = self.merge_action(matched)?;
-            whens[n] = MergeWhen { matched, cond, action };
+            whens[n] = MergeWhen {
+                matched,
+                cond,
+                action,
+            };
             n += 1;
         }
         if n == 0 {
@@ -2618,7 +2844,10 @@ impl<'a> Parser<'a> {
     }
 
     /// One MERGE action after `THEN`. `matched` selects the allowed set.
-    fn merge_action(&mut self, matched: bool) -> Result<crate::sql::ast::MergeAction<'a>, ParseError> {
+    fn merge_action(
+        &mut self,
+        matched: bool,
+    ) -> Result<crate::sql::ast::MergeAction<'a>, ParseError> {
         use crate::sql::ast::MergeAction;
         if self.eat_ident("do")? {
             self.expect_ident("nothing")?;
@@ -2670,7 +2899,11 @@ impl<'a> Parser<'a> {
             }
             if self.eat_ident("default")? {
                 self.expect_ident("values")?;
-                return Ok(MergeAction::Insert { columns, values: &[], default_values: true });
+                return Ok(MergeAction::Insert {
+                    columns,
+                    values: &[],
+                    default_values: true,
+                });
             }
             self.expect_ident("values")?;
             self.expect_op("(")?;
@@ -2688,7 +2921,11 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
-            Ok(MergeAction::Insert { columns, values: self.arena_slice(&vals[..v])?, default_values: false })
+            Ok(MergeAction::Insert {
+                columns,
+                values: self.arena_slice(&vals[..v])?,
+                default_values: false,
+            })
         }
     }
 
@@ -2743,11 +2980,17 @@ impl<'a> Parser<'a> {
             if self.eat_op(".")? {
                 let third = self.col_ident("column reference")?;
                 CommentTarget::Column {
-                    relation: QualName { schema: Some(first), name: second },
+                    relation: QualName {
+                        schema: Some(first),
+                        name: second,
+                    },
                     column: third,
                 }
             } else {
-                CommentTarget::Column { relation: QualName::bare(first), column: second }
+                CommentTarget::Column {
+                    relation: QualName::bare(first),
+                    column: second,
+                }
             }
         } else {
             return Err(self.err_here(
@@ -2771,8 +3014,7 @@ impl<'a> Parser<'a> {
             let second = self.any_ident("type name")?;
             if self.eat_op("[")? {
                 self.expect_op("]")?;
-                return self
-                    .arena_str(stack_format!(144, "{}.{}[]", first, second).as_str());
+                return self.arena_str(stack_format!(144, "{}.{}[]", first, second).as_str());
             }
             return self.arena_str(stack_format!(144, "{}.{}", first, second).as_str());
         }
@@ -2811,13 +3053,23 @@ impl<'a> Parser<'a> {
         let table = self.qual_name("table name")?;
         let using = if self.eat_ident("using")? {
             let fc = self.from_clause()?;
-            Some(&*self.arena.alloc(fc).map_err(|_| self.err_here("USING too large for SQL arena"))?)
+            Some(
+                &*self
+                    .arena
+                    .alloc(fc)
+                    .map_err(|_| self.err_here("USING too large for SQL arena"))?,
+            )
         } else {
             None
         };
         let where_clause = self.where_clause()?;
         let returning = self.returning()?;
-        Ok(Stmt::Delete(Delete { table, using, where_clause, returning }))
+        Ok(Stmt::Delete(Delete {
+            table,
+            using,
+            where_clause,
+            returning,
+        }))
     }
 
     fn where_clause(&mut self) -> Result<Option<&'a Expr<'a>>, ParseError> {
@@ -2865,7 +3117,14 @@ impl<'a> Parser<'a> {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
-                return Ok((if name == "timestamp" { "timestamptz" } else { "timetz" }, -1));
+                return Ok((
+                    if name == "timestamp" {
+                        "timestamptz"
+                    } else {
+                        "timetz"
+                    },
+                    -1,
+                ));
             }
             if self.eat_ident("without")? {
                 self.expect_ident("time")?;
@@ -2957,7 +3216,11 @@ impl<'a> Parser<'a> {
                 if !(0..=p).contains(&s) {
                     return Err(self.unexpected("numeric scale must be between 0 and precision"));
                 }
-                Ok(TypeMod::NumericPS { precision: p as u16, scale: s as u16 }.encode())
+                Ok(TypeMod::NumericPS {
+                    precision: p as u16,
+                    scale: s as u16,
+                }
+                .encode())
             }
             "bit" | "varbit" => {
                 if n != 1 {
@@ -3020,9 +3283,26 @@ impl<'a> Parser<'a> {
         if let Tok::Ident(name) = self.peeked {
             let reserved = matches!(
                 name,
-                "from" | "where" | "order" | "limit" | "group" | "having" | "union"
-                    | "intersect" | "except" | "window" | "for" | "fetch" | "into"
-                    | "and" | "or" | "is" | "as" | "asc" | "desc" | "offset"
+                "from"
+                    | "where"
+                    | "order"
+                    | "limit"
+                    | "group"
+                    | "having"
+                    | "union"
+                    | "intersect"
+                    | "except"
+                    | "window"
+                    | "for"
+                    | "fetch"
+                    | "into"
+                    | "and"
+                    | "or"
+                    | "is"
+                    | "as"
+                    | "asc"
+                    | "desc"
+                    | "offset"
             );
             if !reserved {
                 self.advance()?;
@@ -3149,13 +3429,11 @@ impl<'a> Parser<'a> {
         table: &str,
     ) -> Result<&'a str, ParseError> {
         let text = crate::stack_format!(130, "{}.{}", schema, table);
-        self.arena
-            .alloc_str(text.as_str())
-            .map_err(|_| ParseError {
-                at: self.peek_at,
-                message: crate::stack_format!(96, "statement too large for SQL arena"),
-                sqlstate: crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            })
+        self.arena.alloc_str(text.as_str()).map_err(|_| ParseError {
+            at: self.peek_at,
+            message: crate::stack_format!(96, "statement too large for SQL arena"),
+            sqlstate: crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        })
     }
 
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {
@@ -3201,7 +3479,9 @@ impl<'a> Parser<'a> {
                                 m |= tm;
                             }
                         }
-                        push_mask(&mut elem, &mut n_elem, m, || self.err_here("too many grouping sets"))?;
+                        push_mask(&mut elem, &mut n_elem, m, || {
+                            self.err_here("too many grouping sets")
+                        })?;
                     }
                 } else {
                     for keep in (0..=n_terms).rev() {
@@ -3209,7 +3489,9 @@ impl<'a> Parser<'a> {
                         for &tm in &terms[..keep] {
                             m |= tm;
                         }
-                        push_mask(&mut elem, &mut n_elem, m, || self.err_here("too many grouping sets"))?;
+                        push_mask(&mut elem, &mut n_elem, m, || {
+                            self.err_here("too many grouping sets")
+                        })?;
                     }
                 }
                 explicit = true;
@@ -3227,13 +3509,17 @@ impl<'a> Parser<'a> {
                 explicit = true;
             } else {
                 let m = self.grouping_term(&mut flat, &mut n_flat)?;
-                push_mask(&mut elem, &mut n_elem, m, || self.err_here("too many grouping sets"))?;
+                push_mask(&mut elem, &mut n_elem, m, || {
+                    self.err_here("too many grouping sets")
+                })?;
             }
             // Cross product: acc × elem.
             let mut n_new = 0usize;
             for &a in &acc[..n_acc] {
                 for &e in &elem[..n_elem] {
-                    push_mask(&mut scratch, &mut n_new, a | e, || self.err_here("too many grouping sets"))?;
+                    push_mask(&mut scratch, &mut n_new, a | e, || {
+                        self.err_here("too many grouping sets")
+                    })?;
                 }
             }
             acc[..n_new].copy_from_slice(&scratch[..n_new]);
@@ -3243,7 +3529,11 @@ impl<'a> Parser<'a> {
             }
         }
         let group_by = self.arena_slice(&flat[..n_flat])?;
-        let grouping_sets = if explicit { self.arena_slice(&acc[..n_acc])? } else { &[][..] };
+        let grouping_sets = if explicit {
+            self.arena_slice(&acc[..n_acc])?
+        } else {
+            &[][..]
+        };
         Ok((group_by, grouping_sets))
     }
 
@@ -3459,10 +3749,14 @@ mod tests {
                 panic!()
             };
             assert_eq!(s.items.len(), 3);
-            let SelectItem::Expr { expression, alias } = s.items[1] else { panic!() };
+            let SelectItem::Expr { expression, alias } = s.items[1] else {
+                panic!()
+            };
             assert_eq!(*expression, Expr::Str("x"));
             assert_eq!(alias, Some("name"));
-            let SelectItem::Expr { alias, .. } = s.items[2] else { panic!() };
+            let SelectItem::Expr { alias, .. } = s.items[2] else {
+                panic!()
+            };
             assert_eq!(alias, Some("half"));
             assert!(p.next_stmt().unwrap().is_none());
         });
@@ -3472,37 +3766,52 @@ mod tests {
     fn grouping_sets_expansion() {
         // Plain GROUP BY: no explicit sets, all columns implied.
         with_parser("SELECT a FROM t GROUP BY a, b", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
             assert_eq!(s.group_by.len(), 2);
             assert!(s.grouping_sets.is_empty());
         });
         // ROLLUP(a, b) -> {a,b}, {a}, {} (bits index group_by = [a, b]).
         with_parser("SELECT a FROM t GROUP BY ROLLUP(a, b)", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
             assert_eq!(s.group_by.len(), 2);
             assert_eq!(s.grouping_sets, &[0b11, 0b01, 0b00]);
         });
         // CUBE(a, b) -> all four subsets.
         with_parser("SELECT a FROM t GROUP BY CUBE(a, b)", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
             let mut got = s.grouping_sets.to_vec();
             got.sort_unstable();
             assert_eq!(got, vec![0b00, 0b01, 0b10, 0b11]);
         });
         // Explicit GROUPING SETS, including the empty grand-total set.
-        with_parser("SELECT a FROM t GROUP BY GROUPING SETS ((a, b), (a), ())", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
-            assert_eq!(s.grouping_sets, &[0b11, 0b01, 0b00]);
-        });
+        with_parser(
+            "SELECT a FROM t GROUP BY GROUPING SETS ((a, b), (a), ())",
+            |p| {
+                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(s.grouping_sets, &[0b11, 0b01, 0b00]);
+            },
+        );
         // Cross product: a, ROLLUP(b, c) -> a always set, times {bc},{b},{}.
         with_parser("SELECT a FROM t GROUP BY a, ROLLUP(b, c)", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
             assert_eq!(s.group_by.len(), 3); // a, b, c
             assert_eq!(s.grouping_sets, &[0b111, 0b011, 0b001]);
         });
         // A parenthesized scalar must not be read as a grouping list.
         with_parser("SELECT a FROM t GROUP BY (a + 1) * 2", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
             assert_eq!(s.group_by.len(), 1);
             assert!(s.grouping_sets.is_empty());
         });
@@ -3511,7 +3820,9 @@ mod tests {
     #[test]
     fn derived_table_column_alias_list() {
         with_parser("SELECT * FROM (VALUES (1,'a')) AS v(id, name)", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
             let base = &s.from.unwrap().base;
             assert_eq!(base.alias, Some("v"));
             assert_eq!(base.col_alias, Some(&["id", "name"][..]));
@@ -3522,7 +3833,9 @@ mod tests {
     #[test]
     fn table_function_column_alias() {
         with_parser("SELECT * FROM generate_series(1,3) AS g(x)", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
             let base = &s.from.unwrap().base;
             assert_eq!(base.alias, Some("g"));
             assert_eq!(base.col_alias, Some(&["x"][..]));
@@ -3533,14 +3846,39 @@ mod tests {
     #[test]
     fn precedence_and_parens() {
         with_parser("SELECT 1 + 2 * 3, (1 + 2) * 3", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
-            let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
+            let SelectItem::Expr { expression, .. } = s.items[0] else {
+                panic!()
+            };
             // 1 + (2 * 3)
-            let Expr::Binary { operator: BinaryOp::Add, left, right } = expression else { panic!() };
+            let Expr::Binary {
+                operator: BinaryOp::Add,
+                left,
+                right,
+            } = expression
+            else {
+                panic!()
+            };
             assert_eq!(**left, Expr::Int(1));
-            assert!(matches!(right, Expr::Binary { operator: BinaryOp::Mul, .. }));
-            let SelectItem::Expr { expression, .. } = s.items[1] else { panic!() };
-            assert!(matches!(expression, Expr::Binary { operator: BinaryOp::Mul, .. }));
+            assert!(matches!(
+                right,
+                Expr::Binary {
+                    operator: BinaryOp::Mul,
+                    ..
+                }
+            ));
+            let SelectItem::Expr { expression, .. } = s.items[1] else {
+                panic!()
+            };
+            assert!(matches!(
+                expression,
+                Expr::Binary {
+                    operator: BinaryOp::Mul,
+                    ..
+                }
+            ));
         });
     }
 
@@ -3549,11 +3887,16 @@ mod tests {
         with_parser(
             "SELECT a, b FROM t WHERE a > 1 AND b = 'x' ORDER BY a DESC, b LIMIT 10",
             |p| {
-                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
+                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
                 assert_eq!(s.from.unwrap().base.table, "t");
                 assert!(matches!(
                     s.where_clause.unwrap(),
-                    Expr::Binary { operator: BinaryOp::And, .. }
+                    Expr::Binary {
+                        operator: BinaryOp::And,
+                        ..
+                    }
                 ));
                 assert_eq!(s.order_by.len(), 2);
                 assert!(s.order_by[0].descending);
@@ -3572,20 +3915,26 @@ mod tests {
              DELETE FROM t WHERE id = 2;
              DROP TABLE IF EXISTS t",
             |p| {
-                let Stmt::CreateTable(c) = p.next_stmt().unwrap().unwrap() else { panic!() };
+                let Stmt::CreateTable(c) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
                 assert_eq!(c.name, QualName::bare("t"));
                 assert_eq!(c.columns.len(), 3);
                 assert!(c.columns[0].not_null);
                 assert_eq!(c.columns[2].type_name, "float8");
 
-                let Stmt::Insert(i) = p.next_stmt().unwrap().unwrap() else { panic!() };
+                let Stmt::Insert(i) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
                 assert_eq!(i.columns, &["id", "name"]);
                 assert_eq!(i.rows.len(), 2);
                 assert_eq!(*i.rows[1][1], Expr::Null);
 
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Update(_)));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Delete(_)));
-                let Stmt::DropTable(d) = p.next_stmt().unwrap().unwrap() else { panic!() };
+                let Stmt::DropTable(d) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
                 assert!(d.if_exists);
             },
         );
@@ -3593,16 +3942,31 @@ mod tests {
 
     #[test]
     fn casts_is_null_and_txn() {
-        with_parser("SELECT 1::bigint, NULL IS NULL, 2 IS NOT NULL; BEGIN; COMMIT; ROLLBACK", |p| {
-            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else { panic!() };
-            let SelectItem::Expr { expression, .. } = s.items[0] else { panic!() };
-            assert!(matches!(expression, Expr::Cast { type_name: "bigint", .. }));
-            let SelectItem::Expr { expression, .. } = s.items[2] else { panic!() };
-            assert!(matches!(expression, Expr::IsNull { negated: true, .. }));
-            assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Begin("")));
-            assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
-            assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));
-        });
+        with_parser(
+            "SELECT 1::bigint, NULL IS NULL, 2 IS NOT NULL; BEGIN; COMMIT; ROLLBACK",
+            |p| {
+                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                let SelectItem::Expr { expression, .. } = s.items[0] else {
+                    panic!()
+                };
+                assert!(matches!(
+                    expression,
+                    Expr::Cast {
+                        type_name: "bigint",
+                        ..
+                    }
+                ));
+                let SelectItem::Expr { expression, .. } = s.items[2] else {
+                    panic!()
+                };
+                assert!(matches!(expression, Expr::IsNull { negated: true, .. }));
+                assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Begin("")));
+                assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
+                assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));
+            },
+        );
     }
 
     #[test]

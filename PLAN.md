@@ -37,7 +37,7 @@ acknowledged data in durable mode.
 | P6 | Driver compatibility | Extended query protocol incl. binary parameters, named statements/portals; functions & aggregates; psycopg 3 suite passes | **done** (`pg_catalog` tables themselves still absent) |
 | P7 | Object storage is the database | CHECKPOINT + auto-checkpoint snapshot SSTs + CAS'd manifest; cold start from a wiped disk; WAL truncation; heap compaction; object GC | **done** (snapshot model — see "Deviations") |
 | P8 | External conformance suite | psql 18 golden tests (dialect, SQLSTATEs, extended), raw wire probes, psycopg, durability + cold-start scenarios; 12/12 pass | **done** |
-| P9 | Transactions | BEGIN/COMMIT/ROLLBACK, READ COMMITTED and REPEATABLE READ snapshots, READ ONLY enforcement, per-row pending/committed history with fail-fast 40001 conflicts, WAL-batch-at-commit, transactional DDL | **done** |
+| P9 | Transactions | BEGIN/COMMIT/ROLLBACK, READ COMMITTED and REPEATABLE READ snapshots, READ ONLY enforcement, commit-LSN-keyed row versions in resident staging and object SSTs with fail-fast 40001 conflicts, WAL-batch-at-commit, transactional DDL | **done** |
 | P10 | VSR multi-replica | Sans-io Replica state machine (normal op + view change), TCP transport (`vsr::cluster`), wire codec; 3-node cluster replicates and fails over | **done** (live psql write-routing into the cluster is the remaining productionization step) |
 | P11 | VOPR hardening | Deterministic whole-cluster simulator (`sim`) with loss/reorder/dup/delay/crash/partition; found and fixed two real consensus bugs (B-009, B-010); reproducible from a seed | **done** |
 | P12 | Compatibility polish | SCRAM-SHA-256 + cleartext auth, GROUP BY/HAVING/joins/subqueries, `pg_catalog` + `information_schema`, binary result format, portal max_rows, NOTICE, more types (date/timestamp/uuid/bytea), differential suite vs real PostgreSQL 18. | **done** (the TLS decision, deferred here, was later resolved in Stage G: isolated rustls to the object store) |
@@ -481,21 +481,22 @@ counts, noted for the day manifests are large.
 
 ### Stage F — MVCC snapshot reads over object-resident data
 
-Preserve snapshot isolation once the working set spills to the bucket. Committed
-rows now retain a bounded LSN-keyed history: a read at snapshot `S` sees the newest
-version whose `commit_lsn ≤ S`. REPEATABLE READ pins that snapshot across statements,
-READ ONLY is enforced recursively through prepared statements, and a fixed active-
-snapshot registry exposes the oldest retention watermark. Checkpoint publication may
-continue while a reader is pinned, but merge installation, history collapse, heap
-reclamation, and WAL pruning cannot destroy the pinned generation. A second writer
-still fails fast (`40001`).
+Preserve snapshot isolation once the working set spills to the bucket. Every
+committed row version carries its final WAL LSN; a read at snapshot `S` sees the
+newest version whose `commit_lsn ≤ S`. REPEATABLE READ pins that snapshot across
+statements, READ ONLY is enforced recursively through prepared statements, and a
+fixed active-snapshot registry exposes the oldest retention watermark. Checkpoints
+encode immutable entries by `(rowid, commit_lsn)`, publish while readers are pinned,
+and release their bounded resident staging histories after the manifest makes those
+versions object-resident. Point probes and merged walks use the same snapshot rule.
+Paced compaction keeps every version newer than the oldest live snapshot plus its
+one visible baseline, and may discard older versions only after that watermark
+advances. A second writer still fails fast (`40001`).
 
-The scalable end state remains a snapshot-aware merge iterator over live/frozen
-memtables and level SSTs, with historical versions resident in immutable objects
-rather than retained only in the bounded in-process history while a snapshot is
-active. **Milestone:** concurrent sessions show identical snapshot semantics whether
-data is in RAM or on the bucket; the full differential suite stays green with
-`memtable_bytes` shrunk tiny.
+**Milestone:** concurrent sessions show identical snapshot semantics whether data
+is in RAM or on the bucket; update churn and snapshot duration consume immutable
+object capacity rather than the bounded resident history; the full differential
+suite stays green with `memtable_bytes` shrunk tiny.
 
 **Status (2026-07-24): the forced-spill differential mode landed early** — the
 single-session half of the milestone needs no MVCC change, so it now runs as a
@@ -538,20 +539,28 @@ cold-starts the latest image from the same bucket. This closes the pg_dump
 consistency prerequisite without changing the durable hierarchy: the provider-neutral
 object store is authoritative, and RAM/local disk remain disposable caches.
 
-**Remaining Stage F work:** move historical versions into the SST format and merge
-them by `(rowid, commit_lsn)` so snapshot duration and update churn are bounded by
-object capacity rather than the eight-version resident history. The current bound
-fails loudly instead of discarding a visible version.
+**Status (2026-07-29): historical versions are object-resident.** The block SST
+format now sorts immutable live values and tombstones by
+`(rowid, commit_lsn DESC)`, while retaining read compatibility with manifests
+that name legacy rowid-only SSTs. One storage visibility choke point selects
+across pending command versions, resident committed versions, and every SST
+member. Delta checkpoints flush newly resident versions, then release their RAM
+side chains; paced pair merges compact physical version streams against the
+oldest active snapshot instead of stopping when a reader is pinned. Tombstones
+participate in bloom filters, so a certain-negative filter result can never
+resurrect an older member. The deterministic provider-neutral regression holds
+one old snapshot through 24 updates, a delete, 25 publications, repeated pair
+merges, and a cold start with both cache tiers wiped. The storage VOPR also
+proved commit publication independent of object-store reads during injected
+outages by removing old uniqueness-index entries by row identity.
 
-**Remaining integration constraint:** committed-history MVCC and Stage I's
-suspendable row source share one lifetime boundary and must use the same
-snapshot registry. Every current read materializes within its statement
-(portals fully materialize and cursors materialize at DECLARE), so today's
-oldest-live-snapshot watermark is always "now"; a suspendable read makes the
-watermark observable. The implementation therefore needs one coherent slice:
-LSN-stamped row versions, active-snapshot registration, snapshot-aware point
-and merged scans, and compaction retention. None of those semantics is claimed
-by the existing command-version chain.
+**Stage F core is complete for the current materialized execution model.**
+Stage I's future suspendable row source must register its longer-lived read in
+this same snapshot registry and unregister it only when the portal is exhausted
+or closed; it must not introduce a second retention mechanism. SERIALIZABLE
+predicate/range conflict tracking and PostgreSQL's block-and-wait writer
+behavior remain separate concurrency-fidelity work, not storage-authority
+exceptions.
 
 ### Stage G — object-store client hardening & multi-provider reach
 

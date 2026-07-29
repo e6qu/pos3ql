@@ -1,30 +1,29 @@
 //! A sorted string table over the block grid.
 //!
-//! An SST is a table's rows written once, in key order, and never changed —
+//! An SST is a table's row versions written once, in key order, and never changed —
 //! which is what lets it be a run of immutable blocks rather than a file that
-//! is seeked within. Rows are packed into [`BlockType::SstData`] blocks in key
-//! order, and a single [`BlockType::SstIndex`] block records, for each data
-//! block, the first key it holds and the block's identity. The index is the
-//! SST's root: given its identity a reader can find any key, and given the root
-//! nothing else about the SST needs naming.
+//! is seeked within. Current rows are packed into [`BlockType::SstDataV2`]
+//! blocks in key order, and sparse [`BlockType::SstIndexV2`] leaves record,
+//! for each data block, the first key it holds and the block's identity. A
+//! large SST adds one root over those leaves. Given the root identity a reader
+//! can find any key; nothing else about the SST needs naming.
 //!
 //! The index is *sparse* — one entry per data block, not per row. Finding a key
 //! is a binary search of the index for the last block whose first key does not
-//! exceed the target, then a scan of that one block. So a lookup reads exactly
-//! two blocks whatever the table's size: the index and the data block the key
-//! must be in if it is anywhere. That is the whole point of the sparse index —
-//! it is small enough to cache and to ship to the bucket alongside the data,
-//! the way Loki ships its chunk index.
+//! exceed the target, then a scan of that one block. A lookup reads a filter,
+//! one index leaf and one data block (plus the root for a multi-leaf SST).
+//! That is the whole point of the sparse index: lookup cost stays bounded as
+//! the table grows, and the index is cacheable alongside the data.
 //!
-//! Keys are row identities (`u64`), matching what the current checkpoint SST is
-//! keyed by, so this re-expresses that format in blocks rather than inventing a
-//! new key space. Rows within a block and blocks within the SST are both in
-//! ascending key order, which is what makes the two binary searches valid.
+//! Current SSTs key versions by `(rowid, commit_lsn)`: row identities ascend,
+//! and versions of one row descend by commit LSN so a snapshot lookup finds
+//! the newest admissible image first. The reader also accepts the original
+//! rowid-only block format; the next checkpoint rewrites those legacy SSTs.
 
 use crate::mem::arena::Arena;
 
 use super::bloom::{self, FILTER_BYTES};
-use super::{BlockId, BlockStore, BlockType, StoreError, MAX_PAYLOAD};
+use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
 /// What a finished SST is named by: the index block a reader searches, and the
 /// filter block it checks first to skip an SST that cannot hold a key. The
@@ -37,14 +36,66 @@ pub(crate) struct SstHandle {
     /// chain, filter, index), so garbage collection can enumerate an SST by
     /// reading one block instead of all of them.
     pub(crate) roster: BlockId,
+    /// False for manifests written before commit-LSN keys were introduced.
+    pub(crate) versioned: bool,
 }
 
-/// `rowid` u64 | `len` u32, then the row bytes — one row inside a data block.
+/// A durable row-version key. Ordering is rowid ascending, then commit LSN
+/// descending: all versions of one row are contiguous and newest-first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SstKey {
+    pub(crate) rowid: u64,
+    pub(crate) commit_lsn: u64,
+}
+
+impl SstKey {
+    pub(crate) const MIN: Self = Self {
+        rowid: 0,
+        commit_lsn: u64::MAX,
+    };
+
+    pub(crate) const fn newest(rowid: u64) -> Self {
+        Self {
+            rowid,
+            commit_lsn: u64::MAX,
+        }
+    }
+
+    pub(crate) const fn at(rowid: u64, commit_lsn: u64) -> Self {
+        Self { rowid, commit_lsn }
+    }
+
+    fn successor(self) -> Option<Self> {
+        if self.commit_lsn > 0 {
+            Some(Self::at(self.rowid, self.commit_lsn - 1))
+        } else {
+            self.rowid.checked_add(1).map(Self::newest)
+        }
+    }
+}
+
+impl Ord for SstKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.rowid
+            .cmp(&other.rowid)
+            .then_with(|| other.commit_lsn.cmp(&self.commit_lsn))
+    }
+}
+
+impl PartialOrd for SstKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Legacy: `rowid` u64 | `len` u32. Versioned: `rowid` u64 |
+/// `commit_lsn` u64 | `len` u32. The row bytes follow.
 /// `len`'s high bit marks a *chained* entry: a row too large for one block,
 /// whose payload continues in overflow blocks. The masked low bits are the
 /// row's total length; the entry body is then `n_chunks` u16, the overflow
 /// blocks' identities, and the head chunk inline.
-const ENTRY_HEADER: usize = 12;
+const LEGACY_ENTRY_HEADER: usize = 12;
+const VERSIONED_ENTRY_HEADER: usize = 20;
 
 /// High bit of the entry length: the row continues in overflow blocks.
 const CHAIN_FLAG: u32 = 1 << 31;
@@ -57,20 +108,20 @@ const TOMB_FLAG: u32 = 1 << 30;
 /// The largest assembled row a reader's scan scratch admits: the chained
 /// head chunk plus every overflow block.
 pub(crate) const MAX_ASSEMBLED: usize =
-    (MAX_PAYLOAD - ENTRY_HEADER - 2 - MAX_CHAIN * 32) + MAX_CHAIN * MAX_PAYLOAD;
+    (MAX_PAYLOAD - VERSIONED_ENTRY_HEADER - 2 - MAX_CHAIN * 32) + MAX_CHAIN * MAX_PAYLOAD;
 
 /// The most overflow blocks one chained row may span. With ~256 KiB blocks
 /// this caps a single row at about 4 MiB — far above anything the engine's
 /// arenas admit — and exceeding it is a loud error, never truncation.
 const MAX_CHAIN: usize = 16;
 
-/// `first_rowid` u64 | `block_id` [u8; 32] — one data block's index entry.
-const INDEX_ENTRY: usize = 8 + 32;
+const LEGACY_INDEX_ENTRY: usize = 8 + 32;
+const VERSIONED_INDEX_ENTRY: usize = 16 + 32;
 
 /// The most data blocks a single-block index can point at. A larger SST needs a
 /// multi-block index, which is a later concern; this bound is checked and raised
 /// rather than silently overrun.
-const MAX_DATA_BLOCKS: usize = MAX_PAYLOAD / INDEX_ENTRY;
+const MAX_DATA_BLOCKS: usize = MAX_PAYLOAD / VERSIONED_INDEX_ENTRY;
 
 /// The most block identities one roster block can list — and so the most
 /// blocks one SST may comprise. Checked and raised, never overrun.
@@ -112,13 +163,13 @@ pub(crate) struct SstWriter {
     pending: Box<[u8]>,
     pending_len: usize,
     /// The first key in the current data block, set when its first row lands.
-    pending_first: Option<u64>,
-    /// The index as it grows: `(first_rowid, block_id)` per flushed data block.
-    index: Box<[(u64, BlockId)]>,
+    pending_first: Option<SstKey>,
+    /// The index as it grows: `(first key, block_id)` per flushed data block.
+    index: Box<[(SstKey, BlockId)]>,
     index_len: usize,
     /// The last key written, so out-of-order rows are caught rather than
     /// producing an SST whose binary search silently misses them.
-    last_key: Option<u64>,
+    last_key: Option<SstKey>,
     /// The filter ladder: every key is set into all three candidate sizes,
     /// and finish keeps the smallest whose bits-per-key stays healthy — a
     /// small SST no longer pays a 128 KiB filter for a handful of rows.
@@ -131,10 +182,10 @@ pub(crate) struct SstWriter {
     /// LZ4 staging for data-block flushes: the smaller of raw/compressed is
     /// what gets stored.
     compress_buf: Box<[u8]>,
-    /// Flushed index leaves: `(first_rowid, data_block_count, id)`. One leaf
+    /// Flushed index leaves: `(first key, data_block_count, id)`. One leaf
     /// makes the classic single-block index; more make a two-level one, so
     /// an SST is no longer capped at one index block's worth of data.
-    leaves: Box<[(u64, u32, BlockId)]>,
+    leaves: Box<[(SstKey, u32, BlockId)]>,
     leaves_len: usize,
 }
 
@@ -153,8 +204,8 @@ const MAX_LEAVES: usize = 4096;
 /// Unambiguous: a leaf's count is at most `MAX_DATA_BLOCKS` (~6.5k).
 pub(crate) const INDEX_ROOT_MAGIC: u32 = 0xFFFF_FFFF;
 
-/// One root entry: `first_rowid u64 | data_block_count u32 | leaf id 32B`.
-const ROOT_ENTRY: usize = 8 + 4 + 32;
+const LEGACY_ROOT_ENTRY: usize = 8 + 4 + 32;
+const VERSIONED_ROOT_ENTRY: usize = 16 + 4 + 32;
 
 impl SstWriter {
     /// Allocates the writer's fixed buffers (about 0.9 MiB). Startup only —
@@ -164,7 +215,7 @@ impl SstWriter {
             pending: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             pending_len: 0,
             pending_first: None,
-            index: vec![(0u64, BlockId([0u8; 32])); MAX_DATA_BLOCKS].into_boxed_slice(),
+            index: vec![(SstKey::MIN, BlockId([0u8; 32])); MAX_DATA_BLOCKS].into_boxed_slice(),
             index_len: 0,
             last_key: None,
             filters: [
@@ -176,7 +227,7 @@ impl SstWriter {
             roster: vec![BlockId([0u8; 32]); MAX_ROSTER].into_boxed_slice(),
             roster_len: 0,
             compress_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
-            leaves: vec![(0u64, 0u32, BlockId([0u8; 32])); MAX_LEAVES].into_boxed_slice(),
+            leaves: vec![(SstKey::MIN, 0u32, BlockId([0u8; 32])); MAX_LEAVES].into_boxed_slice(),
             leaves_len: 0,
         }
     }
@@ -184,10 +235,10 @@ impl SstWriter {
     /// The fixed bytes one writer reserves, for budget estimates.
     pub(crate) fn budget_bytes() -> usize {
         2 * MAX_PAYLOAD // pending + compress staging
-            + MAX_DATA_BLOCKS * core::mem::size_of::<(u64, BlockId)>()
+            + MAX_DATA_BLOCKS * core::mem::size_of::<(SstKey, BlockId)>()
             + FILTER_TIERS.iter().sum::<usize>()
             + MAX_ROSTER * 32
-            + MAX_LEAVES * core::mem::size_of::<(u64, u32, BlockId)>()
+            + MAX_LEAVES * core::mem::size_of::<(SstKey, u32, BlockId)>()
     }
 
     /// Empties the writer for its next SST. Allocation-free.
@@ -219,29 +270,40 @@ impl SstWriter {
         rowid: u64,
         row: &[u8],
     ) -> Result<(), SstError> {
+        self.append_version(store, SstKey::at(rowid, 0), row)
+    }
+
+    /// Appends one committed image under its durable LSN.
+    pub(crate) fn append_version(
+        &mut self,
+        store: &mut dyn BlockStore,
+        key: SstKey,
+        row: &[u8],
+    ) -> Result<(), SstError> {
         if let Some(last) = self.last_key
-            && rowid <= last
+            && key <= last
         {
             return Err(SstError::KeyOutOfOrder);
         }
-        let entry = ENTRY_HEADER + row.len();
+        let entry = VERSIONED_ENTRY_HEADER + row.len();
         if entry > MAX_PAYLOAD {
-            return self.append_chained(store, rowid, row);
+            return self.append_chained(store, key, row);
         }
         if self.pending_len + entry > MAX_PAYLOAD {
             self.flush_data(store)?;
         }
         let at = self.pending_len;
-        self.pending[at..at + 8].copy_from_slice(&rowid.to_le_bytes());
-        self.pending[at + 8..at + 12].copy_from_slice(&(row.len() as u32).to_le_bytes());
-        self.pending[at + 12..at + entry].copy_from_slice(row);
+        self.pending[at..at + 8].copy_from_slice(&key.rowid.to_le_bytes());
+        self.pending[at + 8..at + 16].copy_from_slice(&key.commit_lsn.to_le_bytes());
+        self.pending[at + 16..at + 20].copy_from_slice(&(row.len() as u32).to_le_bytes());
+        self.pending[at + VERSIONED_ENTRY_HEADER..at + entry].copy_from_slice(row);
         self.pending_len += entry;
         if self.pending_first.is_none() {
-            self.pending_first = Some(rowid);
+            self.pending_first = Some(key);
         }
-        self.last_key = Some(rowid);
+        self.last_key = Some(key);
         for filter in &mut self.filters {
-            bloom::insert(filter, rowid);
+            bloom::insert(filter, key.rowid);
         }
         self.key_count += 1;
         Ok(())
@@ -253,12 +315,12 @@ impl SstWriter {
     fn append_chained(
         &mut self,
         store: &mut dyn BlockStore,
-        rowid: u64,
+        key: SstKey,
         row: &[u8],
     ) -> Result<(), SstError> {
         // The head block holds the entry header, the chunk count, up to
         // MAX_CHAIN identities, and the head chunk; overflow blocks are raw.
-        let head_room = MAX_PAYLOAD - ENTRY_HEADER - 2 - MAX_CHAIN * 32;
+        let head_room = MAX_PAYLOAD - VERSIONED_ENTRY_HEADER - 2 - MAX_CHAIN * 32;
         let tail = &row[head_room..];
         let n_chunks = tail.len().div_ceil(MAX_PAYLOAD);
         if n_chunks > MAX_CHAIN {
@@ -273,10 +335,11 @@ impl SstWriter {
             self.record(ids[i])?;
         }
         let at = 0usize;
-        self.pending[at..at + 8].copy_from_slice(&rowid.to_le_bytes());
-        self.pending[at + 8..at + 12]
+        self.pending[at..at + 8].copy_from_slice(&key.rowid.to_le_bytes());
+        self.pending[at + 8..at + 16].copy_from_slice(&key.commit_lsn.to_le_bytes());
+        self.pending[at + 16..at + 20]
             .copy_from_slice(&((row.len() as u32) | CHAIN_FLAG).to_le_bytes());
-        let mut cursor = ENTRY_HEADER;
+        let mut cursor = VERSIONED_ENTRY_HEADER;
         self.pending[cursor..cursor + 2].copy_from_slice(&(n_chunks as u16).to_le_bytes());
         cursor += 2;
         for id in &ids[..n_chunks] {
@@ -285,10 +348,10 @@ impl SstWriter {
         }
         self.pending[cursor..cursor + head_room].copy_from_slice(&row[..head_room]);
         self.pending_len = cursor + head_room;
-        self.pending_first = Some(rowid);
-        self.last_key = Some(rowid);
+        self.pending_first = Some(key);
+        self.last_key = Some(key);
         for filter in &mut self.filters {
-            bloom::insert(filter, rowid);
+            bloom::insert(filter, key.rowid);
         }
         self.key_count += 1;
         self.flush_data(store)
@@ -301,24 +364,38 @@ impl SstWriter {
         store: &mut dyn BlockStore,
         rowid: u64,
     ) -> Result<(), SstError> {
+        self.append_tombstone_version(store, SstKey::at(rowid, 0))
+    }
+
+    pub(crate) fn append_tombstone_version(
+        &mut self,
+        store: &mut dyn BlockStore,
+        key: SstKey,
+    ) -> Result<(), SstError> {
         if let Some(last) = self.last_key
-            && rowid <= last
+            && key <= last
         {
             return Err(SstError::KeyOutOfOrder);
         }
-        if self.pending_len + ENTRY_HEADER > MAX_PAYLOAD {
+        if self.pending_len + VERSIONED_ENTRY_HEADER > MAX_PAYLOAD {
             self.flush_data(store)?;
         }
         let at = self.pending_len;
-        self.pending[at..at + 8].copy_from_slice(&rowid.to_le_bytes());
-        self.pending[at + 8..at + 12].copy_from_slice(&TOMB_FLAG.to_le_bytes());
-        self.pending_len += ENTRY_HEADER;
+        self.pending[at..at + 8].copy_from_slice(&key.rowid.to_le_bytes());
+        self.pending[at + 8..at + 16].copy_from_slice(&key.commit_lsn.to_le_bytes());
+        self.pending[at + 16..at + 20].copy_from_slice(&TOMB_FLAG.to_le_bytes());
+        self.pending_len += VERSIONED_ENTRY_HEADER;
         if self.pending_first.is_none() {
-            self.pending_first = Some(rowid);
+            self.pending_first = Some(key);
         }
-        self.last_key = Some(rowid);
-        // Not in the bloom filter: the filter answers "is this row here", and
-        // a tombstone is exactly a row not being here.
+        self.last_key = Some(key);
+        // The filter answers whether this SST *mentions* the rowid. Omitting
+        // tombstones lets a negative filter skip the deletion and resurrect
+        // an older member's row.
+        for filter in &mut self.filters {
+            bloom::insert(filter, key.rowid);
+        }
+        self.key_count += 1;
         Ok(())
     }
 
@@ -340,16 +417,18 @@ impl SstWriter {
             // whether a root is needed over them.
             self.flush_index_leaf(store)?;
         }
-        let first = self.pending_first.expect("a non-empty block has a first key");
+        let first = self
+            .pending_first
+            .expect("a non-empty block has a first key");
         // Store whichever of raw/LZ4 is smaller: on object storage the bytes
         // are latency, bandwidth and money, and an incompressible block
         // costs nothing but this attempt.
         let raw = &self.pending[..self.pending_len];
         let id = match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
             Some(n) if n < raw.len() => {
-                store.put(&self.compress_buf[..n], BlockType::SstDataLz4, 0)?
+                store.put(&self.compress_buf[..n], BlockType::SstDataV2Lz4, 0)?
             }
-            _ => store.put(raw, BlockType::SstData, 0)?,
+            _ => store.put(raw, BlockType::SstDataV2, 0)?,
         };
         self.record(id)?;
         self.index[self.index_len] = (first, id);
@@ -368,18 +447,17 @@ impl SstWriter {
         if self.leaves_len == MAX_LEAVES {
             return Err(SstError::TooManyBlocks);
         }
-        let bytes = 4 + self.index_len * INDEX_ENTRY;
+        let bytes = 4 + self.index_len * VERSIONED_INDEX_ENTRY;
         let buffer = &mut *self.compress_buf; // free between data flushes
         buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
         for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
-            let at = 4 + i * INDEX_ENTRY;
-            buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
-            buffer[at + 8..at + INDEX_ENTRY].copy_from_slice(&id.0);
+            let at = 4 + i * VERSIONED_INDEX_ENTRY;
+            write_key(*first, &mut buffer[at..at + 16]);
+            buffer[at + 16..at + VERSIONED_INDEX_ENTRY].copy_from_slice(&id.0);
         }
-        let id = store.put(&self.compress_buf[..bytes], BlockType::SstIndex, 0)?;
+        let id = store.put(&self.compress_buf[..bytes], BlockType::SstIndexV2, 0)?;
         self.record(id)?;
-        self.leaves[self.leaves_len] =
-            (self.index[0].0, self.index_len as u32, id);
+        self.leaves[self.leaves_len] = (self.index[0].0, self.index_len as u32, id);
         self.leaves_len += 1;
         self.index_len = 0;
         Ok(())
@@ -409,28 +487,28 @@ impl SstWriter {
         // block; more make leaves under a root, so SST size is no longer
         // bounded by one index block.
         let index = if self.leaves_len == 0 {
-            let bytes = 4 + self.index_len * INDEX_ENTRY;
+            let bytes = 4 + self.index_len * VERSIONED_INDEX_ENTRY;
             let buffer = &mut *self.pending; // reuse the data scratch; it is done with
             buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
             for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
-                let at = 4 + i * INDEX_ENTRY;
-                buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
-                buffer[at + 8..at + INDEX_ENTRY].copy_from_slice(&id.0);
+                let at = 4 + i * VERSIONED_INDEX_ENTRY;
+                write_key(*first, &mut buffer[at..at + 16]);
+                buffer[at + 16..at + VERSIONED_INDEX_ENTRY].copy_from_slice(&id.0);
             }
-            store.put(&buffer[..bytes], BlockType::SstIndex, 0)?
+            store.put(&buffer[..bytes], BlockType::SstIndexV2, 0)?
         } else {
             self.flush_index_leaf(store)?;
-            let bytes = 8 + self.leaves_len * ROOT_ENTRY;
+            let bytes = 8 + self.leaves_len * VERSIONED_ROOT_ENTRY;
             let buffer = &mut *self.pending;
             buffer[0..4].copy_from_slice(&INDEX_ROOT_MAGIC.to_le_bytes());
             buffer[4..8].copy_from_slice(&(self.leaves_len as u32).to_le_bytes());
             for (i, (first, count, id)) in self.leaves[..self.leaves_len].iter().enumerate() {
-                let at = 8 + i * ROOT_ENTRY;
-                buffer[at..at + 8].copy_from_slice(&first.to_le_bytes());
-                buffer[at + 8..at + 12].copy_from_slice(&count.to_le_bytes());
-                buffer[at + 12..at + ROOT_ENTRY].copy_from_slice(&id.0);
+                let at = 8 + i * VERSIONED_ROOT_ENTRY;
+                write_key(*first, &mut buffer[at..at + 16]);
+                buffer[at + 16..at + 20].copy_from_slice(&count.to_le_bytes());
+                buffer[at + 20..at + VERSIONED_ROOT_ENTRY].copy_from_slice(&id.0);
             }
-            store.put(&buffer[..bytes], BlockType::SstIndex, 0)?
+            store.put(&buffer[..bytes], BlockType::SstIndexV2, 0)?
         };
         if self.roster_len == MAX_ROSTER {
             return Err(SstError::TooManyBlocks);
@@ -447,7 +525,12 @@ impl SstWriter {
             buffer[i * 32..i * 32 + 32].copy_from_slice(&id.0);
         }
         let roster = store.put(&buffer[..roster_bytes], BlockType::SstRoster, 0)?;
-        Ok(Some(SstHandle { index, filter, roster }))
+        Ok(Some(SstHandle {
+            index,
+            filter,
+            roster,
+            versioned: true,
+        }))
     }
 }
 
@@ -462,6 +545,13 @@ pub(crate) struct SstReader<'a> {
     assembly: &'a mut [u8],
 }
 
+/// One SST's best version for a snapshot. `len == None` is a deletion marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SstProbe {
+    pub(crate) key: SstKey,
+    pub(crate) len: Option<u32>,
+}
+
 /// Fetches a data block, transparently decompressing an LZ4 one: `buf`
 /// receives the raw entries either way; `bounce` stages the compressed
 /// bytes (any MAX_PAYLOAD-sized buffer that is free at the call).
@@ -473,13 +563,16 @@ pub(crate) fn read_data_block(
 ) -> Result<usize, SstError> {
     let (n, block_type) = store.get(id, buf)?;
     match block_type {
-        BlockType::SstData => Ok(n),
-        BlockType::SstDataLz4 => {
+        BlockType::SstData | BlockType::SstDataV2 => Ok(n),
+        BlockType::SstDataLz4 | BlockType::SstDataV2Lz4 => {
             bounce[..n].copy_from_slice(&buf[..n]);
-            super::lz4::decompress(&bounce[..n], buf)
-                .ok_or(SstError::Store(StoreError::Corrupt(super::BlockError::Payload)))
+            super::lz4::decompress(&bounce[..n], buf).ok_or(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            )))
         }
-        _ => Err(SstError::Store(StoreError::Corrupt(super::BlockError::UnknownType))),
+        _ => Err(SstError::Store(StoreError::Corrupt(
+            super::BlockError::UnknownType,
+        ))),
     }
 }
 
@@ -494,18 +587,22 @@ impl<'a> SstReader<'a> {
         let assembly = arena
             .alloc_slice_with(MAX_ASSEMBLED, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        Ok(Self { index_scratch, data_scratch, assembly })
+        Ok(Self {
+            index_scratch,
+            data_scratch,
+            assembly,
+        })
     }
 
     /// A reader over caller-owned buffers — the long-lived spill path, whose
     /// scratch persists across statements instead of living in an arena.
     /// `index`/`data` must each hold a block payload; `assembly` a chained row.
-    pub(crate) fn over(
-        index: &'a mut [u8],
-        data: &'a mut [u8],
-        assembly: &'a mut [u8],
-    ) -> Self {
-        Self { index_scratch: index, data_scratch: data, assembly }
+    pub(crate) fn over(index: &'a mut [u8], data: &'a mut [u8], assembly: &'a mut [u8]) -> Self {
+        Self {
+            index_scratch: index,
+            data_scratch: data,
+            assembly,
+        }
     }
 
     /// Finds `rowid`, copying its row into `into` and returning the length, or
@@ -520,46 +617,69 @@ impl<'a> SstReader<'a> {
         rowid: u64,
         into: &mut [u8],
     ) -> Result<Option<usize>, SstError> {
+        Ok(self
+            .get_at(store, handle, rowid, u64::MAX, into)?
+            .and_then(|probe| probe.len.map(|length| length as usize)))
+    }
+
+    /// Finds the newest version of `rowid` whose commit LSN is at or below
+    /// `snapshot`, copying a live image into `into`. A returned `SstProbe`
+    /// with no length is a visible tombstone, distinct from no version.
+    pub(crate) fn get_at(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+        snapshot: u64,
+        into: &mut [u8],
+    ) -> Result<Option<SstProbe>, SstError> {
         // The filter reuses the index buffer: it is consulted and done with
         // before the index is read, so the two never coexist.
         let (filter_len, _) = store.get(&handle.filter, self.index_scratch)?;
         if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
             return Ok(None);
         }
-        let count = self.load_covering_leaf(store, &handle.index, rowid)?;
-        let Some(entry) = block_containing(self.index_scratch, count, rowid) else {
+        let target = SstKey::at(rowid, if handle.versioned { snapshot } else { 0 });
+        let count = self.load_covering_leaf(store, handle, target)?;
+        let Some(entry) = block_containing(self.index_scratch, count, target, handle.versioned)
+        else {
             return Ok(None);
         };
-        let block_id = block_id_at(self.index_scratch, entry);
+        let block_id = block_id_at(self.index_scratch, entry, handle.versioned);
 
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
         let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
-        let mut found: Option<(usize, bool)> = None;
-        for entry in DataBlock(&self.data_scratch[..data_len]) {
-            if entry.key == rowid {
+        for entry in (DataBlock {
+            bytes: &self.data_scratch[..data_len],
+            versioned: handle.versioned,
+        }) {
+            if entry.key.rowid == rowid && entry.key.commit_lsn <= snapshot {
                 if entry.tombstone {
-                    break;
+                    return Ok(Some(SstProbe {
+                        key: entry.key,
+                        len: None,
+                    }));
                 }
                 if entry.is_chained() {
                     assemble_chain(store, &entry, into)?;
-                    found = Some((entry.total_len, true));
                 } else {
                     if into.len() < entry.total_len {
                         return Err(SstError::Store(StoreError::BufferTooSmall));
                     }
                     into[..entry.total_len].copy_from_slice(entry.head);
-                    found = Some((entry.total_len, false));
                 }
-                break;
+                return Ok(Some(SstProbe {
+                    key: entry.key,
+                    len: Some(entry.total_len as u32),
+                }));
             }
-            // Rows are ascending, so once past the target it is not here.
-            if entry.key > rowid {
+            if entry.key.rowid > rowid {
                 break;
             }
         }
-        Ok(found.map(|(n, _)| n))
+        Ok(None)
     }
 
     /// Whether the SST holds `rowid`, without copying its bytes: `None` —
@@ -573,25 +693,41 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         rowid: u64,
     ) -> Result<Option<Option<u32>>, SstError> {
+        Ok(self
+            .probe_at(store, handle, rowid, u64::MAX)?
+            .map(|probe| probe.len))
+    }
+
+    pub(crate) fn probe_at(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<SstProbe>, SstError> {
         let (filter_len, _) = store.get(&handle.filter, self.index_scratch)?;
         if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
             return Ok(None);
         }
-        let count = self.load_covering_leaf(store, &handle.index, rowid)?;
-        let Some(entry) = block_containing(self.index_scratch, count, rowid) else {
+        let target = SstKey::at(rowid, if handle.versioned { snapshot } else { 0 });
+        let count = self.load_covering_leaf(store, handle, target)?;
+        let Some(entry) = block_containing(self.index_scratch, count, target, handle.versioned)
+        else {
             return Ok(None);
         };
-        let block_id = block_id_at(self.index_scratch, entry);
+        let block_id = block_id_at(self.index_scratch, entry, handle.versioned);
         let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
-        for entry in DataBlock(&self.data_scratch[..data_len]) {
-            if entry.key == rowid {
-                return Ok(Some(if entry.tombstone {
-                    None
-                } else {
-                    Some(entry.total_len as u32)
+        for entry in (DataBlock {
+            bytes: &self.data_scratch[..data_len],
+            versioned: handle.versioned,
+        }) {
+            if entry.key.rowid == rowid && entry.key.commit_lsn <= snapshot {
+                return Ok(Some(SstProbe {
+                    key: entry.key,
+                    len: (!entry.tombstone).then_some(entry.total_len as u32),
                 }));
             }
-            if entry.key > rowid {
+            if entry.key.rowid > rowid {
                 break;
             }
         }
@@ -618,94 +754,100 @@ impl<'a> SstReader<'a> {
         // help here; the index locates the covering blocks directly. Leaves
         // walk in order (a single-block index is its own only leaf), the
         // root refetched per leaf advance through the cache.
-        let start_leaf = self.leaf_for(store, &handle.index, lo)?;
+        let start_key = SstKey::newest(lo);
+        let start_leaf = self.leaf_for(store, handle, start_key)?;
         let mut leaf_ordinal = start_leaf;
+        let mut emitted_rowid: Option<u64> = None;
         'leaves: loop {
-        let Some(count) = self.load_leaf(store, &handle.index, leaf_ordinal)? else {
-            break 'leaves;
-        };
-        // The block `lo` falls in, or — when `lo` precedes every key — the
-        // first block, since the range may still cover it from the left.
-        let start = if leaf_ordinal == start_leaf {
-            block_containing(self.index_scratch, count, lo).unwrap_or(0)
-        } else {
-            0
-        };
-        for entry_index in start..count {
-            let block_id = block_id_at(self.index_scratch, entry_index);
-            let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
-            let mut ran_past = false;
-            // A chained entry owns its whole block, so at most one assembly
-            // happens per block and the borrow of `data_scratch` has ended by
-            // the time the chain's overflow blocks are read.
-            let mut chained: Option<(u64, usize)> = None;
-            for entry in DataBlock(&self.data_scratch[..data_len]) {
-                if entry.key > hi {
-                    ran_past = true;
-                    break;
-                }
-                if entry.key >= lo {
-                    if entry.tombstone {
-                        emit(entry.key, None);
-                    } else if entry.is_chained() {
-                        assemble_chain(store, &entry, self.assembly)?;
-                        chained = Some((entry.key, entry.total_len));
+            let Some(count) = self.load_leaf(store, handle, leaf_ordinal)? else {
+                break 'leaves;
+            };
+            // The block `lo` falls in, or — when `lo` precedes every key — the
+            // first block, since the range may still cover it from the left.
+            let start = if leaf_ordinal == start_leaf {
+                block_containing(self.index_scratch, count, start_key, handle.versioned)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            for entry_index in start..count {
+                let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
+                let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
+                let mut ran_past = false;
+                // A chained entry owns its whole block, so at most one assembly
+                // happens per block and the borrow of `data_scratch` has ended by
+                // the time the chain's overflow blocks are read.
+                let mut chained: Option<(u64, usize)> = None;
+                for entry in (DataBlock {
+                    bytes: &self.data_scratch[..data_len],
+                    versioned: handle.versioned,
+                }) {
+                    if entry.key.rowid > hi {
+                        ran_past = true;
                         break;
-                    } else {
-                        emit(entry.key, Some(entry.head));
+                    }
+                    if entry.key.rowid >= lo && emitted_rowid != Some(entry.key.rowid) {
+                        emitted_rowid = Some(entry.key.rowid);
+                        if entry.tombstone {
+                            emit(entry.key.rowid, None);
+                        } else if entry.is_chained() {
+                            assemble_chain(store, &entry, self.assembly)?;
+                            chained = Some((entry.key.rowid, entry.total_len));
+                            break;
+                        } else {
+                            emit(entry.key.rowid, Some(entry.head));
+                        }
                     }
                 }
+                if let Some((key, n)) = chained {
+                    emit(key, Some(&self.assembly[..n]));
+                }
+                // A block ending past `hi` bounds the scan: later blocks hold only
+                // larger keys, so none of them can be in range.
+                if ran_past {
+                    break 'leaves;
+                }
             }
-            if let Some((key, n)) = chained {
-                emit(key, Some(&self.assembly[..n]));
-            }
-            // A block ending past `hi` bounds the scan: later blocks hold only
-            // larger keys, so none of them can be in range.
-            if ran_past {
-                break 'leaves;
-            }
-        }
-        leaf_ordinal += 1;
+            leaf_ordinal += 1;
         }
         Ok(())
     }
 
-    /// A bounded slice of a full scan: streams rows with keys `>= lo`, in key
-    /// order, reading at most `max_blocks` data blocks, and returns where to
-    /// resume — `Some(next_lo)` when the SST has more, `None` when it is
-    /// exhausted. This is what lets a paced merge pay for its schedule a few
-    /// block reads per beat instead of one unbounded pass.
-    pub(crate) fn scan_bounded(
+    /// Bounded physical-version scan used by compaction. Unlike `scan`, it
+    /// does not collapse versions of one row.
+    pub(crate) fn scan_versions_bounded(
         &mut self,
         store: &mut dyn BlockStore,
         handle: &SstHandle,
-        lo: u64,
+        lo: SstKey,
         max_blocks: usize,
-        emit: &mut dyn FnMut(u64, bool),
-    ) -> Result<Option<u64>, SstError> {
-        let start_leaf = self.leaf_for(store, &handle.index, lo)?;
+        emit: &mut dyn FnMut(SstKey, bool),
+    ) -> Result<Option<SstKey>, SstError> {
+        let start_leaf = self.leaf_for(store, handle, lo)?;
         let mut leaf_ordinal = start_leaf;
         let mut budget = max_blocks;
-        let mut last_key: Option<u64> = None;
+        let mut last_key: Option<SstKey> = None;
         loop {
-            let Some(count) = self.load_leaf(store, &handle.index, leaf_ordinal)? else {
+            let Some(count) = self.load_leaf(store, handle, leaf_ordinal)? else {
                 return Ok(None); // the SST is exhausted
             };
             let start = if leaf_ordinal == start_leaf {
-                block_containing(self.index_scratch, count, lo).unwrap_or(0)
+                block_containing(self.index_scratch, count, lo, handle.versioned).unwrap_or(0)
             } else {
                 0
             };
             let end = (start + budget).min(count);
             for entry_index in start..end {
-                let block_id = block_id_at(self.index_scratch, entry_index);
-                let data_len =
-                    read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
-                for entry in DataBlock(&self.data_scratch[..data_len]) {
+                let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
+                let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
+                for entry in (DataBlock {
+                    bytes: &self.data_scratch[..data_len],
+                    versioned: handle.versioned,
+                }) {
                     if entry.key >= lo {
                         emit(entry.key, entry.tombstone);
                     }
-                    last_key = Some(last_key.map_or(entry.key, |k| k.max(entry.key)));
+                    last_key = Some(last_key.map_or(entry.key, |key| key.max(entry.key)));
                 }
             }
             budget -= end - start;
@@ -722,9 +864,7 @@ impl<'a> SstReader<'a> {
                 break;
             }
         }
-        // Resuming one past the largest key seen re-locates through the index
-        // and cannot skip an entry: keys are unique and ascending.
-        Ok(Some(last_key.map_or(lo, |k| k + 1)))
+        Ok(last_key.and_then(SstKey::successor))
     }
 
     /// Loads leaf `ordinal` of the index into the index scratch and returns
@@ -733,10 +873,10 @@ impl<'a> SstReader<'a> {
     fn load_leaf(
         &mut self,
         store: &mut dyn BlockStore,
-        root: &BlockId,
+        handle: &SstHandle,
         ordinal: usize,
     ) -> Result<Option<usize>, SstError> {
-        let _ = store.get(root, self.index_scratch)?;
+        load_index(store, &handle.index, self.index_scratch, handle.versioned)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
             return Ok((ordinal == 0).then_some(head as usize));
@@ -745,10 +885,12 @@ impl<'a> SstReader<'a> {
         if ordinal >= leaves {
             return Ok(None);
         }
-        let at = 8 + ordinal * ROOT_ENTRY;
+        let entry_size = root_entry_size(handle.versioned);
+        let key_bytes = key_size(handle.versioned);
+        let at = 8 + ordinal * entry_size;
         let mut id = [0u8; 32];
-        id.copy_from_slice(&self.index_scratch[at + 12..at + ROOT_ENTRY]);
-        let _ = store.get(&BlockId(id), self.index_scratch)?;
+        id.copy_from_slice(&self.index_scratch[at + key_bytes + 4..at + entry_size]);
+        load_index(store, &BlockId(id), self.index_scratch, handle.versioned)?;
         Ok(Some(
             u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize,
         ))
@@ -759,16 +901,16 @@ impl<'a> SstReader<'a> {
     fn leaf_for(
         &mut self,
         store: &mut dyn BlockStore,
-        root: &BlockId,
-        rowid: u64,
+        handle: &SstHandle,
+        key: SstKey,
     ) -> Result<usize, SstError> {
-        let _ = store.get(root, self.index_scratch)?;
+        load_index(store, &handle.index, self.index_scratch, handle.versioned)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
             return Ok(0);
         }
         let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
-        Ok(root_leaf_containing(self.index_scratch, leaves, rowid).unwrap_or(0))
+        Ok(root_leaf_containing(self.index_scratch, leaves, key, handle.versioned).unwrap_or(0))
     }
 
     /// Loads the leaf covering `rowid` and returns its entry count — after
@@ -777,10 +919,10 @@ impl<'a> SstReader<'a> {
     fn load_covering_leaf(
         &mut self,
         store: &mut dyn BlockStore,
-        root: &BlockId,
-        rowid: u64,
+        handle: &SstHandle,
+        key: SstKey,
     ) -> Result<usize, SstError> {
-        let _ = store.get(root, self.index_scratch)?;
+        load_index(store, &handle.index, self.index_scratch, handle.versioned)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
             // The single-block shape: the root is its own covering leaf, and
@@ -788,21 +930,25 @@ impl<'a> SstReader<'a> {
             return Ok(head as usize);
         }
         let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
-        let leaf = root_leaf_containing(self.index_scratch, leaves, rowid).unwrap_or(0);
-        let at = 8 + leaf * ROOT_ENTRY;
+        let leaf =
+            root_leaf_containing(self.index_scratch, leaves, key, handle.versioned).unwrap_or(0);
+        let entry_size = root_entry_size(handle.versioned);
+        let key_bytes = key_size(handle.versioned);
+        let at = 8 + leaf * entry_size;
         let mut id = [0u8; 32];
-        id.copy_from_slice(&self.index_scratch[at + 12..at + ROOT_ENTRY]);
-        let _ = store.get(&BlockId(id), self.index_scratch)?;
+        id.copy_from_slice(&self.index_scratch[at + key_bytes + 4..at + entry_size]);
+        load_index(store, &BlockId(id), self.index_scratch, handle.versioned)?;
         Ok(u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize)
     }
 }
 
 /// The root entry (last one whose first key does not exceed `key`) in a
 /// fetched two-level root. `None` when `key` precedes every leaf.
-fn root_leaf_containing(root: &[u8], leaves: usize, key: u64) -> Option<usize> {
+fn root_leaf_containing(root: &[u8], leaves: usize, key: SstKey, versioned: bool) -> Option<usize> {
+    let entry_size = root_entry_size(versioned);
     let first_key = |i: usize| {
-        let at = 8 + i * ROOT_ENTRY;
-        u64::from_le_bytes(root[at..at + 8].try_into().unwrap())
+        let at = 8 + i * entry_size;
+        read_key(&root[at..], versioned)
     };
     if leaves == 0 || key < first_key(0) {
         return None;
@@ -816,7 +962,15 @@ fn root_leaf_containing(root: &[u8], leaves: usize, key: u64) -> Option<usize> {
             hi = mid - 1;
         }
     }
-    Some(lo)
+    if first_key(lo).rowid != key.rowid
+        && lo + 1 < leaves
+        && first_key(lo + 1).rowid == key.rowid
+        && key < first_key(lo + 1)
+    {
+        Some(lo + 1)
+    } else {
+        Some(lo)
+    }
 }
 
 /// Resolves global data-block `ordinal` through an SST's index root of
@@ -825,29 +979,32 @@ fn root_leaf_containing(root: &[u8], leaves: usize, key: u64) -> Option<usize> {
 /// walk an SST without holding its whole index resident.
 pub(crate) fn locate_data_block(
     store: &mut dyn BlockStore,
-    root: &BlockId,
+    handle: &SstHandle,
     buf: &mut [u8],
     ordinal: usize,
 ) -> Result<Option<BlockId>, SstError> {
-    let _ = store.get(root, buf)?;
+    load_index(store, &handle.index, buf, handle.versioned)?;
     let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if head != INDEX_ROOT_MAGIC {
         let count = head as usize;
         if ordinal >= count {
             return Ok(None);
         }
-        return Ok(Some(block_id_at(buf, ordinal)));
+        return Ok(Some(block_id_at(buf, ordinal, handle.versioned)));
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+    let entry_size = root_entry_size(handle.versioned);
+    let key_bytes = key_size(handle.versioned);
     let mut remaining = ordinal;
     for leaf in 0..leaves {
-        let at = 8 + leaf * ROOT_ENTRY;
-        let count = u32::from_le_bytes(buf[at + 8..at + 12].try_into().unwrap()) as usize;
+        let at = 8 + leaf * entry_size;
+        let count = u32::from_le_bytes(buf[at + key_bytes..at + key_bytes + 4].try_into().unwrap())
+            as usize;
         if remaining < count {
             let mut id = [0u8; 32];
-            id.copy_from_slice(&buf[at + 12..at + ROOT_ENTRY]);
-            let _ = store.get(&BlockId(id), buf)?;
-            return Ok(Some(block_id_at(buf, remaining)));
+            id.copy_from_slice(&buf[at + key_bytes + 4..at + entry_size]);
+            load_index(store, &BlockId(id), buf, handle.versioned)?;
+            return Ok(Some(block_id_at(buf, remaining, handle.versioned)));
         }
         remaining -= count;
     }
@@ -857,19 +1014,22 @@ pub(crate) fn locate_data_block(
 /// Total data blocks under an SST's index root of either shape.
 pub(crate) fn data_block_total(
     store: &mut dyn BlockStore,
-    root: &BlockId,
+    handle: &SstHandle,
     buf: &mut [u8],
 ) -> Result<usize, SstError> {
-    let _ = store.get(root, buf)?;
+    load_index(store, &handle.index, buf, handle.versioned)?;
     let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if head != INDEX_ROOT_MAGIC {
         return Ok(head as usize);
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+    let entry_size = root_entry_size(handle.versioned);
+    let key_bytes = key_size(handle.versioned);
     let mut total = 0usize;
     for leaf in 0..leaves {
-        let at = 8 + leaf * ROOT_ENTRY;
-        total += u32::from_le_bytes(buf[at + 8..at + 12].try_into().unwrap()) as usize;
+        let at = 8 + leaf * entry_size;
+        total += u32::from_le_bytes(buf[at + key_bytes..at + key_bytes + 4].try_into().unwrap())
+            as usize;
     }
     Ok(total)
 }
@@ -877,13 +1037,19 @@ pub(crate) fn data_block_total(
 /// Binary-searches the sparse index for the last block whose first key does not
 /// exceed `key` — the only data block `key` can be in. `None` when the index is
 /// empty or `key` precedes every block's first key.
-fn block_containing(index: &[u8], count: usize, key: u64) -> Option<usize> {
+fn block_containing(index: &[u8], count: usize, key: SstKey, versioned: bool) -> Option<usize> {
+    let entry_size = index_entry_size(versioned);
     let first_key = |i: usize| {
-        let at = 4 + i * INDEX_ENTRY;
-        u64::from_le_bytes(index[at..at + 8].try_into().unwrap())
+        let at = 4 + i * entry_size;
+        read_key(&index[at..], versioned)
     };
-    if count == 0 || key < first_key(0) {
+    if count == 0 {
         return None;
+    }
+    if key < first_key(0) {
+        // A snapshot target newer than this SST's first version still belongs
+        // in the first block when the rowid matches.
+        return (key.rowid == first_key(0).rowid).then_some(0);
     }
     let (mut lo, mut hi) = (0usize, count - 1);
     while lo < hi {
@@ -894,14 +1060,80 @@ fn block_containing(index: &[u8], count: usize, key: u64) -> Option<usize> {
             hi = mid - 1;
         }
     }
-    Some(lo)
+    if first_key(lo).rowid != key.rowid
+        && lo + 1 < count
+        && first_key(lo + 1).rowid == key.rowid
+        && key < first_key(lo + 1)
+    {
+        Some(lo + 1)
+    } else {
+        Some(lo)
+    }
 }
 
 /// The block identity stored in index entry `i`.
-fn block_id_at(index: &[u8], i: usize) -> BlockId {
+fn block_id_at(index: &[u8], i: usize, versioned: bool) -> BlockId {
+    let entry_size = index_entry_size(versioned);
+    let key_bytes = key_size(versioned);
+    let at = 4 + i * entry_size;
     let mut id = [0u8; 32];
-    id.copy_from_slice(&index[4 + i * INDEX_ENTRY + 8..4 + i * INDEX_ENTRY + INDEX_ENTRY]);
+    id.copy_from_slice(&index[at + key_bytes..at + entry_size]);
     BlockId(id)
+}
+
+fn key_size(versioned: bool) -> usize {
+    if versioned { 16 } else { 8 }
+}
+
+fn index_entry_size(versioned: bool) -> usize {
+    if versioned {
+        VERSIONED_INDEX_ENTRY
+    } else {
+        LEGACY_INDEX_ENTRY
+    }
+}
+
+fn root_entry_size(versioned: bool) -> usize {
+    if versioned {
+        VERSIONED_ROOT_ENTRY
+    } else {
+        LEGACY_ROOT_ENTRY
+    }
+}
+
+fn write_key(key: SstKey, into: &mut [u8]) {
+    into[0..8].copy_from_slice(&key.rowid.to_le_bytes());
+    into[8..16].copy_from_slice(&key.commit_lsn.to_le_bytes());
+}
+
+fn read_key(bytes: &[u8], versioned: bool) -> SstKey {
+    let rowid = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let commit_lsn = if versioned {
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap())
+    } else {
+        0
+    };
+    SstKey::at(rowid, commit_lsn)
+}
+
+fn load_index(
+    store: &mut dyn BlockStore,
+    id: &BlockId,
+    into: &mut [u8],
+    versioned: bool,
+) -> Result<usize, SstError> {
+    let (length, block_type) = store.get(id, into)?;
+    let expected = if versioned {
+        BlockType::SstIndexV2
+    } else {
+        BlockType::SstIndex
+    };
+    if block_type != expected {
+        return Err(SstError::Store(StoreError::Corrupt(
+            super::BlockError::UnknownType,
+        )));
+    }
+    Ok(length)
 }
 
 /// One row read out of a data block. For an ordinary entry `head` is the
@@ -909,7 +1141,7 @@ fn block_id_at(index: &[u8], i: usize) -> BlockId {
 /// chunk and `chain` the overflow blocks' identities (32 bytes each), with
 /// `total_len` the assembled row's length.
 struct DataEntry<'a> {
-    key: u64,
+    key: SstKey,
     total_len: usize,
     head: &'a [u8],
     chain: &'a [u8],
@@ -925,27 +1157,48 @@ impl DataEntry<'_> {
 /// Iterates the `(key, len, row)` entries packed in a data block, in the key
 /// order they were written. A short trailing fragment — never present in a
 /// well-formed block — ends iteration rather than reading past the payload.
-struct DataBlock<'a>(&'a [u8]);
+struct DataBlock<'a> {
+    bytes: &'a [u8],
+    versioned: bool,
+}
 
 impl<'a> Iterator for DataBlock<'a> {
     type Item = DataEntry<'a>;
 
     fn next(&mut self) -> Option<DataEntry<'a>> {
-        let data = self.0;
-        if data.len() < ENTRY_HEADER {
+        let data = self.bytes;
+        let header = if self.versioned {
+            VERSIONED_ENTRY_HEADER
+        } else {
+            LEGACY_ENTRY_HEADER
+        };
+        if data.len() < header {
             return None;
         }
-        let key = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let raw_len = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let rowid = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let commit_lsn = if self.versioned {
+            u64::from_le_bytes(data[8..16].try_into().unwrap())
+        } else {
+            0
+        };
+        let key = SstKey::at(rowid, commit_lsn);
+        let length_at = if self.versioned { 16 } else { 8 };
+        let raw_len = u32::from_le_bytes(data[length_at..length_at + 4].try_into().unwrap());
         if raw_len & TOMB_FLAG != 0 {
-            self.0 = &data[ENTRY_HEADER..];
-            return Some(DataEntry { key, total_len: 0, head: &[], chain: &[], tombstone: true });
+            self.bytes = &data[header..];
+            return Some(DataEntry {
+                key,
+                total_len: 0,
+                head: &[],
+                chain: &[],
+                tombstone: true,
+            });
         }
         if raw_len & CHAIN_FLAG != 0 {
             // A chained head fills the rest of its block: count, identities,
             // then the leading chunk.
             let total_len = (raw_len & !CHAIN_FLAG) as usize;
-            let body = &data[ENTRY_HEADER..];
+            let body = &data[header..];
             if body.len() < 2 {
                 return None;
             }
@@ -955,18 +1208,24 @@ impl<'a> Iterator for DataBlock<'a> {
             }
             let chain = &body[2..2 + n_chunks * 32];
             let head = &body[2 + n_chunks * 32..];
-            self.0 = &[];
-            return Some(DataEntry { key, total_len, head, chain, tombstone: false });
+            self.bytes = &[];
+            return Some(DataEntry {
+                key,
+                total_len,
+                head,
+                chain,
+                tombstone: false,
+            });
         }
         let len = raw_len as usize;
-        if data.len() < ENTRY_HEADER + len {
+        if data.len() < header + len {
             return None;
         }
-        self.0 = &data[ENTRY_HEADER + len..];
+        self.bytes = &data[header + len..];
         Some(DataEntry {
             key,
             total_len: len,
-            head: &data[ENTRY_HEADER..ENTRY_HEADER + len],
+            head: &data[header..header + len],
             chain: &[],
             tombstone: false,
         })
@@ -977,26 +1236,28 @@ impl<'a> Iterator for DataBlock<'a> {
 /// block's entries without copying row bytes — how the row-map overlay's
 /// merged enumeration walks keys. `at` is the previous step's returned
 /// offset (0 to start); `None` is the block's end.
-pub(crate) fn block_keys_at(block: &[u8], at: usize) -> Option<(u64, bool, u32, usize)> {
+pub(crate) fn block_keys_at(
+    block: &[u8],
+    at: usize,
+    versioned: bool,
+) -> Option<(SstKey, bool, u32, usize)> {
     if at >= block.len() {
         return None;
     }
     let remaining = &block[at..];
     let before = remaining.len();
-    let mut entries = DataBlock(remaining);
+    let mut entries = DataBlock {
+        bytes: remaining,
+        versioned,
+    };
     let entry = entries.next()?;
-    let consumed = before - entries.0.len();
-    Some((entry.key, entry.tombstone, entry.total_len as u32, at + consumed))
-}
-
-/// The data-block count a fetched index block names.
-pub(crate) fn index_block_count(index_block: &[u8]) -> usize {
-    u32::from_le_bytes(index_block[0..4].try_into().unwrap()) as usize
-}
-
-/// The `i`th data block's identity in a fetched index block.
-pub(crate) fn index_block_id(index_block: &[u8], i: usize) -> BlockId {
-    block_id_at(index_block, i)
+    let consumed = before - entries.bytes.len();
+    Some((
+        entry.key,
+        entry.tombstone,
+        entry.total_len as u32,
+        at + consumed,
+    ))
 }
 
 /// Copies a chained entry's row into `into`: the inline head chunk, then each
@@ -1058,10 +1319,13 @@ mod tests {
         rowid: u64,
     ) -> Option<Vec<u8>> {
         let mut out = vec![0u8; MAX_PAYLOAD];
-        reader.get(store, handle, rowid, &mut out).unwrap().map(|n| {
-            out.truncate(n);
-            out
-        })
+        reader
+            .get(store, handle, rowid, &mut out)
+            .unwrap()
+            .map(|n| {
+                out.truncate(n);
+                out
+            })
     }
 
     #[test]
@@ -1070,7 +1334,10 @@ mod tests {
         let a = arena();
         let root = build(&mut s, &[(1, b"only row".to_vec())]).expect("has a root");
         let mut r = SstReader::new(&a).unwrap();
-        assert_eq!(get(&mut r, &mut s, &root, 1).as_deref(), Some(&b"only row"[..]));
+        assert_eq!(
+            get(&mut r, &mut s, &root, 1).as_deref(),
+            Some(&b"only row"[..])
+        );
         assert_eq!(get(&mut r, &mut s, &root, 2), None);
         assert_eq!(get(&mut r, &mut s, &root, 0), None);
     }
@@ -1088,11 +1355,17 @@ mod tests {
         // single-block SST that never consults the index arithmetic.
         let (_b, mut s) = store();
         let a = arena();
-        let rows: Vec<_> = (0..5000u64).map(|i| (i * 2 + 1, vec![i as u8; 400])).collect();
+        let rows: Vec<_> = (0..5000u64)
+            .map(|i| (i * 2 + 1, vec![i as u8; 400]))
+            .collect();
         let root = build(&mut s, &rows).expect("has a root");
         let mut r = SstReader::new(&a).unwrap();
         for (rowid, row) in &rows {
-            assert_eq!(get(&mut r, &mut s, &root, *rowid).as_ref(), Some(row), "row {rowid}");
+            assert_eq!(
+                get(&mut r, &mut s, &root, *rowid).as_ref(),
+                Some(row),
+                "row {rowid}"
+            );
         }
         // Every gap between the odd keys is absent, and the ends too.
         assert_eq!(get(&mut r, &mut s, &root, 0), None);
@@ -1130,12 +1403,19 @@ mod tests {
         let mut single_read = 0;
         for probe in (1..200u64).step_by(2) {
             let before = s.reads();
-            assert_eq!(get(&mut r, &mut s, &root, probe), None, "odd key {probe} is absent");
+            assert_eq!(
+                get(&mut r, &mut s, &root, probe),
+                None,
+                "odd key {probe} is absent"
+            );
             if s.reads() - before == 1 {
                 single_read += 1;
             }
         }
-        assert!(single_read >= 95, "the filter skipped the index on {single_read} of 100 absent keys");
+        assert!(
+            single_read >= 95,
+            "the filter skipped the index on {single_read} of 100 absent keys"
+        );
     }
 
     #[test]
@@ -1143,8 +1423,14 @@ mod tests {
         let (_b, mut s) = store();
         let mut w = SstWriter::new();
         w.append(&mut s, 5, b"five").unwrap();
-        assert_eq!(w.append(&mut s, 3, b"three").err(), Some(SstError::KeyOutOfOrder));
-        assert_eq!(w.append(&mut s, 5, b"again").err(), Some(SstError::KeyOutOfOrder));
+        assert_eq!(
+            w.append(&mut s, 3, b"three").err(),
+            Some(SstError::KeyOutOfOrder)
+        );
+        assert_eq!(
+            w.append(&mut s, 5, b"again").err(),
+            Some(SstError::KeyOutOfOrder)
+        );
     }
 
     #[test]
@@ -1155,7 +1441,9 @@ mod tests {
         let (_b, mut s) = store();
         let a = Arena::new(&mut Budget::new(64 << 20), "sst chain", 16 << 20).expect("arena");
         let mut w = SstWriter::new();
-        let huge: Vec<u8> = (0..MAX_PAYLOAD + 50_000).map(|i| (i * 31 % 251) as u8).collect();
+        let huge: Vec<u8> = (0..MAX_PAYLOAD + 50_000)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
         w.append(&mut s, 1, &[7u8; 40]).unwrap();
         w.append(&mut s, 2, &huge).unwrap();
         w.append(&mut s, 3, &[8u8; 40]).unwrap();
@@ -1168,7 +1456,7 @@ mod tests {
         r.scan(&mut s, &root, 0, u64::MAX, &mut |k, row| {
             seen.push((k, row.expect("data row").to_vec()))
         })
-            .unwrap();
+        .unwrap();
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[1].0, 2);
         assert_eq!(seen[1].1, huge, "chained row round-trips by scan");
@@ -1190,12 +1478,129 @@ mod tests {
         let root = w.finish(&mut s).unwrap().expect("root");
         let mut r = SstReader::new(&a).unwrap();
         let mut out = [0u8; 64];
-        assert_eq!(r.get(&mut s, &root, 2, &mut out).unwrap(), None, "tombstoned key is absent");
+        assert_eq!(
+            r.get(&mut s, &root, 2, &mut out).unwrap(),
+            None,
+            "tombstoned key is absent"
+        );
         assert!(r.get(&mut s, &root, 1, &mut out).unwrap().is_some());
         let mut seen = Vec::new();
-        r.scan(&mut s, &root, 0, u64::MAX, &mut |k, row| seen.push((k, row.is_none())))
-            .unwrap();
+        r.scan(&mut s, &root, 0, u64::MAX, &mut |k, row| {
+            seen.push((k, row.is_none()))
+        })
+        .unwrap();
         assert_eq!(seen, vec![(1, false), (2, true), (3, false)]);
+    }
+
+    #[test]
+    fn commit_lsn_versions_select_the_postgresql_snapshot_image() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer
+            .append_version(&mut store, SstKey::at(7, 30), b"thirty")
+            .unwrap();
+        writer
+            .append_tombstone_version(&mut store, SstKey::at(7, 20))
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(7, 10), b"ten")
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        let mut out = [0u8; 32];
+
+        let newest = reader
+            .get_at(&mut store, &handle, 7, 35, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest.key.commit_lsn, 30);
+        assert_eq!(&out[..newest.len.unwrap() as usize], b"thirty");
+        assert_eq!(
+            reader
+                .probe_at(&mut store, &handle, 7, 25)
+                .unwrap()
+                .unwrap(),
+            SstProbe {
+                key: SstKey::at(7, 20),
+                len: None,
+            }
+        );
+        let old = reader
+            .get_at(&mut store, &handle, 7, 15, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.key.commit_lsn, 10);
+        assert_eq!(&out[..old.len.unwrap() as usize], b"ten");
+        assert!(
+            reader
+                .probe_at(&mut store, &handle, 7, 9)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_rowid_only_ssts_remain_readable() {
+        let (_budget, mut store) = store();
+        let rowid = 42u64;
+        let row = b"legacy";
+        let mut data = [0u8; LEGACY_ENTRY_HEADER + 6];
+        data[0..8].copy_from_slice(&rowid.to_le_bytes());
+        data[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
+        data[12..].copy_from_slice(row);
+        let data_id = store.put(&data, BlockType::SstData, 0).unwrap();
+
+        let mut index = [0u8; 4 + LEGACY_INDEX_ENTRY];
+        index[0..4].copy_from_slice(&1u32.to_le_bytes());
+        index[4..12].copy_from_slice(&rowid.to_le_bytes());
+        index[12..].copy_from_slice(&data_id.0);
+        let index_id = store.put(&index, BlockType::SstIndex, 0).unwrap();
+
+        let mut filter = vec![0u8; FILTER_TIERS[0]];
+        bloom::insert(&mut filter, rowid);
+        let filter_id = store.put(&filter, BlockType::SstFilter, 0).unwrap();
+        let roster_id = store.put(&data_id.0, BlockType::SstRoster, 0).unwrap();
+        let handle = SstHandle {
+            index: index_id,
+            filter: filter_id,
+            roster: roster_id,
+            versioned: false,
+        };
+
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        let mut out = [0u8; 32];
+        let probe = reader
+            .get_at(&mut store, &handle, rowid, 1, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(probe.key, SstKey::at(rowid, 0));
+        assert_eq!(&out[..probe.len.unwrap() as usize], row);
+    }
+
+    #[test]
+    fn one_rows_versions_may_cross_data_block_boundaries() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        let row = vec![0x5au8; MAX_PAYLOAD / 2];
+        for commit_lsn in (1..=6).rev() {
+            writer
+                .append_version(&mut store, SstKey::at(9, commit_lsn), &row)
+                .unwrap();
+        }
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        let mut out = vec![0u8; row.len()];
+        for snapshot in 1..=6 {
+            let probe = reader
+                .get_at(&mut store, &handle, 9, snapshot, &mut out)
+                .unwrap()
+                .unwrap();
+            assert_eq!(probe.key.commit_lsn, snapshot);
+            assert_eq!(&out[..probe.len.unwrap() as usize], &row);
+        }
     }
 
     #[test]
@@ -1203,7 +1608,10 @@ mod tests {
         let (_b, mut s) = store();
         let mut w = SstWriter::new();
         let huge = vec![0u8; MAX_ASSEMBLED + MAX_PAYLOAD];
-        assert_eq!(w.append(&mut s, 1, &huge).err(), Some(SstError::RowTooLarge));
+        assert_eq!(
+            w.append(&mut s, 1, &huge).err(),
+            Some(SstError::RowTooLarge)
+        );
     }
 
     #[test]
@@ -1258,7 +1666,9 @@ mod tests {
         // block `lo` lands in through the consecutive blocks the range covers.
         let (_b, mut s) = store();
         let a = arena();
-        let rows: Vec<_> = (0..4000u64).map(|i| (i, vec![(i % 251) as u8; 400])).collect();
+        let rows: Vec<_> = (0..4000u64)
+            .map(|i| (i, vec![(i % 251) as u8; 400]))
+            .collect();
         let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         let got = scan(&mut r, &mut s, &root, 1000, 2999);
@@ -1277,13 +1687,31 @@ mod tests {
         let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         // Below, above, and straddling both ends.
-        assert_eq!(scan(&mut r, &mut s, &root, 0, 5).len(), 0, "before the first key");
-        assert_eq!(scan(&mut r, &mut s, &root, 40, 99).len(), 0, "after the last key");
-        assert_eq!(scan(&mut r, &mut s, &root, 0, 100).len(), 21, "covers everything");
+        assert_eq!(
+            scan(&mut r, &mut s, &root, 0, 5).len(),
+            0,
+            "before the first key"
+        );
+        assert_eq!(
+            scan(&mut r, &mut s, &root, 40, 99).len(),
+            0,
+            "after the last key"
+        );
+        assert_eq!(
+            scan(&mut r, &mut s, &root, 0, 100).len(),
+            21,
+            "covers everything"
+        );
         let straddle_low = scan(&mut r, &mut s, &root, 5, 12);
-        assert_eq!(straddle_low.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![10, 11, 12]);
+        assert_eq!(
+            straddle_low.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
         let straddle_high = scan(&mut r, &mut s, &root, 28, 50);
-        assert_eq!(straddle_high.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![28, 29, 30]);
+        assert_eq!(
+            straddle_high.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![28, 29, 30]
+        );
     }
 
     #[test]
@@ -1293,7 +1721,10 @@ mod tests {
         let rows: Vec<_> = (1..=40u64).map(|i| (i * 3, vec![i as u8; 16])).collect();
         let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
-        assert_eq!(scan(&mut r, &mut s, &root, 30, 30), vec![(30, vec![10u8; 16])]);
+        assert_eq!(
+            scan(&mut r, &mut s, &root, 30, 30),
+            vec![(30, vec![10u8; 16])]
+        );
         // A key that falls in a gap between stored keys returns nothing.
         assert_eq!(scan(&mut r, &mut s, &root, 31, 31), vec![]);
     }
@@ -1305,7 +1736,11 @@ mod tests {
         let rows: Vec<_> = (1..=10u64).map(|i| (i, vec![i as u8; 4])).collect();
         let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
-        assert_eq!(scan(&mut r, &mut s, &root, 8, 3), vec![], "hi below lo yields nothing");
+        assert_eq!(
+            scan(&mut r, &mut s, &root, 8, 3),
+            vec![],
+            "hi below lo yields nothing"
+        );
     }
 
     #[test]
@@ -1323,7 +1758,10 @@ mod tests {
         assert_eq!(got.len(), 11);
         let read = s.reads() - before;
         // Index + the one or two data blocks an eleven-key window touches.
-        assert!(read <= 4, "a narrow range read {read} blocks; expected the index and a few data blocks");
+        assert!(
+            read <= 4,
+            "a narrow range read {read} blocks; expected the index and a few data blocks"
+        );
     }
 
     #[test]
@@ -1357,17 +1795,21 @@ mod tests {
             u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             INDEX_ROOT_MAGIC
         );
-        let total = super::data_block_total(&mut s, &handle.index, &mut buf).unwrap();
+        let total = super::data_block_total(&mut s, &handle, &mut buf).unwrap();
         assert!(total >= 10, "five groups of two blocks, got {total}");
         // Every ordinal resolves; one past the end does not.
         for ordinal in 0..total {
-            assert!(super::locate_data_block(&mut s, &handle.index, &mut buf, ordinal)
-                .unwrap()
-                .is_some());
+            assert!(
+                super::locate_data_block(&mut s, &handle, &mut buf, ordinal)
+                    .unwrap()
+                    .is_some()
+            );
         }
-        assert!(super::locate_data_block(&mut s, &handle.index, &mut buf, total)
-            .unwrap()
-            .is_none());
+        assert!(
+            super::locate_data_block(&mut s, &handle, &mut buf, total)
+                .unwrap()
+                .is_none()
+        );
         // Point reads and probes, present and absent.
         let mut out = vec![0u8; 128 * 1024];
         for &rowid in &written {
@@ -1376,7 +1818,10 @@ mod tests {
                 Some(100_000),
                 "row {rowid}"
             );
-            assert_eq!(r.probe(&mut s, &handle, rowid).unwrap(), Some(Some(100_000)));
+            assert_eq!(
+                r.probe(&mut s, &handle, rowid).unwrap(),
+                Some(Some(100_000))
+            );
         }
         assert_eq!(r.get(&mut s, &handle, 2, &mut out).unwrap(), None);
         assert_eq!(r.probe(&mut s, &handle, 100_000).unwrap(), None);
@@ -1390,11 +1835,11 @@ mod tests {
         assert_eq!(seen, written);
         // A bounded scan resumes across leaf boundaries to the same total.
         let mut walked = Vec::new();
-        let mut lo = 0u64;
+        let mut lo = SstKey::MIN;
         while let Some(next) = r
-            .scan_bounded(&mut s, &handle, lo, 3, &mut |rowid, tomb| {
+            .scan_versions_bounded(&mut s, &handle, lo, 3, &mut |key, tomb| {
                 assert!(!tomb);
-                walked.push(rowid);
+                walked.push(key.rowid);
             })
             .unwrap()
         {
@@ -1411,7 +1856,14 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let rows: Vec<_> = (1..=40u64)
-            .map(|i| (i, format!("row {i} says the same thing over and over; ").repeat(400).into_bytes()))
+            .map(|i| {
+                (
+                    i,
+                    format!("row {i} says the same thing over and over; ")
+                        .repeat(400)
+                        .into_bytes(),
+                )
+            })
             .collect();
         let raw_total: usize = rows.iter().map(|(_, r)| r.len()).sum();
         let root = build(&mut s, &rows).expect("root");
@@ -1422,7 +1874,11 @@ mod tests {
         );
         let mut r = SstReader::new(&a).unwrap();
         for (rowid, row) in &rows {
-            assert_eq!(get(&mut r, &mut s, &root, *rowid).as_ref(), Some(row), "row {rowid}");
+            assert_eq!(
+                get(&mut r, &mut s, &root, *rowid).as_ref(),
+                Some(row),
+                "row {rowid}"
+            );
         }
     }
 
@@ -1430,11 +1886,17 @@ mod tests {
     fn variable_row_sizes_in_one_block_are_read_back() {
         let (_b, mut s) = store();
         let a = arena();
-        let rows: Vec<_> = (1..=20u64).map(|i| (i, vec![i as u8; (i * 3) as usize])).collect();
+        let rows: Vec<_> = (1..=20u64)
+            .map(|i| (i, vec![i as u8; (i * 3) as usize]))
+            .collect();
         let root = build(&mut s, &rows).expect("root");
         let mut r = SstReader::new(&a).unwrap();
         for (rowid, row) in &rows {
-            assert_eq!(get(&mut r, &mut s, &root, *rowid).as_ref(), Some(row), "row {rowid}");
+            assert_eq!(
+                get(&mut r, &mut s, &root, *rowid).as_ref(),
+                Some(row),
+                "row {rowid}"
+            );
         }
     }
 }

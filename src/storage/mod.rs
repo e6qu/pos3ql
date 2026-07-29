@@ -538,7 +538,12 @@ pub struct RowState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowHome {
     Heap(RowLoc),
-    Spilled { len: u32, sst: u8 },
+    Spilled {
+        len: u32,
+        sst: u8,
+        /// Exact immutable version to fetch. Legacy rowid-only SSTs use zero.
+        commit_lsn: u64,
+    },
 }
 
 impl RowHome {
@@ -759,10 +764,9 @@ impl RowState {
         self.visible_at_lsn(txid, snapshot, u64::MAX)
     }
 
-    /// Visibility under both the transaction's command snapshot and a durable
-    /// commit-LSN snapshot. This one-version foundation can hide a too-new
-    /// image but cannot yet recover the older image; the committed version
-    /// chain will fill that branch.
+    /// Resident visibility under both the transaction's command snapshot and
+    /// a durable commit-LSN snapshot. Object-resident fallback belongs to
+    /// `Storage::visible_row_home_at`, the engine-wide visibility choke point.
     pub fn visible_at_lsn(
         &self,
         txid: u32,
@@ -1908,9 +1912,16 @@ struct MemberCursor {
     /// and how many bytes of it are the block (the buffer is oversized).
     loaded: Option<usize>,
     loaded_len: usize,
-    /// The head entry, parsed: `(rowid, tombstone, len)`.
-    head: Option<(u64, bool, u32)>,
+    /// The head entry, parsed as one immutable row-version key.
+    head: Option<(crate::store::SstKey, bool, u32)>,
     done: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SpillVersion {
+    len: Option<u32>,
+    member: u8,
+    commit_lsn: u64,
 }
 
 /// The reader's owned block buffers (index, data, chain assembly, and the
@@ -2994,7 +3005,7 @@ impl Storage {
     fn spill_merged_walk(
         &self,
         slot: usize,
-        emit: &mut dyn FnMut(u64, u32, u8) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        emit: &mut dyn FnMut(u64, u32, u8, u64) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
         let table = &self.tables[slot];
         let n = table.n_spill_ssts;
@@ -3033,27 +3044,42 @@ impl Storage {
         loop {
             let mut min: Option<u64> = None;
             for cursor in cursors[..n].iter() {
-                if let Some((rowid, ..)) = cursor.head {
-                    min = Some(min.map_or(rowid, |m: u64| m.min(rowid)));
+                if let Some((key, ..)) = cursor.head {
+                    min = Some(min.map_or(key.rowid, |rowid: u64| rowid.min(key.rowid)));
                 }
             }
             let Some(rowid) = min else { return Ok(()) };
-            // Newest member holding this rowid decides; every holder steps.
-            let mut verdict: Option<(bool, u32, u8)> = None;
-            for member in (0..n).rev() {
-                if let Some((r, tombstone, len)) = cursors[member].head
-                    && r == rowid
+            // Consume every version of this row from every member. The
+            // greatest commit LSN admitted by the statement snapshot wins;
+            // equal keys prefer the newer list member.
+            let mut verdict: Option<SpillVersion> = None;
+            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                while let Some((key, tombstone, len)) = cursor.head
+                    && key.rowid == rowid
                 {
-                    if verdict.is_none() {
-                        verdict = Some((tombstone, len, member as u8));
+                    if key.commit_lsn <= self.commit_snapshot
+                        && verdict.is_none_or(|current| {
+                            key.commit_lsn > current.commit_lsn
+                                || (key.commit_lsn == current.commit_lsn
+                                    && member as u8 > current.member)
+                        })
+                    {
+                        verdict = Some(SpillVersion {
+                            len: (!tombstone).then_some(len),
+                            member: member as u8,
+                            commit_lsn: key.commit_lsn,
+                        });
                     }
-                    Self::cursor_advance(spill, table, member, &mut cursors[member], context)?;
+                    Self::cursor_advance(spill, table, member, cursor, context)?;
                 }
             }
-            let (tombstone, len, member) = verdict.expect("min came from a head");
-            if !tombstone
+            if let Some(SpillVersion {
+                len: Some(len),
+                member,
+                commit_lsn,
+            }) = verdict
                 && self.tables[slot].rows.get(&rowid).is_none()
-                && emit(rowid, len, member)?.is_break()
+                && emit(rowid, len, member, commit_lsn)?.is_break()
             {
                 return Ok(());
             }
@@ -3082,7 +3108,7 @@ impl Storage {
                 // bounce alike.
                 let Some(id) = crate::store::locate_data_block(
                     &mut *blocks,
-                    &handle.index,
+                    &handle,
                     &mut context.index_buf,
                     cursor.ordinal,
                 )
@@ -3104,10 +3130,11 @@ impl Storage {
             match crate::store::block_keys_at(
                 &context.member_blocks[member][..cursor.loaded_len],
                 cursor.offset,
+                handle.versioned,
             ) {
-                Some((rowid, tombstone, len, next)) => {
+                Some((key, tombstone, len, next)) => {
                     cursor.offset = next;
-                    cursor.head = Some((rowid, tombstone, len));
+                    cursor.head = Some((key, tombstone, len));
                     return Ok(());
                 }
                 None => {
@@ -3117,10 +3144,15 @@ impl Storage {
         }
     }
 
-    /// Point probe of the spill list: the newest member's verdict for
-    /// `rowid` — `Some((len, member))` for a live row, `None` for absent or
-    /// tombstoned. Bloom filters make the common absent answer cheap.
-    fn spill_probe(&self, slot: usize, rowid: u64) -> Result<Option<(u32, u8)>, SqlError> {
+    /// The newest object-resident version admitted by `snapshot`. Every SST
+    /// is consulted because a newer run may contain only too-new versions;
+    /// a tombstone remains a first-class verdict.
+    fn spill_probe_at(
+        &self,
+        slot: usize,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<SpillVersion>, SqlError> {
         let table = &self.tables[slot];
         if table.n_spill_ssts == 0 {
             return Ok(None);
@@ -3143,29 +3175,35 @@ impl Storage {
             &mut scratch.data_buf,
             &mut scratch.assembly_buf,
         );
-        for member in (0..table.n_spill_ssts).rev() {
+        let mut best: Option<SpillVersion> = None;
+        for member in 0..table.n_spill_ssts {
             let handle = table.spill_ssts[member].expect("counted");
             let verdict = reader
-                .probe(&mut *spill.blocks.borrow_mut(), &handle, rowid)
+                .probe_at(&mut *spill.blocks.borrow_mut(), &handle, rowid, snapshot)
                 .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
-            match verdict {
-                Some(Some(len)) => return Ok(Some((len, member as u8))),
-                Some(None) => return Ok(None), // tombstoned
-                None => {}
+            if let Some(probe) = verdict
+                && best.is_none_or(|current| {
+                    probe.key.commit_lsn > current.commit_lsn
+                        || (probe.key.commit_lsn == current.commit_lsn
+                            && member as u8 > current.member)
+                })
+            {
+                best = Some(SpillVersion {
+                    len: probe.len,
+                    member: member as u8,
+                    commit_lsn: probe.key.commit_lsn,
+                });
             }
         }
-        Ok(None)
+        Ok(best)
     }
 
-    /// The one place a table's row states are enumerated — the seam the
-    /// maturity roadmap's "map spills" step flips. Today every row has a map
-    /// entry, so this walks the map; when the map becomes an overlay
-    /// (pending + hot rows over SST-resident cold rows), this is where the
-    /// merged newest-wins enumeration lives, and no caller changes. The
-    /// callback takes the state *by value* for the same reason: an
-    /// SST-resident row's state will be synthesized, not stored. Errors are
-    /// threaded now — enumerating from the bucket can fail — so the flip
-    /// never re-touches a call site.
+    /// The one place a table's row states are enumerated. The bounded map is
+    /// an overlay of pending changes and hot/resident rows; the merged SST
+    /// walk synthesizes every remaining snapshot-visible state directly from
+    /// the provider-neutral object store through the cache tiers. The callback
+    /// therefore takes state by value, and errors stay visible to every SQL
+    /// consumer.
     ///
     /// `Break` stops the walk early; the callback's own error aborts it.
     pub fn for_each_row_state(
@@ -3181,12 +3219,16 @@ impl Storage {
             }
         }
         // Then everything that lives only in the bucket, synthesized.
-        self.spill_merged_walk(table_slot, &mut |rowid, len, member| {
+        self.spill_merged_walk(table_slot, &mut |rowid, len, member, commit_lsn| {
             each(
                 rowid,
                 RowState {
-                    committed: Some(RowHome::Spilled { len, sst: member }),
-                    committed_lsn: 0,
+                    committed: Some(RowHome::Spilled {
+                        len,
+                        sst: member,
+                        commit_lsn,
+                    }),
+                    committed_lsn: commit_lsn,
                     history: CommittedHistory::empty(),
                     pending: PendingVersions::empty(),
                 },
@@ -3200,23 +3242,80 @@ impl Storage {
             return Ok(Some(*state));
         }
         Ok(self
-            .spill_probe(table_slot, rowid)?
-            .map(|(len, member)| RowState {
-                committed: Some(RowHome::Spilled { len, sst: member }),
-                committed_lsn: 0,
-                history: CommittedHistory::empty(),
-                pending: PendingVersions::empty(),
+            .spill_probe_at(table_slot, rowid, u64::MAX)?
+            .and_then(|version| {
+                version.len.map(|len| RowState {
+                    committed: Some(RowHome::Spilled {
+                        len,
+                        sst: version.member,
+                        commit_lsn: version.commit_lsn,
+                    }),
+                    committed_lsn: version.commit_lsn,
+                    history: CommittedHistory::empty(),
+                    pending: PendingVersions::empty(),
+                })
+            }))
+    }
+
+    /// The single visibility choke point for heap and object-resident row
+    /// versions. Pending command visibility wins first; then the resident
+    /// committed chain; finally immutable SSTs supply an older admissible
+    /// image when the resident chain no longer carries it.
+    pub fn visible_row_home(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        state: RowState,
+        txid: u32,
+    ) -> Result<Option<RowHome>, SqlError> {
+        self.visible_row_home_at(
+            table_slot,
+            rowid,
+            state,
+            txid,
+            self.read_snapshot,
+            self.commit_snapshot,
+        )
+    }
+
+    /// Visibility with explicit command and commit snapshots. DDL validation
+    /// uses `SNAPSHOT_ALL` to include every change made earlier in the current
+    /// transaction; ordinary scans call `visible_row_home`.
+    pub fn visible_row_home_at(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        state: RowState,
+        txid: u32,
+        command_snapshot: u32,
+        commit_snapshot: u64,
+    ) -> Result<Option<RowHome>, SqlError> {
+        match state.pending.visible_at(txid, command_snapshot) {
+            Some(location) => return Ok(location.map(RowHome::Heap)),
+            None if state.committed_lsn <= commit_snapshot => return Ok(state.committed),
+            None => {}
+        }
+        if let Some(home) = state.history.visible_at(commit_snapshot) {
+            return Ok(home);
+        }
+        Ok(self
+            .spill_probe_at(table_slot, rowid, commit_snapshot)?
+            .and_then(|version| {
+                version.len.map(|len| RowHome::Spilled {
+                    len,
+                    sst: version.member,
+                    commit_lsn: version.commit_lsn,
+                })
             }))
     }
 
     /// How many rows `txid` sees, through the same seam — under the current
     /// command snapshot, so it matches what the scan loop iterates.
     pub fn visible_row_count(&self, table_slot: usize, txid: u32) -> Result<usize, SqlError> {
-        let snapshot = self.read_snapshot;
         let mut count = 0usize;
-        self.for_each_row_state(table_slot, &mut |_, state| {
-            if state
-                .visible_at_lsn(txid, snapshot, self.commit_snapshot)
+        self.for_each_row_state(table_slot, &mut |rowid, state| {
+            if self
+                .visible_row_home(table_slot, rowid, state, txid)?
                 .is_some()
             {
                 count += 1;
@@ -3235,7 +3334,11 @@ impl Storage {
     ) -> Result<&'a [u8], SqlError> {
         match home {
             RowHome::Heap(loc) => Ok(self.heap.get(loc)),
-            RowHome::Spilled { len, sst } => {
+            RowHome::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            } => {
                 let Some(spill) = &self.spill else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -3277,13 +3380,15 @@ impl Storage {
                 } = &mut *scratch;
                 let mut reader = crate::store::SstReader::over(index_buf, data_buf, assembly_buf);
                 let got = reader
-                    .get(&mut *blocks, &handle, rowid, out)
+                    .get_at(&mut *blocks, &handle, rowid, commit_lsn, out)
                     .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
                 match got {
-                    Some(n) if n == len as usize => Ok(&out[..n]),
+                    Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
+                        Ok(&out[..len as usize])
+                    }
                     Some(_) => Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
-                        "spilled row length mismatch"
+                        "spilled row version mismatch"
                     )),
                     None => Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -3308,7 +3413,11 @@ impl Storage {
     ) -> Result<R, SqlError> {
         match home {
             RowHome::Heap(loc) => f(self.heap.get(loc)),
-            RowHome::Spilled { len, sst } => {
+            RowHome::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            } => {
                 let Some(spill) = &self.spill else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -3349,14 +3458,16 @@ impl Storage {
                     let mut blocks = spill.blocks.borrow_mut();
                     let mut reader = crate::store::SstReader::over(index_buf, data_buf, bounce_buf);
                     reader
-                        .get(&mut *blocks, &handle, rowid, row_buf)
+                        .get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf)
                         .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?
                 };
                 match got {
-                    Some(n) if n == len as usize => f(&row_buf[..n]),
+                    Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
+                        f(&row_buf[..len as usize])
+                    }
                     Some(_) => Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
-                        "spilled row length mismatch"
+                        "spilled row version mismatch"
                     )),
                     None => Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -3385,6 +3496,7 @@ impl Storage {
                     state.committed = Some(RowHome::Spilled {
                         len: loc.len,
                         sst: newest,
+                        commit_lsn: state.committed_lsn,
                     });
                 }
             }
@@ -3400,8 +3512,15 @@ impl Storage {
         table.spill_ssts[0] = Some(handle);
         table.n_spill_ssts = 1;
         for (_, state) in table.rows.iter_mut() {
-            if let Some(RowHome::Spilled { len, .. }) = state.committed {
-                state.committed = Some(RowHome::Spilled { len, sst: 0 });
+            if let Some(RowHome::Spilled {
+                len, commit_lsn, ..
+            }) = state.committed
+            {
+                state.committed = Some(RowHome::Spilled {
+                    len,
+                    sst: 0,
+                    commit_lsn,
+                });
             }
         }
     }
@@ -3437,7 +3556,12 @@ impl Storage {
         table.n_spill_ssts = n;
         let at = at as u8;
         for (_, state) in table.rows.iter_mut() {
-            if let Some(RowHome::Spilled { len, sst }) = state.committed {
+            if let Some(RowHome::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            }) = state.committed
+            {
                 let sst = if sst < at {
                     sst
                 } else if sst == at || sst == at + 1 {
@@ -3445,7 +3569,11 @@ impl Storage {
                 } else {
                     sst - removed
                 };
-                state.committed = Some(RowHome::Spilled { len, sst });
+                state.committed = Some(RowHome::Spilled {
+                    len,
+                    sst,
+                    commit_lsn,
+                });
             }
         }
     }
@@ -3512,16 +3640,6 @@ impl Storage {
     /// What the next checkpoint should do for this table: a delta flush (the
     /// spill list has room and every remembered tombstone fits), or a full
     /// rewrite.
-    pub(crate) fn delta_eligible(&self, slot: usize) -> bool {
-        let t = &self.tables[slot];
-        t.n_spill_ssts > 0 && t.n_spill_ssts < MAX_SPILL_SSTS && !t.tombstones_overflow
-    }
-
-    pub(crate) fn tombstones(&self, slot: usize) -> &[u64] {
-        let t = &self.tables[slot];
-        &t.tombstones[..t.n_tombstones]
-    }
-
     /// Records a committed-row removal for the next delta checkpoint, so a
     /// cold start cannot resurrect an older SST's version of the row. Only
     /// meaningful while the table has spilled SSTs.
@@ -3697,8 +3815,18 @@ impl Storage {
         // — a pending change with `committed: None` would hide the old
         // value from uniqueness scans and resurrect wrongly on rollback.
         let committed = self
-            .spill_probe(table_index, rowid)?
-            .map(|(len, sst)| RowHome::Spilled { len, sst });
+            .spill_probe_at(table_index, rowid, u64::MAX)?
+            .and_then(|version| {
+                version.len.map(|len| RowHome::Spilled {
+                    len,
+                    sst: version.member,
+                    commit_lsn: version.commit_lsn,
+                })
+            });
+        let committed_lsn = committed.map_or(0, |home| match home {
+            RowHome::Heap(_) => 0,
+            RowHome::Spilled { commit_lsn, .. } => commit_lsn,
+        });
         let table = &mut self.tables[table_index];
         if table.rows.len() == table.rows.capacity() {
             // Entries the spill lists reproduce are droppable on demand.
@@ -3717,7 +3845,7 @@ impl Storage {
                 rowid,
                 RowState {
                     committed,
-                    committed_lsn: 0,
+                    committed_lsn,
                     history: CommittedHistory::empty(),
                     pending: {
                         let mut versions = PendingVersions::empty();
@@ -3773,6 +3901,29 @@ impl Storage {
         self.tables
             .iter()
             .any(|t| t.live && t.n_spill_ssts > 0 && t.rows.len() * 100 >= t.rows.capacity() * 50)
+    }
+
+    /// Starts an object flush before the resident safety window can fill.
+    /// Published versions are then read through the immutable SST forest and
+    /// the resident side chain is released.
+    pub fn history_pressure(&self) -> bool {
+        self.tables.iter().any(|table| {
+            table.live
+                && table
+                    .rows
+                    .iter()
+                    .any(|(_, state)| state.history.len() + 2 >= MAX_COMMITTED_ROW_VERSIONS)
+        })
+    }
+
+    /// A successful manifest publish made every resident historical image
+    /// reachable through the table's installed versioned SST list.
+    pub fn release_durable_histories(&mut self) {
+        for table in self.tables.iter_mut().filter(|table| table.live) {
+            for (_, state) in table.rows.iter_mut() {
+                state.history.prune(None);
+            }
+        }
     }
 
     /// The map-occupancy pass after a publish: any table whose overlay is
@@ -3869,7 +4020,7 @@ impl Storage {
         // Maintain the value indexes: drop the old committed value's key, add
         // the new one. The row images are still readable (committed not yet
         // repointed, new bytes already in the heap).
-        self.maintain_indexes_on_commit(table_index, rowid, old_committed, new_loc);
+        self.maintain_indexes_on_commit(table_index, rowid, new_loc);
 
         let retain_history = !self.active_snapshots.is_empty();
         let table = &mut self.tables[table_index];
@@ -3981,27 +4132,19 @@ impl Storage {
     }
 
     /// The value-index maintenance for one committed row transition: remove the
-    /// old committed value's key, insert the new value's key. Physical headroom
-    /// guarantees the insert fits (the logical cap is enforced at insert time),
-    /// so this is infallible; a decode failure on our own encoded row is a bug,
-    /// surfaced loudly.
+    /// old entry by row identity, then insert the new value's key. Removing by
+    /// identity keeps publication independent of object-store availability:
+    /// the old row may be object-resident, while the new encoded bytes are
+    /// already in the heap. Physical headroom guarantees the insert fits.
     fn maintain_indexes_on_commit(
         &mut self,
         table_index: usize,
         rowid: u64,
-        old_committed: Option<RowHome>,
         new_loc: Option<RowLoc>,
     ) {
         if self.tables[table_index].n_enforcers == 0 {
             return;
         }
-        let mut removals = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
-        let n_removals = match old_committed {
-            Some(home) => self
-                .row_enforcer_hashes(table_index, rowid, home, &mut removals)
-                .expect("committed row decodes"),
-            None => 0,
-        };
         let mut inserts = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
         let n_inserts = match new_loc {
             Some(loc) => self
@@ -4023,8 +4166,8 @@ impl Storage {
             .value_indexes
             .as_mut()
             .expect("value index pool present");
-        for &(ei, hash) in &removals[..n_removals] {
-            pool.get_mut(slots[ei]).remove(hash, rowid);
+        for &slot in &slots[..self.tables[table_index].n_enforcers] {
+            pool.get_mut(slot).remove_rowid(rowid);
         }
         for &(ei, hash) in &inserts[..n_inserts] {
             pool.get_mut(slots[ei])

@@ -29,7 +29,8 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{ColumnMeta, MAX_COLUMNS, OwnedDatum, RowHome, SqlName, Storage, TableDef};
 use crate::store::{
-    BlockId, BlockStore, OwnedObjectStore, SstHandle, SstReader, SstWriter, StackPlan, TieredStore,
+    BlockId, BlockStore, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter, StackPlan,
+    TieredStore,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -40,6 +41,7 @@ const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const SST_MAGIC: u64 = 0x3154_5353_4c51_3350; // "P3QLSST1" little-endian
 const SST_FOOTER_LEN: usize = 20; // count u64 | crc u32 | magic u64
 const SST_ENTRY_HEADER: usize = 12; // rowid u64 | len u32
+const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 
 /// io_error — object storage trouble surfaced to a statement.
 const SQLSTATE_IO: &str = "58030";
@@ -99,7 +101,7 @@ impl SlotList {
 /// Where a paced merge stands between beats.
 enum MergePhase {
     /// Building the id schedule: member `rank`'s scan resumes at `resume_lo`.
-    Schedule { rank: u8, resume_lo: u64 },
+    Schedule { rank: u8, resume_lo: SstKey },
     /// Streaming scheduled entries into the merged SST from `cursor`.
     Write { cursor: usize },
 }
@@ -115,6 +117,9 @@ struct MergeJob {
     /// True at the list head: nothing older remains for a tombstone to
     /// suppress, so none survives the merge.
     drop_tombstones: bool,
+    /// Compaction keeps every version newer than this watermark and the first
+    /// version at or below it. None means only the current image is needed.
+    oldest_snapshot: Option<u64>,
     phase: MergePhase,
     schedule_len: usize,
     count: u64,
@@ -145,6 +150,16 @@ fn pair_at(list: &SlotList, at: usize) -> Option<(SstHandle, SstHandle)> {
     Some((a.handle, b.handle))
 }
 
+fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
+    if !list.push(prior) {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "spill list exceeds its fixed capacity"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct Checkpointer {
     client: ObjectStore,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
@@ -159,10 +174,8 @@ pub(crate) struct Checkpointer {
     /// Spill-list updates computed during a checkpoint, applied to storage
     /// only after the manifest CAS lands.
     pending_installs: Vec<(usize, SlotInstall)>,
-    /// Pre-reserved id scratch for a paced merge: (rowid, source-and-kind).
-    merge_scratch: Vec<(u64, u8)>,
-    /// Pre-reserved sort scratch for a delta's tombstones.
-    tomb_scratch: Vec<u64>,
+    /// Pre-reserved physical-version schedule: (key, source-and-kind).
+    merge_scratch: Vec<(SstKey, u8)>,
     /// Rosters of the SSTs the current manifest references (GC keep-set
     /// source) and their sweep scratch.
     roster_scratch: Vec<BlockId>,
@@ -265,7 +278,7 @@ impl Checkpointer {
             + MANIFEST_BUF_BYTES
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
-            + MERGE_SCRATCH_ENTRIES * core::mem::size_of::<(u64, u8)>()
+            + MERGE_SCRATCH_ENTRIES * core::mem::size_of::<(SstKey, u8)>()
     }
 
     /// One bounded step of the paced merge — the compaction work a beat may
@@ -325,9 +338,21 @@ impl Checkpointer {
     /// rewrite stays the safety net) and pairs whose scans previously
     /// overflowed it.
     fn merge_candidate(&self, storage: &Storage) -> Option<MergeJob> {
-        if storage.has_active_snapshots() || self.merge_job.is_some() || self.merge_done.is_some() {
+        if self.merge_job.is_some() || self.merge_done.is_some() {
             return None;
         }
+        // A dirty full list cannot append its next delta while a snapshot is
+        // pinned. Free one of those lists before servicing ordinary merge
+        // candidates, or a smaller unrelated table can starve the publication.
+        let must_free_full_list = storage.has_active_snapshots()
+            && (0..storage.table_count()).any(|slot| {
+                storage.table(slot).live
+                    && storage.table(slot).dirty
+                    && self
+                        .prev_ssts
+                        .get(slot)
+                        .is_some_and(|list| list.n == crate::storage::MAX_SPILL_SSTS)
+            });
         for slot in 0..storage.table_count().min(MAX_CKPT_TABLES) {
             if !storage.table(slot).live {
                 continue;
@@ -335,6 +360,11 @@ impl Checkpointer {
             let Some(list) = self.prev_ssts.get(slot) else {
                 continue;
             };
+            if must_free_full_list
+                && (!storage.table(slot).dirty || list.n != crate::storage::MAX_SPILL_SSTS)
+            {
+                continue;
+            }
             if list.n < MERGE_TRIGGER {
                 continue;
             }
@@ -358,10 +388,11 @@ impl Checkpointer {
                 at,
                 old0,
                 old1,
-                drop_tombstones: at == 0,
+                drop_tombstones: at == 0 && !storage.has_active_snapshots(),
+                oldest_snapshot: storage.oldest_snapshot(),
                 phase: MergePhase::Schedule {
                     rank: 0,
-                    resume_lo: 0,
+                    resume_lo: SstKey::MIN,
                 },
                 schedule_len: 0,
                 count: 0,
@@ -380,14 +411,14 @@ impl Checkpointer {
     }
 
     /// A schedule beat: scan a bounded stretch of one member, collecting
-    /// `(rowid, source-rank | tombstone-bit)`. When both members are done,
-    /// the transition sorts newer-wins and dedups — one in-place sort, paid
-    /// once per job.
+    /// `(rowid, commit_lsn, source-rank | tombstone-bit)`. When both members
+    /// are done, exact duplicate keys choose the newer member, then the
+    /// oldest-snapshot watermark prunes each row's physical chain.
     fn merge_schedule_beat(
         &mut self,
         job: &mut MergeJob,
         rank: u8,
-        resume_lo: u64,
+        resume_lo: SstKey,
     ) -> Result<MergeBeatOutcome, SqlError> {
         self.sst_arena.reset();
         let mut reader = SstReader::new(&self.sst_arena).map_err(sst_to_sql)?;
@@ -396,17 +427,17 @@ impl Checkpointer {
         let blocks = &self.blocks;
         let mut overflow = false;
         let next = reader
-            .scan_bounded(
+            .scan_versions_bounded(
                 &mut *blocks.borrow_mut(),
                 &member.handle,
                 resume_lo,
                 MERGE_SCHEDULE_BEAT_BLOCKS,
-                &mut |rowid, tombstone| {
+                &mut |key, tombstone| {
                     if scratch.len() == MERGE_SCRATCH_ENTRIES {
                         overflow = true;
                         return;
                     }
-                    scratch.push((rowid, rank | (u8::from(tombstone) << 1)));
+                    scratch.push((key, rank | (u8::from(tombstone) << 1)));
                 },
             )
             .map_err(sst_to_sql)?;
@@ -427,13 +458,12 @@ impl Checkpointer {
             },
             (None, 0) => MergePhase::Schedule {
                 rank: 1,
-                resume_lo: 0,
+                resume_lo: SstKey::MIN,
             },
             (None, _) => {
-                // Newer-wins dedup: sort by (rowid, rank), keep each rowid's
-                // last. In-place and allocation-free (unstable sort).
+                // Exact duplicates choose the newer list member.
                 self.merge_scratch
-                    .sort_unstable_by_key(|&(rowid, kind)| (rowid, kind & 1));
+                    .sort_unstable_by_key(|&(key, kind)| (key, kind & 1));
                 let mut keep = 0usize;
                 for i in 0..self.merge_scratch.len() {
                     if keep > 0 && self.merge_scratch[keep - 1].0 == self.merge_scratch[i].0 {
@@ -443,7 +473,33 @@ impl Checkpointer {
                         keep += 1;
                     }
                 }
-                job.schedule_len = keep;
+                // Keep every version newer than the oldest live snapshot and
+                // one baseline version at/below it. With no live snapshot,
+                // only the newest physical version of each row survives.
+                let mut retained = 0usize;
+                let mut at = 0usize;
+                while at < keep {
+                    let rowid = self.merge_scratch[at].0.rowid;
+                    let mut kept_baseline = false;
+                    while at < keep && self.merge_scratch[at].0.rowid == rowid {
+                        let lsn = self.merge_scratch[at].0.commit_lsn;
+                        let retain = match job.oldest_snapshot {
+                            Some(oldest) => lsn > oldest || !kept_baseline,
+                            None => {
+                                retained == 0 || self.merge_scratch[retained - 1].0.rowid != rowid
+                            }
+                        };
+                        if retain {
+                            if job.oldest_snapshot.is_some_and(|oldest| lsn <= oldest) {
+                                kept_baseline = true;
+                            }
+                            self.merge_scratch[retained] = self.merge_scratch[at];
+                            retained += 1;
+                        }
+                        at += 1;
+                    }
+                }
+                job.schedule_len = retained;
                 MergePhase::Write { cursor: 0 }
             }
         };
@@ -479,7 +535,8 @@ impl Checkpointer {
                 job.phase = MergePhase::Write { cursor };
                 return Ok(MergeBeatOutcome::Continue);
             }
-            let (rowid, kind) = scratch[cursor];
+            let (key, kind) = scratch[cursor];
+            let rowid = key.rowid;
             cursor += 1;
             processed += 1;
             if kind & 2 != 0 {
@@ -488,11 +545,13 @@ impl Checkpointer {
                 // it; elsewhere it still shadows earlier members at cold
                 // start, so it survives into the merged SST.
                 if !job.drop_tombstones {
-                    let mut header = [0u8; 8];
-                    header.copy_from_slice(&rowid.to_le_bytes());
+                    let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
+                    header[0..8].copy_from_slice(&rowid.to_le_bytes());
+                    header[8..16].copy_from_slice(&key.commit_lsn.to_le_bytes());
+                    header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
                     job.crc.update(&header);
                     writer
-                        .append_tombstone(&mut *blocks.borrow_mut(), rowid)
+                        .append_tombstone_version(&mut *blocks.borrow_mut(), key)
                         .map_err(sst_to_sql)?;
                     job.count += 1;
                 }
@@ -500,8 +559,15 @@ impl Checkpointer {
             }
             let member = if kind & 1 == 0 { &job.old0 } else { &job.old1 };
             let len = reader
-                .get(&mut *blocks.borrow_mut(), &member.handle, rowid, row_buf)
+                .get_at(
+                    &mut *blocks.borrow_mut(),
+                    &member.handle,
+                    rowid,
+                    key.commit_lsn,
+                    row_buf,
+                )
                 .map_err(sst_to_sql)?
+                .filter(|probe| probe.key == key && probe.len.is_some())
                 .ok_or_else(|| {
                     sql_err!(
                         SQLSTATE_IO,
@@ -509,13 +575,15 @@ impl Checkpointer {
                         rowid
                     )
                 })?;
-            let mut header = [0u8; SST_ENTRY_HEADER];
+            let len = len.len.expect("filtered live version") as usize;
+            let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
             header[0..8].copy_from_slice(&rowid.to_le_bytes());
-            header[8..12].copy_from_slice(&(len as u32).to_le_bytes());
+            header[8..16].copy_from_slice(&key.commit_lsn.to_le_bytes());
+            header[16..20].copy_from_slice(&(len as u32).to_le_bytes());
             job.crc.update(&header);
             job.crc.update(&row_buf[..len]);
             writer
-                .append(&mut *blocks.borrow_mut(), rowid, &row_buf[..len])
+                .append_version(&mut *blocks.borrow_mut(), key, &row_buf[..len])
                 .map_err(sst_to_sql)?;
             job.count += 1;
         }
@@ -565,7 +633,6 @@ impl Checkpointer {
                 .map_err(CheckpointSetupError::Budget)?,
             pending_installs: Vec::with_capacity(MAX_CKPT_TABLES),
             merge_scratch: Vec::with_capacity(MERGE_SCRATCH_ENTRIES),
-            tomb_scratch: Vec::with_capacity(crate::storage::MAX_TOMBSTONES),
             roster_scratch: Vec::with_capacity(MAX_KEEP_BLOCKS),
             doomed_blocks: Vec::with_capacity(MAX_SWEEP_KEYS),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", MANIFEST_BUF_BYTES)
@@ -1035,6 +1102,7 @@ impl Checkpointer {
                             index: parse_block_id(index)?,
                             filter: parse_block_id(filter)?,
                             roster: parse_block_id(roster)?,
+                            versioned: false,
                         })
                     };
                     bssts.push((mindex, 0, count, crc, handle));
@@ -1057,10 +1125,18 @@ impl Checkpointer {
                     let handle = if index == "-" {
                         None
                     } else {
+                        let versioned = match words.next() {
+                            None | Some("v1") => false,
+                            Some("v2") => true,
+                            Some(_) => {
+                                return Err(CheckpointSetupError::Corrupt("unknown dsst format"));
+                            }
+                        };
                         Some(SstHandle {
                             index: parse_block_id(index)?,
                             filter: parse_block_id(filter)?,
                             roster: parse_block_id(roster)?,
+                            versioned,
                         })
                     };
                     bssts.push((mindex, idx, count, crc, handle));
@@ -1393,9 +1469,9 @@ impl Checkpointer {
             self.referenced.push(crate::stack_format!(64, "{}", key));
         }
 
-        // Block SSTs apply in (slot, list index) order: rows install spilled,
-        // a later list member's rows overwrite an earlier one's, tombstones
-        // remove — the same shadowing the deltas were written under.
+        // Block SSTs load in (slot, list index) order so the installed list
+        // preserves generation rank for equal legacy keys. Versioned reads
+        // choose the greatest admissible commit LSN across every member.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
         for (mindex, idx, count, crc, handle) in &bssts {
             let slot =
@@ -1460,11 +1536,10 @@ impl Checkpointer {
         Ok(lsn)
     }
 
-    /// Rehydrates one block-grid SST in list order: rows install *spilled*
-    /// (the map gets rowid and length, the bytes stay in the SST — the scan
-    /// just warmed the cache tiers), a later SST's row overwrites an earlier
-    /// one's, and a tombstone removes the entry. Cold start no longer needs
-    /// the dataset to fit the heap.
+    /// Verifies one block-grid SST's roots and advances the global rowid floor.
+    /// Cold start installs only the ordered handle list: rows and historical
+    /// versions remain object-resident, so neither the heap nor the row-map
+    /// capacity bounds recovery.
     fn rehydrate_block_sst(
         &mut self,
         storage: &mut Storage,
@@ -1495,26 +1570,23 @@ impl Checkpointer {
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| CheckpointSetupError::Corrupt("sst reader scratch"))?;
         let mut blocks = self.blocks.borrow_mut();
-        let block_count = crate::store::data_block_total(&mut *blocks, &handle.index, index_buf)
+        let block_count = crate::store::data_block_total(&mut *blocks, handle, index_buf)
             .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?;
         if block_count == 0 {
             return Err(CheckpointSetupError::Corrupt("sst index names no blocks"));
         }
-        let last_id = crate::store::locate_data_block(
-            &mut *blocks,
-            &handle.index,
-            index_buf,
-            block_count - 1,
-        )
-        .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?
-        .ok_or(CheckpointSetupError::Corrupt("sst index names no blocks"))?;
+        let last_id =
+            crate::store::locate_data_block(&mut *blocks, handle, index_buf, block_count - 1)
+                .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?
+                .ok_or(CheckpointSetupError::Corrupt("sst index names no blocks"))?;
         let data_len = crate::store::read_data_block(&mut *blocks, &last_id, data_buf, index_buf)
             .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
         let mut at = 0usize;
         let mut max_rowid: Option<u64> = None;
-        while let Some((rowid, _, _, next)) = crate::store::block_keys_at(&data_buf[..data_len], at)
+        while let Some((key, _, _, next)) =
+            crate::store::block_keys_at(&data_buf[..data_len], at, handle.versioned)
         {
-            max_rowid = Some(rowid);
+            max_rowid = Some(key.rowid);
             at = next;
         }
         drop(blocks);
@@ -1645,17 +1717,25 @@ impl Checkpointer {
         storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
-        if storage.has_active_snapshots() && (self.merge_job.is_some() || self.merge_done.is_some())
-        {
-            // A snapshot may begin between merge beats. The unpublished
-            // output is an orphan, so abandon it before it can replace the
-            // immutable generations that historical readers still reference.
-            self.merge_job = None;
-            self.merge_done = None;
-            self.merge_writer.reset();
-            self.merge_scratch.clear();
-            self.pending_installs
-                .retain(|(_, install)| !matches!(install, SlotInstall::MergePair { .. }));
+        let pinned_full_list = storage.has_active_snapshots()
+            && self.merge_done.is_none()
+            && (0..storage.table_count()).any(|slot| {
+                storage.table(slot).live
+                    && storage.table(slot).dirty
+                    && self
+                        .prev_ssts
+                        .get(slot)
+                        .is_some_and(|list| list.n == crate::storage::MAX_SPILL_SSTS)
+            });
+        if pinned_full_list {
+            if self.merge_job.is_none() && self.merge_candidate(storage).is_none() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "historical snapshot pins a full SST generation list whose merge exceeds the fixed checkpoint scratch"
+                ));
+            }
+            self.merge_beat(storage)?;
+            return Ok(CheckpointStep::Working);
         }
         // Merge beats interleave with sweep work — alternating when both
         // want the engine, so a hot sweep cannot starve compaction and a
@@ -2064,12 +2144,13 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "dsst {slot} {idx} {} {} {} {} {}",
+                        "dsst {slot} {idx} {} {} {} {} {} {}",
                         p.count,
                         p.crc,
                         core::str::from_utf8(&ih).expect("hex"),
                         core::str::from_utf8(&fh).expect("hex"),
                         core::str::from_utf8(&rh).expect("hex"),
+                        if h.versioned { "v2" } else { "v1" },
                     ),
                 )?;
             }
@@ -2398,12 +2479,44 @@ impl Checkpointer {
         slot: usize,
     ) -> Result<(), SqlError> {
         self.pending_installs.retain(|(s, _)| *s != slot);
+        let mut base_list = self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
+        // A completed paced merge is part of this publish's base before a
+        // dirty table decides whether its new versions fit as a delta.
+        let completed = self.merge_done.as_ref().and_then(|done| {
+            (done.slot == slot
+                && pair_at(&base_list, done.at) == Some((done.old0.handle, done.old1.handle)))
+            .then_some((done.at, done.merged))
+        });
+        if let Some((at, merged)) = completed {
+            let mut list = SlotList::EMPTY;
+            for prior in base_list.iter().take(at) {
+                push_slot_list(&mut list, *prior)?;
+            }
+            if let Some(prior) = merged {
+                push_slot_list(&mut list, prior)?;
+            }
+            for prior in base_list.iter().skip(at + 2) {
+                push_slot_list(&mut list, *prior)?;
+            }
+            base_list = list;
+            self.pending_installs.push((
+                slot,
+                SlotInstall::MergePair {
+                    at,
+                    handle: merged.map(|prior| prior.handle),
+                },
+            ));
+        }
         // A clean table carries its whole SST list forward untouched.
-        let clean = !storage.table(slot).dirty && self.prev_ssts.get(slot).is_some_and(|l| l.n > 0);
+        let clean = !storage.table(slot).dirty && base_list.n > 0;
         // A dirty table with spilled SSTs and room flushes a *delta*:
         // its heap-resident committed rows plus the tombstones recorded
         // since the last checkpoint. Otherwise it rewrites fully.
-        let delta = !clean && storage.delta_eligible(slot) && storage.table(slot).dirty;
+        let delta = !clean
+            && storage.table(slot).dirty
+            && base_list.n > 0
+            && base_list.n < crate::storage::MAX_SPILL_SSTS
+            && !storage.table(slot).tombstones_overflow;
         if storage.has_active_snapshots()
             && !clean
             && storage.table(slot).n_spill_ssts > 0
@@ -2417,20 +2530,37 @@ impl Checkpointer {
         }
 
         let new_list: SlotList = if clean {
-            self.prev_ssts[slot]
+            base_list
         } else {
-            // Collect the rows this SST will hold.
+            // Collect rowids; each rowid expands to its current image plus
+            // every snapshot-retained committed version. The scratch remains
+            // one entry per row even when object capacity holds a long chain.
             sort_scratch.clear();
             storage.for_each_row_state(slot, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                let Some(home) = state.committed else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                if delta && !matches!(home, RowHome::Heap(_)) {
-                    // Already durable in an earlier list member.
+                let has_version = state.committed.is_some()
+                    || state.committed_lsn != 0
+                    || !state.history.is_empty();
+                if !has_version {
                     return Ok(ControlFlow::Continue(()));
                 }
-                sort_scratch.push((rowid, home)).map_err(|e| {
+                let resident = matches!(state.committed, Some(RowHome::Heap(_)))
+                    || (state.committed.is_none() && state.committed_lsn != 0)
+                    || (0..state.history.len()).any(|index| {
+                        state.history.get(index).is_some_and(|version| {
+                            version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
+                        })
+                    });
+                if delta && !resident {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let marker = state
+                    .committed
+                    .or_else(|| {
+                        (0..state.history.len()).find_map(|index| state.history.get(index)?.home)
+                    })
+                    .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
+                sort_scratch.push((rowid, marker)).map_err(|e| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "checkpoint scratch: {}",
@@ -2442,68 +2572,68 @@ impl Checkpointer {
             sort_scratch
                 .as_mut_slice()
                 .sort_unstable_by_key(|(rowid, _)| *rowid);
-            self.tomb_scratch.clear();
-            if delta {
-                // Within the reserved capacity: MAX_TOMBSTONES entries.
-                self.tomb_scratch
-                    .extend_from_slice(storage.tombstones(slot));
-            }
-            self.tomb_scratch.sort_unstable();
-            self.tomb_scratch.dedup();
-            let tomb_sorted = &self.tomb_scratch;
 
-            let count = (sort_scratch.len() + tomb_sorted.len()) as u64;
+            // Versions are already grouped in `(rowid, commit_lsn DESC)`
+            // order. Write and checksum the same logical stream in one pass,
+            // avoiding a second round of provider-neutral reads for spilled
+            // images during a full rewrite.
+            self.sst_arena.reset();
+            self.slice_writer.reset();
+            let writer = &mut self.slice_writer;
+            let blocks = &self.blocks;
+            let mut count = 0u64;
             let mut crc = Crc32c::new();
-            for &(rowid, home) in sort_scratch.iter() {
-                storage.with_row_bytes(slot, rowid, home, |row| {
-                    let mut header = [0u8; SST_ENTRY_HEADER];
+            for &(rowid, _) in sort_scratch.iter() {
+                let Some(state) = storage.row_state(slot, rowid)? else {
+                    continue;
+                };
+                let mut append_version = |commit_lsn: u64,
+                                          home: Option<RowHome>|
+                 -> Result<(), SqlError> {
+                    if delta && home.is_some_and(|location| !matches!(location, RowHome::Heap(_))) {
+                        return Ok(());
+                    }
+                    let key = SstKey::at(rowid, commit_lsn);
+                    let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
                     header[0..8].copy_from_slice(&rowid.to_le_bytes());
-                    header[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
+                    header[8..16].copy_from_slice(&commit_lsn.to_le_bytes());
+                    header[16..20].copy_from_slice(
+                        &home
+                            .map_or(u32::MAX, |location| match location {
+                                RowHome::Heap(row) => row.len,
+                                RowHome::Spilled { len, .. } => len,
+                            })
+                            .to_le_bytes(),
+                    );
                     crc.update(&header);
-                    crc.update(row);
+                    if let Some(location) = home {
+                        storage.with_row_bytes(slot, rowid, location, |row| {
+                            crc.update(row);
+                            writer
+                                .append_version(&mut *blocks.borrow_mut(), key, row)
+                                .map_err(sst_to_sql)
+                        })?
+                    } else {
+                        writer
+                            .append_tombstone_version(&mut *blocks.borrow_mut(), key)
+                            .map_err(sst_to_sql)?
+                    }
+                    count += 1;
                     Ok(())
-                })?;
-            }
-            for &t in tomb_sorted.iter() {
-                crc.update(&t.to_le_bytes());
+                };
+                if state.committed.is_some() || state.committed_lsn != 0 {
+                    append_version(state.committed_lsn, state.committed)?;
+                }
+                for index in 0..state.history.len() {
+                    if let Some(version) = state.history.get(index) {
+                        append_version(version.lsn, version.home)?;
+                    }
+                }
             }
             let crc = crc.finish();
-
-            let handle = if count == 0 {
-                None
-            } else {
-                // Rows and tombstones merge in rowid order into the block
-                // grid: sorted data blocks, sparse index, bloom filter,
-                // roster. A spilled row's bytes come back through the
-                // cache on the way into a full rewrite.
-                self.sst_arena.reset();
-                self.slice_writer.reset();
-                let writer = &mut self.slice_writer;
-                let blocks = &self.blocks;
-                let mut ti = 0usize;
-                for &(rowid, home) in sort_scratch.iter() {
-                    while ti < tomb_sorted.len() && tomb_sorted[ti] < rowid {
-                        writer
-                            .append_tombstone(&mut *blocks.borrow_mut(), tomb_sorted[ti])
-                            .map_err(sst_to_sql)?;
-                        ti += 1;
-                    }
-                    storage.with_row_bytes(slot, rowid, home, |row| {
-                        writer
-                            .append(&mut *blocks.borrow_mut(), rowid, row)
-                            .map_err(sst_to_sql)
-                    })?;
-                }
-                while ti < tomb_sorted.len() {
-                    writer
-                        .append_tombstone(&mut *blocks.borrow_mut(), tomb_sorted[ti])
-                        .map_err(sst_to_sql)?;
-                    ti += 1;
-                }
-                writer
-                    .finish(&mut *blocks.borrow_mut())
-                    .map_err(sst_to_sql)?
-            };
+            let handle = writer
+                .finish(&mut *blocks.borrow_mut())
+                .map_err(sst_to_sql)?;
 
             // Storage is not touched yet: the list installs (and the
             // entry remap a collapse implies) apply only after the
@@ -2511,7 +2641,7 @@ impl Checkpointer {
             // consistent with the still-current manifest.
             match (delta, handle) {
                 (true, Some(h)) => {
-                    let mut list = self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
+                    let mut list = base_list;
                     if !list.push(PrevSst {
                         handle: h,
                         count,
@@ -2525,16 +2655,19 @@ impl Checkpointer {
                 (true, None) => {
                     // Dirty but nothing new to flush (e.g. the change was
                     // rolled back): the list stands.
-                    self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY)
+                    base_list
                 }
                 (false, Some(h)) => {
                     self.pending_installs.push((slot, SlotInstall::Collapse(h)));
                     let mut list = SlotList::EMPTY;
-                    let _ = list.push(PrevSst {
-                        handle: h,
-                        count,
-                        crc,
-                    });
+                    push_slot_list(
+                        &mut list,
+                        PrevSst {
+                            handle: h,
+                            count,
+                            crc,
+                        },
+                    )?;
                     list
                 }
                 (false, None) => SlotList::EMPTY,

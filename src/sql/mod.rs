@@ -1023,6 +1023,7 @@ impl Engine {
         }
         // The checkpoint installed each table's spill-SST list as it
         // wrote (full rewrites collapse a list, deltas append).
+        self.storage.release_durable_histories();
         self.storage.compact_heap(&mut self.compact_scratch)?;
         // Under memory pressure, committed bytes leave the heap: the map
         // entries flip to spilled and a second compaction drops the
@@ -1145,7 +1146,12 @@ impl Engine {
         };
         let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
-        if !(ckpt.sweep_active() || ckpt.merge_work_pending(&self.storage) || heap_full || wal_full)
+        let history_full = self.storage.history_pressure();
+        if !(ckpt.sweep_active()
+            || ckpt.merge_work_pending(&self.storage)
+            || heap_full
+            || wal_full
+            || history_full)
         {
             return true;
         }

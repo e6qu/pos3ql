@@ -7513,12 +7513,7 @@ fn set_transaction_changes_only_named_characteristics() {
     assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
     assert!(transaction.read_only);
     assert!(!transaction.deferrable);
-    let nested = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut transaction,
-        "BEGIN",
-    );
+    let nested = run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
     assert!(nested.contains("25001"), "{nested}");
     assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
     assert!(transaction.read_only);
@@ -7641,8 +7636,9 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         &mut engine,
         &mut budget,
         &mut writer,
-        "INSERT INTO snapshot_rows VALUES (1, 'before')",
+        "INSERT INTO snapshot_rows VALUES (1, 'before'), (2, 'remove-me')",
     );
+    assert!(engine.checkpoint().unwrap());
     run_txn(
         &mut engine,
         &mut budget,
@@ -7654,32 +7650,68 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
             &mut engine,
             &mut budget,
             &mut reader,
-            "SELECT value FROM snapshot_rows",
+            "SELECT value FROM snapshot_rows ORDER BY id",
         )),
-        ["before"]
+        ["before", "remove-me"]
     );
-    run_txn(
-        &mut engine,
-        &mut budget,
-        &mut writer,
-        "UPDATE snapshot_rows SET value = 'after' WHERE id = 1",
-    );
-
-    assert!(
-        engine.checkpoint().unwrap(),
-        "the latest generation must publish while the historical snapshot is pinned"
-    );
+    // Cross both the resident history bound and the immutable-SST list bound.
+    // Every checkpoint must be free to publish and compact while the old
+    // snapshot remains pinned; the object store, not either cache tier, owns
+    // the durable version chain.
+    for version in 1..=24 {
+        let updated = run_txn(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            &format!("UPDATE snapshot_rows SET value = 'after-{version}' WHERE id = 1"),
+        );
+        assert!(updated.contains("UPDATE 1"), "{updated}");
+        if version == 8 {
+            let deleted = run_txn(
+                &mut engine,
+                &mut budget,
+                &mut writer,
+                "DELETE FROM snapshot_rows WHERE id = 2",
+            );
+            assert!(deleted.contains("DELETE 1"), "{deleted}");
+        }
+        assert!(
+            engine.checkpoint().unwrap(),
+            "version {version} must publish while the historical snapshot is pinned"
+        );
+        assert_eq!(
+            data_rows(&run_with_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut reader,
+                "SELECT value FROM snapshot_rows ORDER BY id",
+            )),
+            ["before", "remove-me"],
+            "version {version} must preserve the object-resident snapshot"
+        );
+    }
     assert_eq!(
         data_rows(&run_with_txn_bytes(
             &mut engine,
             &mut budget,
             &mut reader,
-            "SELECT value FROM snapshot_rows",
+            "SELECT value FROM snapshot_rows ORDER BY id",
         )),
-        ["before"],
-        "checkpointing must not collapse a pinned historical generation"
+        ["before", "remove-me"],
+        "compaction must retain both an overwritten row and a deleted row at the pinned snapshot"
     );
     run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "SELECT id, value FROM snapshot_rows ORDER BY id",
+        )),
+        ["1|after-24"],
+        "the current snapshot must honor the tombstone and newest version"
+    );
+    engine.checkpoint().unwrap();
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -7689,9 +7721,9 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT value FROM snapshot_rows",
+            "SELECT id, value FROM snapshot_rows ORDER BY id",
         )),
-        ["after"],
+        ["1|after-24"],
         "a cold RAM-and-disk cache must recover the authoritative object-store generation"
     );
     drop(restarted);

@@ -17,7 +17,10 @@ engineering discipline.
   first transport speaks the S3-compatible API; native adapters or compatibility
   gateways provide the same immutable-object, range-read, listing, deletion,
   and conditional-root semantics for other providers without storage-engine
-  special cases. Reads go **RAM block
+  special cases. Committed histories are immutable SST entries keyed by
+  `(rowid, commit_lsn)`; repeatable-read snapshots therefore survive arbitrary
+  checkpoint churn and cache eviction, while snapshot-aware compaction retains
+  only versions a live reader can still observe. Reads go **RAM block
   cache → local disk cache → ranged GET** (`block_cache_bytes` /
   `disk_cache_bytes`), and under memory pressure committed row bytes spill to
   the bucket and page back through the caches, so ingest is not bounded by
@@ -196,6 +199,11 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   read back through bloom-gated probes and merged walks. A single
   transaction's touched rows must still fit the map, and with `object_store = off`
   (no bucket) the map bound is the table bound.
+- **Historical rows do not make RAM authoritative.** A bounded resident
+  committed-history chain only stages versions until the next successful
+  manifest publication. Versioned SSTs in the provider-neutral object store
+  retain snapshots across long update/checkpoint churn; RAM and disk cache
+  loss changes latency, never visibility or durability.
 - **Uniqueness is value-indexed.** A `PRIMARY KEY` / `UNIQUE` constraint keeps
   an in-RAM `value → rowid` index, so a duplicate check is a hash seek rather
   than a scan of the whole spilled dataset. It bounds a constrained table to

@@ -1,5 +1,5 @@
 //! SHA-512 and SHA-384 (FIPS 180-4), for the `sha512` / `sha384` SQL functions.
-//! SHA-224/256 already ship in `crate::s3::sha256`; this is the 64-bit-word
+//! SHA-224/256 live in `crate::crypto::sha256`; this is the 64-bit-word
 //! family. Validated against the FIPS 180-4 example vectors in the tests below.
 
 const K: [u64; 80] = [

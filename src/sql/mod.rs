@@ -116,7 +116,7 @@ pub struct Engine {
     pending_copy: Option<exec::CopySetup>,
     wal_upload: bool,
     /// When set, a commit blocks until its WAL batch is uploaded (RPO=0 to
-    /// S3). Otherwise the upload is drained off the commit path.
+    /// durable object tier). Otherwise upload is drained off the commit path.
     wal_upload_sync: bool,
     /// Backpressure threshold: once this many bytes of committed WAL await
     /// asynchronous upload, the next commit drains synchronously.
@@ -178,7 +178,7 @@ impl Engine {
                 * size_of::<(u32, u64, u8, RowLoc)>()
             + config.work_arena_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
-            + if config.s3_on {
+            + if config.object_store_on {
                 // The checkpointer's fixed parts plus the spilled-row reader's
                 // two scratch sets.
                 Checkpointer::budget_bytes(config)
@@ -192,7 +192,7 @@ impl Engine {
     /// (when enabled), and replays the journal tail on top. Startup only.
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, EngineSetupError> {
         let mut storage = Storage::new(config, budget)?;
-        let mut ckpt = if config.s3_on {
+        let mut ckpt = if config.object_store_on {
             Some(Checkpointer::new(config, budget)?)
         } else {
             None
@@ -243,7 +243,7 @@ impl Engine {
             wal,
             ckpt,
             pending_copy: None,
-            wal_upload: config.wal_upload && config.s3_on,
+            wal_upload: config.wal_upload && config.object_store_on,
             wal_upload_sync: config.wal_upload_sync,
             wal_upload_backpressure: backpressure,
             wal_seg_buf: Vec::with_capacity(upload_buf),
@@ -456,15 +456,17 @@ impl Engine {
             altered_tables[altered_count] = (slot, rewrote_rows);
             altered_count += 1;
         }
+        let commit_lsn = self.storage.lsn();
         for &(table, rowid, _) in txn.touched() {
             let table = table as usize;
             if altered_tables[..altered_count]
                 .iter()
                 .any(|&(altered, _)| altered == table)
             {
-                self.storage.commit_rewritten_row(table, rowid, txn.txid);
+                self.storage
+                    .commit_rewritten_row(table, rowid, txn.txid, commit_lsn);
             } else {
-                self.storage.commit_row(table, rowid, txn.txid);
+                self.storage.commit_row(table, rowid, txn.txid, commit_lsn);
             }
         }
         for undo in txn.ddl() {
@@ -806,8 +808,8 @@ impl Engine {
     }
 
     /// Whether committed WAL awaits asynchronous upload. The event loop polls
-    /// this to drain uploads between requests without adding S3 latency to any
-    /// commit.
+    /// this to drain uploads between requests without adding object-store
+    /// latency to any commit.
     pub fn has_pending_wal_upload(&self) -> bool {
         self.wal_upload && !self.wal_upload_sync && self.wal.pending_batch_bytes() > 0
     }
@@ -845,7 +847,7 @@ impl Engine {
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                message: stack_format!(192, "no object storage configured (s3 = off)"),
+                message: stack_format!(192, "no object storage configured (object_store = off)"),
             });
         };
         // Everything the snapshot will contain must be journal-durable
@@ -3099,7 +3101,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage
                 .table_mut(index)
                 .rows
-                .insert(rowid, crate::storage::RowState::committed_only(loc))
+                .insert(
+                    rowid,
+                    crate::storage::RowState::committed_only_at(loc, lsn),
+                )
                 .map_err(|e| SqlError {
                     sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     message: stack_format!(192, "journal replay overflows {}", e.what),
@@ -3112,7 +3117,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
                 });
             };
-            storage.remove_committed(index, rowid);
+            storage.remove_committed(index, rowid, lsn);
         }
         WalOp::CreateView { schema, name, sql, path, dependencies } => {
             // Replay reconstructs committed state: create then promote.

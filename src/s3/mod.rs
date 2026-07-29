@@ -1,16 +1,14 @@
 //! S3-compatible object storage client: hand-rolled HTTP/1.1 over a
 //! blocking, keep-alive TCP connection, signed with SigV4. Plaintext HTTP or
-//! TLS (the isolated rustls door in [`tls`]) —
-//! development targets MinIO; TLS to public endpoints is an explicitly
-//! deferred decision (never hand-rolled).
+//! TLS (the isolated rustls door in [`tls`]); development targets MinIO and
+//! the same adapter reaches hosted S3-compatible endpoints and provider
+//! compatibility gateways.
 //!
 //! Request heads are assembled in a fixed buffer; bodies are written
 //! straight from the caller's slice, so object size is not bounded by any
 //! client buffer. Response bodies must fit the fixed response buffer —
 //! reads use ranged GETs sized accordingly.
 
-pub mod hmac;
-pub mod sha256;
 pub mod sigv4;
 
 use std::io::{Read, Write};
@@ -18,12 +16,13 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::crypto::sha256::{HexDigest, sha256};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
+pub use crate::object_store::{Error as S3Error, GetResult, Precondition};
 use crate::stack_format;
 use crate::util::StackStr;
 
-use sha256::{sha256, HexDigest};
 use sigv4::{sign, uri_encode, SigningInput};
 
 pub const EMPTY_SHA256_HEX: &str =
@@ -43,7 +42,9 @@ impl std::fmt::Display for S3SetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(e) => write!(f, "{e}"),
-            Self::Resolve(endpoint, e) => write!(f, "cannot resolve s3_endpoint '{endpoint}': {e}"),
+            Self::Resolve(endpoint, e) => {
+                write!(f, "cannot resolve object_store_endpoint '{endpoint}': {e}")
+            }
             Self::Tls(message) => write!(f, "tls: {message}"),
         }
     }
@@ -57,170 +58,7 @@ impl From<BudgetError> for S3SetupError {
     }
 }
 
-#[derive(Debug)]
-// `allow`, not `expect`: whether the lint fires depends on the clippy
-// version's size thresholds (the inline detail field sits near them), and an
-// unfulfilled expectation is itself an error under -D warnings.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "error text is carried inline on the stack; boxing would heap-allocate"
-)]
-pub enum S3Error {
-    /// Non-2xx status; message holds the beginning of the error body.
-    Status { code: u16, message: StackStr<256> },
-    /// Connection-level failure after retries.
-    Io {
-        context: &'static str,
-        kind: std::io::ErrorKind,
-        /// The source error's own words — a TLS failure names its cause here
-        /// (kind alone reduces a certificate rejection to `InvalidData`).
-        detail: StackStr<160>,
-    },
-    /// Response exceeded the fixed response buffer.
-    ResponseTooLarge { content_length: usize, capacity: usize },
-    /// Malformed HTTP from the server.
-    Protocol(&'static str),
-}
-
-impl S3Error {
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::Status { code: 404, .. })
-    }
-
-    pub fn is_precondition_failed(&self) -> bool {
-        matches!(self, Self::Status { code: 412 | 409, .. })
-    }
-}
-
-impl std::fmt::Display for S3Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Status { code, message } => {
-                write!(f, "object store returned {code}: {}", message.as_str())
-            }
-            Self::Io { context, kind, detail } => {
-                if detail.as_str().is_empty() {
-                    write!(f, "object store i/o ({context}): {kind:?}")
-                } else {
-                    write!(f, "object store i/o ({context}): {}", detail.as_str())
-                }
-            }
-            Self::ResponseTooLarge {
-                content_length,
-                capacity,
-            } => write!(
-                f,
-                "object store response of {content_length} bytes exceeds buffer of {capacity}"
-            ),
-            Self::Protocol(what) => write!(f, "object store protocol error: {what}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Precondition<'a> {
-    None,
-    /// `If-None-Match: *` — create only.
-    IfNoneMatchAny,
-    /// `If-Match: <etag>` — compare-and-swap.
-    IfMatch(&'a str),
-}
-
-#[derive(Debug)]
-pub struct GetResult {
-    pub len: usize,
-    pub etag: StackStr<80>,
-}
-
-pub(crate) mod sim;
 pub(crate) mod tls;
-
-/// The object-client seam: the real HTTP client, or the deterministic
-/// virtual bucket (`s3 = sim`) the storage VOPR drives faults through. An
-/// enum, not a trait object, so no allocation or dynamic dispatch enters
-/// the storage path; both arms share the observable semantics callers rely
-/// on (fixed response buffer, inclusive ranges with 416 past the end,
-/// 404/412 statuses, LIST in key order with the key prefix stripped).
-// The size difference is the real client's inline connection state; a
-// handful of these exist per process, so boxing the variant would spend a
-// heap indirection to save bytes nobody is short of.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "two long-lived instances per process; boxing buys nothing"
-)]
-pub(crate) enum ObjectClient {
-    Real(S3Client),
-    Sim(sim::SimClient),
-}
-
-impl ObjectClient {
-    pub(crate) fn budget_bytes(config: &Config) -> usize {
-        S3Client::budget_bytes(config)
-    }
-
-    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, S3SetupError> {
-        if config.s3_sim {
-            Ok(Self::Sim(sim::SimClient::new(config, budget)?))
-        } else {
-            Ok(Self::Real(S3Client::new(config, budget)?))
-        }
-    }
-
-    pub(crate) fn put(
-        &mut self,
-        key: &str,
-        body: &[u8],
-        precondition: Precondition,
-    ) -> Result<StackStr<80>, S3Error> {
-        match self {
-            Self::Real(c) => c.put(key, body, precondition),
-            Self::Sim(c) => c.put(key, body, precondition),
-        }
-    }
-
-    pub(crate) fn get(
-        &mut self,
-        key: &str,
-        range: Option<(u64, u64)>,
-    ) -> Result<GetResult, S3Error> {
-        match self {
-            Self::Real(c) => c.get(key, range),
-            Self::Sim(c) => c.get(key, range),
-        }
-    }
-
-    pub(crate) fn body_bytes(&self) -> &[u8] {
-        match self {
-            Self::Real(c) => c.body_bytes(),
-            Self::Sim(c) => c.body_bytes(),
-        }
-    }
-
-    pub(crate) fn response_capacity(&self) -> usize {
-        match self {
-            Self::Real(c) => c.response_capacity(),
-            Self::Sim(c) => c.response_capacity(),
-        }
-    }
-
-    pub(crate) fn delete(&mut self, key: &str) -> Result<(), S3Error> {
-        match self {
-            Self::Real(c) => c.delete(key),
-            Self::Sim(c) => c.delete(key),
-        }
-    }
-
-    pub(crate) fn list(
-        &mut self,
-        prefix: &str,
-        each: impl FnMut(&str),
-    ) -> Result<usize, S3Error> {
-        match self {
-            Self::Real(c) => c.list(prefix, each),
-            Self::Sim(c) => c.list(prefix, each),
-        }
-    }
-}
 
 pub struct S3Client {
     host_header: String,
@@ -234,7 +72,7 @@ pub struct S3Client {
     access_key: String,
     secret_key: String,
     stream: Option<tls::Transport>,
-    /// TLS client state when `s3_tls` is on (built at startup).
+    /// TLS client state when object-store TLS is on (built at startup).
     tls_context: Option<tls::TlsContext>,
     head: FixedBuf,
     body: FixedBuf,
@@ -250,21 +88,21 @@ fn system_clock() -> i64 {
 
 impl S3Client {
     pub fn budget_bytes(config: &Config) -> usize {
-        config.s3_head_bytes + config.s3_response_bytes
+        config.object_store_head_bytes + config.object_store_response_bytes
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, S3SetupError> {
-        let host_header = config.s3_endpoint.clone();
+        let host_header = config.object_store_endpoint.clone();
         let connect_addr = {
             use std::net::ToSocketAddrs;
             config
-                .s3_endpoint
+                .object_store_endpoint
                 .to_socket_addrs()
-                .map_err(|e| S3SetupError::Resolve(config.s3_endpoint.clone(), e))?
+                .map_err(|e| S3SetupError::Resolve(config.object_store_endpoint.clone(), e))?
                 .next()
                 .ok_or_else(|| {
                     S3SetupError::Resolve(
-                        config.s3_endpoint.clone(),
+                        config.object_store_endpoint.clone(),
                         std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses"),
                     )
                 })?
@@ -272,27 +110,35 @@ impl S3Client {
         Ok(Self {
             host_header,
             connect_addr,
-            bucket: config.s3_bucket.clone(),
-            key_prefix: config.s3_prefix.clone(),
-            region: config.s3_region.clone(),
-            access_key: config.s3_access_key.clone(),
-            secret_key: config.s3_secret_key.clone(),
+            bucket: config.object_store_bucket.clone(),
+            key_prefix: config.object_store_prefix.clone(),
+            region: config.object_store_region.clone(),
+            access_key: config.object_store_access_key.clone(),
+            secret_key: config.object_store_secret_key.clone(),
             stream: None,
-            tls_context: if config.s3_tls {
+            tls_context: if config.object_store_tls {
                 let host = config
-                    .s3_endpoint
+                    .object_store_endpoint
                     .rsplit_once(':')
                     .map(|(h, _)| h)
-                    .unwrap_or(config.s3_endpoint.as_str());
+                    .unwrap_or(config.object_store_endpoint.as_str());
                 Some(
-                    tls::build_context(host, &config.s3_tls_ca_file)
+                    tls::build_context(host, &config.object_store_tls_ca_file)
                         .map_err(S3SetupError::Tls)?,
                 )
             } else {
                 None
             },
-            head: FixedBuf::new(budget, "s3_head", config.s3_head_bytes)?,
-            body: FixedBuf::new(budget, "s3_response", config.s3_response_bytes)?,
+            head: FixedBuf::new(
+                budget,
+                "object_store_head",
+                config.object_store_head_bytes,
+            )?,
+            body: FixedBuf::new(
+                budget,
+                "object_store_response",
+                config.object_store_response_bytes,
+            )?,
             clock: system_clock,
         })
     }
@@ -927,12 +773,13 @@ mod tests {
 
     fn test_config(port: u16) -> Config {
         let mut c = Config::default_dev();
-        c.s3_endpoint = format!("127.0.0.1:{port}");
-        c.s3_bucket = "testbucket".to_string();
-        c.s3_access_key = "AKIDEXAMPLE".to_string();
-        c.s3_secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string();
-        c.s3_head_bytes = 8192;
-        c.s3_response_bytes = 65536;
+        c.object_store_endpoint = format!("127.0.0.1:{port}");
+        c.object_store_bucket = "testbucket".to_string();
+        c.object_store_access_key = "AKIDEXAMPLE".to_string();
+        c.object_store_secret_key =
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string();
+        c.object_store_head_bytes = 8192;
+        c.object_store_response_bytes = 65536;
         c
     }
 
@@ -977,8 +824,8 @@ mod tests {
     fn tls_round_trip() {
         // An in-process rustls server (the dependency's own server side — no
         // new dev dependency) answers one canned S3 response over TLS; the
-        // client connects with s3_tls on, trusting the checked-in self-signed
-        // certificate via s3_tls_ca_file (provenance: tests/data/README.md).
+        // client connects with object-store TLS on, trusting the checked-in
+        // self-signed certificate (provenance: tests/data/README.md).
         use std::sync::Arc;
         let cert_pem = std::fs::read_to_string("tests/data/tls-test-cert.pem").unwrap();
         let key_pem = std::fs::read_to_string("tests/data/tls-test-key.pem").unwrap();
@@ -1046,11 +893,11 @@ mod tests {
             .unwrap();
         });
         let mut config = test_config(port);
-        config.s3_tls = true;
-        config.s3_tls_ca_file = "tests/data/tls-test-cert.pem".to_string();
+        config.object_store_tls = true;
+        config.object_store_tls_ca_file = "tests/data/tls-test-cert.pem".to_string();
         // The certificate carries an IP SAN for exactly this: `localhost`
         // may resolve to ::1 while the listener binds 127.0.0.1.
-        config.s3_endpoint = format!("127.0.0.1:{port}");
+        config.object_store_endpoint = format!("127.0.0.1:{port}");
         let mut budget = Budget::new(1 << 20);
         let mut client = S3Client::new(&config, &mut budget).unwrap();
         client.with_clock(|| 1_440_938_160);

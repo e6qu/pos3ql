@@ -1781,7 +1781,7 @@ mod code_roundtrip_tests {
         // The layout this replaced could emit any code in 20..=40; a moved
         // family must not reuse one, or old data decodes as the wrong type
         // instead of failing.
-        // 20..=40 is what the pre-B-095 layout could emit. Only the families
+        // 20..=40 is what the previous layout could emit. Only the families
         // that legitimately held codes there then may hold them now; anything
         // else would decode old data as itself instead of failing.
         for t in &types {

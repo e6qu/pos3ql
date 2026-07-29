@@ -10,8 +10,10 @@
 
 pub(crate) mod checkpoint;
 pub mod config;
+pub(crate) mod crypto;
 pub mod io;
 pub mod mem;
+pub(crate) mod object_store;
 pub(crate) mod pem;
 pub mod pg;
 pub(crate) mod prng;

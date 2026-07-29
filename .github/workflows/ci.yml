@@ -16,13 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install zsh (for the no-op guard)
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Cache Rust build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -42,9 +42,10 @@ jobs:
         run: zsh tools/check-bugs.sh
 
       - name: Set up Node (for the duplicate-code guard)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
+          package-manager-cache: false
 
       # Copy-paste gate: fails if source duplication exceeds the ratchet in
       # .jscpd.json. See tools/check-dups.sh.

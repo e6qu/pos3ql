@@ -51,7 +51,7 @@ jobs:
           - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }
           - { name: torture-b, shard: "runtest:torture", torture_seed: 20260725 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -91,7 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           pattern: lcov-*

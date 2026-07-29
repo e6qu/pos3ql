@@ -477,6 +477,11 @@ pub struct RowLoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowState {
     pub committed: Option<RowHome>,
+    /// Commit LSN of `committed`, or of the deletion when `committed` is
+    /// absent but the entry shadows an older SST row. Zero means the image
+    /// predates LSN-versioned row metadata (legacy checkpoint/cold start) and
+    /// is therefore visible to every later snapshot.
+    pub committed_lsn: u64,
     pub pending: PendingVersions,
 }
 
@@ -604,8 +609,13 @@ pub(crate) const SNAPSHOT_ALL: u32 = u32::MAX;
 
 impl RowState {
     pub fn committed_only(loc: RowLoc) -> Self {
+        Self::committed_only_at(loc, 0)
+    }
+
+    pub fn committed_only_at(loc: RowLoc, commit_lsn: u64) -> Self {
         Self {
             committed: Some(RowHome::Heap(loc)),
+            committed_lsn: commit_lsn,
             pending: PendingVersions::empty(),
         }
     }
@@ -622,9 +632,23 @@ impl RowState {
     /// `snapshot` (`cid < snapshot`); a later/same-command change is not, so the
     /// committed image shows through. `snapshot == SNAPSHOT_ALL` sees everything.
     pub fn visible_at(&self, txid: u32, snapshot: u32) -> Option<RowHome> {
-        match self.pending.visible_at(txid, snapshot) {
+        self.visible_at_lsn(txid, snapshot, u64::MAX)
+    }
+
+    /// Visibility under both the transaction's command snapshot and a durable
+    /// commit-LSN snapshot. This one-version foundation can hide a too-new
+    /// image but cannot yet recover the older image; the committed version
+    /// chain will fill that branch.
+    pub fn visible_at_lsn(
+        &self,
+        txid: u32,
+        command_snapshot: u32,
+        commit_snapshot: u64,
+    ) -> Option<RowHome> {
+        match self.pending.visible_at(txid, command_snapshot) {
             Some(loc) => loc.map(RowHome::Heap),
-            None => self.committed,
+            None if self.committed_lsn <= commit_snapshot => self.committed,
+            None => None,
         }
     }
 
@@ -756,7 +780,7 @@ pub(crate) const MAX_UNIQUE_ENFORCERS: usize = 16;
 /// A table's binding of one uniqueness constraint to its value index: the key
 /// columns it covers and the pool slot holding the `value_hash → rowid` map for
 /// the committed rows. A uniqueness probe finds the enforcer whose columns match
-/// and seeks the index instead of scanning every row (B-169's quadratic).
+/// and seeks the index instead of scanning every row.
 #[derive(Clone, Copy)]
 pub(crate) struct Enforcer {
     slot: u32,
@@ -2970,6 +2994,7 @@ impl Storage {
                 rowid,
                 RowState {
                     committed: Some(RowHome::Spilled { len, sst: member }),
+                    committed_lsn: 0,
                     pending: PendingVersions::empty(),
                 },
             )
@@ -2983,6 +3008,7 @@ impl Storage {
         }
         Ok(self.spill_probe(table_slot, rowid)?.map(|(len, member)| RowState {
             committed: Some(RowHome::Spilled { len, sst: member }),
+            committed_lsn: 0,
             pending: PendingVersions::empty(),
         }))
     }
@@ -3445,6 +3471,7 @@ impl Storage {
                 rowid,
                 RowState {
                     committed,
+                    committed_lsn: 0,
                     pending: {
                         let mut versions = PendingVersions::empty();
                         versions.push(PendingChange { txid, cid, loc })?;
@@ -3557,7 +3584,7 @@ impl Storage {
     /// already be durable.
     /// Removes a committed row outright (journal replay of a DELETE),
     /// recording the tombstone a later delta checkpoint needs.
-    pub fn remove_committed(&mut self, table_index: usize, rowid: u64) {
+    pub fn remove_committed(&mut self, table_index: usize, rowid: u64, commit_lsn: u64) {
         let table = &mut self.tables[table_index];
         if table.n_spill_ssts == 0 {
             if table.rows.remove(&rowid).is_some() {
@@ -3572,6 +3599,7 @@ impl Storage {
             rowid,
             RowState {
                 committed: None,
+                committed_lsn: commit_lsn,
                 pending: PendingVersions::empty(),
             },
         );
@@ -3579,7 +3607,13 @@ impl Storage {
         table.mark_dirty();
     }
 
-    pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32) {
+    pub fn commit_row(
+        &mut self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        commit_lsn: u64,
+    ) {
         // Read the transition without holding a mutable borrow.
         let (old_committed, new_loc) = {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
@@ -3598,6 +3632,7 @@ impl Storage {
         let table = &mut self.tables[table_index];
         let state = table.rows.get_mut(&rowid).expect("row present after read");
         state.committed = new_loc.map(RowHome::Heap);
+        state.committed_lsn = commit_lsn;
         state.pending.clear();
         if state.committed.is_none() {
             // A rowid that ever reached an SST — even if its latest version was
@@ -3620,7 +3655,13 @@ impl Storage {
     /// indexes are rebuilt once after every row and the definition are
     /// promoted, because the old and new encodings cannot share an index
     /// decoder.
-    pub fn commit_rewritten_row(&mut self, table_index: usize, rowid: u64, txid: u32) {
+    pub fn commit_rewritten_row(
+        &mut self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        commit_lsn: u64,
+    ) {
         let new_loc = {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
@@ -3633,6 +3674,7 @@ impl Storage {
         let table = &mut self.tables[table_index];
         let state = table.rows.get_mut(&rowid).expect("row present after read");
         state.committed = new_loc.map(RowHome::Heap);
+        state.committed_lsn = commit_lsn;
         state.pending.clear();
         if state.committed.is_none() {
             if table.n_spill_ssts == 0 {
@@ -3852,7 +3894,7 @@ impl Storage {
             }
         }
         // A CREATE UNIQUE INDEX keeps its existing full-scan enforcement (a
-        // separate feature from the PRIMARY KEY / UNIQUE constraints B-169 names)
+        // separate feature from the PRIMARY KEY / UNIQUE constraints)
         // — it is not given a value index here, so the pending/live index
         // lifecycle stays out of this path.
         #[allow(clippy::needless_range_loop)]
@@ -5829,6 +5871,39 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_image_obeys_an_lsn_snapshot() {
+        let location = RowLoc { offset: 12, len: 4 };
+        let state = RowState::committed_only_at(location, 42);
+        assert_eq!(state.visible_at_lsn(7, SNAPSHOT_ALL, 41), None);
+        assert_eq!(
+            state.visible_at_lsn(7, SNAPSHOT_ALL, 42),
+            Some(RowHome::Heap(location))
+        );
+        assert_eq!(
+            state.visible_at_lsn(7, SNAPSHOT_ALL, 99),
+            Some(RowHome::Heap(location))
+        );
+
+        // A transaction's own pending image remains governed by command ID:
+        // committed-snapshot filtering applies only when no visible own image
+        // overlays it.
+        let mut pending = state;
+        pending
+            .pending
+            .push(PendingChange {
+                txid: 7,
+                cid: 3,
+                loc: Some(RowLoc { offset: 20, len: 4 }),
+            })
+            .unwrap();
+        assert_eq!(
+            pending.visible_at_lsn(7, 4, 41),
+            Some(RowHome::Heap(RowLoc { offset: 20, len: 4 }))
+        );
+        assert_eq!(pending.visible_at_lsn(8, 4, 41), None);
+    }
 
     #[test]
     fn comment_class_codec_rejects_unknown_values() {

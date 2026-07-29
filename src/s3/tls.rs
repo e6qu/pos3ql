@@ -79,7 +79,7 @@ impl Drop for Transport {
     }
 }
 
-/// The startup-built client state for TLS endpoints: `None` when `s3_tls`
+/// The startup-built client state for TLS endpoints: `None` when object-store TLS
 /// is off.
 pub(super) struct TlsContext {
     pub config: Arc<rustls::ClientConfig>,
@@ -99,23 +99,26 @@ pub(super) fn build_context(
     };
     if !ca_file.is_empty() {
         let pem = std::fs::read_to_string(ca_file)
-            .map_err(|e| format!("s3_tls_ca_file {ca_file}: {e}"))?;
+            .map_err(|e| format!("object_store_tls_ca_file {ca_file}: {e}"))?;
         let mut added = 0usize;
         for der in crate::pem::certificates(&pem)? {
             roots
                 .add(rustls::pki_types::CertificateDer::from(der))
-                .map_err(|e| format!("s3_tls_ca_file {ca_file}: bad certificate: {e}"))?;
+                .map_err(|e| {
+                    format!("object_store_tls_ca_file {ca_file}: bad certificate: {e}")
+                })?;
             added += 1;
         }
         if added == 0 {
-            return Err(format!("s3_tls_ca_file {ca_file}: no certificates found"));
+            return Err(format!(
+                "object_store_tls_ca_file {ca_file}: no certificates found"
+            ));
         }
     }
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| format!("s3_endpoint host {host}: {e}"))?;
+        .map_err(|e| format!("object_store_endpoint host {host}: {e}"))?;
     Ok(TlsContext { config: Arc::new(config), server_name })
 }
-

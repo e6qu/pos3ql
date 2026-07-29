@@ -73,7 +73,7 @@ pub struct Config {
     /// Committed-row cap for a table carrying a UNIQUE / PRIMARY KEY / unique
     /// index: its value index holds this many committed rows, and an insert past
     /// it is a loud error. This is the price of an in-RAM value index that keeps
-    /// a uniqueness probe O(1) even after the table spills — see B-169.
+    /// a uniqueness probe O(1) even after the table spills.
     pub value_index_rows: usize,
     /// Total value-index buffers shared across all tables' constraints (one per
     /// UNIQUE/PRIMARY KEY flag, multi-column key, and unique index). Exhausting
@@ -83,22 +83,21 @@ pub struct Config {
     pub block_cache_bytes: usize,
     /// Disk budget for locally cached objects (not RAM).
     pub disk_cache_bytes: usize,
-    /// Object storage on/off. When on, checkpoints snapshot to the bucket
-    /// and a wiped node cold-starts from it; credentials are required.
-    pub s3_on: bool,
-    /// `s3 = sim`: object storage backed by the in-process deterministic
+    /// Durable object storage on/off. When on, checkpoints snapshot to the
+    /// configured namespace and a wiped node cold-starts from it.
+    pub object_store_on: bool,
+    /// `object_store = sim`: storage backed by the in-process deterministic
     /// virtual bucket instead of a network endpoint — the storage VOPR's
-    /// seam. Implies `s3_on`; refused by the real server binary (the
+    /// seam. Implies `object_store_on`; refused by the real server binary (the
     /// virtual bucket allocates freely and exists for simulation tests).
-    pub s3_sim: bool,
-    /// Upload committed WAL batches to the bucket (backup / RPO). Requires
-    /// s3 = on, and defaults on with it — the local disk is a cache, so an
-    /// acknowledged commit must not live only there. Set off explicitly for
-    /// the asynchronous-only or bucket-as-backup postures.
+    pub object_store_sim: bool,
+    /// Upload committed WAL batches to durable object storage (backup / RPO).
+    /// Requires `object_store = on`, and defaults on with it — the local disk
+    /// is a cache, so an acknowledged commit must not live only there.
     pub wal_upload: bool,
     /// Make WAL upload synchronous: a commit blocks until its batch is in the
-    /// bucket (RPO=0 against total local-disk loss), at the cost of S3 latency
-    /// on every commit. Defaults on when s3 and wal_upload are on
+    /// bucket (RPO=0 against total local-disk loss), at the cost of object-store
+    /// latency on every commit. Defaults on with object storage and WAL upload
     /// (commit-durable-on-bucket, the plan of record); set off explicitly to
     /// trade the tail of durability for local-fsync commit latency.
     pub wal_upload_sync: bool,
@@ -106,28 +105,29 @@ pub struct Config {
     /// between drains; when it fills, a commit drains synchronously
     /// (backpressure). Must exceed wal_buffer_bytes.
     pub wal_upload_buffer_bytes: usize,
-    /// S3-compatible endpoint, `host:port`, plaintext HTTP (MinIO-style).
-    pub s3_endpoint: String,
-    pub s3_bucket: String,
+    /// Endpoint for the configured adapter. The first adapter speaks the
+    /// S3-compatible HTTP API used by AWS, MinIO, and compatibility gateways.
+    pub object_store_endpoint: String,
+    pub object_store_bucket: String,
     /// Prepended to every object key; lets databases share a bucket.
-    pub s3_prefix: String,
-    pub s3_region: String,
+    pub object_store_prefix: String,
+    pub object_store_region: String,
     /// Empty means "read AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the
     /// environment at startup".
-    pub s3_access_key: String,
-    pub s3_secret_key: String,
+    pub object_store_access_key: String,
+    pub object_store_secret_key: String,
     /// Request/response head assembly buffer.
-    pub s3_head_bytes: usize,
+    pub object_store_head_bytes: usize,
     /// Largest response body (bounds ranged GETs and LIST pages).
-    pub s3_response_bytes: usize,
+    pub object_store_response_bytes: usize,
     /// TLS to the object store (rustls, the single whitelisted dependency
     /// exception, isolated behind mem::guard::tls_scope).
-    pub s3_tls: bool,
-    /// Extra PEM root certificates for `s3_tls` (self-signed test
+    pub object_store_tls: bool,
+    /// Extra PEM root certificates for object-store TLS (self-signed test
     /// endpoints); empty = the compiled-in Mozilla roots alone.
-    pub s3_tls_ca_file: String,
-    /// Byte budget for the isolated TLS component's allocations (the S3 client
-    /// and, when `tls_on`, every server-side session).
+    pub object_store_tls_ca_file: String,
+    /// Byte budget for the isolated TLS component's allocations (the object
+    /// client and, when `tls_on`, every server-side session).
     pub tls_pool_bytes: usize,
     /// Server-side TLS: answer the SSLRequest probe with `S` and negotiate TLS
     /// for the client connection. Requires `tls_cert_file` and `tls_key_file`.
@@ -173,21 +173,21 @@ impl Config {
             max_value_indexes: 16,
             block_cache_bytes: 128 * MIB,
             disk_cache_bytes: GIB,
-            s3_on: false,
-            s3_sim: false,
+            object_store_on: false,
+            object_store_sim: false,
             wal_upload: false,
             wal_upload_sync: false,
             wal_upload_buffer_bytes: 8 * MIB,
-            s3_endpoint: "127.0.0.1:9000".to_string(),
-            s3_bucket: "pos3ql".to_string(),
-            s3_prefix: String::new(),
-            s3_region: "us-east-1".to_string(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_head_bytes: 16 * KIB,
-            s3_response_bytes: 4 * MIB,
-            s3_tls: false,
-            s3_tls_ca_file: String::new(),
+            object_store_endpoint: "127.0.0.1:9000".to_string(),
+            object_store_bucket: "pos3ql".to_string(),
+            object_store_prefix: String::new(),
+            object_store_region: "us-east-1".to_string(),
+            object_store_access_key: String::new(),
+            object_store_secret_key: String::new(),
+            object_store_head_bytes: 16 * KIB,
+            object_store_response_bytes: 4 * MIB,
+            object_store_tls: false,
+            object_store_tls_ca_file: String::new(),
             tls_pool_bytes: 4 * MIB,
             tls_on: false,
             tls_cert_file: String::new(),
@@ -211,11 +211,31 @@ impl Config {
             };
             let key = key.trim();
             let value = value.trim();
-            if seen.iter().any(|s| s == key) {
-                return Err(ConfigError::at(line_no, format!("duplicate key '{key}'")));
+            // `s3*` remains a strict compatibility alias for existing
+            // deployments. Canonicalize before duplicate detection so two
+            // spellings cannot quietly override one setting.
+            let canonical_key = match key {
+                "s3" => "object_store",
+                "s3_endpoint" => "object_store_endpoint",
+                "s3_bucket" => "object_store_bucket",
+                "s3_prefix" => "object_store_prefix",
+                "s3_region" => "object_store_region",
+                "s3_access_key" => "object_store_access_key",
+                "s3_secret_key" => "object_store_secret_key",
+                "s3_head_bytes" => "object_store_head_bytes",
+                "s3_response_bytes" => "object_store_response_bytes",
+                "s3_tls" => "object_store_tls",
+                "s3_tls_ca_file" => "object_store_tls_ca_file",
+                other => other,
+            };
+            if seen.iter().any(|seen_key| seen_key == canonical_key) {
+                return Err(ConfigError::at(
+                    line_no,
+                    format!("duplicate setting '{canonical_key}'"),
+                ));
             }
-            seen.push(key.to_string());
-            match key {
+            seen.push(canonical_key.to_string());
+            match canonical_key {
                 "listen_addr" => config.listen_addr = value.to_string(),
                 "data_dir" => config.data_dir = value.to_string(),
                 "max_connections" => config.max_connections = parse_count(value).map_err(|m| ConfigError::at(line_no, m))?,
@@ -283,41 +303,41 @@ impl Config {
                     }
                 }
                 "wal_upload_buffer_bytes" => config.wal_upload_buffer_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "s3" => match value {
-                    "on" | "true" => config.s3_on = true,
-                    "off" | "false" => config.s3_on = false,
+                "object_store" => match value {
+                    "on" | "true" => config.object_store_on = true,
+                    "off" | "false" => config.object_store_on = false,
                     "sim" => {
-                        config.s3_on = true;
-                        config.s3_sim = true;
+                        config.object_store_on = true;
+                        config.object_store_sim = true;
                     }
                     other => {
                         return Err(ConfigError::at(
                             line_no,
-                            format!("s3 must be on, off or sim, got '{other}'"),
+                            format!("object_store must be on, off or sim, got '{other}'"),
                         ))
                     }
                 },
-                "s3_endpoint" => config.s3_endpoint = value.to_string(),
-                "s3_bucket" => config.s3_bucket = value.to_string(),
-                "s3_prefix" => config.s3_prefix = value.to_string(),
-                "s3_region" => config.s3_region = value.to_string(),
-                "s3_access_key" => config.s3_access_key = value.to_string(),
-                "s3_secret_key" => config.s3_secret_key = value.to_string(),
-                "s3_head_bytes" => config.s3_head_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "s3_response_bytes" => config.s3_response_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "s3_tls" => {
-                    config.s3_tls = match value {
+                "object_store_endpoint" => config.object_store_endpoint = value.to_string(),
+                "object_store_bucket" => config.object_store_bucket = value.to_string(),
+                "object_store_prefix" => config.object_store_prefix = value.to_string(),
+                "object_store_region" => config.object_store_region = value.to_string(),
+                "object_store_access_key" => config.object_store_access_key = value.to_string(),
+                "object_store_secret_key" => config.object_store_secret_key = value.to_string(),
+                "object_store_head_bytes" => config.object_store_head_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "object_store_response_bytes" => config.object_store_response_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "object_store_tls" => {
+                    config.object_store_tls = match value {
                         "on" | "true" => true,
                         "off" | "false" => false,
                         other => {
                             return Err(ConfigError::at(
                                 line_no,
-                                format!("s3_tls must be on or off, got '{other}'"),
+                                format!("object_store_tls must be on or off, got '{other}'"),
                             ))
                         }
                     }
                 }
-                "s3_tls_ca_file" => config.s3_tls_ca_file = value.to_string(),
+                "object_store_tls_ca_file" => config.object_store_tls_ca_file = value.to_string(),
                 "tls_pool_bytes" => config.tls_pool_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "tls_on" => {
                     config.tls_on = match value {
@@ -342,7 +362,7 @@ impl Config {
         // acknowledged commits living only on that disk. An explicit
         // `wal_upload = off` / `wal_upload_sync = off` still wins — the
         // opt-out is a stated choice, never an accident of omission.
-        if config.s3_on {
+        if config.object_store_on {
             if !seen.iter().any(|s| s == "wal_upload") {
                 config.wal_upload = true;
             }
@@ -529,20 +549,36 @@ sql_arena_bytes = 4096
     }
 
     #[test]
-    fn s3_on_defaults_to_commit_durable_on_bucket() {
-        let c = Config::parse("s3 = on\n").unwrap();
+    fn object_store_defaults_to_commit_durable_on_bucket() {
+        let c = Config::parse("object_store = on\n").unwrap();
         assert!(c.wal_upload && c.wal_upload_sync, "the plan-of-record default");
         // Explicit settings win over the resolved defaults.
-        let c = Config::parse("s3 = on\nwal_upload = off\n").unwrap();
+        let c = Config::parse("object_store = on\nwal_upload = off\n").unwrap();
         assert!(!c.wal_upload && !c.wal_upload_sync);
-        let c = Config::parse("s3 = on\nwal_upload_sync = off\n").unwrap();
+        let c = Config::parse("object_store = on\nwal_upload_sync = off\n").unwrap();
         assert!(c.wal_upload && !c.wal_upload_sync, "async upload, stated");
         // Without object storage nothing is implied.
         let c = Config::parse("").unwrap();
-        assert!(!c.s3_on && !c.wal_upload && !c.wal_upload_sync);
+        assert!(!c.object_store_on && !c.wal_upload && !c.wal_upload_sync);
         // The simulator mode is object storage too.
-        let c = Config::parse("s3 = sim\n").unwrap();
-        assert!(c.s3_sim && c.wal_upload && c.wal_upload_sync);
+        let c = Config::parse("object_store = sim\n").unwrap();
+        assert!(c.object_store_sim && c.wal_upload && c.wal_upload_sync);
+    }
+
+    #[test]
+    fn legacy_s3_names_are_strict_aliases() {
+        let legacy = Config::parse(
+            "s3 = on\ns3_endpoint = minio:9000\ns3_bucket = db\ns3_tls = on\n",
+        )
+        .unwrap();
+        let neutral = Config::parse(
+            "object_store = on\nobject_store_endpoint = minio:9000\nobject_store_bucket = db\nobject_store_tls = on\n",
+        )
+        .unwrap();
+        assert_eq!(legacy, neutral);
+        let error = Config::parse("s3 = on\nobject_store = off\n").unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.message.contains("duplicate setting 'object_store'"));
     }
 
     #[test]

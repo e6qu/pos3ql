@@ -97,10 +97,10 @@ pub(crate) fn dispatch<'a>(
                 };
                 let digest: &[u8] = match name {
                     "sha224" => {
-                        arena.alloc_slice_copy(&crate::s3::sha256::sha224(bytes)).map_err(|_| arena_full())?
+                        arena.alloc_slice_copy(&crate::crypto::sha256::sha224(bytes)).map_err(|_| arena_full())?
                     }
                     "sha256" => {
-                        arena.alloc_slice_copy(&crate::s3::sha256::sha256(bytes)).map_err(|_| arena_full())?
+                        arena.alloc_slice_copy(&crate::crypto::sha256::sha256(bytes)).map_err(|_| arena_full())?
                     }
                     "sha384" => {
                         arena.alloc_slice_copy(&crate::sql::sha512::sha384(bytes)).map_err(|_| arena_full())?

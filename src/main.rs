@@ -31,10 +31,10 @@ fn run() -> Result<(), String> {
         FmtBytes(config.disk_cache_bytes)
     );
 
-    if config.s3_sim {
+    if config.object_store_sim {
         return Err(
-            "s3 = sim is the in-process simulator's mode (it allocates freely); \
-             the server refuses it — use s3 = on with a real endpoint"
+            "object_store = sim is the in-process simulator's mode (it allocates freely); \
+             the server refuses it — use object_store = on with a real endpoint"
                 .to_string(),
         );
     }
@@ -46,8 +46,8 @@ fn run() -> Result<(), String> {
     // The IANA zone-name catalog walks /usr/share/zoneinfo, which allocates —
     // it must happen on this side of the freeze. Zone files themselves load
     // on demand into fixed pools.
-    // The TLS pool covers the S3 client and, when server TLS is on, up to
-    // max_connections concurrent server-side sessions.
+    // The TLS pool covers the object-store client and, when server TLS is on,
+    // up to max_connections concurrent server-side sessions.
     let tls_budget = config.tls_pool_bytes
         + if config.tls_on {
             config.max_connections as usize * pos3ql::pg::tls::SERVER_SESSION_BYTES

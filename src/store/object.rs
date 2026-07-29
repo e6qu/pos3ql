@@ -12,13 +12,13 @@
 //! well as the CRC — the one case a checksum cannot cover is being handed a
 //! *different* block that is itself intact.
 
-use crate::s3::{ObjectClient, Precondition, S3Error};
+use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
 
 use super::{decode, encode, BlockId, BlockStore, BlockType, StoreError, HEADER_LEN};
 
 /// Blocks kept as objects under a key prefix.
 pub(crate) struct ObjectBlockStore<'c> {
-    client: &'c mut ObjectClient,
+    client: &'c mut ObjectStore,
     /// Prefix every block key sits under, e.g. `blocks/`. Kept short: it is
     /// paid on every request line.
     prefix: &'static str,
@@ -31,7 +31,7 @@ pub(crate) struct ObjectBlockStore<'c> {
 impl<'c> ObjectBlockStore<'c> {
     /// `scratch` must hold a whole block — `HEADER_LEN + MAX_PAYLOAD`.
     pub(crate) fn new(
-        client: &'c mut ObjectClient,
+        client: &'c mut ObjectStore,
         prefix: &'static str,
         scratch: &'c mut [u8],
     ) -> Self {
@@ -54,15 +54,15 @@ fn key_of<'k>(prefix: &str, id: &BlockId, out: &'k mut [u8; 128]) -> &'k str {
 
 /// A missing object is `NotFound`; everything else is `Unavailable`, because a
 /// caller can retry the second and cannot conjure the first.
-fn store_error(e: S3Error) -> StoreError {
+fn store_error(e: ObjectError) -> StoreError {
     match e {
-        S3Error::Status { code: 404, .. } => StoreError::NotFound,
+        ObjectError::Status { code: 404, .. } => StoreError::NotFound,
         _ => StoreError::Unavailable,
     }
 }
 
 fn put_block(
-    client: &mut ObjectClient,
+    client: &mut ObjectStore,
     prefix: &str,
     scratch: &mut [u8],
     payload: &[u8],
@@ -80,7 +80,7 @@ fn put_block(
 }
 
 fn get_block(
-    client: &mut ObjectClient,
+    client: &mut ObjectStore,
     prefix: &str,
     id: &BlockId,
     into: &mut [u8],
@@ -106,7 +106,7 @@ fn get_block(
 /// The bucket store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
-    client: ObjectClient,
+    client: ObjectStore,
     prefix: &'static str,
     scratch: Vec<u8>,
 }
@@ -114,7 +114,7 @@ pub(crate) struct OwnedObjectStore {
 impl OwnedObjectStore {
     /// Startup-only: the scratch Vec is reserved once, before the allocator
     /// freezes, and never grows.
-    pub(crate) fn new(client: ObjectClient, prefix: &'static str) -> Self {
+    pub(crate) fn new(client: ObjectStore, prefix: &'static str) -> Self {
         Self { client, prefix, scratch: vec![0u8; super::BLOCK_SIZE] }
     }
 }
@@ -138,7 +138,7 @@ impl BlockStore for OwnedObjectStore {
         let key = key_of(self.prefix, id, &mut key_buffer);
         match self.client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
             Ok(_) => Ok(true),
-            Err(S3Error::Status { code: 404, .. }) => Ok(false),
+            Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
         }
     }
@@ -166,7 +166,7 @@ impl BlockStore for ObjectBlockStore<'_> {
         // cost as much as a read.
         match self.client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
             Ok(_) => Ok(true),
-            Err(S3Error::Status { code: 404, .. }) => Ok(false),
+            Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
         }
     }

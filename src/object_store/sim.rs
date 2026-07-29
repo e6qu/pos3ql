@@ -1,7 +1,8 @@
 //! The virtual bucket: a deterministic, in-process object store standing in
-//! for S3 behind [`super::ObjectClient`] — the storage VOPR's seam.
+//! for the provider-neutral [`crate::object_store::Client`] — the storage
+//! VOPR's seam.
 //!
-//! `s3 = sim` routes every object operation here instead of a socket. The
+//! `object_store = sim` routes every object operation here instead of a socket. The
 //! bucket is plain memory shared by every client opened on the same name
 //! (the checkpointer holds two, exactly as it holds two real clients), and
 //! every fault it injects is drawn from a PCG stream, so a failing run
@@ -23,19 +24,19 @@
 //! curiosity.
 //!
 //! This module allocates freely (a growing map of objects is the point);
-//! it exists for simulation tests, and `main` refuses `s3 = sim`.
+//! it exists for simulation tests, and `main` refuses `object_store = sim`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::config::Config;
-use crate::mem::budget::Budget;
+use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::prng::Pcg32;
 use crate::stack_format;
 use crate::util::StackStr;
 
-use super::{GetResult, Precondition, S3Error, S3SetupError};
+use crate::object_store::{Error, GetResult, Precondition};
 
 /// Fault probabilities in parts per thousand, plus the outage schedule.
 /// All zeros (the default) is a perfectly healthy bucket.
@@ -105,7 +106,7 @@ impl SimBucket {
 
     /// The per-operation gate: counts the operation and reports whether the
     /// outage window has swallowed it.
-    fn operation_gate(&mut self) -> Result<(), S3Error> {
+    fn operation_gate(&mut self) -> Result<(), Error> {
         let index = self.op_count;
         self.op_count += 1;
         if self.faults.fail_from_op.is_some_and(|from| index >= from) {
@@ -118,8 +119,8 @@ impl SimBucket {
     }
 }
 
-fn io_fault(detail: &str) -> S3Error {
-    S3Error::Io {
+fn io_fault(detail: &str) -> Error {
+    Error::Io {
         context: "virtual bucket",
         kind: std::io::ErrorKind::ConnectionReset,
         detail: stack_format!(160, "{detail}"),
@@ -158,7 +159,8 @@ pub(crate) fn drop_bucket(name: &str) {
     BUCKETS.with(|buckets| buckets.borrow_mut().retain(|(n, _)| n != name));
 }
 
-/// The client half: what [`super::ObjectClient::Sim`] holds. Mirrors the
+/// The client half: what [`crate::object_store::Client::Simulator`] holds.
+/// Mirrors the
 /// real client's observable semantics — the fixed response buffer (and its
 /// `ResponseTooLarge`), inclusive ranges with 416 past the end, 404/412
 /// statuses, DELETE of a missing key succeeding, LIST in key order with the
@@ -170,11 +172,15 @@ pub(crate) struct SimClient {
 }
 
 impl SimClient {
-    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, S3SetupError> {
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         Ok(Self {
-            bucket: open_bucket(&config.s3_bucket, 0),
-            key_prefix: config.s3_prefix.clone(),
-            body: FixedBuf::new(budget, "s3_response", config.s3_response_bytes)?,
+            bucket: open_bucket(&config.object_store_bucket, 0),
+            key_prefix: config.object_store_prefix.clone(),
+            body: FixedBuf::new(
+                budget,
+                "object_store_response",
+                config.object_store_response_bytes,
+            )?,
         })
     }
 
@@ -190,7 +196,7 @@ impl SimClient {
         key: &str,
         body: &[u8],
         precondition: Precondition,
-    ) -> Result<StackStr<80>, S3Error> {
+    ) -> Result<StackStr<80>, Error> {
         let full = self.full_key(key);
         let mut bucket = self.bucket.borrow_mut();
         bucket.operation_gate()?;
@@ -239,7 +245,7 @@ impl SimClient {
         Ok(etag_text(etag))
     }
 
-    pub(crate) fn get(&mut self, key: &str, range: Option<(u64, u64)>) -> Result<GetResult, S3Error> {
+    pub(crate) fn get(&mut self, key: &str, range: Option<(u64, u64)>) -> Result<GetResult, Error> {
         let full = self.full_key(key);
         let mut bucket = self.bucket.borrow_mut();
         bucket.operation_gate()?;
@@ -259,7 +265,7 @@ impl SimClient {
         };
         let len = to - from;
         if len > self.body.capacity() {
-            return Err(S3Error::ResponseTooLarge {
+            return Err(Error::ResponseTooLarge {
                 content_length: len,
                 capacity: self.body.capacity(),
             });
@@ -285,7 +291,7 @@ impl SimClient {
         self.body.capacity()
     }
 
-    pub(crate) fn delete(&mut self, key: &str) -> Result<(), S3Error> {
+    pub(crate) fn delete(&mut self, key: &str) -> Result<(), Error> {
         let full = self.full_key(key);
         let mut bucket = self.bucket.borrow_mut();
         bucket.operation_gate()?;
@@ -299,7 +305,7 @@ impl SimClient {
         &mut self,
         prefix: &str,
         mut each: impl FnMut(&str),
-    ) -> Result<usize, S3Error> {
+    ) -> Result<usize, Error> {
         let full_prefix = self.full_key(prefix);
         let mut bucket = self.bucket.borrow_mut();
         bucket.operation_gate()?;
@@ -314,8 +320,8 @@ impl SimClient {
     }
 }
 
-fn status(code: u16, message: &str) -> S3Error {
-    S3Error::Status { code, message: stack_format!(256, "{message}") }
+fn status(code: u16, message: &str) -> Error {
+    Error::Status { code, message: stack_format!(256, "{message}") }
 }
 
 #[cfg(test)]
@@ -326,9 +332,9 @@ mod tests {
         drop_bucket(name);
         let bucket = open_bucket(name, 7);
         let mut config = Config::default_dev();
-        config.s3_bucket = name.to_string();
-        config.s3_prefix = "p/".to_string();
-        config.s3_response_bytes = 64;
+        config.object_store_bucket = name.to_string();
+        config.object_store_prefix = "p/".to_string();
+        config.object_store_response_bytes = 64;
         let mut budget = Budget::new(1 << 20);
         (SimClient::new(&config, &mut budget).unwrap(), bucket)
     }
@@ -347,14 +353,14 @@ mod tests {
         assert_eq!(c.body_bytes(), b"world");
         assert!(matches!(
             c.get("k", Some((11, 12))).unwrap_err(),
-            S3Error::Status { code: 416, .. }
+            Error::Status { code: 416, .. }
         ));
         // Oversized bodies refuse like the real client.
         let big = [0u8; 65];
         c.put("big", &big, Precondition::None).unwrap();
         assert!(matches!(
             c.get("big", None).unwrap_err(),
-            S3Error::ResponseTooLarge { .. }
+            Error::ResponseTooLarge { .. }
         ));
         c.delete("missing").unwrap();
     }
@@ -397,17 +403,17 @@ mod tests {
         // Outage-from-op: everything past the mark fails.
         let mark = bucket.borrow().op_count;
         bucket.borrow_mut().faults.fail_from_op = Some(mark);
-        assert!(matches!(c.get("k", None).unwrap_err(), S3Error::Io { .. }));
+        assert!(matches!(c.get("k", None).unwrap_err(), Error::Io { .. }));
         assert!(matches!(
             c.put("k2", b"x", Precondition::None).unwrap_err(),
-            S3Error::Io { .. }
+            Error::Io { .. }
         ));
         bucket.borrow_mut().faults.fail_from_op = None;
         // Ambiguous PUT: reported failed, actually applied.
         bucket.borrow_mut().faults.ambiguous_put_per_mille = 1000;
         assert!(matches!(
             c.put("amb", b"landed", Precondition::None).unwrap_err(),
-            S3Error::Io { .. }
+            Error::Io { .. }
         ));
         bucket.borrow_mut().faults.ambiguous_put_per_mille = 0;
         c.get("amb", None).unwrap();

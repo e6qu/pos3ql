@@ -801,66 +801,67 @@ fn find_conflict(
     values: &[Datum],
     arbiter: &Arbiter,
     txid: u32,
-) -> Option<u64> {
+) -> Result<Option<u64>, SqlError> {
     let mut found: Option<u64> = None;
-    let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) =
-            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-        else {
+        let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
             return Ok(ControlFlow::Continue(()));
         };
-        let hit = storage
-            .with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut other = [Datum::Null; MAX_COLUMNS];
-                if rowenc::decode(bytes, schema, &mut other).is_err() {
+        let hit = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            let eq = |a: &Datum, b: &Datum| {
+                if a.is_null() || b.is_null() {
+                    Ok(false)
+                } else {
+                    compare_datums(a, b).map(|ordering| ordering.is_eq())
+                }
+            };
+            let key_hit = |cols: &[u16]| {
+                if cols.iter().any(|&column| values[column as usize].is_null()) {
                     return Ok(false);
                 }
-                let eq = |a: &Datum, b: &Datum| {
-                    !a.is_null()
-                        && !b.is_null()
-                        && compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false)
-                };
-                let key_hit = |cols: &[u16]| {
-                    !cols.iter().any(|&c| values[c as usize].is_null())
-                        && cols
-                            .iter()
-                            .all(|&c| eq(&values[c as usize], &other[c as usize]))
-                };
-                match arbiter {
-                    // A named/inferred arbiter conflicts on its own columns only.
-                    Arbiter::Columns(cols, n) => Ok(key_hit(&cols[..*n])),
-                    // No target (DO NOTHING): any unique violation is a conflict.
-                    Arbiter::Any => {
-                        for (i, c) in def.columns().iter().enumerate() {
-                            if c.unique && eq(&values[i], &other[i]) {
-                                return Ok(true);
-                            }
-                        }
-                        for uk in def.uniques() {
-                            if key_hit(uk.columns()) {
-                                return Ok(true);
-                            }
-                        }
-                        for index in
-                            storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
-                        {
-                            if key_hit(&index.columns[..index.n_cols]) {
-                                return Ok(true);
-                            }
-                        }
-                        Ok(false)
+                for &column in cols {
+                    if !eq(&values[column as usize], &other[column as usize])? {
+                        return Ok(false);
                     }
                 }
-            })
-            .unwrap_or(false);
+                Ok(true)
+            };
+            match arbiter {
+                // A named/inferred arbiter conflicts on its own columns only.
+                Arbiter::Columns(cols, n) => key_hit(&cols[..*n]),
+                // No target (DO NOTHING): any unique violation is a conflict.
+                Arbiter::Any => {
+                    for (i, c) in def.columns().iter().enumerate() {
+                        if c.unique && eq(&values[i], &other[i])? {
+                            return Ok(true);
+                        }
+                    }
+                    for uk in def.uniques() {
+                        if key_hit(uk.columns())? {
+                            return Ok(true);
+                        }
+                    }
+                    for index in
+                        storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+                    {
+                        if key_hit(&index.columns[..index.n_cols])? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+            }
+        })?;
         if hit {
             found = Some(rowid);
             return Ok(ControlFlow::Break(()));
         }
         Ok(ControlFlow::Continue(()))
-    });
-    found
+    })?;
+    Ok(found)
 }
 
 /// Column lookup for ON CONFLICT DO UPDATE: `excluded.<col>` resolves to the
@@ -932,7 +933,7 @@ fn handle_conflict<'a>(
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
     };
-    let Some(rowid) = find_conflict(storage, table_index, def, schema, values, arbiter, txn.txid)
+    let Some(rowid) = find_conflict(storage, table_index, def, schema, values, arbiter, txn.txid)?
     else {
         return Ok(ConflictOutcome::Store);
     };
@@ -942,13 +943,13 @@ fn handle_conflict<'a>(
     // DO UPDATE: recompute the conflicting row, `excluded` = the proposed row.
     let new_bytes = {
         let mut existing = [Datum::Null; MAX_COLUMNS];
-        let home = storage
+        let state = *storage
             .table(table_index)
             .rows
             .get(&rowid)
-            .and_then(|s| {
-                s.visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
-            })
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
+        let home = storage
+            .visible_row_home(table_index, rowid, state, txn.txid)?
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
         rowenc::decode(bytes, schema, &mut existing)?;
@@ -3044,10 +3045,10 @@ pub fn refresh_materialized_view(
     let mut rowids: [u64; 4096] = [0; 4096];
     loop {
         let mut count = 0usize;
-        let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+        if let Err(error) = storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            if state
-                .visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
+            if storage
+                .visible_row_home(table_index, rowid, state, txn.txid)?
                 .is_none()
             {
                 return Ok(ControlFlow::Continue(()));
@@ -3058,7 +3059,9 @@ pub fn refresh_materialized_view(
             rowids[count] = rowid;
             count += 1;
             Ok(ControlFlow::Continue(()))
-        });
+        }) {
+            return sql_fail(error);
+        }
         if count == 0 {
             break;
         }
@@ -4471,9 +4474,7 @@ fn validate_domain_rows(
         def.schema(&mut schema);
         storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            let Some(home) =
-                state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-            else {
+            let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
                 return Ok(ControlFlow::Continue(()));
             };
             let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
@@ -5469,9 +5470,7 @@ fn rewrite_enum_label(
             })?;
         let mut n = 0;
         storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) =
-                state.visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
-            {
+            if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)? {
                 rows[n] = Some((rowid, home));
                 n += 1;
             }
@@ -5800,8 +5799,7 @@ pub fn create_index(
         // Every existing row is checked against the others via the just-
         // registered index (all borrows shared); a conflict is deferred so the
         // rollback drop_index (a mutable borrow) runs after the scan.
-        let mut conflict: Option<SqlError> = None;
-        let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+        let validation = storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
             let Some(home) = state.committed else {
                 return Ok(ControlFlow::Continue(()));
@@ -5809,7 +5807,7 @@ pub fn create_index(
             // The whole check runs inside the fetch: the decoded values borrow
             // the fetched bytes, and the re-scan's own fetches nest into the
             // spill reader's second scratch.
-            if let Err(e) = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
                 check_unique_indexes(
@@ -5823,15 +5821,12 @@ pub fn create_index(
                     // by this transaction; validation must see it.
                     txn.txid,
                 )
-            }) {
-                conflict = Some(e);
-                return Ok(ControlFlow::Break(()));
-            }
+            })?;
             Ok(ControlFlow::Continue(()))
         });
-        if let Some(e) = conflict {
+        if let Err(error) = validation {
             storage.rollback_index_create(slot);
-            return sql_fail(e);
+            return sql_fail(error);
         }
     }
     let lsn = storage.bump_lsn();
@@ -6624,9 +6619,9 @@ pub fn copy_out(
     // order PostgreSQL's COPY TO emits for a freshly-loaded table. Snapshot
     // the visible tokens first, sort, then stream.
     let mut visible = 0usize;
-    storage.for_each_row_state(setup.table_index, &mut |_, state| {
-        if state
-            .visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+    storage.for_each_row_state(setup.table_index, &mut |rowid, state| {
+        if storage
+            .visible_row_home(setup.table_index, rowid, state, txid)?
             .is_some()
         {
             visible += 1;
@@ -6648,9 +6643,7 @@ pub fn copy_out(
         })?;
     let mut fill = 0usize;
     storage.for_each_row_state(setup.table_index, &mut |rowid, state| {
-        if let Some(home) =
-            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-        {
+        if let Some(home) = storage.visible_row_home(setup.table_index, rowid, state, txid)? {
             tokens[fill] = (rowid, home);
             fill += 1;
         }
@@ -7366,7 +7359,11 @@ pub fn merge(
         use core::ops::ControlFlow;
         // Snapshot rowid + home first (the closure cannot borrow the arena while
         // `storage` is borrowed), then decode.
-        let placeholder = crate::storage::RowHome::Spilled { len: 0, sst: 0 };
+        let placeholder = crate::storage::RowHome::Spilled {
+            len: 0,
+            sst: 0,
+            commit_lsn: 0,
+        };
         let ids: &mut [u64] = target_ids;
         let hms: &mut [crate::storage::RowHome] =
             match arena.alloc_slice_with(n_target, |_| placeholder) {
@@ -7375,8 +7372,7 @@ pub fn merge(
             };
         let mut k = 0usize;
         if let Err(e) = storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) =
-                state.visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
+            if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)?
                 && k < ids.len()
             {
                 ids[k] = rowid;
@@ -8676,24 +8672,30 @@ pub fn update(
             if let Err(e) = rowenc::decode(new_bytes, schema, &mut new_row) {
                 return sql_fail(e);
             }
-            if referenced_key_changed(
+            let referenced_key_changed = match referenced_key_changed(
                 storage,
                 def.schema.as_str(),
                 def.name.as_str(),
                 &old_row[..def.n_columns],
                 &new_row[..def.n_columns],
                 txn.txid,
-            ) && let Err(e) = apply_fk_parent_actions(
-                storage,
-                txn,
-                def.schema.as_str(),
-                def.name.as_str(),
-                &old_row[..def.n_columns],
-                Some(&new_row[..def.n_columns]),
-                arena,
-                params,
-                MAX_FK_CASCADE_DEPTH,
             ) {
+                Ok(changed) => changed,
+                Err(error) => return sql_fail(error),
+            };
+            if referenced_key_changed
+                && let Err(e) = apply_fk_parent_actions(
+                    storage,
+                    txn,
+                    def.schema.as_str(),
+                    def.name.as_str(),
+                    &old_row[..def.n_columns],
+                    Some(&new_row[..def.n_columns]),
+                    arena,
+                    params,
+                    MAX_FK_CASCADE_DEPTH,
+                )
+            {
                 return sql_fail(e);
             }
         }
@@ -8972,10 +8974,10 @@ pub fn truncate(
         let mut rowids: [u64; 4096] = [0; 4096];
         loop {
             let mut count = 0usize;
-            let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+            if let Err(error) = storage.for_each_row_state(table_index, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                if state
-                    .visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
+                if storage
+                    .visible_row_home(table_index, rowid, state, txn.txid)?
                     .is_none()
                 {
                     return Ok(ControlFlow::Continue(()));
@@ -8986,7 +8988,9 @@ pub fn truncate(
                 rowids[count] = rowid;
                 count += 1;
                 Ok(ControlFlow::Continue(()))
-            });
+            }) {
+                return sql_fail(error);
+            }
             if count == 0 {
                 break;
             }
@@ -9110,11 +9114,15 @@ fn validate_all_rows(
     let mut result = Ok(());
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) = state.visible_at_lsn(
+        let Some(home) = storage.visible_row_home_at(
+            table_index,
+            rowid,
+            state,
             txid,
             crate::storage::SNAPSHOT_ALL,
             storage.commit_snapshot(),
-        ) else {
+        )?
+        else {
             return Ok(ControlFlow::Continue(()));
         };
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
@@ -9417,13 +9425,17 @@ fn alter_table_inner(
     scratch.clear();
     {
         let mut overflow = false;
-        let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
+        if let Err(error) = storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            let Some(loc) = state.visible_at_lsn(
+            let Some(loc) = storage.visible_row_home_at(
+                table_index,
+                rowid,
+                state,
                 txn.txid,
                 crate::storage::SNAPSHOT_ALL,
                 storage.commit_snapshot(),
-            ) else {
+            )?
+            else {
                 return Ok(ControlFlow::Continue(()));
             };
             if scratch.push((rowid, loc)).is_err() {
@@ -9431,7 +9443,9 @@ fn alter_table_inner(
                 return Ok(ControlFlow::Break(()));
             }
             Ok(ControlFlow::Continue(()))
-        });
+        }) {
+            return sql_fail(error);
+        }
         if overflow {
             return sql_fail(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -10552,9 +10566,7 @@ fn collect_matches<'a>(
     let def = storage.table_def(table_index, txid);
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(loc) =
-            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-        else {
+        let Some(loc) = storage.visible_row_home(table_index, rowid, state, txid)? else {
             return Ok(ControlFlow::Continue(()));
         };
         if row_matches(
@@ -10601,9 +10613,7 @@ fn collect_join_matches<'a>(
     scratch.clear();
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(loc) =
-            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-        else {
+        let Some(loc) = storage.visible_row_home(table_index, rowid, state, txid)? else {
             return Ok(ControlFlow::Continue(()));
         };
         // Consume-in-place, as in row_matches: the joined-row probe reads

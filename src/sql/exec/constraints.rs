@@ -195,20 +195,20 @@ fn committed_key_matches(
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
         let mut other = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut other)?;
-        Ok(key_equal(columns, values, &other))
+        key_equal(columns, values, &other)
     })
 }
 
 /// Whether every key column is non-NULL and equal between a candidate `values`
 /// tuple and a decoded `other` row (SQL treats a NULL key as distinct).
-fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> bool {
-    columns.iter().all(|&c| {
-        let i = c as usize;
-        !other[i].is_null()
-            && compare_datums(&values[i], &other[i])
-                .map(|o| o.is_eq())
-                .unwrap_or(false)
-    })
+fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> Result<bool, SqlError> {
+    for &column in columns {
+        let index = column as usize;
+        if other[index].is_null() || !compare_datums(&values[index], &other[index])?.is_eq() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The shared uniqueness enforcement for one key (a single-column flag, a
@@ -322,7 +322,7 @@ fn committed_scan_uniqueness(
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut other)?;
-            Ok(key_equal(columns, values, &other))
+            key_equal(columns, values, &other)
         })?;
         if matched {
             return Err(unique_violation(def, name));
@@ -362,7 +362,7 @@ fn pending_scan_uniqueness(
         let matched = storage.with_row_bytes(table_index, rowid, RowHome::Heap(loc), |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut other)?;
-            Ok(key_equal(columns, values, &other))
+            key_equal(columns, values, &other)
         })?;
         if matched {
             if pending.txid != txid {
@@ -683,19 +683,20 @@ fn parent_has_key(
     let mut found = false;
     storage.for_each_row_state(parent_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) =
-            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-        else {
+        let Some(home) = storage.visible_row_home(parent_index, rowid, state, txid)? else {
             return Ok(ControlFlow::Continue(()));
         };
         let all_eq = storage.with_row_bytes(parent_index, rowid, home, |bytes| {
             let mut prow = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, parent_schema, &mut prow)?;
-            Ok(parent_cols.iter().zip(child_cols).all(|(&pc, &cc)| {
-                let pv = &prow[pc as usize];
-                let cv = &child_values[cc as usize];
-                !pv.is_null() && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
-            }))
+            for (&parent_column, &child_column) in parent_cols.iter().zip(child_cols) {
+                let parent = &prow[parent_column as usize];
+                let child = &child_values[child_column as usize];
+                if parent.is_null() || !compare_datums(child, parent)?.is_eq() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         })?;
         if all_eq {
             found = true;
@@ -752,14 +753,15 @@ pub(crate) fn apply_fk_parent_actions(
             }
             // An update triggers this key's action only when the key changed.
             if let Some(new_parent) = new_parent {
-                let changed = fk.parent_cols().iter().any(|&pc| {
-                    let (a, b) = (&old_parent[pc as usize], &new_parent[pc as usize]);
-                    match (a.is_null(), b.is_null()) {
-                        (true, true) => false,
-                        (true, false) | (false, true) => true,
-                        (false, false) => !compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false),
+                let mut changed = false;
+                for &parent_column in fk.parent_cols() {
+                    let old = &old_parent[parent_column as usize];
+                    let new = &new_parent[parent_column as usize];
+                    if datum_changed(old, new)? {
+                        changed = true;
+                        break;
                     }
-                });
+                }
                 if !changed {
                     continue;
                 }
@@ -772,27 +774,30 @@ pub(crate) fn apply_fk_parent_actions(
 
             // Collect the referencing rows first: the rewrites below mutate
             // the row map, so the scan must complete before them.
-            let refers = |crow: &[Datum]| {
-                !fk.columns().iter().any(|&c| crow[c as usize].is_null())
-                    && fk.columns().iter().zip(fk.parent_cols()).all(|(&cc, &pc)| {
-                        let (cv, pv) = (&crow[cc as usize], &old_parent[pc as usize]);
-                        !pv.is_null() && compare_datums(cv, pv).map(|o| o.is_eq()).unwrap_or(false)
-                    })
+            let refers = |child_row: &[Datum]| -> Result<bool, SqlError> {
+                for (&child_column, &parent_column) in fk.columns().iter().zip(fk.parent_cols()) {
+                    let child = &child_row[child_column as usize];
+                    let parent = &old_parent[parent_column as usize];
+                    if child.is_null()
+                        || parent.is_null()
+                        || !compare_datums(child, parent)?.is_eq()
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             };
             let mut n_match = 0usize;
             storage.for_each_row_state(child_index, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                let Some(home) = state.visible_at_lsn(
-                    txn.txid,
-                    storage.read_snapshot(),
-                    storage.commit_snapshot(),
-                ) else {
+                let Some(home) = storage.visible_row_home(child_index, rowid, state, txn.txid)?
+                else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 let is_match = storage.with_row_bytes(child_index, rowid, home, |bytes| {
                     let mut crow = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, cschema, &mut crow)?;
-                    Ok(refers(&crow[..cdef.n_columns]))
+                    refers(&crow[..cdef.n_columns])
                 })?;
                 if is_match {
                     n_match += 1;
@@ -834,11 +839,9 @@ pub(crate) fn apply_fk_parent_actions(
                 let mut at = 0usize;
                 storage.for_each_row_state(child_index, &mut |rowid, state| {
                     use core::ops::ControlFlow;
-                    let Some(home) = state.visible_at_lsn(
-                        txn.txid,
-                        storage.read_snapshot(),
-                        storage.commit_snapshot(),
-                    ) else {
+                    let Some(home) =
+                        storage.visible_row_home(child_index, rowid, state, txn.txid)?
+                    else {
                         return Ok(ControlFlow::Continue(()));
                     };
                     // The cascade mutates storage below, so a matching row is
@@ -846,7 +849,7 @@ pub(crate) fn apply_fk_parent_actions(
                     let bytes = storage.row_bytes(child_index, rowid, home, arena)?;
                     let mut crow = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, cschema, &mut crow)?;
-                    if refers(&crow[..cdef.n_columns]) {
+                    if refers(&crow[..cdef.n_columns])? {
                         let copy = arena.alloc_slice_copy(bytes).map_err(|_| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -992,7 +995,7 @@ pub(crate) fn referenced_key_changed(
     old: &[Datum],
     new: &[Datum],
     txid: u32,
-) -> bool {
+) -> Result<bool, SqlError> {
     for column_index in 0..storage.table_count() {
         if !storage.table(column_index).visible_to(txid) {
             continue;
@@ -1005,16 +1008,19 @@ pub(crate) fn referenced_key_changed(
             for &pc in fk.parent_cols() {
                 let i = pc as usize;
                 let (a, b) = (&old[i], &new[i]);
-                let changed = match (a.is_null(), b.is_null()) {
-                    (true, true) => false,
-                    (true, false) | (false, true) => true,
-                    (false, false) => !compare_datums(a, b).map(|o| o.is_eq()).unwrap_or(false),
-                };
-                if changed {
-                    return true;
+                if datum_changed(a, b)? {
+                    return Ok(true);
                 }
             }
         }
     }
-    false
+    Ok(false)
+}
+
+fn datum_changed(old: &Datum, new: &Datum) -> Result<bool, SqlError> {
+    match (old.is_null(), new.is_null()) {
+        (true, true) => Ok(false),
+        (true, false) | (false, true) => Ok(true),
+        (false, false) => compare_datums(old, new).map(|ordering| !ordering.is_eq()),
+    }
 }

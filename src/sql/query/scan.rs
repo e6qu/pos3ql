@@ -511,9 +511,7 @@ pub(crate) fn scan_source<'a>(
                 .map_err(|_| arena_full())?;
             let mut fill = 0usize;
             storage.for_each_row_state(slot, &mut |rowid, state| {
-                if let Some(home) =
-                    state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-                {
+                if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
                     ordered[fill] = (rowid, home);
                     fill += 1;
                 }
@@ -565,9 +563,7 @@ pub(crate) fn scan_source<'a>(
             storage.for_each_row_state(slot, &mut |rowid, state| {
                 use core::ops::ControlFlow;
                 check_timeout()?;
-                let Some(home) =
-                    state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
-                else {
+                let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
@@ -802,8 +798,7 @@ pub(crate) fn scan_source<'a>(
             let mut done = false;
             storage.for_each_row_state(scope.slots[d], &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                let Some(home) =
-                    state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+                let Some(home) = storage.visible_row_home(scope.slots[d], rowid, state, txid)?
                 else {
                     return Ok(ControlFlow::Continue(()));
                 };

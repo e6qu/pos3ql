@@ -97,10 +97,12 @@ vocabulary — with the meaning they carry in this codebase.
   the bucket and page back through the cache tiers; the per-row map stays
   in RAM (making it block-resident is the maturity roadmap's gap 2).
 - **Sorted String Table (SST)** — an immutable, sorted, block-structured
-  object of rows on object storage: sorted data blocks + a sparse index
-  block + a bloom filter block, read block-at-a-time through the cache
-  tiers. Checkpoints write per-table block SSTs; delta flushes append to a
-  table's SST list and paced merges bound it.
+  object of row versions on object storage: versioned SSTs sort
+  `(rowid, commit_lsn DESC)` live values and tombstones into data blocks,
+  with a sparse index and bloom filter read block-at-a-time through the
+  cache tiers. Checkpoints write per-table block SSTs; delta flushes append
+  to a table's SST list and snapshot-aware paced merges bound it. Legacy
+  rowid-only SSTs remain readable and are rewritten by later checkpoints.
 - **block** — the fixed-size (256 KiB), checksummed, content-addressed unit
   the storage engine reads and caches: SST data/index/filter/roster blocks
   (after TigerBeetle's *grid*), identified by the SHA-256 of the payload.
@@ -187,44 +189,41 @@ vocabulary — with the meaning they carry in this codebase.
   engine's clock for durability questions: the manifest names the LSN its
   snapshot covers, WAL replay applies only records newer than the manifest
   it loaded (the monotonic-LSN rule that makes replay idempotent), WAL
-  segments are keyed by their batch's first LSN, and the roadmap's
-  LSN-keyed MVCC will stamp row versions with their commit LSN so a
-  snapshot is just an LSN.
+  segments are keyed by their batch's first LSN, and MVCC stamps row versions
+  with their commit LSN so a snapshot is an LSN.
 - **Multi-Version Concurrency Control (MVCC)** — letting readers and
   writers coexist by keeping more than one version of a row, each reader
   seeing the versions its snapshot admits rather than blocking writers.
-  *Today's model* is the minimal two-version form: each row is at most one
-  committed image plus one uncommitted pending image, visibility decided by
-  transaction id (READ COMMITTED — every statement sees what was committed
-  when it started), and a second concurrent writer fails fast with `40001`
-  rather than blocking. *The roadmap's model* (Stage F) is genuine
-  LSN-keyed versioning: versions appended (never repointed in place)
-  stamped with their commit LSN, a read at snapshot `S` taking the newest
-  version with `commit_lsn <= S`, and compaction retaining any version
-  still visible to the *oldest live snapshot* watermark. It lands with the
-  suspendable row source (Stage I), the first place a reader can outlive a
-  statement and so first needs a version history.
+  Committed versions are appended with their commit LSN; a read at snapshot
+  `S` takes the newest version with `commit_lsn <= S`. A bounded resident
+  side chain stages recent versions until checkpoint publication moves them
+  into immutable object SSTs. Compaction retains every version newer than
+  the *oldest live snapshot* plus the one baseline that snapshot sees. A
+  second concurrent writer still fails fast with `40001` rather than
+  blocking.
 - **snapshot** — the point in time a read is served *as of*. Under READ
-  COMMITTED it is per-statement (identified by transaction id today); under
-  the roadmap's LSN-keyed MVCC it is literally an LSN.
+  COMMITTED it is a per-statement commit LSN; REPEATABLE READ pins one commit
+  LSN across statements. Command IDs separately decide which of a
+  transaction's own pending changes the current statement can see.
 - **oldest live snapshot (watermark)** — the earliest snapshot any live
   reader still holds; compaction may drop a superseded row version only
-  once it falls below this watermark. (With no suspendable readers, the
-  watermark today is always "now", which is why compaction needs no
-  version retention yet.)
+  after retaining the newest baseline at or below this watermark. With no
+  registered snapshot, compaction keeps only the current version per row.
 - **write-write conflict (`40001`)** — two transactions writing the same
   row: the second fails immediately with SQLSTATE `40001` (serialization
   failure) instead of blocking on a lock the way PostgreSQL's READ
   COMMITTED would; applications retry.
 - **tombstone** — a marker recording that a key was deleted, written into
-  delta SSTs so an older member's version stays dead at cold start, and
-  carried through merges until the pair sits at the head of the list —
-  where nothing older remains to suppress, and it is dropped.
+  delta SSTs and their bloom filters so an older member's version stays dead
+  at cold start. Snapshot-aware merges retain it like any other version; a
+  head tombstone may be dropped only when no active snapshot needs it and
+  nothing older remains to suppress.
 - **spill / spill list** — under memory pressure a committed row's *bytes*
   leave the heap: the row's map entry flips to `Spilled`, naming which
   member of its table's **spill list** (the ordered SSTs in the manifest's
   `dsst` lines) holds them; reads fetch them back through the cache tiers.
-  Later members shadow earlier ones; tombstones delete.
+  Point and merged reads examine all members and choose the newest admissible
+  commit LSN; a tombstone at that version deletes.
 - **delta flush** — a dirty table with spilled SSTs checkpoints only its
   heap-resident committed rows plus the tombstones recorded since the last
   checkpoint, appended as one new list member — instead of rewriting

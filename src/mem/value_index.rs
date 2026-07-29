@@ -31,7 +31,11 @@ pub struct IndexFull {
 
 impl fmt::Display for IndexFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "value index '{}' is full (capacity {})", self.what, self.capacity)
+        write!(
+            f,
+            "value index '{}' is full (capacity {})",
+            self.what, self.capacity
+        )
     }
 }
 
@@ -78,7 +82,10 @@ impl ValueIndex {
     /// index.
     pub fn insert(&mut self, hash: u64, rowid: u64) -> Result<(), IndexFull> {
         if self.len == self.max_len {
-            return Err(IndexFull { what: self.what, capacity: self.max_len });
+            return Err(IndexFull {
+                what: self.what,
+                capacity: self.max_len,
+            });
         }
         let mut i = self.home(hash);
         while self.slots[i].is_some() {
@@ -114,6 +121,28 @@ impl ValueIndex {
                 None => return false,
             }
         }
+        self.remove_at(hole);
+        true
+    }
+
+    /// Removes the entry belonging to `rowid`, regardless of its value hash.
+    ///
+    /// A table enforcer holds at most one entry per row. Commit publication
+    /// uses this path so replacing an object-resident row never has to fetch
+    /// its old bytes after the WAL record is already durable.
+    pub fn remove_rowid(&mut self, rowid: u64) -> bool {
+        let Some(hole) = self
+            .slots
+            .iter()
+            .position(|entry| matches!(entry, Some((_, candidate)) if *candidate == rowid))
+        else {
+            return false;
+        };
+        self.remove_at(hole);
+        true
+    }
+
+    fn remove_at(&mut self, mut hole: usize) {
         self.slots[hole] = None;
         self.len -= 1;
 
@@ -137,7 +166,6 @@ impl ValueIndex {
                 hole = probe;
             }
         }
-        true
     }
 
     pub fn len(&self) -> usize {
@@ -186,7 +214,10 @@ impl ValueIndexPool {
         for slot in (0..capacity as u32).rev() {
             free.push(slot).expect("free list sized to capacity");
         }
-        Ok(Self { indexes: indexes.into_boxed_slice(), free })
+        Ok(Self {
+            indexes: indexes.into_boxed_slice(),
+            free,
+        })
     }
 
     /// Claims a cleared index, returning its slot, or `None` if the pool is
@@ -257,6 +288,23 @@ mod tests {
     }
 
     #[test]
+    fn remove_rowid_restores_every_probe_run() {
+        let mut budget = Budget::new(1 << 16);
+        let mut index = ValueIndex::new(&mut budget, "test", 8).unwrap();
+        // All four homes collide, and the run wraps around the slot array.
+        for (hash, rowid) in [(7, 10), (15, 20), (23, 30), (31, 40)] {
+            index.insert(hash, rowid).unwrap();
+        }
+        assert!(index.remove_rowid(20));
+        assert!(!index.remove_rowid(99));
+        assert_eq!(collect(&index, 7), [10]);
+        assert_eq!(collect(&index, 15), Vec::<u64>::new());
+        assert_eq!(collect(&index, 23), [30]);
+        assert_eq!(collect(&index, 31), [40]);
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
     fn full_index_is_a_loud_error() {
         let mut budget = Budget::new(1 << 16);
         let mut index = ValueIndex::new(&mut budget, "constrained", 2).unwrap();
@@ -318,8 +366,11 @@ mod tests {
                     assert_eq!(removed, before != reference.len());
                 }
                 _ => {
-                    let mut want: Vec<u64> =
-                        reference.iter().filter(|&&(h, _)| h == hash).map(|&(_, r)| r).collect();
+                    let mut want: Vec<u64> = reference
+                        .iter()
+                        .filter(|&&(h, _)| h == hash)
+                        .map(|&(_, r)| r)
+                        .collect();
                     want.sort_unstable();
                     assert_eq!(collect(&index, hash), want);
                 }

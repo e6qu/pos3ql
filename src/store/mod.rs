@@ -18,14 +18,12 @@
 //! decoding borrows from one, so a block lives in whatever pool its owner
 //! reserved at startup.
 
-
 // The checkpoint and cold-start paths now run through this module (the SST
 // writer, the range-scan reader, the tiered stack over the object store);
-// what a --lib build still sees as dead is the part the next stages reach —
-// the point-lookup path (`SstReader::get`, the bloom check, `contains`), the
-// cache/disk stats counters, and the memory/borrowed-object stores the tests
-// and the simulator drive. `allow` rather than `expect`, as `prng` has it: an
-// `expect` would be unfulfilled in the --tests build and fail it.
+// what a --lib build still sees as dead is test/simulator infrastructure and
+// observability that production does not call directly (cache counters and
+// the memory/borrowed-object stores). `allow` rather than `expect`, as `prng`
+// has it: an `expect` would be unfulfilled in the --tests build and fail it.
 #![allow(dead_code)]
 
 mod bloom;
@@ -39,11 +37,11 @@ mod tiered;
 pub(crate) mod lz4;
 
 pub(crate) use object::OwnedObjectStore;
+pub(crate) use sst::{MAX_ASSEMBLED, SstError, SstWriter};
+pub(crate) use sst::{SstHandle, SstKey, SstReader};
 pub(crate) use sst::{block_keys_at, data_block_total, locate_data_block, read_data_block};
-pub(crate) use sst::{SstHandle, SstReader};
-pub(crate) use sst::{SstError, SstWriter, MAX_ASSEMBLED};
 pub(crate) use tiered::TieredStore;
-pub(crate) use tiered::{build as build_tiers, StackPlan};
+pub(crate) use tiered::{StackPlan, build as build_tiers};
 
 use crate::wal::crc32c::crc32c;
 
@@ -83,6 +81,12 @@ pub(crate) enum BlockType {
     /// hand-rolled [`lz4`]); the writer keeps whichever of raw/compressed
     /// is smaller, so both types coexist in one SST.
     SstDataLz4 = 7,
+    /// Commit-LSN-versioned sorted rows.
+    SstDataV2 = 8,
+    /// LZ4-compressed commit-LSN-versioned sorted rows.
+    SstDataV2Lz4 = 9,
+    /// Sparse index over `(rowid, commit_lsn)` keys.
+    SstIndexV2 = 10,
 }
 
 impl BlockType {
@@ -95,6 +99,9 @@ impl BlockType {
             5 => BlockType::WalSegment,
             6 => BlockType::SstRoster,
             7 => BlockType::SstDataLz4,
+            8 => BlockType::SstDataV2,
+            9 => BlockType::SstDataV2Lz4,
+            10 => BlockType::SstIndexV2,
             _ => return None,
         })
     }
@@ -286,6 +293,11 @@ mod tests {
             BlockType::SstFilter,
             BlockType::ManifestLog,
             BlockType::WalSegment,
+            BlockType::SstRoster,
+            BlockType::SstDataLz4,
+            BlockType::SstDataV2,
+            BlockType::SstDataV2Lz4,
+            BlockType::SstIndexV2,
         ]
         .into_iter()
         .enumerate()
@@ -341,8 +353,14 @@ mod tests {
         buffer[HEADER_LEN..n].copy_from_slice(b"a fake  payload!");
         let checksum = crc32c(&buffer[4..n]);
         buffer[0..4].copy_from_slice(&checksum.to_le_bytes());
-        assert_eq!(decode(&buffer[..n], false).map(|b| b.payload), Ok(&b"a fake  payload!"[..]));
-        assert_eq!(decode(&buffer[..n], true).err(), Some(BlockError::IdentityMismatch));
+        assert_eq!(
+            decode(&buffer[..n], false).map(|b| b.payload),
+            Ok(&b"a fake  payload!"[..])
+        );
+        assert_eq!(
+            decode(&buffer[..n], true).err(),
+            Some(BlockError::IdentityMismatch)
+        );
     }
 
     #[test]
@@ -350,13 +368,22 @@ mod tests {
         let mut buffer = [0u8; BLOCK_SIZE];
         let (_, n) = encode(b"short", BlockType::SstData, 1, &mut buffer).unwrap();
         for short in 0..n {
-            assert!(decode(&buffer[..short], true).is_err(), "accepted {short} of {n} bytes");
+            assert!(
+                decode(&buffer[..short], true).is_err(),
+                "accepted {short} of {n} bytes"
+            );
         }
         let mut small = [0u8; 8];
-        assert_eq!(encode(b"x", BlockType::SstData, 1, &mut small).err(), Some(BlockError::Truncated));
+        assert_eq!(
+            encode(b"x", BlockType::SstData, 1, &mut small).err(),
+            Some(BlockError::Truncated)
+        );
         let too_big = [0u8; MAX_PAYLOAD + 1];
         let mut out = [0u8; BLOCK_SIZE + 64];
-        assert_eq!(encode(&too_big, BlockType::SstData, 1, &mut out).err(), Some(BlockError::TooLarge));
+        assert_eq!(
+            encode(&too_big, BlockType::SstData, 1, &mut out).err(),
+            Some(BlockError::TooLarge)
+        );
     }
 
     #[test]
@@ -366,7 +393,10 @@ mod tests {
         buffer[4] = 200;
         let checksum = crc32c(&buffer[4..n]);
         buffer[0..4].copy_from_slice(&checksum.to_le_bytes());
-        assert_eq!(decode(&buffer[..n], true).err(), Some(BlockError::UnknownType));
+        assert_eq!(
+            decode(&buffer[..n], true).err(),
+            Some(BlockError::UnknownType)
+        );
     }
 
     #[test]

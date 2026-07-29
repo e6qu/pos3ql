@@ -6,16 +6,16 @@
 //! `DISTINCT`, an aggregate-level `ORDER BY`, and `FILTER (WHERE ...)` at the
 //! one choke point `update`. The window executor reuses it per frame.
 
-use core::fmt::Write as _;
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, FromClause};
-use crate::sql::eval::{compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, compare_datums, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::Storage;
+use core::fmt::Write as _;
 
-use super::{arena_full, scan_source, Chained, QueryScope, MAX_AGGS};
+use super::{Chained, MAX_AGGS, QueryScope, arena_full, scan_source};
 
 /// Streams the source once, folding every aggregate node's state.
 /// Returns per-node result datums in the arena.
@@ -47,7 +47,10 @@ pub(crate) fn fold_aggregates<'a>(
         hooks,
         outer_arg,
         &mut |row| {
-            let chained_row = Chained { inner: row, outer: outer_arg };
+            let chained_row = Chained {
+                inner: row,
+                outer: outer_arg,
+            };
             for (i, (_, node)) in agg_nodes.iter().enumerate() {
                 states[i].update(node, arena, params, &chained_row, hooks)?;
             }
@@ -77,10 +80,10 @@ pub(crate) struct AggState<'a> {
     sum_numeric: Option<crate::sql::numeric::Numeric<'a>>,
     // Statistical-aggregate accumulators (all in f64). `sum_float` holds Σx (the
     // second argument for the two-argument regression/covariance aggregates).
-    sum_sq: f64,  // Σx²
-    sum_y: f64,   // Σy (first argument of a two-arg aggregate)
-    sum_xy: f64,  // Σxy
-    sum_yy: f64,  // Σy²
+    sum_sq: f64, // Σx²
+    sum_y: f64,  // Σy (first argument of a two-arg aggregate)
+    sum_xy: f64, // Σxy
+    sum_yy: f64, // Σy²
     // Exact Σx² for the single-argument variance/stddev family over
     // integer/numeric inputs, which return numeric (Σx reuses `sum_numeric`).
     sum_sq_numeric: Option<crate::sql::numeric::Numeric<'a>>,
@@ -113,6 +116,56 @@ pub(crate) struct AggState<'a> {
     ord: *mut &'a [u8],
     ord_len: usize,
     ord_cap: usize,
+}
+
+fn compare_ordered_aggregate_rows(
+    left: &[u8],
+    right: &[u8],
+    specification: &[crate::sql::ast::OrderBy<'_>],
+    comparison_error: &mut Option<SqlError>,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+
+    for (index, ordering) in specification.iter().enumerate() {
+        let left_key = crate::sql::exec::decode_projected_pub(left, 1 + index);
+        let right_key = crate::sql::exec::decode_projected_pub(right, 1 + index);
+        let result = match (left_key.is_null(), right_key.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if ordering.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if ordering.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => match compare_datums(&left_key, &right_key) {
+                Ok(result) => {
+                    if ordering.descending {
+                        result.reverse()
+                    } else {
+                        result
+                    }
+                }
+                Err(error) => {
+                    if comparison_error.is_none() {
+                        *comparison_error = Some(error);
+                    }
+                    Ordering::Equal
+                }
+            },
+        };
+        if !result.is_eq() {
+            return result;
+        }
+    }
+    Ordering::Equal
 }
 
 /// The most general numeric class seen among an aggregate's inputs, driving
@@ -148,10 +201,14 @@ enum AggKind {
     ArrayAgg,
     /// `json_agg`/`jsonb_agg(expr [ORDER BY ...])`: buffers values, then
     /// serializes them to a JSON array. `star` distinguishes json vs jsonb.
-    JsonAgg { jsonb: bool },
+    JsonAgg {
+        jsonb: bool,
+    },
     /// `json_object_agg`/`jsonb_object_agg(key, value)`: buffers `[key, value]`
     /// tuples into a JSON object.
-    JsonObjectAgg { jsonb: bool },
+    JsonObjectAgg {
+        jsonb: bool,
+    },
     /// Ordered-set aggregates: the aggregated values come from `WITHIN GROUP
     /// (ORDER BY ...)` and are buffered (in `vals`), sorted, then reduced in
     /// `finish`. `sum_float` holds the percentile fraction.
@@ -259,7 +316,15 @@ fn agg_f64(d: &Datum) -> Option<f64> {
 
 impl<'a> AggState<'a> {
     pub(crate) fn init(&mut self, node: &'a Expr<'a>) -> Result<(), SqlError> {
-        let Expr::Call { name, star, distinct, order_by, args, .. } = node else {
+        let Expr::Call {
+            name,
+            star,
+            distinct,
+            order_by,
+            args,
+            ..
+        } = node
+        else {
             return Err(sql_err!(sqlstate::GROUPING_ERROR, "not an aggregate"));
         };
         self.kind = match *name {
@@ -303,7 +368,7 @@ impl<'a> AggState<'a> {
                     sqlstate::UNDEFINED_FUNCTION,
                     "function {}() is not an aggregate",
                     other
-                ))
+                ));
             }
         };
         self.star = *star;
@@ -325,8 +390,8 @@ impl<'a> AggState<'a> {
             if *distinct {
                 // With DISTINCT, PostgreSQL permits ORDER BY only on the
                 // aggregated expression itself.
-                let sorts_by_argument =
-                    order_by.len() == 1 && args.first().is_some_and(|a| **a == *order_by[0].expression);
+                let sorts_by_argument = order_by.len() == 1
+                    && args.first().is_some_and(|a| **a == *order_by[0].expression);
                 if !sorts_by_argument {
                     return Err(sql_err!(
                         sqlstate::INVALID_COLUMN_REFERENCE,
@@ -353,7 +418,10 @@ impl<'a> AggState<'a> {
         };
         // `FILTER (WHERE cond)` excludes rows where the condition is not true.
         if let Some(cond) = filter
-            && !matches!(eval_full(cond, arena, params, row, hooks)?, Datum::Bool(true))
+            && !matches!(
+                eval_full(cond, arena, params, row, hooks)?,
+                Datum::Bool(true)
+            )
         {
             return Ok(());
         }
@@ -373,7 +441,10 @@ impl<'a> AggState<'a> {
             }
             let key = eval_full(args[0], arena, params, row, hooks)?;
             if key.is_null() {
-                return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "field name must not be null"));
+                return Err(sql_err!(
+                    sqlstate::NULL_VALUE_NOT_ALLOWED,
+                    "field name must not be null"
+                ));
             }
             let value = eval_full(args[1], arena, params, row, hooks)?;
             let tuple = [key, value];
@@ -402,7 +473,10 @@ impl<'a> AggState<'a> {
                 for (i, o) in self.ord_spec.iter().enumerate() {
                     tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
                 }
-                let enc = crate::sql::exec::encode_projected_pub(&tuple[..1 + self.ord_spec.len()], arena)?;
+                let enc = crate::sql::exec::encode_projected_pub(
+                    &tuple[..1 + self.ord_spec.len()],
+                    arena,
+                )?;
                 if self.distinct && self.ord_len > 0 {
                     let seen = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
                     if seen.contains(&enc) {
@@ -426,7 +500,10 @@ impl<'a> AggState<'a> {
                 unreachable!("validated in init");
             };
             let Some(item) = order_by.first() else {
-                return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "an ordered-set aggregate requires WITHIN GROUP"));
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "an ordered-set aggregate requires WITHIN GROUP"
+                ));
             };
             if matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc)
                 && let Some(fraction) = args.first()
@@ -438,7 +515,12 @@ impl<'a> AggState<'a> {
                     Datum::Int2(v) => f64::from(v),
                     Datum::Int4(v) => f64::from(v),
                     Datum::Int8(v) => v as f64,
-                    _ => return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "percentile value must be numeric")),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                            "percentile value must be numeric"
+                        ));
+                    }
                 };
             }
             let value = eval_full(item.expression, arena, params, row, hooks)?;
@@ -451,7 +533,10 @@ impl<'a> AggState<'a> {
         // either argument is NULL, else fold Σx, Σx², Σy, Σxy, Σy².
         if self.kind.is_two_arg_stat() {
             if args.len() != 2 {
-                return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "aggregate requires two arguments"));
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "aggregate requires two arguments"
+                ));
             }
             let y = eval_full(args[0], arena, params, row, hooks)?;
             let x = eval_full(args[1], arena, params, row, hooks)?;
@@ -467,7 +552,10 @@ impl<'a> AggState<'a> {
             return Ok(());
         }
         let Some(arg) = args.first() else {
-            return Err(sql_err!(sqlstate::GROUPING_ERROR, "aggregate requires an argument"));
+            return Err(sql_err!(
+                sqlstate::GROUPING_ERROR,
+                "aggregate requires an argument"
+            ));
         };
         let v = eval_full(arg, arena, params, row, hooks)?;
         if v.is_null() {
@@ -505,7 +593,9 @@ impl<'a> AggState<'a> {
                 }
                 Datum::Numeric(n) => {
                     self.arg_kind = self.arg_kind.max(ArgKind::Numeric);
-                    let running = self.sum_numeric.unwrap_or(crate::sql::numeric::Numeric::ZERO);
+                    let running = self
+                        .sum_numeric
+                        .unwrap_or(crate::sql::numeric::Numeric::ZERO);
                     self.sum_numeric = Some(crate::sql::numeric::add(&running, &n, arena)?);
                 }
                 // sum(real) -> real, accumulated in single precision; avg(real)
@@ -527,7 +617,7 @@ impl<'a> AggState<'a> {
                         sqlstate::DATATYPE_MISMATCH,
                         "cannot sum {:?}",
                         other
-                    ))
+                    ));
                 }
             },
             AggKind::Min | AggKind::Max => {
@@ -550,8 +640,14 @@ impl<'a> AggState<'a> {
                         "bool_and/bool_or requires boolean arguments"
                     ));
                 };
-                let acc = self.bool_acc.get_or_insert(matches!(self.kind, AggKind::BoolAnd));
-                *acc = if self.kind == AggKind::BoolAnd { *acc && x } else { *acc || x };
+                let acc = self
+                    .bool_acc
+                    .get_or_insert(matches!(self.kind, AggKind::BoolAnd));
+                *acc = if self.kind == AggKind::BoolAnd {
+                    *acc && x
+                } else {
+                    *acc || x
+                };
             }
             // Bitwise aggregates reduce the running value (kept in `best`) with
             // the incoming one via the corresponding bitwise operator.
@@ -622,14 +718,15 @@ impl<'a> AggState<'a> {
                             sqlstate::DATATYPE_MISMATCH,
                             "statistical aggregate requires a numeric argument, got {:?}",
                             other
-                        ))
+                        ));
                     }
                 };
                 if let Some(x) = as_numeric {
                     let sum_x = self.sum_numeric.unwrap_or(Numeric::ZERO);
                     self.sum_numeric = Some(num::add(&sum_x, &x, arena)?);
                     let sum_x2 = self.sum_sq_numeric.unwrap_or(Numeric::ZERO);
-                    self.sum_sq_numeric = Some(num::add(&sum_x2, &num::mul(&x, &x, arena)?, arena)?);
+                    self.sum_sq_numeric =
+                        Some(num::add(&sum_x2, &num::mul(&x, &x, arena)?, arena)?);
                 }
             }
             // Ordered-set, array, json, and two-arg statistical aggregates buffer
@@ -690,7 +787,7 @@ impl<'a> AggState<'a> {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "string_agg delimiter must be text"
-                ))
+                ));
             }
         };
         // Stash the first delimiter so the DISTINCT/ORDER BY fold can reuse it.
@@ -730,7 +827,11 @@ impl<'a> AggState<'a> {
     /// growing it (doubling) in the arena when full.
     fn push_ordered(&mut self, enc: &'a [u8], arena: &'a Arena) -> Result<(), SqlError> {
         if self.ord_len == self.ord_cap {
-            let new_cap = if self.ord_cap == 0 { 8 } else { self.ord_cap * 2 };
+            let new_cap = if self.ord_cap == 0 {
+                8
+            } else {
+                self.ord_cap * 2
+            };
             let empty: &[u8] = &[];
             let fresh = arena
                 .alloc_slice_with(new_cap, |_| empty)
@@ -749,7 +850,12 @@ impl<'a> AggState<'a> {
 
     /// Append `value` to the string_agg buffer, prefixing `sep` for every element
     /// after the first (first = buffer still empty).
-    fn append_str_elem(&mut self, sep: &str, value: &str, arena: &'a Arena) -> Result<(), SqlError> {
+    fn append_str_elem(
+        &mut self,
+        sep: &str,
+        value: &str,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
         if self.str_len > 0 {
             self.push_bytes(sep.as_bytes(), arena)?;
         }
@@ -762,7 +868,11 @@ impl<'a> AggState<'a> {
     fn push_bytes(&mut self, src: &[u8], arena: &'a Arena) -> Result<(), SqlError> {
         let need = self.str_len + src.len();
         if need > self.str_cap {
-            let mut new_cap = if self.str_cap == 0 { 16 } else { self.str_cap * 2 };
+            let mut new_cap = if self.str_cap == 0 {
+                16
+            } else {
+                self.str_cap * 2
+            };
             while new_cap < need {
                 new_cap *= 2;
             }
@@ -823,7 +933,9 @@ impl<'a> AggState<'a> {
                 let index = if fraction <= 0.0 {
                     0
                 } else {
-                    ((fraction * n as f64).ceil() as usize).saturating_sub(1).min(n - 1)
+                    ((fraction * n as f64).ceil() as usize)
+                        .saturating_sub(1)
+                        .min(n - 1)
                 };
                 Ok(values[index])
             }
@@ -846,11 +958,15 @@ impl<'a> AggState<'a> {
                         _ => 0.0,
                     }
                 };
-                let interpolated = to_f64(&values[low]) + (to_f64(&values[high]) - to_f64(&values[low])) * weight;
+                let interpolated =
+                    to_f64(&values[low]) + (to_f64(&values[high]) - to_f64(&values[low])) * weight;
                 match values[low] {
                     Datum::Numeric(_) => {
                         let text = crate::stack_format!(48, "{}", interpolated);
-                        Ok(Datum::Numeric(crate::sql::numeric::Numeric::parse(text.as_str(), arena)?))
+                        Ok(Datum::Numeric(crate::sql::numeric::Numeric::parse(
+                            text.as_str(),
+                            arena,
+                        )?))
                     }
                     _ => Ok(Datum::Float8(interpolated)),
                 }
@@ -860,7 +976,11 @@ impl<'a> AggState<'a> {
 
     fn push_distinct(&mut self, v: Datum<'a>, arena: &'a Arena) -> Result<(), SqlError> {
         if self.vals_len == self.vals_cap {
-            let new_cap = if self.vals_cap == 0 { 8 } else { self.vals_cap * 2 };
+            let new_cap = if self.vals_cap == 0 {
+                8
+            } else {
+                self.vals_cap * 2
+            };
             let fresh = arena
                 .alloc_slice_with(new_cap, |_| Datum::Null)
                 .map_err(|_| arena_full())?;
@@ -922,34 +1042,8 @@ impl<'a> AggState<'a> {
         let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
         let spec = self.ord_spec;
         let mut cmp_err: Option<SqlError> = None;
-        rows.sort_unstable_by(|a, b| {
-            use core::cmp::Ordering;
-            for (k, o) in spec.iter().enumerate() {
-                let ka = crate::sql::exec::decode_projected_pub(a, 1 + k);
-                let kb = crate::sql::exec::decode_projected_pub(b, 1 + k);
-                let ord = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => {
-                        if o.nulls_first { Ordering::Less } else { Ordering::Greater }
-                    }
-                    (false, true) => {
-                        if o.nulls_first { Ordering::Greater } else { Ordering::Less }
-                    }
-                    (false, false) => match compare_datums(&ka, &kb) {
-                        Ok(c) => if o.descending { c.reverse() } else { c },
-                        Err(e) => {
-                            if cmp_err.is_none() {
-                                cmp_err = Some(e);
-                            }
-                            Ordering::Equal
-                        }
-                    },
-                };
-                if !ord.is_eq() {
-                    return ord;
-                }
-            }
-            Ordering::Equal
+        rows.sort_unstable_by(|left, right| {
+            compare_ordered_aggregate_rows(left, right, spec, &mut cmp_err)
         });
         if let Some(e) = cmp_err {
             return Err(e);
@@ -1023,10 +1117,16 @@ impl<'a> AggState<'a> {
                     let sum_x = self.sum_numeric.unwrap_or(Numeric::ZERO);
                     let sum_x2 = self.sum_sq_numeric.unwrap_or(Numeric::ZERO);
                     let sample = matches!(self.kind, AggKind::VarSamp | AggKind::StddevSamp);
-                    let want_stddev =
-                        matches!(self.kind, AggKind::StddevPop | AggKind::StddevSamp);
+                    let want_stddev = matches!(self.kind, AggKind::StddevPop | AggKind::StddevSamp);
                     return Ok(
-                        match num::var_stddev(self.count, &sum_x, &sum_x2, sample, want_stddev, arena)? {
+                        match num::var_stddev(
+                            self.count,
+                            &sum_x,
+                            &sum_x2,
+                            sample,
+                            want_stddev,
+                            arena,
+                        )? {
                             Some(result) => Datum::Numeric(result),
                             None => Datum::Null,
                         },
@@ -1078,19 +1178,18 @@ impl<'a> AggState<'a> {
             AggKind::Sum => match self.arg_kind {
                 ArgKind::Float4 => Datum::Float4(self.sum_float4),
                 ArgKind::Float => Datum::Float8(self.sum_float),
-                ArgKind::Int4 => Datum::Int8(
-                    i64::try_from(self.sum_int)
-                        .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range"))?,
-                ),
+                ArgKind::Int4 => Datum::Int8(i64::try_from(self.sum_int).map_err(|_| {
+                    sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range")
+                })?),
                 ArgKind::Int8 => Datum::Numeric(Numeric::from_i128(self.sum_int, arena)?),
-                ArgKind::Numeric => {
-                    Datum::Numeric(self.sum_numeric.unwrap_or(Numeric::ZERO))
-                }
+                ArgKind::Numeric => Datum::Numeric(self.sum_numeric.unwrap_or(Numeric::ZERO)),
                 ArgKind::None => Datum::Null,
             },
             // AVG: numeric for int/int8/numeric, float8 for float8.
             AggKind::Avg => match self.arg_kind {
-                ArgKind::Float4 | ArgKind::Float => Datum::Float8(self.sum_float / self.count as f64),
+                ArgKind::Float4 | ArgKind::Float => {
+                    Datum::Float8(self.sum_float / self.count as f64)
+                }
                 ArgKind::Int4 | ArgKind::Int8 => {
                     let sum = Numeric::from_i128(self.sum_int, arena)?;
                     let cnt = Numeric::from_i64(self.count as i64, arena)?;
@@ -1132,7 +1231,9 @@ impl<'a> AggState<'a> {
         // No default here. Falling back to int4 for an element type arrays
         // cannot yet carry relabelled the values rather than failing, so
         // `array_agg` over a time or a uuid came back as meaningless integers.
-        let from_values = values.iter().find_map(crate::sql::types::ArrElem::from_datum);
+        let from_values = values
+            .iter()
+            .find_map(crate::sql::types::ArrElem::from_datum);
         let Some(element) = self.elem_hint.or(from_values) else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1203,51 +1304,39 @@ impl<'a> AggState<'a> {
     /// shared by `finish_array_agg` and `finish_json_agg`.
     fn collect_agg_values(&mut self, arena: &'a Arena) -> Result<&'a [Datum<'a>], SqlError> {
         if self.ordered {
+            if self.ord_len == 0 {
+                return Ok(&[]);
+            }
             let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
             let spec = self.ord_spec;
             let mut cmp_err: Option<SqlError> = None;
-            crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
-                use core::cmp::Ordering;
-                for (k, o) in spec.iter().enumerate() {
-                    let ka = crate::sql::exec::decode_projected_pub(a, 1 + k);
-                    let kb = crate::sql::exec::decode_projected_pub(b, 1 + k);
-                    let ord = match (ka.is_null(), kb.is_null()) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => if o.nulls_first { Ordering::Less } else { Ordering::Greater },
-                        (false, true) => if o.nulls_first { Ordering::Greater } else { Ordering::Less },
-                        (false, false) => match compare_datums(&ka, &kb) {
-                            Ok(c) => if o.descending { c.reverse() } else { c },
-                            Err(e) => {
-                                if cmp_err.is_none() { cmp_err = Some(e); }
-                                Ordering::Equal
-                            }
-                        },
-                    };
-                    if !ord.is_eq() {
-                        return ord;
-                    }
-                }
-                Ordering::Equal
+            crate::mem::arena::stable_sort_via(arena, rows, |left, right| {
+                compare_ordered_aggregate_rows(left, right, spec, &mut cmp_err)
             })
             .map_err(|_| arena_full())?;
             if let Some(e) = cmp_err {
                 return Err(e);
             }
-            let out = arena.alloc_slice_with(rows.len(), |_| Datum::Null).map_err(|_| arena_full())?;
+            let out = arena
+                .alloc_slice_with(rows.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
             for (i, &row) in rows.iter().enumerate() {
                 out[i] = crate::sql::exec::decode_projected_pub(row, 0);
             }
             Ok(out)
         } else if self.distinct {
+            if self.vals_len == 0 {
+                return Ok(&[]);
+            }
             let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
             let mut cmp_err: Option<SqlError> = None;
-            crate::mem::arena::stable_sort_via(arena, vals, |a, b| {
-                match compare_datums(a, b) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        if cmp_err.is_none() { cmp_err = Some(e); }
-                        core::cmp::Ordering::Equal
+            crate::mem::arena::stable_sort_via(arena, vals, |a, b| match compare_datums(a, b) {
+                Ok(o) => o,
+                Err(e) => {
+                    if cmp_err.is_none() {
+                        cmp_err = Some(e);
                     }
+                    core::cmp::Ordering::Equal
                 }
             })
             .map_err(|_| arena_full())?;

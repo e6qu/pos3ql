@@ -12,6 +12,7 @@ pub mod oid {
     pub const BYTEA: i32 = 17;
     pub const INT8: i32 = 20;
     pub const INT2: i32 = 21;
+    pub const INT2VECTOR: i32 = 22;
     pub const INT4: i32 = 23;
     pub const TEXT: i32 = 25;
     pub const NAME: i32 = 19;
@@ -90,9 +91,12 @@ pub mod oid {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
     Bool,
-    /// `smallint`/`int2`. Stored as an i32 but range-checked to ±32767. Its
-    /// wire OID stays int4 so binary output width matches the 4-byte payload.
+    /// `smallint`/`int2`. A real i16 datum with PostgreSQL's OID 21 and
+    /// two-byte binary wire representation.
     Int2,
+    /// PostgreSQL's zero-based, space-delimited `int2vector` catalog type.
+    /// It is transient catalog data and is never accepted as a stored column.
+    Int2Vector,
     Int4,
     Int8,
     /// `real`/`float4`. Its own [`Datum::Float4`] (f32); reports OID 700 and
@@ -134,7 +138,9 @@ pub enum ColType {
     /// A bit string. `varying` = `false` is `bit(n)` (OID 1560), `true` is
     /// `bit varying` / `varbit` (OID 1562). Length is enforced at cast time,
     /// not tracked here.
-    Bit { varying: bool },
+    Bit {
+        varying: bool,
+    },
     /// A multirange type (int4multirange/…), stored as canonical text.
     Multirange(RangeKind),
     /// `inet`: a host or network IPv4/IPv6 address with a mask length. Host
@@ -201,8 +207,8 @@ impl ColType {
             "float4" | "real" => Self::Float4,
             // `name` and the `reg*` object-identifier types render as text for
             // catalog introspection.
-            "text" | "regtype" | "regclass" | "regproc" | "regprocedure"
-            | "regrole" | "regnamespace" | "regoper" | "regoperator" => Self::Text,
+            "text" | "regtype" | "regclass" | "regproc" | "regprocedure" | "regrole"
+            | "regnamespace" | "regoper" | "regoperator" => Self::Text,
             "name" => Self::Name,
             "oid" => Self::Int4,
             "varchar" | "character varying" => Self::Varchar,
@@ -232,6 +238,7 @@ impl ColType {
         match self {
             Self::Bool => oid::BOOL,
             Self::Int2 => oid::INT2,
+            Self::Int2Vector => oid::INT2VECTOR,
             Self::Int4 => oid::INT4,
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT4,
@@ -273,6 +280,7 @@ impl ColType {
         let scalar = match type_oid {
             oid::BOOL => Some(Self::Bool),
             oid::INT2 => Some(Self::Int2),
+            oid::INT2VECTOR => Some(Self::Int2Vector),
             oid::INT4 => Some(Self::Int4),
             oid::INT8 => Some(Self::Int8),
             oid::FLOAT4 => Some(Self::Float4),
@@ -321,18 +329,39 @@ impl ColType {
         }
         // Arrays: match the element type's array OID.
         for element in [
-            ArrElem::Bool, ArrElem::Int2, ArrElem::Int4, ArrElem::Int8, ArrElem::Float4,
-            ArrElem::Float8, ArrElem::Text, ArrElem::Name, ArrElem::Varchar, ArrElem::Bpchar,
-            ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz, ArrElem::Time, ArrElem::Timetz,
-            ArrElem::Interval, ArrElem::Json, ArrElem::Jsonb, ArrElem::Uuid, ArrElem::Bytea,
-            ArrElem::Numeric, ArrElem::Inet, ArrElem::Cidr, ArrElem::Macaddr, ArrElem::Macaddr8,
+            ArrElem::Bool,
+            ArrElem::Int2,
+            ArrElem::Int4,
+            ArrElem::Int8,
+            ArrElem::Float4,
+            ArrElem::Float8,
+            ArrElem::Text,
+            ArrElem::Name,
+            ArrElem::Varchar,
+            ArrElem::Bpchar,
+            ArrElem::Date,
+            ArrElem::Timestamp,
+            ArrElem::Timestamptz,
+            ArrElem::Time,
+            ArrElem::Timetz,
+            ArrElem::Interval,
+            ArrElem::Json,
+            ArrElem::Jsonb,
+            ArrElem::Uuid,
+            ArrElem::Bytea,
+            ArrElem::Numeric,
+            ArrElem::Inet,
+            ArrElem::Cidr,
+            ArrElem::Macaddr,
+            ArrElem::Macaddr8,
         ] {
             if type_oid == element.array_oid() {
                 return Some(Self::Array(element));
             }
         }
         // User-defined enum types occupy a synthesized OID band.
-        if type_oid >= oid::FIRST_ENUM && type_oid < oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32
+        if type_oid >= oid::FIRST_ENUM
+            && type_oid < oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32
         {
             return Some(Self::Enum((type_oid - oid::FIRST_ENUM) as u16));
         }
@@ -352,6 +381,7 @@ impl ColType {
         match self {
             Self::Bool => 1,
             Self::Int2 => 2,
+            Self::Int2Vector => -1,
             Self::Int4 | Self::Date | Self::Float4 => 4,
             Self::Int8 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
             Self::Timetz => 12,
@@ -360,7 +390,13 @@ impl ColType {
             Self::Macaddr => 6,
             Self::Macaddr8 => 8,
             Self::Name => 64,
-            Self::Text | Self::Varchar | Self::Bpchar | Self::Bytea | Self::Numeric | Self::Json | Self::Jsonb => -1,
+            Self::Text
+            | Self::Varchar
+            | Self::Bpchar
+            | Self::Bytea
+            | Self::Numeric
+            | Self::Json
+            | Self::Jsonb => -1,
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
             Self::Inet | Self::Cidr => -1,
             Self::Record => -1,
@@ -384,6 +420,7 @@ impl ColType {
         match self {
             Self::Bool => "bool",
             Self::Int2 => "int2",
+            Self::Int2Vector => "int2vector",
             Self::Int4 => "int4",
             Self::Int8 => "int8",
             Self::Float4 => "float4",
@@ -432,6 +469,7 @@ impl ColType {
         match self {
             Self::Bool => "boolean",
             Self::Int2 => "smallint",
+            Self::Int2Vector => "int2vector",
             Self::Int4 => "integer",
             Self::Int8 => "bigint",
             Self::Float4 => "real",
@@ -482,6 +520,7 @@ impl ColType {
             Self::Bytea => 10,
             Self::Numeric => 11,
             Self::Int2 => 12,
+            Self::Int2Vector => 55,
             Self::Float4 => 13,
             Self::Varchar => 14,
             Self::Bpchar => 15,
@@ -1012,7 +1051,11 @@ impl TypeMod {
                 TypeMod::IntervalMod {
                     range: ((atttypmod as u32) >> 16) as u16,
                     // 0xFFFF is "no precision given", not a precision.
-                    precision: if precision_raw <= 6 { Some(precision_raw as u8) } else { None },
+                    precision: if precision_raw <= 6 {
+                        Some(precision_raw as u8)
+                    } else {
+                        None
+                    },
                 }
             }
             _ => TypeMod::None,
@@ -1035,7 +1078,6 @@ impl TypeMod {
         }
     }
 }
-
 
 /// A PostgreSQL `interval`: three independent fields (months, days, and
 /// microseconds) that add to a date/timestamp separately — a month is a
@@ -1206,22 +1248,39 @@ pub enum Datum<'a> {
     /// A duration.
     Interval(Interval),
     /// JSON text; `jsonb` is true for the binary/normalized form.
-    Json { text: &'a str, jsonb: bool },
+    Json {
+        text: &'a str,
+        jsonb: bool,
+    },
     /// A one-dimensional array: the element type plus the serialized element
     /// bytes (`u16 count` then `u32 len + element encoding` per element). Kept
     /// as raw bytes so decoding from storage needs no separate allocation.
-    Array { element: ArrElem, raw: &'a [u8] },
+    Array {
+        element: ArrElem,
+        raw: &'a [u8],
+    },
+    /// The fixed-width integer vector used by PostgreSQL system catalogs.
+    Int2Vector(&'a [u8]),
     Uuid([u8; 16]),
     Bytea(&'a [u8]),
     Numeric(Numeric<'a>),
     /// A range value in its canonical text form (e.g. `[1,5)`, `empty`).
-    Range { text: &'a str, kind: RangeKind },
+    Range {
+        text: &'a str,
+        kind: RangeKind,
+    },
     /// A bit string as a sequence of `'0'`/`'1'` characters. `varying` selects
     /// the reported type: `false` = `bit(n)` (OID 1560), `true` = `varbit`
     /// (OID 1562).
-    Bit { bits: &'a str, varying: bool },
+    Bit {
+        bits: &'a str,
+        varying: bool,
+    },
     /// A multirange value in canonical text form (e.g. `{[1,3),[5,7)}`, `{}`).
-    Multirange { text: &'a str, kind: RangeKind },
+    Multirange {
+        text: &'a str,
+        kind: RangeKind,
+    },
     /// An `inet` address (host bits preserved).
     Inet(NetAddr),
     /// A `cidr` network (always prints its mask length).
@@ -1241,7 +1300,11 @@ pub enum Datum<'a> {
     /// is the member's text, used for output and equality. All three are
     /// carried inline so a value is self-describing — decode needs no catalog
     /// and [`compare_datums`](super::eval::operators::compare_datums) stays pure.
-    Enum { slot: u16, sort: f64, label: &'a str },
+    Enum {
+        slot: u16,
+        sort: f64,
+        label: &'a str,
+    },
 }
 
 /// One field of a [`Datum::Record`].
@@ -1278,6 +1341,7 @@ impl<'a> Datum<'a> {
             Datum::Json { jsonb: false, .. } => oid::JSON,
             Datum::Json { jsonb: true, .. } => oid::JSONB,
             Datum::Array { element, .. } => element.array_oid(),
+            Datum::Int2Vector(_) => oid::INT2VECTOR,
             Datum::Uuid(_) => oid::UUID,
             Datum::Bytea(_) => oid::BYTEA,
             Datum::Numeric(_) => oid::NUMERIC,
@@ -1433,12 +1497,24 @@ impl fmt::Display for Datum<'_> {
                 f.write_str(super::datetime::format_time(*t).as_str())?;
                 f.write_str(super::datetime::iso_offset_string(*zone).as_str())
             }
-            Datum::Interval(interval) => f.write_str(super::datetime::format_interval(*interval).as_str()),
+            Datum::Interval(interval) => {
+                f.write_str(super::datetime::format_interval(*interval).as_str())
+            }
             Datum::Json { text, .. } => f.write_str(text),
             Datum::Range { text, .. } => f.write_str(text),
             Datum::Bit { bits, .. } => f.write_str(bits),
             Datum::Multirange { text, .. } => f.write_str(text),
             Datum::Array { element, raw } => super::array::write(f, *element, raw),
+            Datum::Int2Vector(raw) => {
+                for (index, bytes) in raw.chunks_exact(2).enumerate() {
+                    if index > 0 {
+                        f.write_str(" ")?;
+                    }
+                    let value = i16::from_le_bytes([bytes[0], bytes[1]]);
+                    write!(f, "{value}")?;
+                }
+                Ok(())
+            }
             Datum::Uuid(b) => {
                 for (i, byte) in b.iter().enumerate() {
                     if matches!(i, 4 | 6 | 8 | 10) {
@@ -1520,7 +1596,9 @@ impl fmt::Write for QuoteScan {
         if !s.is_empty() {
             self.empty = false;
         }
-        if s.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace()) {
+        if s.chars()
+            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace())
+        {
             self.special = true;
         }
         // Only the first four bytes are kept, enough to recognize `null`.
@@ -1558,7 +1636,12 @@ pub(crate) fn write_array_elem(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Re
     if matches!(v, Datum::Null) {
         return f.write_str("NULL");
     }
-    let mut scan = QuoteScan { empty: true, special: false, text: [0; 4], len: 0 };
+    let mut scan = QuoteScan {
+        empty: true,
+        special: false,
+        text: [0; 4],
+        len: 0,
+    };
     write!(scan, "{v}")?;
     let is_null_word = scan.len == 4 && scan.text.eq_ignore_ascii_case(b"null");
     if scan.empty || scan.special || is_null_word {
@@ -1584,7 +1667,12 @@ pub struct ColDesc<'a> {
 
 impl<'a> ColDesc<'a> {
     pub fn new(name: &'a str, type_oid: i32, typlen: i16) -> Self {
-        Self { name, type_oid, typlen, type_mod: -1 }
+        Self {
+            name,
+            type_oid,
+            typlen,
+            type_mod: -1,
+        }
     }
 
     pub fn of_type(name: &'a str, t: ColType) -> Self {
@@ -1607,15 +1695,30 @@ mod tests {
         // The values PostgreSQL 18.4 stores in pg_attribute, byte for byte.
         assert_eq!(TypeMod::Length(5).encode(), 9); // varchar(5)
         assert_eq!(TypeMod::Length(3).encode(), 7); // char(3)
-        assert_eq!(TypeMod::NumericPS { precision: 6, scale: 2 }.encode(), 393222);
+        assert_eq!(
+            TypeMod::NumericPS {
+                precision: 6,
+                scale: 2
+            }
+            .encode(),
+            393222
+        );
         assert_eq!(TypeMod::TemporalPrecision(3).encode(), 3); // timestamp(3)
         assert_eq!(TypeMod::TemporalPrecision(0).encode(), 0); // timestamp(0)
         assert_eq!(
-            TypeMod::IntervalMod { range: INTERVAL_FULL_RANGE, precision: Some(1) }.encode(),
+            TypeMod::IntervalMod {
+                range: INTERVAL_FULL_RANGE,
+                precision: Some(1)
+            }
+            .encode(),
             2147418113 // interval(1)
         );
         assert_eq!(
-            TypeMod::IntervalMod { range: 0x0C00, precision: None }.encode(),
+            TypeMod::IntervalMod {
+                range: 0x0C00,
+                precision: None
+            }
+            .encode(),
             201392127 // interval hour to minute — precision unspecified
         );
         assert_eq!(TypeMod::None.encode(), -1);
@@ -1627,16 +1730,31 @@ mod tests {
             (ColType::Varchar, TypeMod::Length(5)),
             (ColType::Bpchar, TypeMod::Length(3)),
             (ColType::Bit { varying: false }, TypeMod::Length(8)),
-            (ColType::Numeric, TypeMod::NumericPS { precision: 6, scale: 2 }),
+            (
+                ColType::Numeric,
+                TypeMod::NumericPS {
+                    precision: 6,
+                    scale: 2,
+                },
+            ),
             (ColType::Timestamp, TypeMod::TemporalPrecision(3)),
             (ColType::Timestamptz, TypeMod::TemporalPrecision(0)),
             (ColType::Time, TypeMod::TemporalPrecision(6)),
             (ColType::Timetz, TypeMod::TemporalPrecision(2)),
             (
                 ColType::Interval,
-                TypeMod::IntervalMod { range: INTERVAL_FULL_RANGE, precision: Some(4) },
+                TypeMod::IntervalMod {
+                    range: INTERVAL_FULL_RANGE,
+                    precision: Some(4),
+                },
             ),
-            (ColType::Interval, TypeMod::IntervalMod { range: 0x0C00, precision: None }),
+            (
+                ColType::Interval,
+                TypeMod::IntervalMod {
+                    range: 0x0C00,
+                    precision: None,
+                },
+            ),
         ];
         for &(ctype, modifier) in cases {
             assert_eq!(
@@ -1669,7 +1787,10 @@ mod tests {
         // The interval 0xFFFF low half is "no precision", not precision 65535.
         assert_eq!(
             TypeMod::decode(ColType::Interval, 201392127),
-            TypeMod::IntervalMod { range: 0x0C00, precision: None }
+            TypeMod::IntervalMod {
+                range: 0x0C00,
+                precision: None
+            }
         );
     }
 
@@ -1722,28 +1843,80 @@ mod tests {
     fn from_oid_inverts_oid() {
         // Every type the binary-parameter path can name by OID round-trips.
         let mut types = vec![
-            ColType::Bool, ColType::Int2, ColType::Int4, ColType::Int8, ColType::Float4,
-            ColType::Float8, ColType::Text, ColType::Name, ColType::Varchar, ColType::Bpchar,
-            ColType::Date, ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Timetz,
-            ColType::Interval, ColType::Json, ColType::Jsonb, ColType::Uuid, ColType::Bytea,
-            ColType::Numeric, ColType::Bit { varying: false }, ColType::Bit { varying: true },
-            ColType::Inet, ColType::Cidr, ColType::Macaddr, ColType::Macaddr8,
+            ColType::Bool,
+            ColType::Int2,
+            ColType::Int4,
+            ColType::Int8,
+            ColType::Float4,
+            ColType::Float8,
+            ColType::Text,
+            ColType::Name,
+            ColType::Varchar,
+            ColType::Bpchar,
+            ColType::Date,
+            ColType::Timestamp,
+            ColType::Timestamptz,
+            ColType::Time,
+            ColType::Timetz,
+            ColType::Interval,
+            ColType::Json,
+            ColType::Jsonb,
+            ColType::Uuid,
+            ColType::Bytea,
+            ColType::Numeric,
+            ColType::Bit { varying: false },
+            ColType::Bit { varying: true },
+            ColType::Inet,
+            ColType::Cidr,
+            ColType::Macaddr,
+            ColType::Macaddr8,
         ];
-        for k in [RangeKind::Int4, RangeKind::Int8, RangeKind::Num, RangeKind::Date, RangeKind::Ts, RangeKind::Tstz] {
+        for k in [
+            RangeKind::Int4,
+            RangeKind::Int8,
+            RangeKind::Num,
+            RangeKind::Date,
+            RangeKind::Ts,
+            RangeKind::Tstz,
+        ] {
             types.push(ColType::Range(k));
             types.push(ColType::Multirange(k));
         }
         for e in [
-            ArrElem::Bool, ArrElem::Int2, ArrElem::Int4, ArrElem::Int8, ArrElem::Float4,
-            ArrElem::Float8, ArrElem::Text, ArrElem::Name, ArrElem::Varchar, ArrElem::Bpchar,
-            ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz, ArrElem::Time, ArrElem::Timetz,
-            ArrElem::Interval, ArrElem::Json, ArrElem::Jsonb, ArrElem::Uuid, ArrElem::Bytea,
-            ArrElem::Numeric, ArrElem::Inet, ArrElem::Cidr, ArrElem::Macaddr, ArrElem::Macaddr8,
+            ArrElem::Bool,
+            ArrElem::Int2,
+            ArrElem::Int4,
+            ArrElem::Int8,
+            ArrElem::Float4,
+            ArrElem::Float8,
+            ArrElem::Text,
+            ArrElem::Name,
+            ArrElem::Varchar,
+            ArrElem::Bpchar,
+            ArrElem::Date,
+            ArrElem::Timestamp,
+            ArrElem::Timestamptz,
+            ArrElem::Time,
+            ArrElem::Timetz,
+            ArrElem::Interval,
+            ArrElem::Json,
+            ArrElem::Jsonb,
+            ArrElem::Uuid,
+            ArrElem::Bytea,
+            ArrElem::Numeric,
+            ArrElem::Inet,
+            ArrElem::Cidr,
+            ArrElem::Macaddr,
+            ArrElem::Macaddr8,
         ] {
             types.push(ColType::Array(e));
         }
         for t in types {
-            assert_eq!(ColType::from_oid(t.oid()), Some(t), "{t:?} did not round-trip through its OID");
+            assert_eq!(
+                ColType::from_oid(t.oid()),
+                Some(t),
+                "{t:?} did not round-trip through its OID"
+            );
         }
         // An OID this engine does not model is None, never a wrong type.
         assert_eq!(ColType::from_oid(0), None);
@@ -1762,20 +1935,59 @@ mod code_roundtrip_tests {
     #[test]
     fn every_coltype_code_roundtrips() {
         let mut types = vec![
-            ColType::Bool, ColType::Int2, ColType::Int4, ColType::Int8, ColType::Float4,
-            ColType::Float8, ColType::Text, ColType::Varchar, ColType::Bpchar, ColType::Date,
-            ColType::Timestamp, ColType::Timestamptz, ColType::Time, ColType::Timetz, ColType::Interval,
-            ColType::Json, ColType::Jsonb, ColType::Uuid, ColType::Bytea, ColType::Numeric,
-            ColType::Bit { varying: false }, ColType::Bit { varying: true },
-            ColType::Inet, ColType::Cidr, ColType::Macaddr, ColType::Macaddr8,
+            ColType::Bool,
+            ColType::Int2,
+            ColType::Int4,
+            ColType::Int8,
+            ColType::Float4,
+            ColType::Float8,
+            ColType::Text,
+            ColType::Varchar,
+            ColType::Bpchar,
+            ColType::Date,
+            ColType::Timestamp,
+            ColType::Timestamptz,
+            ColType::Time,
+            ColType::Timetz,
+            ColType::Interval,
+            ColType::Json,
+            ColType::Jsonb,
+            ColType::Uuid,
+            ColType::Bytea,
+            ColType::Numeric,
+            ColType::Bit { varying: false },
+            ColType::Bit { varying: true },
+            ColType::Inet,
+            ColType::Cidr,
+            ColType::Macaddr,
+            ColType::Macaddr8,
         ];
-        for k in [RangeKind::Int4, RangeKind::Int8, RangeKind::Num, RangeKind::Date, RangeKind::Ts, RangeKind::Tstz] {
+        for k in [
+            RangeKind::Int4,
+            RangeKind::Int8,
+            RangeKind::Num,
+            RangeKind::Date,
+            RangeKind::Ts,
+            RangeKind::Tstz,
+        ] {
             types.push(ColType::Range(k));
             types.push(ColType::Multirange(k));
         }
-        for e in [ArrElem::Bool, ArrElem::Int4, ArrElem::Int8, ArrElem::Float8, ArrElem::Text,
-                  ArrElem::Numeric, ArrElem::Date, ArrElem::Timestamp, ArrElem::Timestamptz,
-                  ArrElem::Inet, ArrElem::Cidr, ArrElem::Macaddr, ArrElem::Macaddr8] {
+        for e in [
+            ArrElem::Bool,
+            ArrElem::Int4,
+            ArrElem::Int8,
+            ArrElem::Float8,
+            ArrElem::Text,
+            ArrElem::Numeric,
+            ArrElem::Date,
+            ArrElem::Timestamp,
+            ArrElem::Timestamptz,
+            ArrElem::Inet,
+            ArrElem::Cidr,
+            ArrElem::Macaddr,
+            ArrElem::Macaddr8,
+        ] {
             types.push(ColType::Array(e));
         }
         // The layout this replaced could emit any code in 20..=40; a moved
@@ -1796,7 +2008,11 @@ mod code_roundtrip_tests {
         let mut seen: Vec<(u8, ColType)> = Vec::new();
         for t in types {
             let c = t.code();
-            assert_eq!(ColType::from_code(c), Some(t), "code {c} does not round-trip for {t:?}");
+            assert_eq!(
+                ColType::from_code(c),
+                Some(t),
+                "code {c} does not round-trip for {t:?}"
+            );
             if let Some((_, other)) = seen.iter().find(|(code, _)| *code == c) {
                 panic!("code {c} is produced by both {other:?} and {t:?}");
             }

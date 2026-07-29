@@ -11,6 +11,8 @@
 #   SLT_LIMIT                  max sqllogictest blocks per file (default 20000 = all vendored)
 #   FUZZ_COUNT / FUZZ_SEED     generative fuzz statements / seed (default 20000 / 1)
 #   FUZZ_BUDGET                allowed fuzz divergences before failing (ratchet; default 0)
+#   RUN_FAST / RUN_SLT / RUN_FUZZ
+#                              select deterministic, sqllogictest, and fuzz phases
 #
 # Gating steps (a failure fails CI): wire probe, psycopg driver, the curated
 # differential SQL corpus, and the sqllogictest replay. The fuzzer is gated by
@@ -35,11 +37,12 @@ FUZZ_BUDGET=${FUZZ_BUDGET:-0}
 # preserved: the sqllogictest replay splits each file's query blocks across
 # SLT_QUERY_SHARDS shards (this run does shard SLT_QUERY_SHARD, 0-based) — every
 # shard runs all files and all statement/DDL blocks, only the read-only query
-# blocks are divided, which balances even a single huge file. RUN_SLT / RUN_FUZZ
-# gate the two slow phases so a shard can run one, the other, or both. Defaults
-# run everything in one shard, matching the unsharded behavior.
+# blocks are divided, which balances even a single huge file. RUN_FAST /
+# RUN_SLT / RUN_FUZZ gate the deterministic and two slow phases independently.
+# Defaults run everything in one shard, matching the unsharded behavior.
 SLT_QUERY_SHARD=${SLT_QUERY_SHARD:-0}
 SLT_QUERY_SHARDS=${SLT_QUERY_SHARDS:-1}
+RUN_FAST=${RUN_FAST:-1}
 RUN_SLT=${RUN_SLT:-1}
 RUN_FUZZ=${RUN_FUZZ:-1}
 
@@ -115,6 +118,7 @@ restart_p3_fresh() {
   return 1
 }
 
+if [[ "$RUN_FAST" == 1 ]]; then
 # --- raw wire-protocol probes ----------------------------------------------
 echo "=== wire protocol probes ==="
 if POS3QL_PORT=$P3_PORT python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
@@ -164,6 +168,77 @@ else
     bad "PostgreSQL 18.4 plain dump restore result"
     printf 'expected:\n%s\nobserved:\n%s\n' "$expected_dump_observed" "$dump_observed"
   fi
+fi
+
+# --- outbound pg_dump, restored by vanilla PostgreSQL 18 -------------------
+echo "=== pos3ql outbound pg_dump round trip ==="
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 > "$WORK/outbound_setup.out" 2>&1 <<'SQL'
+CREATE SCHEMA outbound_dump;
+CREATE TYPE outbound_dump.mood AS ENUM ('ok', 'great');
+CREATE TABLE outbound_dump.items (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  mood outbound_dump.mood NOT NULL,
+  note text DEFAULT 'hello'
+);
+INSERT INTO outbound_dump.items(mood,note) VALUES ('ok','one'),('great','two');
+CREATE VIEW outbound_dump.item_view AS
+  SELECT id,mood,note FROM outbound_dump.items;
+SQL
+outbound_setup_status=$?
+pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  --schema=outbound_dump --no-owner --no-acl \
+  -f "$WORK/outbound.sql" > "$WORK/outbound_dump.out" 2>&1
+outbound_dump_status=$?
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE' \
+  > "$WORK/outbound_drop.out" 2>&1
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 -f "$WORK/outbound.sql" \
+  > "$WORK/outbound_restore.out" 2>&1
+outbound_restore_status=$?
+if [[ $outbound_setup_status -ne 0 || $outbound_dump_status -ne 0 || $outbound_restore_status -ne 0 ]]; then
+  bad "pos3ql pg_dump restores into PostgreSQL 18"
+  tail -40 "$WORK/outbound_setup.out"
+  tail -40 "$WORK/outbound_dump.out"
+  tail -40 "$WORK/outbound_restore.out"
+else
+  outbound_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+    -X -At -F '|' -v ON_ERROR_STOP=1 -c "
+      SELECT id,mood,note FROM outbound_dump.item_view ORDER BY id;
+      INSERT INTO outbound_dump.items(mood,note) VALUES ('ok','three') RETURNING id;
+      SELECT is_identity,identity_generation
+        FROM information_schema.columns
+       WHERE table_schema='outbound_dump'
+         AND table_name='items'
+         AND column_name='id';
+    " 2>/dev/null)
+  expected_outbound_observed=$'1|ok|one\n2|great|two\n3\nINSERT 0 1\nYES|ALWAYS'
+  if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
+    ok "pos3ql pg_dump restores into PostgreSQL 18 with data, view and identity"
+  else
+    bad "pos3ql pg_dump round-trip result"
+    printf 'expected:\n%s\nobserved:\n%s\n' \
+      "$expected_outbound_observed" "$outbound_observed"
+  fi
+fi
+# The curated corpus later creates a public type with the same unqualified
+# name. Keep the PostgreSQL oracle as clean as the fresh pos3ql restart below,
+# so pg_type cardinality probes do not inherit this tooling fixture.
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE' \
+  > "$WORK/outbound_cleanup.out" 2>&1 || {
+    bad "clean outbound pg_dump fixture from PostgreSQL"
+    tail -40 "$WORK/outbound_cleanup.out"
+  }
+
+# --- two-session historical MVCC and table locks ---------------------------
+echo "=== historical MVCC and table-lock differential ==="
+if P3_PORT="$P3_PORT" "$PY" "$EXT/mvcc_diff.py" > "$WORK/mvcc_diff.out" 2>&1; then
+  ok "repeatable-read history, read-only enforcement and table locks"
+else
+  bad "historical MVCC and table locks"
+  cat "$WORK/mvcc_diff.out"
 fi
 
 # --- PostgreSQL 15.18 custom archive through pg_restore --------------------
@@ -295,6 +370,7 @@ if "$PY" "$EXT/binary_param_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/bin
   ok "binary parameters ($(tail -1 "$WORK/binparam.out"))"
 else
   bad "binary parameters"; cat "$WORK/binparam.out"
+fi
 fi
 
 # --- vendored sqllogictest replay (real PostgreSQL is the oracle) ----------

@@ -7,16 +7,16 @@
 //! and joins all work against them.
 
 use crate::mem::arena::Arena;
+use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
-use crate::storage::{ColumnMeta, SqlName, Storage, TableDef, MAX_COLUMNS};
 
-use super::eval::{sqlstate, SqlError};
+use super::eval::{SqlError, sqlstate};
 use super::types::{ColType, Datum};
 
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
-    pub def: TableDef,
+    pub def: &'a TableDef,
     pub rows: &'a [&'a [Datum<'a>]],
 }
 
@@ -29,6 +29,26 @@ const PG_CATALOG_NS_OID: i32 = 11;
 const PG_CLASS_OID: i32 = 1259;
 const PG_NAMESPACE_OID: i32 = 2615;
 const PG_TYPE_OID: i32 = 1247;
+
+fn catalog_relation_oid(name: &str) -> Option<i32> {
+    Some(match name {
+        "pg_type" => PG_TYPE_OID,
+        "pg_proc" => 1255,
+        "pg_class" => PG_CLASS_OID,
+        "pg_attribute" => 1249,
+        "pg_amop" => 2602,
+        "pg_amproc" => 2603,
+        "pg_cast" => 2605,
+        "pg_constraint" => 2606,
+        "pg_depend" => 2608,
+        "pg_rewrite" => 2618,
+        "pg_namespace" => PG_NAMESPACE_OID,
+        "pg_opfamily" => 2753,
+        "pg_extension" => 3079,
+        "pg_transform" => 3576,
+        _ => return None,
+    })
+}
 
 pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
     match qualifier {
@@ -54,28 +74,50 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_constraint"
                 | "pg_attrdef"
                 | "pg_collation"
+                | "pg_conversion"
                 | "pg_policy"
                 | "pg_rewrite"
                 | "pg_trigger"
+                | "pg_event_trigger"
                 | "pg_inherits"
                 | "pg_statistic_ext"
                 | "pg_publication"
                 | "pg_publication_rel"
                 | "pg_publication_namespace"
+                | "pg_subscription"
+                | "pg_subscription_rel"
                 | "pg_foreign_table"
                 | "pg_foreign_server"
                 | "pg_partitioned_table"
                 | "pg_description"
+                | "pg_seclabels"
+                | "pg_shseclabel"
+                | "pg_largeobject_metadata"
+                | "pg_largeobject"
                 | "pg_enum"
                 | "pg_range"
                 | "pg_settings"
                 | "pg_proc"
+                | "pg_operator"
+                | "pg_opclass"
+                | "pg_opfamily"
+                | "pg_amop"
+                | "pg_amproc"
+                | "pg_ts_parser"
+                | "pg_ts_template"
+                | "pg_ts_dict"
+                | "pg_ts_config"
+                | "pg_ts_config_map"
                 | "pg_language"
                 | "pg_auth_members"
                 | "pg_db_role_setting"
                 | "pg_parameter_acl"
+                | "pg_default_acl"
                 | "pg_extension"
                 | "pg_depend"
+                | "pg_init_privs"
+                | "pg_cast"
+                | "pg_transform"
                 | "pg_tablespace"
                 | "pg_foreign_data_wrapper"
         ),
@@ -97,6 +139,24 @@ pub fn synthesize<'a>(
         (false, "pg_attribute") => pg_attribute(storage, txid, arena),
         (false, "pg_attrdef") => pg_attrdef(storage, txid, arena),
         (false, "pg_collation") => pg_collation(arena),
+        (false, "pg_conversion") => finish(
+            def_of(
+                "pg_conversion",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("conname", ColType::Name),
+                    ("connamespace", ColType::Int4),
+                    ("conowner", ColType::Int4),
+                    ("conforencoding", ColType::Int4),
+                    ("contoencoding", ColType::Int4),
+                    ("conproc", ColType::Int4),
+                    ("condefault", ColType::Bool),
+                ],
+            ),
+            &[],
+            arena,
+        ),
         (false, "pg_type") => pg_type(storage, arena),
         (false, "pg_namespace") => pg_namespace(storage, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
@@ -105,6 +165,7 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_am",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("amname", ColType::Text),
                     ("amhandler", ColType::Int4),
@@ -112,8 +173,26 @@ pub fn synthesize<'a>(
                 ],
             ),
             &[
-                row(&[Datum::Int4(403), text("btree", arena)?, Datum::Int4(0), text("i", arena)?], arena)?,
-                row(&[Datum::Int4(405), text("hash", arena)?, Datum::Int4(0), text("i", arena)?], arena)?,
+                row(
+                    &[
+                        Datum::Int4(2601),
+                        Datum::Int4(403),
+                        text("btree", arena)?,
+                        Datum::Int4(0),
+                        text("i", arena)?,
+                    ],
+                    arena,
+                )?,
+                row(
+                    &[
+                        Datum::Int4(2601),
+                        Datum::Int4(405),
+                        text("hash", arena)?,
+                        Datum::Int4(0),
+                        text("i", arena)?,
+                    ],
+                    arena,
+                )?,
             ],
             arena,
         ),
@@ -123,6 +202,7 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_policy",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("polname", ColType::Text),
                     ("polrelid", ColType::Int4),
@@ -140,10 +220,12 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_statistic_ext",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("stxrelid", ColType::Int4),
                     ("stxnamespace", ColType::Int4),
                     ("stxname", ColType::Text),
+                    ("stxowner", ColType::Int4),
                     ("stxkind", ColType::Array(super::types::ArrElem::Text)),
                     ("stxstattarget", ColType::Int4),
                 ],
@@ -155,6 +237,7 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_publication",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("pubname", ColType::Text),
                     ("pubowner", ColType::Int4),
@@ -164,6 +247,7 @@ pub fn synthesize<'a>(
                     ("pubdelete", ColType::Bool),
                     ("pubtruncate", ColType::Bool),
                     ("pubviaroot", ColType::Bool),
+                    ("pubgencols", ColType::Bpchar),
                 ],
             ),
             &[],
@@ -172,7 +256,12 @@ pub fn synthesize<'a>(
         (false, "pg_publication_namespace") => finish(
             def_of(
                 "pg_publication_namespace",
-                &[("pnpubid", ColType::Int4), ("pnnspid", ColType::Int4)],
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("pnpubid", ColType::Int4),
+                    ("pnnspid", ColType::Int4),
+                ],
             ),
             &[],
             arena,
@@ -181,10 +270,56 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_publication_rel",
                 &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
                     ("prpubid", ColType::Int4),
                     ("prrelid", ColType::Int4),
                     ("prqual", ColType::Text),
                     ("prattrs", ColType::Array(super::types::ArrElem::Int4)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_subscription") => finish(
+            def_of(
+                "pg_subscription",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("subdbid", ColType::Int4),
+                    ("subskiplsn", ColType::Text),
+                    ("subname", ColType::Name),
+                    ("subowner", ColType::Int4),
+                    ("subenabled", ColType::Bool),
+                    ("subbinary", ColType::Bool),
+                    ("substream", ColType::Bpchar),
+                    ("subtwophasestate", ColType::Bpchar),
+                    ("subdisableonerr", ColType::Bool),
+                    ("subpasswordrequired", ColType::Bool),
+                    ("subrunasowner", ColType::Bool),
+                    ("subfailover", ColType::Bool),
+                    ("subconninfo", ColType::Text),
+                    ("subslotname", ColType::Name),
+                    ("subsynccommit", ColType::Text),
+                    (
+                        "subpublications",
+                        ColType::Array(super::types::ArrElem::Text),
+                    ),
+                    ("suborigin", ColType::Text),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_subscription_rel") => finish(
+            def_of(
+                "pg_subscription_rel",
+                &[
+                    ("srsubid", ColType::Int4),
+                    ("srrelid", ColType::Int4),
+                    ("srsubstate", ColType::Bpchar),
+                    ("srsublsn", ColType::Text),
                 ],
             ),
             &[],
@@ -207,11 +342,13 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_rewrite",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("rulename", ColType::Text),
                     ("ev_class", ColType::Int4),
                     ("ev_type", ColType::Bpchar),
                     ("is_instead", ColType::Bool),
+                    ("ev_enabled", ColType::Bpchar),
                 ],
             ),
             &[],
@@ -221,6 +358,7 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_trigger",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("tgname", ColType::Text),
                     ("tgrelid", ColType::Int4),
@@ -228,6 +366,24 @@ pub fn synthesize<'a>(
                     ("tgisinternal", ColType::Bool),
                     ("tgconstraint", ColType::Int4),
                     ("tgfoid", ColType::Int4),
+                    ("tgparentid", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_event_trigger") => finish(
+            def_of(
+                "pg_event_trigger",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("evtname", ColType::Name),
+                    ("evtevent", ColType::Name),
+                    ("evtowner", ColType::Int4),
+                    ("evtfoid", ColType::Int4),
+                    ("evtenabled", ColType::Bpchar),
+                    ("evttags", ColType::Array(super::types::ArrElem::Text)),
                 ],
             ),
             &[],
@@ -306,11 +462,61 @@ pub fn synthesize<'a>(
                 ],
             ),
             &[
-                row(&[text("max_index_keys", arena)?, text("32", arena)?, text("default", arena)?, text("32", arena)?, text("integer", arena)?, text("internal", arena)?], arena)?,
-                row(&[text("max_identifier_length", arena)?, text("63", arena)?, text("default", arena)?, text("63", arena)?, text("integer", arena)?, text("internal", arena)?], arena)?,
-                row(&[text("server_version", arena)?, text("18.4", arena)?, text("default", arena)?, text("18.4", arena)?, text("string", arena)?, text("internal", arena)?], arena)?,
-                row(&[text("server_encoding", arena)?, text("UTF8", arena)?, text("default", arena)?, text("UTF8", arena)?, text("string", arena)?, text("internal", arena)?], arena)?,
-                row(&[text("standard_conforming_strings", arena)?, text("on", arena)?, text("default", arena)?, text("on", arena)?, text("bool", arena)?, text("user", arena)?], arena)?,
+                row(
+                    &[
+                        text("max_index_keys", arena)?,
+                        text("32", arena)?,
+                        text("default", arena)?,
+                        text("32", arena)?,
+                        text("integer", arena)?,
+                        text("internal", arena)?,
+                    ],
+                    arena,
+                )?,
+                row(
+                    &[
+                        text("max_identifier_length", arena)?,
+                        text("63", arena)?,
+                        text("default", arena)?,
+                        text("63", arena)?,
+                        text("integer", arena)?,
+                        text("internal", arena)?,
+                    ],
+                    arena,
+                )?,
+                row(
+                    &[
+                        text("server_version", arena)?,
+                        text("18.4", arena)?,
+                        text("default", arena)?,
+                        text("18.4", arena)?,
+                        text("string", arena)?,
+                        text("internal", arena)?,
+                    ],
+                    arena,
+                )?,
+                row(
+                    &[
+                        text("server_encoding", arena)?,
+                        text("UTF8", arena)?,
+                        text("default", arena)?,
+                        text("UTF8", arena)?,
+                        text("string", arena)?,
+                        text("internal", arena)?,
+                    ],
+                    arena,
+                )?,
+                row(
+                    &[
+                        text("standard_conforming_strings", arena)?,
+                        text("on", arena)?,
+                        text("default", arena)?,
+                        text("on", arena)?,
+                        text("bool", arena)?,
+                        text("user", arena)?,
+                    ],
+                    arena,
+                )?,
             ],
             arena,
         ),
@@ -318,9 +524,11 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_proc",
                 &[
+                    ("tableoid", ColType::Int4),
                     ("oid", ColType::Int4),
                     ("proname", ColType::Text),
                     ("pronamespace", ColType::Int4),
+                    ("pronargs", ColType::Int4),
                     ("prorettype", ColType::Int4),
                     ("prokind", ColType::Bpchar),
                     ("proargtypes", ColType::Text),
@@ -331,6 +539,213 @@ pub fn synthesize<'a>(
                     ("proacl", ColType::Array(super::types::ArrElem::Text)),
                     ("prolang", ColType::Int4),
                     ("prosrc", ColType::Text),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_operator") => finish(
+            def_of(
+                "pg_operator",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("oprname", ColType::Name),
+                    ("oprnamespace", ColType::Int4),
+                    ("oprowner", ColType::Int4),
+                    ("oprkind", ColType::Bpchar),
+                    ("oprleft", ColType::Int4),
+                    ("oprright", ColType::Int4),
+                    ("oprcode", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_opclass") => finish(
+            def_of(
+                "pg_opclass",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("opcmethod", ColType::Int4),
+                    ("opcname", ColType::Name),
+                    ("opcnamespace", ColType::Int4),
+                    ("opcowner", ColType::Int4),
+                    ("opcfamily", ColType::Int4),
+                    ("opcintype", ColType::Int4),
+                    ("opcdefault", ColType::Bool),
+                    ("opckeytype", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_opfamily") => finish(
+            def_of(
+                "pg_opfamily",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("opfmethod", ColType::Int4),
+                    ("opfname", ColType::Name),
+                    ("opfnamespace", ColType::Int4),
+                    ("opfowner", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_amop") => finish(
+            def_of(
+                "pg_amop",
+                &[
+                    ("oid", ColType::Int4),
+                    ("amopfamily", ColType::Int4),
+                    ("amoplefttype", ColType::Int4),
+                    ("amoprighttype", ColType::Int4),
+                    ("amopstrategy", ColType::Int4),
+                    ("amoppurpose", ColType::Bpchar),
+                    ("amopopr", ColType::Int4),
+                    ("amopmethod", ColType::Int4),
+                    ("amopsortfamily", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_amproc") => finish(
+            def_of(
+                "pg_amproc",
+                &[
+                    ("oid", ColType::Int4),
+                    ("amprocfamily", ColType::Int4),
+                    ("amproclefttype", ColType::Int4),
+                    ("amprocrighttype", ColType::Int4),
+                    ("amprocnum", ColType::Int4),
+                    ("amproc", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_ts_parser") => finish(
+            def_of(
+                "pg_ts_parser",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("prsname", ColType::Name),
+                    ("prsnamespace", ColType::Int4),
+                    ("prsstart", ColType::Int4),
+                    ("prstoken", ColType::Int4),
+                    ("prsend", ColType::Int4),
+                    ("prsheadline", ColType::Int4),
+                    ("prslextype", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_ts_template") => finish(
+            def_of(
+                "pg_ts_template",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("tmplname", ColType::Name),
+                    ("tmplnamespace", ColType::Int4),
+                    ("tmplinit", ColType::Int4),
+                    ("tmpllexize", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_ts_dict") => finish(
+            def_of(
+                "pg_ts_dict",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("dictname", ColType::Name),
+                    ("dictnamespace", ColType::Int4),
+                    ("dictowner", ColType::Int4),
+                    ("dicttemplate", ColType::Int4),
+                    ("dictinitoption", ColType::Text),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_ts_config") => finish(
+            def_of(
+                "pg_ts_config",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("cfgname", ColType::Name),
+                    ("cfgnamespace", ColType::Int4),
+                    ("cfgowner", ColType::Int4),
+                    ("cfgparser", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_ts_config_map") => finish(
+            def_of(
+                "pg_ts_config_map",
+                &[
+                    ("mapcfg", ColType::Int4),
+                    ("maptokentype", ColType::Int4),
+                    ("mapseqno", ColType::Int4),
+                    ("mapdict", ColType::Int4),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_init_privs") => finish(
+            def_of(
+                "pg_init_privs",
+                &[
+                    ("objoid", ColType::Int4),
+                    ("classoid", ColType::Int4),
+                    ("objsubid", ColType::Int4),
+                    ("privtype", ColType::Bpchar),
+                    ("initprivs", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_cast") => finish(
+            def_of(
+                "pg_cast",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("castsource", ColType::Int4),
+                    ("casttarget", ColType::Int4),
+                    ("castfunc", ColType::Int4),
+                    ("castcontext", ColType::Bpchar),
+                    ("castmethod", ColType::Bpchar),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_transform") => finish(
+            def_of(
+                "pg_transform",
+                &[
+                    ("tableoid", ColType::Int4),
+                    ("oid", ColType::Int4),
+                    ("trftype", ColType::Int4),
+                    ("trflang", ColType::Int4),
+                    ("trffromsql", ColType::Int4),
+                    ("trftosql", ColType::Int4),
                 ],
             ),
             &[],
@@ -386,6 +801,21 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
+        (false, "pg_default_acl") => finish(
+            def_of(
+                "pg_default_acl",
+                &[
+                    ("oid", ColType::Int4),
+                    ("tableoid", ColType::Int4),
+                    ("defaclrole", ColType::Int4),
+                    ("defaclnamespace", ColType::Int4),
+                    ("defaclobjtype", ColType::Bpchar),
+                    ("defaclacl", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
         (false, "pg_extension") => finish(
             def_of(
                 "pg_extension",
@@ -403,22 +833,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_depend") => finish(
-            def_of(
-                "pg_depend",
-                &[
-                    ("classid", ColType::Int4),
-                    ("objid", ColType::Int4),
-                    ("objsubid", ColType::Int4),
-                    ("refclassid", ColType::Int4),
-                    ("refobjid", ColType::Int4),
-                    ("refobjsubid", ColType::Int4),
-                    ("deptype", ColType::Bpchar),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_depend") => pg_depend(storage, txid, arena),
         (false, "pg_tablespace") => {
             let def = def_of(
                 "pg_tablespace",
@@ -489,11 +904,69 @@ pub fn synthesize<'a>(
             )
         }
         (false, "pg_description") => pg_description(storage, txid, arena),
+        (false, "pg_seclabels") => finish(
+            def_of(
+                "pg_seclabels",
+                &[
+                    ("objoid", ColType::Int4),
+                    ("classoid", ColType::Int4),
+                    ("objsubid", ColType::Int4),
+                    ("objtype", ColType::Text),
+                    ("objnamespace", ColType::Int4),
+                    ("objname", ColType::Text),
+                    ("provider", ColType::Text),
+                    ("label", ColType::Text),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_shseclabel") => finish(
+            def_of(
+                "pg_shseclabel",
+                &[
+                    ("objoid", ColType::Int4),
+                    ("classoid", ColType::Int4),
+                    ("provider", ColType::Text),
+                    ("label", ColType::Text),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_largeobject_metadata") => finish(
+            def_of(
+                "pg_largeobject_metadata",
+                &[
+                    ("oid", ColType::Int4),
+                    ("lomowner", ColType::Int4),
+                    ("lomacl", ColType::Array(super::types::ArrElem::Text)),
+                ],
+            ),
+            &[],
+            arena,
+        ),
+        (false, "pg_largeobject") => finish(
+            def_of(
+                "pg_largeobject",
+                &[
+                    ("loid", ColType::Int4),
+                    ("pageno", ColType::Int4),
+                    ("data", ColType::Bytea),
+                ],
+            ),
+            &[],
+            arena,
+        ),
         (false, "pg_enum") => pg_enum(storage, arena),
         (false, "pg_range") => finish(
             def_of(
                 "pg_range",
-                &[("rngtypid", ColType::Int4), ("rngsubtype", ColType::Int4)],
+                &[
+                    ("rngtypid", ColType::Int4),
+                    ("rngsubtype", ColType::Int4),
+                    ("rngmultitypid", ColType::Int4),
+                ],
             ),
             &[],
             arena,
@@ -580,6 +1053,13 @@ fn sequence_oid(slot: usize) -> i32 {
     FIRST_SEQUENCE_OID + slot as i32
 }
 
+pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32) -> Option<(i64, bool)> {
+    storage
+        .sequences_with_slots()
+        .find(|(slot, _)| sequence_oid(*slot) == oid)
+        .map(|(_, sequence)| (sequence.last_value.get(), sequence.is_called.get()))
+}
+
 /// Plain views get OIDs from their own range so `'view'::regclass` resolves and
 /// their comments surface, even though a view is not yet a full `pg_class` row.
 const FIRST_VIEW_OID: i32 = 100_000;
@@ -596,12 +1076,7 @@ fn domain_oid(slot: usize) -> i32 {
 const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = 130_000;
 const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
 
-fn composite_type_oid(
-    storage: &Storage,
-    schema: &str,
-    name: &str,
-    txid: u32,
-) -> Option<i32> {
+fn composite_type_oid(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option<i32> {
     match storage.resolve_relation(Some(schema), name, txid)? {
         crate::storage::ResolvedRelation::Table(slot) => {
             Some(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32)
@@ -675,19 +1150,33 @@ fn collect_indexes(
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 push(mk(&[ci as u16], true, true, name), &mut n);
             } else if col.unique {
-                let name =
-                    stack_str_64(stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str());
+                let name = stack_str_64(
+                    stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
+                );
                 push(mk(&[ci as u16], false, true, name), &mut n);
             }
         }
         // Multi-column PK / UNIQUE constraints.
         for uk in def.uniques() {
-            push(mk(uk.columns(), uk.is_primary, true, stack_str_64(uk.name.as_str())), &mut n);
+            push(
+                mk(
+                    uk.columns(),
+                    uk.is_primary,
+                    true,
+                    stack_str_64(uk.name.as_str()),
+                ),
+                &mut n,
+            );
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
             push(
-                mk(&index.columns[..index.n_cols], false, index.unique, stack_str_64(index.name.as_str())),
+                mk(
+                    &index.columns[..index.n_cols],
+                    false,
+                    index.unique,
+                    stack_str_64(index.name.as_str()),
+                ),
                 &mut n,
             );
         }
@@ -709,15 +1198,34 @@ pub fn relname_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    for name in [
+        "pg_type",
+        "pg_proc",
+        "pg_class",
+        "pg_attribute",
+        "pg_amop",
+        "pg_amproc",
+        "pg_cast",
+        "pg_constraint",
+        "pg_depend",
+        "pg_rewrite",
+        "pg_namespace",
+        "pg_opfamily",
+        "pg_extension",
+        "pg_transform",
+    ] {
+        if catalog_relation_oid(name) == Some(oid) {
+            return arena.alloc_str(name).map(Some).map_err(|_| arena_full());
+        }
+    }
     for slot in 0..storage.table_count() {
         if !storage.table(slot).visible_to(txid) {
             continue;
         }
         if table_oid(storage, slot) == oid {
-            let bytes =
-                arena
-                    .alloc_slice_copy(storage.table_def(slot, txid).name.as_str().as_bytes())
-                    .map_err(|_| arena_full())?;
+            let bytes = arena
+                .alloc_slice_copy(storage.table_def(slot, txid).name.as_str().as_bytes())
+                .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
@@ -725,8 +1233,9 @@ pub fn relname_text<'a>(
     let n = collect_indexes(storage, txid, &mut indices);
     for info in indices[..n].iter().flatten() {
         if info.oid == oid {
-            let bytes =
-                arena.alloc_slice_copy(info.name.as_str().as_bytes()).map_err(|_| arena_full())?;
+            let bytes = arena
+                .alloc_slice_copy(info.name.as_str().as_bytes())
+                .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
@@ -736,8 +1245,9 @@ pub fn relname_text<'a>(
             continue;
         }
         if sequence_oid(slot) == oid {
-            let bytes =
-                arena.alloc_slice_copy(seq.name.as_str().as_bytes()).map_err(|_| arena_full())?;
+            let bytes = arena
+                .alloc_slice_copy(seq.name.as_str().as_bytes())
+                .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
@@ -747,8 +1257,9 @@ pub fn relname_text<'a>(
             continue;
         }
         if view_oid(slot) == oid {
-            let bytes =
-                arena.alloc_slice_copy(view.name.as_str().as_bytes()).map_err(|_| arena_full())?;
+            let bytes = arena
+                .alloc_slice_copy(view.name.as_str().as_bytes())
+                .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
@@ -759,27 +1270,45 @@ pub fn relname_text<'a>(
 /// ordinary tables, synthesized index relations and sequences; `None` if no
 /// such relation.
 pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
+    let (schema, relation) = name
+        .split_once('.')
+        .map_or((None, name), |(schema, relation)| (Some(schema), relation));
+    if schema.is_none_or(|schema| schema == "pg_catalog")
+        && let Some(oid) = catalog_relation_oid(relation)
+    {
+        return Some(oid);
+    }
     for slot in 0..storage.table_count() {
         if storage.table(slot).visible_to(txid)
-            && storage.table_def(slot, txid).name.as_str() == name
+            && storage.table_def(slot, txid).name.as_str() == relation
+            && schema.is_none_or(|schema| storage.table_def(slot, txid).schema.as_str() == schema)
         {
             return Some(table_oid(storage, slot));
         }
     }
     let mut indices = [None; MAX_SYNTH_INDEXES];
     let n = collect_indexes(storage, txid, &mut indices);
-    if let Some(info) = indices[..n].iter().flatten().find(|info| info.name.as_str() == name) {
+    if let Some(info) = indices[..n]
+        .iter()
+        .flatten()
+        .find(|info| info.name.as_str() == relation)
+    {
         return Some(info.oid);
     }
     for slot in 0..storage.sequence_count() {
         let sequence = storage.sequence(slot);
-        if sequence.visible_to(txid) && sequence.name.as_str() == name {
+        if sequence.visible_to(txid)
+            && sequence.name.as_str() == relation
+            && schema.is_none_or(|schema| sequence.schema.as_str() == schema)
+        {
             return Some(sequence_oid(slot));
         }
     }
     (0..storage.view_count())
         .find(|&slot| {
-            storage.view(slot).visible_to(txid) && storage.view(slot).name.as_str() == name
+            storage.view(slot).visible_to(txid)
+                && storage.view(slot).name.as_str() == relation
+                && schema.is_none_or(|schema| storage.view(slot).schema.as_str() == schema)
         })
         .map(view_oid)
 }
@@ -800,14 +1329,14 @@ pub fn view_def_text<'a>(
             return Ok(None);
         };
         return arena
-            .alloc_str(view.sql.as_str())
+            .alloc_str_display(format_args!("{};", view.sql.as_str()))
             .map(Some)
             .map_err(|_| arena_full());
     }
     for (slot, view) in storage.views_with_slots() {
         if view_oid(slot) == oid {
             return arena
-                .alloc_str(view.sql.as_str())
+                .alloc_str_display(format_args!("{};", view.sql.as_str()))
                 .map(Some)
                 .map_err(|_| arena_full());
         }
@@ -825,12 +1354,19 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
         }
         return table_size(storage, txid, slot).map(Some);
     }
-    if storage.views_with_slots().any(|(slot, _)| view_oid(slot) == oid) {
+    if storage
+        .views_with_slots()
+        .any(|(slot, _)| view_oid(slot) == oid)
+    {
         return Ok(Some(0));
     }
     let mut indexes = [None; MAX_SYNTH_INDEXES];
     let count = collect_indexes(storage, txid, &mut indexes);
-    if indexes[..count].iter().flatten().any(|index| index.oid == oid) {
+    if indexes[..count]
+        .iter()
+        .flatten()
+        .any(|index| index.oid == oid)
+    {
         return Ok(Some(0));
     }
     Ok(None)
@@ -839,9 +1375,14 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
 pub fn database_size(storage: &Storage, txid: u32) -> Result<i64, SqlError> {
     let mut total = 0i64;
     for (slot, _) in storage.live_tables() {
-        total = total.checked_add(table_size(storage, txid, slot)?).ok_or_else(|| {
-            sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "database size exceeds bigint")
-        })?;
+        total = total
+            .checked_add(table_size(storage, txid, slot)?)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::NUMERIC_OUT_OF_RANGE,
+                    "database size exceeds bigint"
+                )
+            })?;
     }
     Ok(total)
 }
@@ -849,13 +1390,18 @@ pub fn database_size(storage: &Storage, txid: u32) -> Result<i64, SqlError> {
 fn table_size(storage: &Storage, txid: u32, slot: usize) -> Result<i64, SqlError> {
     let mut bytes = 0i64;
     storage.for_each_row_state(slot, &mut |_, state| {
-        if let Some(home) = state.visible_to(txid) {
+        if let Some(home) =
+            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+        {
             let len = match home {
                 crate::storage::RowHome::Heap(location) => location.len,
                 crate::storage::RowHome::Spilled { len, .. } => len,
             };
             bytes = bytes.checked_add(i64::from(len)).ok_or_else(|| {
-                sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "relation size exceeds bigint")
+                sql_err!(
+                    sqlstate::NUMERIC_OUT_OF_RANGE,
+                    "relation size exceeds bigint"
+                )
             })?;
         }
         Ok(core::ops::ControlFlow::Continue(()))
@@ -889,11 +1435,13 @@ fn pg_description<'a>(
         let (objoid, classoid) = match class {
             crate::storage::CommentClass::Relation => {
                 match relation_oid_of(storage, txid, schema, name) {
-                Some(oid) => (oid, PG_CLASS_OID),
-                None => continue,
+                    Some(oid) => (oid, PG_CLASS_OID),
+                    None => continue,
                 }
             }
-            crate::storage::CommentClass::Schema => (namespace_oid(storage, name), PG_NAMESPACE_OID),
+            crate::storage::CommentClass::Schema => {
+                (namespace_oid(storage, name), PG_NAMESPACE_OID)
+            }
             crate::storage::CommentClass::Type => match type_oid_of(storage, schema, name, txid) {
                 Some(oid) => (oid, PG_TYPE_OID),
                 None => continue,
@@ -934,10 +1482,7 @@ fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Op
     }
     for slot in 0..storage.view_count() {
         let view = storage.view(slot);
-        if view.visible_to(txid)
-            && view.schema.as_str() == schema
-            && view.name.as_str() == name
-        {
+        if view.visible_to(txid) && view.schema.as_str() == schema && view.name.as_str() == name {
             return Some(view_oid(slot));
         }
     }
@@ -957,7 +1502,7 @@ fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Op
 /// Qualified names accept only `pg_type.typname` spellings; PostgreSQL does
 /// not resolve aliases such as `pg_catalog.integer`.
 pub fn builtin_type_identity(name: &str, allow_aliases: bool) -> Option<(&'static str, i32)> {
-    use crate::sql::types::{oid, ArrElem};
+    use crate::sql::types::{ArrElem, oid};
 
     let catalog_only = match name {
         "oid" => Some(("oid", 26)),
@@ -1054,61 +1599,60 @@ pub fn user_type_name_text<'a>(
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     use crate::sql::types::oid as type_oid;
-    let (schema, name, visible, array, enumeration) =
-        if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
-            .contains(&oid)
-        {
-            let slot = (oid - type_oid::FIRST_DOMAIN) as usize;
-            let definition = storage.domain(slot);
-            (
-                definition.schema,
-                definition.name,
-                definition.visible_to(txid),
-                false,
-                false,
-            )
-        } else if (type_oid::FIRST_DOMAIN_ARRAY
-            ..type_oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
-            .contains(&oid)
-        {
-            let slot = (oid - type_oid::FIRST_DOMAIN_ARRAY) as usize;
-            let definition = storage.domain(slot);
-            (
-                definition.schema,
-                definition.name,
-                definition.visible_to(txid),
-                true,
-                false,
-            )
-        } else if (type_oid::FIRST_ENUM
-            ..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
-            .contains(&oid)
-        {
-            let slot = (oid - type_oid::FIRST_ENUM) as usize;
-            let definition = storage.enum_def(slot);
-            (
-                definition.schema,
-                definition.name,
-                definition.visible_to(txid),
-                false,
-                true,
-            )
-        } else if (type_oid::FIRST_ENUM_ARRAY
-            ..type_oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32)
-            .contains(&oid)
-        {
-            let slot = (oid - type_oid::FIRST_ENUM_ARRAY) as usize;
-            let definition = storage.enum_def(slot);
-            (
-                definition.schema,
-                definition.name,
-                definition.visible_to(txid),
-                true,
-                true,
-            )
-        } else {
-            return Ok(None);
-        };
+    let (schema, name, visible, array, enumeration) = if (type_oid::FIRST_DOMAIN
+        ..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&oid)
+    {
+        let slot = (oid - type_oid::FIRST_DOMAIN) as usize;
+        let definition = storage.domain(slot);
+        (
+            definition.schema,
+            definition.name,
+            definition.visible_to(txid),
+            false,
+            false,
+        )
+    } else if (type_oid::FIRST_DOMAIN_ARRAY
+        ..type_oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+        .contains(&oid)
+    {
+        let slot = (oid - type_oid::FIRST_DOMAIN_ARRAY) as usize;
+        let definition = storage.domain(slot);
+        (
+            definition.schema,
+            definition.name,
+            definition.visible_to(txid),
+            true,
+            false,
+        )
+    } else if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
+        .contains(&oid)
+    {
+        let slot = (oid - type_oid::FIRST_ENUM) as usize;
+        let definition = storage.enum_def(slot);
+        (
+            definition.schema,
+            definition.name,
+            definition.visible_to(txid),
+            false,
+            true,
+        )
+    } else if (type_oid::FIRST_ENUM_ARRAY
+        ..type_oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32)
+        .contains(&oid)
+    {
+        let slot = (oid - type_oid::FIRST_ENUM_ARRAY) as usize;
+        let definition = storage.enum_def(slot);
+        (
+            definition.schema,
+            definition.name,
+            definition.visible_to(txid),
+            true,
+            true,
+        )
+    } else {
+        return Ok(None);
+    };
     if !visible {
         return Ok(None);
     }
@@ -1174,7 +1718,9 @@ pub fn comment_text_for<'a>(
             }
         };
         if hit {
-            let bytes = arena.alloc_slice_copy(text.as_bytes()).map_err(|_| arena_full())?;
+            let bytes = arena
+                .alloc_slice_copy(text.as_bytes())
+                .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
@@ -1195,6 +1741,7 @@ struct FkInfo {
 const FIRST_FK_OID: i32 = 200_000;
 const FIRST_CHECK_OID: i32 = 300_000;
 const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
+const FIRST_NOT_NULL_OID: i32 = 450_000;
 
 /// Enumerates every foreign-key constraint, resolving each child/parent table to
 /// its OID. A child whose parent no longer exists is skipped (it cannot be
@@ -1250,8 +1797,7 @@ pub fn constraint_def_text<'a>(
         }
         let child = storage.table_def(info.child_slot, txid);
         let fk = &child.fkeys()[info.fk_index];
-        let Some(pslot) =
-            storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
+        let Some(pslot) = storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
         else {
             return Ok(None);
         };
@@ -1285,12 +1831,7 @@ pub fn constraint_def_text<'a>(
         if !storage.table(slot).visible_to(txid) {
             continue;
         }
-        for (check_index, check) in storage
-            .table_def(slot, txid)
-            .checks()
-            .iter()
-            .enumerate()
-        {
+        for (check_index, check) in storage.table_def(slot, txid).checks().iter().enumerate() {
             let check_oid = FIRST_CHECK_OID
                 + slot as i32 * crate::storage::MAX_CHECKS as i32
                 + check_index as i32;
@@ -1390,8 +1931,14 @@ pub fn index_def_text<'a>(
         let col_name = |ci: usize| def.columns()[info.columns[ci] as usize].name.as_str();
         // `col > 0`: just the name of that 1-based indexed column.
         if col > 0 {
-            let name = if col <= info.n_cols { col_name(col - 1) } else { return Ok(None) };
-            let bytes = arena.alloc_slice_copy(name.as_bytes()).map_err(|_| arena_full())?;
+            let name = if col <= info.n_cols {
+                col_name(col - 1)
+            } else {
+                return Ok(None);
+            };
+            let bytes = arena
+                .alloc_slice_copy(name.as_bytes())
+                .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
         let mut s = StackStr::<640>::new();
@@ -1413,9 +1960,19 @@ pub fn index_def_text<'a>(
     Ok(None)
 }
 
-fn def_of(name: &str, columns: &[(&str, ColType)]) -> TableDef {
-    let mut def = TableDef {
-        name: SqlName::parse(name).expect("catalog name fits"),
+#[derive(Clone, Copy)]
+struct SynthDef<'a> {
+    name: &'a str,
+    columns: &'a [(&'a str, ColType)],
+}
+
+fn def_of<'a>(name: &'a str, columns: &'a [(&'a str, ColType)]) -> SynthDef<'a> {
+    SynthDef { name, columns }
+}
+
+fn materialize_def(specification: SynthDef<'_>) -> TableDef {
+    let mut definition = TableDef {
+        name: SqlName::parse(specification.name).expect("catalog name fits"),
         columns: [ColumnMeta {
             name: SqlName::parse("").unwrap(),
             ctype: ColType::Bool,
@@ -1433,34 +1990,41 @@ fn def_of(name: &str, columns: &[(&str, ColType)]) -> TableDef {
             domain: None,
             user_type_schema: None,
         }; MAX_COLUMNS],
-        n_columns: columns.len(),
+        n_columns: specification.columns.len(),
         ..TableDef::empty()
     };
-    for (i, (n, t)) in columns.iter().enumerate() {
-        def.columns[i].name = SqlName::parse(n).expect("catalog column fits");
-        def.columns[i].ctype = *t;
+    for (index, (name, column_type)) in specification.columns.iter().enumerate() {
+        definition.columns[index].name = SqlName::parse(name).expect("catalog column fits");
+        definition.columns[index].ctype = *column_type;
     }
-    def
+    definition
 }
 
 /// Allocates `rows` (each a slice already in the arena) as a row slice.
 fn finish<'a>(
-    def: TableDef,
+    specification: SynthDef<'_>,
     rows: &[&'a [Datum<'a>]],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let rows = arena
-        .alloc_slice_copy(rows)
+    let def = arena
+        .alloc(materialize_def(specification))
         .map_err(|_| arena_full())?;
+    let rows = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
     Ok(SynthTable { def, rows: &*rows })
 }
 
 fn row<'a>(vals: &[Datum<'a>], arena: &'a Arena) -> Result<&'a [Datum<'a>], SqlError> {
-    arena.alloc_slice_copy(vals).map(|r| &*r).map_err(|_| arena_full())
+    arena
+        .alloc_slice_copy(vals)
+        .map(|r| &*r)
+        .map_err(|_| arena_full())
 }
 
 fn text<'a>(s: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    arena.alloc_str(s).map(Datum::Text).map_err(|_| arena_full())
+    arena
+        .alloc_str(s)
+        .map(Datum::Text)
+        .map_err(|_| arena_full())
 }
 
 fn describe_view<'a>(
@@ -1530,7 +2094,10 @@ fn pg_class<'a>(
             break;
         }
         let toid = table_oid(storage, slot);
-        let has_index = indexes[..n_idx].iter().flatten().any(|i| i.table_oid == toid);
+        let has_index = indexes[..n_idx]
+            .iter()
+            .flatten()
+            .any(|i| i.table_oid == toid);
         let has_triggers = !table_def.fkeys().is_empty()
             || foreign_keys[..n_foreign_keys]
                 .iter()
@@ -1555,21 +2122,21 @@ fn pg_class<'a>(
                 text(relkind, arena)?, // relkind: ordinary table 'r' / matview 'm'
                 Datum::Int4(table_def.n_columns as i32),
                 Datum::Float8(table.rows.len() as f64),
-                Datum::Int4(0), // relpages
-                Datum::Int4(0),  // relam
-                Datum::Int4(10), // relowner (a role oid)
+                Datum::Int4(0),        // relpages
+                Datum::Int4(0),        // relam
+                Datum::Int4(10),       // relowner (a role oid)
                 Datum::Int4(n_checks), // relchecks
                 Datum::Bool(has_index),
-                Datum::Bool(false), // relhasrules
+                Datum::Bool(false),        // relhasrules
                 Datum::Bool(has_triggers), // FK enforcement is trigger-backed in PostgreSQL
-                Datum::Bool(false), // relrowsecurity
-                Datum::Bool(false), // relforcerowsecurity
-                Datum::Bool(false), // relispartition
-                Datum::Int4(0),     // reltablespace
-                Datum::Int4(0),     // reloftype
-                Datum::Int4(0),     // reltoastrelid
-                text("p", arena)?,  // relpersistence: permanent
-                text("d", arena)?,  // relreplident: default
+                Datum::Bool(false),        // relrowsecurity
+                Datum::Bool(false),        // relforcerowsecurity
+                Datum::Bool(false),        // relispartition
+                Datum::Int4(0),            // reltablespace
+                Datum::Int4(0),            // reloftype
+                Datum::Int4(0),            // reltoastrelid
+                text("p", arena)?,         // relpersistence: permanent
+                text("d", arena)?,         // relreplident: default
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
                 Datum::Null,
@@ -1601,7 +2168,7 @@ fn pg_class<'a>(
                 text("i", arena)?, // relkind: index
                 Datum::Int4(info.n_cols as i32),
                 Datum::Float8(0.0),
-                Datum::Int4(0), // relpages
+                Datum::Int4(0),   // relpages
                 Datum::Int4(403), // relam: btree
                 Datum::Int4(10),
                 Datum::Int4(0), // relchecks
@@ -1746,6 +2313,21 @@ fn pg_constraint<'a>(
             ("confdeltype", ColType::Bpchar),
             ("conkey", ColType::Array(super::types::ArrElem::Int4)),
             ("confkey", ColType::Array(super::types::ArrElem::Int4)),
+            ("tableoid", ColType::Int4),
+            ("connamespace", ColType::Int4),
+            ("confmatchtype", ColType::Bpchar),
+            ("conislocal", ColType::Bool),
+            ("coninhcount", ColType::Int4),
+            ("connoinherit", ColType::Bool),
+            ("conpfeqop", ColType::Array(super::types::ArrElem::Int4)),
+            ("conppeqop", ColType::Array(super::types::ArrElem::Int4)),
+            ("conffeqop", ColType::Array(super::types::ArrElem::Int4)),
+            (
+                "confdelsetcols",
+                ColType::Array(super::types::ArrElem::Int4),
+            ),
+            ("conexclop", ColType::Array(super::types::ArrElem::Int4)),
+            ("conbin", ColType::Text),
         ],
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
@@ -1772,17 +2354,32 @@ fn pg_constraint<'a>(
                 Datum::Int4(info.table_oid),
                 Datum::Int4(0),
                 text(contype, arena)?,
-                Datum::Int4(0), // conparentid
+                Datum::Int4(0),        // conparentid
                 Datum::Int4(info.oid), // conindid -> the backing index
-                Datum::Int4(0), // confrelid
+                Datum::Int4(0),        // confrelid
                 Datum::Bool(false),
                 Datum::Bool(false),
-                Datum::Bool(true), // convalidated
+                Datum::Bool(true),  // convalidated
                 Datum::Bool(false), // conperiod
-                text(" ", arena)?, // confupdtype (n/a for non-FK)
-                text(" ", arena)?, // confdeltype
+                text(" ", arena)?,  // confupdtype (n/a for non-FK)
+                text(" ", arena)?,  // confdeltype
                 attnum_array(&info.columns[..info.n_cols], arena)?,
                 empty_int_array(arena)?,
+                Datum::Int4(2606),
+                Datum::Int4(namespace_oid(
+                    storage,
+                    storage.table_def(info.table_slot, txid).schema.as_str(),
+                )),
+                text(" ", arena)?,
+                Datum::Bool(true),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -1827,6 +2424,21 @@ fn pg_constraint<'a>(
                 text(fk_action_char(fk.on_delete), arena)?,
                 attnum_array(&fk.columns[..fk.n_cols], arena)?,
                 attnum_array(&fk.parent_cols[..fk.n_parent_cols], arena)?,
+                Datum::Int4(2606),
+                Datum::Int4(namespace_oid(
+                    storage,
+                    storage.table_def(info.child_slot, txid).schema.as_str(),
+                )),
+                text("s", arena)?,
+                Datum::Bool(true),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -1840,12 +2452,7 @@ fn pg_constraint<'a>(
         if !storage.table(slot).visible_to(txid) {
             continue;
         }
-        for (check_index, check) in storage
-            .table_def(slot, txid)
-            .checks()
-            .iter()
-            .enumerate()
-        {
+        for (check_index, check) in storage.table_def(slot, txid).checks().iter().enumerate() {
             if n == out.len() {
                 break;
             }
@@ -1871,6 +2478,83 @@ fn pg_constraint<'a>(
                     text(" ", arena)?,
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
+                    Datum::Int4(2606),
+                    Datum::Int4(namespace_oid(
+                        storage,
+                        storage.table_def(slot, txid).schema.as_str(),
+                    )),
+                    text(" ", arena)?,
+                    Datum::Bool(true),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    // PostgreSQL 18 represents NOT NULL constraints in pg_constraint as well
+    // as pg_attribute. pg_dump uses these rows to preserve the constraint
+    // before adding an identity property in its dependency-ordered output.
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for (column_index, column) in table.columns().iter().enumerate() {
+            if !column.not_null {
+                continue;
+            }
+            if n == out.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pg_constraint result exceeds static capacity"
+                ));
+            }
+            let constraint_name = stack_format!(
+                128,
+                "{}_{}_not_null",
+                table.name.as_str(),
+                column.name.as_str()
+            );
+            out[n] = row(
+                &[
+                    Datum::Int4(
+                        FIRST_NOT_NULL_OID + slot as i32 * MAX_COLUMNS as i32 + column_index as i32,
+                    ),
+                    text(constraint_name.as_str(), arena)?,
+                    Datum::Int4(table_oid(storage, slot)),
+                    Datum::Int4(0),
+                    text("n", arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                    Datum::Bool(true),
+                    Datum::Bool(false),
+                    text(" ", arena)?,
+                    text(" ", arena)?,
+                    attnum_array(&[column_index as u16], arena)?,
+                    empty_int_array(arena)?,
+                    Datum::Int4(2606),
+                    Datum::Int4(namespace_oid(storage, table.schema.as_str())),
+                    text(" ", arena)?,
+                    Datum::Bool(true),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    Datum::Null,
                 ],
                 arena,
             )?;
@@ -1905,6 +2589,18 @@ fn pg_constraint<'a>(
                     text(" ", arena)?,
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
+                    Datum::Int4(2606),
+                    Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
+                    text(" ", arena)?,
+                    Datum::Bool(true),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    empty_int_array(arena)?,
+                    Datum::Null,
                 ],
                 arena,
             )?;
@@ -1912,6 +2608,139 @@ fn pg_constraint<'a>(
         }
     }
     finish(def, &out[..n], arena)
+}
+
+fn pg_depend<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_depend",
+        &[
+            ("classid", ColType::Int4),
+            ("objid", ColType::Int4),
+            ("objsubid", ColType::Int4),
+            ("refclassid", ColType::Int4),
+            ("refobjid", ColType::Int4),
+            ("refobjsubid", ColType::Int4),
+            ("deptype", ColType::Bpchar),
+        ],
+    );
+    let mut out: [&[Datum]; 4096] = [&[]; 4096];
+    let mut count = 0usize;
+    let mut push = |object: i32,
+                    referenced_class: i32,
+                    referenced_object: i32,
+                    referenced_subobject: i32,
+                    dependency_type: &str|
+     -> Result<(), SqlError> {
+        if count == out.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "catalog dependency result exceeds static capacity"
+            ));
+        }
+        out[count] = row(
+            &[
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(object),
+                Datum::Int4(0),
+                Datum::Int4(referenced_class),
+                Datum::Int4(referenced_object),
+                Datum::Int4(referenced_subobject),
+                text(dependency_type, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+
+    // Sequence ownership is how pg_dump distinguishes serial/identity
+    // generators from independent sequences and orders them with the owning
+    // column.
+    for (sequence_slot, sequence) in storage.sequences_with_slots() {
+        let Some(owner) = sequence.owner else {
+            continue;
+        };
+        let Some(table_slot) =
+            storage.find_visible(owner.table_schema.as_str(), owner.table.as_str(), txid)
+        else {
+            continue;
+        };
+        let table = storage.table_def(table_slot, txid);
+        let Some(column) = table.column_index(owner.column.as_str()) else {
+            continue;
+        };
+        push(
+            sequence_oid(sequence_slot),
+            PG_CLASS_OID,
+            table_oid(storage, table_slot),
+            column as i32 + 1,
+            if table.columns()[column].is_identity {
+                "i"
+            } else {
+                "a"
+            },
+        )?;
+    }
+
+    let referenced_oid = |dependency: &crate::storage::StoredQueryDependency| match dependency.class
+    {
+        crate::storage::DependencyClass::Table => {
+            Some((PG_CLASS_OID, table_oid(storage, dependency.slot as usize)))
+        }
+        crate::storage::DependencyClass::View => {
+            Some((PG_CLASS_OID, view_oid(dependency.slot as usize)))
+        }
+        crate::storage::DependencyClass::Sequence => {
+            Some((PG_CLASS_OID, sequence_oid(dependency.slot as usize)))
+        }
+        crate::storage::DependencyClass::Domain => {
+            Some((PG_TYPE_OID, domain_oid(dependency.slot as usize)))
+        }
+        crate::storage::DependencyClass::Enum => Some((
+            PG_TYPE_OID,
+            crate::sql::types::oid::enum_oid(dependency.slot),
+        )),
+    };
+    for (view_slot, _) in storage.views_with_slots() {
+        for dependency in storage.view_dependencies(view_slot).entries() {
+            let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
+                continue;
+            };
+            push(
+                view_oid(view_slot),
+                referenced_class,
+                referenced_object,
+                0,
+                "n",
+            )?;
+        }
+    }
+    for (materialized_slot, materialized_view) in storage.matviews_with_slots() {
+        let Some(table_slot) = storage.find_visible(
+            materialized_view.schema.as_str(),
+            materialized_view.name.as_str(),
+            txid,
+        ) else {
+            continue;
+        };
+        for dependency in storage.matview_dependencies(materialized_slot).entries() {
+            let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
+                continue;
+            };
+            push(
+                table_oid(storage, table_slot),
+                referenced_class,
+                referenced_object,
+                0,
+                "n",
+            )?;
+        }
+    }
+    finish(def, &out[..count], arena)
 }
 
 /// PostgreSQL's `confupdtype`/`confdeltype` code for a referential action.
@@ -1965,9 +2794,13 @@ fn pg_index<'a>(
             ("indnullsnotdistinct", ColType::Bool),
             ("indnatts", ColType::Int4),
             ("indnkeyatts", ColType::Int4),
-            ("indkey", ColType::Array(super::types::ArrElem::Int4)),
+            ("indkey", ColType::Int2Vector),
             ("indoption", ColType::Array(super::types::ArrElem::Int4)),
             ("indpred", ColType::Text),
+            ("indisready", ColType::Bool),
+            ("indexprs", ColType::Text),
+            ("indcollation", ColType::Array(super::types::ArrElem::Int4)),
+            ("indclass", ColType::Array(super::types::ArrElem::Int4)),
         ],
     );
     let mut indexes = [None; MAX_SYNTH_INDEXES];
@@ -1991,9 +2824,13 @@ fn pg_index<'a>(
                 Datum::Bool(false), // NULL values are distinct by default
                 Datum::Int4(info.n_cols as i32),
                 Datum::Int4(info.n_cols as i32),
-                attnum_array(&info.columns[..info.n_cols], arena)?,
+                int2vector(&info.columns[..info.n_cols], arena)?,
                 option_array(&zeros[..info.n_cols], arena)?,
                 Datum::Null, // partial indexes are not yet accepted by the DDL grammar
+                Datum::Bool(true),
+                Datum::Null,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
             ],
             arena,
         )?;
@@ -2014,13 +2851,21 @@ fn option_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlE
     })
 }
 
+fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let raw = arena
+        .alloc_slice_with(columns.len() * 2, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    for (index, column) in columns.iter().enumerate() {
+        raw[index * 2..index * 2 + 2].copy_from_slice(&(*column as i16 + 1).to_le_bytes());
+    }
+    Ok(Datum::Int2Vector(raw))
+}
+
 fn column_type_oid(storage: &Storage, column: &ColumnMeta, txid: u32) -> i32 {
     match (column.ctype, column.domain, column.user_type_schema) {
-        (
-            ColType::Array(super::types::ArrElem::Domain { slot, .. }),
-            _,
-            _,
-        ) => super::types::oid::domain_array_oid(slot),
+        (ColType::Array(super::types::ArrElem::Domain { slot, .. }), _, _) => {
+            super::types::oid::domain_array_oid(slot)
+        }
         (ColType::Enum(slot), _, _) => super::types::oid::enum_oid(slot),
         (ColType::Array(super::types::ArrElem::Enum(slot)), _, _) => {
             super::types::oid::enum_array_oid(slot)
@@ -2057,6 +2902,13 @@ fn pg_attribute<'a>(
             ("attstattarget", ColType::Int4),
             ("attisdropped", ColType::Bool),
             ("attnum_ord", ColType::Int4),
+            ("attalign", ColType::Bpchar),
+            ("attislocal", ColType::Bool),
+            ("attoptions", ColType::Array(super::types::ArrElem::Text)),
+            ("attfdwoptions", ColType::Array(super::types::ArrElem::Text)),
+            ("atthasmissing", ColType::Bool),
+            ("attmissingval", ColType::Text),
+            ("attacl", ColType::Array(super::types::ArrElem::Text)),
         ],
     );
     let mut out: [&[Datum]; 1024] = [&[]; 1024];
@@ -2094,10 +2946,17 @@ fn pg_attribute<'a>(
                     // Fixed-width values are plain; variable-width values use
                     // PostgreSQL's ordinary extended storage policy.
                     text(if c.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
-                    text("", arena)?, // attcompression: type default
-                    Datum::Int4(-1),  // attstattarget: use server default
+                    text("", arena)?,   // attcompression: type default
+                    Datum::Int4(-1),    // attstattarget: use server default
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i as i32 + 1),
+                    text("i", arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
                 ],
                 arena,
             )?;
@@ -2131,6 +2990,13 @@ fn pg_attribute<'a>(
                     Datum::Int4(-1),
                     Datum::Bool(false),
                     Datum::Int4(attribute as i32 + 1),
+                    text("i", arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
                 ],
                 arena,
             )?;
@@ -2170,6 +3036,13 @@ fn pg_attribute<'a>(
                     Datum::Int4(-1),
                     Datum::Bool(false),
                     Datum::Int4(attribute as i32 + 1),
+                    text("i", arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
                 ],
                 arena,
             )?;
@@ -2191,6 +3064,7 @@ fn pg_attrdef<'a>(
             ("adrelid", ColType::Int4),
             ("adnum", ColType::Int4),
             ("adbin", ColType::Text),
+            ("tableoid", ColType::Int4),
         ],
     );
     // A row per column carrying a DEFAULT — the raw source text in `adbin`.
@@ -2217,6 +3091,7 @@ fn pg_attrdef<'a>(
                     Datum::Int4(relid),
                     Datum::Int4(ci as i32 + 1),
                     text(text_expr.as_str(), arena)?,
+                    Datum::Int4(2604),
                 ],
                 arena,
             )?;
@@ -2231,9 +3106,11 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         def_of(
             "pg_collation",
             &[
+                ("tableoid", ColType::Int4),
                 ("oid", ColType::Int4),
                 ("collname", ColType::Text),
                 ("collnamespace", ColType::Int4),
+                ("collowner", ColType::Int4),
                 ("collcollate", ColType::Text),
                 ("collctype", ColType::Text),
                 ("colliculocale", ColType::Text),
@@ -2269,7 +3146,12 @@ fn pg_enum<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                     Datum::Int4(typid * 1000 + i as i32),
                     Datum::Int4(typid),
                     Datum::Float8(m.sort),
-                    text(arena.alloc_str(m.label.as_str()).map_err(|_| arena_full())?, arena)?,
+                    text(
+                        arena
+                            .alloc_str(m.label.as_str())
+                            .map_err(|_| arena_full())?,
+                        arena,
+                    )?,
                 ],
                 arena,
             )?;
@@ -2284,11 +3166,11 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
         "pg_type",
         &[
             ("oid", ColType::Int4),
-            ("typname", ColType::Text),
+            ("typname", ColType::Name),
             ("typlen", ColType::Int4),
             ("typcollation", ColType::Int4),
             ("typnamespace", ColType::Int4),
-            ("typtype", ColType::Bpchar),   // 'b' = base type
+            ("typtype", ColType::Bpchar), // 'b' = base type
             ("typcategory", ColType::Bpchar),
             ("typbasetype", ColType::Int4), // 0 unless a domain
             ("typelem", ColType::Int4),     // element type of an array, else 0
@@ -2299,8 +3181,11 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
             ("typdefault", ColType::Text),
             ("typinput", ColType::Text),
             ("typoutput", ColType::Text),
-            ("typacl", ColType::Text),
+            ("typacl", ColType::Array(super::types::ArrElem::Text)),
             ("tableoid", ColType::Int4),
+            ("typowner", ColType::Int4),
+            ("typisdefined", ColType::Bool),
+            ("typstorage", ColType::Bpchar),
         ],
     );
     let types = [
@@ -2327,7 +3212,11 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
     ];
     let category = |t: &ColType| match t {
         ColType::Bool => "B",
-        ColType::Int2 | ColType::Int4 | ColType::Int8 | ColType::Float4 | ColType::Float8
+        ColType::Int2
+        | ColType::Int4
+        | ColType::Int8
+        | ColType::Float4
+        | ColType::Float8
         | ColType::Numeric => "N",
         ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
         ColType::Interval => "T",
@@ -2349,10 +3238,10 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Int4(PG_CATALOG_NS_OID),
                 text("b", arena)?,
                 text(category(t), arena)?,
-                Datum::Int4(0), // typbasetype
-                Datum::Int4(0), // typelem
-                Datum::Int4(0), // typarray
-                Datum::Int4(0), // typrelid
+                Datum::Int4(0),  // typbasetype
+                Datum::Int4(0),  // typelem
+                Datum::Int4(0),  // typarray
+                Datum::Int4(0),  // typrelid
                 Datum::Int4(-1), // typtypmod
                 Datum::Bool(false),
                 Datum::Null, // typdefault
@@ -2360,6 +3249,9 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text(if t.typlen() < 0 { "x" } else { "p" }, arena)?,
             ],
             arena,
         )?;
@@ -2384,7 +3276,10 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
         out[n] = row(
             &[
                 Datum::Int4(domain_oid(slot)),
-                text(arena.alloc_str(d.name.as_str()).map_err(|_| arena_full())?, arena)?,
+                text(
+                    arena.alloc_str(d.name.as_str()).map_err(|_| arena_full())?,
+                    arena,
+                )?,
                 Datum::Int4(i32::from(d.base.typlen())),
                 Datum::Int4(0),
                 Datum::Int4(namespace_oid(storage, d.schema.as_str())),
@@ -2397,13 +3292,19 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Int4(d.base_type_mod),
                 Datum::Bool(d.not_null),
                 match &d.default_expr {
-                    Some(e) => text(arena.alloc_str(e.as_str()).map_err(|_| arena_full())?, arena)?,
+                    Some(e) => text(
+                        arena.alloc_str(e.as_str()).map_err(|_| arena_full())?,
+                        arena,
+                    )?,
                     None => Datum::Null,
                 },
                 text("", arena)?,
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text(if d.base.typlen() < 0 { "x" } else { "p" }, arena)?,
             ],
             arena,
         )?;
@@ -2434,6 +3335,9 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text("x", arena)?,
             ],
             arena,
         )?;
@@ -2466,6 +3370,9 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text("p", arena)?,
             ],
             arena,
         )?;
@@ -2496,6 +3403,9 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text("x", arena)?,
             ],
             arena,
         )?;
@@ -2526,6 +3436,9 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text("x", arena)?,
             ],
             arena,
         )?;
@@ -2555,6 +3468,9 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text("x", arena)?,
             ],
             arena,
         )?;
@@ -2592,7 +3508,12 @@ fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
                 Datum::Int4(namespace_oid(storage, schema.name.as_str())),
-                text(arena.alloc_str(schema.name.as_str()).map_err(|_| crate::sql::eval::arena_full())?, arena)?,
+                text(
+                    arena
+                        .alloc_str(schema.name.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena,
+                )?,
                 Datum::Int4(10),
                 Datum::Null,
             ],
@@ -2642,8 +3563,8 @@ fn pg_indexes<'a>(
                 if k > 0 {
                     let _ = indexdef.write_str(", ");
                 }
-                let _ = indexdef
-                    .write_str(table_def.columns()[info.columns[k] as usize].name.as_str());
+                let _ =
+                    indexdef.write_str(table_def.columns()[info.columns[k] as usize].name.as_str());
             }
             let _ = indexdef.write_str(")");
         }
@@ -2663,7 +3584,10 @@ fn pg_indexes<'a>(
                     arena,
                 )?,
                 Datum::Null,
-                text(alloc_rendered(&indexdef, "index definition is too long", arena)?, arena)?,
+                text(
+                    alloc_rendered(&indexdef, "index definition is too long", arena)?,
+                    arena,
+                )?,
             ],
             arena,
         )?;
@@ -2708,10 +3632,9 @@ fn pg_tables<'a>(
                 )?,
                 text(table.name.as_str(), arena)?,
                 text(
-                    arena.alloc_str(
-                        crate::sql::eval::funcs::system::session_user_owned().as_str(),
-                    )
-                    .map_err(|_| crate::sql::eval::arena_full())?,
+                    arena
+                        .alloc_str(crate::sql::eval::funcs::system::session_user_owned().as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
             ],
@@ -2749,9 +3672,7 @@ fn pg_views<'a>(
                 text(view.name.as_str(), arena)?,
                 text(
                     arena
-                        .alloc_str(
-                            crate::sql::eval::funcs::system::session_user_owned().as_str(),
-                        )
+                        .alloc_str(crate::sql::eval::funcs::system::session_user_owned().as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
@@ -2804,9 +3725,7 @@ fn pg_matviews<'a>(
                 )?,
                 text(
                     arena
-                        .alloc_str(
-                            crate::sql::eval::funcs::system::session_user_owned().as_str(),
-                        )
+                        .alloc_str(crate::sql::eval::funcs::system::session_user_owned().as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
@@ -3064,7 +3983,10 @@ fn info_schemata<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
         )?;
         n += 1;
     }
-    out[n] = row(&[text("postgres", arena)?, text("pg_catalog", arena)?], arena)?;
+    out[n] = row(
+        &[text("postgres", arena)?, text("pg_catalog", arena)?],
+        arena,
+    )?;
     n += 1;
     out[n] = row(
         &[text("postgres", arena)?, text("information_schema", arena)?],

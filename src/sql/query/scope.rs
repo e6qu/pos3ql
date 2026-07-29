@@ -9,18 +9,16 @@
 //! describe, and an executing form that also materializes derived tables.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{
-    BinaryOp, Expr, FromClause, MaterializedCte, TableRef, MAX_USING_COLUMNS,
-};
-use crate::sql::eval::{ColumnLookup, sqlstate, SqlError};
+use crate::sql::ast::{BinaryOp, Expr, FromClause, MAX_USING_COLUMNS, MaterializedCte, TableRef};
+use crate::sql::eval::{ColumnLookup, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, SqlName, Storage, TableDef, MAX_COLUMNS};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
 
 use super::{
-    arena_full, common_using_type, select_into_rows, synth_derived_def, synth_derived_def_outer,
-    table_func_def, table_func_def_outer, table_func_rows, table_func_rows_outer, Chained,
-    MAX_JOIN_TABLES,
+    Chained, MAX_JOIN_TABLES, arena_full, common_using_type, select_into_rows, synth_derived_def,
+    synth_derived_def_outer, table_func_def, table_func_def_outer, table_func_rows,
+    table_func_rows_outer,
 };
 
 /// Upper bound on distinct USING/NATURAL-merged columns across a join tree
@@ -99,7 +97,10 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        self.0.find_column(qualifier, name).ok().map(|column| self.0.output_type(column))
+        self.0
+            .find_column(qualifier, name)
+            .ok()
+            .map(|column| self.0.output_type(column))
     }
 
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
@@ -216,7 +217,11 @@ impl<'d> QueryScope<'d> {
                 .unwrap_or(m.column_names[i]);
             let ctype =
                 crate::sql::exec::coltype_of_oid(m.column_types[i].0).unwrap_or(ColType::Text);
-            *slot = ColumnMeta { name: SqlName::parse(name)?, ctype, ..ColumnMeta::EMPTY };
+            *slot = ColumnMeta {
+                name: SqlName::parse(name)?,
+                ctype,
+                ..ColumnMeta::EMPTY
+            };
         }
         let def = TableDef {
             name: SqlName::parse(exposed)?,
@@ -250,7 +255,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(tref, m, arena, true);
         }
         if tref.func_args.is_some() {
-            return self.add_table_func(tref, arena, params, true, outer);
+            return self.add_table_func(storage, tref, arena, params, true, outer);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -274,8 +279,15 @@ impl<'d> QueryScope<'d> {
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
         if tref.lateral {
-            let def_reference =
-                synth_derived_def_outer(storage, sub, exposed, tref.col_alias, txid, arena, Some(self))?;
+            let def_reference = synth_derived_def_outer(
+                storage,
+                sub,
+                exposed,
+                tref.col_alias,
+                txid,
+                arena,
+                Some(self),
+            )?;
             self.names[self.n] = exposed;
             self.defs[self.n] = Some(def_reference);
             self.derived[self.n] = Some(&[]);
@@ -355,7 +367,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(tref, m, arena, false);
         }
         if tref.func_args.is_some() {
-            return self.add_table_func(tref, arena, &[], false, None);
+            return self.add_table_func(storage, tref, arena, &[], false, None);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -375,7 +387,15 @@ impl<'d> QueryScope<'d> {
             ));
         }
         let def_reference = if tref.lateral {
-            synth_derived_def_outer(storage, sub, exposed, tref.col_alias, txid, arena, Some(self))?
+            synth_derived_def_outer(
+                storage,
+                sub,
+                exposed,
+                tref.col_alias,
+                txid,
+                arena,
+                Some(self),
+            )?
         } else {
             synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?
         };
@@ -405,8 +425,7 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
-        let synth =
-            crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, arena)?;
+        let synth = crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, arena)?;
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
@@ -415,7 +434,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_reference: &'a TableDef = arena.alloc(synth.def).map_err(|_| arena_full())?;
+        let def_reference = synth.def;
         let rows: &'a [&'a [u8]] = if materialize {
             const EMPTY: &[u8] = &[];
             let encoded = arena
@@ -440,6 +459,7 @@ impl<'d> QueryScope<'d> {
     /// entry. `materialize` false = schema only (Describe / synth-def path).
     fn add_table_func<'a>(
         &mut self,
+        storage: &'a Storage,
         tref: &'a TableRef<'a>,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -487,9 +507,9 @@ impl<'d> QueryScope<'d> {
         let rows: &'a [&'a [u8]] = if !materialize {
             &[]
         } else if outer.is_some() {
-            table_func_rows_outer(tref, arena, params, &columns)?
+            table_func_rows_outer(tref, storage, arena, params, &columns)?
         } else {
-            table_func_rows(tref, arena, params)?
+            table_func_rows(tref, storage, arena, params)?
         };
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);
@@ -568,7 +588,11 @@ impl<'d> QueryScope<'d> {
         from: &FromClause<'d>,
         arena: Option<&'d Arena>,
     ) -> Result<(), SqlError> {
-        if !from.joins.iter().any(|j| j.natural || j.using_columns.is_some()) {
+        if !from
+            .joins
+            .iter()
+            .any(|j| j.natural || j.using_columns.is_some())
+        {
             return Ok(());
         }
         // The left join tree's output columns, updated join by join.
@@ -598,9 +622,7 @@ impl<'d> QueryScope<'d> {
             } else {
                 for entry in &out[..n_out] {
                     let name = self.output_name(*entry);
-                    if right_def.column_index(name).is_some()
-                        && !using[..n_using].contains(&name)
-                    {
+                    if right_def.column_index(name).is_some() && !using[..n_using].contains(&name) {
                         if n_using == MAX_USING_COLUMNS {
                             return Err(sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -707,7 +729,11 @@ impl<'d> QueryScope<'d> {
                     predicate = Some(match predicate {
                         None => eq,
                         Some(prev) => arena
-                            .alloc(Expr::Binary { operator: BinaryOp::And, left: prev, right: eq })
+                            .alloc(Expr::Binary {
+                                operator: BinaryOp::And,
+                                left: prev,
+                                right: eq,
+                            })
                             .map_err(|_| arena_full())?,
                     });
                 }
@@ -787,8 +813,9 @@ impl<'d> QueryScope<'d> {
                         })
                         .map_err(|_| arena_full())?;
                 }
-                let args =
-                    arena.alloc_slice_copy(&args[..mc.n_parts]).map_err(|_| arena_full())?;
+                let args = arena
+                    .alloc_slice_copy(&args[..mc.n_parts])
+                    .map_err(|_| arena_full())?;
                 Ok(&*arena
                     .alloc(Expr::Call {
                         name: "coalesce",
@@ -838,7 +865,9 @@ impl<'d> QueryScope<'d> {
         match q.split_once('.') {
             None => self.names[t] == q,
             Some((schema, table)) => {
-                let Some(def) = self.defs[t] else { return false };
+                let Some(def) = self.defs[t] else {
+                    return false;
+                };
                 self.names[t] == table
                     && def.name.as_str() == table
                     && def.schema.as_str() == schema

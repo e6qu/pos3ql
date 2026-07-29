@@ -7,7 +7,7 @@
 //! it — which is what lets a materialized result outlive the scope it came from.
 
 use crate::mem::arena::Arena;
-use crate::sql::eval::{sqlstate, SqlError};
+use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
 
@@ -54,6 +54,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::Array { raw, .. } => 8 + raw.len(),
+        Datum::Int2Vector(raw) => 4 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
         Datum::Numeric(nm) => 7 + nm.digits.len(),
         Datum::Range { text, .. } => 5 + text.len(),
@@ -200,6 +201,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[9..9 + raw.len()].copy_from_slice(raw);
             9 + raw.len()
         }
+        Datum::Int2Vector(raw) => {
+            out[0] = 29;
+            out[1..5].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            out[5..5 + raw.len()].copy_from_slice(raw);
+            5 + raw.len()
+        }
         Datum::Uuid(b) => {
             out[0] = 9;
             out[1..17].copy_from_slice(b);
@@ -338,8 +345,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             4,
         ),
         5 => {
-            let len =
-                u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             (
                 Datum::Text(
                     core::str::from_utf8(&bytes[at + 4..at + 4 + len])
@@ -446,8 +452,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             };
             let weight = i16::from_le_bytes(bytes[at + 1..at + 3].try_into().unwrap());
             let dscale = u16::from_le_bytes(bytes[at + 3..at + 5].try_into().unwrap());
-            let ndigits =
-                u16::from_le_bytes(bytes[at + 5..at + 7].try_into().unwrap()) as usize;
+            let ndigits = u16::from_le_bytes(bytes[at + 5..at + 7].try_into().unwrap()) as usize;
             (
                 Datum::Numeric(crate::sql::numeric::Numeric {
                     sign,
@@ -463,8 +468,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             2,
         ),
         21 => {
-            let len =
-                u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             (
                 Datum::Bpchar(
                     core::str::from_utf8(&bytes[at + 4..at + 4 + len])
@@ -486,7 +490,11 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 bits: bytes[at + 1],
                 addr: bytes[at + 2..at + 18].try_into().unwrap(),
             };
-            let d = if tag == 25 { Datum::Cidr(net) } else { Datum::Inet(net) };
+            let d = if tag == 25 {
+                Datum::Cidr(net)
+            } else {
+                Datum::Inet(net)
+            };
             (d, 18)
         }
         26 => (Datum::Macaddr(bytes[at..at + 6].try_into().unwrap()), 6),
@@ -498,6 +506,10 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             let label = core::str::from_utf8(&bytes[at + 14..at + 14 + len])
                 .expect("projected enum label is valid UTF-8");
             (Datum::Enum { slot, sort, label }, 14 + len)
+        }
+        29 => {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (Datum::Int2Vector(&bytes[at + 4..at + 4 + len]), 4 + len)
         }
         _ => unreachable!("tags are exhaustive"),
     }
@@ -588,8 +600,7 @@ pub fn decode_projected_col_record<'a>(
         let (value, size) = decode_projected_value(bytes, tag, at);
         if current == col {
             if tag == 19 {
-                let text_len =
-                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                let text_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
                 return decode_record_tail(bytes, at + 4 + text_len, arena);
             }
             return Ok(value);
@@ -652,8 +663,7 @@ pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
     rows.sort_unstable_by(|a, b| cmp_projected_prefix(a, b, width).then_with(|| a.cmp(b)));
     let mut unique = 0usize;
     for i in 0..rows.len() {
-        let same =
-            i > 0 && cmp_projected_prefix(rows[i], rows[unique - 1], width).is_eq();
+        let same = i > 0 && cmp_projected_prefix(rows[i], rows[unique - 1], width).is_eq();
         if !same {
             rows[unique] = rows[i];
             unique += 1;

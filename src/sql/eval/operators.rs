@@ -14,10 +14,10 @@ use super::cast_to;
 use crate::sql::types::ColType;
 
 use super::{
-    arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
+    SqlError, arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
     division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
     jsonb_delete, jsonb_delete_path, like_match, num_factor, out_of_range, overflow, parse_bool,
-    parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits, SqlError,
+    parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits,
 };
 
 /// An unknown-type literal facing an array operand takes the array's type, the
@@ -46,7 +46,16 @@ pub(crate) fn array_set_op<'a>(
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
-    let (Datum::Array { element: le, raw: lr }, Datum::Array { element: re, raw: rr }) = (l, r)
+    let (
+        Datum::Array {
+            element: le,
+            raw: lr,
+        },
+        Datum::Array {
+            element: re,
+            raw: rr,
+        },
+    ) = (l, r)
     else {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
@@ -66,15 +75,16 @@ pub(crate) fn array_set_op<'a>(
         Ok(false)
     };
     // Every element of `sub` is a member of `sup`.
-    let subset = |sub_elem, sub_raw: &'a [u8], sup_elem, sup_raw: &'a [u8]| -> Result<bool, SqlError> {
-        for i in 0..array::len(sub_raw) {
-            let v = array::get(sub_raw, sub_elem, i).unwrap_or(Datum::Null);
-            if !v.is_null() && !member(&v, sup_elem, sup_raw)? {
-                return Ok(false);
+    let subset =
+        |sub_elem, sub_raw: &'a [u8], sup_elem, sup_raw: &'a [u8]| -> Result<bool, SqlError> {
+            for i in 0..array::len(sub_raw) {
+                let v = array::get(sub_raw, sub_elem, i).unwrap_or(Datum::Null);
+                if !v.is_null() && !member(&v, sup_elem, sup_raw)? {
+                    return Ok(false);
+                }
             }
-        }
-        Ok(true)
-    };
+            Ok(true)
+        };
     let result = match operator {
         Contains => subset(re, rr, le, lr)?,
         ContainedBy => subset(le, lr, re, rr)?,
@@ -118,7 +128,11 @@ pub(crate) fn jsonb_contains<'a>(
             _ => Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "operator does not exist: jsonb {} json — cast to jsonb",
-                if operator == BinaryOp::Contains { "@>" } else { "<@" }
+                if operator == BinaryOp::Contains {
+                    "@>"
+                } else {
+                    "<@"
+                }
             )),
         }
     };
@@ -129,7 +143,9 @@ pub(crate) fn jsonb_contains<'a>(
     };
     let container = crate::sql::json::parse(container_text, arena)?;
     let contained = crate::sql::json::parse(contained_text, arena)?;
-    Ok(Datum::Bool(crate::sql::json::contains(&container, &contained)))
+    Ok(Datum::Bool(crate::sql::json::contains(
+        &container, &contained,
+    )))
 }
 
 pub(crate) fn range_op<'a>(
@@ -190,7 +206,10 @@ pub(crate) fn range_setop<'a>(
 }
 
 pub(crate) fn range_mismatch() -> SqlError {
-    sql_err!(sqlstate::UNDEFINED_FUNCTION, "operator requires matching range types")
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator requires matching range types"
+    )
 }
 
 /// Whether `container` (a range) contains `contained` (a range of the same kind
@@ -206,7 +225,11 @@ fn range_contains<'a>(
             if kind != container_kind {
                 return Err(range_mismatch());
             }
-            Ok(Datum::Bool(range::contains_range(container_text, text, container_kind)?))
+            Ok(Datum::Bool(range::contains_range(
+                container_text,
+                text,
+                container_kind,
+            )?))
         }
         element => {
             let element_text = arena.alloc_str_display(element).map_err(|_| arena_full())?;
@@ -247,17 +270,28 @@ fn bit_is_varying(d: &Datum) -> bool {
 }
 
 /// `bit || bit`: concatenation, always `varbit`.
-pub(crate) fn bit_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn bit_concat<'a>(
+    l: Datum<'a>,
+    r: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
     let (a, b) = (bit_operand(&l)?, bit_operand(&r)?);
     let out = arena
         .alloc_slice_with(a.len() + b.len(), |i| {
-            if i < a.len() { a.as_bytes()[i] } else { b.as_bytes()[i - a.len()] }
+            if i < a.len() {
+                a.as_bytes()[i]
+            } else {
+                b.as_bytes()[i - a.len()]
+            }
         })
         .map_err(|_| arena_full())?;
-    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying: true })
+    Ok(Datum::Bit {
+        bits: unsafe { core::str::from_utf8_unchecked(out) },
+        varying: true,
+    })
 }
 
 /// `bit & bit`, `bit | bit`, `bit # bit`: per-position boolean combination.
@@ -278,7 +312,11 @@ pub(crate) fn bit_bitwise<'a>(
             BinaryOp::BitOr => "OR",
             _ => "XOR",
         };
-        return Err(sql_err!(sqlstate::STRING_DATA_LENGTH_MISMATCH, "cannot {} bit strings of different sizes", verb));
+        return Err(sql_err!(
+            sqlstate::STRING_DATA_LENGTH_MISMATCH,
+            "cannot {} bit strings of different sizes",
+            verb
+        ));
     }
     let varying = bit_is_varying(&l) || bit_is_varying(&r);
     let out = arena
@@ -292,7 +330,10 @@ pub(crate) fn bit_bitwise<'a>(
             if bit { b'1' } else { b'0' }
         })
         .map_err(|_| arena_full())?;
-    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+    Ok(Datum::Bit {
+        bits: unsafe { core::str::from_utf8_unchecked(out) },
+        varying,
+    })
 }
 
 /// `bit << n` / `bit >> n`: length-preserving shift, zero-filled. A negative
@@ -311,22 +352,37 @@ pub(crate) fn bit_shift<'a>(
     };
     let count = as_i64(&r).ok_or_else(|| type_mismatch("bit-string shift amount", &r))?;
     // `<<` moves bits toward the most-significant (left) end.
-    let left = if matches!(operator, BinaryOp::Shl) { count } else { -count };
+    let left = if matches!(operator, BinaryOp::Shl) {
+        count
+    } else {
+        -count
+    };
     let len = bits.len() as i64;
     let src = bits.as_bytes();
     let out = arena
         .alloc_slice_with(bits.len(), |i| {
             let from = i as i64 + left;
-            if (0..len).contains(&from) { src[from as usize] } else { b'0' }
+            if (0..len).contains(&from) {
+                src[from as usize]
+            } else {
+                b'0'
+            }
         })
         .map_err(|_| arena_full())?;
-    Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+    Ok(Datum::Bit {
+        bits: unsafe { core::str::from_utf8_unchecked(out) },
+        varying,
+    })
 }
 
 /// Comparison of two bit strings: PostgreSQL compares bit-by-bit, and when one
 /// is a prefix of the other the shorter sorts first — exactly the lexicographic
 /// order of the `'0'`/`'1'` strings.
-pub(crate) fn compare_bits<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn compare_bits<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+) -> Result<Datum<'a>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
@@ -474,6 +530,10 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
         Datum::Range { .. } => hasher.write(&[23]),
         Datum::Multirange { .. } => hasher.write(&[24]),
         Datum::Array { .. } => hasher.write(&[25]),
+        Datum::Int2Vector(raw) => {
+            hasher.write(&[32]);
+            hasher.write(raw);
+        }
         Datum::Record(_) => hasher.write(&[26]),
         Datum::Json { jsonb: false, .. } => hasher.write(&[27]),
         // Network addresses hash by their comparison key (family, address,
@@ -533,13 +593,22 @@ pub(crate) fn compare_datums_as(
             .then_with(|| (-za).cmp(&-zb)),
         // Only `jsonb` compares; `json` keeps its original text, so equal
         // documents can differ byte for byte and PostgreSQL offers no operator.
-        (Datum::Json { text: a, jsonb: true }, Datum::Json { text: b, jsonb: true }) => a.cmp(b),
+        (
+            Datum::Json {
+                text: a,
+                jsonb: true,
+            },
+            Datum::Json {
+                text: b,
+                jsonb: true,
+            },
+        ) => a.cmp(b),
         (Datum::Json { jsonb: false, .. }, Datum::Json { .. })
         | (Datum::Json { .. }, Datum::Json { jsonb: false, .. }) => {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "operator does not exist: json = json"
-            ))
+            ));
         }
         (Datum::Record(a), Datum::Record(b)) => {
             // Field-wise, with a NULL field comparing greater (PostgreSQL
@@ -638,13 +707,13 @@ pub(crate) fn compare_datums_as(
                 a.cmp(&b)
             } else if let (Some(a), Some(b)) = (as_f64(l), as_f64(r)) {
                 // PostgreSQL float comparison treats NaN as largest.
-                return Ok(a.partial_cmp(&b).unwrap_or_else(|| {
-                    match (a.is_nan(), b.is_nan()) {
+                return Ok(a
+                    .partial_cmp(&b)
+                    .unwrap_or_else(|| match (a.is_nan(), b.is_nan()) {
                         (true, false) => Ordering::Greater,
                         (false, true) => Ordering::Less,
                         _ => Ordering::Equal,
-                    }
-                }));
+                    }));
             } else {
                 // PostgreSQL reports incompatible comparisons as
                 // "operator does not exist" (42883), not a datatype mismatch.
@@ -670,20 +739,11 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
     };
     Ok(match other {
         Datum::Int2(_) => {
-            let x: i64 =
-                s.trim().parse().map_err(|_| bad_text(s, "smallint"))?;
+            let x: i64 = s.trim().parse().map_err(|_| bad_text(s, "smallint"))?;
             Datum::Int2(i16::try_from(x).map_err(|_| overflow("smallint"))?)
         }
-        Datum::Int4(_) => Datum::Int4(
-            s.trim()
-                .parse()
-                .map_err(|_| bad_text(s, "integer"))?,
-        ),
-        Datum::Int8(_) => Datum::Int8(
-            s.trim()
-                .parse()
-                .map_err(|_| bad_text(s, "bigint"))?,
-        ),
+        Datum::Int4(_) => Datum::Int4(s.trim().parse().map_err(|_| bad_text(s, "integer"))?),
+        Datum::Int8(_) => Datum::Int8(s.trim().parse().map_err(|_| bad_text(s, "bigint"))?),
         Datum::Float8(_) => Datum::Float8(
             s.trim()
                 .parse()
@@ -700,15 +760,20 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
         Datum::Bool(_) => Datum::Bool(parse_bool(s)?),
         Datum::Date(_) => Datum::Date(datetime::parse_date(s)?),
         Datum::Timestamp(_) => Datum::Timestamp(datetime::parse_timestamp(s, false)?),
-        Datum::Timestamptz(_) => {
-            Datum::Timestamptz(datetime::parse_timestamp(s, true)?)
-        }
+        Datum::Timestamptz(_) => Datum::Timestamptz(datetime::parse_timestamp(s, true)?),
         Datum::Uuid(_) => Datum::Uuid(parse_uuid(s)?),
         Datum::Bpchar(_) => Datum::Bpchar(s),
         Datum::Time(_) => Datum::Time(datetime::parse_time(s)?),
         Datum::Timetz(..) => {
             let (t, zone) = datetime::parse_timetz(s)?;
-            Datum::Timetz(t, zone.unwrap_or_else(|| crate::sql::timezone::session().resolve(datetime::now_micros()).0))
+            Datum::Timetz(
+                t,
+                zone.unwrap_or_else(|| {
+                    crate::sql::timezone::session()
+                        .resolve(datetime::now_micros())
+                        .0
+                }),
+            )
         }
         Datum::Interval(_) => Datum::Interval(datetime::parse_interval(s)?),
         Datum::Inet(_) => {
@@ -720,16 +785,20 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
         Datum::Macaddr(_) => {
             Datum::Macaddr(crate::sql::net::parse_macaddr(s).ok_or_else(|| bad_text(s, "macaddr"))?)
         }
-        Datum::Macaddr8(_) => {
-            Datum::Macaddr8(crate::sql::net::parse_macaddr8(s).ok_or_else(|| bad_text(s, "macaddr8"))?)
-        }
+        Datum::Macaddr8(_) => Datum::Macaddr8(
+            crate::sql::net::parse_macaddr8(s).ok_or_else(|| bad_text(s, "macaddr8"))?,
+        ),
         _ => v,
     })
 }
 
 /// Range comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`). Both operands
 /// must be ranges of the same kind; ordering follows PostgreSQL `range_cmp`.
-pub(crate) fn compare_ranges<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn compare_ranges<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+) -> Result<Datum<'a>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
@@ -836,23 +905,47 @@ pub(crate) fn arithmetic<'a>(
         }
         // `interval * number` / `number * interval` / `interval / number`.
         (BinaryOp::Mul, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(datetime::interval_scale(interval, num_factor(&r).expect("checked"), false)));
+            return Ok(Datum::Interval(datetime::interval_scale(
+                interval,
+                num_factor(&r).expect("checked"),
+                false,
+            )));
         }
         (BinaryOp::Mul, _, Datum::Interval(interval)) if num_factor(&l).is_some() => {
-            return Ok(Datum::Interval(datetime::interval_scale(interval, num_factor(&l).expect("checked"), false)));
+            return Ok(Datum::Interval(datetime::interval_scale(
+                interval,
+                num_factor(&l).expect("checked"),
+                false,
+            )));
         }
         (BinaryOp::Div, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(datetime::interval_scale(interval, num_factor(&r).expect("checked"), true)));
+            return Ok(Datum::Interval(datetime::interval_scale(
+                interval,
+                num_factor(&r).expect("checked"),
+                true,
+            )));
         }
-        (BinaryOp::Add | BinaryOp::Sub, dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)), Datum::Interval(interval))
-        | (BinaryOp::Add, Datum::Interval(interval), dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_))) => {
+        (
+            BinaryOp::Add | BinaryOp::Sub,
+            dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)),
+            Datum::Interval(interval),
+        )
+        | (
+            BinaryOp::Add,
+            Datum::Interval(interval),
+            dt @ (Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Date(_)),
+        ) => {
             let base = match dt {
                 Datum::Timestamp(t) | Datum::Timestamptz(t) => t,
                 Datum::Date(d) => d as i64 * 86_400_000_000,
                 _ => unreachable!(),
             };
             let signed = if operator == BinaryOp::Sub {
-                Interval { months: -interval.months, days: -interval.days, micros: -interval.micros }
+                Interval {
+                    months: -interval.months,
+                    days: -interval.days,
+                    micros: -interval.micros,
+                }
             } else {
                 interval
             };
@@ -867,12 +960,20 @@ pub(crate) fn arithmetic<'a>(
         // the day; a timetz keeps the zone it already had.
         (BinaryOp::Add | BinaryOp::Sub, Datum::Time(t), Datum::Interval(interval))
         | (BinaryOp::Add, Datum::Interval(interval), Datum::Time(t)) => {
-            let delta = if operator == BinaryOp::Sub { -interval.micros } else { interval.micros };
+            let delta = if operator == BinaryOp::Sub {
+                -interval.micros
+            } else {
+                interval.micros
+            };
             return Ok(Datum::Time((t + delta).rem_euclid(86_400_000_000)));
         }
         (BinaryOp::Add | BinaryOp::Sub, Datum::Timetz(t, zone), Datum::Interval(interval))
         | (BinaryOp::Add, Datum::Interval(interval), Datum::Timetz(t, zone)) => {
-            let delta = if operator == BinaryOp::Sub { -interval.micros } else { interval.micros };
+            let delta = if operator == BinaryOp::Sub {
+                -interval.micros
+            } else {
+                interval.micros
+            };
             return Ok(Datum::Timetz((t + delta).rem_euclid(86_400_000_000), zone));
         }
         _ => {}
@@ -908,8 +1009,8 @@ pub(crate) fn arithmetic<'a>(
     // (single precision); any other float pairing -> float8 (real mixed with
     // int/float8/numeric all widen to double precision).
     let either_numeric = matches!(l, Datum::Numeric(_)) || matches!(r, Datum::Numeric(_));
-    let either_float =
-        matches!(l, Datum::Float8(_) | Datum::Float4(_)) || matches!(r, Datum::Float8(_) | Datum::Float4(_));
+    let either_float = matches!(l, Datum::Float8(_) | Datum::Float4(_))
+        || matches!(r, Datum::Float8(_) | Datum::Float4(_));
     // Integer operator integer stays integral.
     if let (Some(a), Some(b)) = (as_i64(&l), as_i64(&r)) {
         let out = match operator {
@@ -1022,7 +1123,10 @@ fn date_shift<'a>(date: i32, days: i64, sub: bool) -> Result<Datum<'a>, SqlError
         .and_then(|v| i32::try_from(v).ok());
     match shifted {
         Some(d) => Ok(Datum::Date(d)),
-        None => Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date out of range")),
+        None => Err(sql_err!(
+            sqlstate::DATETIME_FIELD_OVERFLOW,
+            "date out of range"
+        )),
     }
 }
 
@@ -1155,7 +1259,11 @@ fn multirange_contains<'a>(
 }
 
 /// Integer bitwise operators (`& | # << >>`). Both operands must be integers.
-pub(crate) fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn bitwise<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
     let int = |d: &Datum| -> Result<i64, SqlError> {
         match d {
@@ -1196,15 +1304,28 @@ pub(crate) fn bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Res
     })
 }
 
-pub(crate) fn unary<'a>(operator: UnaryOp, v: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn unary<'a>(
+    operator: UnaryOp,
+    v: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     match (operator, v) {
         (_, Datum::Null) => Ok(Datum::Null),
         // ~bit flips every bit, preserving length and type.
         (UnaryOp::BitNot, Datum::Bit { bits, varying }) => {
             let out = arena
-                .alloc_slice_with(bits.len(), |i| if bits.as_bytes()[i] == b'1' { b'0' } else { b'1' })
+                .alloc_slice_with(bits.len(), |i| {
+                    if bits.as_bytes()[i] == b'1' {
+                        b'0'
+                    } else {
+                        b'1'
+                    }
+                })
                 .map_err(|_| arena_full())?;
-            Ok(Datum::Bit { bits: unsafe { core::str::from_utf8_unchecked(out) }, varying })
+            Ok(Datum::Bit {
+                bits: unsafe { core::str::from_utf8_unchecked(out) },
+                varying,
+            })
         }
         (UnaryOp::Neg, Datum::Int2(x)) => x
             .checked_neg()
@@ -1266,7 +1387,10 @@ fn row_compare<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
     if a.len() != b.len() {
-        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "unequal number of entries in row expressions"));
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "unequal number of entries in row expressions"
+        ));
     }
     match operator {
         Eq | NotEq => {
@@ -1340,7 +1464,9 @@ fn bits_prefix_eq(a: &[u8; 16], b: &[u8; 16], bits: u8) -> bool {
 /// Whether network `sup` contains address `sub` (same family, `sup` is the
 /// same size or larger, and they agree on `sup`'s masked prefix).
 fn net_contains(sup: &NetAddr, sub: &NetAddr) -> bool {
-    sup.family == sub.family && sup.bits <= sub.bits && bits_prefix_eq(&sup.addr, &sub.addr, sup.bits)
+    sup.family == sub.family
+        && sup.bits <= sub.bits
+        && bits_prefix_eq(&sup.addr, &sub.addr, sup.bits)
 }
 
 /// The network containment/overlap predicates (`<<`, `>>`, `<<=`, `>>=`, `&&`).
@@ -1552,7 +1678,9 @@ pub(crate) fn binary<'a>(
             (Datum::Multirange { .. }, _) | (_, Datum::Multirange { .. }) => {
                 multirange_setop(operator, l, r, arena)
             }
-            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_setop(operator, l, r, arena),
+            (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => {
+                range_setop(operator, l, r, arena)
+            }
             _ => arithmetic(operator, l, r, l_unknown, r_unknown, arena),
         },
         JsonGet | JsonGetText => json_get(l, r, operator == JsonGetText, arena),
@@ -1602,7 +1730,12 @@ pub(crate) fn binary<'a>(
             }
             let text = cast_to_text(l, arena)?;
             let pattern = cast_to_text(r, arena)?;
-            Ok(Datum::Bool(like_match(text, pattern, operator == ILike, Some('\\'))))
+            Ok(Datum::Bool(like_match(
+                text,
+                pattern,
+                operator == ILike,
+                Some('\\'),
+            )))
         }
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none
@@ -1624,7 +1757,11 @@ pub(crate) fn binary<'a>(
 }
 
 /// SQL three-valued AND/OR.
-pub(crate) fn logic<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn logic<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+) -> Result<Datum<'a>, SqlError> {
     let as_bool = |d: &Datum| -> Result<Option<bool>, SqlError> {
         match d {
             Datum::Null => Ok(None),

@@ -10,19 +10,17 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, FromClause, JoinKind};
-use crate::sql::eval::{eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{rowenc, Storage, MAX_COLUMNS};
+use crate::storage::{MAX_COLUMNS, Storage, rowenc};
 
 use super::plan::{
-    conjunct_passes, expr_tables, flatten_and, fold_null, is_error_safe, MAX_CONJUNCTS,
+    MAX_CONJUNCTS, conjunct_passes, expr_tables, flatten_and, fold_null, is_error_safe,
 };
 use super::{
-    arena_full, check_timeout, 
-     join_order, reorder_qual, simplify_qual, where_passes, QueryScope,
-    ResolvedColumn,
-     MAX_JOIN_TABLES,
+    MAX_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, join_order,
+    reorder_qual, simplify_qual, where_passes,
 };
 
 /// One assembled source row: per table, decoded values (empty slice =
@@ -65,7 +63,11 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         Some(self.scope.output_type(entry))
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<crate::storage::SqlName> {
+    fn column_domain(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::SqlName> {
         match self.scope.find_column(qualifier, name).ok()? {
             ResolvedColumn::Table(t, c) => {
                 self.scope.defs[t].and_then(|def| def.columns().get(c).and_then(|col| col.domain))
@@ -107,7 +109,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                     sqlstate::INVALID_COLUMN_REFERENCE,
                     "whole-row reference to \"{}\" before its table is joined",
                     table
-                ))
+                ));
             }
         };
         // Copy field names into the arena so the record does not borrow the
@@ -119,7 +121,9 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             value: Datum::Null,
         }; MAX_COLUMNS];
         for (i, field) in fields.iter_mut().enumerate().take(def.n_columns) {
-            let name = arena.alloc_str(cols[i].name.as_str()).map_err(|_| arena_full())?;
+            let name = arena
+                .alloc_str(cols[i].name.as_str())
+                .map_err(|_| arena_full())?;
             field.name = name;
             field.type_oid = cols[i].ctype.oid();
             field.value = vals.get(i).copied().unwrap_or(Datum::Null);
@@ -139,7 +143,6 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
-
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         match self.inner.whole_row_present(table) {
             Ok(v) => Ok(v),
@@ -211,29 +214,43 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
         let mut store: *mut &[u8] = core::ptr::null_mut();
         let mut len = 0usize;
         let mut cap = 0usize;
-        super::select_into_rows(storage, txid, sub, arena, params, Some(outer), None, &mut |vals| {
-            let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
-            if len == cap {
-                let new_cap = if cap == 0 { 8 } else { cap * 2 };
-                let fresh: &mut [&[u8]] =
-                    arena.alloc_slice_with(new_cap, |_| EMPTY).map_err(|_| arena_full())?;
-                if len > 0 {
-                    let old = unsafe { core::slice::from_raw_parts(store, len) };
-                    fresh[..len].copy_from_slice(old);
+        super::select_into_rows(
+            storage,
+            txid,
+            sub,
+            arena,
+            params,
+            Some(outer),
+            None,
+            &mut |vals| {
+                let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
+                if len == cap {
+                    let new_cap = if cap == 0 { 8 } else { cap * 2 };
+                    let fresh: &mut [&[u8]] = arena
+                        .alloc_slice_with(new_cap, |_| EMPTY)
+                        .map_err(|_| arena_full())?;
+                    if len > 0 {
+                        let old = unsafe { core::slice::from_raw_parts(store, len) };
+                        fresh[..len].copy_from_slice(old);
+                    }
+                    store = fresh.as_mut_ptr();
+                    cap = new_cap;
                 }
-                store = fresh.as_mut_ptr();
-                cap = new_cap;
-            }
-            unsafe { store.add(len).write(enc) };
-            len += 1;
-            Ok(())
-        })?;
-        return Ok(if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(store, len) } });
+                unsafe { store.add(len).write(enc) };
+                len += 1;
+                Ok(())
+            },
+        )?;
+        return Ok(if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(store, len) }
+        });
     }
     if tref.func_args.is_some() {
         // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
         // arguments against the outer row.
-        return super::table_func_rows_outer(tref, arena, params, outer);
+        return super::table_func_rows_outer(tref, storage, arena, params, outer);
     }
     Err(sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -263,7 +280,11 @@ pub(crate) fn scan_source<'a>(
     let where_clause = match where_clause {
         Some(w) => {
             let simplified = simplify_qual(w, arena)?;
-            Some(reorder_qual(fold_null(simplified, scope, arena)?, scope, arena)?)
+            Some(reorder_qual(
+                fold_null(simplified, scope, arena)?,
+                scope,
+                arena,
+            )?)
         }
         None => None,
     };
@@ -293,9 +314,7 @@ pub(crate) fn scan_source<'a>(
                             // Structural decode: a record column comes back
                             // as a `Datum::Record` (fields in the arena), so
                             // field access sees its shape.
-                            *slot = crate::sql::exec::decode_projected_col_record(
-                                bytes, c, arena,
-                            )?;
+                            *slot = crate::sql::exec::decode_projected_col_record(bytes, c, arena)?;
                         }
                     } else {
                         let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -346,15 +365,20 @@ pub(crate) fn scan_source<'a>(
             return f(&row);
         }
 
-        let join = if depth == 0 { None } else { Some(&from.joins[depth - 1]) };
+        let join = if depth == 0 {
+            None
+        } else {
+            Some(&from.joins[depth - 1])
+        };
         let mut matched_any = false;
         // Bind one candidate row for this level, run the ON condition, then
         // recurse. `on_matches` returns false to skip the row.
-        let on_matches = |bound: &mut [Option<&'a [u8]>; MAX_JOIN_TABLES]|
-         -> Result<bool, SqlError> {
-            if let Some(join) = join
+        let on_matches =
+            |bound: &mut [Option<&'a [u8]>; MAX_JOIN_TABLES]| -> Result<bool, SqlError> {
+                if let Some(join) = join
                 // USING/NATURAL predicates are synthesized at plan time.
-                && let Some(on) = join.on.or(scope.join_on[depth - 1]) {
+                && let Some(on) = join.on.or(scope.join_on[depth - 1])
+                {
                     let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
                     let row = assemble(scope, bound, order, depth + 1, &mut buffers, arena)?;
                     let chained_row = Chained { inner: &row, outer };
@@ -367,34 +391,44 @@ pub(crate) fn scan_source<'a>(
                         )),
                     };
                 }
-            Ok(true)
-        };
+                Ok(true)
+            };
         // Predicate pushdown: skip a partial row that already fails an error-safe
         // WHERE conjunct fully bound at this depth.
-        let passes_pushdown = |bound: &[Option<&'a [u8]>; MAX_JOIN_TABLES]|
-         -> Result<bool, SqlError> {
-            if pushdown[depth].is_empty() {
-                return Ok(true);
-            }
-            let mut pbuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-            let prow = assemble(scope, bound, order, depth + 1, &mut pbuf, arena)?;
-            let pcr = Chained { inner: &prow, outer };
-            for &c in pushdown[depth] {
-                if !conjunct_passes(c, arena, params, &pcr, hooks)? {
-                    return Ok(false);
+        let passes_pushdown =
+            |bound: &[Option<&'a [u8]>; MAX_JOIN_TABLES]| -> Result<bool, SqlError> {
+                if pushdown[depth].is_empty() {
+                    return Ok(true);
                 }
-            }
-            Ok(true)
-        };
+                let mut pbuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
+                let prow = assemble(scope, bound, order, depth + 1, &mut pbuf, arena)?;
+                let pcr = Chained {
+                    inner: &prow,
+                    outer,
+                };
+                for &c in pushdown[depth] {
+                    if !conjunct_passes(c, arena, params, &pcr, hooks)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
         // A LATERAL FROM item is re-run per outer row: assemble the row bound by
         // the tables to its left, resolve the item's body against it, and iterate
         // the resulting rows like a derived table's.
         if scope.lateral[order[depth]] {
             let t = order[depth];
-            let tref = if t == 0 { &from.base } else { &from.joins[t - 1].table };
+            let tref = if t == 0 {
+                &from.base
+            } else {
+                &from.joins[t - 1].table
+            };
             let mut obuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
             let outer_row = assemble(scope, bound, order, depth, &mut obuf, arena)?;
-            let chained = Chained { inner: &outer_row, outer };
+            let chained = Chained {
+                inner: &outer_row,
+                outer,
+            };
             let rows = materialize_lateral(storage, txid, tref, arena, params, &chained)?;
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
@@ -407,8 +441,21 @@ pub(crate) fn scan_source<'a>(
                     m[index].set(true);
                 }
                 if !level(
-                    storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, pushdown, order, f,
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    depth + 1,
+                    bound,
+                    matched,
+                    pushdown,
+                    order,
+                    f,
                 )? {
                     return Ok(false);
                 }
@@ -425,8 +472,21 @@ pub(crate) fn scan_source<'a>(
                     m[index].set(true);
                 }
                 if !level(
-                    storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, pushdown, order, f,
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    depth + 1,
+                    bound,
+                    matched,
+                    pushdown,
+                    order,
+                    f,
                 )? {
                     return Ok(false);
                 }
@@ -442,11 +502,18 @@ pub(crate) fn scan_source<'a>(
             let slot = scope.slots[order[depth]];
             let count = storage.visible_row_count(slot, txid)?;
             let ordered = arena
-                .alloc_slice_with(count, |_| (0u64, crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 })))
+                .alloc_slice_with(count, |_| {
+                    (
+                        0u64,
+                        crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }),
+                    )
+                })
                 .map_err(|_| arena_full())?;
             let mut fill = 0usize;
             storage.for_each_row_state(slot, &mut |rowid, state| {
-                if let Some(home) = state.visible_at(txid, storage.read_snapshot()) {
+                if let Some(home) =
+                    state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+                {
                     ordered[fill] = (rowid, home);
                     fill += 1;
                 }
@@ -472,8 +539,21 @@ pub(crate) fn scan_source<'a>(
                     m[this].set(true);
                 }
                 if !level(
-                    storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, pushdown, order, f,
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    depth + 1,
+                    bound,
+                    matched,
+                    pushdown,
+                    order,
+                    f,
                 )? {
                     return Ok(false);
                 }
@@ -485,7 +565,9 @@ pub(crate) fn scan_source<'a>(
             storage.for_each_row_state(slot, &mut |rowid, state| {
                 use core::ops::ControlFlow;
                 check_timeout()?;
-                let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
+                let Some(home) =
+                    state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+                else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
@@ -499,8 +581,21 @@ pub(crate) fn scan_source<'a>(
                     m[this].set(true);
                 }
                 if !level(
-                    storage, scope, from, txid, where_clause, arena, params, hooks,
-                    outer, depth + 1, bound, matched, pushdown, order, f,
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    depth + 1,
+                    bound,
+                    matched,
+                    pushdown,
+                    order,
+                    f,
                 )? {
                     aborted = true;
                     return Ok(ControlFlow::Break(()));
@@ -513,13 +608,24 @@ pub(crate) fn scan_source<'a>(
         }
         // LEFT/FULL join with no match at this level: emit one null row (the
         // left side preserved, this table nulled).
-        if !matched_any
-            && join.is_some_and(|j| matches!(j.kind, JoinKind::Left | JoinKind::Full))
-        {
+        if !matched_any && join.is_some_and(|j| matches!(j.kind, JoinKind::Left | JoinKind::Full)) {
             bound[order[depth]] = None;
             if !level(
-                storage, scope, from, txid, where_clause, arena, params, hooks,
-                outer, depth + 1, bound, matched, pushdown, order, f,
+                storage,
+                scope,
+                from,
+                txid,
+                where_clause,
+                arena,
+                params,
+                hooks,
+                outer,
+                depth + 1,
+                bound,
+                matched,
+                pushdown,
+                order,
+                f,
             )? {
                 return Ok(false);
             }
@@ -533,8 +639,7 @@ pub(crate) fn scan_source<'a>(
     // row null-pads the tables to its left and still joins the tables to its
     // right (post-passes below, shallowest level first — so a deeper level's
     // flags also accumulate matches found during a shallower post-pass).
-    let mut matched: [Option<&[core::cell::Cell<bool>]>; MAX_JOIN_TABLES] =
-        [None; MAX_JOIN_TABLES];
+    let mut matched: [Option<&[core::cell::Cell<bool>]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
     for (i, j) in from.joins.iter().enumerate() {
         if !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             continue;
@@ -593,11 +698,17 @@ pub(crate) fn scan_source<'a>(
     let mut pushdown_buffers: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
         [[&Expr::Null; MAX_CONJUNCTS]; MAX_JOIN_TABLES];
     let mut pd_n = [0usize; MAX_JOIN_TABLES];
-    if all_inner && scope.n >= 2 && let Some(w) = where_clause {
+    if all_inner
+        && scope.n >= 2
+        && let Some(w) = where_clause
+    {
         let mut conjunct: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
         let mut n = 0;
-        let conjuncts: &[&Expr] =
-            if flatten_and(w, &mut conjunct, &mut n) { &conjunct[..n] } else { core::slice::from_ref(&w) };
+        let conjuncts: &[&Expr] = if flatten_and(w, &mut conjunct, &mut n) {
+            &conjunct[..n]
+        } else {
+            core::slice::from_ref(&w)
+        };
         for &c in conjuncts {
             // The execution depth at which a conjunct is fully bound is the
             // latest execution position of any table it references (under
@@ -617,7 +728,8 @@ pub(crate) fn scan_source<'a>(
             }
         }
     }
-    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] = core::array::from_fn(|d| &pushdown_buffers[d][..pd_n[d]]);
+    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] =
+        core::array::from_fn(|d| &pushdown_buffers[d][..pd_n[d]]);
 
     let mut bound = [None; MAX_JOIN_TABLES];
     level(
@@ -645,9 +757,7 @@ pub(crate) fn scan_source<'a>(
     for d in 1..scope.n {
         let Some(m) = matched[d] else { continue };
         let emit_unmatched = |bytes: &'a [u8],
-                                  f: &mut dyn FnMut(
-            &JoinRow<'_, 'a, '_>,
-        ) -> Result<bool, SqlError>|
+                              f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
          -> Result<bool, SqlError> {
             let mut b = [None; MAX_JOIN_TABLES];
             b[d] = Some(bytes);
@@ -664,8 +774,21 @@ pub(crate) fn scan_source<'a>(
                 return f(&row);
             }
             level(
-                storage, scope, from, txid, where_clause, arena, params, hooks,
-                outer, d + 1, &mut b, &matched, &pushdown, &order, f,
+                storage,
+                scope,
+                from,
+                txid,
+                where_clause,
+                arena,
+                params,
+                hooks,
+                outer,
+                d + 1,
+                &mut b,
+                &matched,
+                &pushdown,
+                &order,
+                f,
             )
         };
         if let Some(rows) = scope.derived[d] {
@@ -679,16 +802,15 @@ pub(crate) fn scan_source<'a>(
             let mut done = false;
             storage.for_each_row_state(scope.slots[d], &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
+                let Some(home) =
+                    state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+                else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 let this = index;
                 index += 1;
                 if !m[this].get()
-                    && !emit_unmatched(
-                        storage.row_bytes(scope.slots[d], rowid, home, arena)?,
-                        f,
-                    )?
+                    && !emit_unmatched(storage.row_bytes(scope.slots[d], rowid, home, arena)?, f)?
                 {
                     done = true;
                     return Ok(ControlFlow::Break(()));

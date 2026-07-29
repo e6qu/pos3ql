@@ -4,18 +4,18 @@
 //! materializes sort keys into the per-statement arena (bounded by the
 //! arena size, loudly). No allocation anywhere.
 
+use super::txn::TxnState;
 use crate::mem::arena::Arena;
 use crate::mem::fixed_vec::FixedVec;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::util::StackStr;
-use crate::storage::{
-    ColumnMeta, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef, MAX_COLUMNS,
-};
-use super::txn::TxnState;
 use crate::storage::rowenc;
+use crate::storage::{
+    ColumnMeta, MAX_COLUMNS, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
+};
+use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
 
 use super::ast::{
@@ -23,8 +23,8 @@ use super::ast::{
     QualName, SelectItem, Update,
 };
 use super::eval::{
-    cast_to, compare_datums, eval, eval_full, sqlstate, ColumnLookup, EvalHooks, NoColumns,
-    SqlError, NO_HOOKS,
+    ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
+    eval_full, sqlstate,
 };
 use super::types::{ColDesc, ColType, Datum, TypeMod};
 
@@ -42,13 +42,14 @@ pub struct RowCtx<'s, 'v, 'd> {
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
-            && !crate::sql::eval::qualifier_answers_single(self.def, q) {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "missing FROM-clause entry for table \"{}\"",
-                    q
-                ));
-            }
+            && !crate::sql::eval::qualifier_answers_single(self.def, q)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                q
+            ));
+        }
         match self.def.column_index(name) {
             Some(i) => Ok(self.values[i]),
             None => Err(sql_err!(
@@ -77,23 +78,29 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
             type_oid: 0,
             value: Datum::Null,
         }; MAX_COLUMNS];
-        let too_large =
-            || sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "record exceeds the arena");
+        let too_large = || sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "record exceeds the arena");
         for (i, field) in fields.iter_mut().enumerate().take(self.def.n_columns) {
-            field.name = arena.alloc_str(cols[i].name.as_str()).map_err(|_| too_large())?;
+            field.name = arena
+                .alloc_str(cols[i].name.as_str())
+                .map_err(|_| too_large())?;
             field.type_oid = cols[i].ctype.oid();
             field.value = self.values.get(i).copied().unwrap_or(Datum::Null);
         }
-        let out = arena.alloc_slice_copy(&fields[..self.def.n_columns]).map_err(|_| too_large())?;
+        let out = arena
+            .alloc_slice_copy(&fields[..self.def.n_columns])
+            .map_err(|_| too_large())?;
         Ok(Some(&*out))
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if let Some(q) = qualifier
-            && q != self.def.name.as_str() {
-                return None;
-            }
-        self.def.column_index(name).map(|i| self.def.columns()[i].ctype)
+            && q != self.def.name.as_str()
+        {
+            return None;
+        }
+        self.def
+            .column_index(name)
+            .map(|i| self.def.columns()[i].ctype)
     }
 
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
@@ -102,7 +109,9 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         {
             return None;
         }
-        self.def.column_index(name).and_then(|i| self.def.columns()[i].domain)
+        self.def
+            .column_index(name)
+            .and_then(|i| self.def.columns()[i].domain)
     }
 }
 
@@ -263,11 +272,8 @@ pub fn create_table(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    def.schema = match storage.creation_schema(
-        statement.name.schema,
-        statement.name.name,
-        txn.txid,
-    ) {
+    def.schema = match storage.creation_schema(statement.name.schema, statement.name.name, txn.txid)
+    {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -320,7 +326,12 @@ pub fn create_table(
         Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
             responder.notice(
                 crate::sql::eval::sqlstate::DUPLICATE_TABLE,
-                stack_format!(128, "relation \"{}\" already exists, skipping", statement.name.name).as_str(),
+                stack_format!(
+                    128,
+                    "relation \"{}\" already exists, skipping",
+                    statement.name.name
+                )
+                .as_str(),
             )?;
         }
         Err(e) => return sql_fail(e),
@@ -338,7 +349,10 @@ pub fn create_table(
 /// by counting the assembled definition.
 fn reject_multiple_primary(def: &TableDef) -> Result<(), SqlError> {
     let declared = def.columns().iter().filter(|c| c.primary).count()
-        + def.uniques[..def.n_uniques].iter().filter(|k| k.is_primary).count();
+        + def.uniques[..def.n_uniques]
+            .iter()
+            .filter(|k| k.is_primary)
+            .count();
     if declared > 1 {
         return Err(sql_err!(
             crate::sql::eval::sqlstate::INVALID_TABLE_DEFINITION,
@@ -373,7 +387,10 @@ fn build_def_with_likes(
     if statement.likes.is_empty() {
         return build_def(statement.name.name, statement.columns, storage, txid, arena);
     }
-    let mut def = TableDef { name: SqlName::parse(statement.name.name)?, ..TableDef::empty() };
+    let mut def = TableDef {
+        name: SqlName::parse(statement.name.name)?,
+        ..TableDef::empty()
+    };
     let mut n = 0usize;
     for position in 0..=statement.columns.len() {
         for like in statement.likes.iter().filter(|l| l.at == position) {
@@ -403,7 +420,11 @@ fn build_def_with_likes(
             }
         }
         if let Some(column) = statement.columns.get(position) {
-            push_column(&mut def, &mut n, build_column(column, storage, txid, arena)?)?;
+            push_column(
+                &mut def,
+                &mut n,
+                build_column(column, storage, txid, arena)?,
+            )?;
         }
     }
     def.n_columns = n;
@@ -419,7 +440,10 @@ fn push_column(def: &mut TableDef, n: &mut usize, column: ColumnMeta) -> Result<
             MAX_COLUMNS
         ));
     }
-    if def.columns[..*n].iter().any(|prev| prev.name == column.name) {
+    if def.columns[..*n]
+        .iter()
+        .any(|prev| prev.name == column.name)
+    {
         return Err(sql_err!(
             sqlstate::DUPLICATE_COLUMN,
             "column \"{}\" specified more than once",
@@ -492,7 +516,7 @@ fn remap_columns(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" does not exist",
                     name
-                ))
+                ));
             }
         }
     }
@@ -519,11 +543,16 @@ fn copy_like_indexes(
     use crate::storage::IndexDef;
     for like in statement.likes.iter().filter(|l| l.indexes) {
         // Collected up front: creating one needs `storage` mutably.
-        let mut copied = [CopiedIndex { columns: [0; crate::storage::MAX_INDEX_COLS], n_cols: 0, unique: false };
-            MAX_LIKE_INDEXES];
+        let mut copied = [CopiedIndex {
+            columns: [0; crate::storage::MAX_INDEX_COLS],
+            n_cols: 0,
+            unique: false,
+        }; MAX_LIKE_INDEXES];
         let mut n_copied = 0;
-        let source_def =
-            *storage.table_def(resolve_dml_table(storage, &like.source, txn.txid)?, txn.txid);
+        let source_def = *storage.table_def(
+            resolve_dml_table(storage, &like.source, txn.txid)?,
+            txn.txid,
+        );
         for index in storage.indexes_for(
             source_def.schema.as_str(),
             source_def.name.as_str(),
@@ -536,8 +565,11 @@ fn copy_like_indexes(
                     MAX_LIKE_INDEXES
                 ));
             }
-            copied[n_copied] =
-                CopiedIndex { columns: index.columns, n_cols: index.n_cols, unique: index.unique };
+            copied[n_copied] = CopiedIndex {
+                columns: index.columns,
+                n_cols: index.n_cols,
+                unique: index.unique,
+            };
             n_copied += 1;
         }
         let source = source_def;
@@ -581,7 +613,6 @@ fn copy_like_indexes(
 /// Upper bound on the secondary indexes one `LIKE ... INCLUDING INDEXES` copies.
 const MAX_LIKE_INDEXES: usize = 8;
 
-
 /// The next value of a serial/identity column: a real sequence, as PostgreSQL
 /// has it. Explicit inserts do not advance it, deletes and TRUNCATE do not
 /// rewind it, and the advance survives a rollback (a consumed number stays
@@ -619,14 +650,11 @@ fn next_auto_value<'x>(
     let step = def.columns()[col].auto_increment_step;
     let table = storage.table_mut(table_index);
     let next = table.serial_last[col] + step;
-    let bound_error = |what: &'static str| {
-        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", what)
-    };
+    let bound_error =
+        |what: &'static str| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", what);
     let out = match ctype {
         ColType::Int8 => Datum::Int8(next),
-        ColType::Int2 => {
-            Datum::Int2(i16::try_from(next).map_err(|_| bound_error("smallint"))?)
-        }
+        ColType::Int2 => Datum::Int2(i16::try_from(next).map_err(|_| bound_error("smallint"))?),
         _ => Datum::Int4(i32::try_from(next).map_err(|_| bound_error("integer"))?),
     };
     table.serial_last[col] = next;
@@ -777,7 +805,9 @@ fn find_conflict(
     let mut found: Option<u64> = None;
     let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
+        let Some(home) =
+            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+        else {
             return Ok(ControlFlow::Continue(()));
         };
         let hit = storage
@@ -793,7 +823,9 @@ fn find_conflict(
                 };
                 let key_hit = |cols: &[u16]| {
                     !cols.iter().any(|&c| values[c as usize].is_null())
-                        && cols.iter().all(|&c| eq(&values[c as usize], &other[c as usize]))
+                        && cols
+                            .iter()
+                            .all(|&c| eq(&values[c as usize], &other[c as usize]))
                 };
                 match arbiter {
                     // A named/inferred arbiter conflicts on its own columns only.
@@ -810,11 +842,9 @@ fn find_conflict(
                                 return Ok(true);
                             }
                         }
-                        for index in storage.unique_indexes_for(
-                            def.schema.as_str(),
-                            def.name.as_str(),
-                            txid,
-                        ) {
+                        for index in
+                            storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+                        {
                             if key_hit(&index.columns[..index.n_cols]) {
                                 return Ok(true);
                             }
@@ -850,18 +880,28 @@ impl<'v> ColumnLookup<'v> for ExcludedCtx<'_, 'v, '_> {
             if let Some(q) = qualifier
                 && !crate::sql::eval::qualifier_answers_single(self.def, q)
             {
-                return Err(sql_err!(sqlstate::UNDEFINED_TABLE, "missing FROM-clause entry for table \"{}\"", q));
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    q
+                ));
             }
             self.existing
         };
         match self.def.column_index(name) {
             Some(i) => Ok(src[i]),
-            None => Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name)),
+            None => Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            )),
         }
     }
 
     fn col_type(&self, _qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        self.def.column_index(name).map(|i| self.def.columns()[i].ctype)
+        self.def
+            .column_index(name)
+            .map(|i| self.def.columns()[i].ctype)
     }
 }
 
@@ -906,11 +946,17 @@ fn handle_conflict<'a>(
             .table(table_index)
             .rows
             .get(&rowid)
-            .and_then(|s| s.visible_at(txn.txid, storage.read_snapshot()))
+            .and_then(|s| {
+                s.visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
+            })
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
         rowenc::decode(bytes, schema, &mut existing)?;
-        let context = ExcludedCtx { def, existing: &existing[..def.n_columns], excluded: values };
+        let context = ExcludedCtx {
+            def,
+            existing: &existing[..def.n_columns],
+            excluded: values,
+        };
         let mut subquery_expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
         let mut subquery_expression_count = 0usize;
         if let Some(condition) = oc.update_where {
@@ -928,7 +974,10 @@ fn handle_conflict<'a>(
             arena,
             params,
         )?;
-        let hooks = EvalHooks { subs: Some(&subqueries), ..NO_HOOKS };
+        let hooks = EvalHooks {
+            subs: Some(&subqueries),
+            ..NO_HOOKS
+        };
         if let Some(cond) = oc.update_where
             && !matches!(
                 eval_full(cond, arena, params, &context, &hooks)?,
@@ -953,19 +1002,36 @@ fn handle_conflict<'a>(
         }
         check_not_null(def, &new_values)?;
         enforce_row_constraints(
-            storage, table_index, def, schema, &new_values[..def.n_columns], Some(rowid),
-            txn.txid, checks, arena, params,
+            storage,
+            table_index,
+            def,
+            schema,
+            &new_values[..def.n_columns],
+            Some(rowid),
+            txn.txid,
+            checks,
+            arena,
+            params,
         )?;
         let len = rowenc::encoded_len(&new_values[..def.n_columns]);
-        let out = arena
-            .alloc_slice_with(len, |_| 0u8)
-            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "updated row exceeds the arena"))?;
+        let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "updated row exceeds the arena"
+            )
+        })?;
         rowenc::encode(&new_values[..def.n_columns], out);
         &*out
     };
     let (new_loc, slice) = storage.heap.append(new_bytes.len())?;
     slice.copy_from_slice(new_bytes);
-    let prior = storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(new_loc))?;
+    let prior = storage.write_pending(
+        table_index,
+        rowid,
+        txn.txid,
+        txn.command_id(),
+        Some(new_loc),
+    )?;
     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
@@ -992,18 +1058,21 @@ fn fill_auto_increment(
     for i in 0..def.n_columns {
         let col = &def.columns()[i];
         if col.auto_increment && !explicit[i] && values[i].is_null() {
-            values[i] =
-                next_auto_value(storage, table_index, i, col.ctype, seq_session, txid)?;
+            values[i] = next_auto_value(storage, table_index, i, col.ctype, seq_session, txid)?;
         }
     }
     Ok(())
 }
 
-
 /// PostgreSQL names the kind of object a DROP could not find — `table "x" does
 /// not exist`, not `relation` — while every other lookup says relation.
 fn undefined_kind(kind: &str, name: &str) -> SqlError {
-    sql_err!(sqlstate::UNDEFINED_TABLE, "{} \"{}\" does not exist", kind, name)
+    sql_err!(
+        sqlstate::UNDEFINED_TABLE,
+        "{} \"{}\" does not exist",
+        kind,
+        name
+    )
 }
 
 pub fn drop_table(
@@ -1028,7 +1097,10 @@ pub fn drop_table(
         }
         // A sequence is a relation, but not a table: DROP TABLE on it is a type
         // error (42809), which IF EXISTS does not suppress.
-        if storage.sequence_on_path(name.schema, name.name, txn.txid).is_some() {
+        if storage
+            .sequence_on_path(name.schema, name.name, txn.txid)
+            .is_some()
+        {
             return sql_fail(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
                 "\"{}\" is not a table",
@@ -1161,8 +1233,8 @@ pub fn drop_table(
                         txn.txid,
                     ) {
                         Ok(Some(slot)) => {
-                            if let Err(error) = txn
-                                .record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
+                            if let Err(error) =
+                                txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
                             {
                                 return sql_fail(error);
                             }
@@ -1193,8 +1265,7 @@ pub fn drop_table(
                 // PostgreSQL's skip notice carries SQLSTATE 00000.
                 responder.notice(
                     crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "table \"{}\" does not exist, skipping", name.name)
-                        .as_str(),
+                    stack_format!(128, "table \"{}\" does not exist, skipping", name.name).as_str(),
                 )?;
             }
             _ => return sql_fail(undefined_kind("table", name.name)),
@@ -1253,10 +1324,7 @@ pub fn create_schema(
                 return sql_fail(e);
             }
         }
-        Err(e)
-            if e.sqlstate == crate::sql::eval::sqlstate::DUPLICATE_SCHEMA
-                && if_not_exists =>
-        {
+        Err(e) if e.sqlstate == crate::sql::eval::sqlstate::DUPLICATE_SCHEMA && if_not_exists => {
             responder.notice(
                 crate::sql::eval::sqlstate::DUPLICATE_SCHEMA,
                 stack_format!(128, "schema \"{}\" already exists, skipping", name).as_str(),
@@ -1311,7 +1379,7 @@ pub fn alter_owner(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a table",
                     name.name
-                ))
+                ));
             }
             None => match resolve_sequence(storage, name, txn.txid) {
                 Ok(Some(_)) => true,
@@ -1326,7 +1394,7 @@ pub fn alter_owner(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a view",
                     name.name
-                ))
+                ));
             }
             None => false,
         },
@@ -1351,7 +1419,7 @@ pub fn alter_owner(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a materialized view",
                     name.name
-                ))
+                ));
             }
             None => false,
         },
@@ -1377,13 +1445,20 @@ pub fn alter_owner(
                 name.name
             ),
             AlterOwnerKind::Type | AlterOwnerKind::Domain => {
-                sql_err!(sqlstate::UNDEFINED_OBJECT, "type \"{}\" does not exist", name.name)
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    name.name
+                )
             }
             AlterOwnerKind::Sequence => undefined_kind("sequence", name.name),
             _ => undefined_qual(name),
         });
     }
-    if !matches!(role, "postgres" | "current_role" | "current_user" | "session_user") {
+    if !matches!(
+        role,
+        "postgres" | "current_role" | "current_user" | "session_user"
+    ) {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "role \"{}\" does not exist",
@@ -1402,12 +1477,18 @@ pub fn alter_owner(
 enum SchemaObject {
     Table(usize),
     View(usize),
-    Matview { table: usize, catalog: usize },
+    Matview {
+        table: usize,
+        catalog: usize,
+    },
     Sequence(usize),
     Domain(usize),
     Enum(usize),
     /// An inbound foreign key on a table that itself survives.
-    InboundFk { table: usize, fk_index: usize },
+    InboundFk {
+        table: usize,
+        fk_index: usize,
+    },
 }
 
 /// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT]: RESTRICT (the
@@ -1455,8 +1536,7 @@ pub fn drop_schema(
             None if if_exists => {
                 responder.notice(
                     crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "schema \"{}\" does not exist, skipping", name)
-                        .as_str(),
+                    stack_format!(128, "schema \"{}\" does not exist, skipping", name).as_str(),
                 )?;
             }
             None => {
@@ -1464,7 +1544,7 @@ pub fn drop_schema(
                     sqlstate::INVALID_SCHEMA_NAME,
                     "schema \"{}\" does not exist",
                     name
-                ))
+                ));
             }
         }
     }
@@ -1490,9 +1570,7 @@ pub fn drop_schema(
     };
     for t in 0..storage.table_count() {
         let def = storage.table_def(t, txn.txid);
-        if !storage.table(t).visible_to(txn.txid)
-            || !in_listed(storage, def.schema.as_str())
-        {
+        if !storage.table(t).visible_to(txn.txid) || !in_listed(storage, def.schema.as_str()) {
             continue;
         }
         let def = *def;
@@ -1554,8 +1632,7 @@ pub fn drop_schema(
                 continue;
             }
             let parent_in_schema = (0..storage.domain_count()).any(|parent| {
-                schema_domains[parent]
-                    && domain_depends_on(storage, domain_slot, parent, txn.txid)
+                schema_domains[parent] && domain_depends_on(storage, domain_slot, parent, txn.txid)
             });
             let enum_in_schema = match domain.base {
                 ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
@@ -1592,11 +1669,9 @@ pub fn drop_schema(
                     let Some(domain_schema) = column.user_type_schema else {
                         return false;
                     };
-                    let Some(domain_slot) = storage.domain_slot(
-                        domain_schema.as_str(),
-                        domain_name.as_str(),
-                        txn.txid,
-                    ) else {
+                    let Some(domain_slot) =
+                        storage.domain_slot(domain_schema.as_str(), domain_name.as_str(), txn.txid)
+                    else {
                         return false;
                     };
                     let parent_domain_in_schema = (0..storage.domain_count()).any(|parent| {
@@ -1604,8 +1679,7 @@ pub fn drop_schema(
                             && domain_depends_on(storage, domain_slot, parent, txn.txid)
                     });
                     let base_enum_in_schema = match storage.domain(domain_slot).base {
-                        ColType::Enum(slot)
-                        | ColType::Array(super::types::ArrElem::Enum(slot)) => {
+                        ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
                             in_listed(storage, storage.enum_def(slot as usize).schema.as_str())
                         }
                         _ => false,
@@ -1633,22 +1707,12 @@ pub fn drop_schema(
                     .zip(column.user_type_schema)
                     .and_then(|(domain_name, domain_schema)| {
                         storage
-                            .domain_slot(
-                                domain_schema.as_str(),
-                                domain_name.as_str(),
-                                txn.txid,
-                            )
+                            .domain_slot(domain_schema.as_str(), domain_name.as_str(), txn.txid)
                             .map(|domain_slot| {
-                                let parent_in_schema =
-                                    (0..storage.domain_count()).any(|parent| {
-                                        schema_domains[parent]
-                                            && domain_depends_on(
-                                                storage,
-                                                domain_slot,
-                                                parent,
-                                                txn.txid,
-                                            )
-                                    });
+                                let parent_in_schema = (0..storage.domain_count()).any(|parent| {
+                                    schema_domains[parent]
+                                        && domain_depends_on(storage, domain_slot, parent, txn.txid)
+                                });
                                 let enum_in_schema = match storage.domain(domain_slot).base {
                                     ColType::Enum(slot)
                                     | ColType::Array(super::types::ArrElem::Enum(slot)) => {
@@ -1725,7 +1789,10 @@ pub fn drop_schema(
                     return sql_fail(undefined_kind("materialized view", matview.name.as_str()));
                 };
                 if let Err(error) = push(
-                    SchemaObject::Matview { table, catalog: matview_slot },
+                    SchemaObject::Matview {
+                        table,
+                        catalog: matview_slot,
+                    },
                     &mut n_objects,
                 ) {
                     return sql_fail(error);
@@ -1737,14 +1804,18 @@ pub fn drop_schema(
     // the constraint (PostgreSQL drops the constraint, not the table).
     for t in 0..storage.table_count() {
         let def = storage.table_def(t, txn.txid);
-        if !storage.table(t).visible_to(txn.txid)
-            || in_listed(storage, def.schema.as_str())
-        {
+        if !storage.table(t).visible_to(txn.txid) || in_listed(storage, def.schema.as_str()) {
             continue;
         }
         for f in 0..def.n_fkeys {
             if in_listed(storage, def.fkeys[f].parent_schema.as_str())
-                && let Err(e) = push(SchemaObject::InboundFk { table: t, fk_index: f }, &mut n_objects)
+                && let Err(e) = push(
+                    SchemaObject::InboundFk {
+                        table: t,
+                        fk_index: f,
+                    },
+                    &mut n_objects,
+                )
             {
                 return sql_fail(e);
             }
@@ -1773,7 +1844,11 @@ pub fn drop_schema(
             }
             SchemaObject::View(v) => {
                 let view = storage.view(*v);
-                (schema_rank(storage, view.schema.as_str()), view.created_at, 0)
+                (
+                    schema_rank(storage, view.schema.as_str()),
+                    view.created_at,
+                    0,
+                )
             }
             SchemaObject::Matview { table, .. } => {
                 let table_state = storage.table(*table);
@@ -1812,10 +1887,7 @@ pub fn drop_schema(
                 let child = storage.table(*table);
                 let def = storage.table_def(*table, txn.txid);
                 (
-                    schema_rank(
-                        storage,
-                        def.fkeys[*fk_index].parent_schema.as_str(),
-                    ),
+                    schema_rank(storage, def.fkeys[*fk_index].parent_schema.as_str()),
                     child.created_at,
                     1,
                 )
@@ -1904,18 +1976,22 @@ pub fn drop_schema(
                     SchemaObject::View(v) => storage.view(*v).schema.as_str(),
                     SchemaObject::Matview { table, .. } =>
                         storage.table_def(*table, txn.txid).schema.as_str(),
-                    SchemaObject::Sequence(sequence) =>
-                        storage.sequence(*sequence).schema.as_str(),
+                    SchemaObject::Sequence(sequence) => storage.sequence(*sequence).schema.as_str(),
                     SchemaObject::Domain(domain) => storage.domain(*domain).schema.as_str(),
                     SchemaObject::Enum(enumeration) =>
                         storage.enum_def(*enumeration).schema.as_str(),
                     SchemaObject::InboundFk { table, fk_index } =>
-                        storage.table_def(*table, txn.txid).fkeys[*fk_index].parent_schema.as_str(),
+                        storage.table_def(*table, txn.txid).fkeys[*fk_index]
+                            .parent_schema
+                            .as_str(),
                 }
             );
         }
         let mut hint = crate::util::StackStr::<128>::new();
-        let _ = write!(hint, "Use DROP ... CASCADE to drop the dependent objects too.");
+        let _ = write!(
+            hint,
+            "Use DROP ... CASCADE to drop the dependent objects too."
+        );
         crate::sql::eval::stash_diagnostic(detail, Some(hint));
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -2010,24 +2086,16 @@ pub fn drop_schema(
                     continue;
                 }
                 let mut identity_mapping = [None; MAX_COLUMNS];
-                for (column, target) in identity_mapping
-                    .iter_mut()
-                    .enumerate()
-                    .take(def.n_columns)
+                for (column, target) in identity_mapping.iter_mut().enumerate().take(def.n_columns)
                 {
                     *target = Some(def.columns()[column].name);
                 }
-                if let Err(error) = storage.write_table_def(
-                    *table,
-                    txn.txid,
-                    updated,
-                    &identity_mapping,
-                    false,
-                ) {
+                if let Err(error) =
+                    storage.write_table_def(*table, txn.txid, updated, &identity_mapping, false)
+                {
                     return sql_fail(error);
                 }
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::TableAltered(*table as u32))
+                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(*table as u32))
                 {
                     storage.rollback_table_def(*table, txn.txid);
                     return sql_fail(error);
@@ -2041,18 +2109,19 @@ pub fn drop_schema(
                 let lsn = storage.bump_lsn();
                 if let Err(e) = wal.append(
                     lsn,
-                    &WalOp::DropView { schema: schema.as_str(), name: vname.as_str() },
+                    &WalOp::DropView {
+                        schema: schema.as_str(),
+                        name: vname.as_str(),
+                    },
                 ) {
                     return sql_fail(e);
                 }
-                let dropped = match storage.drop_view(schema.as_str(), vname.as_str(), txn.txid)
-                {
+                let dropped = match storage.drop_view(schema.as_str(), vname.as_str(), txn.txid) {
                     Ok(d) => d,
                     Err(e) => return sql_fail(e),
                 };
                 if let Some(slot) = dropped
-                    && let Err(e) =
-                        txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
+                    && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
                 {
                     return sql_fail(e);
                 }
@@ -2283,7 +2352,11 @@ pub fn create_view(
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
     let dependencies = match super::query::stored_query_dependencies(
-        buffer.as_str(), storage, txn.txid, path, arena,
+        buffer.as_str(),
+        storage,
+        txn.txid,
+        path,
+        arena,
     ) {
         Ok(dependencies) => dependencies,
         Err(error) => return sql_fail(error),
@@ -2362,8 +2435,8 @@ pub fn comment(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    use crate::storage::{CommentClass, StoredRelKind};
     use super::ast::CommentTarget;
+    use crate::storage::{CommentClass, StoredRelKind};
 
     let txid = txn.txid;
     // Resolve the target to a comment key `(class, schema, name, subid)`,
@@ -2382,16 +2455,26 @@ pub fn comment(
                 (kind, actual),
                 (super::ast::CommentRelKind::Table, StoredRelKind::Table)
                     | (super::ast::CommentRelKind::View, StoredRelKind::View)
-                    | (super::ast::CommentRelKind::MaterializedView, StoredRelKind::Matview)
+                    | (
+                        super::ast::CommentRelKind::MaterializedView,
+                        StoredRelKind::Matview
+                    )
                     | (super::ast::CommentRelKind::Index, StoredRelKind::Index)
-                    | (super::ast::CommentRelKind::Sequence, StoredRelKind::Sequence)
+                    | (
+                        super::ast::CommentRelKind::Sequence,
+                        StoredRelKind::Sequence
+                    )
             );
             if !ok {
                 return sql_fail(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a{} {}",
                     rel.name,
-                    if kind.noun().starts_with(['a', 'e', 'i', 'o', 'u']) { "n" } else { "" },
+                    if kind.noun().starts_with(['a', 'e', 'i', 'o', 'u']) {
+                        "n"
+                    } else {
+                        ""
+                    },
                     kind.noun()
                 ));
             }
@@ -2436,8 +2519,7 @@ pub fn comment(
                     Ok(sql) => sql,
                     Err(_) => return sql_fail(super::query::arena_full_pub()),
                 };
-                let mut columns =
-                    [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+                let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
                 let described = super::query::describe_stored_query(
                     view_sql,
                     storage,
@@ -2507,9 +2589,7 @@ pub fn comment(
                 .split_once('.')
                 .map_or((None, type_name), |(schema, name)| (Some(schema), name));
             let builtin = (qualifier.is_none() || qualifier == Some("pg_catalog"))
-                .then(|| {
-                    super::catalog::builtin_type_identity(bare_name, qualifier.is_none())
-                })
+                .then(|| super::catalog::builtin_type_identity(bare_name, qualifier.is_none()))
                 .flatten();
             let composite = storage
                 .classify_relation(qualifier, bare_name, txid)
@@ -2590,11 +2670,10 @@ pub fn comment(
         None => None,
     };
 
-    let (slot, prior) =
-        match storage.set_comment(class, schema, name, subid, stored_text, txid) {
-            Ok(v) => v,
-            Err(e) => return sql_fail(e),
-        };
+    let (slot, prior) = match storage.set_comment(class, schema, name, subid, stored_text, txid) {
+        Ok(v) => v,
+        Err(e) => return sql_fail(e),
+    };
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.append(
         lsn,
@@ -2610,7 +2689,10 @@ pub fn comment(
         storage.restore_comment_pending(slot, prior);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::CommentSet { slot: slot as u32, prior }) {
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
+        slot: slot as u32,
+        prior,
+    }) {
         storage.restore_comment_pending(slot, prior);
         return sql_fail(e);
     }
@@ -2682,7 +2764,11 @@ pub fn create_table_as(
                 columns[i].type_oid
             ));
         };
-        let col_name = if rename.is_empty() { columns[i].name } else { rename[i] };
+        let col_name = if rename.is_empty() {
+            columns[i].name
+        } else {
+            rename[i]
+        };
         let parsed = match SqlName::parse(col_name) {
             Ok(n) => n,
             Err(e) => return sql_fail(e),
@@ -2740,7 +2826,14 @@ pub fn create_table_as(
         };
         let mut rows = 0usize;
         if let Err(e) = super::query::select_into_rows(
-            storage, txn.txid, sel, arena, params, None, None, &mut |_| {
+            storage,
+            txn.txid,
+            sel,
+            arena,
+            params,
+            None,
+            None,
+            &mut |_| {
                 rows += 1;
                 Ok(())
             },
@@ -2754,12 +2847,19 @@ pub fn create_table_as(
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "CREATE TABLE AS result exceeds the statement arena"
-                ))
+                ));
             }
         };
         let mut at = 0usize;
         if let Err(e) = super::query::select_into_rows(
-            storage, txn.txid, sel, arena, params, None, None, &mut |vals| {
+            storage,
+            txn.txid,
+            sel,
+            arena,
+            params,
+            None,
+            None,
+            &mut |vals| {
                 rows_bytes[at] = encode_projected_pub(vals, arena)?;
                 at += 1;
                 Ok(())
@@ -2847,26 +2947,33 @@ fn materialized_column_type(
     storage: &Storage,
     txid: u32,
     type_oid: i32,
-) -> Option<(ColType, Option<crate::storage::SqlName>, Option<crate::storage::SqlName>)> {
-    use crate::sql::types::{oid, ArrElem};
+) -> Option<(
+    ColType,
+    Option<crate::storage::SqlName>,
+    Option<crate::storage::SqlName>,
+)> {
+    use crate::sql::types::{ArrElem, oid};
     if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
         .contains(&type_oid)
     {
         let domain = storage.domain((type_oid - oid::FIRST_DOMAIN) as usize);
-        return domain
-            .visible_to(txid)
-            .then_some((domain.base, Some(domain.name), Some(domain.schema)));
+        return domain.visible_to(txid).then_some((
+            domain.base,
+            Some(domain.name),
+            Some(domain.schema),
+        ));
     }
-    if (oid::FIRST_DOMAIN_ARRAY
-        ..oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+    if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
         .contains(&type_oid)
     {
         let slot = (type_oid - oid::FIRST_DOMAIN_ARRAY) as usize;
         let domain = storage.domain(slot);
         let element = ArrElem::domain(slot as u16, domain.base)?;
-        return domain
-            .visible_to(txid)
-            .then_some((ColType::Array(element), Some(domain.name), Some(domain.schema)));
+        return domain.visible_to(txid).then_some((
+            ColType::Array(element),
+            Some(domain.name),
+            Some(domain.schema),
+        ));
     }
     let ctype = coltype_of_oid(type_oid)?;
     let user_type = match ctype {
@@ -2913,7 +3020,7 @@ pub fn refresh_materialized_view(
             return sql_fail(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "materialized view query exceeds the statement arena"
-            ))
+            ));
         }
     };
     let user = super::eval::funcs::system::session_user_owned();
@@ -2939,7 +3046,10 @@ pub fn refresh_materialized_view(
         let mut count = 0usize;
         let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            if state.visible_at(txn.txid, storage.read_snapshot()).is_none() {
+            if state
+                .visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
+                .is_none()
+            {
                 return Ok(ControlFlow::Continue(()));
             }
             if count == rowids.len() {
@@ -2968,7 +3078,14 @@ pub fn refresh_materialized_view(
     // the source may read another table without overlapping the write).
     let mut rows = 0usize;
     if let Err(e) = super::query::select_into_rows(
-        storage, txn.txid, select, arena, params, None, None, &mut |_| {
+        storage,
+        txn.txid,
+        select,
+        arena,
+        params,
+        None,
+        None,
+        &mut |_| {
             rows += 1;
             Ok(())
         },
@@ -2982,12 +3099,19 @@ pub fn refresh_materialized_view(
             return sql_fail(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "REFRESH result exceeds the statement arena"
-            ))
+            ));
         }
     };
     let mut at = 0usize;
     if let Err(e) = super::query::select_into_rows(
-        storage, txn.txid, select, arena, params, None, None, &mut |values| {
+        storage,
+        txn.txid,
+        select,
+        arena,
+        params,
+        None,
+        None,
+        &mut |values| {
             rows_bytes[at] = encode_projected_pub(values, arena)?;
             at += 1;
             Ok(())
@@ -3057,13 +3181,17 @@ pub fn drop_materialized_view(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a materialized view",
                     name.name
-                ))
+                ));
             }
             None if if_exists => {
                 responder.notice(
                     crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "materialized view \"{}\" does not exist, skipping", name.name)
-                        .as_str(),
+                    stack_format!(
+                        128,
+                        "materialized view \"{}\" does not exist, skipping",
+                        name.name
+                    )
+                    .as_str(),
                 )?;
                 continue;
             }
@@ -3089,7 +3217,11 @@ pub fn drop_materialized_view(
         }
         if cascade
             && let Err(error) = drop_selected_stored_queries(
-                storage, wal, txn, &dependent_views, &dependent_matviews,
+                storage,
+                wal,
+                txn,
+                &dependent_views,
+                &dependent_matviews,
             )
         {
             return sql_fail(error);
@@ -3098,7 +3230,10 @@ pub fn drop_materialized_view(
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
             lsn,
-            &WalOp::DropTable { schema: def.schema.as_str(), name: def.name.as_str() },
+            &WalOp::DropTable {
+                schema: def.schema.as_str(),
+                name: def.name.as_str(),
+            },
         ) {
             return sql_fail(e);
         }
@@ -3111,7 +3246,10 @@ pub fn drop_materialized_view(
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
             lsn,
-            &WalOp::DropMatview { schema: def.schema.as_str(), name: def.name.as_str() },
+            &WalOp::DropMatview {
+                schema: def.schema.as_str(),
+                name: def.name.as_str(),
+            },
         ) {
             return sql_fail(e);
         }
@@ -3156,10 +3294,7 @@ fn resolve_seq_spec(
         Some(n) => seq_type_of(n)?,
         None => base.map(|b| b.data_type).unwrap_or(SeqType::Bigint),
     };
-    let increment = options
-        .increment
-        .or(base.map(|b| b.increment))
-        .unwrap_or(1);
+    let increment = options.increment.or(base.map(|b| b.increment)).unwrap_or(1);
     if increment == 0 {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,
@@ -3256,7 +3391,15 @@ fn resolve_seq_spec(
         }
     };
     Ok((
-        SeqSpec { data_type, increment, min_value, max_value, start_value, cache, cycle },
+        SeqSpec {
+            data_type,
+            increment,
+            min_value,
+            max_value,
+            start_value,
+            cache,
+            cycle,
+        },
         restart,
     ))
 }
@@ -3322,10 +3465,12 @@ pub fn create_sequence(
         Err(e) => return sql_fail(e),
     };
     let owner = match options.owned_by {
-        Some(Some(owner)) => match resolve_sequence_owner(storage, owner, schema.as_str(), txn.txid) {
-            Ok(owner) => Some(owner),
-            Err(error) => return sql_fail(error),
-        },
+        Some(Some(owner)) => {
+            match resolve_sequence_owner(storage, owner, schema.as_str(), txn.txid) {
+                Ok(owner) => Some(owner),
+                Err(error) => return sql_fail(error),
+            }
+        }
         _ => None,
     };
     let sqlname = match SqlName::parse(name.name) {
@@ -3405,12 +3550,11 @@ pub fn alter_sequence(
     let prior = storage.sequence(slot);
     if options.owned_by.is_some()
         && let Some(generator) = prior.generator_for
-        && let Some(table_slot) =
-            storage.find_visible(
-                generator.table_schema.as_str(),
-                generator.table.as_str(),
-                txn.txid,
-            )
+        && let Some(table_slot) = storage.find_visible(
+            generator.table_schema.as_str(),
+            generator.table.as_str(),
+            txn.txid,
+        )
         && let Some(column) = storage
             .table_def(table_slot, txn.txid)
             .column_index(generator.column.as_str())
@@ -3575,7 +3719,11 @@ pub fn drop_sequence(
                 return sql_fail(error);
             }
             if let Err(error) = drop_selected_stored_queries(
-                storage, wal, txn, &dependent_views, &dependent_matviews,
+                storage,
+                wal,
+                txn,
+                &dependent_views,
+                &dependent_matviews,
             ) {
                 return sql_fail(error);
             }
@@ -3583,7 +3731,10 @@ pub fn drop_sequence(
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.append(
             lsn,
-            &WalOp::DropSequence { schema: schema.as_str(), name: sname.as_str() },
+            &WalOp::DropSequence {
+                schema: schema.as_str(),
+                name: sname.as_str(),
+            },
         ) {
             return sql_fail(e);
         }
@@ -3621,11 +3772,7 @@ fn domain_text<const N: usize>(text: &str) -> Result<StackStr<N>, SqlError> {
 
 /// Validates that a domain CHECK/DEFAULT expression parses and references no
 /// column other than `VALUE` (PostgreSQL's placeholder for the input value).
-fn validate_domain_expr(
-    text: &str,
-    allow_value: bool,
-    arena: &Arena,
-) -> Result<(), SqlError> {
+fn validate_domain_expr(text: &str, allow_value: bool, arena: &Arena) -> Result<(), SqlError> {
     let expr = crate::sql::parser::parse_expr(text, arena)?;
     let mut bad: Option<SqlError> = None;
     expr.for_each_column(&mut |name| {
@@ -3633,7 +3780,11 @@ fn validate_domain_expr(
             return;
         }
         if !(allow_value && name.eq_ignore_ascii_case("value")) {
-            bad = Some(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name));
+            bad = Some(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            ));
         }
     });
     match bad {
@@ -3668,12 +3819,7 @@ fn build_domain_spec(
                 parent.default_expr,
             )
         } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            (
-                None,
-                None,
-                ColType::Enum(enum_slot as u16),
-                None,
-            )
+            (None, None, ColType::Enum(enum_slot as u16), None)
         } else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -3735,11 +3881,17 @@ fn generate_check_name(
         } else {
             stack_format!(128, "{}_check{}", domain, suffix)
         };
-        if !existing.iter().any(|c| c.name.as_str() == candidate.as_str()) {
+        if !existing
+            .iter()
+            .any(|c| c.name.as_str() == candidate.as_str())
+        {
             return SqlName::parse(candidate.as_str());
         }
     }
-    Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cannot name domain CHECK constraint"))
+    Err(sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "cannot name domain CHECK constraint"
+    ))
 }
 
 pub fn create_domain(
@@ -3754,7 +3906,10 @@ pub fn create_domain(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    if storage.domain_slot(schema.as_str(), d.name.name, txn.txid).is_some() {
+    if storage
+        .domain_slot(schema.as_str(), d.name.name, txn.txid)
+        .is_some()
+    {
         return sql_fail(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
             "type \"{}\" already exists",
@@ -3847,8 +4002,7 @@ pub fn drop_domain(
         if !cascade {
             let target = (0..storage.domain_count())
                 .find(|target| {
-                    selected[*target]
-                        && domain_depends_on(storage, candidate, *target, txn.txid)
+                    selected[*target] && domain_depends_on(storage, candidate, *target, txn.txid)
                 })
                 .expect("dependency target");
             return sql_fail(sql_err!(
@@ -3860,21 +4014,19 @@ pub fn drop_domain(
         selected[candidate] = true;
     }
 
-    if let Err(error) =
-        drop_domain_selection(
-            storage,
-            wal,
-            txn,
-            scratch,
-            &selected,
-            None,
-            cascade,
-            0,
-            arena,
-            seq_session,
-            responder,
-        )
-    {
+    if let Err(error) = drop_domain_selection(
+        storage,
+        wal,
+        txn,
+        scratch,
+        &selected,
+        None,
+        cascade,
+        0,
+        arena,
+        seq_session,
+        responder,
+    ) {
         return sql_fail(error);
     }
     responder.command_complete("DROP DOMAIN")?;
@@ -3897,35 +4049,18 @@ fn drop_domain_selection(
 ) -> Result<(), SqlError> {
     let selected_count = selected.iter().filter(|&&yes| yes).count();
     if selected_count > 0 || selected_enum.is_some() {
-        apply_type_drop_to_stored_queries(
-            storage,
-            wal,
-            txn,
-            selected,
-            selected_enum,
-            cascade,
-        )?;
+        apply_type_drop_to_stored_queries(storage, wal, txn, selected, selected_enum, cascade)?;
     }
-    for (slot, is_selected) in selected
-        .iter()
-        .enumerate()
-        .take(storage.domain_count())
-    {
+    for (slot, is_selected) in selected.iter().enumerate().take(storage.domain_count()) {
         if !*is_selected {
             continue;
         }
-        while let Some((table_schema, table, _)) =
-            domain_column_in_use(storage, slot, txn.txid)
-        {
+        while let Some((table_schema, table, _)) = domain_column_in_use(storage, slot, txn.txid) {
             if cascade {
                 let domain = storage.domain(slot);
                 let (domain_schema, domain_name) = (domain.schema, domain.name);
                 let table_slot = storage
-                    .find_visible(
-                        table_schema.as_str(),
-                        table.as_str(),
-                        txn.txid,
-                    )
+                    .find_visible(table_schema.as_str(), table.as_str(), txn.txid)
                     .expect("dependent table remains visible");
                 let def = storage.table_def(table_slot, txn.txid);
                 let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
@@ -3999,10 +4134,13 @@ fn drop_domain_selection(
             (domain.schema, domain.name)
         };
         let lsn = storage.bump_lsn();
-        wal.append(lsn, &WalOp::DropDomain {
-            schema: schema.as_str(),
-            name: dname.as_str(),
-        })?;
+        wal.append(
+            lsn,
+            &WalOp::DropDomain {
+                schema: schema.as_str(),
+                name: dname.as_str(),
+            },
+        )?;
         match storage.drop_domain(schema.as_str(), dname.as_str(), txn.txid) {
             Ok(Some(slot)) => {
                 txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32))?;
@@ -4027,9 +4165,7 @@ fn domain_column_in_use(
         }
         let def = storage.table_def(table_index, txid);
         for column in def.columns() {
-            if column
-                .domain
-                .is_some_and(|name| name == domain.name)
+            if column.domain.is_some_and(|name| name == domain.name)
                 && column
                     .user_type_schema
                     .is_some_and(|schema| schema == domain.schema)
@@ -4335,7 +4471,9 @@ fn validate_domain_rows(
         def.schema(&mut schema);
         storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            let Some(home) = state.visible_at(txid, storage.read_snapshot()) else {
+            let Some(home) =
+                state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+            else {
                 return Ok(ControlFlow::Continue(()));
             };
             let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
@@ -4407,9 +4545,15 @@ fn build_enum_spec(labels: &[&str]) -> Result<crate::storage::EnumSpec, SqlError
                 label
             ));
         }
-        members[i] = crate::storage::EnumMember { label: SqlName::parse(label)?, sort: (i + 1) as f64 };
+        members[i] = crate::storage::EnumMember {
+            label: SqlName::parse(label)?,
+            sort: (i + 1) as f64,
+        };
     }
-    Ok(crate::storage::EnumSpec { members, n_members: labels.len() })
+    Ok(crate::storage::EnumSpec {
+        members,
+        n_members: labels.len(),
+    })
 }
 
 pub fn create_enum(
@@ -4425,8 +4569,12 @@ pub fn create_enum(
         Err(e) => return sql_fail(e),
     };
     // Types share a namespace: reject a name already taken by a domain or enum.
-    if storage.enum_slot(schema.as_str(), name.name, txn.txid).is_some()
-        || storage.domain_slot(schema.as_str(), name.name, txn.txid).is_some()
+    if storage
+        .enum_slot(schema.as_str(), name.name, txn.txid)
+        .is_some()
+        || storage
+            .domain_slot(schema.as_str(), name.name, txn.txid)
+            .is_some()
     {
         return sql_fail(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
@@ -4494,16 +4642,10 @@ pub fn drop_enum(
             let e = storage.enum_def(slot);
             (e.schema, e.name)
         };
-        while let Some((table_schema, table, _)) =
-            enum_column_in_use(storage, slot, txn.txid)
-        {
+        while let Some((table_schema, table, _)) = enum_column_in_use(storage, slot, txn.txid) {
             if cascade {
                 let table_slot = storage
-                    .find_visible(
-                        table_schema.as_str(),
-                        table.as_str(),
-                        txn.txid,
-                    )
+                    .find_visible(table_schema.as_str(), table.as_str(), txn.txid)
                     .expect("dependent table remains visible");
                 let def = storage.table_def(table_slot, txn.txid);
                 let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
@@ -4567,27 +4709,29 @@ pub fn drop_enum(
                 ename.as_str()
             ));
         }
-        if let Err(error) =
-            drop_domain_selection(
-                storage,
-                wal,
-                txn,
-                scratch,
-                &dependent_domains,
-                Some(slot),
-                cascade,
-                1,
-                arena,
-                seq_session,
-                responder,
-            )
-        {
+        if let Err(error) = drop_domain_selection(
+            storage,
+            wal,
+            txn,
+            scratch,
+            &dependent_domains,
+            Some(slot),
+            cascade,
+            1,
+            arena,
+            seq_session,
+            responder,
+        ) {
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) =
-            wal.append(lsn, &WalOp::DropEnum { schema: schema.as_str(), name: ename.as_str() })
-        {
+        if let Err(e) = wal.append(
+            lsn,
+            &WalOp::DropEnum {
+                schema: schema.as_str(),
+                name: ename.as_str(),
+            },
+        ) {
             return sql_fail(e);
         }
         match storage.drop_enum(schema.as_str(), ename.as_str(), txn.txid) {
@@ -4668,13 +4812,17 @@ fn stored_query_dependent_closure(
             if views[slot] || !view.visible_to(txid) {
                 continue;
             }
-            let hit = storage.view_dependencies(slot).entries().iter().any(|dependency| {
-                root(dependency)
-                    || (dependency.class == DependencyClass::View
-                        && views[dependency.slot as usize])
-                    || (dependency.class == DependencyClass::Table
-                        && matview_tables[dependency.slot as usize])
-            });
+            let hit = storage
+                .view_dependencies(slot)
+                .entries()
+                .iter()
+                .any(|dependency| {
+                    root(dependency)
+                        || (dependency.class == DependencyClass::View
+                            && views[dependency.slot as usize])
+                        || (dependency.class == DependencyClass::Table
+                            && matview_tables[dependency.slot as usize])
+                });
             if hit {
                 views[slot] = true;
                 changed = true;
@@ -4687,13 +4835,17 @@ fn stored_query_dependent_closure(
                 slot += 1;
                 continue;
             }
-            let hit = storage.matview_dependencies(slot).entries().iter().any(|dependency| {
-                root(dependency)
-                    || (dependency.class == DependencyClass::View
-                        && views[dependency.slot as usize])
-                    || (dependency.class == DependencyClass::Table
-                        && matview_tables[dependency.slot as usize])
-            });
+            let hit = storage
+                .matview_dependencies(slot)
+                .entries()
+                .iter()
+                .any(|dependency| {
+                    root(dependency)
+                        || (dependency.class == DependencyClass::View
+                            && views[dependency.slot as usize])
+                        || (dependency.class == DependencyClass::Table
+                            && matview_tables[dependency.slot as usize])
+                });
             if hit {
                 matviews[slot] = true;
                 let table = storage
@@ -4740,8 +4892,8 @@ fn report_stored_query_dependents(
     cascade: bool,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
-    use core::fmt::Write as _;
     use crate::storage::DependencyClass;
+    use core::fmt::Write as _;
 
     let views = selection.views;
     let matviews = selection.matviews;
@@ -4966,7 +5118,10 @@ fn report_stored_query_dependents(
         }
     } else {
         let mut hint = crate::util::StackStr::<128>::new();
-        let _ = write!(hint, "Use DROP ... CASCADE to drop the dependent objects too.");
+        let _ = write!(
+            hint,
+            "Use DROP ... CASCADE to drop the dependent objects too."
+        );
         crate::sql::eval::stash_diagnostic(detail, Some(hint));
     }
     Ok(())
@@ -5104,13 +5259,19 @@ pub fn alter_type(
         ));
     };
     match action {
-        A::AddValue { label, if_not_exists, before, after } => {
+        A::AddValue {
+            label,
+            if_not_exists,
+            before,
+            after,
+        } => {
             let current = *storage.enum_def(slot);
             if current.sort_of(label).is_some() {
                 if *if_not_exists {
                     responder.notice(
                         sqlstate::DUPLICATE_OBJECT,
-                        stack_format!(128, "enum label \"{}\" already exists, skipping", label).as_str(),
+                        stack_format!(128, "enum label \"{}\" already exists, skipping", label)
+                            .as_str(),
                     )?;
                     responder.command_complete("ALTER TYPE")?;
                     return sql_ok();
@@ -5308,7 +5469,9 @@ fn rewrite_enum_label(
             })?;
         let mut n = 0;
         storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) = state.visible_at(txn.txid, storage.read_snapshot()) {
+            if let Some(home) =
+                state.visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
+            {
                 rows[n] = Some((rowid, home));
                 n += 1;
             }
@@ -5407,7 +5570,10 @@ fn compute_add_value_sort(
     let neighbour = before.or(after);
     let Some(pivot) = neighbour else {
         // Append: one past the current maximum sort (or 1.0 for an empty enum).
-        let max = members.iter().map(|m| m.sort).fold(f64::NEG_INFINITY, f64::max);
+        let max = members
+            .iter()
+            .map(|m| m.sort)
+            .fold(f64::NEG_INFINITY, f64::max);
         return Ok(if members.is_empty() { 1.0 } else { max + 1.0 });
     };
     let Some(pivot_sort) = def.sort_of(pivot) else {
@@ -5423,12 +5589,23 @@ fn compute_add_value_sort(
         sorts[i] = m.sort;
     }
     sorts[..members.len()].sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pos = sorts[..members.len()].iter().position(|&s| s == pivot_sort).unwrap();
+    let pos = sorts[..members.len()]
+        .iter()
+        .position(|&s| s == pivot_sort)
+        .unwrap();
     let new_sort = if before.is_some() {
-        let lower = if pos == 0 { pivot_sort - 1.0 } else { sorts[pos - 1] };
+        let lower = if pos == 0 {
+            pivot_sort - 1.0
+        } else {
+            sorts[pos - 1]
+        };
         (lower + pivot_sort) / 2.0
     } else {
-        let upper = if pos + 1 == members.len() { pivot_sort + 1.0 } else { sorts[pos + 1] };
+        let upper = if pos + 1 == members.len() {
+            pivot_sort + 1.0
+        } else {
+            sorts[pos + 1]
+        };
         (pivot_sort + upper) / 2.0
     };
     Ok(new_sort)
@@ -5447,7 +5624,10 @@ fn resolve_sequence(
         return Ok(Some(slot));
     }
     // Not a sequence: distinguish a wrong-type relation (42809) from absence.
-    if storage.resolve_relation(name.schema, name.name, txid).is_some() {
+    if storage
+        .resolve_relation(name.schema, name.name, txid)
+        .is_some()
+    {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
             "\"{}\" is not a sequence",
@@ -5506,7 +5686,11 @@ pub fn drop_view(
             }
             if cascade
                 && let Err(error) = drop_selected_stored_queries(
-                    storage, wal, txn, &dependent_views, &dependent_matviews,
+                    storage,
+                    wal,
+                    txn,
+                    &dependent_views,
+                    &dependent_matviews,
                 )
             {
                 return sql_fail(error);
@@ -5514,12 +5698,14 @@ pub fn drop_view(
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(
                 lsn,
-                &WalOp::DropView { schema: schema.as_str(), name: view_name.as_str() },
+                &WalOp::DropView {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                },
             ) {
                 return sql_fail(e);
             }
-            let dropped = match storage.drop_view(schema.as_str(), view_name.as_str(), txn.txid)
-            {
+            let dropped = match storage.drop_view(schema.as_str(), view_name.as_str(), txn.txid) {
                 Ok(d) => d,
                 Err(e) => return sql_fail(e),
             };
@@ -5711,7 +5897,10 @@ pub fn drop_index(
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.append(
                 lsn,
-                &WalOp::DropIndex { schema: schema.as_str(), name: name.name },
+                &WalOp::DropIndex {
+                    schema: schema.as_str(),
+                    name: name.name,
+                },
             ) {
                 return sql_fail(e);
             }
@@ -5781,7 +5970,10 @@ impl CopyFmt {
         let mut null = StackStr::<64>::new();
         let _ = null.write_str(options.null_str());
         if null.is_truncated() {
-            return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "COPY NULL string is too long"));
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY NULL string is too long"
+            ));
         }
         // Resolve a FORCE column list into a bitmask over table columns.
         let mask = |names: &[&str]| -> Result<u64, SqlError> {
@@ -5904,7 +6096,12 @@ pub fn copy_begin(
             }
         }
     }
-    Ok(CopySetup { table_index, targets, n_targets, fmt })
+    Ok(CopySetup {
+        table_index,
+        targets,
+        n_targets,
+        fmt,
+    })
 }
 
 /// Whether COPY BINARY can round-trip a column of this type (its binary wire
@@ -6003,7 +6200,13 @@ pub fn copy_row(
         arena,
         &[],
     )?;
-    store_row(storage, txn, setup.table_index, None, &values[..def.n_columns])
+    store_row(
+        storage,
+        txn,
+        setup.table_index,
+        None,
+        &values[..def.n_columns],
+    )
 }
 
 /// One COPY FROM binary row: `row` is the int16 field count followed by each
@@ -6084,7 +6287,13 @@ pub fn copy_row_binary(
         arena,
         &[],
     )?;
-    store_row(storage, txn, setup.table_index, None, &values[..def.n_columns])
+    store_row(
+        storage,
+        txn,
+        setup.table_index,
+        None,
+        &values[..def.n_columns],
+    )
 }
 
 /// Decodes one COPY-binary field into a datum of `ctype`, per PostgreSQL's
@@ -6122,12 +6331,18 @@ fn decode_binary_field_with_storage<'a>(
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::Int2(i16::from_be_bytes(b)))
         }
+        ColType::Int2Vector => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY BINARY of type int2vector is not supported"
+        )),
         ColType::Int4 => via(oids::INT4),
         ColType::Int8 => via(oids::INT8),
         ColType::Float4 => via(oids::FLOAT4),
         ColType::Float8 => via(oids::FLOAT8),
         ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
-            core::str::from_utf8(bytes).map(Datum::Text).map_err(|_| bad())
+            core::str::from_utf8(bytes)
+                .map(Datum::Text)
+                .map_err(|_| bad())
         }
         ColType::Date => via(oids::DATE),
         ColType::Timestamp => via(oids::TIMESTAMP),
@@ -6203,7 +6418,10 @@ fn decode_binary_array<'a>(
     let count = reader.i32().map_err(|_| bad())?;
     let _lower_bound = reader.i32().map_err(|_| bad())?;
     if !(0..=crate::sql::array::MAX_ELEMENTS as i32).contains(&count) {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "array value too large"
+        ));
     }
     let element_type = element.to_coltype();
     let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
@@ -6271,17 +6489,21 @@ fn decode_range_body<'a>(
         return crate::sql::range::canonical(&parsed, kind, arena);
     }
     let element_type = kind.elem_type();
-    let read_bound = |reader: &mut crate::pg::wire::MsgIn<'a>| -> Result<Option<&'a str>, SqlError> {
-        let len = reader.i32().map_err(|_| bad())?;
-        if len < 0 {
-            return Ok(None);
-        }
-        let field = reader.take(len as usize).map_err(|_| bad())?;
-        let datum = decode_binary_field(element_type, field, arena)?;
-        Ok(Some(arena.alloc_str_display(datum).map_err(|_| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "range bound exceeds the statement arena")
-        })?))
-    };
+    let read_bound =
+        |reader: &mut crate::pg::wire::MsgIn<'a>| -> Result<Option<&'a str>, SqlError> {
+            let len = reader.i32().map_err(|_| bad())?;
+            if len < 0 {
+                return Ok(None);
+            }
+            let field = reader.take(len as usize).map_err(|_| bad())?;
+            let datum = decode_binary_field(element_type, field, arena)?;
+            Ok(Some(arena.alloc_str_display(datum).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "range bound exceeds the statement arena"
+                )
+            })?))
+        };
     if flags & 0x08 == 0 {
         parsed.lower = read_bound(reader)?;
     }
@@ -6302,7 +6524,10 @@ fn decode_binary_multirange<'a>(
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
     let count = reader.i32().map_err(|_| bad())?;
     if !(0..=crate::sql::range::MAX_MULTIRANGE as i32).contains(&count) {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many ranges"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange has too many ranges"
+        ));
     }
     let mut ranges = [""; crate::sql::range::MAX_MULTIRANGE];
     for slot in ranges.iter_mut().take(count as usize) {
@@ -6311,7 +6536,8 @@ fn decode_binary_multirange<'a>(
         let mut inner = crate::pg::wire::MsgIn::new(field);
         *slot = decode_range_body(kind, &mut inner, arena)?;
     }
-    let text = crate::sql::range::canonicalize_multirange(&mut ranges[..count as usize], kind, arena)?;
+    let text =
+        crate::sql::range::canonicalize_multirange(&mut ranges[..count as usize], kind, arena)?;
     Ok(Datum::Multirange { text, kind })
 }
 
@@ -6338,7 +6564,12 @@ fn decode_binary_bit<'a>(
                 b'0'
             }
         })
-        .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "bit string exceeds the statement arena"))?;
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "bit string exceeds the statement arena"
+            )
+        })?;
     let bits = core::str::from_utf8(bits).map_err(|_| bad())?;
     Ok(Datum::Bit { bits, varying })
 }
@@ -6357,7 +6588,9 @@ pub fn copy_out(
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let fmt = &setup.fmt;
-    responder.copy_out_response(setup.n_targets, fmt.binary).map_err(wire_to_sql)?;
+    responder
+        .copy_out_response(setup.n_targets, fmt.binary)
+        .map_err(wire_to_sql)?;
     if fmt.binary {
         responder.copy_binary_header().map_err(wire_to_sql)?;
     }
@@ -6372,8 +6605,13 @@ pub fn copy_out(
                     let name = def.columns()[setup.targets[i]].name.as_str();
                     if fmt.csv {
                         crate::sql::copy::encode_field_csv(
-                            out, Some(name), fmt.null.as_str(), fmt.delimiter, fmt.quote,
-                            fmt.escape, false,
+                            out,
+                            Some(name),
+                            fmt.null.as_str(),
+                            fmt.delimiter,
+                            fmt.quote,
+                            fmt.escape,
+                            false,
                         );
                     } else {
                         crate::sql::copy::encode_field(out, Some(name));
@@ -6387,17 +6625,32 @@ pub fn copy_out(
     // the visible tokens first, sort, then stream.
     let mut visible = 0usize;
     storage.for_each_row_state(setup.table_index, &mut |_, state| {
-        if state.visible_at(txid, storage.read_snapshot()).is_some() {
+        if state
+            .visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+            .is_some()
+        {
             visible += 1;
         }
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
     let tokens = arena
-        .alloc_slice_with(visible, |_| (0u64, crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 })))
-        .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "COPY TO snapshot exceeds the statement arena"))?;
+        .alloc_slice_with(visible, |_| {
+            (
+                0u64,
+                crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }),
+            )
+        })
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "COPY TO snapshot exceeds the statement arena"
+            )
+        })?;
     let mut fill = 0usize;
     storage.for_each_row_state(setup.table_index, &mut |rowid, state| {
-        if let Some(home) = state.visible_at(txid, storage.read_snapshot()) {
+        if let Some(home) =
+            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+        {
             tokens[fill] = (rowid, home);
             fill += 1;
         }
@@ -6451,8 +6704,7 @@ pub fn copy_out(
                 // The wire-text output function, exactly as a SELECT would
                 // render it — styled timestamps, GUC-honoring bytea, `t`
                 // for booleans — then COPY's escapes on top below.
-                *texts_slot =
-                    Responder::datum_wire_text(&values[setup.targets[i]], render, arena)?;
+                *texts_slot = Responder::datum_wire_text(&values[setup.targets[i]], render, arena)?;
             }
             responder
                 .copy_data_row(&|out| {
@@ -6464,8 +6716,13 @@ pub fn copy_out(
                             let force = fmt.force_quote_all
                                 || CopyFmt::forced(fmt.force_quote, setup.targets[i]);
                             crate::sql::copy::encode_field_csv(
-                                out, *text, fmt.null.as_str(), fmt.delimiter, fmt.quote,
-                                fmt.escape, force,
+                                out,
+                                *text,
+                                fmt.null.as_str(),
+                                fmt.delimiter,
+                                fmt.quote,
+                                fmt.escape,
+                                force,
                             );
                         } else if let Some(value) = text {
                             crate::sql::copy::encode_field(out, Some(value));
@@ -6487,7 +6744,10 @@ pub fn copy_out(
 }
 
 fn wire_to_sql(_: crate::pg::wire::WireFull) -> SqlError {
-    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "COPY output exceeds the send buffer")
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "COPY output exceeds the send buffer"
+    )
 }
 
 /// Resolves COPY format options for a `COPY (query) TO STDOUT`, whose columns
@@ -6509,7 +6769,10 @@ fn copy_fmt_for_columns(
     let mut null = StackStr::<64>::new();
     let _ = null.write_str(options.null_str());
     if null.is_truncated() {
-        return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "COPY NULL string is too long"));
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY NULL string is too long"
+        ));
     }
     let mask = |cols: &[&str]| -> Result<u64, SqlError> {
         let mut bits = 0u64;
@@ -6587,7 +6850,9 @@ pub fn copy_out_query(
             }
         }
     }
-    responder.copy_out_response(n, fmt.binary).map_err(wire_to_sql)?;
+    responder
+        .copy_out_response(n, fmt.binary)
+        .map_err(wire_to_sql)?;
     if fmt.binary {
         responder.copy_binary_header().map_err(wire_to_sql)?;
     }
@@ -6600,8 +6865,13 @@ pub fn copy_out_query(
                     }
                     if fmt.csv {
                         crate::sql::copy::encode_field_csv(
-                            out, Some(c.name), fmt.null.as_str(), fmt.delimiter, fmt.quote,
-                            fmt.escape, false,
+                            out,
+                            Some(c.name),
+                            fmt.null.as_str(),
+                            fmt.delimiter,
+                            fmt.quote,
+                            fmt.escape,
+                            false,
                         );
                     } else {
                         crate::sql::copy::encode_field(out, Some(c.name));
@@ -6614,73 +6884,68 @@ pub fn copy_out_query(
     let render = responder.render_context();
     let fmt = &fmt;
     let mut count = 0u64;
-    super::query::select_into_rows(
-        storage,
-        txid,
-        sel,
-        arena,
-        params,
-        None,
-        seq,
-        &mut |vals| {
-            if fmt.binary {
-                let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
-                for (i, plan) in plans.iter_mut().enumerate().take(n) {
-                    *plan = binary_field_plan(&vals[i], arena)?;
-                }
-                responder
-                    .copy_binary_row(n, &|m| {
-                        for (i, plan) in plans.iter().enumerate().take(n) {
-                            match *plan {
-                                BinaryFieldPlan::Direct => {
-                                    Responder::encode_value_binary(m, &vals[i]);
-                                }
-                                BinaryFieldPlan::Range(f, l, u) => {
-                                    m.field(|m| encode_range_binary(m, f, l, u));
-                                }
-                                BinaryFieldPlan::Multirange(ranges) => {
-                                    m.field(|m| {
-                                        m.i32(ranges.len() as i32);
-                                        for &(f, l, u) in ranges {
-                                            m.field(|m| encode_range_binary(m, f, l, u));
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    })
-                    .map_err(wire_to_sql)?;
-            } else {
-                let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
-                for (i, slot) in texts.iter_mut().enumerate().take(n) {
-                    *slot = Responder::datum_wire_text(&vals[i], render, arena)?;
-                }
-                responder
-                    .copy_data_row(&|out| {
-                        for (i, text) in texts.iter().enumerate().take(n) {
-                            if i > 0 {
-                                out(&[fmt.delimiter]);
-                            }
-                            if fmt.csv {
-                                let force =
-                                    fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, i);
-                                crate::sql::copy::encode_field_csv(
-                                    out, *text, fmt.null.as_str(), fmt.delimiter, fmt.quote,
-                                    fmt.escape, force,
-                                );
-                            } else if let Some(value) = text {
-                                crate::sql::copy::encode_field(out, Some(value));
-                            } else {
-                                out(fmt.null.as_str().as_bytes());
-                            }
-                        }
-                    })
-                    .map_err(wire_to_sql)?;
+    super::query::select_into_rows(storage, txid, sel, arena, params, None, seq, &mut |vals| {
+        if fmt.binary {
+            let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
+            for (i, plan) in plans.iter_mut().enumerate().take(n) {
+                *plan = binary_field_plan(&vals[i], arena)?;
             }
-            count += 1;
-            Ok(())
-        },
-    )?;
+            responder
+                .copy_binary_row(n, &|m| {
+                    for (i, plan) in plans.iter().enumerate().take(n) {
+                        match *plan {
+                            BinaryFieldPlan::Direct => {
+                                Responder::encode_value_binary(m, &vals[i]);
+                            }
+                            BinaryFieldPlan::Range(f, l, u) => {
+                                m.field(|m| encode_range_binary(m, f, l, u));
+                            }
+                            BinaryFieldPlan::Multirange(ranges) => {
+                                m.field(|m| {
+                                    m.i32(ranges.len() as i32);
+                                    for &(f, l, u) in ranges {
+                                        m.field(|m| encode_range_binary(m, f, l, u));
+                                    }
+                                });
+                            }
+                        }
+                    }
+                })
+                .map_err(wire_to_sql)?;
+        } else {
+            let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            for (i, slot) in texts.iter_mut().enumerate().take(n) {
+                *slot = Responder::datum_wire_text(&vals[i], render, arena)?;
+            }
+            responder
+                .copy_data_row(&|out| {
+                    for (i, text) in texts.iter().enumerate().take(n) {
+                        if i > 0 {
+                            out(&[fmt.delimiter]);
+                        }
+                        if fmt.csv {
+                            let force = fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, i);
+                            crate::sql::copy::encode_field_csv(
+                                out,
+                                *text,
+                                fmt.null.as_str(),
+                                fmt.delimiter,
+                                fmt.quote,
+                                fmt.escape,
+                                force,
+                            );
+                        } else if let Some(value) = text {
+                            crate::sql::copy::encode_field(out, Some(value));
+                        } else {
+                            out(fmt.null.as_str().as_bytes());
+                        }
+                    }
+                })
+                .map_err(wire_to_sql)?;
+        }
+        count += 1;
+        Ok(())
+    })?;
     if fmt.binary {
         responder.copy_binary_trailer().map_err(wire_to_sql)?;
     }
@@ -6704,10 +6969,7 @@ enum BinaryFieldPlan<'a> {
     Multirange(&'a [RangeBinaryParts<'a>]),
 }
 
-fn binary_field_plan<'a>(
-    v: &Datum<'a>,
-    arena: &'a Arena,
-) -> Result<BinaryFieldPlan<'a>, SqlError> {
+fn binary_field_plan<'a>(v: &Datum<'a>, arena: &'a Arena) -> Result<BinaryFieldPlan<'a>, SqlError> {
     match v {
         Datum::Range { text, kind } => {
             let (flags, lower, upper) = parse_range_bounds(text, *kind, arena)?;
@@ -6801,7 +7063,10 @@ fn compute_generated<'a>(
         return Ok(());
     }
     let snapshot: [Datum<'a>; MAX_COLUMNS] = *values;
-    let context = RowCtx { def, values: &snapshot[..def.n_columns] };
+    let context = RowCtx {
+        def,
+        values: &snapshot[..def.n_columns],
+    };
     for (i, g) in generated.iter().enumerate() {
         if let Some(expr) = g {
             let v = eval(expr, arena, crate::sql::eval::NO_PARAMS, &context)?;
@@ -6987,11 +7252,18 @@ pub fn merge(
     let source_alias = statement
         .source
         .alias
-        .unwrap_or(if statement.source.table.is_empty() { "" } else { statement.source.table });
+        .unwrap_or(if statement.source.table.is_empty() {
+            ""
+        } else {
+            statement.source.table
+        });
 
     // Materialize the source as `SELECT * FROM <source>`: its column set (a
     // synthesized def) and its rows.
-    let source_from = crate::sql::ast::FromClause { base: statement.source, joins: &[] };
+    let source_from = crate::sql::ast::FromClause {
+        base: statement.source,
+        joins: &[],
+    };
     let star = match arena.alloc_slice_copy(&[SelectItem::Wildcard]) {
         Ok(s) => &*s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -7030,7 +7302,14 @@ pub fn merge(
     // Pass 1: count source rows. Pass 2: encode each to arena bytes.
     let mut n_source = 0usize;
     if let Err(e) = super::query::select_into_rows(
-        storage, txn.txid, &source_select, arena, params, None, None, &mut |_| {
+        storage,
+        txn.txid,
+        &source_select,
+        arena,
+        params,
+        None,
+        None,
+        &mut |_| {
             n_source += 1;
             Ok(())
         },
@@ -7045,7 +7324,14 @@ pub fn merge(
     {
         let mut at = 0usize;
         if let Err(e) = super::query::select_into_rows(
-            storage, txn.txid, &source_select, arena, params, None, None, &mut |vals| {
+            storage,
+            txn.txid,
+            &source_select,
+            arena,
+            params,
+            None,
+            None,
+            &mut |vals| {
                 source_rows[at] = encode_projected_pub(vals, arena)?;
                 at += 1;
                 Ok(())
@@ -7089,7 +7375,8 @@ pub fn merge(
             };
         let mut k = 0usize;
         if let Err(e) = storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) = state.visible_at(txn.txid, storage.read_snapshot())
+            if let Some(home) =
+                state.visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
                 && k < ids.len()
             {
                 ids[k] = rowid;
@@ -7176,9 +7463,16 @@ pub fn merge(
                             return sql_fail(merge_cardinality());
                         }
                         affected[j] = true;
-                        match storage.write_pending(table_index, target_ids[j], txn.txid, txn.command_id(), None) {
+                        match storage.write_pending(
+                            table_index,
+                            target_ids[j],
+                            txn.txid,
+                            txn.command_id(),
+                            None,
+                        ) {
                             Ok(prior) => {
-                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior) {
+                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior)
+                                {
                                     return sql_fail(e);
                                 }
                             }
@@ -7205,16 +7499,25 @@ pub fn merge(
                                 Err(e) => return sql_fail(e),
                             }
                         }
-                        if let Err(e) = compute_generated(&def, &generated, &mut new_values, storage, arena) {
+                        if let Err(e) =
+                            compute_generated(&def, &generated, &mut new_values, storage, arena)
+                        {
                             return sql_fail(e);
                         }
                         if let Err(e) = check_not_null(&def, &new_values) {
                             return sql_fail(e);
                         }
                         if let Err(e) = enforce_row_constraints(
-                            storage, table_index, &def, target_schema,
-                            &new_values[..def.n_columns], Some(target_ids[j]), txn.txid,
-                            &checks, arena, params,
+                            storage,
+                            table_index,
+                            &def,
+                            target_schema,
+                            &new_values[..def.n_columns],
+                            Some(target_ids[j]),
+                            txn.txid,
+                            &checks,
+                            arena,
+                            params,
                         ) {
                             return sql_fail(e);
                         }
@@ -7229,10 +7532,22 @@ pub fn merge(
                             Err(e) => return sql_fail(e),
                         };
                         slice.copy_from_slice(out);
-                        match storage.write_pending(table_index, target_ids[j], txn.txid, txn.command_id(), Some(loc)) {
+                        match storage.write_pending(
+                            table_index,
+                            target_ids[j],
+                            txn.txid,
+                            txn.command_id(),
+                            Some(loc),
+                        ) {
                             Ok(prior) => {
-                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior) {
-                                    storage.restore_pending(table_index, target_ids[j], txn.txid, prior);
+                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior)
+                                {
+                                    storage.restore_pending(
+                                        table_index,
+                                        target_ids[j],
+                                        txn.txid,
+                                        prior,
+                                    );
                                     return sql_fail(e);
                                 }
                             }
@@ -7253,7 +7568,10 @@ pub fn merge(
         }
         if !matched {
             // First satisfied WHEN NOT MATCHED clause (source columns only).
-            let source_ctx = RowCtx { def: source_def, values: sv };
+            let source_ctx = RowCtx {
+                def: source_def,
+                values: sv,
+            };
             for when in statement.whens.iter().filter(|w| !w.matched) {
                 if let Some(cond) = when.cond {
                     match eval(cond, arena, params, &source_ctx) {
@@ -7264,10 +7582,26 @@ pub fn merge(
                 }
                 match &when.action {
                     MergeAction::DoNothing => {}
-                    MergeAction::Insert { columns, values, default_values } => {
+                    MergeAction::Insert {
+                        columns,
+                        values,
+                        default_values,
+                    } => {
                         if let Err(e) = merge_insert(
-                            storage, txn, table_index, &def, columns, values, *default_values,
-                            &source_ctx, &generated, &defaults, seq_session, arena, params, &checks,
+                            storage,
+                            txn,
+                            table_index,
+                            &def,
+                            columns,
+                            values,
+                            *default_values,
+                            &source_ctx,
+                            &generated,
+                            &defaults,
+                            seq_session,
+                            arena,
+                            params,
+                            &checks,
                         ) {
                             return sql_fail(e);
                         }
@@ -7374,7 +7708,13 @@ fn merge_insert(
             if let Some(d) = &col.default_value {
                 row[i] = d.as_datum();
             } else if let Some(expr) = defaults[i] {
-                let v = super::eval::eval_full(expr, arena, crate::sql::eval::NO_PARAMS, &NoColumns, &hooks)?;
+                let v = super::eval::eval_full(
+                    expr,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                    &NoColumns,
+                    &hooks,
+                )?;
                 row[i] = coerce(v, col, storage, arena)?;
             }
         }
@@ -7394,8 +7734,16 @@ fn merge_insert(
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     enforce_row_constraints(
-        storage, table_index, def, &schema[..def.n_columns],
-        &row_arr[..def.n_columns], None, txn.txid, checks, arena, params,
+        storage,
+        table_index,
+        def,
+        &schema[..def.n_columns],
+        &row_arr[..def.n_columns],
+        None,
+        txn.txid,
+        checks,
+        arena,
+        params,
     )?;
     store_row(storage, txn, table_index, None, &row_arr[..def.n_columns])
 }
@@ -7481,7 +7829,14 @@ pub fn insert(
         {
             let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
             if let Err(e) = super::query::select_into_rows(
-                storage, txn.txid, sel, arena, params, None, Some(&dry), &mut |_| {
+                storage,
+                txn.txid,
+                sel,
+                arena,
+                params,
+                None,
+                Some(&dry),
+                &mut |_| {
                     count += 1;
                     Ok(())
                 },
@@ -7493,10 +7848,12 @@ pub fn insert(
         let empty: &[u8] = &[];
         let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {
             Ok(r) => r,
-            Err(_) => return sql_fail(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "INSERT ... SELECT result exceeds the statement arena"
-            )),
+            Err(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "INSERT ... SELECT result exceeds the statement arena"
+                ));
+            }
         };
         let mut at = 0usize;
         let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
@@ -7506,7 +7863,16 @@ pub fn insert(
         };
         {
             let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-            if let Err(e) = super::query::select_into_rows(storage, txn.txid, sel, arena, params, None, Some(&live), &mut fill) {
+            if let Err(e) = super::query::select_into_rows(
+                storage,
+                txn.txid,
+                sel,
+                arena,
+                params,
+                None,
+                Some(&live),
+                &mut fill,
+            ) {
                 return sql_fail(e);
             }
         }
@@ -7538,7 +7904,9 @@ pub fn insert(
                     return sql_fail(e);
                 }
                 match identity_action(&def, targets[i], statement.overriding) {
-                    IdentityAction::Reject => return sql_fail(reject_identity_write(&def, targets[i])),
+                    IdentityAction::Reject => {
+                        return sql_fail(reject_identity_write(&def, targets[i]));
+                    }
                     // OVERRIDING USER VALUE: skip the query's value, use identity.
                     IdentityAction::UseSequence => continue,
                     IdentityAction::Accept => {}
@@ -7606,15 +7974,38 @@ pub fn insert(
             {
                 let mut sch = [ColType::Bool; MAX_COLUMNS];
                 def.schema(&mut sch);
-                match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &arbiter, &checks, arena, params) {
+                match handle_conflict(
+                    storage,
+                    txn,
+                    table_index,
+                    &def,
+                    &sch[..def.n_columns],
+                    &values[..def.n_columns],
+                    &statement.on_conflict,
+                    &arbiter,
+                    &checks,
+                    arena,
+                    params,
+                ) {
                     Ok(ConflictOutcome::Store) => {}
                     Ok(ConflictOutcome::Skip) => continue,
                     Ok(ConflictOutcome::Updated(row_bytes)) => {
                         inserted += 1;
                         if !statement.returning.is_empty()
-                            && let Err(e) = emit_conflict_returning(storage, txn.txid, &def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
-                                return sql_fail(e);
-                            }
+                            && let Err(e) = emit_conflict_returning(
+                                storage,
+                                txn.txid,
+                                &def,
+                                row_bytes,
+                                statement.returning,
+                                arena,
+                                params,
+                                responder,
+                                &mut capture,
+                            )?
+                        {
+                            return sql_fail(e);
+                        }
                         continue;
                     }
                     Err(e) => return sql_fail(e),
@@ -7640,13 +8031,26 @@ pub fn insert(
                 return sql_fail(e);
             }
             if !statement.returning.is_empty()
-                && let Err(e) = emit_projected(storage, txn.txid, &def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
-                    return sql_fail(e);
-                }
+                && let Err(e) = emit_projected(
+                    storage,
+                    txn.txid,
+                    &def,
+                    &values[..def.n_columns],
+                    statement.returning,
+                    arena,
+                    params,
+                    responder,
+                    &mut capture,
+                )?
+            {
+                return sql_fail(e);
+            }
             inserted += 1;
         }
         let tag = stack_format!(48, "INSERT 0 {}", inserted);
-        if !capturing { responder.command_complete(tag.as_str())?; }
+        if !capturing {
+            responder.command_complete(tag.as_str())?;
+        }
         return sql_ok();
     }
 
@@ -7683,7 +8087,9 @@ pub fn insert(
                     return sql_fail(e);
                 }
                 match identity_action(&def, targets[i], statement.overriding) {
-                    IdentityAction::Reject => return sql_fail(reject_identity_write(&def, targets[i])),
+                    IdentityAction::Reject => {
+                        return sql_fail(reject_identity_write(&def, targets[i]));
+                    }
                     IdentityAction::UseSequence => ignore[targets[i]] = true,
                     IdentityAction::Accept => explicit[targets[i]] = true,
                 }
@@ -7776,15 +8182,38 @@ pub fn insert(
         {
             let mut sch = [ColType::Bool; MAX_COLUMNS];
             def.schema(&mut sch);
-            match handle_conflict(storage, txn, table_index, &def, &sch[..def.n_columns], &values[..def.n_columns], &statement.on_conflict, &arbiter, &checks, arena, params) {
+            match handle_conflict(
+                storage,
+                txn,
+                table_index,
+                &def,
+                &sch[..def.n_columns],
+                &values[..def.n_columns],
+                &statement.on_conflict,
+                &arbiter,
+                &checks,
+                arena,
+                params,
+            ) {
                 Ok(ConflictOutcome::Store) => {}
                 Ok(ConflictOutcome::Skip) => continue,
                 Ok(ConflictOutcome::Updated(row_bytes)) => {
                     inserted += 1;
                     if !statement.returning.is_empty()
-                        && let Err(e) = emit_conflict_returning(storage, txn.txid, &def, row_bytes, statement.returning, arena, params, responder, &mut capture)? {
-                            return sql_fail(e);
-                        }
+                        && let Err(e) = emit_conflict_returning(
+                            storage,
+                            txn.txid,
+                            &def,
+                            row_bytes,
+                            statement.returning,
+                            arena,
+                            params,
+                            responder,
+                            &mut capture,
+                        )?
+                    {
+                        return sql_fail(e);
+                    }
                     continue;
                 }
                 Err(e) => return sql_fail(e),
@@ -7810,9 +8239,20 @@ pub fn insert(
             return sql_fail(e);
         }
         if !statement.returning.is_empty()
-            && let Err(e) = emit_projected(storage, txn.txid, &def, &values[..def.n_columns], statement.returning, arena, params, responder, &mut capture)? {
-                return sql_fail(e);
-            }
+            && let Err(e) = emit_projected(
+                storage,
+                txn.txid,
+                &def,
+                &values[..def.n_columns],
+                statement.returning,
+                arena,
+                params,
+                responder,
+                &mut capture,
+            )?
+        {
+            return sql_fail(e);
+        }
         inserted += 1;
     }
     let tag = stack_format!(48, "INSERT 0 {}", inserted);
@@ -7894,7 +8334,10 @@ fn emit_projected(
         Ok(subqueries) => subqueries,
         Err(error) => return Ok(Err(error)),
     };
-    let hooks = EvalHooks { subs: Some(&subqueries), ..NO_HOOKS };
+    let hooks = EvalHooks {
+        subs: Some(&subqueries),
+        ..NO_HOOKS
+    };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0;
     for item in items {
@@ -7931,11 +8374,11 @@ fn emit_projected(
             }
             SelectItem::Expr { expression, .. } => {
                 match eval_full(expression, arena, params, &context, &hooks) {
-                Ok(v) => {
-                    projected[n] = v;
-                    n += 1;
-                }
-                Err(e) => return Ok(Err(e)),
+                    Ok(v) => {
+                        projected[n] = v;
+                        n += 1;
+                    }
+                    Err(e) => return Ok(Err(e)),
                 }
             }
         }
@@ -8087,7 +8530,7 @@ pub fn update(
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "updated rows exceed the statement arena"
-                ))
+                ));
             }
         };
         let new_bytes = {
@@ -8097,13 +8540,22 @@ pub fn update(
             }
             let mut new_values = [Datum::Null; MAX_COLUMNS];
             new_values[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
-            let context = RowCtx { def: &def, values: &values[..def.n_columns] };
+            let context = RowCtx {
+                def: &def,
+                values: &values[..def.n_columns],
+            };
             if let Some(from) = statement.from {
                 // UPDATE ... FROM: evaluate the assignments against the target
                 // row joined with the first matching FROM row.
                 let mut set_err: Option<SqlError> = None;
                 let r = super::query::first_from_match(
-                    storage, from, txn.txid, statement.where_clause, arena, params, &context,
+                    storage,
+                    from,
+                    txn.txid,
+                    statement.where_clause,
+                    arena,
+                    params,
+                    &context,
                     &mut |combined| {
                         for (a, (_, expression)) in statement.assignments.iter().enumerate() {
                             // A generated target's `= DEFAULT` is a no-op here; it
@@ -8112,7 +8564,8 @@ pub fn update(
                                 continue;
                             }
                             let v = eval(expression, arena, params, &combined)?;
-                            new_values[targets[a]] = coerce(v, &def.columns()[targets[a]], storage, arena)?;
+                            new_values[targets[a]] =
+                                coerce(v, &def.columns()[targets[a]], storage, arena)?;
                         }
                         Ok(())
                     },
@@ -8153,7 +8606,9 @@ pub fn update(
             }
             // Every generated column is recomputed from the updated row (a change
             // to any dependency must flow through).
-            if let Err(e) = compute_generated(&def, &generated_exprs, &mut new_values, storage, arena) {
+            if let Err(e) =
+                compute_generated(&def, &generated_exprs, &mut new_values, storage, arena)
+            {
                 return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &new_values) {
@@ -8180,7 +8635,7 @@ pub fn update(
                     return sql_fail(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "updated rows exceed the statement arena"
-                    ))
+                    ));
                 }
             };
             rowenc::encode(&new_values[..def.n_columns], out);
@@ -8191,7 +8646,13 @@ pub fn update(
             Err(e) => return sql_fail(e),
         };
         slice.copy_from_slice(new_bytes);
-        match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(new_loc)) {
+        match storage.write_pending(
+            table_index,
+            rowid,
+            txn.txid,
+            txn.command_id(),
+            Some(new_loc),
+        ) {
             Ok(prior) => {
                 if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
                     storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -8258,7 +8719,9 @@ pub fn update(
         updated += 1;
     }
     let tag = stack_format!(48, "UPDATE {}", updated);
-    if !capturing { responder.command_complete(tag.as_str())?; }
+    if !capturing {
+        responder.command_complete(tag.as_str())?;
+    }
     sql_ok()
 }
 
@@ -8361,7 +8824,7 @@ pub fn delete(
                     return sql_fail(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "deleted rows exceed the statement arena"
-                    ))
+                    ));
                 }
             };
             let mut old_values = [Datum::Null; MAX_COLUMNS];
@@ -8511,7 +8974,10 @@ pub fn truncate(
             let mut count = 0usize;
             let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                if state.visible_at(txn.txid, storage.read_snapshot()).is_none() {
+                if state
+                    .visible_at_lsn(txn.txid, storage.read_snapshot(), storage.commit_snapshot())
+                    .is_none()
+                {
                     return Ok(ControlFlow::Continue(()));
                 }
                 if count == rowids.len() {
@@ -8644,7 +9110,11 @@ fn validate_all_rows(
     let mut result = Ok(());
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(home) = state.visible_at(txid, crate::storage::SNAPSHOT_ALL) else {
+        let Some(home) = state.visible_at_lsn(
+            txid,
+            crate::storage::SNAPSHOT_ALL,
+            storage.commit_snapshot(),
+        ) else {
             return Ok(ControlFlow::Continue(()));
         };
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
@@ -8653,7 +9123,16 @@ fn validate_all_rows(
         let values = &values[..new_def.n_columns];
         let check = check_not_null(new_def, values).and_then(|()| {
             enforce_row_constraints(
-                storage, table_index, new_def, schema, values, Some(rowid), txid, &checks, arena, &[],
+                storage,
+                table_index,
+                new_def,
+                schema,
+                values,
+                Some(rowid),
+                txid,
+                &checks,
+                arena,
+                &[],
             )
         });
         if let Err(e) = check {
@@ -8709,7 +9188,12 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
     // A single-column UNIQUE is "<table>_<column>_key".
     for i in 0..def.n_columns {
         if def.columns[i].unique && !def.columns[i].primary {
-            let key = crate::stack_format!(128, "{}_{}_key", def.name.as_str(), def.columns[i].name.as_str());
+            let key = crate::stack_format!(
+                128,
+                "{}_{}_key",
+                def.name.as_str(),
+                def.columns[i].name.as_str()
+            );
             if name == key.as_str() {
                 def.columns[i].unique = false;
                 return true;
@@ -8730,7 +9214,9 @@ fn rewritten_dup_name(new_def: &TableDef, a: &[Datum], b: &[Datum]) -> Option<St
     let eq = |i: usize| {
         !a[i].is_null()
             && !b[i].is_null()
-            && compare_datums(&a[i], &b[i]).map(|o| o.is_eq()).unwrap_or(false)
+            && compare_datums(&a[i], &b[i])
+                .map(|o| o.is_eq())
+                .unwrap_or(false)
     };
     for (i, c) in new_def.columns().iter().enumerate() {
         if c.unique && eq(i) {
@@ -8762,7 +9248,12 @@ enum ColSource<'a> {
     Keep(usize),
     /// Cast the old row's column (or a USING expression over the old row) to a
     /// new type; `orig` is the source column's original index.
-    Cast { orig: usize, target: ColType, type_mod: i32, using: Option<&'a Expr<'a>> },
+    Cast {
+        orig: usize,
+        target: ColType,
+        type_mod: i32,
+        using: Option<&'a Expr<'a>>,
+    },
     /// A column added by this statement; its value is the new column's default
     /// (or NULL). The index is into the *new* definition.
     FillDefault(usize),
@@ -8804,29 +9295,26 @@ fn alter_table_inner(
     responder: &mut Responder,
     emit_completion: bool,
 ) -> Outcome {
-    let table_index = match storage.resolve_relation(
-        statement.table.schema,
-        statement.table.name,
-        txn.txid,
-    ) {
-        Some(crate::storage::ResolvedRelation::Table(i)) => i,
-        None if statement.if_exists => {
-            responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(
-                    160,
-                    "relation \"{}\" does not exist, skipping",
-                    statement.table.name
-                )
-                .as_str(),
-            )?;
-            if emit_completion {
-                responder.command_complete("ALTER TABLE")?;
+    let table_index =
+        match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::Table(i)) => i,
+            None if statement.if_exists => {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "relation \"{}\" does not exist, skipping",
+                        statement.table.name
+                    )
+                    .as_str(),
+                )?;
+                if emit_completion {
+                    responder.command_complete("ALTER TABLE")?;
+                }
+                return sql_ok();
             }
-            return sql_ok();
-        }
-        _ => return sql_fail(undefined_qual(&statement.table)),
-    };
+            _ => return sql_fail(undefined_qual(&statement.table)),
+        };
     let def = *storage.table_def(table_index, txn.txid);
 
     // Any in-flight change on this table blocks ALTER (fail fast).
@@ -8908,20 +9396,11 @@ fn alter_table_inner(
         for (column, target) in mapping.iter_mut().enumerate().take(def.n_columns) {
             *target = Some(def.columns()[column].name);
         }
-        if let Err(error) =
-            storage.write_table_def(
-                table_index,
-                txn.txid,
-                new_def,
-                &mapping,
-                false,
-            )
+        if let Err(error) = storage.write_table_def(table_index, txn.txid, new_def, &mapping, false)
         {
             return sql_fail(error);
         }
-        if let Err(error) =
-            txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32))
-        {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
             storage.rollback_table_def(table_index, txn.txid);
             return sql_fail(error);
         }
@@ -8940,7 +9419,11 @@ fn alter_table_inner(
         let mut overflow = false;
         let _ = storage.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            let Some(loc) = state.visible_at(txn.txid, crate::storage::SNAPSHOT_ALL) else {
+            let Some(loc) = state.visible_at_lsn(
+                txn.txid,
+                crate::storage::SNAPSHOT_ALL,
+                storage.commit_snapshot(),
+            ) else {
                 return Ok(ControlFlow::Continue(()));
             };
             if scratch.push((rowid, loc)).is_err() {
@@ -8997,7 +9480,11 @@ fn alter_table_inner(
                     return sql_fail(undefined_column(from));
                 };
                 if new_def.column_index(to).is_some() {
-                    return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", to));
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_COLUMN,
+                        "column \"{}\" already exists",
+                        to
+                    ));
                 }
                 new_def.columns[i].name = match SqlName::parse(to) {
                     Ok(n) => n,
@@ -9006,7 +9493,11 @@ fn alter_table_inner(
             }
             AlterAction::AddColumn(c) => {
                 if new_def.column_index(c.name).is_some() {
-                    return sql_fail(sql_err!(sqlstate::DUPLICATE_COLUMN, "column \"{}\" already exists", c.name));
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_COLUMN,
+                        "column \"{}\" already exists",
+                        c.name
+                    ));
                 }
                 if new_def.n_columns == MAX_COLUMNS {
                     return sql_fail(sql_err!(
@@ -9065,7 +9556,11 @@ fn alter_table_inner(
                 new_def.n_columns -= 1;
                 dropped_any = true;
             }
-            AlterAction::SetDefault { column, value, value_text } => {
+            AlterAction::SetDefault {
+                column,
+                value,
+                value_text,
+            } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
@@ -9073,19 +9568,18 @@ fn alter_table_inner(
                 let type_mod = new_def.columns[i].type_mod;
                 // A literal-only default folds to a constant; a call-bearing one
                 // is stored as text and evaluated per row — CREATE TABLE's path.
-                let (default_value, default_expr) =
-                    match ddl::resolve_default(
-                        Some(value),
-                        Some(value_text),
-                        ctype,
-                        type_mod,
-                        storage,
-                        txn.txid,
-                        arena,
-                    ) {
-                        Ok(d) => d,
-                        Err(e) => return sql_fail(e),
-                    };
+                let (default_value, default_expr) = match ddl::resolve_default(
+                    Some(value),
+                    Some(value_text),
+                    ctype,
+                    type_mod,
+                    storage,
+                    txn.txid,
+                    arena,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => return sql_fail(e),
+                };
                 new_def.columns[i].default_value = default_value;
                 new_def.columns[i].default_expr = default_expr;
             }
@@ -9128,14 +9622,11 @@ fn alter_table_inner(
                     Ok(plan) => plan,
                     Err(error) => return sql_fail(error),
                 };
-                if storage.relation_name_taken(
-                    plan.schema.as_str(),
-                    plan.name.as_str(),
-                    txn.txid,
-                ) || identity_sequences[..n_identity_sequences]
-                    .iter()
-                    .flatten()
-                    .any(|other| other.schema == plan.schema && other.name == plan.name)
+                if storage.relation_name_taken(plan.schema.as_str(), plan.name.as_str(), txn.txid)
+                    || identity_sequences[..n_identity_sequences]
+                        .iter()
+                        .flatten()
+                        .any(|other| other.schema == plan.schema && other.name == plan.name)
                 {
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_TABLE,
@@ -9226,7 +9717,12 @@ fn alter_table_inner(
                 }
                 new_def.columns[i].not_null = false;
             }
-            AlterAction::AlterColumnType { column, type_name, type_mod, using } => {
+            AlterAction::AlterColumnType {
+                column,
+                type_name,
+                type_mod,
+                using,
+            } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
@@ -9253,7 +9749,12 @@ fn alter_table_inner(
                 // a column added in this same statement re-casts its default.
                 match source[i] {
                     ColSource::Keep(orig) | ColSource::Cast { orig, .. } => {
-                        source[i] = ColSource::Cast { orig, target, type_mod: *type_mod, using: *using };
+                        source[i] = ColSource::Cast {
+                            orig,
+                            target,
+                            type_mod: *type_mod,
+                            using: *using,
+                        };
                         retyped_any = true;
                     }
                     ColSource::FillDefault(fi) => {
@@ -9318,9 +9819,15 @@ fn alter_table_inner(
             }
             AlterAction::RenameConstraint { from, to } => {
                 // The new name must be free among this table's constraints.
-                let taken = new_def.checks[..new_def.n_checks].iter().any(|c| c.name.as_str() == *to)
-                    || new_def.uniques[..new_def.n_uniques].iter().any(|k| k.name.as_str() == *to)
-                    || new_def.fkeys[..new_def.n_fkeys].iter().any(|f| f.name.as_str() == *to);
+                let taken = new_def.checks[..new_def.n_checks]
+                    .iter()
+                    .any(|c| c.name.as_str() == *to)
+                    || new_def.uniques[..new_def.n_uniques]
+                        .iter()
+                        .any(|k| k.name.as_str() == *to)
+                    || new_def.fkeys[..new_def.n_fkeys]
+                        .iter()
+                        .any(|f| f.name.as_str() == *to);
                 if taken {
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_OBJECT,
@@ -9361,7 +9868,7 @@ fn alter_table_inner(
                                 "constraint \"{}\" for table \"{}\" does not exist",
                                 from,
                                 def.name.as_str()
-                            ))
+                            ));
                         }
                         Err(e) => return sql_fail(e),
                     }
@@ -9438,12 +9945,20 @@ fn alter_table_inner(
                 for c in 0..new_def.n_columns {
                     out[c] = match source[c] {
                         ColSource::Keep(orig) => old_values[orig],
-                        ColSource::Cast { orig, target, type_mod, using } => {
+                        ColSource::Cast {
+                            orig,
+                            target,
+                            type_mod,
+                            using,
+                        } => {
                             // USING is evaluated with the old row's columns in
                             // scope; otherwise the old value is the cast source.
                             let cast_source = match using {
                                 Some(expr) => {
-                                    let ctx = RowCtx { def: &def, values: &old_values[..def.n_columns] };
+                                    let ctx = RowCtx {
+                                        def: &def,
+                                        values: &old_values[..def.n_columns],
+                                    };
                                     match eval(expr, arena, crate::sql::eval::NO_PARAMS, &ctx) {
                                         Ok(v) => v,
                                         Err(e) => return sql_fail(e),
@@ -9496,12 +10011,20 @@ fn alter_table_inner(
                         }
                     };
                 }
-                if let Err(e) = compute_generated(&new_def, &new_generated, &mut out, storage, arena) {
+                if let Err(e) =
+                    compute_generated(&new_def, &new_generated, &mut out, storage, arena)
+                {
                     return sql_fail(e);
                 }
                 let values = &out[..new_def.n_columns];
                 if let Err(e) = crate::sql::exec::constraints::check_row_content(
-                    storage, &new_def, values, &checks, arena, &[], txn.txid,
+                    storage,
+                    &new_def,
+                    values,
+                    &checks,
+                    arena,
+                    &[],
+                    txn.txid,
                 ) {
                     return sql_fail(e);
                 }
@@ -9512,7 +10035,7 @@ fn alter_table_inner(
                         return sql_fail(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "ALTER rewrite exceeds the statement arena"
-                        ))
+                        ));
                     }
                 };
                 rowenc::encode(values, buffer);
@@ -9541,7 +10064,7 @@ fn alter_table_inner(
                             return sql_fail(sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                                 "ALTER rewrite exceeds the statement arena"
-                            ))
+                            ));
                         }
                     };
                     let (loc, slice) = match storage.heap.append(copied.len()) {
@@ -9561,14 +10084,18 @@ fn alter_table_inner(
     // that cannot run against the stored (still old) rows. NULLs are distinct.
     if has_rewrite && has_added_unique {
         for a in 0..scratch.len() {
-            let RowHome::Heap(la) = scratch[a].1 else { unreachable!() };
+            let RowHome::Heap(la) = scratch[a].1 else {
+                unreachable!()
+            };
             let abytes = storage.heap.get(la);
             let mut avals = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(abytes, new_schema, &mut avals) {
                 return sql_fail(e);
             }
             for b in (a + 1)..scratch.len() {
-                let RowHome::Heap(lb) = scratch[b].1 else { unreachable!() };
+                let RowHome::Heap(lb) = scratch[b].1 else {
+                    unreachable!()
+                };
                 let bbytes = storage.heap.get(lb);
                 let mut bvals = [Datum::Null; MAX_COLUMNS];
                 if let Err(e) = rowenc::decode(bbytes, new_schema, &mut bvals) {
@@ -9595,7 +10122,10 @@ fn alter_table_inner(
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.append(
         lsn,
-        &WalOp::DropTable { schema: def.schema.as_str(), name: def.name.as_str() },
+        &WalOp::DropTable {
+            schema: def.schema.as_str(),
+            name: def.name.as_str(),
+        },
     ) {
         return sql_fail(e);
     }
@@ -9647,11 +10177,7 @@ fn alter_table_inner(
         ) {
             return sql_fail(error);
         }
-        match storage.drop_sequence(
-            sequence_schema.as_str(),
-            sequence_name.as_str(),
-            txn.txid,
-        ) {
+        match storage.drop_sequence(sequence_schema.as_str(), sequence_name.as_str(), txn.txid) {
             Ok(Some(slot)) => {
                 if let Err(error) =
                     txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
@@ -9666,7 +10192,11 @@ fn alter_table_inner(
     }
     let mut column_mapping = [None; MAX_COLUMNS];
     for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
-        if let ColSource::Keep(old_column) | ColSource::Cast { orig: old_column, .. } = *source {
+        if let ColSource::Keep(old_column)
+        | ColSource::Cast {
+            orig: old_column, ..
+        } = *source
+        {
             column_mapping[old_column] = Some(new_def.columns()[new_column].name);
         }
     }
@@ -9734,13 +10264,9 @@ fn alter_table_inner(
         }
     }
 
-    if let Err(error) = storage.write_table_def(
-        table_index,
-        txn.txid,
-        new_def,
-        &column_mapping,
-        true,
-    ) {
+    if let Err(error) =
+        storage.write_table_def(table_index, txn.txid, new_def, &column_mapping, true)
+    {
         return sql_fail(error);
     }
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
@@ -9749,7 +10275,8 @@ fn alter_table_inner(
     }
     if relation_moved {
         for dependent_table in 0..storage.table_count() {
-            if dependent_table == table_index || !storage.table(dependent_table).visible_to(txn.txid)
+            if dependent_table == table_index
+                || !storage.table(dependent_table).visible_to(txn.txid)
             {
                 continue;
             }
@@ -9861,7 +10388,11 @@ fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<
     Ok(false)
 }
 
-pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -> Result<u64, SqlError> {
+pub fn eval_offset_pub(
+    offset: Option<&Expr>,
+    arena: &Arena,
+    params: &[Datum],
+) -> Result<u64, SqlError> {
     let Some(expression) = offset else {
         return Ok(0);
     };
@@ -9870,9 +10401,10 @@ pub fn eval_offset_pub(offset: Option<&Expr>, arena: &Arena, params: &[Datum]) -
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
         Datum::Int8(v) if v >= 0 => Ok(v as u64),
-        Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) => {
-            Err(sql_err!(sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET, "OFFSET must not be negative"))
-        }
+        Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) => Err(sql_err!(
+            sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET,
+            "OFFSET must not be negative"
+        )),
         _ => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
             "argument of OFFSET must be an integer"
@@ -9891,10 +10423,18 @@ pub fn resolve_order_expr_pub<'a>(
     // is ambiguous (42702), matching PostgreSQL's findTargetlistEntrySQL92 —
     // e.g. `SELECT (CASE .. ELSE b END), b ... ORDER BY b`, where the CASE
     // inherits the name `b` from its ELSE column.
-    if let Expr::Column { qualifier: None, name } = expression {
+    if let Expr::Column {
+        qualifier: None,
+        name,
+    } = expression
+    {
         let mut found: Option<&'a Expr<'a>> = None;
         for item in items {
-            if let SelectItem::Expr { expression: item_expr, alias } = item {
+            if let SelectItem::Expr {
+                expression: item_expr,
+                alias,
+            } = item
+            {
                 let out_name = alias.unwrap_or(derived_name(item_expr));
                 if out_name == *name {
                     match found {
@@ -9923,8 +10463,11 @@ pub fn resolve_order_expr_pub<'a>(
     Ok(expression)
 }
 
-
-pub fn eval_limit_pub(limit: Option<&Expr>, arena: &Arena, params: &[Datum]) -> Result<u64, SqlError> {
+pub fn eval_limit_pub(
+    limit: Option<&Expr>,
+    arena: &Arena,
+    params: &[Datum],
+) -> Result<u64, SqlError> {
     let Some(expression) = limit else {
         return Ok(u64::MAX);
     };
@@ -9979,7 +10522,10 @@ fn row_matches_values<'a>(
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    let context = RowCtx { def, values: &values[..def.n_columns] };
+    let context = RowCtx {
+        def,
+        values: &values[..def.n_columns],
+    };
     match super::eval::eval_full(w, arena, params, &context, hooks)? {
         Datum::Bool(true) => Ok(true),
         Datum::Bool(false) | Datum::Null => Ok(false),
@@ -10006,10 +10552,23 @@ fn collect_matches<'a>(
     let def = storage.table_def(table_index, txid);
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(loc) = state.visible_at(txid, storage.read_snapshot()) else {
+        let Some(loc) =
+            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+        else {
             return Ok(ControlFlow::Continue(()));
         };
-        if row_matches(storage, table_index, rowid, def, schema, loc, where_clause, arena, params, hooks)? {
+        if row_matches(
+            storage,
+            table_index,
+            rowid,
+            def,
+            schema,
+            loc,
+            where_clause,
+            arena,
+            params,
+            hooks,
+        )? {
             scratch.push((rowid, loc)).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -10042,7 +10601,9 @@ fn collect_join_matches<'a>(
     scratch.clear();
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
-        let Some(loc) = state.visible_at(txid, storage.read_snapshot()) else {
+        let Some(loc) =
+            state.visible_at_lsn(txid, storage.read_snapshot(), storage.commit_snapshot())
+        else {
             return Ok(ControlFlow::Continue(()));
         };
         // Consume-in-place, as in row_matches: the joined-row probe reads
@@ -10050,9 +10611,19 @@ fn collect_join_matches<'a>(
         let found = storage.with_row_bytes(table_index, rowid, loc, |bytes| {
             let mut tv = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut tv)?;
-            let context = RowCtx { def, values: &tv[..def.n_columns] };
+            let context = RowCtx {
+                def,
+                values: &tv[..def.n_columns],
+            };
             super::query::first_from_match(
-                storage, from, txid, where_clause, arena, params, &context, &mut |_| Ok(()),
+                storage,
+                from,
+                txid,
+                where_clause,
+                arena,
+                params,
+                &context,
+                &mut |_| Ok(()),
             )
         })?;
         if found {
@@ -10200,7 +10771,7 @@ pub(crate) fn coerce_enum_value<'a>(
                 sqlstate::DATATYPE_MISMATCH,
                 "column is of type {} but expression is of incompatible type",
                 def.name.as_str()
-            ))
+            ));
         }
     };
     let Some(sort) = def.sort_of(label) else {
@@ -10214,7 +10785,9 @@ pub(crate) fn coerce_enum_value<'a>(
     Ok(Datum::Enum {
         slot,
         sort,
-        label: arena.alloc_str(label).map_err(|_| super::query::arena_full_pub())?,
+        label: arena
+            .alloc_str(label)
+            .map_err(|_| super::query::arena_full_pub())?,
     })
 }
 
@@ -10279,7 +10852,11 @@ fn bpchar_fit<'a>(
                 .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cast result too large"))?;
             return Ok(Datum::Text(t));
         }
-        return Err(sql_err!(sqlstate::STRING_DATA_RIGHT_TRUNCATION, "value too long for type character({})", n));
+        return Err(sql_err!(
+            sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+            "value too long for type character({})",
+            n
+        ));
     }
     if clen == n {
         return Ok(Datum::Text(s));
@@ -10290,7 +10867,9 @@ fn bpchar_fit<'a>(
         .alloc_slice_with(total, |_| b' ')
         .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "padded value too large"))?;
     buffer[..s.len()].copy_from_slice(s.as_bytes());
-    Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buffer) }))
+    Ok(Datum::Text(unsafe {
+        core::str::from_utf8_unchecked(buffer)
+    }))
 }
 
 /// Enforces a PostgreSQL atttypmod on an already-cast value: varchar(n) length
@@ -10330,8 +10909,7 @@ pub fn apply_typmod<'a>(
             }
         }
         (_, TypeMod::NumericPS { precision, scale }, Datum::Numeric(n)) => {
-            apply_numeric_typmod(&n, precision as usize, scale as usize, arena)
-                .map(Datum::Numeric)
+            apply_numeric_typmod(&n, precision as usize, scale as usize, arena).map(Datum::Numeric)
         }
         (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
             super::eval::fit_bits(bits, n, varying, arena)
@@ -10351,13 +10929,17 @@ pub fn apply_typmod<'a>(
         // An interval range form with no precision (`interval hour to minute`)
         // rounds nothing — its `precision: None` cannot be mistaken for a
         // number, where the packed 0xFFFF once could.
-        (_, TypeMod::IntervalMod { precision: Some(p), .. }, Datum::Interval(iv)) => {
-            Ok(Datum::Interval(crate::sql::types::Interval {
-                months: iv.months,
-                days: iv.days,
-                micros: round_micros(iv.micros, p),
-            }))
-        }
+        (
+            _,
+            TypeMod::IntervalMod {
+                precision: Some(p), ..
+            },
+            Datum::Interval(iv),
+        ) => Ok(Datum::Interval(crate::sql::types::Interval {
+            months: iv.months,
+            days: iv.days,
+            micros: round_micros(iv.micros, p),
+        })),
         _ => Ok(v),
     }
 }
@@ -10405,7 +10987,10 @@ fn apply_numeric_typmod<'a>(
     let (int_b, frac_b) = (int_part.as_bytes(), frac_part.as_bytes());
     let int_len = int_b.len();
     if int_len + scale + 2 >= DIG {
-        return Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "numeric field overflow"));
+        return Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "numeric field overflow"
+        ));
     }
 
     // Kept digits: every integer digit, then `scale` fractional digits (padded
@@ -10436,7 +11021,10 @@ fn apply_numeric_typmod<'a>(
         int_len - lead_zeros
     };
     if sig_int > precision - scale {
-        return Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "numeric field overflow"));
+        return Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "numeric field overflow"
+        ));
     }
 
     // Reassemble and re-parse (parse sets dscale = scale, matching PostgreSQL).
@@ -10509,7 +11097,6 @@ pub(crate) fn resolve_dml_table(
         _ => Err(undefined_qual(name)),
     }
 }
-
 
 /// Public view of the OID-to-ColType mapping for value-level renderers
 /// (`oid::regtype`).

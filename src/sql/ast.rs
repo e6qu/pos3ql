@@ -12,6 +12,12 @@ pub struct QualName<'a> {
     pub name: &'a str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceTarget<'a> {
+    pub table: QualName<'a>,
+    pub columns: &'a [&'a str],
+}
+
 impl<'a> QualName<'a> {
     pub fn bare(name: &'a str) -> Self {
         QualName { schema: None, name }
@@ -45,15 +51,34 @@ pub enum Stmt<'a> {
     ReleaseSavepoint(&'a str),
     /// ROLLBACK TO [SAVEPOINT] name.
     RollbackToSavepoint(&'a str),
+    /// LOCK [TABLE] relation [, ...] IN ACCESS SHARE MODE [NOWAIT].
+    /// ACCESS SHARE is the pg_dump consistency lock; stronger modes remain
+    /// loud until the wait/deadlock scheduler exists.
+    LockTable {
+        tables: &'a [QualName<'a>],
+        nowait: bool,
+    },
     DropTable(DropTable<'a>),
     /// TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
     /// [CASCADE | RESTRICT].
-    Truncate { tables: &'a [QualName<'a>], restart_identity: bool, cascade: bool },
+    Truncate {
+        tables: &'a [QualName<'a>],
+        restart_identity: bool,
+        cascade: bool,
+    },
     /// CREATE [OR REPLACE] VIEW name AS <select>. `sql` is the raw SELECT text,
     /// stored and re-expanded as a derived table at query time.
-    CreateView { name: QualName<'a>, or_replace: bool, sql: &'a str },
+    CreateView {
+        name: QualName<'a>,
+        or_replace: bool,
+        sql: &'a str,
+    },
     /// DROP VIEW [IF EXISTS] name.
-    DropView { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
+    DropView {
+        names: &'a [QualName<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
     /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
     /// SELECT text, run once to populate the new (backing) table; `columns`
@@ -67,9 +92,15 @@ pub enum Stmt<'a> {
         materialized: bool,
     },
     /// REFRESH MATERIALIZED VIEW name — re-run the stored query, replacing rows.
-    RefreshMaterializedView { name: QualName<'a> },
+    RefreshMaterializedView {
+        name: QualName<'a>,
+    },
     /// DROP MATERIALIZED VIEW [IF EXISTS] name.
-    DropMaterializedView { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
+    DropMaterializedView {
+        names: &'a [QualName<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// CREATE SEQUENCE [IF NOT EXISTS] name [options].
     CreateSequence {
         name: QualName<'a>,
@@ -83,19 +114,40 @@ pub enum Stmt<'a> {
         options: SeqOptions<'a>,
     },
     /// DROP SEQUENCE [IF EXISTS] name [, ...].
-    DropSequence { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
+    DropSequence {
+        names: &'a [QualName<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// CREATE DOMAIN name [AS] basetype [ constraint ... ].
     CreateDomain(CreateDomain<'a>),
     /// ALTER DOMAIN name <action>.
-    AlterDomain { name: QualName<'a>, action: AlterDomainAction<'a> },
+    AlterDomain {
+        name: QualName<'a>,
+        action: AlterDomainAction<'a>,
+    },
     /// DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
-    DropDomain { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
+    DropDomain {
+        names: &'a [QualName<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// CREATE TYPE name AS ENUM ('label', ...).
-    CreateEnum { name: QualName<'a>, labels: &'a [&'a str] },
+    CreateEnum {
+        name: QualName<'a>,
+        labels: &'a [&'a str],
+    },
     /// ALTER TYPE name <action> (enum ADD VALUE / RENAME).
-    AlterType { name: QualName<'a>, action: AlterTypeAction<'a> },
+    AlterType {
+        name: QualName<'a>,
+        action: AlterTypeAction<'a>,
+    },
     /// DROP TYPE [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
-    DropType { names: &'a [QualName<'a>], if_exists: bool, cascade: bool },
+    DropType {
+        names: &'a [QualName<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// CREATE [UNIQUE] INDEX name ON table (col, ...).
     CreateIndex {
         name: &'a str,
@@ -104,10 +156,17 @@ pub enum Stmt<'a> {
         unique: bool,
     },
     /// DROP INDEX [IF EXISTS] name.
-    DropIndex { names: &'a [QualName<'a>], if_exists: bool },
+    DropIndex {
+        names: &'a [QualName<'a>],
+        if_exists: bool,
+    },
     /// SET [LOCAL] name {=|TO} value. `value` is the raw source text of the
     /// value (quotes included); the session GUC store validates and applies it.
-    Set { name: &'a str, value: &'a str, local: bool },
+    Set {
+        name: &'a str,
+        value: &'a str,
+        local: bool,
+    },
     /// RESET name / RESET ALL restores one or every settable GUC to default.
     Reset(Option<&'a str>),
     /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ....
@@ -121,9 +180,16 @@ pub enum Stmt<'a> {
     /// SQL-level PREPARE name [(types)] AS <statement>; `sql` is the raw
     /// statement text and `param_types` the declared `$n` type names (empty if
     /// none were declared).
-    Prepare { name: &'a str, sql: &'a str, param_types: &'a [&'a str] },
+    Prepare {
+        name: &'a str,
+        sql: &'a str,
+        param_types: &'a [&'a str],
+    },
     /// SQL-level EXECUTE name(args).
-    ExecutePrepared { name: &'a str, args: &'a [&'a Expr<'a>] },
+    ExecutePrepared {
+        name: &'a str,
+        args: &'a [&'a Expr<'a>],
+    },
     /// DEALLOCATE name | ALL (None = ALL).
     Deallocate(Option<&'a str>),
     /// COPY table [(columns)] FROM STDIN / TO STDOUT — the bulk-data
@@ -141,10 +207,19 @@ pub enum Stmt<'a> {
         elements: &'a [&'a Stmt<'a>],
     },
     /// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT].
-    DropSchema { names: &'a [&'a str], if_exists: bool, cascade: bool },
+    DropSchema {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// DECLARE name [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
     /// `sql` is the raw SELECT text, materialized at DECLARE.
-    DeclareCursor { name: &'a str, scroll: bool, hold: bool, sql: &'a str },
+    DeclareCursor {
+        name: &'a str,
+        scroll: bool,
+        hold: bool,
+        sql: &'a str,
+    },
     /// FETCH/MOVE direction [FROM|IN] cursor. MOVE positions without rows.
     FetchCursor {
         name: &'a str,
@@ -153,23 +228,30 @@ pub enum Stmt<'a> {
     },
     /// CLOSE cursor | CLOSE ALL (None).
     CloseCursor(Option<&'a str>),
-    /// VACUUM [options] [table [(columns)] [, ...]] — drives a checkpoint
-    /// (this engine's space reclamation); options and targets are parsed and
-    /// the whole store is compacted.
-    Vacuum,
-    /// ANALYZE [options] [table [(columns)] [, ...]] — accepted; the planner
-    /// works from live table state, not collected statistics, so there is no
-    /// statistics artifact to build and none is client-observable.
-    Analyze,
+    /// VACUUM [options] [table [(columns)] [, ...]] — drives this engine's
+    /// checkpoint/compaction and optionally refreshes exact live statistics.
+    Vacuum {
+        targets: &'a [MaintenanceTarget<'a>],
+        analyze: bool,
+    },
+    /// ANALYZE [options] [table [(columns)] [, ...]] — validates the requested
+    /// relations and walks the exact live row state used by the planner.
+    Analyze(&'a [MaintenanceTarget<'a>]),
     /// LISTEN channel — register interest; delivered notifications arrive as
     /// asynchronous NotificationResponse messages.
     Listen(&'a str),
     /// UNLISTEN channel, or UNLISTEN * to drop every registration.
     Unlisten(Option<&'a str>),
     /// NOTIFY channel [, payload] — raise a notification (delivered at commit).
-    Notify { channel: &'a str, payload: Option<&'a str> },
+    Notify {
+        channel: &'a str,
+        payload: Option<&'a str>,
+    },
     /// COMMENT ON <object> IS { 'text' | NULL }. `text: None` removes it.
-    Comment { target: CommentTarget<'a>, text: Option<&'a str> },
+    Comment {
+        target: CommentTarget<'a>,
+        text: Option<&'a str>,
+    },
     /// ALTER <supported object> name OWNER TO role. Every catalog object is
     /// owned by the one modeled role, but the target and requested role are
     /// still validated exactly.
@@ -220,9 +302,15 @@ impl CommentRelKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentTarget<'a> {
     /// TABLE / VIEW / MATERIALIZED VIEW / INDEX / SEQUENCE name.
-    Relation { kind: CommentRelKind, name: QualName<'a> },
+    Relation {
+        kind: CommentRelKind,
+        name: QualName<'a>,
+    },
     /// COLUMN table.column.
-    Column { relation: QualName<'a>, column: &'a str },
+    Column {
+        relation: QualName<'a>,
+        column: &'a str,
+    },
     /// SCHEMA name.
     Schema(&'a str),
     /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
@@ -241,7 +329,12 @@ pub enum SetOp {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SetTree<'a> {
     Select(&'a Select<'a>),
-    Op { operator: SetOp, all: bool, left: &'a SetTree<'a>, right: &'a SetTree<'a> },
+    Op {
+        operator: SetOp,
+        all: bool,
+        left: &'a SetTree<'a>,
+        right: &'a SetTree<'a>,
+    },
 }
 
 /// A set-operation query plus the trailing ORDER BY / LIMIT / OFFSET that apply
@@ -446,7 +539,10 @@ pub enum SelectItem<'a> {
     /// `(expr).*`: expand a record-valued expression into its fields as
     /// separate columns (`(ROW(1,2)).*`, `(json_each(j)).*`, `(t).*`).
     RecordStar(&'a Expr<'a>),
-    Expr { expression: &'a Expr<'a>, alias: Option<&'a str> },
+    Expr {
+        expression: &'a Expr<'a>,
+        alias: Option<&'a str>,
+    },
 }
 
 /// A window function's `OVER (PARTITION BY ... ORDER BY ...)` clause. Only the
@@ -660,7 +756,12 @@ pub enum AlterDomainAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterTypeAction<'a> {
     /// ADD VALUE [IF NOT EXISTS] 'label' [ {BEFORE|AFTER} 'existing' ].
-    AddValue { label: &'a str, if_not_exists: bool, before: Option<&'a str>, after: Option<&'a str> },
+    AddValue {
+        label: &'a str,
+        if_not_exists: bool,
+        before: Option<&'a str>,
+        after: Option<&'a str>,
+    },
     /// RENAME TO new_name (renames the type itself, not a value).
     RenameTo(&'a str),
     /// RENAME VALUE 'old' TO 'new' — rejected (values are stored inline).
@@ -928,7 +1029,11 @@ pub enum MergeAction<'a> {
     Delete,
     /// `INSERT [(cols)] VALUES (exprs)` or `INSERT DEFAULT VALUES` (WHEN NOT
     /// MATCHED only). Empty `values` means DEFAULT VALUES.
-    Insert { columns: &'a [&'a str], values: &'a [&'a Expr<'a>], default_values: bool },
+    Insert {
+        columns: &'a [&'a str],
+        values: &'a [&'a Expr<'a>],
+        default_values: bool,
+    },
     /// `DO NOTHING`.
     DoNothing,
 }
@@ -951,21 +1056,40 @@ pub enum AlterAction<'a> {
     RenameTable(&'a str),
     /// ALTER TABLE ... SET SCHEMA new_schema.
     SetSchema(&'a str),
-    RenameColumn { from: &'a str, to: &'a str },
+    RenameColumn {
+        from: &'a str,
+        to: &'a str,
+    },
     AddColumn(ColumnDef<'a>),
     DropColumn(&'a str),
     /// ALTER [COLUMN] col SET DEFAULT expr.
-    SetDefault { column: &'a str, value: &'a Expr<'a>, value_text: &'a str },
+    SetDefault {
+        column: &'a str,
+        value: &'a Expr<'a>,
+        value_text: &'a str,
+    },
     /// ALTER [COLUMN] col DROP DEFAULT.
-    DropDefault { column: &'a str },
+    DropDefault {
+        column: &'a str,
+    },
     /// ALTER [COLUMN] col ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY.
-    AddIdentity { column: &'a str, spec: IdentitySpec<'a> },
+    AddIdentity {
+        column: &'a str,
+        spec: IdentitySpec<'a>,
+    },
     /// ALTER [COLUMN] col DROP IDENTITY [IF EXISTS].
-    DropIdentity { column: &'a str, if_exists: bool },
+    DropIdentity {
+        column: &'a str,
+        if_exists: bool,
+    },
     /// ALTER [COLUMN] col SET NOT NULL — validated against existing rows.
-    SetNotNull { column: &'a str },
+    SetNotNull {
+        column: &'a str,
+    },
     /// ALTER [COLUMN] col DROP NOT NULL.
-    DropNotNull { column: &'a str },
+    DropNotNull {
+        column: &'a str,
+    },
     /// ALTER [COLUMN] col [SET DATA] TYPE newtype [USING expr]. Without `using`
     /// the stored value is cast through the assignment cast; with it, `using`
     /// is evaluated per row (the old columns in scope) and cast to the type.
@@ -979,9 +1103,15 @@ pub enum AlterAction<'a> {
     /// are validated against the new constraint before it is attached.
     AddConstraint(TableConstraint<'a>),
     /// ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name.
-    DropConstraint { name: &'a str, if_exists: bool },
+    DropConstraint {
+        name: &'a str,
+        if_exists: bool,
+    },
     /// ALTER TABLE ... RENAME CONSTRAINT old TO new.
-    RenameConstraint { from: &'a str, to: &'a str },
+    RenameConstraint {
+        from: &'a str,
+        to: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1099,14 +1229,24 @@ pub enum Expr<'a> {
     /// `ARRAY[e1, e2, ...]` array constructor.
     Array(&'a [&'a Expr<'a>]),
     /// `base[index]` array element access (1-based).
-    Subscript { base: &'a Expr<'a>, index: &'a Expr<'a> },
+    Subscript {
+        base: &'a Expr<'a>,
+        index: &'a Expr<'a>,
+    },
     /// Array slice `base[lower:upper]`; either bound may be omitted (`base[:2]`,
     /// `base[2:]`, `base[:]`), defaulting to the array's first / last element.
-    Slice { base: &'a Expr<'a>, lower: Option<&'a Expr<'a>>, upper: Option<&'a Expr<'a>> },
+    Slice {
+        base: &'a Expr<'a>,
+        lower: Option<&'a Expr<'a>>,
+        upper: Option<&'a Expr<'a>>,
+    },
     /// `(base).field` composite field access. Used by driver introspection with
     /// the `_pg_expandarray` set function, whose result exposes `.x` (element)
     /// and `.n` (1-based ordinal).
-    Field { base: &'a Expr<'a>, field: &'a str },
+    Field {
+        base: &'a Expr<'a>,
+        field: &'a str,
+    },
     /// `t.*` in an expression position (a whole-row reference). Supported
     /// only as a `count()` argument; anywhere else it is rejected at type
     /// analysis (record values are not first-class here).
@@ -1114,7 +1254,11 @@ pub enum Expr<'a> {
     /// A three-part column reference `schema.table.column`: the qualifier
     /// pair must match an unaliased FROM entry that really is that schema's
     /// table (PostgreSQL's rule), then resolves like `table.column`.
-    SchemaColumn { schema: &'a str, table: &'a str, name: &'a str },
+    SchemaColumn {
+        schema: &'a str,
+        table: &'a str,
+        name: &'a str,
+    },
     /// `operand operator ANY/ALL (array)` — quantified comparison.
     AnyAll {
         operand: &'a Expr<'a>,
@@ -1178,12 +1322,27 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("generate_subscripts")
         }
         match self {
-            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
-            | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_) => true,
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::BitLit(_) => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
-            Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_)
-            | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_)
+            Expr::Column { .. }
+            | Expr::Param(_)
+            | Expr::Subquery(_)
+            | Expr::InSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
+            Expr::Cast { type_name, .. }
+                if type_name.eq_ignore_ascii_case("regclass")
+                    || type_name.eq_ignore_ascii_case("regtype") =>
+            {
+                false
+            }
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
             | Expr::IsNull { operand, .. } => operand.is_constant(),
@@ -1191,22 +1350,34 @@ impl Expr<'_> {
             Expr::InList { operand, list, .. } => {
                 operand.is_constant() && list.iter().all(|e| e.is_constant())
             }
-            Expr::Between { operand, low, high, .. } => {
-                operand.is_constant() && low.is_constant() && high.is_constant()
+            Expr::Between {
+                operand, low, high, ..
+            } => operand.is_constant() && low.is_constant() && high.is_constant(),
+            Expr::Like {
+                operand, pattern, ..
             }
-            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-                operand.is_constant() && pattern.is_constant()
-            }
-            Expr::Case { operand, whens, otherwise, .. } => {
+            | Expr::Match {
+                operand, pattern, ..
+            } => operand.is_constant() && pattern.is_constant(),
+            Expr::Case {
+                operand,
+                whens,
+                otherwise,
+                ..
+            } => {
                 operand.map(|o| o.is_constant()).unwrap_or(true)
-                    && whens.iter().all(|(c, r)| c.is_constant() && r.is_constant())
+                    && whens
+                        .iter()
+                        .all(|(c, r)| c.is_constant() && r.is_constant())
                     && otherwise.map(|e| e.is_constant()).unwrap_or(true)
             }
             // Aggregates, window functions, set-returning functions, and the
             // side-effecting sequence functions are never constant (the last
             // must reach the sequence engine, not be folded at plan time); other
             // calls are constant when their arguments are.
-            Expr::Call { name, args, over, .. } => {
+            Expr::Call {
+                name, args, over, ..
+            } => {
                 over.is_none()
                     && !self.is_aggregate()
                     && !is_set_returning(name)
@@ -1231,40 +1402,67 @@ impl Expr<'_> {
     pub fn contains_call(&self) -> bool {
         match self {
             Expr::Call { .. } => true,
-            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-            | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::WholeRow(_)
-            | Expr::SchemaColumn { .. } | Expr::Param(_) | Expr::DefaultMarker => false,
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
-            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
-                operand.contains_call()
-            }
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::BitLit(_)
+            | Expr::Column { .. }
+            | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. }
+            | Expr::Param(_)
+            | Expr::DefaultMarker => false,
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. }
+            | Expr::Field { base: operand, .. } => operand.contains_call(),
             Expr::Slice { base, lower, upper } => {
                 base.contains_call()
                     || lower.is_some_and(|e| e.contains_call())
                     || upper.is_some_and(|e| e.contains_call())
             }
-            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
-            | Expr::AnyAll { operand: left, array: right, .. } => {
-                left.contains_call() || right.contains_call()
+            Expr::Binary { left, right, .. }
+            | Expr::Subscript {
+                base: left,
+                index: right,
             }
+            | Expr::AnyAll {
+                operand: left,
+                array: right,
+                ..
+            } => left.contains_call() || right.contains_call(),
             Expr::InList { operand, list, .. } => {
                 operand.contains_call() || list.iter().any(|e| e.contains_call())
             }
-            Expr::Between { operand, low, high, .. } => {
-                operand.contains_call() || low.contains_call() || high.contains_call()
+            Expr::Between {
+                operand, low, high, ..
+            } => operand.contains_call() || low.contains_call() || high.contains_call(),
+            Expr::Like {
+                operand, pattern, ..
             }
-            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-                operand.contains_call() || pattern.contains_call()
-            }
-            Expr::Case { operand, whens, otherwise, .. } => {
+            | Expr::Match {
+                operand, pattern, ..
+            } => operand.contains_call() || pattern.contains_call(),
+            Expr::Case {
+                operand,
+                whens,
+                otherwise,
+                ..
+            } => {
                 operand.map(|o| o.contains_call()).unwrap_or(false)
-                    || whens.iter().any(|(c, r)| c.contains_call() || r.contains_call())
+                    || whens
+                        .iter()
+                        .any(|(c, r)| c.contains_call() || r.contains_call())
                     || otherwise.map(|o| o.contains_call()).unwrap_or(false)
             }
             Expr::Array(items) => items.iter().any(|e| e.contains_call()),
             // A subquery-bearing default is rejected elsewhere; treat it as
             // non-foldable to be safe.
-            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
+            Expr::Subquery(_)
+            | Expr::InSubquery { .. }
+            | Expr::Exists(_)
             | Expr::ArraySubquery(_) => true,
         }
     }
@@ -1273,37 +1471,60 @@ impl Expr<'_> {
     /// generation expression (0A000).
     pub fn contains_subquery(&self) -> bool {
         match self {
-            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
+            Expr::Subquery(_)
+            | Expr::InSubquery { .. }
+            | Expr::Exists(_)
             | Expr::ArraySubquery(_) => true,
-            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-            | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::WholeRow(_)
-            | Expr::SchemaColumn { .. } | Expr::Param(_) | Expr::DefaultMarker => false,
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
-            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
-                operand.contains_subquery()
-            }
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::BitLit(_)
+            | Expr::Column { .. }
+            | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. }
+            | Expr::Param(_)
+            | Expr::DefaultMarker => false,
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. }
+            | Expr::Field { base: operand, .. } => operand.contains_subquery(),
             Expr::Slice { base, lower, upper } => {
                 base.contains_subquery()
                     || lower.is_some_and(|e| e.contains_subquery())
                     || upper.is_some_and(|e| e.contains_subquery())
             }
-            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
-            | Expr::AnyAll { operand: left, array: right, .. } => {
-                left.contains_subquery() || right.contains_subquery()
+            Expr::Binary { left, right, .. }
+            | Expr::Subscript {
+                base: left,
+                index: right,
             }
+            | Expr::AnyAll {
+                operand: left,
+                array: right,
+                ..
+            } => left.contains_subquery() || right.contains_subquery(),
             Expr::Call { args, .. } => args.iter().any(|a| a.contains_subquery()),
             Expr::InList { operand, list, .. } => {
                 operand.contains_subquery() || list.iter().any(|e| e.contains_subquery())
             }
-            Expr::Between { operand, low, high, .. } => {
-                operand.contains_subquery()
-                    || low.contains_subquery()
-                    || high.contains_subquery()
+            Expr::Between {
+                operand, low, high, ..
+            } => operand.contains_subquery() || low.contains_subquery() || high.contains_subquery(),
+            Expr::Like {
+                operand, pattern, ..
             }
-            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-                operand.contains_subquery() || pattern.contains_subquery()
-            }
-            Expr::Case { operand, whens, otherwise, .. } => {
+            | Expr::Match {
+                operand, pattern, ..
+            } => operand.contains_subquery() || pattern.contains_subquery(),
+            Expr::Case {
+                operand,
+                whens,
+                otherwise,
+                ..
+            } => {
                 operand.map(|o| o.contains_subquery()).unwrap_or(false)
                     || whens
                         .iter()
@@ -1322,13 +1543,38 @@ impl Expr<'_> {
     pub fn contains_nonimmutable_function(&self) -> Option<&str> {
         fn is_nonimmutable(name: &str) -> bool {
             const NAMES: &[&str] = &[
-                "now", "current_timestamp", "current_date", "current_time", "localtime",
-                "localtimestamp", "statement_timestamp", "transaction_timestamp",
-                "clock_timestamp", "timeofday", "random", "random_normal", "nextval", "currval",
-                "lastval", "setval", "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
-                "current_user", "session_user", "user", "current_role", "current_schema",
-                "current_database", "current_catalog", "pg_backend_pid", "txid_current",
-                "pg_current_xact_id", "pg_is_in_recovery", "current_setting", "set_config",
+                "now",
+                "current_timestamp",
+                "current_date",
+                "current_time",
+                "localtime",
+                "localtimestamp",
+                "statement_timestamp",
+                "transaction_timestamp",
+                "clock_timestamp",
+                "timeofday",
+                "random",
+                "random_normal",
+                "nextval",
+                "currval",
+                "lastval",
+                "setval",
+                "gen_random_uuid",
+                "uuid_generate_v1",
+                "uuid_generate_v4",
+                "current_user",
+                "session_user",
+                "user",
+                "current_role",
+                "current_schema",
+                "current_database",
+                "current_catalog",
+                "pg_backend_pid",
+                "txid_current",
+                "pg_current_xact_id",
+                "pg_is_in_recovery",
+                "current_setting",
+                "set_config",
             ];
             NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
         }
@@ -1339,34 +1585,65 @@ impl Expr<'_> {
                 }
                 args.iter().find_map(|a| a.contains_nonimmutable_function())
             }
-            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-            | Expr::Str(_) | Expr::BitLit(_) | Expr::Column { .. } | Expr::WholeRow(_)
-            | Expr::SchemaColumn { .. } | Expr::Param(_) | Expr::DefaultMarker
-            | Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::BitLit(_)
+            | Expr::Column { .. }
+            | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. }
+            | Expr::Param(_)
+            | Expr::DefaultMarker
+            | Expr::Subquery(_)
+            | Expr::InSubquery { .. }
+            | Expr::Exists(_)
             | Expr::ArraySubquery(_) => None,
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
-            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
-                operand.contains_nonimmutable_function()
-            }
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. }
+            | Expr::Field { base: operand, .. } => operand.contains_nonimmutable_function(),
             Expr::Slice { base, lower, upper } => base
                 .contains_nonimmutable_function()
                 .or_else(|| lower.and_then(|e| e.contains_nonimmutable_function()))
                 .or_else(|| upper.and_then(|e| e.contains_nonimmutable_function())),
-            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
-            | Expr::AnyAll { operand: left, array: right, .. } => left
+            Expr::Binary { left, right, .. }
+            | Expr::Subscript {
+                base: left,
+                index: right,
+            }
+            | Expr::AnyAll {
+                operand: left,
+                array: right,
+                ..
+            } => left
                 .contains_nonimmutable_function()
                 .or_else(|| right.contains_nonimmutable_function()),
             Expr::InList { operand, list, .. } => operand
                 .contains_nonimmutable_function()
                 .or_else(|| list.iter().find_map(|e| e.contains_nonimmutable_function())),
-            Expr::Between { operand, low, high, .. } => operand
+            Expr::Between {
+                operand, low, high, ..
+            } => operand
                 .contains_nonimmutable_function()
                 .or_else(|| low.contains_nonimmutable_function())
                 .or_else(|| high.contains_nonimmutable_function()),
-            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => operand
+            Expr::Like {
+                operand, pattern, ..
+            }
+            | Expr::Match {
+                operand, pattern, ..
+            } => operand
                 .contains_nonimmutable_function()
                 .or_else(|| pattern.contains_nonimmutable_function()),
-            Expr::Case { operand, whens, otherwise, .. } => operand
+            Expr::Case {
+                operand,
+                whens,
+                otherwise,
+                ..
+            } => operand
                 .and_then(|o| o.contains_nonimmutable_function())
                 .or_else(|| {
                     whens.iter().find_map(|(c, r)| {
@@ -1375,9 +1652,9 @@ impl Expr<'_> {
                     })
                 })
                 .or_else(|| otherwise.and_then(|o| o.contains_nonimmutable_function())),
-            Expr::Array(items) => {
-                items.iter().find_map(|e| e.contains_nonimmutable_function())
-            }
+            Expr::Array(items) => items
+                .iter()
+                .find_map(|e| e.contains_nonimmutable_function()),
         }
     }
 
@@ -1386,14 +1663,25 @@ impl Expr<'_> {
     pub fn for_each_column(&self, f: &mut dyn FnMut(&str)) {
         match self {
             Expr::Column { name, .. } => f(name),
-            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-            | Expr::Str(_) | Expr::BitLit(_) | Expr::WholeRow(_) | Expr::SchemaColumn { .. }
-            | Expr::Param(_) | Expr::DefaultMarker | Expr::Subquery(_)
-            | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {}
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. }
-            | Expr::IsNull { operand, .. } | Expr::Field { base: operand, .. } => {
-                operand.for_each_column(f)
-            }
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::BitLit(_)
+            | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. }
+            | Expr::Param(_)
+            | Expr::DefaultMarker
+            | Expr::Subquery(_)
+            | Expr::InSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => {}
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. }
+            | Expr::Field { base: operand, .. } => operand.for_each_column(f),
             Expr::Slice { base, lower, upper } => {
                 base.for_each_column(f);
                 if let Some(e) = lower {
@@ -1403,8 +1691,16 @@ impl Expr<'_> {
                     e.for_each_column(f);
                 }
             }
-            Expr::Binary { left, right, .. } | Expr::Subscript { base: left, index: right }
-            | Expr::AnyAll { operand: left, array: right, .. } => {
+            Expr::Binary { left, right, .. }
+            | Expr::Subscript {
+                base: left,
+                index: right,
+            }
+            | Expr::AnyAll {
+                operand: left,
+                array: right,
+                ..
+            } => {
                 left.for_each_column(f);
                 right.for_each_column(f);
             }
@@ -1413,16 +1709,28 @@ impl Expr<'_> {
                 operand.for_each_column(f);
                 list.iter().for_each(|e| e.for_each_column(f));
             }
-            Expr::Between { operand, low, high, .. } => {
+            Expr::Between {
+                operand, low, high, ..
+            } => {
                 operand.for_each_column(f);
                 low.for_each_column(f);
                 high.for_each_column(f);
             }
-            Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+            Expr::Like {
+                operand, pattern, ..
+            }
+            | Expr::Match {
+                operand, pattern, ..
+            } => {
                 operand.for_each_column(f);
                 pattern.for_each_column(f);
             }
-            Expr::Case { operand, whens, otherwise, .. } => {
+            Expr::Case {
+                operand,
+                whens,
+                otherwise,
+                ..
+            } => {
                 if let Some(o) = operand {
                     o.for_each_column(f);
                 }
@@ -1551,7 +1859,10 @@ impl BinaryOp {
             // Exponentiation binds tighter than multiplication.
             Self::Pow => 8,
             // JSON accessors bind tightest among binary operators.
-            Self::JsonGet | Self::JsonGetText | Self::JsonPath | Self::JsonPathText
+            Self::JsonGet
+            | Self::JsonGetText
+            | Self::JsonPath
+            | Self::JsonPathText
             | Self::JsonDeletePath => 9,
         }
     }

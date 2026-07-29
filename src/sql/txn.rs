@@ -7,10 +7,10 @@
 //! committed image; a write conflict raises 40001 immediately instead of
 //! blocking (single-threaded execution cannot wait).
 
-use crate::sql::eval::sqlstate;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
+use crate::sql::eval::sqlstate;
 use crate::sql_err;
 use crate::storage::RowLoc;
 use crate::util::StackStr;
@@ -51,12 +51,26 @@ pub enum TxnMode {
     Explicit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+}
+
 pub struct TxnState {
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
     /// COMMIT/ROLLBACK fails with 25P02.
     pub failed: bool,
     pub txid: u32,
+    /// The isolation level promised to this transaction. READ COMMITTED takes
+    /// a fresh durable-LSN snapshot per statement; REPEATABLE READ pins the
+    /// first data statement's snapshot until commit or rollback.
+    pub isolation: IsolationLevel,
+    pub read_only: bool,
+    pub deferrable: bool,
+    snapshot_lsn: Option<u64>,
+    snapshot_taken: bool,
     /// PostgreSQL's command-id: a monotonically increasing counter bumped once
     /// per statement. A row write records the command that made it, so a query
     /// snapshotting at command K sees writes from commands `< K` but not its own
@@ -174,7 +188,10 @@ pub enum DdlUndo {
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
     /// promoted and journaled.
-    CommentSet { slot: u32, prior: Option<crate::storage::PendingComment> },
+    CommentSet {
+        slot: u32,
+        prior: Option<crate::storage::PendingComment>,
+    },
 }
 
 /// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and
@@ -187,6 +204,11 @@ impl TxnState {
             mode: TxnMode::Idle,
             failed: false,
             txid: 0,
+            isolation: IsolationLevel::ReadCommitted,
+            read_only: false,
+            deferrable: false,
+            snapshot_lsn: None,
+            snapshot_taken: false,
             command_id: 1,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
             ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
@@ -230,6 +252,36 @@ impl TxnState {
     /// and its main query) share one command-id and therefore one snapshot.
     pub fn begin_command(&mut self) {
         self.command_id = self.command_id.saturating_add(1);
+    }
+
+    pub fn set_characteristics(
+        &mut self,
+        isolation: IsolationLevel,
+        read_only: bool,
+        deferrable: bool,
+    ) {
+        self.isolation = isolation;
+        self.read_only = read_only;
+        self.deferrable = deferrable;
+    }
+
+    /// Selects this statement's durable commit snapshot. A repeatable-read
+    /// transaction pins its first data statement; READ COMMITTED follows the
+    /// latest committed LSN on every statement.
+    pub fn statement_snapshot(&mut self, current_lsn: u64) -> u64 {
+        self.snapshot_taken = true;
+        match self.isolation {
+            IsolationLevel::ReadCommitted => current_lsn,
+            IsolationLevel::RepeatableRead => *self.snapshot_lsn.get_or_insert(current_lsn),
+        }
+    }
+
+    pub fn snapshot_lsn(&self) -> Option<u64> {
+        self.snapshot_lsn
+    }
+
+    pub fn snapshot_taken(&self) -> bool {
+        self.snapshot_taken
     }
 
     pub fn status_byte(&self) -> u8 {
@@ -303,10 +355,7 @@ impl TxnState {
     }
 
     /// Buffers a LISTEN/UNLISTEN to apply at commit.
-    pub fn buffer_listen_op(
-        &mut self,
-        op: crate::sql::notify::ListenOp,
-    ) -> Result<(), SqlError> {
+    pub fn buffer_listen_op(&mut self, op: crate::sql::notify::ListenOp) -> Result<(), SqlError> {
         self.pending_listen_ops.push(op).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -375,7 +424,11 @@ impl TxnState {
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "more than {} active savepoints", MAX_SAVEPOINTS)
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "more than {} active savepoints",
+                MAX_SAVEPOINTS
+            )
         })
     }
 
@@ -438,6 +491,11 @@ impl TxnState {
     pub fn clear(&mut self) {
         self.mode = TxnMode::Idle;
         self.failed = false;
+        self.isolation = IsolationLevel::ReadCommitted;
+        self.read_only = false;
+        self.deferrable = false;
+        self.snapshot_lsn = None;
+        self.snapshot_taken = false;
         self.touched.clear();
         self.ddl.clear();
         self.savepoints.clear();

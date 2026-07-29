@@ -21,7 +21,10 @@ pub struct ResultFmt {
 }
 
 impl ResultFmt {
-    pub const ALL_TEXT: Self = Self { codes: [false; MAX_RESULT_COLS], n: 0 };
+    pub const ALL_TEXT: Self = Self {
+        codes: [false; MAX_RESULT_COLS],
+        n: 0,
+    };
 
     pub fn new(codes: [bool; MAX_RESULT_COLS], n: u16) -> Self {
         Self { codes, n }
@@ -143,8 +146,7 @@ impl<'b> Responder<'b> {
                     if n > 0 {
                         self.buffer.consume(n as usize);
                     } else if n < 0 {
-                        if std::io::Error::last_os_error().kind()
-                            == std::io::ErrorKind::Interrupted
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
                         {
                             continue;
                         }
@@ -413,11 +415,7 @@ impl<'b> Responder<'b> {
         m.finish()
     }
 
-    fn encode_value_text(
-        m: &mut MsgOut,
-        v: &Datum,
-        render: crate::sql::guc::RenderContext,
-    ) {
+    fn encode_value_text(m: &mut MsgOut, v: &Datum, render: crate::sql::guc::RenderContext) {
         {
             match v {
                 Datum::Null => {
@@ -551,7 +549,9 @@ impl<'b> Responder<'b> {
                         _ => 4,
                     })
                     .sum();
-                let out = arena.alloc_slice_with(escaped_len, |_| 0u8).map_err(|_| full())?;
+                let out = arena
+                    .alloc_slice_with(escaped_len, |_| 0u8)
+                    .map_err(|_| full())?;
                 let mut at = 0;
                 for &byte in b.iter() {
                     match byte {
@@ -749,9 +749,25 @@ impl<'b> Responder<'b> {
                             m.i32(1);
                         }
                         for i in 0..count {
-                            let elem = crate::sql::array::get(raw, *element, i)
-                                .unwrap_or(Datum::Null);
+                            let elem =
+                                crate::sql::array::get(raw, *element, i).unwrap_or(Datum::Null);
                             Self::encode_value_binary(m, &elem);
+                        }
+                    });
+                }
+                Datum::Int2Vector(raw) => {
+                    let count = raw.len() / 2;
+                    m.field(|m| {
+                        m.i32(if count == 0 { 0 } else { 1 });
+                        m.i32(0);
+                        m.i32(crate::sql::types::oid::INT2);
+                        if count > 0 {
+                            m.i32(count as i32);
+                            m.i32(0);
+                        }
+                        for bytes in raw.chunks_exact(2) {
+                            m.i32(2);
+                            m.bytes(&i16::from_le_bytes([bytes[0], bytes[1]]).to_be_bytes());
                         }
                     });
                 }

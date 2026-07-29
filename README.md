@@ -108,8 +108,13 @@ Working single-node database:
   indexes, views and materialized views. CI runs parallel pg_restore, replaces
   the populated catalog with `--clean --if-exists`, and verifies the result
   again after restart.
-- Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED snapshot isolation,
-  transactional DDL, and fail-fast (`40001`) write-conflict detection.
+- PostgreSQL 18.4 pg_dump also runs in the other direction: it takes its real
+  REPEATABLE READ, READ ONLY snapshot with ACCESS SHARE locks, and the emitted
+  schema/data/view/identity dump restores into vanilla PostgreSQL with sequence
+  continuation intact.
+- Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED and REPEATABLE READ
+  snapshots, READ ONLY enforcement, transactional DDL, and fail-fast (`40001`)
+  write-conflict detection.
 - LISTEN / NOTIFY: `LISTEN`/`UNLISTEN`/`NOTIFY channel[, payload]` with
   PostgreSQL's transactional delivery (fired at commit, dropped on rollback,
   de-duplicated within a transaction) and asynchronous cross-connection
@@ -164,8 +169,9 @@ upload.
 Known divergences from PostgreSQL and current constraints (details and IDs in
 [BUGS.md](BUGS.md)):
 
-- **Concurrency is single-threaded, fail-fast.** Isolation is READ COMMITTED;
-  sessions interleave only at message boundaries. A write-write conflict fails
+- **Concurrency is single-threaded, fail-fast.** READ COMMITTED and REPEATABLE
+  READ are implemented; SERIALIZABLE is not yet implemented. Sessions
+  interleave only at message boundaries. A write-write conflict fails
   immediately with `40001` (serialization failure) — pos3ql does **not**
   block-and-wait like PostgreSQL READ COMMITTED, so applications must retry
   (B-004).

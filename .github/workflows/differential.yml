@@ -123,6 +123,10 @@ jobs:
           SLT_LIMIT: "50000"
           SLT_QUERY_SHARDS: "4"
           SLT_QUERY_SHARD: ${{ matrix.query_shard }}
+          # Unsupported SQL is a measured compatibility debt, not a green
+          # escape hatch. Every shard currently reports 183; new support may
+          # lower the count, while any regression above this ceiling fails.
+          SLT_UNSUPPORTED_BUDGET: "183"
           RUN_FAST: ${{ matrix.run_fast }}
           RUN_SLT: ${{ matrix.run_slt }}
           RUN_FUZZ: ${{ matrix.run_fuzz }}

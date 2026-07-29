@@ -5829,6 +5829,13 @@ pub fn create_index(
             return sql_fail(error);
         }
     }
+    if let Err(error) = storage.prepare_index_enforcers(table_index, txn.txid) {
+        storage.rollback_index_create(slot);
+        storage
+            .refresh_enforcers(table_index)
+            .expect("rolling back a pending index restores the prior cache shape");
+        return sql_fail(error);
+    }
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.append(
         lsn,
@@ -5842,9 +5849,16 @@ pub fn create_index(
         },
     ) {
         storage.rollback_index_create(slot);
+        storage
+            .refresh_enforcers(table_index)
+            .expect("failed index WAL restores the prior cache shape");
         return sql_fail(e);
     }
     if let Err(e) = txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32)) {
+        storage.rollback_index_create(slot);
+        storage
+            .refresh_enforcers(table_index)
+            .expect("failed DDL undo reservation restores the prior cache shape");
         return sql_fail(e);
     }
     responder.command_complete("CREATE INDEX")?;

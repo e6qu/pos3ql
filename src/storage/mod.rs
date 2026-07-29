@@ -885,10 +885,10 @@ pub struct Table {
     pub(crate) tombstones: [u64; MAX_TOMBSTONES],
     pub(crate) n_tombstones: usize,
     pub(crate) tombstones_overflow: bool,
-    /// The value indexes accelerating this table's uniqueness/foreign-key
-    /// probes, one per constraint, rebuilt from `def` whenever the definition or
-    /// index set changes and maintained per committed row otherwise.
-    pub(crate) enforcers: [Option<Enforcer>; MAX_UNIQUE_ENFORCERS],
+    /// Value caches accelerating this table's uniqueness and equality probes,
+    /// one per distinct constrained or named-index tuple, rebuilt whenever the
+    /// definition/index set changes and maintained per committed row otherwise.
+    pub(crate) enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
     pub(crate) n_enforcers: usize,
 }
 
@@ -900,15 +900,14 @@ pub(crate) const MAX_SPILL_SSTS: usize = 8;
 /// rewrites the table fully rather than lose one.
 pub(crate) const MAX_TOMBSTONES: usize = 1024;
 
-/// The most value indexes one table can carry: one per single-column
-/// UNIQUE/PRIMARY KEY flag, per multi-column key, and per UNIQUE index.
+/// The most value indexes one table can carry: one per distinct indexed
+/// column tuple, whether introduced by a constraint or a named index.
 /// Exceeding it at DDL is a loud error.
-pub(crate) const MAX_UNIQUE_ENFORCERS: usize = 16;
+pub(crate) const MAX_VALUE_ENFORCERS: usize = 16;
 
-/// A table's binding of one uniqueness constraint to its value index: the key
-/// columns it covers and the pool slot holding the `value_hash → rowid` map for
-/// the committed rows. A uniqueness probe finds the enforcer whose columns match
-/// and seeks the index instead of scanning every row.
+/// A table's binding of one indexed tuple to its value cache: the key columns
+/// it covers and the pool slot holding the `value_hash → rowid` map. Constraint
+/// enforcement and eligible query scans share this lookup.
 #[derive(Clone, Copy)]
 pub(crate) struct Enforcer {
     slot: u32,
@@ -1864,11 +1863,6 @@ pub struct Storage {
     /// in an `Option` so a rebuild can take it out for the duration of a row
     /// walk (which borrows the rest of `self`) and put it back.
     value_indexes: Option<ValueIndexPool>,
-    /// The logical cap on a constrained table's committed rows: an enforcer's
-    /// index holds this many (plus a one-transaction headroom the physical slot
-    /// array carries), and an insert past it is a loud error. This is the price
-    /// of an in-RAM value index under unbounded spill.
-    value_index_cap: usize,
 }
 
 /// Fetches spilled rows back through the cache tiers. The buffers are owned
@@ -2114,7 +2108,7 @@ impl Storage {
             + config.max_connections as usize * config.max_tables * size_of::<(u32, u32)>()
             + ValueIndexPool::budget_bytes(
                 config.max_value_indexes,
-                config.value_index_rows + config.table_rows,
+                config.value_index_rows,
             )
     }
 
@@ -2167,7 +2161,7 @@ impl Storage {
                     tombstones: [0; MAX_TOMBSTONES],
                     n_tombstones: 0,
                     tombstones_overflow: false,
-                    enforcers: [None; MAX_UNIQUE_ENFORCERS],
+                    enforcers: [None; MAX_VALUE_ENFORCERS],
                     n_enforcers: 0,
                 })
                 .expect("sized to max_tables");
@@ -2274,14 +2268,10 @@ impl Storage {
                 })
                 .expect("sized to max_tables");
         }
-        // A transaction's committed batch is bounded by the overlay, so the
-        // physical index carries the cap plus one overlay-worth of headroom: the
-        // per-row commit maintenance never overflows, while the cap itself is
-        // enforced gracefully at insert time.
         let value_indexes = ValueIndexPool::new(
             budget,
             config.max_value_indexes,
-            config.value_index_rows + config.table_rows,
+            config.value_index_rows,
         )?;
         let active_snapshots =
             FixedVec::new(budget, "active_snapshots", config.max_connections as usize)?;
@@ -2314,7 +2304,6 @@ impl Storage {
             lsn: 0,
             spill: None,
             value_indexes: Some(value_indexes),
-            value_index_cap: config.value_index_rows,
         })
     }
 
@@ -4101,7 +4090,7 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         home: RowHome,
-        out: &mut [(usize, u64); MAX_UNIQUE_ENFORCERS],
+        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
         let table = &self.tables[table_index];
         let n_enf = table.n_enforcers;
@@ -4110,7 +4099,7 @@ impl Storage {
         }
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = table.def.schema(&mut schema);
-        let mut cols = [([0u16; MAX_INDEX_COLS], 0usize); MAX_UNIQUE_ENFORCERS];
+        let mut cols = [([0u16; MAX_INDEX_COLS], 0usize); MAX_VALUE_ENFORCERS];
         for (i, entry) in cols.iter_mut().enumerate().take(n_enf) {
             let e = table.enforcers[i].expect("enforcer present");
             *entry = (e.columns, e.n_cols);
@@ -4145,14 +4134,14 @@ impl Storage {
         if self.tables[table_index].n_enforcers == 0 {
             return;
         }
-        let mut inserts = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
+        let mut inserts = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
         let n_inserts = match new_loc {
             Some(loc) => self
                 .row_enforcer_hashes(table_index, rowid, RowHome::Heap(loc), &mut inserts)
                 .expect("new row decodes"),
             None => 0,
         };
-        let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
+        let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
         for (i, s) in slots
             .iter_mut()
             .enumerate()
@@ -4170,17 +4159,21 @@ impl Storage {
             pool.get_mut(slot).remove_rowid(rowid);
         }
         for &(ei, hash) in &inserts[..n_inserts] {
-            pool.get_mut(slots[ei])
-                .insert(hash, rowid)
-                .expect("value index headroom absorbs a commit batch");
+            let index = pool.get_mut(slots[ei]);
+            if index.insert(hash, rowid).is_err() {
+                // This structure is an acceleration cache, not durable state.
+                // Once it cannot represent the complete committed image, a
+                // negative probe must fall through to the authoritative rows.
+                index.mark_incomplete();
+            }
         }
     }
 
-    /// Probes the value index for the enforcer covering exactly `columns`,
+    /// Probes the value cache for the indexed tuple covering exactly `columns`,
     /// visiting every candidate rowid whose key hashes to `hash`. Returns true
-    /// if an index served the probe; false if no enforcer covers these columns,
-    /// so the caller must fall back to a full scan.
-    pub fn probe_unique(
+    /// only when the cache is complete, so a caller may trust a negative
+    /// answer; false means the authoritative row store must be scanned.
+    pub fn probe_value(
         &self,
         table_index: usize,
         columns: &[u16],
@@ -4191,39 +4184,41 @@ impl Storage {
         for i in 0..table.n_enforcers {
             let e = table.enforcers[i].expect("enforcer present");
             if e.columns() == columns {
-                self.value_indexes
-                    .as_ref()
-                    .expect("value index pool present")
-                    .get(e.slot)
-                    .probe(hash, &mut visit);
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Whether the enforcer covering `columns` already holds its logical cap of
-    /// committed rows, so a further new key would exceed `value_index_rows`.
-    pub fn enforcer_at_capacity(&self, table_index: usize, columns: &[u16]) -> bool {
-        let table = &self.tables[table_index];
-        for i in 0..table.n_enforcers {
-            let e = table.enforcers[i].expect("enforcer present");
-            if e.columns() == columns {
-                return self
+                let index = self
                     .value_indexes
                     .as_ref()
                     .expect("value index pool present")
-                    .get(e.slot)
-                    .len()
-                    >= self.value_index_cap;
+                    .get(e.slot);
+                index.probe(hash, &mut visit);
+                return index.is_complete();
             }
         }
         false
     }
 
-    /// The configured committed-row cap for a constrained table.
-    pub fn value_index_cap(&self) -> usize {
-        self.value_index_cap
+    pub fn value_cache_complete(&self, table_index: usize, columns: &[u16]) -> bool {
+        let table = &self.tables[table_index];
+        (0..table.n_enforcers).any(|index| {
+            let enforcer = table.enforcers[index].expect("enforcer present");
+            enforcer.columns() == columns
+                && self
+                    .value_indexes
+                    .as_ref()
+                    .expect("value index pool present")
+                    .get(enforcer.slot)
+                    .is_complete()
+        })
+    }
+
+    /// Whether any row in the resident overlay has an uncommitted image.
+    /// Access paths over the committed value cache conservatively decline
+    /// while this is true; the ordinary scan then supplies exact command
+    /// visibility for every transaction.
+    pub fn has_pending_rows(&self, table_index: usize) -> bool {
+        self.tables[table_index]
+            .rows
+            .iter()
+            .any(|(_, state)| state.pending.is_some())
     }
 
     /// Releases a table's enforcer index slots back to the pool and clears its
@@ -4234,7 +4229,7 @@ impl Storage {
         if n == 0 {
             return;
         }
-        let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
+        let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n) {
             if let Some(e) = self.tables[table_index].enforcers[i] {
                 *s = e.slot;
@@ -4247,7 +4242,7 @@ impl Storage {
                 }
             }
         }
-        self.tables[table_index].enforcers = [None; MAX_UNIQUE_ENFORCERS];
+        self.tables[table_index].enforcers = [None; MAX_VALUE_ENFORCERS];
         self.tables[table_index].n_enforcers = 0;
     }
 
@@ -4264,27 +4259,46 @@ impl Storage {
         Ok(())
     }
 
-    /// Rebuilds a table's value-index enforcers from its current definition and
-    /// unique indexes, then repopulates them from the committed rows. Idempotent
+    /// Rebuilds a table's value-cache enforcers from its current definition and
+    /// named indexes, then repopulates them from the committed rows. Idempotent
     /// — call it whenever the definition, the index set, or the committed rows
     /// change outside the per-row [`Self::commit_row`] maintenance (ALTER, a
     /// committed CREATE, CREATE/DROP INDEX, cold-start replay).
     pub fn refresh_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
+        self.refresh_enforcers_visible(table_index, None)
+    }
+
+    /// Builds the cache shape visible to the owner of a pending CREATE INDEX
+    /// before its WAL record becomes durable. Pool exhaustion is therefore a
+    /// pre-commit DDL error, never a committed index followed by an error.
+    pub fn prepare_index_enforcers(
+        &mut self,
+        table_index: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        self.refresh_enforcers_visible(table_index, Some(txid))
+    }
+
+    fn refresh_enforcers_visible(
+        &mut self,
+        table_index: usize,
+        txid: Option<u32>,
+    ) -> Result<(), SqlError> {
         self.release_enforcers(table_index);
-        let mut want = [([0u16; MAX_INDEX_COLS], 0usize); MAX_UNIQUE_ENFORCERS];
+        let mut want = [([0u16; MAX_INDEX_COLS], 0usize); MAX_VALUE_ENFORCERS];
         let mut n_want = 0usize;
         let too_many = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "a table can have at most {} uniqueness constraints with value indexes",
-                MAX_UNIQUE_ENFORCERS
+                "a table can have at most {} distinct value-indexed column tuples",
+                MAX_VALUE_ENFORCERS
             )
         };
         {
             let def = &self.tables[table_index].def;
             for (i, col) in def.columns().iter().enumerate() {
                 if col.unique {
-                    if n_want == MAX_UNIQUE_ENFORCERS {
+                    if n_want == MAX_VALUE_ENFORCERS {
                         return Err(too_many());
                     }
                     want[n_want].0[0] = i as u16;
@@ -4293,7 +4307,7 @@ impl Storage {
                 }
             }
             for uk in def.uniques() {
-                if n_want == MAX_UNIQUE_ENFORCERS {
+                if n_want == MAX_VALUE_ENFORCERS {
                     return Err(too_many());
                 }
                 let cols = uk.columns();
@@ -4302,10 +4316,31 @@ impl Storage {
                 n_want += 1;
             }
         }
-        // A CREATE UNIQUE INDEX keeps its existing full-scan enforcement (a
-        // separate feature from the PRIMARY KEY / UNIQUE constraints)
-        // — it is not given a value index here, so the pending/live index
-        // lifecycle stays out of this path.
+        // Named indexes use the same cache. Identical column tuples
+        // share one enforcer: PostgreSQL permits redundant indexes, but a
+        // second copy cannot improve the equality probe and would waste a
+        // startup-reserved pool slot.
+        let table_schema = self.tables[table_index].def.schema;
+        let table_name = self.tables[table_index].def.name;
+        for index in self.indexes.iter().filter(|index| {
+            txid.map_or(index.live, |owner| index.visible_to(owner))
+                && index.schema == table_schema
+                && index.table == table_name
+        }) {
+            let columns = &index.columns[..index.n_cols];
+            if want[..n_want]
+                .iter()
+                .any(|(cached, n)| &cached[..*n] == columns)
+            {
+                continue;
+            }
+            if n_want == MAX_VALUE_ENFORCERS {
+                return Err(too_many());
+            }
+            want[n_want].0[..columns.len()].copy_from_slice(columns);
+            want[n_want].1 = columns.len();
+            n_want += 1;
+        }
         #[allow(clippy::needless_range_loop)]
         for w in 0..n_want {
             let slot = match self.value_indexes.as_mut().expect("pool present").acquire() {
@@ -4324,8 +4359,11 @@ impl Storage {
                 columns: want[w].0,
                 n_cols: want[w].1,
             });
+            // Keep the installed prefix visible to `release_enforcers`, so an
+            // acquire failure later in this loop returns every slot already
+            // taken by this rebuild.
+            self.tables[table_index].n_enforcers = w + 1;
         }
-        self.tables[table_index].n_enforcers = n_want;
         self.populate_enforcers(table_index)
     }
 
@@ -4344,14 +4382,15 @@ impl Storage {
 
     fn populate_into(&self, table_index: usize, pool: &mut ValueIndexPool) -> Result<(), SqlError> {
         let n_enf = self.tables[table_index].n_enforcers;
-        let mut slots = [u32::MAX; MAX_UNIQUE_ENFORCERS];
+        let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
             *s = self.tables[table_index].enforcers[i]
                 .expect("enforcer")
                 .slot;
         }
-        let mut error: Result<(), SqlError> = Ok(());
-        let mut buf = [(0usize, 0u64); MAX_UNIQUE_ENFORCERS];
+        let mut decode_error: Result<(), SqlError> = Ok(());
+        let mut incomplete = false;
+        let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
         self.for_each_row_state(table_index, &mut |rowid, state| {
             use core::ops::ControlFlow;
             let Some(home) = state.committed else {
@@ -4360,24 +4399,29 @@ impl Storage {
             let n = match self.row_enforcer_hashes(table_index, rowid, home, &mut buf) {
                 Ok(n) => n,
                 Err(e) => {
-                    error = Err(e);
+                    decode_error = Err(e);
                     return Ok(ControlFlow::Break(()));
                 }
             };
             for &(ei, hash) in &buf[..n] {
-                if pool.get_mut(slots[ei]).insert(hash, rowid).is_err() {
-                    error = Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "table \"{}\" exceeds its value-index capacity ({} rows); raise value_index_rows",
-                        self.tables[table_index].def.name.as_str(),
-                        self.value_index_cap
-                    ));
+                let index = pool.get_mut(slots[ei]);
+                if index.insert(hash, rowid).is_err() {
+                    incomplete = true;
                     return Ok(ControlFlow::Break(()));
                 }
             }
             Ok(ControlFlow::Continue(()))
         })?;
-        error
+        decode_error?;
+        if incomplete {
+            // The walk stopped at the first exhausted cache. Every enforcer
+            // may therefore be missing later rows, including caches that did
+            // not themselves fill, so completeness is invalidated as a set.
+            for &slot in &slots[..n_enf] {
+                pool.get_mut(slot).mark_incomplete();
+            }
+        }
+        Ok(())
     }
 
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
@@ -6137,6 +6181,9 @@ impl Storage {
     pub fn commit_index_create(&mut self, slot: usize) {
         self.indexes[slot].live = true;
         self.indexes[slot].pending = None;
+        if let Some(table) = self.index_table_slot(slot) {
+            self.tables[table].mark_dirty();
+        }
     }
 
     /// Promotes an uncommitted DROP INDEX into the committed catalog.
@@ -6145,6 +6192,17 @@ impl Storage {
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.indexes[slot].live = false;
         self.indexes[slot].pending = None;
+        if let Some(table) = self.index_table_slot(slot) {
+            self.tables[table].mark_dirty();
+        }
+    }
+
+    /// The committed table named by an index slot. The definition stays in
+    /// the reusable catalog slot after DROP, so this also resolves the table
+    /// while finalizing a drop.
+    pub fn index_table_slot(&self, slot: usize) -> Option<usize> {
+        let index = self.indexes.get(slot)?;
+        self.find_table(index.schema.as_str(), index.table.as_str())
     }
 
     /// Discards an uncommitted CREATE INDEX (rollback): the slot is freed.

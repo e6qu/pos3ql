@@ -248,20 +248,9 @@ fn enforce_key_uniqueness(
         );
     }
 
-    // A new key (an insert, not an update of the same row) past the enforcer's
-    // committed-row cap is a loud error: an in-RAM value index cannot grow.
-    if self_rowid.is_none() && storage.enforcer_at_capacity(table_index, columns) {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "table \"{}\" has reached its value-index row limit ({}); raise value_index_rows",
-            def.name.as_str(),
-            storage.value_index_cap()
-        ));
-    }
-
     let hash = hash_key(values, columns);
     let mut result: Result<(), SqlError> = Ok(());
-    let served = storage.probe_unique(table_index, columns, hash, |rowid| {
+    let served = storage.probe_value(table_index, columns, hash, |rowid| {
         if result.is_err() || Some(rowid) == self_rowid {
             return;
         }
@@ -431,9 +420,10 @@ pub fn check_all_unique(
 /// Enforces every UNIQUE index on the table: a candidate row conflicts if some
 /// other visible row has an equal, all-non-NULL tuple over the index columns
 /// (23505; a conflicting uncommitted row from another transaction is 40001).
-/// A unique index carries no value index (those currently serve PRIMARY KEY /
-/// UNIQUE constraints), so this always takes the full-scan fallback inside
-/// [`enforce_key_uniqueness`].
+/// Named indexes share the same bounded acceleration cache as table
+/// constraints. CREATE INDEX validates against authoritative rows before its
+/// pending cache binding is prepared, and subsequent writes may use that
+/// binding while the creating transaction remains open.
 #[allow(clippy::too_many_arguments)]
 pub fn check_unique_indexes(
     storage: &Storage,

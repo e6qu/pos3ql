@@ -7188,10 +7188,15 @@ fn create_index_and_unique() {
         &mut b,
         "INSERT INTO t VALUES (1,1,10),(1,2,20),(2,1,30)",
     );
-    // A non-unique index: succeeds, results unchanged (no acceleration).
+    // A non-unique index publishes an equality-probe cache binding.
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE INDEX i1 ON t(c)"))
             .contains("CREATE INDEX")
+    );
+    let table_slot = e.storage.find_table("public", "t").unwrap();
+    assert!(
+        e.storage.value_cache_complete(table_slot, &[2]),
+        "committing a named index must publish its access-path binding immediately"
     );
     assert_eq!(
         data_rows(&run_with(
@@ -7200,6 +7205,10 @@ fn create_index_and_unique() {
             "SELECT a,b,c FROM t ORDER BY a,b"
         )),
         ["1|1|10", "1|2|20", "2|1|30"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT a,b FROM t WHERE c=20")),
+        ["1|2"]
     );
     // Duplicate index name errors; unknown column errors.
     assert!(
@@ -7213,6 +7222,7 @@ fn create_index_and_unique() {
     // A composite UNIQUE index over non-duplicate data succeeds and then
     // enforces the constraint on inserts.
     run_with(&mut e, &mut b, "CREATE UNIQUE INDEX u1 ON t(a,b)");
+    assert!(e.storage.value_cache_complete(table_slot, &[0, 1]));
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,99)"))
             .contains("23505")
@@ -7230,9 +7240,88 @@ fn create_index_and_unique() {
     );
     // DROP INDEX removes the constraint: the once-conflicting insert works.
     run_with(&mut e, &mut b, "DROP INDEX u1");
+    assert!(!e.storage.value_cache_complete(table_slot, &[0, 1]));
     let out = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,7)"))
         .to_string();
     assert!(!out.contains("23505"), "constraint should be gone: {out}");
+}
+
+#[test]
+fn uniqueness_cache_capacity_never_limits_table_correctness() {
+    let mut config = test_config("value-index-cache-capacity");
+    config.table_rows = 32;
+    config.value_index_rows = 1;
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE constrained (id int PRIMARY KEY, value text);\
+         INSERT INTO constrained VALUES (1,'one'),(2,'two'),(3,'three')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id,value FROM constrained ORDER BY id"
+        )),
+        ["1|one", "2|two", "3|three"]
+    );
+    let table_slot = engine.storage.find_table("public", "constrained").unwrap();
+    assert!(
+        !engine.storage.value_cache_complete(table_slot, &[0]),
+        "the one-entry cache must be explicitly incomplete after three keys"
+    );
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO constrained VALUES (2,'duplicate')",
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate).contains("23505"),
+        "an incomplete acceleration cache must fall through to authoritative rows"
+    );
+}
+
+#[test]
+fn failed_index_cache_reservation_restores_every_pool_slot() {
+    let mut config = test_config("value-index-cache-pool");
+    config.max_value_indexes = 1;
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE indexed (a int, b int);\
+         INSERT INTO indexed VALUES (1,10),(2,20);\
+         CREATE INDEX indexed_a ON indexed(a)",
+    );
+    let table_slot = engine.storage.find_table("public", "indexed").unwrap();
+    assert!(engine.storage.value_cache_complete(table_slot, &[0]));
+
+    let exhausted = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX indexed_b ON indexed(b)",
+    );
+    assert!(
+        String::from_utf8_lossy(&exhausted).contains("54000"),
+        "a second distinct cache binding must fail loudly"
+    );
+    assert!(
+        engine.storage.value_cache_complete(table_slot, &[0]),
+        "failed preflight must release its partial acquisition and restore the prior binding"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT b FROM indexed WHERE a=2"
+        )),
+        ["20"]
+    );
 }
 
 #[test]

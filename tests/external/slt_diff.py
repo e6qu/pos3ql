@@ -13,9 +13,10 @@ hashes are ignored (PostgreSQL is the oracle). Every block is bucketed:
   DIVERGENCE     both succeed but results differ, or only one errors, or the
                  SQLSTATEs differ — the interesting failures
 
-Exit code is nonzero iff any DIVERGENCE survived, so this gates CI once the
-divergence budget is zero. Divergences print the file, SQL, and both
-outcomes for a direct repro.
+Exit code is nonzero iff any DIVERGENCE survived or `--max-unsupported` was
+exceeded. The unsupported ceiling is a one-way ratchet: newly-supported SQL
+may lower it, while a regression cannot hide inside the subset bucket.
+Divergences print the file, SQL, and both outcomes for a direct repro.
 
 Usage:
   slt_diff.py --pg PORT --p3 PORT [--limit N] [--max-print K] FILE...
@@ -297,6 +298,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--limit", type=int, default=0, help="max blocks per file")
     ap.add_argument("--max-print", type=int, default=25)
+    ap.add_argument("--max-unsupported", type=int,
+                    help="fail when unsupported blocks exceed this ratchet")
     ap.add_argument("--stmt-timeout-ms", type=int, default=60000,
                     help="per-statement timeout; 0 disables")
     ap.add_argument("--query-shards", type=int, default=1,
@@ -356,7 +359,12 @@ def main():
                 print(f"        e.g. {_EXAMPLES[k]}")
     print(f"\nTOTAL: {total['blocks']} blocks  match={total['match']}  "
           f"unsupported={total['unsupported']}  divergence={total['divergence']}")
-    sys.exit(1 if total["divergence"] > 0 else 0)
+    over_unsupported = (args.max_unsupported is not None
+                        and total["unsupported"] > args.max_unsupported)
+    if over_unsupported:
+        print(f"unsupported budget exceeded: {total['unsupported']} > "
+              f"{args.max_unsupported}")
+    sys.exit(1 if total["divergence"] > 0 or over_unsupported else 0)
 
 
 if __name__ == "__main__":

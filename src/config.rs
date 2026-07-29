@@ -70,14 +70,13 @@ pub struct Config {
     pub cursor_bytes: usize,
     /// Per-table rowid-map capacity (rows resident in the memtable).
     pub table_rows: usize,
-    /// Committed-row cap for a table carrying a UNIQUE / PRIMARY KEY / unique
-    /// index: its value index holds this many committed rows, and an insert past
-    /// it is a loud error. This is the price of an in-RAM value index that keeps
-    /// a uniqueness probe O(1) even after the table spills.
+    /// Entries retained by each in-RAM value-index acceleration cache before it
+    /// becomes incomplete and probes fall through to authoritative row SSTs.
+    /// This controls performance coverage, never table size or correctness.
     pub value_index_rows: usize,
-    /// Total value-index buffers shared across all tables' constraints (one per
-    /// UNIQUE/PRIMARY KEY flag, multi-column key, and unique index). Exhausting
-    /// the pool at DDL is a loud error.
+    /// Total value-index buffers shared across all tables (one per distinct
+    /// constrained or named-index column tuple). Exhausting the pool at DDL is
+    /// a loud static-capacity error.
     pub max_value_indexes: usize,
     /// RAM cache of object-storage blocks.
     pub block_cache_bytes: usize,

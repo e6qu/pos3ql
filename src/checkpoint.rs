@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
-use crate::s3::{ObjectClient, Precondition, S3Error};
+use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
 use crate::sql::eval::{sqlstate, SqlError};
 use crate::sql::types::ColType;
 use crate::sql_err;
@@ -142,7 +142,7 @@ fn pair_at(list: &SlotList, at: usize) -> Option<(SstHandle, SstHandle)> {
 }
 
 pub(crate) struct Checkpointer {
-    client: ObjectClient,
+    client: ObjectStore,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
     /// over content-addressed block objects — `block_cache_bytes` and
     /// `disk_cache_bytes` finally sized to something. SST reads and writes go
@@ -256,7 +256,7 @@ impl Checkpointer {
         // Two clients: one for manifest/WAL objects, one inside the block
         // stack. The cache tiers draw their own budget in the constructor;
         // this accounts the fixed parts.
-        2 * ObjectClient::budget_bytes(config)
+        2 * ObjectStore::budget_bytes(config)
             + 2 * SstWriter::budget_bytes()
             + MANIFEST_BUF_BYTES
             + crate::store::BLOCK_SIZE
@@ -514,28 +514,16 @@ impl Checkpointer {
         })))
     }
 
-    /// Fails when S3 is enabled but credentials are missing — explicitly,
-    /// at startup.
+    /// Builds both clients and every fixed cache/checkpoint buffer at startup.
+    /// Provider credentials and adapter selection terminate at
+    /// [`crate::object_store`].
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
-        let mut config = config.clone();
-        // The virtual bucket signs nothing; requiring credentials for it
-        // would demand secrets no request will carry.
-        if config.s3_access_key.is_empty() && !config.s3_sim {
-            config.s3_access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
-                CheckpointSetupError::Credentials("s3_access_key / AWS_ACCESS_KEY_ID")
-            })?;
-        }
-        if config.s3_secret_key.is_empty() && !config.s3_sim {
-            config.s3_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
-                CheckpointSetupError::Credentials("s3_secret_key / AWS_SECRET_ACCESS_KEY")
-            })?;
-        }
-        let block_client = ObjectClient::new(&config, budget)
-            .map_err(|e| CheckpointSetupError::S3(e.to_string()))?;
+        let block_client = ObjectStore::new(config, budget)
+            .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
         let base = OwnedObjectStore::new(block_client, "blocks/");
         let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
         if plan.undersized_ram() || plan.undersized_disk() {
-            return Err(CheckpointSetupError::S3(
+            return Err(CheckpointSetupError::ObjectStore(
                 "block_cache_bytes / disk_cache_bytes smaller than one block; set 0 to disable a tier"
                     .to_string(),
             ));
@@ -543,15 +531,15 @@ impl Checkpointer {
         // The WAL creates the data directory later in startup; the disk
         // cache's slot file needs it now.
         std::fs::create_dir_all(&config.data_dir)
-            .map_err(|e| CheckpointSetupError::S3(format!("create data_dir: {e}")))?;
+            .map_err(|e| CheckpointSetupError::ObjectStore(format!("create data_dir: {e}")))?;
         let cache_dir = std::path::Path::new(&config.data_dir);
         let blocks = std::rc::Rc::new(std::cell::RefCell::new(
             crate::store::build_tiers(budget, base, plan, cache_dir)
-                .map_err(|e| CheckpointSetupError::S3(format!("block cache stack: {e:?}")))?,
+                .map_err(|e| CheckpointSetupError::ObjectStore(format!("block cache stack: {e:?}")))?,
         ));
         Ok(Self {
-            client: ObjectClient::new(&config, budget)
-                .map_err(|e| CheckpointSetupError::S3(e.to_string()))?,
+            client: ObjectStore::new(config, budget)
+                .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
@@ -578,17 +566,7 @@ impl Checkpointer {
             merge_done: None,
             merge_turn: false,
             merge_overflow: vec![None; MAX_CKPT_TABLES],
-            writer_id: {
-                let mut crc = Crc32c::new();
-                crc.update(config.s3_bucket.as_bytes());
-                crc.update(config.s3_prefix.as_bytes());
-                crc.update(config.data_dir.as_bytes());
-                let low = crc.finish();
-                let mut crc2 = Crc32c::new();
-                crc2.update(config.data_dir.as_bytes());
-                crc2.update(config.s3_bucket.as_bytes());
-                (u64::from(crc2.finish()) << 32) | u64::from(low)
-            },
+            writer_id: crate::object_store::writer_id(config),
         })
     }
 
@@ -607,7 +585,7 @@ impl Checkpointer {
         let key = stack_format!(48, "wal/{:020}.seg", first_lsn);
         self.client
             .put(key.as_str(), bytes, Precondition::None)
-            .map_err(s3_to_sql)?;
+            .map_err(object_store_to_sql)?;
         Ok(())
     }
 
@@ -622,7 +600,7 @@ impl Checkpointer {
         let mut keys: Vec<String> = Vec::new();
         self.client
             .list("wal/", |k| keys.push(k.to_string()))
-            .map_err(|e| CheckpointSetupError::S3(format!("list wal: {e}")))?;
+            .map_err(|e| CheckpointSetupError::ObjectStore(format!("list wal: {e}")))?;
         keys.sort();
         let mut last_lsn = floor;
         for key in &keys {
@@ -646,9 +624,11 @@ impl Checkpointer {
                 match self.client.get(key, Some((offset, to))) {
                     Ok(_) => {}
                     // Past the end of the object: the segment is fully read.
-                    Err(crate::s3::S3Error::Status { code: 416, .. }) => break,
+                    Err(ObjectError::Status { code: 416, .. }) => break,
                     Err(e) => {
-                        return Err(CheckpointSetupError::S3(format!("get wal segment: {e}")))
+                        return Err(CheckpointSetupError::ObjectStore(format!(
+                            "get wal segment: {e}"
+                        )))
                     }
                 }
                 let body = self.client.body_bytes();
@@ -668,8 +648,8 @@ impl Checkpointer {
                         // invalid record — applies here too.
                         break;
                     }
-                    return Err(CheckpointSetupError::S3(format!(
-                        "wal record in {key} exceeds s3_response_bytes; raise it past wal_buffer_bytes"
+                    return Err(CheckpointSetupError::ObjectStore(format!(
+                        "wal record in {key} exceeds object_store_response_bytes; raise it past wal_buffer_bytes"
                     )));
                 }
                 offset += consumed as u64;
@@ -710,13 +690,13 @@ impl Checkpointer {
                     }
                 }
             })
-            .map_err(s3_to_sql)?;
+            .map_err(object_store_to_sql)?;
         for i in 0..self.doomed_scratch.len() {
             let key = self.doomed_scratch[i];
             if key.as_str() == max_key.as_str() {
                 continue;
             }
-            self.client.delete(key.as_str()).map_err(s3_to_sql)?;
+            self.client.delete(key.as_str()).map_err(object_store_to_sql)?;
         }
         if overflow {
             eprintln!("pos3ql: wal segments exceed one sweep; continuing next checkpoint");
@@ -733,7 +713,11 @@ impl Checkpointer {
                 self.manifest_etag = Some(r.etag);
             }
             Err(e) if e.is_not_found() => return Ok(0),
-            Err(e) => return Err(CheckpointSetupError::S3(format!("load manifest: {e}"))),
+            Err(e) => {
+                return Err(CheckpointSetupError::ObjectStore(format!(
+                    "load manifest: {e}"
+                )))
+            }
         }
         let text = core::str::from_utf8(self.client.body_bytes())
             .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
@@ -874,7 +858,7 @@ impl Checkpointer {
                     let name = sql_name(&decode_hex_name(hex)?)?;
                     if storage.find_schema(name.as_str()).is_none() {
                         storage.create_schema(name).map_err(|e| {
-                            CheckpointSetupError::S3(format!(
+                            CheckpointSetupError::ObjectStore(format!(
                                 "manifest schema rejected: {}",
                                 e.message.as_str()
                             ))
@@ -1138,7 +1122,7 @@ impl Checkpointer {
                             0,
                         )
                         .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
+                            CheckpointSetupError::ObjectStore(format!(
                                 "manifest sequence rejected: {}",
                                 e.message.as_str()
                             ))
@@ -1208,7 +1192,7 @@ impl Checkpointer {
                     storage
                         .create_domain(sql_name(&schema)?, sql_name(&name)?, spec, 0)
                         .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
+                            CheckpointSetupError::ObjectStore(format!(
                                 "manifest domain rejected: {}",
                                 e.message.as_str()
                             ))
@@ -1242,7 +1226,7 @@ impl Checkpointer {
                     storage
                         .create_enum(sql_name(&schema)?, sql_name(&name)?, spec, 0)
                         .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
+                            CheckpointSetupError::ObjectStore(format!(
                                 "manifest enum rejected: {}",
                                 e.message.as_str()
                             ))
@@ -1272,7 +1256,7 @@ impl Checkpointer {
                             Some(stored),
                         )
                         .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
+                            CheckpointSetupError::ObjectStore(format!(
                                 "manifest comment rejected: {}",
                                 e.message.as_str()
                             ))
@@ -1316,7 +1300,7 @@ impl Checkpointer {
                             0,
                         )
                         .map_err(|e| {
-                            CheckpointSetupError::S3(format!(
+                            CheckpointSetupError::ObjectStore(format!(
                                 "manifest index rejected: {}",
                                 e.message.as_str()
                             ))
@@ -1333,7 +1317,7 @@ impl Checkpointer {
                 Some("writer") => {}
                 Some("") | None => {}
                 Some(other) => {
-                    return Err(CheckpointSetupError::S3(format!(
+                    return Err(CheckpointSetupError::ObjectStore(format!(
                         "unknown manifest line '{other}'"
                     )));
                 }
@@ -1406,7 +1390,7 @@ impl Checkpointer {
 
         storage
             .rebind_all_stored_query_dependencies()
-            .map_err(|error| CheckpointSetupError::S3(format!(
+            .map_err(|error| CheckpointSetupError::ObjectStore(format!(
                 "manifest stored-query dependency rejected: {}",
                 error.message.as_str()
             )))?;
@@ -1497,7 +1481,7 @@ Ok(lsn)
         // Footer first.
         self.client
             .get(key, Some((entries_end, total_bytes - 1)))
-            .map_err(|e| CheckpointSetupError::S3(format!("sst footer: {e}")))?;
+            .map_err(|e| CheckpointSetupError::ObjectStore(format!("sst footer: {e}")))?;
         let f = self.client.body_bytes();
         if f.len() != SST_FOOTER_LEN {
             return Err(corrupt("sst footer short"));
@@ -1516,7 +1500,7 @@ Ok(lsn)
             let to = (offset + self.client.response_capacity() as u64 - 1).min(entries_end - 1);
             self.client
                 .get(key, Some((offset, to)))
-                .map_err(|e| CheckpointSetupError::S3(format!("sst read: {e}")))?;
+                .map_err(|e| CheckpointSetupError::ObjectStore(format!("sst read: {e}")))?;
             // Parse complete entries; partially fetched ones re-fetch from
             // their start on the next round.
             let mut consumed = 0usize;
@@ -1535,7 +1519,7 @@ Ok(lsn)
                 let (loc, slice) = storage
                     .heap
                     .append(len)
-                    .map_err(|e| CheckpointSetupError::S3(format!(
+                    .map_err(|e| CheckpointSetupError::ObjectStore(format!(
                         "rehydrate: {}",
                         e.message.as_str()
                     )))?;
@@ -2245,7 +2229,10 @@ Ok(CheckpointStep::Published { lsn })
                 // its etag and republish the current state over it. Any
                 // other identity is a genuine second writer, which stays a
                 // loud error rather than a clobber.
-                let refreshed = self.client.get(MANIFEST_KEY, None).map_err(s3_to_sql)?;
+                let refreshed = self
+                    .client
+                    .get(MANIFEST_KEY, None)
+                    .map_err(object_store_to_sql)?;
                 let ours = {
                     let body = self.client.body_bytes();
                     let expect = crate::stack_format!(40, "writer {:016x}", self.writer_id);
@@ -2265,9 +2252,9 @@ Ok(CheckpointStep::Published { lsn })
                         self.manifest_buf.readable(),
                         Precondition::IfMatch(refreshed.etag.as_str()),
                     )
-                    .map_err(s3_to_sql)?
+                    .map_err(object_store_to_sql)?
             }
-            Err(e) => return Err(s3_to_sql(e)),
+            Err(e) => return Err(object_store_to_sql(e)),
         };
         self.manifest_etag = Some(etag);
         self.manifest_lsn = lsn;
@@ -2534,10 +2521,10 @@ Ok(CheckpointStep::Published { lsn })
                     }
                 }
             })
-            .map_err(s3_to_sql)?;
+            .map_err(object_store_to_sql)?;
         for i in 0..self.doomed_blocks.len() {
             let key = self.doomed_blocks[i];
-            self.client.delete(key.as_str()).map_err(s3_to_sql)?;
+            self.client.delete(key.as_str()).map_err(object_store_to_sql)?;
         }
         if overflow {
             eprintln!("pos3ql: block garbage exceeds one sweep; continuing next checkpoint");
@@ -2562,10 +2549,10 @@ Ok(CheckpointStep::Published { lsn })
                     }
                 }
             })
-            .map_err(s3_to_sql)?;
+            .map_err(object_store_to_sql)?;
         for i in 0..self.doomed_scratch.len() {
             let key = self.doomed_scratch[i];
-            self.client.delete(key.as_str()).map_err(s3_to_sql)?;
+            self.client.delete(key.as_str()).map_err(object_store_to_sql)?;
         }
         if overflow {
             eprintln!("pos3ql: sst garbage exceeds one sweep; continuing next checkpoint");
@@ -2607,7 +2594,7 @@ fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Resul
     })
 }
 
-fn s3_to_sql(e: S3Error) -> SqlError {
+fn object_store_to_sql(e: ObjectError) -> SqlError {
     sql_err!(SQLSTATE_IO, "{}", e)
 }
 
@@ -2652,8 +2639,7 @@ fn replay_segment_bytes(
 #[derive(Debug)]
 pub enum CheckpointSetupError {
     Budget(BudgetError),
-    Credentials(&'static str),
-    S3(String),
+    ObjectStore(String),
     Corrupt(&'static str),
     Replay(SqlError),
 }
@@ -2662,10 +2648,7 @@ impl std::fmt::Display for CheckpointSetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(e) => write!(f, "checkpoint: {e}"),
-            Self::Credentials(what) =>
-
-                write!(f, "s3 is enabled but no credentials were provided ({what})"),
-            Self::S3(what) => write!(f, "checkpoint: {what}"),
+            Self::ObjectStore(what) => write!(f, "checkpoint: {what}"),
             Self::Corrupt(what) => write!(f, "checkpoint: corrupt bucket state: {what}"),
             Self::Replay(e) => write!(f, "checkpoint: wal replay failed: {}", e.message.as_str()),
         }
@@ -2730,7 +2713,7 @@ fn finish_pending(
             ));
         }
         let slot = storage.create_table(definition).map_err(|error| {
-            CheckpointSetupError::S3(format!(
+            CheckpointSetupError::ObjectStore(format!(
                 "manifest table rejected: {}",
                 error.message.as_str()
             ))
@@ -2782,7 +2765,7 @@ fn load_legacy_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
             0,
         )
         .map_err(|error| {
-            CheckpointSetupError::S3(format!(
+            CheckpointSetupError::ObjectStore(format!(
                 "manifest view rejected: {}",
                 error.message.as_str()
             ))
@@ -2834,7 +2817,7 @@ fn load_view(
             0,
         )
         .map_err(|error| {
-            CheckpointSetupError::S3(format!(
+            CheckpointSetupError::ObjectStore(format!(
                 "manifest view rejected: {}",
                 error.message.as_str()
             ))
@@ -2887,7 +2870,7 @@ fn load_matview(
             0,
         )
         .map_err(|error| {
-            CheckpointSetupError::S3(format!(
+            CheckpointSetupError::ObjectStore(format!(
                 "manifest matview rejected: {}",
                 error.message.as_str()
             ))
@@ -2973,30 +2956,6 @@ fn sql_name(s: &str) -> Result<SqlName, CheckpointSetupError> {
     SqlName::parse(s).map_err(|_| CheckpointSetupError::Corrupt("name too long in manifest"))
 }
 
-#[cfg(test)]
-mod stored_dependency_tests {
-    use super::*;
-    use crate::storage::{DependencyClass, StoredQueryDependencies};
-
-    #[test]
-    fn manifest_round_trip_preserves_reference_names() {
-        let mut dependencies = StoredQueryDependencies::EMPTY;
-        dependencies.serialized_push(
-            DependencyClass::Table,
-            SqlName::parse("moved").unwrap(),
-            SqlName::parse("current_name").unwrap(),
-            SqlName::parse("").unwrap(),
-            SqlName::parse("original_name").unwrap(),
-        ).unwrap();
-        let encoded = format!("{}", ManifestDependencies(&dependencies));
-        let mut words = encoded.split(' ');
-        assert_eq!(
-            parse_stored_query_dependencies(&mut words, true).unwrap(),
-            dependencies
-        );
-    }
-}
-
 fn empty_column() -> ColumnMeta {
     ColumnMeta {
         name: SqlName::parse("").expect("empty fits"),
@@ -3047,4 +3006,30 @@ fn default_from_hex(hex: &str) -> Result<Option<OwnedDatum>, CheckpointSetupErro
         return Err(corrupt());
     }
     Ok(d)
+}
+
+#[cfg(test)]
+mod stored_dependency_tests {
+    use super::*;
+    use crate::storage::{DependencyClass, StoredQueryDependencies};
+
+    #[test]
+    fn manifest_round_trip_preserves_reference_names() {
+        let mut dependencies = StoredQueryDependencies::EMPTY;
+        dependencies
+            .serialized_push(
+                DependencyClass::Table,
+                SqlName::parse("moved").unwrap(),
+                SqlName::parse("current_name").unwrap(),
+                SqlName::parse("").unwrap(),
+                SqlName::parse("original_name").unwrap(),
+            )
+            .unwrap();
+        let encoded = format!("{}", ManifestDependencies(&dependencies));
+        let mut words = encoded.split(' ');
+        assert_eq!(
+            parse_stored_query_dependencies(&mut words, true).unwrap(),
+            dependencies
+        );
+    }
 }

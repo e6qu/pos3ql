@@ -1,8 +1,8 @@
 //! HMAC-SHA256 per RFC 2104, validated against RFC 4231 test vectors.
 
-use super::sha256::{sha256, Sha256};
+use super::sha256::{Sha256, sha256};
 
-pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut key_block = [0u8; 64];
     if key.len() > 64 {
         key_block[..32].copy_from_slice(&sha256(key));
@@ -31,7 +31,7 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::sha256::HexDigest;
+    use crate::crypto::sha256::HexDigest;
 
     fn check(key: &[u8], msg: &[u8], expected: &str) {
         let mac = hmac_sha256(key, msg);

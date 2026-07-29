@@ -7,8 +7,8 @@
 
 use crate::util::StackStr;
 
-use super::hmac::hmac_sha256;
-use super::sha256::{HexDigest, Sha256};
+use crate::crypto::hmac::hmac_sha256;
+use crate::crypto::sha256::{HexDigest, Sha256};
 
 /// Everything that goes into a signature. Headers must be presorted by
 /// (lowercase) name and include `host`; values must already be trimmed.

@@ -14,12 +14,12 @@ use pos3ql::sql::Engine;
 fn client() -> Option<S3Client> {
     let endpoint = std::env::var("POS3QL_MINIO_ENDPOINT").ok()?;
     let mut config = Config::default_dev();
-    config.s3_endpoint = endpoint;
-    config.s3_bucket =
+    config.object_store_endpoint = endpoint;
+    config.object_store_bucket =
         std::env::var("POS3QL_MINIO_BUCKET").unwrap_or_else(|_| "pos3ql".to_string());
-    config.s3_access_key =
+    config.object_store_access_key =
         std::env::var("POS3QL_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    config.s3_secret_key =
+    config.object_store_secret_key =
         std::env::var("POS3QL_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
     let mut budget = Budget::new(16 << 20);
     Some(S3Client::new(&config, &mut budget).unwrap())
@@ -39,14 +39,14 @@ fn engine_config(run: &str, data_dir: &str) -> Option<Config> {
     config.table_rows = 4096;
     config.wal_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 14;
-    config.s3_on = true;
-    config.s3_endpoint = endpoint;
-    config.s3_bucket =
+    config.object_store_on = true;
+    config.object_store_endpoint = endpoint;
+    config.object_store_bucket =
         std::env::var("POS3QL_MINIO_BUCKET").unwrap_or_else(|_| "pos3ql".to_string());
-    config.s3_prefix = format!("ckpt-it/{}-{run}/", std::process::id());
-    config.s3_access_key =
+    config.object_store_prefix = format!("ckpt-it/{}-{run}/", std::process::id());
+    config.object_store_access_key =
         std::env::var("POS3QL_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    config.s3_secret_key =
+    config.object_store_secret_key =
         std::env::var("POS3QL_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
     Some(config)
 }

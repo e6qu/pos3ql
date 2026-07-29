@@ -1376,7 +1376,7 @@ fn from_binds_relation(from: Option<&FromClause>, name: &str) -> bool {
 /// is no clause or every clause is well-formed.
 ///
 /// pos3ql's run-to-completion execution model does not take blocking row locks
-/// (the same architecture B-004 documents for write-write conflicts): a locked
+/// (the same architecture used for write-write conflicts): a locked
 /// query returns the correct rows, and the safety a `FOR UPDATE` reader relies
 /// on is delivered by the existing fail-fast (40001) conflict detection at write
 /// time. So beyond these analysis-time errors the clause does not change a

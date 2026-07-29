@@ -108,7 +108,7 @@ pub(crate) struct BlockId(pub(crate) [u8; 32]);
 
 impl BlockId {
     pub(crate) fn of(payload: &[u8]) -> Self {
-        BlockId(crate::s3::sha256::sha256(payload))
+        BlockId(crate::crypto::sha256::sha256(payload))
     }
 
     /// The object-storage key for this block, lowercase hex. Written into a

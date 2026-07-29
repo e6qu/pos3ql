@@ -1,7 +1,6 @@
-//! SHA-256 per FIPS 180-4. Needed for AWS SigV4 request signing (payload
-//! hashes and HMAC), implemented here because the dependency policy admits
-//! no crypto crates. This is a fixed, fully specified algorithm validated
-//! against the FIPS/NIST vectors below — not novel cipher design.
+//! SHA-224/256 per FIPS 180-4. Used for content-addressed block identities,
+//! SCRAM authentication, SQL digest functions, and AWS SigV4. The fixed,
+//! fully specified algorithm is validated against the FIPS/NIST vectors below.
 
 /// Round constants: first 32 bits of the fractional parts of the cube
 /// roots of the first 64 primes (FIPS 180-4 §4.2.2).
@@ -25,7 +24,7 @@ const H0: [u32; 8] = [
     0x5be0cd19,
 ];
 
-pub struct Sha256 {
+pub(crate) struct Sha256 {
     state: [u32; 8],
     buffer: [u8; 64],
     buf_len: usize,
@@ -33,7 +32,7 @@ pub struct Sha256 {
 }
 
 impl Sha256 {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: H0,
             buffer: [0; 64],
@@ -42,7 +41,7 @@ impl Sha256 {
         }
     }
 
-    pub fn update(&mut self, mut data: &[u8]) {
+    pub(crate) fn update(&mut self, mut data: &[u8]) {
         self.total = self.total.wrapping_add(data.len() as u64);
         if self.buf_len > 0 {
             let take = data.len().min(64 - self.buf_len);
@@ -66,7 +65,7 @@ impl Sha256 {
         }
     }
 
-    pub fn finish(mut self) -> [u8; 32] {
+    pub(crate) fn finish(mut self) -> [u8; 32] {
         let bit_len = self.total.wrapping_mul(8);
         self.update(&[0x80]);
         while self.buf_len != 56 {
@@ -130,7 +129,7 @@ impl Default for Sha256 {
     }
 }
 
-pub fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finish()
@@ -139,7 +138,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 /// SHA-224 (FIPS 180-4): the SHA-256 compression function with the SHA-224
 /// initial hash, truncated to the leading 28 bytes. Used by the `sha224` SQL
 /// function.
-pub fn sha224(data: &[u8]) -> [u8; 28] {
+pub(crate) fn sha224(data: &[u8]) -> [u8; 28] {
     const H0_224: [u32; 8] = [
         0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7,
         0xbefa4fa4,
@@ -153,7 +152,7 @@ pub fn sha224(data: &[u8]) -> [u8; 28] {
 }
 
 /// Lowercase hex into a caller-provided buffer (2× input size).
-pub fn hex_into(bytes: &[u8], out: &mut [u8]) {
+pub(crate) fn hex_into(bytes: &[u8], out: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     assert!(out.len() >= bytes.len() * 2);
     for (i, b) in bytes.iter().enumerate() {

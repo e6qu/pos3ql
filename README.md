@@ -14,18 +14,18 @@ engineering discipline.
 - **Object storage is the durable home.** Content-addressed, checksummed
   block SSTs, WAL segments, and the CAS'd manifest live behind one semantic
   object-store contract, and a node can cold-start from an empty disk. The
-  current transport speaks the S3 API; native adapters or compatibility
+  first transport speaks the S3-compatible API; native adapters or compatibility
   gateways provide the same immutable-object, range-read, listing, deletion,
   and conditional-root semantics for other providers without storage-engine
   special cases. Reads go **RAM block
   cache → local disk cache → ranged GET** (`block_cache_bytes` /
   `disk_cache_bytes`), and under memory pressure committed row bytes spill to
   the bucket and page back through the caches, so ingest is not bounded by
-  RAM *bytes*. With object storage enabled, synchronous WAL upload is the
-  default, so acknowledged data is already in the durable tier and local disk
-  is disposable. The remaining architectural bound is the in-RAM per-row
-  index (row *count*), whose object-resident replacement is tracked in the
-  *Maturity roadmap* in [PLAN.md](PLAN.md).
+  RAM *bytes* or total row count. With object storage enabled, synchronous WAL
+  upload is the default, so acknowledged data is already in the durable tier
+  and local disk is disposable. The remaining storage bound is the in-RAM uniqueness index
+  on constrained tables; its persistent secondary-index forest is tracked in
+  the *Maturity roadmap* in [PLAN.md](PLAN.md).
 - **Static allocation.** All memory is acquired at startup, sized from
   config. No heap allocation after init — enforced by a guarding global
   allocator. Every pool and queue has a fixed limit; exhaustion is a loud
@@ -35,17 +35,23 @@ engineering discipline.
   simulator with fault injection (VOPR-style), so cluster bugs reproduce from
   a seed.
 - **1..N replicas.** Consensus is Viewstamped Replication (the protocol
-  TigerBeetle uses); a single node is a cluster of one. Commit latency is
-  quorum-disk latency; object-storage upload is asynchronous to commit.
+  TigerBeetle uses); a single node is a cluster of one. The production server
+  is single-node today and synchronously uploads WAL by default when object
+  storage is enabled; live quorum write-routing remains roadmap work.
 
 ## Dependency policy
 
 `std` + `libc` only (raw syscall bindings). No async runtime, no protocol or
 parser crates, no cloud SDKs. TLS is never hand-rolled: the one whitelisted
 exception is an **isolated rustls component** for HTTPS to the object store
-(`s3_tls = on`, optional `s3_tls_ca_file` for self-signed endpoints) — every
+(`object_store_tls = on`, optional `object_store_tls_ca_file` for self-signed
+endpoints) — every
 rustls call runs inside a budgeted allocator scope (`tls_pool_bytes`) so the
 static-memory discipline holds everywhere else.
+
+The documented durable-storage settings use the `object_store*` prefix.
+Existing `s3*` settings remain strict compatibility aliases; configuring both
+names for one setting is an error rather than an override.
 
 ## Status
 
@@ -114,7 +120,8 @@ Working single-node database:
 - Durability: CRC-checksummed WAL with F_FULLFSYNC (kill -9 safe); CHECKPOINT
   snapshots every table to the bucket behind a compare-and-swap manifest, a
   node with an empty disk cold-starts entirely from it, and `wal_upload`
-  streams WAL segments to the bucket (asynchronously by default). See
+  streams WAL segments to the bucket (synchronously by default with object
+  storage enabled). See
   **Durability and write safety** below.
 - `tests/external/run.sh` runs the external conformance suite against real
   MinIO (psql golden files, raw wire probes, psycopg driver suite, kill-9 and
@@ -138,9 +145,9 @@ Durability *against loss of the local disk itself* is tiered by configuration:
 
 | Mode | Commit latency | Survives process crash | Survives total local-disk loss |
 |------|----------------|------------------------|--------------------------------|
-| `s3 = off` (or `wal_upload = off`) | local fsync | yes (WAL replay) | only up to the last `CHECKPOINT` snapshot in the bucket |
-| `wal_upload = on`, `wal_upload_sync = off` | local fsync | yes | **eventually** — the S3 upload is drained off the commit path, so a transaction committed within the last drain window is lost from S3 if the disk is also lost in that window |
-| `wal_upload_sync = on` (**default with s3 = on**) | local fsync **+ S3 round-trip** | yes | yes (RPO=0 to S3 — the batch is in the bucket before the ack) |
+| `object_store = off` (or `wal_upload = off`) | local fsync | yes (WAL replay) | only up to the last `CHECKPOINT` snapshot in the durable object namespace |
+| `wal_upload = on`, `wal_upload_sync = off` | local fsync | yes | **eventually** — object upload is drained off the commit path, so a transaction committed within the last drain window is lost from the durable tier if the disk is also lost in that window |
+| `wal_upload_sync = on` (**default with object storage on**) | local fsync **+ object-store round-trip** | yes | yes (RPO=0 — the batch is in the durable tier before the ack) |
 | Multi-replica VSR | quorum-disk | yes | yes (quorum) | *(not yet active — see PLAN.md)* |
 
 `CHECKPOINT` snapshots every table to the bucket behind a compare-and-swap
@@ -181,7 +188,7 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   *working set* — pending changes plus rows not yet shed under pressure —
   not the dataset: rows beyond it live only in the bucket's SSTs and are
   read back through bloom-gated probes and merged walks. A single
-  transaction's touched rows must still fit the map, and with `s3 = off`
+  transaction's touched rows must still fit the map, and with `object_store = off`
   (no bucket) the map bound is the table bound.
 - **Uniqueness is value-indexed.** A `PRIMARY KEY` / `UNIQUE` constraint keeps
   an in-RAM `value → rowid` index, so a duplicate check is a hash seek rather
@@ -192,7 +199,7 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.
-- **TLS is opt-in.** Object-store HTTPS is controlled by `s3_tls`; PostgreSQL
+- **TLS is opt-in.** Object-store HTTPS is controlled by `object_store_tls`; PostgreSQL
   wire TLS is enabled with `tls_on`, `tls_cert_file`, and `tls_key_file`.
   Cleartext clients remain accepted when server TLS is configured.
 

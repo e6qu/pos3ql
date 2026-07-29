@@ -1,7 +1,7 @@
 //! The storage VOPR: the whole storage stack — WAL, spill, checkpoint,
 //! block SSTs, cache tiers, manifest CAS, garbage sweep — driven through the
 //! real [`Engine`] against the deterministic virtual bucket
-//! ([`crate::s3::sim`]), under seeded fault schedules: transient request
+//! ([`crate::object_store::sim`]), under seeded fault schedules: transient request
 //! failures, ambiguous PUTs, flipped bits on the wire, outages that begin
 //! mid-operation and end in a crash, corrupted disk-cache slots, warm
 //! restarts and wiped-disk cold starts.
@@ -38,7 +38,7 @@ use crate::mem::budget::Budget;
 use crate::mem::buffer::FixedBuf;
 use crate::pg::respond::Responder;
 use crate::prng::Pcg32;
-use crate::s3::sim::{drop_bucket, open_bucket, SimBucket};
+use crate::object_store::sim::{drop_bucket, open_bucket, SimBucket};
 use crate::sql::cursor::CursorPool;
 use crate::sql::guc::GucState;
 use crate::sql::prep::SqlPreparedPool;
@@ -98,10 +98,10 @@ fn vopr_config(seed: u64) -> Config {
         std::process::id()
     ));
     config.data_dir = dir.to_str().unwrap().to_string();
-    config.s3_on = true;
-    config.s3_sim = true;
-    config.s3_bucket = format!("vopr-{}-{seed}", std::process::id());
-    config.s3_response_bytes = 1 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("vopr-{}-{seed}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
@@ -130,8 +130,8 @@ impl World {
     fn new(seed: u64) -> Self {
         let config = vopr_config(seed);
         let _ = std::fs::remove_dir_all(&config.data_dir);
-        drop_bucket(&config.s3_bucket);
-        let bucket = open_bucket(&config.s3_bucket, seed);
+        drop_bucket(&config.object_store_bucket);
+        let bucket = open_bucket(&config.object_store_bucket, seed);
         let mut world = Self {
             seed,
             rng: Pcg32::new(seed, 0x5709a6e), // storage-VOPR stream
@@ -508,7 +508,7 @@ impl World {
 impl Drop for World {
     fn drop(&mut self) {
         self.session = None;
-        drop_bucket(&self.config.s3_bucket);
+        drop_bucket(&self.config.object_store_bucket);
         let _ = std::fs::remove_dir_all(&self.config.data_dir);
     }
 }

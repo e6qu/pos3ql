@@ -209,7 +209,7 @@ fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> bool {
 /// table-level key, or a unique index). Committed collisions raise 23505; a
 /// collision against another transaction's pending image raises 40001. The
 /// committed side is served by the value index when the table carries an
-/// enforcer for these columns (B-169's O(1) probe), falling back to a full scan
+/// enforcer for these columns (an O(1) probe), falling back to a full scan
 /// otherwise; the pending side is always a bounded scan of the resident overlay
 /// (pending rows are never evicted). A NULL in any key column makes the
 /// candidate distinct.
@@ -406,8 +406,8 @@ pub fn check_all_unique(
 /// Enforces every UNIQUE index on the table: a candidate row conflicts if some
 /// other visible row has an equal, all-non-NULL tuple over the index columns
 /// (23505; a conflicting uncommitted row from another transaction is 40001).
-/// A unique index carries no value index (B-169 scopes those to the PRIMARY KEY
-/// / UNIQUE constraints), so this always takes the full-scan fallback inside
+/// A unique index carries no value index (those currently serve PRIMARY KEY /
+/// UNIQUE constraints), so this always takes the full-scan fallback inside
 /// [`enforce_key_uniqueness`].
 #[allow(clippy::too_many_arguments)]
 pub fn check_unique_indexes(

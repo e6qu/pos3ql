@@ -287,7 +287,8 @@ impl Server {
                 }
             }
             // Upload committed WAL off the commit path so request handling and
-            // S3 latency never gate each other; back off if the bucket errors.
+            // Object-store latency never gates requests; back off if the
+            // durable tier errors.
             if self.engine.has_pending_wal_upload() {
                 upload_backoff = if self.engine.drain_wal_upload() {
                     Duration::ZERO

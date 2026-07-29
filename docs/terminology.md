@@ -52,10 +52,10 @@ short names are kept (rule 3) and defined here.
 - **`vsr`** — Viewstamped Replication: messages, the replica state machine, the
   journal, view change, and recovery.
 - **`wal`** — the write-ahead log / VSR journal format and replay.
-- **`s3`** — the object-storage client (HTTP/1.1, AWS Signature Version 4,
-  hand-rolled SHA-256 / HMAC, conditional writes, retries, the isolated
-  rustls TLS door), plus `s3::sim`, the deterministic *virtual bucket*
-  behind the same client seam (see Testing below).
+- **`s3`** — the first object-storage adapter (HTTP/1.1, AWS Signature
+  Version 4, conditional writes, retries, and the isolated rustls TLS door),
+  plus `s3::sim`, the deterministic *virtual bucket*. Durable storage code
+  above `object_store` does not depend on this adapter module.
 - **`pg`** (PostgreSQL) — the PostgreSQL wire protocol: framing, authentication,
   the simple and extended query flows, error responses.
 - **`sql`** — the SQL front end and engine. Sub-modules: **`lexer`**,
@@ -162,7 +162,8 @@ vocabulary — with the meaning they carry in this codebase.
   failed upload keeps the batch marker, so the retry carries the old bytes
   plus newly committed ones. Cold start replays segments newer than the
   manifest; a checkpoint prunes segments it made redundant.
-- **commit-durable-on-bucket** — the default posture with `s3 = on`
+- **commit-durable-on-bucket** — the default posture with
+  `object_store = on`
   (`wal_upload_sync`): a commit acknowledges only after its WAL segment is
   in the bucket, so wiping the local disk at any instant loses nothing
   acknowledged — the disk is formally a cache.
@@ -298,8 +299,11 @@ The performance vocabulary of the object-storage LSM and its adaptive executor
 
 - **AWS Signature Version 4 (SigV4)** — the request-signing scheme for
   authenticating to S3-compatible object storage.
-- **object storage** — an S3-compatible service (AWS S3, GCS, MinIO); the
-  durable home of SSTs, WAL segments, and the manifest.
+- **object storage** — the durable home of SSTs, WAL segments, and the
+  manifest behind the provider-neutral `object_store` contract:
+  immutable/conditional writes, whole/ranged reads, listing, deletion, and
+  compare-and-swap. AWS S3 and MinIO use the first adapter; other providers use
+  a native adapter or compatibility gateway without changing storage behavior.
 
 ### SQL and wire
 
@@ -356,8 +360,9 @@ Universal short names a systems engineer reads without expansion (rule 3); kept.
   ending in crashes, corrupted disk-cache slots, warm restarts and
   wiped-disk cold starts — while a model database tracks every acknowledged
   write and recovery is checked against it exactly.
-- **virtual bucket** (`s3::sim`, `s3 = sim`) — the deterministic in-process
-  object store standing in for S3 behind the object-client seam. It also
+- **virtual bucket** (`s3::sim`, `object_store = sim`) — the deterministic
+  in-process object store implementing the same provider-neutral client
+  contract as network adapters. It also
   enforces the bucket-side key discipline itself (see *blind overwrite*).
   Refused by the real server binary; it exists for simulation tests.
 - **fault plan** — the virtual bucket's per-operation fault dice (parts per

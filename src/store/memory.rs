@@ -9,8 +9,8 @@
 //! never reuses room by dropping one, because that would make "present" mean
 //! "present unless something else needed the space" — the right meaning for a
 //! *cache*, the wrong one for a *store*, and the difference decides whether a
-//! caller still owes the bucket an upload. Stage B's cache is the layer that
-//! reclaims space, and it sits in front of this rather than inside it.
+//! caller still owes the bucket an upload. The cache layer reclaims space, and
+//! it sits in front of this rather than inside it.
 
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;

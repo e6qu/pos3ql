@@ -3,8 +3,8 @@
 //! startup (salted, 4096 iterations); per-connection flows use fixed
 //! stack buffers and getentropy for nonces.
 
-use crate::s3::hmac::hmac_sha256;
-use crate::s3::sha256::sha256;
+use crate::crypto::hmac::hmac_sha256;
+use crate::crypto::sha256::sha256;
 use crate::util::StackStr;
 
 pub const SCRAM_ITERATIONS: u32 = 4096;

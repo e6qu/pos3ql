@@ -1688,6 +1688,16 @@ fn commit_makes_writes_visible_and_durable() {
         run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (id int)");
         run_txn(&mut e, &mut b, &mut t, "BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT");
         run_txn(&mut e, &mut b, &mut t, "BEGIN; INSERT INTO t VALUES (3); ROLLBACK");
+        let slot = e.storage.find_table("public", "t").unwrap();
+        let mut stamped = 0;
+        e.storage
+            .for_each_row_state(slot, &mut |_, state| {
+                assert!(state.committed_lsn > 0);
+                stamped += 1;
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
+        assert_eq!(stamped, 2);
     }
     let mut b2 = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b2).unwrap();
@@ -1695,11 +1705,18 @@ fn commit_makes_writes_visible_and_durable() {
     let out = run_txn(&mut e, &mut b2, &mut t, "SELECT id FROM t ORDER BY id");
     assert!(out.contains("SELECT 2"), "committed rows must replay: {out}");
     assert!(!out.contains('3'), "rolled-back row must not replay: {out}");
+    let slot = e.storage.find_table("public", "t").unwrap();
+    e.storage
+        .for_each_row_state(slot, &mut |_, state| {
+            assert!(state.committed_lsn > 0, "WAL replay must retain commit LSNs");
+            Ok(core::ops::ControlFlow::Continue(()))
+        })
+        .unwrap();
 }
 
 #[test]
 fn implicit_transaction_rolls_back_whole_message() {
-    // B-001: an error in a multi-statement message undoes all of it.
+    // An error in a multi-statement message undoes all of it.
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     run_txn(&mut e, &mut b, &mut t, "CREATE TABLE t (id int)");
@@ -2654,7 +2671,7 @@ fn check_constraint_auto_naming() {
 
 #[test]
 fn value_index_matches_uniqueness_oracle() {
-    // B-169: the value index must give exactly the verdicts a full scan would.
+    // The value index must give exactly the verdicts a full scan would.
     // A deterministic workload of inserts/updates/deletes over a small key space
     // (frequent collisions) is checked against a ground-truth set of committed
     // keys, across a restart (which rebuilds the indexes from replay).
@@ -5605,7 +5622,7 @@ fn transactional_ddl_rollback() {
 
 #[test]
 fn catalog_joins_and_subqueries() {
-    // Joins/subqueries across catalog relations (B-007). Validated vs PG 18.4.
+    // Joins/subqueries across catalog relations, validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE demo (a int, b text)");
     // pg_class JOIN pg_attribute on oid = attrelid.

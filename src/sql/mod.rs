@@ -11,6 +11,7 @@ pub mod encoding;
 pub mod eval;
 pub mod exec;
 mod explain;
+pub(crate) mod external;
 pub mod guc;
 pub mod json;
 pub mod lexer;

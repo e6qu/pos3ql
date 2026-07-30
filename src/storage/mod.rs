@@ -1959,6 +1959,10 @@ pub(crate) struct SpillReader {
     /// Independent buffers for persistent value probes. A probe may invoke an
     /// authoritative spilled-row recheck, so it must not borrow row scratch.
     value_scratch: [std::cell::RefCell<ValueIndexScratch>; 2],
+    /// One statement at a time may build immutable external execution runs.
+    /// Its buffers and merge fan-in are fixed at startup; run blocks travel
+    /// through `blocks`, never a provider-specific path.
+    external: std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
 }
 
 /// A row-state walk releases its block context before invoking its callback.
@@ -2033,6 +2037,7 @@ impl SpillReader {
             4 * crate::store::MAX_PAYLOAD,
             "persistent value-index readers",
         )?;
+        let external = Box::new(crate::sql::external::ExternalSorter::new(budget)?);
         let fresh = || {
             std::cell::RefCell::new(SpillScratch {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -2066,6 +2071,7 @@ impl SpillReader {
             scan_contexts: scan_contexts.into_boxed_slice(),
             next_walk_id: std::cell::Cell::new(1),
             value_scratch: [value(), value()],
+            external: std::cell::RefCell::new(external),
         })
     }
 
@@ -2076,6 +2082,7 @@ impl SpillReader {
                 * ((MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
             + 4 * crate::store::MAX_PAYLOAD
+            + crate::sql::external::ExternalSorter::budget_bytes()
     }
 }
 
@@ -3112,6 +3119,28 @@ impl Storage {
             .as_ref()
             .map(|reader| reader.blocks.borrow().io_stats())
             .unwrap_or_default()
+    }
+
+    /// Borrows the startup-sized external-run workspace.
+    pub(crate) fn external_sorter(
+        &self,
+    ) -> Option<std::cell::RefMut<'_, Box<crate::sql::external::ExternalSorter>>> {
+        self.spill
+            .as_ref()
+            .map(|reader| reader.external.borrow_mut())
+    }
+
+    /// Runs one short operation against the provider-neutral tiered block
+    /// stack. The borrow must not cross a source-row callback: a spilled scan
+    /// releases its own block context before invoking that callback precisely
+    /// so execution work can issue nested reads or writes here.
+    pub(crate) fn with_block_store<R>(
+        &self,
+        operation: impl FnOnce(&mut dyn crate::store::BlockStore) -> R,
+    ) -> Option<R> {
+        let reader = self.spill.as_ref()?;
+        let mut blocks = reader.blocks.borrow_mut();
+        Some(operation(&mut *blocks))
     }
 
     /// Number of immutable row generations currently backing a table.

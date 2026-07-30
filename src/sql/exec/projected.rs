@@ -35,6 +35,22 @@ pub(crate) fn encode_projected_by<'a>(
     mut value_at: impl FnMut(usize) -> Datum<'a>,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
+    let len = projected_row_len_by(count, &mut value_at)?;
+    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "DISTINCT row exceeds the statement arena"
+        )
+    })?;
+    encode_projected_by_into(count, &mut value_at, out)?;
+    Ok(&*out)
+}
+
+/// Exact byte length of a projected row whose values are read by index.
+pub(crate) fn projected_row_len_by<'a>(
+    count: usize,
+    mut value_at: impl FnMut(usize) -> Datum<'a>,
+) -> Result<usize, SqlError> {
     let count_u16 = u16::try_from(count).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -52,19 +68,32 @@ pub(crate) fn encode_projected_by<'a>(
                 )
             })?;
     }
-    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
-        sql_err!(
+    Ok(len)
+}
+
+/// Writes an indexed projected row into caller-owned external-run storage.
+pub(crate) fn encode_projected_by_into<'a>(
+    count: usize,
+    mut value_at: impl FnMut(usize) -> Datum<'a>,
+    out: &mut [u8],
+) -> Result<usize, SqlError> {
+    let len = projected_row_len_by(count, &mut value_at)?;
+    if out.len() < len {
+        return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "DISTINCT row exceeds the statement arena"
-        )
-    })?;
+            "projected row of {} bytes exceeds external-run block capacity {}",
+            len,
+            out.len()
+        ));
+    }
+    let count_u16 = u16::try_from(count).expect("projected_row_len_by checked the count");
     out[..2].copy_from_slice(&count_u16.to_le_bytes());
     let mut at = 2usize;
     for index in 0..count {
         at += write_projected_value(&value_at(index), &mut out[at..]);
     }
     debug_assert_eq!(at, len);
-    Ok(&*out)
+    Ok(at)
 }
 
 /// Exact byte length needed by [`encode_projected_into`].
@@ -92,10 +121,7 @@ pub(crate) fn projected_row_len(values: &[Datum]) -> Result<usize, SqlError> {
 /// The arena path and the external-run path share this writer, so the two
 /// representations cannot drift. `out` may be larger than necessary; the
 /// returned length names the initialized prefix.
-pub(crate) fn encode_projected_into(
-    values: &[Datum],
-    out: &mut [u8],
-) -> Result<usize, SqlError> {
+pub(crate) fn encode_projected_into(values: &[Datum], out: &mut [u8]) -> Result<usize, SqlError> {
     let len = projected_row_len(values)?;
     if out.len() < len {
         return Err(sql_err!(
@@ -633,7 +659,7 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
 /// Compares two encoded rows' first `width` columns under SQL equality:
 /// column bytes compare directly except bpchar values, which compare by their
 /// stripped text — cross-width padding must not split a DISTINCT group.
-fn cmp_projected_prefix(a: &[u8], b: &[u8], width: usize) -> core::cmp::Ordering {
+pub(crate) fn compare_projected_prefix(a: &[u8], b: &[u8], width: usize) -> core::cmp::Ordering {
     let (mut ia, mut ib) = (2usize, 2usize);
     for _ in 0..width {
         let (ta, tb) = (a[ia], b[ib]);
@@ -748,10 +774,10 @@ fn decode_record_tail<'a>(
 /// byte order as the tiebreak so the surviving representative is
 /// deterministic) and keeps the first of each run. Returns the live count.
 pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
-    rows.sort_unstable_by(|a, b| cmp_projected_prefix(a, b, width).then_with(|| a.cmp(b)));
+    rows.sort_unstable_by(|a, b| compare_projected_prefix(a, b, width).then_with(|| a.cmp(b)));
     let mut unique = 0usize;
     for i in 0..rows.len() {
-        let same = i > 0 && cmp_projected_prefix(rows[i], rows[unique - 1], width).is_eq();
+        let same = i > 0 && compare_projected_prefix(rows[i], rows[unique - 1], width).is_eq();
         if !same {
             rows[unique] = rows[i];
             unique += 1;

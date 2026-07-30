@@ -12,18 +12,18 @@ use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Expr, FromClause, Select, SelectItem};
 use crate::sql::eval::{
-    compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError, SubqueryValues,
+    ColumnLookup, EvalHooks, SqlError, SubqueryValues, compare_datums, eval_full, sqlstate,
 };
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::{ColType, Datum};
-use crate::{sql_err, stack_format};
 use crate::storage::Storage;
+use crate::{sql_err, stack_format};
 
 use super::{
-    arena_full, correlated_in_expression, correlated_where_passes, find_srf, merge_correlated,
-    postpone_cost, project_row_skipping, record_star_width, resolve_order_target, scan_source,
-    sql_fail, sql_ok, srf_max_count, JoinRow, Outcome, QueryScope, ResolvedColumn,
-    MAX_SUBQUERIES,
+    JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
+    correlated_in_expression, correlated_where_passes, find_srf, merge_correlated, postpone_cost,
+    project_row_skipping, record_star_width, resolve_order_target, scan_source,
+    scan_source_recycling, sql_fail, sql_ok, srf_max_count,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
@@ -39,7 +39,10 @@ struct EncodedRawRow<'s, 'd, 'a> {
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let flat_of = |t: usize, c: usize| -> usize {
-            (0..t).map(|i| self.scope.defs[i].expect("resolved").n_columns).sum::<usize>() + c
+            (0..t)
+                .map(|i| self.scope.defs[i].expect("resolved").n_columns)
+                .sum::<usize>()
+                + c
         };
         match self.scope.find_column(qualifier, name)? {
             ResolvedColumn::Table(t, c) => crate::sql::exec::decode_projected_col_record(
@@ -91,11 +94,7 @@ fn for_each_materialized_projection<'a>(
     n_keys: usize,
     postponed: Option<&[bool; MAX_PROJ]>,
     has_srf: bool,
-    consume: &mut impl FnMut(
-        &JoinRow<'_, 'a, '_>,
-        &[Datum<'a>],
-        &[Datum<'a>],
-    ) -> Result<(), SqlError>,
+    consume: &mut impl FnMut(&JoinRow<'_, 'a, '_>, &[Datum<'a>], &[Datum<'a>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if !where_correlated.is_empty()
         && !correlated_where_passes(
@@ -147,7 +146,10 @@ fn for_each_materialized_projection<'a>(
     for expansion in 1..=expansions {
         let srf_hooks;
         let use_hooks: &EvalHooks = if has_srf {
-            srf_hooks = EvalHooks { srf_index: Some(expansion), ..*row_hooks };
+            srf_hooks = EvalHooks {
+                srf_index: Some(expansion),
+                ..*row_hooks
+            };
             &srf_hooks
         } else {
             row_hooks
@@ -166,8 +168,7 @@ fn for_each_materialized_projection<'a>(
         )?;
         let mut keys = [Datum::Null; MAX_PROJ];
         for (key, expression) in order_exprs.iter().take(n_keys).enumerate() {
-            keys[key] =
-                eval_full(expression.expect("resolved"), arena, params, row, use_hooks)?;
+            keys[key] = eval_full(expression.expect("resolved"), arena, params, row, use_hooks)?;
         }
         consume(row, &projected[..width], &keys[..n_keys])?;
     }
@@ -183,7 +184,11 @@ fn for_each_materialized_projection<'a>(
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        Err(sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name))
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         let entry = self.0.find_column(qualifier, name).ok()?;
@@ -222,17 +227,20 @@ pub(crate) struct PostponedProjection {
 /// survive LIMIT/OFFSET reach this, in sorted order — the whole point of the
 /// postponement.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
-pub(crate) fn finalize_projected_row<'a>(
-    bytes: &'a [u8],
+pub(crate) fn finalize_projected_row<'row, 'query>(
+    bytes: &'row [u8],
     width: usize,
     deferred: Option<&PostponedProjection>,
-    statement: &'a Select<'a>,
-    scope: &QueryScope<'a>,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    hooks: &EvalHooks<'_, 'a>,
-    out: &mut [Datum<'a>; MAX_PROJ],
-) -> Result<(), SqlError> {
+    statement: &'query Select<'query>,
+    scope: &QueryScope<'query>,
+    arena: &'row Arena,
+    params: &[Datum<'query>],
+    hooks: &EvalHooks<'_, 'query>,
+    out: &mut [Datum<'row>; MAX_PROJ],
+) -> Result<(), SqlError>
+where
+    'query: 'row,
+{
     for (i, slot) in out.iter_mut().take(width).enumerate() {
         *slot = crate::sql::exec::decode_projected_col_record(bytes, i, arena)?;
     }
@@ -250,7 +258,9 @@ pub(crate) fn finalize_projected_row<'a>(
         match item {
             SelectItem::Wildcard => slot += scope.star_columns(),
             SelectItem::TableWildcard(q) => {
-                slot += scope.defs[scope.table_index(q)?].expect("resolved").n_columns;
+                slot += scope.defs[scope.table_index(q)?]
+                    .expect("resolved")
+                    .n_columns;
             }
             SelectItem::RecordStar(base) => slot += record_star_width(base, scope),
             SelectItem::Expr { expression, .. } => {
@@ -266,6 +276,132 @@ pub(crate) fn finalize_projected_row<'a>(
 
 /// Materialized rows, their visible width, and any postponed-projection plan.
 type MaterializedSelect<'a> = (&'a [&'a [u8]], usize, Option<PostponedProjection>);
+
+struct MaterializationPlan<'a> {
+    n_order: usize,
+    n_on: usize,
+    n_keys: usize,
+    width: usize,
+    n_raw: usize,
+    where_correlated: [&'a Expr<'a>; MAX_SUBQUERIES],
+    n_where_correlated: usize,
+    where_in_scan: Option<&'a Expr<'a>>,
+    order_exprs: [Option<&'a Expr<'a>>; MAX_PROJ],
+    postponed: [bool; MAX_PROJ],
+    any_postponed: bool,
+    has_srf: bool,
+}
+
+fn prepare_materialization<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    correlated: &'a [&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<MaterializationPlan<'a>, SqlError> {
+    let n_order = statement.order_by.len();
+    let n_on = statement.distinct_on.len();
+    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
+    let n_where_correlated =
+        correlated_in_expression(statement.where_clause, correlated, &mut where_correlated)?;
+    let where_in_scan = if n_where_correlated == 0 {
+        statement.where_clause
+    } else {
+        None
+    };
+
+    let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    for (key, order) in statement.order_by.iter().enumerate() {
+        order_exprs[key] = Some(resolve_order_target(
+            order.expression,
+            statement.items,
+            scope,
+            arena,
+        )?);
+    }
+    for (index, on) in statement.distinct_on.iter().enumerate() {
+        let resolved = resolve_order_target(on, statement.items, scope, arena)?;
+        if n_order > 0 && (index >= n_order || *order_exprs[index].expect("resolved") != *resolved)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+            ));
+        }
+        order_exprs[n_order + index] = Some(resolved);
+    }
+    let n_keys = n_order + n_on;
+    if statement.distinct && n_on == 0 {
+        for expression in order_exprs.iter().take(n_order) {
+            let target = expression.expect("resolved");
+            let in_list = statement.items.iter().any(|item| {
+                matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
+            });
+            if !in_list {
+                return Err(sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+                ));
+            }
+        }
+    }
+
+    let mut width = 0usize;
+    for item in statement.items {
+        width += match item {
+            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::TableWildcard(qualifier) => {
+                scope.defs[scope.table_index(qualifier)?]
+                    .expect("resolved")
+                    .n_columns
+            }
+            SelectItem::RecordStar(base) => record_star_width(base, scope),
+            SelectItem::Expr { .. } => 1,
+        };
+    }
+
+    let has_srf = find_srf(statement.items).is_some();
+    let defer_allowed = n_order > 0
+        && statement.limit.is_some()
+        && !statement.distinct
+        && correlated.is_empty()
+        && !has_srf
+        && statement.items.len() <= MAX_PROJ;
+    let mut postponed = [false; MAX_PROJ];
+    let mut any_postponed = false;
+    if defer_allowed {
+        for (index, item) in statement.items.iter().enumerate() {
+            let SelectItem::Expr { expression, .. } = item else {
+                continue;
+            };
+            let ordered_by = order_exprs[..n_order]
+                .iter()
+                .any(|order| order.is_some_and(|target| *target == **expression));
+            if !ordered_by && postpone_cost(expression, scope, arena) > 20 {
+                postponed[index] = true;
+                any_postponed = true;
+            }
+        }
+    }
+    let n_raw = if any_postponed {
+        scope.total_columns()
+    } else {
+        0
+    };
+    Ok(MaterializationPlan {
+        n_order,
+        n_on,
+        n_keys,
+        width,
+        n_raw,
+        where_correlated,
+        n_where_correlated,
+        where_in_scan,
+        order_exprs,
+        postponed,
+        any_postponed,
+        has_srf,
+    })
+}
 
 /// The row-producing half of DISTINCT / ORDER BY execution: materialize
 /// projected rows (with hidden ORDER BY key columns), dedupe on the visible
@@ -286,105 +422,21 @@ pub(crate) fn materialized_rows<'a>(
     base: &SubqueryValues<'a, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
-    let n_order = statement.order_by.len();
-    // `DISTINCT ON (exprs)`: its keys are materialized as hidden columns
-    // after the ORDER BY keys, and the result is deduped on them (keeping the
-    // first row per key, in ORDER BY order — PostgreSQL requires the ON
-    // expressions to match the leftmost ORDER BY).
-    let n_on = statement.distinct_on.len();
-    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
-    let n_where_correlated = correlated_in_expression(
-        statement.where_clause,
-        correlated,
-        &mut where_correlated,
-    )?;
-    // Select-list and ORDER BY subqueries do not prevent predicate pushdown.
-    // Only a correlated subquery actually used by WHERE needs per-row hooks.
-    let where_in_scan =
-        if n_where_correlated == 0 { statement.where_clause } else { None };
-
-    // Resolve ORDER BY ordinals to item expressions, then the DISTINCT ON keys.
-    let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
-    for (k, ob) in statement.order_by.iter().enumerate() {
-        order_exprs[k] = Some(resolve_order_target(ob.expression, statement.items, scope, arena)?);
-    }
-    for (j, on) in statement.distinct_on.iter().enumerate() {
-        let resolved = resolve_order_target(on, statement.items, scope, arena)?;
-        // PostgreSQL requires each DISTINCT ON expression to match the
-        // ORDER BY expression at the same leftmost position (when ORDER BY is
-        // present); otherwise the "first" row per key is ill-defined.
-        if n_order > 0 && (j >= n_order || *order_exprs[j].expect("resolved") != *resolved) {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
-            ));
-        }
-        order_exprs[n_order + j] = Some(resolved);
-    }
-    let n_keys = n_order + n_on;
-    // DISTINCT (not DISTINCT ON) restriction: ORDER BY keys must be members.
-    if statement.distinct && n_on == 0 {
-        for oe in order_exprs.iter().take(n_order) {
-            let target = oe.expect("resolved");
-            let in_list = statement.items.iter().any(|item| {
-                matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
-            });
-            if !in_list {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
-                ));
-            }
-        }
-    }
-
-    // Visible width.
-    let width = {
-        let mut w = 0usize;
-        for item in statement.items {
-            w += match item {
-                SelectItem::Wildcard => scope.star_columns(),
-                SelectItem::TableWildcard(q) => {
-                    scope.defs[scope.table_index(q)?].expect("resolved").n_columns
-                }
-                SelectItem::RecordStar(base) => record_star_width(base, scope),
-                SelectItem::Expr { .. } => 1,
-            };
-        }
-        w
-    };
-
-    // Projection postponement (PostgreSQL `make_sort_input_target`, behavior
-    // pinned empirically against 18.4): with ORDER BY *and* LIMIT (OFFSET alone
-    // does not trigger it), a select-list item costing more than 10 operators
-    // is evaluated above the Sort + Limit — only on surviving rows, in sorted
-    // order — unless the ORDER BY references it. Wildcards are plain columns
-    // and never postponed. Each row then also carries its raw source columns
-    // so the deferred items can be evaluated later.
-    // A set-returning function in the list expands each source row into
-    // several output rows here.
-    let srf_call = find_srf(statement.items);
-    let defer_allowed = n_order > 0
-        && statement.limit.is_some()
-        && !statement.distinct
-        && correlated.is_empty()
-        && srf_call.is_none()
-        && statement.items.len() <= MAX_PROJ;
-    let mut postponed = [false; MAX_PROJ];
-    let mut any_postponed = false;
-    if defer_allowed {
-        for (i, item) in statement.items.iter().enumerate() {
-            let SelectItem::Expr { expression, .. } = item else { continue };
-            let ordered_by = order_exprs[..n_order]
-                .iter()
-                .any(|oe| oe.is_some_and(|o| *o == **expression));
-            if !ordered_by && postpone_cost(expression, scope, arena) > 20 {
-                postponed[i] = true;
-                any_postponed = true;
-            }
-        }
-    }
-    let n_raw = if any_postponed { scope.total_columns() } else { 0 };
+    let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let MaterializationPlan {
+        n_order,
+        n_on,
+        n_keys,
+        width,
+        n_raw,
+        where_correlated,
+        n_where_correlated,
+        where_in_scan,
+        order_exprs,
+        postponed,
+        any_postponed,
+        has_srf,
+    } = plan;
 
     // Pass 1: count — and evaluate the projection and ORDER BY keys per row
     // (discarding the values). PostgreSQL scans, filters, and projects in a
@@ -396,7 +448,14 @@ pub(crate) fn materialized_rows<'a>(
     // so they are skipped here too.
     let mut count = 0usize;
     scan_source(
-        storage, scope, from, txid, where_in_scan, arena, params, hooks,
+        storage,
+        scope,
+        from,
+        txid,
+        where_in_scan,
+        arena,
+        params,
+        hooks,
         outer,
         &mut |row| {
             for_each_materialized_projection(
@@ -413,8 +472,12 @@ pub(crate) fn materialized_rows<'a>(
                 &where_correlated[..n_where_correlated],
                 &order_exprs,
                 n_keys,
-                if any_postponed { Some(&postponed) } else { None },
-                srf_call.is_some(),
+                if any_postponed {
+                    Some(&postponed)
+                } else {
+                    None
+                },
+                has_srf,
                 &mut |_, _, _| {
                     count += 1;
                     Ok(())
@@ -431,7 +494,14 @@ pub(crate) fn materialized_rows<'a>(
     {
         let mut at = 0usize;
         scan_source(
-            storage, scope, from, txid, where_in_scan, arena, params, hooks,
+            storage,
+            scope,
+            from,
+            txid,
+            where_in_scan,
+            arena,
+            params,
+            hooks,
             outer,
             &mut |row| {
                 for_each_materialized_projection(
@@ -448,40 +518,44 @@ pub(crate) fn materialized_rows<'a>(
                     &where_correlated[..n_where_correlated],
                     &order_exprs,
                     n_keys,
-                    if any_postponed { Some(&postponed) } else { None },
-                    srf_call.is_some(),
+                    if any_postponed {
+                        Some(&postponed)
+                    } else {
+                        None
+                    },
+                    has_srf,
                     &mut |row, projected, keys| {
-                    debug_assert_eq!(projected.len(), width);
-                    rows[at] = crate::sql::exec::encode_projected_by(
-                        width + n_keys + n_raw,
-                        |index| {
-                            if index < width {
-                                return projected[index];
-                            }
-                            if index < width + n_keys {
-                                return keys[index - width];
-                            }
-                            let mut raw_index = index - width - n_keys;
-                            for table in 0..scope.n {
-                                let column_count =
-                                    scope.defs[table].expect("resolved").n_columns;
-                                if raw_index < column_count {
-                                    let values = row.values[table].expect("bound");
-                                    return if values.is_empty() {
-                                        Datum::Null
-                                    } else {
-                                        values[raw_index]
-                                    };
+                        debug_assert_eq!(projected.len(), width);
+                        rows[at] = crate::sql::exec::encode_projected_by(
+                            width + n_keys + n_raw,
+                            |index| {
+                                if index < width {
+                                    return projected[index];
                                 }
-                                raw_index -= column_count;
-                            }
-                            unreachable!("raw projected column is within scope width")
-                        },
-                        arena,
-                    )?;
-                    at += 1;
-                    Ok(())
-                },
+                                if index < width + n_keys {
+                                    return keys[index - width];
+                                }
+                                let mut raw_index = index - width - n_keys;
+                                for table in 0..scope.n {
+                                    let column_count =
+                                        scope.defs[table].expect("resolved").n_columns;
+                                    if raw_index < column_count {
+                                        let values = row.values[table].expect("bound");
+                                        return if values.is_empty() {
+                                            Datum::Null
+                                        } else {
+                                            values[raw_index]
+                                        };
+                                    }
+                                    raw_index -= column_count;
+                                }
+                                unreachable!("raw projected column is within scope width")
+                            },
+                            arena,
+                        )?;
+                        at += 1;
+                        Ok(())
+                    },
                 )?;
                 Ok(true)
             },
@@ -513,10 +587,18 @@ pub(crate) fn materialized_rows<'a>(
                 let ord = match (ka.is_null(), kb.is_null()) {
                     (true, true) => core::cmp::Ordering::Equal,
                     (true, false) => {
-                        if ob.nulls_first { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater }
+                        if ob.nulls_first {
+                            core::cmp::Ordering::Less
+                        } else {
+                            core::cmp::Ordering::Greater
+                        }
                     }
                     (false, true) => {
-                        if ob.nulls_first { core::cmp::Ordering::Greater } else { core::cmp::Ordering::Less }
+                        if ob.nulls_first {
+                            core::cmp::Ordering::Greater
+                        } else {
+                            core::cmp::Ordering::Less
+                        }
                     }
                     (false, false) => {
                         let c = compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal);
@@ -554,7 +636,8 @@ pub(crate) fn materialized_rows<'a>(
             let same = i > 0
                 && (0..n_on).all(|j| {
                     let ka = crate::sql::exec::decode_projected_pub(rows[i], width + n_order + j);
-                    let kb = crate::sql::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
+                    let kb =
+                        crate::sql::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
                     match (ka.is_null(), kb.is_null()) {
                         (true, true) => true,
                         (true, false) | (false, true) => false,
@@ -583,35 +666,332 @@ pub(crate) fn materialized_rows<'a>(
 /// Whether two sorted rows tie on their `n_order` hidden ORDER BY key columns
 /// (stored after `width`), with NULLs comparing equal — the `WITH TIES` peer
 /// test, independent of ASC/DESC.
-pub(crate) fn order_keys_equal(a: &[u8], b: &[u8], width: usize, n_order: usize) -> bool {
+pub(crate) fn order_keys_equal(
+    a: &[u8],
+    b: &[u8],
+    width: usize,
+    n_order: usize,
+) -> Result<bool, SqlError> {
     for k in 0..n_order {
         let ka = crate::sql::exec::decode_projected_pub(a, width + k);
         let kb = crate::sql::exec::decode_projected_pub(b, width + k);
         let equal = match (ka.is_null(), kb.is_null()) {
             (true, true) => true,
-            (false, false) => compare_datums(&ka, &kb).is_ok_and(|o| o.is_eq()),
+            (false, false) => compare_datums(&ka, &kb)?.is_eq(),
             _ => false,
         };
         if !equal {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
+}
+
+fn compare_materialized_rows(
+    statement: &Select<'_>,
+    width: usize,
+    n_order: usize,
+    n_on: usize,
+    a: &[u8],
+    b: &[u8],
+) -> Result<core::cmp::Ordering, SqlError> {
+    for (key, order) in statement.order_by.iter().enumerate() {
+        let left = crate::sql::exec::decode_projected_pub(a, width + key);
+        let right = crate::sql::exec::decode_projected_pub(b, width + key);
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => {
+                if order.nulls_first {
+                    core::cmp::Ordering::Less
+                } else {
+                    core::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if order.nulls_first {
+                    core::cmp::Ordering::Greater
+                } else {
+                    core::cmp::Ordering::Less
+                }
+            }
+            (false, false) => {
+                let compared = compare_datums(&left, &right)?;
+                if order.descending {
+                    compared.reverse()
+                } else {
+                    compared
+                }
+            }
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    for index in 0..n_on {
+        let left = crate::sql::exec::decode_projected_pub(a, width + n_order + index);
+        let right = crate::sql::exec::decode_projected_pub(b, width + n_order + index);
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => compare_datums(&left, &right)?,
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(if statement.distinct && n_on == 0 {
+        crate::sql::exec::compare_projected_prefix(a, b, width)
+    } else {
+        core::cmp::Ordering::Equal
+    })
+}
+
+fn distinct_on_keys_equal(
+    a: &[u8],
+    b: &[u8],
+    width: usize,
+    n_order: usize,
+    n_on: usize,
+) -> Result<bool, SqlError> {
+    for index in 0..n_on {
+        let left = crate::sql::exec::decode_projected_pub(a, width + n_order + index);
+        let right = crate::sql::exec::decode_projected_pub(b, width + n_order + index);
+        let equal = match (left.is_null(), right.is_null()) {
+            (true, true) => true,
+            (false, false) => compare_datums(&left, &right)?.is_eq(),
+            _ => false,
+        };
+        if !equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn external_materialized_select<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
+    limit: u64,
+    offset: u64,
+    responder: &mut Responder,
+) -> Outcome {
+    let plan = match prepare_materialization(statement, scope, correlated, arena) {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
+    let mut sorter = storage.external_sorter().expect("spill-attached storage");
+    sorter.reset();
+    let mut compare = |left: &[u8], right: &[u8]| {
+        compare_materialized_rows(statement, plan.width, plan.n_order, plan.n_on, left, right)
+    };
+    let scan = scan_source_recycling(
+        storage,
+        scope,
+        from,
+        txid,
+        plan.where_in_scan,
+        arena,
+        params,
+        hooks,
+        None,
+        &mut |row| {
+            let mark = arena.mark();
+            let result = for_each_materialized_projection(
+                storage,
+                scope,
+                statement,
+                row,
+                txid,
+                arena,
+                params,
+                hooks,
+                correlated,
+                base,
+                &plan.where_correlated[..plan.n_where_correlated],
+                &plan.order_exprs,
+                plan.n_keys,
+                if plan.any_postponed {
+                    Some(&plan.postponed)
+                } else {
+                    None
+                },
+                plan.has_srf,
+                &mut |row, projected, keys| {
+                    storage
+                        .with_block_store(|blocks| {
+                            sorter.push_projected_by(
+                                blocks,
+                                plan.width + plan.n_keys + plan.n_raw,
+                                |index| {
+                                    if index < plan.width {
+                                        return projected[index];
+                                    }
+                                    if index < plan.width + plan.n_keys {
+                                        return keys[index - plan.width];
+                                    }
+                                    let mut raw_index = index - plan.width - plan.n_keys;
+                                    for table in 0..scope.n {
+                                        let column_count =
+                                            scope.defs[table].expect("resolved").n_columns;
+                                        if raw_index < column_count {
+                                            let values = row.values[table].expect("bound");
+                                            return if values.is_empty() {
+                                                Datum::Null
+                                            } else {
+                                                values[raw_index]
+                                            };
+                                        }
+                                        raw_index -= column_count;
+                                    }
+                                    unreachable!("raw projected column is in scope")
+                                },
+                                &mut compare,
+                            )
+                        })
+                        .expect("spill-attached block store")
+                },
+            );
+            // SAFETY: every value allocated above `mark` was encoded into the
+            // external run before the callback returned; none escapes.
+            unsafe { arena.rewind_to(mark) };
+            result?;
+            Ok(true)
+        },
+    );
+    if let Err(error) = scan {
+        return sql_fail(error);
+    }
+    let run = match storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("spill-attached block store")
+    {
+        Ok(run) => run,
+        Err(error) => return sql_fail(error),
+    };
+    let Some(run) = run else {
+        responder.command_complete("SELECT 0")?;
+        return sql_ok();
+    };
+
+    let deferred = plan.any_postponed.then_some(PostponedProjection {
+        postponed: plan.postponed,
+        raw_at: plan.width + plan.n_keys,
+    });
+    let window = offset.saturating_add(limit);
+    let mut logical_index = 0u64;
+    let mut emitted = 0u64;
+    let mut boundary_len = 0usize;
+    let mut wire_full = false;
+    let consumed = storage
+        .with_block_store(|blocks| {
+            sorter.consume(blocks, run, |row, previous, boundary| {
+                let duplicate = if let Some(prior) = previous {
+                    if statement.distinct && plan.n_on == 0 {
+                        crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
+                    } else if plan.n_on > 0 {
+                        distinct_on_keys_equal(
+                            row, prior, plan.width, plan.n_order, plan.n_on,
+                        )?
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if duplicate {
+                    return Ok(true);
+                }
+                let in_ties = if statement.with_ties
+                    && limit > 0
+                    && logical_index >= window
+                    && boundary_len > 0
+                {
+                    order_keys_equal(&boundary[..boundary_len], row, plan.width, plan.n_order)?
+                } else {
+                    false
+                };
+                if logical_index >= window && !in_ties {
+                    return Ok(false);
+                }
+                let mark = arena.mark();
+                let mut output = [Datum::Null; MAX_PROJ];
+                let finalized = finalize_projected_row(
+                    row,
+                    plan.width,
+                    deferred.as_ref(),
+                    statement,
+                    scope,
+                    arena,
+                    params,
+                    hooks,
+                    &mut output,
+                );
+                if let Err(error) = finalized {
+                    // SAFETY: failed per-row decode/evaluation cannot
+                    // publish a reference beyond this callback.
+                    unsafe { arena.rewind_to(mark) };
+                    return Err(error);
+                }
+                if logical_index >= offset {
+                    if responder.data_row(&output[..plan.width]).is_err() {
+                        wire_full = true;
+                        // SAFETY: the failed responder did not retain the
+                        // per-row values.
+                        unsafe { arena.rewind_to(mark) };
+                        return Ok(false);
+                    }
+                    emitted += 1;
+                }
+                if statement.with_ties && limit > 0 && logical_index + 1 == window {
+                    boundary[..row.len()].copy_from_slice(row);
+                    boundary_len = row.len();
+                }
+                logical_index += 1;
+                // SAFETY: the responder encoded the row synchronously.
+                unsafe { arena.rewind_to(mark) };
+                Ok(true)
+            })
+        })
+        .expect("spill-attached block store");
+    if let Err(error) = consumed {
+        return sql_fail(error);
+    }
+    if wire_full {
+        return Err(crate::pg::wire::WireFull);
+    }
+    let tag = stack_format!(48, "SELECT {}", emitted);
+    responder.command_complete(tag.as_str())?;
+    sql_ok()
 }
 
 /// Extends an exclusive limit window to include every following row that ties
 /// with `rows[window - 1]` on the ORDER BY keys (`FETCH FIRST ... WITH TIES`).
 /// A `window` at or past the end (or no ORDER BY) is returned clamped.
-pub(crate) fn extend_ties(rows: &[&[u8]], width: usize, n_order: usize, window: usize) -> usize {
+pub(crate) fn extend_ties(
+    rows: &[&[u8]],
+    width: usize,
+    n_order: usize,
+    window: usize,
+) -> Result<usize, SqlError> {
     if n_order == 0 || window == 0 || window >= rows.len() {
-        return window.min(rows.len());
+        return Ok(window.min(rows.len()));
     }
     let boundary = rows[window - 1];
     let mut end = window;
-    while end < rows.len() && order_keys_equal(boundary, rows[end], width, n_order) {
+    while end < rows.len() && order_keys_equal(boundary, rows[end], width, n_order)? {
         end += 1;
     }
-    end
+    Ok(end)
 }
 
 /// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
@@ -632,6 +1012,12 @@ pub(crate) fn materialized_select<'a>(
     offset: u64,
     responder: &mut Responder,
 ) -> Outcome {
+    if storage.spill_attached() {
+        return external_materialized_select(
+            storage, scope, from, txid, statement, arena, params, hooks, correlated, base, limit,
+            offset, responder,
+        );
+    }
     let (rows, width, deferred) = match materialized_rows(
         storage, scope, from, txid, statement, arena, params, hooks, correlated, base, None,
     ) {
@@ -647,12 +1033,23 @@ pub(crate) fn materialized_select<'a>(
     // last one on the ORDER BY keys (which ride as hidden columns after
     // `width`). Only meaningful when a row was actually emitted (`limit > 0`).
     if statement.with_ties && limit > 0 {
-        window = extend_ties(rows, width, statement.order_by.len(), window);
+        window = match extend_ties(rows, width, statement.order_by.len(), window) {
+            Ok(window) => window,
+            Err(error) => return sql_fail(error),
+        };
     }
     for (index, row) in rows.iter().take(window).enumerate() {
         let mut out = [Datum::Null; MAX_PROJ];
         if let Err(e) = finalize_projected_row(
-            row, width, deferred.as_ref(), statement, scope, arena, params, hooks, &mut out,
+            row,
+            width,
+            deferred.as_ref(),
+            statement,
+            scope,
+            arena,
+            params,
+            hooks,
+            &mut out,
         ) {
             return sql_fail(e);
         }

@@ -835,6 +835,17 @@ impl<'a> Parser<'a> {
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).
     pub(super) fn drop_stmt(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("drop")?;
+        if self.eat_ident("owned")? {
+            self.expect_ident("by")?;
+            let roles = self.role_name_list("role name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropOwned { roles, cascade });
+        }
         if self.eat_ident("view")? {
             let (names, if_exists) = self.drop_targets("view name")?;
             let cascade = if self.eat_ident("cascade")? {

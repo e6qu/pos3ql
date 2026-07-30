@@ -73,6 +73,9 @@ pub struct Responder<'b> {
     /// EXPLAIN ANALYZE executes through the ordinary executor but suppresses
     /// its row description, rows, and command tag. Errors still propagate.
     discard_query_output: bool,
+    /// Composite utility commands execute ordinary DROP helpers but publish
+    /// one command tag of their own.
+    suppress_command_complete: bool,
     discarded_rows: u64,
     discard_serialize: ExplainSerialize,
     serialized_bytes: u64,
@@ -206,6 +209,7 @@ impl<'b> Responder<'b> {
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
+            suppress_command_complete: false,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -221,6 +225,7 @@ impl<'b> Responder<'b> {
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
+            suppress_command_complete: false,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -238,6 +243,7 @@ impl<'b> Responder<'b> {
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
+            suppress_command_complete: false,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -998,12 +1004,23 @@ impl<'b> Responder<'b> {
     }
 
     pub fn command_complete(&mut self, tag: &str) -> Result<(), WireFull> {
-        if self.discard_query_output {
+        if self.discard_query_output || self.suppress_command_complete {
             return Ok(());
         }
         let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
         m.cstr(tag);
         m.finish()
+    }
+
+    pub fn without_command_complete<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let prior = self.suppress_command_complete;
+        self.suppress_command_complete = true;
+        let result = operation(self);
+        self.suppress_command_complete = prior;
+        result
     }
 
     pub fn empty_query_response(&mut self) -> Result<(), WireFull> {

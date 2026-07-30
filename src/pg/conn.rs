@@ -581,10 +581,11 @@ impl Conn {
         self.role_scram = None;
         self.auth_role_password = None;
         self.auth_login = None;
-        if let Some(role) = engine.role_login(self.guc.session_user()) {
+        let session_user = self.guc.session_user();
+        if let Some(role) = engine.role_login(session_user.as_str()) {
             self.auth_login = Some(role);
             let bootstrap_fallback =
-                self.guc.session_user() == "postgres" && !auth.password.is_empty();
+                session_user.as_str() == "postgres" && !auth.password.is_empty();
             self.auth_reject = reject_role_login(auth.mode, role, bootstrap_fallback);
             if let Some(password) = role.password {
                 self.auth_role_password = Some(password);

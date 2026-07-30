@@ -603,6 +603,10 @@ fn privilege_query(
                 crate::storage::PrivilegeSet::USAGE
             } else if name.eq_ignore_ascii_case("create") {
                 crate::storage::PrivilegeSet::CREATE
+            } else if name.eq_ignore_ascii_case("execute") {
+                crate::storage::PrivilegeSet::EXECUTE
+            } else if name.eq_ignore_ascii_case("maintain") {
+                crate::storage::PrivilegeSet::MAINTAIN
             } else {
                 return Err(sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,

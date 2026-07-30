@@ -45,6 +45,7 @@ fn catalog_relation_oid(name: &str) -> Option<i32> {
         "pg_namespace" => PG_NAMESPACE_OID,
         "pg_opfamily" => 2753,
         "pg_extension" => 3079,
+        "pg_default_acl" => 826,
         "pg_transform" => 3576,
         _ => return None,
     })
@@ -797,21 +798,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_default_acl") => finish(
-            def_of(
-                "pg_default_acl",
-                &[
-                    ("oid", ColType::Int4),
-                    ("tableoid", ColType::Int4),
-                    ("defaclrole", ColType::Int4),
-                    ("defaclnamespace", ColType::Int4),
-                    ("defaclobjtype", ColType::Bpchar),
-                    ("defaclacl", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_default_acl") => pg_default_acl(storage, txid, arena),
         (false, "pg_extension") => finish(
             def_of(
                 "pg_extension",
@@ -1016,19 +1003,28 @@ fn acl<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     use core::fmt::Write;
+    let owner = storage.object_owner(object, txid);
+    let explicit_owner_acl = storage.acl_entries().any(|(slot, entry)| {
+        let (grantee, grantor) = storage.acl_identity(slot, txid);
+        entry.object == object
+            && grantee == owner as u16
+            && grantor == owner as u16
+            && entry.object.slot != u16::MAX
+    });
     let has_entries = storage.acl_entries().any(|(slot, entry)| {
+        let (grantee, _) = storage.acl_identity(slot, txid);
         entry.object == object
             && (storage.acl_state(slot, txid).0.0 != 0
+                || (explicit_owner_acl && grantee == owner as u16)
                 || (matches!(
                     object.class,
                     crate::storage::AccessClass::Domain | crate::storage::AccessClass::Enum
-                ) && entry.grantee == crate::storage::PUBLIC_ROLE))
+                ) && grantee == crate::storage::PUBLIC_ROLE))
     });
     if !has_entries {
         return Ok(Datum::Null);
     }
     let mut values = [Datum::Null; crate::storage::MAX_ACL_ENTRIES + 1];
-    let owner = storage.object_owner(object, txid);
     let owner_name = storage.role_name(owner, txid);
     let all = match object.class {
         crate::storage::AccessClass::Table
@@ -1048,15 +1044,17 @@ fn acl<'a>(
                   output: &mut StackStr<256>| {
         let _ = write!(output, "{grantee}=");
         let letters = [
-            (crate::storage::PrivilegeSet::SELECT, 'r'),
             (crate::storage::PrivilegeSet::INSERT, 'a'),
+            (crate::storage::PrivilegeSet::SELECT, 'r'),
             (crate::storage::PrivilegeSet::UPDATE, 'w'),
             (crate::storage::PrivilegeSet::DELETE, 'd'),
             (crate::storage::PrivilegeSet::TRUNCATE, 'D'),
             (crate::storage::PrivilegeSet::REFERENCES, 'x'),
             (crate::storage::PrivilegeSet::TRIGGER, 't'),
+            (crate::storage::PrivilegeSet::MAINTAIN, 'm'),
             (crate::storage::PrivilegeSet::USAGE, 'U'),
             (crate::storage::PrivilegeSet::CREATE, 'C'),
+            (crate::storage::PrivilegeSet::EXECUTE, 'X'),
         ];
         for (privilege, letter) in letters {
             if privileges.contains(privilege) {
@@ -1069,11 +1067,16 @@ fn acl<'a>(
         let _ = write!(output, "/{grantor}");
     };
     let mut owner_acl = StackStr::<256>::new();
+    let (owner_privileges, owner_options) = if explicit_owner_acl {
+        storage.acl_from(object, owner as u16, owner as u16, txid)
+    } else {
+        (all, crate::storage::PrivilegeSet::NONE)
+    };
     render(
         owner_name.as_str(),
         owner_name.as_str(),
-        all,
-        crate::storage::PrivilegeSet::NONE,
+        owner_privileges,
+        owner_options,
         &mut owner_acl,
     );
     values[0] = Datum::Text(
@@ -1083,17 +1086,31 @@ fn acl<'a>(
     );
     let mut count = 1usize;
     for (slot, entry) in storage.acl_entries() {
-        if entry.object != object {
+        let (grantee, grantor) = storage.acl_identity(slot, txid);
+        if entry.object != object || (grantee == owner as u16 && grantor == owner as u16) {
             continue;
         }
-        let (privileges, grant_options) = storage.acl_state(slot, txid);
+        if storage
+            .acl_entries()
+            .take(slot)
+            .any(|(earlier_slot, earlier)| {
+                earlier.object == object
+                    && storage.acl_identity(earlier_slot, txid)
+                        != (owner as u16, owner as u16)
+                    && storage.acl_identity(earlier_slot, txid) == (grantee, grantor)
+            })
+        {
+            continue;
+        }
+        let (privileges, grant_options) =
+            storage.acl_from(object, grantee, grantor, txid);
         if privileges.0 == 0 {
             continue;
         }
-        let grantee_name = (entry.grantee != crate::storage::PUBLIC_ROLE)
-            .then(|| storage.role_name(entry.grantee as usize, txid));
+        let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
+            .then(|| storage.role_name(grantee as usize, txid));
         let grantee = grantee_name.as_ref().map_or("", |name| name.as_str());
-        let grantor = storage.role_name(entry.grantor as usize, txid);
+        let grantor = storage.role_name(grantor as usize, txid);
         let mut rendered = StackStr::<256>::new();
         render(
             grantee,
@@ -1113,6 +1130,156 @@ fn acl<'a>(
         element: super::types::ArrElem::Text,
         raw: super::array::build(&values[..count], arena)?,
     })
+}
+
+fn pg_default_acl<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use core::fmt::Write;
+    use crate::storage::{
+        DefaultPrivilegeClass, PrivilegeSet, DEFAULT_ACL_ALL_SCHEMAS,
+        MAX_DEFAULT_ACL_ENTRIES, MAX_ROLES, PUBLIC_ROLE,
+    };
+
+    let def = def_of(
+        "pg_default_acl",
+        &[
+            ("oid", ColType::Int4),
+            ("tableoid", ColType::Int4),
+            ("defaclrole", ColType::Int4),
+            ("defaclnamespace", ColType::Int4),
+            ("defaclobjtype", ColType::Bpchar),
+            ("defaclacl", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let mut rows: [&[Datum]; MAX_DEFAULT_ACL_ENTRIES] = [&[]; MAX_DEFAULT_ACL_ENTRIES];
+    let mut row_count = 0usize;
+
+    for (entry_slot, entry) in storage.default_acl_entries() {
+        let (defined, _, _) = storage.default_acl_state(
+            entry.owner,
+            entry.schema,
+            entry.class,
+            entry.grantee,
+            txid,
+        );
+        if !defined
+            || storage.default_acl_entries().take(entry_slot).any(|(_, earlier)| {
+                let (earlier_defined, _, _) = storage.default_acl_state(
+                    earlier.owner,
+                    earlier.schema,
+                    earlier.class,
+                    earlier.grantee,
+                    txid,
+                );
+                earlier_defined
+                    && earlier.owner == entry.owner
+                    && earlier.schema == entry.schema
+                    && earlier.class == entry.class
+            })
+        {
+            continue;
+        }
+        let mut acl_values = [Datum::Null; MAX_ROLES + 1];
+        let mut acl_count = 0usize;
+        for role_index in 0..=MAX_ROLES {
+            let grantee = if role_index == MAX_ROLES {
+                PUBLIC_ROLE
+            } else {
+                if !storage.role(role_index).visible_to(txid) {
+                    continue;
+                }
+                role_index as u16
+            };
+            let (explicit, privileges, grant_options) = storage.default_acl_state(
+                entry.owner,
+                entry.schema,
+                entry.class,
+                grantee,
+                txid,
+            );
+            let (privileges, grant_options) = if explicit {
+                (privileges, grant_options)
+            } else if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
+                Storage::default_acl_baseline(entry.owner, entry.schema, entry.class, grantee)
+            } else {
+                (PrivilegeSet::NONE, PrivilegeSet::NONE)
+            };
+            let include = if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
+                grantee == entry.owner
+                    || explicit
+                    || (grantee == PUBLIC_ROLE
+                        && entry.class.default_public_privileges().0 != 0)
+            } else {
+                explicit
+            };
+            if !include {
+                continue;
+            }
+            let named_grantee = (grantee != PUBLIC_ROLE)
+                .then(|| storage.role_name(grantee as usize, txid));
+            let grantee_name = named_grantee.as_ref().map_or("", SqlName::as_str);
+            let owner_name = storage.role_name(entry.owner as usize, txid);
+            let mut rendered = StackStr::<256>::new();
+            let _ = write!(rendered, "{grantee_name}=");
+            for (privilege, letter) in [
+                (PrivilegeSet::SELECT, 'r'),
+                (PrivilegeSet::INSERT, 'a'),
+                (PrivilegeSet::UPDATE, 'w'),
+                (PrivilegeSet::DELETE, 'd'),
+                (PrivilegeSet::TRUNCATE, 'D'),
+                (PrivilegeSet::REFERENCES, 'x'),
+                (PrivilegeSet::TRIGGER, 't'),
+                (PrivilegeSet::MAINTAIN, 'm'),
+                (PrivilegeSet::USAGE, 'U'),
+                (PrivilegeSet::CREATE, 'C'),
+                (PrivilegeSet::EXECUTE, 'X'),
+            ] {
+                if privileges.contains(privilege) {
+                    let _ = write!(rendered, "{letter}");
+                    if grant_options.contains(privilege) {
+                        let _ = write!(rendered, "*");
+                    }
+                }
+            }
+            let _ = write!(rendered, "/{}", owner_name.as_str());
+            acl_values[acl_count] = text(rendered.as_str(), arena)?;
+            acl_count += 1;
+        }
+        let namespace = if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
+            0
+        } else {
+            namespace_oid(
+                storage,
+                storage.schema_def(entry.schema as usize).name.as_str(),
+            )
+        };
+        let object_type = match entry.class {
+            DefaultPrivilegeClass::Table => "r",
+            DefaultPrivilegeClass::Sequence => "S",
+            DefaultPrivilegeClass::Function => "f",
+            DefaultPrivilegeClass::Type => "T",
+            DefaultPrivilegeClass::Schema => "n",
+        };
+        rows[row_count] = row(
+            &[
+                Datum::Int4(90_000 + entry_slot as i32),
+                Datum::Int4(826),
+                Datum::Int4(Storage::role_oid(entry.owner as usize)),
+                Datum::Int4(namespace),
+                text(object_type, arena)?,
+                Datum::Array {
+                    element: super::types::ArrElem::Text,
+                    raw: super::array::build(&acl_values[..acl_count], arena)?,
+                },
+            ],
+            arena,
+        )?;
+        row_count += 1;
+    }
+    finish(def, &rows[..row_count], arena)
 }
 
 /// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user

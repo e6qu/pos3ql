@@ -44,3 +44,38 @@ DROP ROLE acl_reader;
 DROP ROLE acl_renamed_owner;
 DROP ROLE acl_managed;
 DROP ROLE acl_administrator;
+
+CREATE ROLE owned_source;
+CREATE ROLE owned_target;
+GRANT CREATE ON SCHEMA public TO owned_source;
+ALTER DEFAULT PRIVILEGES FOR ROLE owned_source
+  GRANT SELECT ON TABLES TO owned_target WITH GRANT OPTION;
+ALTER DEFAULT PRIVILEGES FOR ROLE owned_source IN SCHEMA public
+  GRANT INSERT ON TABLES TO owned_target;
+ALTER DEFAULT PRIVILEGES FOR ROLE owned_source
+  REVOKE USAGE ON TYPES FROM PUBLIC;
+
+SET SESSION AUTHORIZATION owned_source;
+SELECT session_user, current_user, current_role;
+RESET SESSION AUTHORIZATION;
+
+SET ROLE owned_source;
+CREATE TABLE owned_default_table (id integer);
+CREATE TYPE owned_default_type AS ENUM ('ready');
+INSERT INTO owned_default_table VALUES (1);
+RESET ROLE;
+
+SET ROLE owned_target;
+INSERT INTO owned_default_table VALUES (2);
+SELECT id FROM owned_default_table ORDER BY id;
+RESET ROLE;
+SELECT has_type_privilege('owned_target', 'owned_default_type', 'USAGE');
+
+REASSIGN OWNED BY owned_source TO owned_target;
+SELECT tableowner FROM pg_tables WHERE tablename = 'owned_default_table';
+SELECT relacl::text FROM pg_class WHERE relname = 'owned_default_table';
+SELECT typacl::text FROM pg_type WHERE typname = 'owned_default_type';
+DROP OWNED BY owned_source;
+DROP ROLE owned_source;
+DROP OWNED BY owned_target CASCADE;
+DROP ROLE owned_target;

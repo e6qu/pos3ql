@@ -60,7 +60,8 @@ pub struct Config {
     pub memtable_bytes: usize,
     /// Preallocated size of the WAL journal file (disk).
     pub wal_bytes: usize,
-    /// In-memory staging buffer for WAL records (bounds the largest record).
+    /// Bytes available to each transaction's private WAL stage. One stage is
+    /// reserved per maximum connection, plus the durable commit buffer.
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,

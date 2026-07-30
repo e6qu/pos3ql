@@ -239,7 +239,8 @@ fn create_owned_sequence(
         txid,
     )?;
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.append(
+    if let Err(error) = wal.stage(
+        txid,
         lsn,
         &WalOp::CreateSequence {
             schema: plan.schema.as_str(),
@@ -292,7 +293,7 @@ pub fn create_table(
     match storage.create_table_in(def, txn.txid) {
         Ok(slot) => {
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::CreateTable(def)) {
+            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(def)) {
                 // Nothing reached the journal; undo the in-memory apply.
                 storage.rollback_create(slot);
                 return sql_fail(e);
@@ -599,7 +600,8 @@ fn copy_like_indexes(
                 txn.txid,
             )?;
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(
+            if let Err(e) = wal.stage(
+                txn.txid,
                 lsn,
                 &WalOp::CreateIndex {
                     schema: def.schema.as_str(),
@@ -1230,7 +1232,8 @@ pub fn drop_table(
                     }
                     let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
                     let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.append(
+                    if let Err(error) = wal.stage(
+                        txn.txid,
                         lsn,
                         &WalOp::DropSequence {
                             schema: sequence_schema.as_str(),
@@ -1256,7 +1259,8 @@ pub fn drop_table(
                     }
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.append(
+                if let Err(e) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropTable {
                         schema: def.schema.as_str(),
@@ -1327,7 +1331,7 @@ pub fn create_schema(
     match created {
         Ok(slot) => {
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::CreateSchema(name)) {
+            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateSchema(name)) {
                 storage.rollback_schema_create(slot);
                 return sql_fail(e);
             }
@@ -2083,7 +2087,8 @@ pub fn drop_schema(
                 let fk_name = def.fkeys[*fk_index].name;
                 let (schema, tname) = (def.schema, def.name);
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.append(
+                if let Err(e) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropTableFk {
                         schema: schema.as_str(),
@@ -2119,7 +2124,8 @@ pub fn drop_schema(
                     (view.schema, view.name)
                 };
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.append(
+                if let Err(e) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropView {
                         schema: schema.as_str(),
@@ -2141,7 +2147,8 @@ pub fn drop_schema(
             SchemaObject::Matview { table, catalog } => {
                 let def = *storage.table_def(*table, txn.txid);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.append(
+                if let Err(error) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropTable {
                         schema: def.schema.as_str(),
@@ -2156,7 +2163,8 @@ pub fn drop_schema(
                 storage.drop_table_in(*table, txn.txid);
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.append(
+                if let Err(error) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropMatview {
                         schema: def.schema.as_str(),
@@ -2182,7 +2190,8 @@ pub fn drop_schema(
                 let sequence = storage.sequence(*sequence);
                 let (schema, name) = (sequence.schema, sequence.name);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.append(
+                if let Err(error) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropSequence {
                         schema: schema.as_str(),
@@ -2207,7 +2216,8 @@ pub fn drop_schema(
                 let domain = storage.domain(*domain);
                 let (schema, name) = (domain.schema, domain.name);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.append(
+                if let Err(error) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropDomain {
                         schema: schema.as_str(),
@@ -2232,7 +2242,8 @@ pub fn drop_schema(
                 let enumeration = storage.enum_def(*enumeration);
                 let (schema, name) = (enumeration.schema, enumeration.name);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.append(
+                if let Err(error) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropEnum {
                         schema: schema.as_str(),
@@ -2277,7 +2288,8 @@ pub fn drop_schema(
                     }
                     let (schema, name) = (sequence.schema, sequence.name);
                     let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.append(
+                    if let Err(error) = wal.stage(
+                        txn.txid,
                         lsn,
                         &WalOp::DropSequence {
                             schema: schema.as_str(),
@@ -2299,7 +2311,8 @@ pub fn drop_schema(
                     }
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.append(
+                if let Err(e) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::DropTable {
                         schema: def.schema.as_str(),
@@ -2319,7 +2332,7 @@ pub fn drop_schema(
     for &slot in &slots[..n_slots] {
         let name = storage.schema_def(slot).name;
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(lsn, &WalOp::DropSchema(name.as_str())) {
+        if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::DropSchema(name.as_str())) {
             return sql_fail(e);
         }
         if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SchemaDropped(slot as u32)) {
@@ -2402,7 +2415,8 @@ pub fn create_view(
     ) {
         Ok((new_slot, old_slot)) => {
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(
+            if let Err(e) = wal.stage(
+                txn.txid,
                 lsn,
                 &WalOp::CreateView {
                     schema: schema.as_str(),
@@ -2687,7 +2701,8 @@ pub fn comment(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(
+    if let Err(e) = wal.stage(
+        txn.txid,
         lsn,
         &WalOp::Comment {
             class: class.to_u8(),
@@ -2807,7 +2822,7 @@ pub fn create_table_as(
     let table_index = match storage.create_table_in(def, txn.txid) {
         Ok(slot) => {
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::CreateTable(def)) {
+            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(def)) {
                 storage.rollback_create(slot);
                 return sql_fail(e);
             }
@@ -2923,7 +2938,8 @@ pub fn create_table_as(
         ) {
             Ok(slot) => {
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.append(
+                if let Err(e) = wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::CreateMatview {
                         schema: def.schema.as_str(),
@@ -3150,7 +3166,8 @@ pub fn refresh_materialized_view(
     // Mark it populated (durably).
     storage.set_matview_populated(slot, true);
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(
+    if let Err(e) = wal.stage(
+        txn.txid,
         lsn,
         &WalOp::SetMatviewPopulated {
             schema: def.schema.as_str(),
@@ -3242,7 +3259,8 @@ pub fn drop_materialized_view(
         }
         // Drop the backing table.
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(
+        if let Err(e) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::DropTable {
                 schema: def.schema.as_str(),
@@ -3258,7 +3276,8 @@ pub fn drop_materialized_view(
         storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
         // Drop the matview catalog entry.
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(
+        if let Err(e) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::DropMatview {
                 schema: def.schema.as_str(),
@@ -3496,7 +3515,8 @@ pub fn create_sequence(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(
+    if let Err(e) = wal.stage(
+        txn.txid,
         lsn,
         &WalOp::CreateSequence {
             schema: schema.as_str(),
@@ -3598,7 +3618,8 @@ pub fn alter_sequence(
     };
     // The redefinition journals as a CreateSequence (absolute parameters).
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(
+    if let Err(e) = wal.stage(
+        txn.txid,
         lsn,
         &WalOp::CreateSequence {
             schema: schema.as_str(),
@@ -3622,7 +3643,8 @@ pub fn alter_sequence(
         let (last, is_called) = (s.last_value.get(), s.is_called.get());
         s.dirty.set(false);
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(
+        if let Err(e) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::SequenceAdvance {
                 schema: schema.as_str(),
@@ -3743,7 +3765,8 @@ pub fn drop_sequence(
             }
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(
+        if let Err(e) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::DropSequence {
                 schema: schema.as_str(),
@@ -3953,7 +3976,7 @@ pub fn create_domain(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
+    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
         storage.rollback_domain_create(slot);
         return sql_fail(e);
     }
@@ -4148,7 +4171,8 @@ fn drop_domain_selection(
             (domain.schema, domain.name)
         };
         let lsn = storage.bump_lsn();
-        wal.append(
+        wal.stage(
+            txn.txid,
             lsn,
             &WalOp::DropDomain {
                 schema: schema.as_str(),
@@ -4410,7 +4434,7 @@ pub fn alter_domain(
         return sql_fail(e);
     }
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
+    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
         // Restore the pre-ALTER definition on a journal failure.
         let restore = crate::storage::DomainSpec {
             base_domain: current.base_domain,
@@ -4607,7 +4631,7 @@ pub fn create_enum(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
+    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
         storage.rollback_enum_create(slot);
         return sql_fail(e);
     }
@@ -4737,7 +4761,8 @@ pub fn drop_enum(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(
+        if let Err(e) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::DropEnum {
                 schema: schema.as_str(),
@@ -5172,7 +5197,8 @@ fn drop_view_slot(
         (view.schema, view.name)
     };
     let lsn = storage.bump_lsn();
-    wal.append(
+    wal.stage(
+        txn.txid,
         lsn,
         &WalOp::DropView {
             schema: schema.as_str(),
@@ -5199,7 +5225,8 @@ fn drop_matview_slot(
         .find_visible(schema.as_str(), name.as_str(), txn.txid)
         .ok_or_else(|| undefined_kind("materialized view", name.as_str()))?;
     let lsn = storage.bump_lsn();
-    wal.append(
+    wal.stage(
+        txn.txid,
         lsn,
         &WalOp::DropTable {
             schema: schema.as_str(),
@@ -5210,7 +5237,8 @@ fn drop_matview_slot(
     storage.drop_table_in(table, txn.txid);
     storage.drop_indexes_for(schema.as_str(), name.as_str(), txn.txid);
     let lsn = storage.bump_lsn();
-    wal.append(
+    wal.stage(
+        txn.txid,
         lsn,
         &WalOp::DropMatview {
             schema: schema.as_str(),
@@ -5320,7 +5348,7 @@ pub fn alter_type(
             spec.n_members += 1;
             storage.alter_enum(slot, spec);
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
+            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
                 storage.alter_enum(
                     slot,
                     crate::storage::EnumSpec {
@@ -5363,7 +5391,8 @@ pub fn alter_type(
             };
             storage.rename_enum(slot, renamed);
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(
+            if let Err(e) = wal.stage(
+                txn.txid,
                 lsn,
                 &WalOp::RenameEnum {
                     schema: current.schema.as_str(),
@@ -5419,7 +5448,7 @@ pub fn alter_type(
                 return sql_fail(e);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
+            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
                 storage.restore_enum(slot, current);
                 return sql_fail(e);
             }
@@ -5706,7 +5735,8 @@ pub fn drop_view(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(
+            if let Err(e) = wal.stage(
+                txn.txid,
                 lsn,
                 &WalOp::DropView {
                     schema: schema.as_str(),
@@ -5855,7 +5885,8 @@ pub fn create_index(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(
+    if let Err(e) = wal.stage(
+        txn.txid,
         lsn,
         &WalOp::CreateIndex {
             schema: tdef.schema.as_str(),
@@ -5924,7 +5955,8 @@ pub fn drop_index(
         };
         if let Some(schema) = found {
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.append(
+            if let Err(e) = wal.stage(
+                txn.txid,
                 lsn,
                 &WalOp::DropIndex {
                     schema: schema.as_str(),
@@ -9422,7 +9454,8 @@ fn alter_table_inner(
             Err(e) => return sql_fail(e),
         };
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(
+        if let Err(e) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::SetTableSchema {
                 schema: def.schema.as_str(),
@@ -10168,7 +10201,8 @@ fn alter_table_inner(
     // content step is already done; only WAL append can fail here, and it does
     // so before any in-memory swap.
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(
+    if let Err(e) = wal.stage(
+        txn.txid,
         lsn,
         &WalOp::DropTable {
             schema: def.schema.as_str(),
@@ -10178,7 +10212,7 @@ fn alter_table_inner(
         return sql_fail(e);
     }
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.append(lsn, &WalOp::CreateTable(new_def)) {
+    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
         return sql_fail(e);
     }
     for i in 0..scratch.len() {
@@ -10187,7 +10221,8 @@ fn alter_table_inner(
             unreachable!("the rewrite pass re-homes every row to the heap");
         };
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.append(
+        if let Err(e) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::Upsert {
                 schema: new_def.schema.as_str(),
@@ -10216,7 +10251,8 @@ fn alter_table_inner(
         let sequence = storage.sequence(sequence_slot);
         let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.append(
+        if let Err(error) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::DropSequence {
                 schema: sequence_schema.as_str(),
@@ -10292,7 +10328,8 @@ fn alter_table_inner(
         };
         let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.append(
+        if let Err(error) = wal.stage(
+            txn.txid,
             lsn,
             &WalOp::CreateSequence {
                 schema: sequence_schema.as_str(),

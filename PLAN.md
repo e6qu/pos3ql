@@ -935,12 +935,26 @@ capstone. This section is the plan of record for all of it.
    a latest-overlay key generation does not encode every intermediate key.
 3. **Closed at the scheduling boundary: checkpoint work is sliced.** Automatic
    checkpoints and compaction advance through bounded event-loop beats instead
-   of monopolizing a connection. A transaction carrying rollback-capable
-   catalog WAL gates publication until commit, rollback, or rollback to a
-   savepoint removes its schema work; historical read-only snapshots remain
-   compatible with publication. Stage I's suspendable row source will extend
-   the same asynchronous scheduling model to cache misses and large object
-   reads.
+   of monopolizing a connection. **Status (2026-07-30): the transactional
+   publication gate is gone.** WAL now owns one startup-sized private stage per
+   maximum connection. DDL and final row images enter only their transaction's
+   stage; commit copies exactly that stage into the durable batch, rewrites its
+   provisional record LSNs into commit order above the current manifest/storage
+   floor, recomputes CRCs, fsyncs, and synchronously uploads through the common
+   object-store interface. Rollback discards one stage and savepoint rollback
+   truncates only its stage. A checkpoint can therefore publish committed state
+   while other transactions retain rollback-capable catalog work, without
+   either leaking that work or advancing past its eventual committed WAL.
+   Cold recovery after interleaved commit/rollback/savepoint/checkpoint
+   sequences is covered with both local cache tiers deleted. The regression
+   also exposed and fixed heap compaction skipping rows owned by a pending
+   `CREATE TABLE`; compaction now preserves those private row images.
+   Absolute serial/sequence positions are staged for transaction-visible
+   pending creates too, and their retry markers clear only after WAL
+   publication preflight succeeds.
+   Historical read-only snapshots remain compatible with publication. Stage
+   I's suspendable row source will extend the same asynchronous scheduling
+   model to cache misses and large object reads.
 
 ### The compatibility wave (a fresh audit of what real deployments touch)
 
@@ -1926,31 +1940,36 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
 
 ## Verification
 
-- `cargo test` — 497 unit/property tests plus the integration suites
+- `cargo test` — 502 unit/property tests plus the integration suites
   (memory guard incl. unwind safety and the TLS budget scope, differential
   FixedMap vs std, PCG32/CRC-32C/SHA-256/SHA-512/HMAC/SigV4 official vectors,
   row codec fuzz-by-truncation, WAL corruption/floor/stale-tail, engine
   restart persistence, protocol framing, block/SST/bloom/cache stores, an
   in-process rustls round trip, the sqlstate gate).
-- SQLLogicTest differential (local PostgreSQL 15 oracle, PostgreSQL 18 remains
-  the CI gate): 10,911 blocks, 10,335 exact matches, 576 explicitly unsupported,
-  zero divergences unsharded. The exact four-shard CI topology reports
-  144 unsupported and zero divergences on every shard, lowering the ratchet
-  from 183 to 144.
+- SQLLogicTest differential against PostgreSQL 18.4: 3,205 vendored blocks,
+  3,205 exact matches, zero unsupported, and zero divergences. The CI shards
+  keep a zero unsupported/divergence ratchet.
 - `POS3QL_MINIO_ENDPOINT=... cargo test --test minio_it` — S3 client CAS/range
   /list + engine checkpoint/cold-start integration against real MinIO.
+- `POS3QL_RUN_GROUPS=dur tests/external/run.sh` — 19 real-MinIO durability
+  assertions, including immediate kill after acknowledgment, local-disk wipe
+  and WAL-only rebuild, and manifest cold start. All green as of 2026-07-30.
 - `tests/external/run.sh` — the external conformance suite (16 scenario
   steps): psql 18.4 golden files, protocol 3.0/3.2, raw wire probes,
   psycopg 3, kill -9 recovery, object-WAL rebuild, cold start from bucket,
   spill beyond `memtable_bytes`, crash torture vs real PostgreSQL, the TLS
   durability cycle, and the forced-spill differential (the whole suite over a
   256 KiB memtable on MinIO). All green as of 2026-07-24.
-- `tests/external/differential.sh` — 84 corpora + exact-error corpora +
-  the full vendored sqllogictest replay against real PostgreSQL 18, plus the
-  generative fuzzer. SQLLogicTest files reclaim their objects between files,
+- `tests/external/differential.sh` — 79 curated corpora + 3 exact-error
+  corpora + binary COPY + the vendored sqllogictest replay against real
+  PostgreSQL 18, plus the generative fuzzer. SQLLogicTest files reclaim their
+  objects between files,
   unsupported classification is message-qualified rather than a broad
   SQLSTATE allowlist, and a one-way budget makes every newly supported block
-  permanent. CI runs the deterministic
+  permanent. Divergences include bounded error text, and the fuzzer groups
+  unsupported results by SQLSTATE plus concrete message with a reproducible
+  seed/statement/SQL example instead of hiding distinct gaps under one state.
+  CI runs the deterministic
   wire/tooling/corpus gates once, four query-balanced sqllogictest slices, and
   the full zero-budget fuzzer as separate jobs against a hermetic PostgreSQL
   service, keeping every phase within the fixed 15-minute ceiling.

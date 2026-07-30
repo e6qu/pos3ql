@@ -299,7 +299,8 @@ def record(divergences, path, b, pg_res, p3_res, max_print):
 
 def summarize(res):
     if res[0] == "err":
-        return f"ERROR {res[1]}"
+        message = res[2].replace("\n", " ") if len(res) > 2 else ""
+        return f"ERROR {res[1]} {message[:240]}".rstrip()
     rows = res[1]
     if rows is None:
         return "ok (no rows)"

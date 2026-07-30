@@ -3690,7 +3690,12 @@ impl Storage {
     ) -> Result<(), SqlError> {
         scratch.clear();
         for (index, table) in self.tables.iter().enumerate() {
-            if !table.live {
+            // A transaction may have inserted rows into its pending CREATE
+            // before a concurrent checkpoint. Those bytes are private, not
+            // garbage: preserve them even though the committed table image is
+            // not live yet. A genuinely dead slot has neither committed nor
+            // pending existence.
+            if !table.live && table.pending_ddl.is_none() {
                 continue;
             }
             for (&rowid, state) in table.rows.iter() {
@@ -6966,6 +6971,53 @@ mod tests {
         assert_eq!(s.heap.get(loc), b"0123456789");
         let err = s.heap.append(60).unwrap_err();
         assert_eq!(err.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    }
+
+    #[test]
+    fn heap_compaction_preserves_rows_of_a_pending_create() {
+        let config = test_config();
+        let mut budget = Budget::new(1 << 22);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let slot = storage
+            .create_table_in(make_def("pending", &[("id", ColType::Int4, true)]), 7)
+            .unwrap();
+        let _ = storage.heap.append(8).unwrap();
+        let (location, bytes) = storage.heap.append(7).unwrap();
+        bytes.copy_from_slice(b"pending");
+        let mut state = RowState {
+            committed: None,
+            committed_lsn: 0,
+            history: CommittedHistory::empty(),
+            pending: PendingVersions::empty(),
+        };
+        state
+            .pending
+            .push(PendingChange {
+                txid: 7,
+                cid: 1,
+                loc: Some(location),
+            })
+            .unwrap();
+        storage.table_mut(slot).rows.insert(1, state).unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "compact", 8).unwrap();
+
+        storage.compact_heap(&mut scratch).unwrap();
+
+        let compacted = storage
+            .table(slot)
+            .rows
+            .get(&1)
+            .unwrap()
+            .pending
+            .last()
+            .unwrap()
+            .loc
+            .unwrap();
+        assert_eq!(compacted.offset, 0);
+        assert_eq!(storage.heap.get(compacted), b"pending");
+        let (_, replacement) = storage.heap.append(7).unwrap();
+        replacement.copy_from_slice(b"replace");
+        assert_eq!(storage.heap.get(compacted), b"pending");
     }
 
     #[test]

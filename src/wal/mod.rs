@@ -29,7 +29,7 @@ use crate::storage::{
     StoredQueryDependencies, TableDef, UniqueKey, MAX_COLUMNS, MAX_INDEX_COLS,
 };
 
-use crc32c::{crc32c, Crc32c};
+use crc32c::crc32c;
 
 const HEADER_LEN: usize = 24;
 
@@ -305,7 +305,13 @@ pub enum WalOp<'a> {
 
 pub struct Wal {
     file: File,
+    /// Bytes ready to become durable. Transactional work reaches this buffer
+    /// only through [`Self::commit_stage`], so one connection can never flush
+    /// another connection's uncommitted records.
     buffer: FixedBuf,
+    /// One fixed staging buffer per possible active connection. A stage is
+    /// claimed lazily by transaction id and released at commit or rollback.
+    stages: Vec<TransactionStage>,
     /// File offset where the next buffered byte lands.
     write_offset: u64,
     capacity: u64,
@@ -315,6 +321,11 @@ pub struct Wal {
     batch_first_lsn: u64,
     /// Bytes appended since the last upload capture.
     batch_start_offset: u64,
+}
+
+struct TransactionStage {
+    transaction_id: u32,
+    buffer: FixedBuf,
 }
 
 #[derive(Debug)]
@@ -349,6 +360,30 @@ impl From<BudgetError> for WalSetupError {
     }
 }
 
+fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
+    let payload_len = encoded_payload_len(operation);
+    let total = HEADER_LEN + payload_len;
+    if buffer.capacity() - buffer.len() < total {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "transaction exceeds wal_buffer_bytes ({}); raise it or commit in smaller batches",
+            buffer.capacity()
+        ));
+    }
+    let mark = buffer.mark();
+    let mut appended = buffer.append(&[0u8; 4]);
+    appended &= buffer.append(&(payload_len as u32).to_le_bytes());
+    appended &= buffer.append(&lsn.to_le_bytes());
+    appended &= buffer.append(&[op_kind(operation), 0, 0, 0, 0, 0, 0, 0]);
+    appended &= append_payload(buffer, operation);
+    assert!(appended, "record size was checked against buffer capacity");
+
+    let filled = buffer.filled_mut();
+    let crc = crc32c(&filled[mark + 4..mark + total]);
+    filled[mark..mark + 4].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
 impl Wal {
     /// Opens (creating and preallocating if needed) `<data_dir>/journal.wal`.
     pub fn open(config: &Config, budget: &mut Budget) -> Result<Self, WalSetupError> {
@@ -377,9 +412,17 @@ impl Wal {
             file.set_len(capacity)
                 .map_err(|e| WalSetupError::Io("preallocate journal", e))?;
         }
+        let mut stages = Vec::with_capacity(config.max_connections as usize);
+        for _ in 0..config.max_connections {
+            stages.push(TransactionStage {
+                transaction_id: 0,
+                buffer: FixedBuf::new(budget, "transaction_wal_stage", config.wal_buffer_bytes)?,
+            });
+        }
         Ok(Self {
             file,
             buffer: FixedBuf::new(budget, "wal_buffer", config.wal_buffer_bytes)?,
+            stages,
             write_offset: 0,
             capacity,
             last_lsn: 0,
@@ -474,62 +517,183 @@ impl Wal {
         Ok(())
     }
 
-    /// Byte position for [`Self::truncate_to_mark`]: everything appended
-    /// after the mark can be dropped, which is how an aborted transaction
-    /// guarantees none of its records ever reach the journal file.
-    pub fn mark(&self) -> usize {
-        self.buffer.mark()
+    fn stage_index(&self, transaction_id: u32) -> Option<usize> {
+        assert_ne!(transaction_id, 0, "zero is reserved for an unclaimed WAL stage");
+        self.stages
+            .iter()
+            .position(|stage| stage.transaction_id == transaction_id)
     }
 
-    pub fn truncate_to_mark(&mut self, mark: usize) {
-        self.buffer.truncate_to(mark);
-        self.dirty = !self.buffer.is_empty();
+    fn stage_index_or_claim(&mut self, transaction_id: u32) -> Result<usize, SqlError> {
+        if let Some(index) = self.stage_index(transaction_id) {
+            return Ok(index);
+        }
+        let Some(index) = self.stages.iter().position(|stage| stage.transaction_id == 0) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "concurrent WAL staging exceeds max_connections ({})",
+                self.stages.len()
+            ));
+        };
+        self.stages[index].transaction_id = transaction_id;
+        self.stages[index].buffer.clear();
+        Ok(index)
     }
 
-    /// Appends one record to the in-memory batch. Never writes to the file:
-    /// a batch either fits `wal_buffer_bytes` entirely or the transaction
-    /// fails — so the journal only ever contains whole transactions.
-    pub fn append(&mut self, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
-        let payload_len = encoded_payload_len(operation);
-        let total = HEADER_LEN + payload_len;
-        if self.buffer.capacity() - self.buffer.len() < total {
+    /// Byte position inside one transaction's private stage. Savepoints use
+    /// this to discard only their own tail.
+    pub fn stage_mark(&self, transaction_id: u32) -> usize {
+        self.stage_index(transaction_id)
+            .map_or(0, |index| self.stages[index].buffer.mark())
+    }
+
+    pub fn truncate_stage(&mut self, transaction_id: u32, mark: usize) {
+        let Some(index) = self.stage_index(transaction_id) else {
+            debug_assert_eq!(mark, 0);
+            return;
+        };
+        self.stages[index].buffer.truncate_to(mark);
+        if self.stages[index].buffer.is_empty() {
+            self.stages[index].transaction_id = 0;
+        }
+    }
+
+    pub fn discard_stage(&mut self, transaction_id: u32) {
+        if let Some(index) = self.stage_index(transaction_id) {
+            self.stages[index].buffer.clear();
+            self.stages[index].transaction_id = 0;
+        }
+    }
+
+    /// Encodes one record into a transaction-private buffer. The LSN is
+    /// provisional: commit rewrites staged records into commit order before
+    /// their CRCs are finalized in the durable batch.
+    pub fn stage(
+        &mut self,
+        transaction_id: u32,
+        provisional_lsn: u64,
+        operation: &WalOp,
+    ) -> Result<(), SqlError> {
+        let index = self.stage_index_or_claim(transaction_id)?;
+        append_record(&mut self.stages[index].buffer, provisional_lsn, operation)
+    }
+
+    /// Publishes exactly one transaction's staged records into the durable
+    /// batch, assigning monotonically increasing commit-order LSNs. Returns
+    /// the last assigned LSN, or `lsn_floor` for a transaction with no WAL.
+    pub fn commit_stage(
+        &mut self,
+        transaction_id: u32,
+        lsn_floor: u64,
+    ) -> Result<u64, SqlError> {
+        let Some(index) = self.stage_index(transaction_id) else {
+            return Ok(lsn_floor);
+        };
+        let staged_len = self.stages[index].buffer.len();
+        let staged = self.stages[index].buffer.readable();
+        let mut record_count = 0_u64;
+        let mut staged_offset = 0;
+        while staged_offset < staged_len {
+            assert!(
+                staged_len - staged_offset >= HEADER_LEN,
+                "staged WAL contains a complete record header"
+            );
+            let payload_len = u32::from_le_bytes(
+                staged[staged_offset + 4..staged_offset + 8]
+                    .try_into()
+                    .expect("record header is complete"),
+            ) as usize;
+            let total = HEADER_LEN + payload_len;
+            assert!(
+                staged_offset + total <= staged_len,
+                "staged WAL contains a complete encoded record"
+            );
+            staged_offset += total;
+            record_count += 1;
+        }
+        let final_lsn = lsn_floor.checked_add(record_count).ok_or_else(|| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
+        })?;
+        if self.buffer.capacity() - self.buffer.len() < staged_len {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction exceeds wal_buffer_bytes ({}); raise it or commit in smaller batches",
                 self.buffer.capacity()
             ));
         }
-        if self.write_offset + self.buffer.len() as u64 + total as u64 > self.capacity {
+        if self
+            .write_offset
+            .checked_add(self.buffer.len() as u64)
+            .and_then(|used| used.checked_add(staged_len as u64))
+            .is_none_or(|used| used > self.capacity)
+        {
             return Err(sql_err!(
                 JOURNAL_FULL,
                 "WAL journal is full; run CHECKPOINT (or raise wal_bytes)"
             ));
         }
-        debug_assert!(lsn > self.last_lsn, "LSNs must be strictly increasing");
+        assert!(
+            self.buffer.is_empty(),
+            "a prior committed WAL batch must be flushed before another commit"
+        );
+        assert!(lsn_floor >= self.last_lsn, "commit LSN floor must not regress");
+
+        let durable_mark = self.buffer.mark();
+        let appended = self.buffer.append(self.stages[index].buffer.readable());
+        assert!(appended, "stage size was checked against durable buffer capacity");
+
+        let mut next_lsn = lsn_floor;
+        let mut offset = durable_mark;
+        while offset < durable_mark + staged_len {
+            let payload_len = u32::from_le_bytes(
+                self.buffer.filled_mut()[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("record header is complete"),
+            ) as usize;
+            let total = HEADER_LEN + payload_len;
+            assert!(
+                offset + total <= durable_mark + staged_len,
+                "staged WAL contains a complete encoded record"
+            );
+            next_lsn += 1;
+            let filled = self.buffer.filled_mut();
+            filled[offset + 8..offset + 16].copy_from_slice(&next_lsn.to_le_bytes());
+            let crc = crc32c(&filled[offset + 4..offset + total]);
+            filled[offset..offset + 4].copy_from_slice(&crc.to_le_bytes());
+            offset += total;
+        }
+        assert_eq!(next_lsn, final_lsn);
+        if staged_len > 0 && self.batch_first_lsn == 0 {
+            self.batch_first_lsn = lsn_floor + 1;
+            self.batch_start_offset = self.write_offset + durable_mark as u64;
+        }
+        self.last_lsn = next_lsn;
+        self.dirty = staged_len > 0;
+        self.stages[index].buffer.clear();
+        self.stages[index].transaction_id = 0;
+        Ok(next_lsn)
+    }
+
+    /// Appends one already-committed record. This exists for recovery-format
+    /// tests; transactional SQL must use [`Self::stage`] and
+    /// [`Self::commit_stage`].
+    #[cfg(test)]
+    pub fn append_committed(&mut self, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
+        if self.write_offset + self.buffer.len() as u64
+            + (HEADER_LEN + encoded_payload_len(operation)) as u64
+            > self.capacity
+        {
+            return Err(sql_err!(
+                JOURNAL_FULL,
+                "WAL journal is full; run CHECKPOINT (or raise wal_bytes)"
+            ));
+        }
+        assert!(lsn > self.last_lsn, "LSNs must be strictly increasing");
         if self.batch_first_lsn == 0 {
             self.batch_first_lsn = lsn;
-            // The file offset where this batch's first byte will land once the
-            // buffer flushes — not the in-memory buffer mark. `read_range`
-            // during upload reads from the file, so a buffer-relative offset
-            // would re-read (and re-upload) the journal from its start.
             self.batch_start_offset = self.write_offset + self.buffer.len() as u64;
         }
-
-        let mark = self.buffer.mark();
-        let mut ok = self.buffer.append(&[0u8; 4]); // crc, patched below
-        ok &= self.buffer.append(&(payload_len as u32).to_le_bytes());
-        ok &= self.buffer.append(&lsn.to_le_bytes());
-        ok &= self.buffer.append(&[op_kind(operation), 0, 0, 0, 0, 0, 0, 0]);
-        ok &= append_payload(&mut self.buffer, operation);
-        assert!(ok, "record size was checked against buffer capacity");
-
-        let filled = self.buffer.filled_mut();
-        let crc = {
-            let mut c = Crc32c::new();
-            c.update(&filled[mark + 4..mark + total]);
-            c.finish()
-        };
-        filled[mark..mark + 4].copy_from_slice(&crc.to_le_bytes());
+        append_record(&mut self.buffer, lsn, operation)?;
         self.last_lsn = lsn;
         self.dirty = true;
         Ok(())
@@ -2119,8 +2283,9 @@ mod tests {
         };
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
-            wal.append(1, &WalOp::CreateTable(sample_def())).unwrap();
-            wal.append(
+            wal.append_committed(1, &WalOp::CreateTable(sample_def()))
+                .unwrap();
+            wal.append_committed(
                 2,
                 &WalOp::Upsert {
                     schema: "public",
@@ -2130,9 +2295,24 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append(3, &WalOp::Delete { schema: "public", table: "t", rowid: 1 }).unwrap();
-            wal.append(4, &WalOp::DropTable { schema: "public", name: "t" }).unwrap();
-            wal.append(
+            wal.append_committed(
+                3,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "t",
+                    rowid: 1,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                4,
+                &WalOp::DropTable {
+                    schema: "public",
+                    name: "t",
+                },
+            )
+            .unwrap();
+            wal.append_committed(
                 5,
                 &WalOp::CreateSequence {
                     schema: "public",
@@ -2149,7 +2329,7 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append(
+            wal.append_committed(
                 6,
                 &WalOp::SequenceAdvance {
                     schema: "public",
@@ -2159,8 +2339,15 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append(7, &WalOp::DropSequence { schema: "public", name: "s" }).unwrap();
-            wal.append(
+            wal.append_committed(
+                7,
+                &WalOp::DropSequence {
+                    schema: "public",
+                    name: "s",
+                },
+            )
+            .unwrap();
+            wal.append_committed(
                 8,
                 &WalOp::Comment {
                     class: 0,
@@ -2171,7 +2358,7 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append(
+            wal.append_committed(
                 9,
                 &WalOp::Comment { class: 1, schema: "", name: "s", subid: 0, text: None },
             )
@@ -2207,7 +2394,14 @@ mod tests {
         );
         assert_eq!(wal.last_lsn(), 9);
         // Appending continues after the replayed tail.
-        wal.append(10, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
+        wal.append_committed(
+            10,
+            &WalOp::DropTable {
+                schema: "public",
+                name: "u",
+            },
+        )
+        .unwrap();
         wal.commit();
     }
 
@@ -2273,6 +2467,90 @@ mod tests {
     }
 
     #[test]
+    fn transaction_stages_publish_independently_in_commit_order() {
+        let dir = temp_dir("transaction-stages");
+        let config = test_config(&dir);
+        let mut budget = Budget::new(1 << 20);
+        {
+            let mut wal = Wal::open(&config, &mut budget).unwrap();
+            wal.stage(
+                11,
+                1,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "late",
+                    rowid: 1,
+                },
+            )
+            .unwrap();
+            let savepoint = wal.stage_mark(11);
+            wal.stage(
+                11,
+                2,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "savepoint_discarded",
+                    rowid: 2,
+                },
+            )
+            .unwrap();
+            wal.truncate_stage(11, savepoint);
+            wal.stage(
+                22,
+                3,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "middle",
+                    rowid: 20,
+                },
+            )
+            .unwrap();
+            wal.stage(
+                33,
+                4,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "rolled_back",
+                    rowid: 30,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(wal.commit_stage(22, 50).unwrap(), 51);
+            wal.commit();
+            wal.discard_stage(33);
+            assert_eq!(wal.commit_stage(11, 51).unwrap(), 52);
+            wal.commit();
+        }
+
+        let mut replay_budget = Budget::new(1 << 20);
+        let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
+        let seen = collect_replay(&mut wal);
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].starts_with("51:") && seen[0].contains("middle"));
+        assert!(seen[1].starts_with("52:") && seen[1].contains("late"));
+        assert!(!seen.iter().any(|record| {
+            record.contains("savepoint_discarded") || record.contains("rolled_back")
+        }));
+    }
+
+    #[test]
+    fn transaction_stage_pool_is_bounded_and_reusable() {
+        let dir = temp_dir("transaction-stage-pool");
+        let mut config = test_config(&dir);
+        config.max_connections = 2;
+        let mut budget = Budget::new(1 << 20);
+        let mut wal = Wal::open(&config, &mut budget).unwrap();
+        let operation = WalOp::Delete { schema: "public", table: "t", rowid: 1 };
+        wal.stage(1, 1, &operation).unwrap();
+        wal.stage(2, 2, &operation).unwrap();
+        let error = wal.stage(3, 3, &operation).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        wal.discard_stage(1);
+        wal.stage(3, 3, &operation).unwrap();
+    }
+
+    #[test]
     fn corrupt_record_truncates_tail() {
         let dir = temp_dir("corrupt");
         let config = test_config(&dir);
@@ -2280,8 +2558,15 @@ mod tests {
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
             for lsn in 1..=3 {
-                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn })
-                    .unwrap();
+                wal.append_committed(
+                    lsn,
+                    &WalOp::Delete {
+                        schema: "public",
+                        table: "t",
+                        rowid: lsn,
+                    },
+                )
+                .unwrap();
             }
             wal.commit();
         }
@@ -2306,7 +2591,15 @@ mod tests {
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
             for lsn in 1..=5 {
-                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn }).unwrap();
+                wal.append_committed(
+                    lsn,
+                    &WalOp::Delete {
+                        schema: "public",
+                        table: "t",
+                        rowid: lsn,
+                    },
+                )
+                .unwrap();
             }
             wal.commit();
         }
@@ -2326,13 +2619,37 @@ mod tests {
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
             for lsn in 1..=10 {
-                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn }).unwrap();
+                wal.append_committed(
+                    lsn,
+                    &WalOp::Delete {
+                        schema: "public",
+                        table: "t",
+                        rowid: lsn,
+                    },
+                )
+                .unwrap();
             }
             wal.commit();
             // Checkpoint at lsn 10; journal restarts with two tail records.
             wal.reset_after_checkpoint();
-            wal.append(11, &WalOp::Delete { schema: "public", table: "t", rowid: 11 }).unwrap();
-            wal.append(12, &WalOp::Delete { schema: "public", table: "t", rowid: 12 }).unwrap();
+            wal.append_committed(
+                11,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "t",
+                    rowid: 11,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                12,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "t",
+                    rowid: 12,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
@@ -2355,7 +2672,7 @@ mod tests {
         let mut lsn = 0;
         let err = loop {
             lsn += 1;
-            match wal.append(
+            match wal.append_committed(
                 lsn,
                 &WalOp::Upsert {
                     schema: "public",
@@ -2381,22 +2698,31 @@ mod tests {
         let mut wal = Wal::open(&config, &mut budget).unwrap();
         let big = [0u8; 256];
         let err = wal
-            .append(1, &WalOp::Upsert { schema: "public", table: "t", rowid: 1, row: &big })
+            .append_committed(
+                1,
+                &WalOp::Upsert {
+                    schema: "public",
+                    table: "t",
+                    rowid: 1,
+                    row: &big,
+                },
+            )
             .unwrap_err();
         assert_eq!(err.sqlstate, "54000");
     }
 
     #[test]
-    fn append_does_not_allocate() {
+    fn transaction_staging_does_not_allocate() {
         let dir = temp_dir("noalloc");
         let config = test_config(&dir);
         let mut budget = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for lsn in 1..=16 {
-                wal.append(lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn })
+                wal.stage(1, lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn })
                     .unwrap();
             }
+            assert_eq!(wal.commit_stage(1, 16).unwrap(), 32);
         });
         wal.commit();
     }

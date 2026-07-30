@@ -2876,6 +2876,77 @@ fn sequence_survives_restart() {
 }
 
 #[test]
+fn sequence_advance_in_creating_transaction_survives_restart() {
+    let config = test_config("sequence_create_advance_restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let result = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             CREATE SEQUENCE s START 10 INCREMENT 5; \
+             SELECT nextval('s'); \
+             CREATE TABLE generated (id serial PRIMARY KEY); \
+             INSERT INTO generated DEFAULT VALUES; \
+             COMMIT",
+        );
+        assert!(!String::from_utf8_lossy(&result).contains("ERROR"));
+    }
+
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('s')"
+        )),
+        ["15"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO generated DEFAULT VALUES",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM generated ORDER BY id"
+        )),
+        ["1", "2"]
+    );
+}
+
+#[test]
+fn journal_full_keeps_sequence_advance_dirty_for_retry() {
+    let mut config = test_config("sequence_journal_retry");
+    config.wal_bytes = 100;
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let slot = engine
+        .storage
+        .sequence_slot("public", "s", 0)
+        .unwrap();
+    assert!(!engine.storage.sequence(slot).dirty.get());
+
+    let failed = run_with(&mut engine, &mut budget, "SELECT nextval('s')");
+    assert!(String::from_utf8_lossy(&failed).contains("53100"));
+    assert_eq!(engine.storage.sequence(slot).last_value.get(), 1);
+    assert!(engine.storage.sequence(slot).dirty.get());
+
+    // Model the journal space a successful checkpoint makes available. A
+    // later read-only commit must retry the absolute sequence position.
+    engine.wal.reset_after_checkpoint();
+    let retried = run_with(&mut engine, &mut budget, "SELECT 1");
+    assert!(!String::from_utf8_lossy(&retried).contains("ERROR"));
+    assert!(!engine.storage.sequence(slot).dirty.get());
+}
+
+#[test]
 fn expression_defaults() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE SEQUENCE dseq");
@@ -7914,80 +7985,172 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
 }
 
 #[test]
-fn checkpoint_waits_for_transactional_schema_wal_before_publishing() {
+fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
-    let mut config = test_config(&format!("object-ddl-gate-{sequence}"));
+    let mut config = test_config(&format!("object-transaction-wal-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-object-ddl-gate-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-object-transaction-wal-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
+    config.max_tables = 16;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(
+    let mut connection_a = TxnState::new(&mut budget, 256).unwrap();
+    let mut connection_b = TxnState::new(&mut budget, 256).unwrap();
+    let mut guc_a = GucState::new();
+    let mut guc_b = GucState::new();
+    run_session_transaction(
         &mut engine,
         &mut budget,
-        &mut transaction,
-        "CREATE TABLE indexed_rows (id int, value text)",
-    );
-    run_txn(
-        &mut engine,
-        &mut budget,
-        &mut transaction,
-        "INSERT INTO indexed_rows VALUES (1, 'one'), (2, 'two')",
+        &mut connection_b,
+        &mut guc_b,
+        "CREATE TABLE checkpoint_base (id int PRIMARY KEY); \
+         INSERT INTO checkpoint_base VALUES (1)",
     );
     assert!(engine.checkpoint().unwrap());
 
-    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
-    run_txn(
+    run_session_transaction(
         &mut engine,
         &mut budget,
-        &mut transaction,
-        "CREATE UNIQUE INDEX indexed_rows_id ON indexed_rows(id DESC NULLS LAST)",
+        &mut connection_a,
+        &mut guc_a,
+        "BEGIN; \
+         CREATE TABLE rolled_back_catalog (id int); \
+         CREATE UNIQUE INDEX rolled_back_index ON checkpoint_base(id)",
     );
-    let blocked = engine.checkpoint().unwrap_err();
-    assert_eq!(
-        blocked.sqlstate,
-        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
-    );
-    assert!(
-        blocked
-            .message
-            .as_str()
-            .contains("uncommitted schema changes")
-    );
-    assert!(engine.maybe_checkpoint());
-    run_txn(&mut engine, &mut budget, &mut transaction, "COMMIT");
+    // A checkpoint may publish committed state while a transaction privately
+    // stages catalog WAL. It must neither publish nor discard that stage.
     assert!(engine.checkpoint().unwrap());
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut connection_b,
+        &mut guc_b,
+        "CREATE TABLE committed_while_a_open (id int PRIMARY KEY); \
+         INSERT INTO committed_while_a_open VALUES (2)",
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut connection_a,
+        &mut guc_a,
+        "ROLLBACK",
+    );
+
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut connection_a,
+        &mut guc_a,
+        "BEGIN; \
+         CREATE TABLE late_commit (id int PRIMARY KEY); \
+         INSERT INTO late_commit VALUES (3); \
+         CREATE INDEX late_commit_id ON late_commit(id DESC NULLS LAST); \
+         SAVEPOINT before_discard; \
+         CREATE TABLE savepoint_discarded (id int); \
+         ROLLBACK TO SAVEPOINT before_discard; \
+         CREATE TABLE after_savepoint (id int PRIMARY KEY); \
+         INSERT INTO after_savepoint VALUES (4); \
+         CREATE SEQUENCE late_sequence START 10 INCREMENT 5; \
+         SELECT nextval('late_sequence')",
+    );
+    // This checkpoint advances the object-store manifest through connection
+    // B's commit while connection A's later commit remains private.
+    assert!(engine.checkpoint().unwrap());
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut connection_b,
+        &mut guc_b,
+        "CREATE TABLE middle_commit (id int PRIMARY KEY); \
+         INSERT INTO middle_commit VALUES (5)",
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut connection_a,
+        &mut guc_a,
+        "COMMIT",
+    );
     drop(engine);
 
+    // Lose both local durability and every cache. The manifest plus uploaded
+    // WAL segments in the provider-neutral object store are the authority.
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget = Budget::new(1 << 28);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    for name in [
+        "checkpoint_base",
+        "committed_while_a_open",
+        "late_commit",
+        "after_savepoint",
+        "middle_commit",
+    ] {
+        assert!(
+            restarted.storage.find_table("public", name).is_some(),
+            "committed table {name} must survive cold object-store recovery"
+        );
+    }
+    for name in ["rolled_back_catalog", "savepoint_discarded"] {
+        assert!(
+            restarted.storage.find_table("public", name).is_none(),
+            "rolled-back table {name} must never reach durable recovery"
+        );
+    }
     assert_eq!(
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT indexdef FROM pg_indexes WHERE indexname = 'indexed_rows_id'"
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'late_commit_id'"
         )),
-        ["CREATE UNIQUE INDEX indexed_rows_id ON public.indexed_rows USING btree (id DESC NULLS LAST)"]
+        ["CREATE INDEX late_commit_id ON public.late_commit USING btree (id DESC NULLS LAST)"]
     );
-    let duplicate = run_with(
-        &mut restarted,
-        &mut restarted_budget,
-        "INSERT INTO indexed_rows VALUES (1, 'duplicate')",
+    assert!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'rolled_back_index'"
+        )).is_empty(),
+        "a rolled-back index must never reach durable recovery"
     );
-    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    assert_eq!(
+        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM checkpoint_base")),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM committed_while_a_open")),
+        ["2"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM late_commit")),
+        ["3"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM after_savepoint")),
+        ["4"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM middle_commit")),
+        ["5"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT nextval('late_sequence')"
+        )),
+        ["15"]
+    );
     drop(restarted);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

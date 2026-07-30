@@ -127,7 +127,7 @@ pub struct TxnState {
     clippy::large_enum_variant,
     reason = "CommentSet carries its payload inline (no heap after startup); the undo list is a small fixed pool"
 )]
-pub enum DdlUndo {
+pub(crate) enum DdlUndo {
     /// CREATE TABLE at this slot — undo by dropping it.
     Created(u32),
     /// DROP TABLE at this slot (rows retained until commit) — undo by
@@ -206,6 +206,24 @@ pub enum DdlUndo {
     SchemaCreated(u32),
     /// DROP SCHEMA at this slot — undo by reviving it.
     SchemaDropped(u32),
+    /// CREATE/ALTER/DROP ROLE changed one transaction-private role overlay.
+    /// Restoring the prior overlay makes repeated changes and savepoints exact.
+    RoleChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingRole>,
+    },
+    RoleMembershipChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingRoleMembership>,
+    },
+    ObjectOwnerChanged {
+        object: crate::storage::AccessObject,
+        prior: Option<crate::storage::PendingOwnership>,
+    },
+    ObjectAclChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingAcl>,
+    },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
     /// promoted and journaled.
@@ -545,7 +563,7 @@ impl TxnState {
         }
     }
 
-    pub fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
+    pub(crate) fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
         self.ddl.push(undo).map_err(|_| {
             sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -555,7 +573,7 @@ impl TxnState {
         })
     }
 
-    pub fn ddl(&self) -> &[DdlUndo] {
+    pub(crate) fn ddl(&self) -> &[DdlUndo] {
         &self.ddl
     }
 

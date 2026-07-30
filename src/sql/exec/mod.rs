@@ -137,8 +137,7 @@ pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeri
 
 mod projected;
 pub(crate) use projected::{
-    compare_projected_prefix, encode_projected_by, encode_projected_by_into,
-    encode_projected_into,
+    compare_projected_prefix, encode_projected_by, encode_projected_by_into, encode_projected_into,
     projected_row_len_by, projected_row_width,
 };
 pub use projected::{
@@ -594,6 +593,7 @@ fn copy_like_indexes(
                     schema: def.schema,
                     name,
                     table: def.name,
+                    ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
                     descending: index.descending,
                     nulls_first: index.nulls_first,
@@ -652,6 +652,30 @@ fn next_auto_value<'x>(
         column.name.as_str(),
         txid,
     ) {
+        let role = storage.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Sequence,
+            slot: slot as u16,
+        };
+        if !storage.has_object_privilege(object, role, crate::storage::PrivilegeSet::USAGE, txid)
+            && !storage.has_object_privilege(
+                object,
+                role,
+                crate::storage::PrivilegeSet::UPDATE,
+                txid,
+            )
+        {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for sequence {}",
+                storage.sequence(slot).name.as_str()
+            ));
+        }
         let sequence = storage.sequence(slot);
         let next = sequence.next_value()?;
         seq_session.record_nextval(slot, sequence.created_at, next);
@@ -1146,6 +1170,16 @@ pub fn drop_table(
                 ));
             }
             Some(crate::storage::ResolvedRelation::Table(index)) => {
+                if let Err(error) = storage.require_owner(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Table,
+                        slot: index as u16,
+                    },
+                    txn.txid,
+                    "table",
+                ) {
+                    return sql_fail(error);
+                }
                 if let Err(error) = storage.lock_table(
                     txn.txid,
                     index,
@@ -1313,9 +1347,34 @@ pub fn create_schema(
     wal: &mut Wal,
     txn: &mut TxnState,
     name: &str,
+    authorization: Option<&str>,
     if_not_exists: bool,
     responder: &mut Responder,
 ) -> Outcome {
+    let authorized_owner = if let Some(written) = authorization {
+        let role = resolve_role_name(written);
+        let Some(owner) = storage.find_role_visible(role.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                role.as_str()
+            ));
+        };
+        let current = storage.current_role_slot(txn.txid).unwrap_or(0);
+        if !storage.role(current).attributes_to(txn.txid).superuser
+            && current != owner
+            && !storage.role_can_set(current, owner, txn.txid)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "must be able to SET ROLE \"{}\"",
+                role.as_str()
+            ));
+        }
+        Some(owner)
+    } else {
+        None
+    };
     if name.starts_with("pg_") {
         let mut detail = crate::util::StackStr::<512>::new();
         let _ = core::fmt::Write::write_str(
@@ -1345,6 +1404,16 @@ pub fn create_schema(
     };
     match created {
         Ok(slot) => {
+            if let Some(owner) = authorized_owner {
+                storage.set_object_owner(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Schema,
+                        slot: slot as u16,
+                    },
+                    owner,
+                    txn.txid,
+                );
+            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateSchema(name)) {
                 storage.rollback_schema_create(slot);
@@ -1368,8 +1437,8 @@ pub fn create_schema(
 }
 
 pub fn alter_owner(
-    storage: &Storage,
-    txn: &TxnState,
+    storage: &mut Storage,
+    txn: &mut TxnState,
     kind: crate::sql::ast::AlterOwnerKind,
     name: &QualName,
     role: &str,
@@ -1377,6 +1446,7 @@ pub fn alter_owner(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::AlterOwnerKind;
+    use crate::storage::{AccessClass, AccessObject};
     let (noun, tag) = match kind {
         AlterOwnerKind::Schema => ("schema", "ALTER SCHEMA"),
         AlterOwnerKind::Type => ("type", "ALTER TYPE"),
@@ -1387,24 +1457,55 @@ pub fn alter_owner(
         AlterOwnerKind::Sequence => ("sequence", "ALTER SEQUENCE"),
     };
     let relation = || storage.resolve_relation(name.schema, name.name, txn.txid);
-    let found = match kind {
-        AlterOwnerKind::Schema => storage.find_schema_visible(name.name, txn.txid).is_some(),
-        AlterOwnerKind::Type => match name.schema {
-            Some(schema) => storage.enum_slot(schema, name.name, txn.txid).is_some(),
-            None => storage.resolve_enum_slot(name.name, txn.txid).is_some(),
-        },
-        AlterOwnerKind::Domain => match name.schema {
-            Some(schema) => storage.domain_slot(schema, name.name, txn.txid).is_some(),
-            None => storage.resolve_domain_slot(name.name, txn.txid).is_some(),
-        },
+    let object = match kind {
+        AlterOwnerKind::Schema => storage
+            .find_schema_visible(name.name, txn.txid)
+            .map(|slot| AccessObject {
+                class: AccessClass::Schema,
+                slot: slot as u16,
+            }),
+        AlterOwnerKind::Type => (match name.schema {
+            Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
+            None => storage.resolve_enum_slot(name.name, txn.txid),
+        })
+        .map(|slot| AccessObject {
+            class: AccessClass::Enum,
+            slot: slot as u16,
+        }),
+        AlterOwnerKind::Domain => (match name.schema {
+            Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
+            None => storage.resolve_domain_slot(name.name, txn.txid),
+        })
+        .map(|slot| AccessObject {
+            class: AccessClass::Domain,
+            slot: slot as u16,
+        }),
         AlterOwnerKind::Table => match relation() {
-            // PostgreSQL 15 pg_dump spells view, materialized-view and
-            // sequence owner changes as ALTER TABLE; newer clients use their
-            // specific kinds.
-            Some(
-                crate::storage::ResolvedRelation::Table(_)
-                | crate::storage::ResolvedRelation::View(_),
-            ) => true,
+            Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                let definition = storage.table_def(slot, txn.txid);
+                storage
+                    .matview_slot(
+                        definition.schema.as_str(),
+                        definition.name.as_str(),
+                        txn.txid,
+                    )
+                    .map_or(
+                        Some(AccessObject {
+                            class: AccessClass::Table,
+                            slot: slot as u16,
+                        }),
+                        |matview| {
+                            Some(AccessObject {
+                                class: AccessClass::MaterializedView,
+                                slot: matview as u16,
+                            })
+                        },
+                    )
+            }
+            Some(crate::storage::ResolvedRelation::View(slot)) => Some(AccessObject {
+                class: AccessClass::View,
+                slot: slot as u16,
+            }),
             Some(_) => {
                 return sql_fail(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
@@ -1413,13 +1514,19 @@ pub fn alter_owner(
                 ));
             }
             None => match resolve_sequence(storage, name, txn.txid) {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
+                Ok(Some(slot)) => Some(AccessObject {
+                    class: AccessClass::Sequence,
+                    slot: slot as u16,
+                }),
+                Ok(None) => None,
                 Err(error) => return sql_fail(error),
             },
         },
         AlterOwnerKind::View => match relation() {
-            Some(crate::storage::ResolvedRelation::View(_)) => true,
+            Some(crate::storage::ResolvedRelation::View(slot)) => Some(AccessObject {
+                class: AccessClass::View,
+                slot: slot as u16,
+            }),
             Some(_) => {
                 return sql_fail(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
@@ -1427,23 +1534,24 @@ pub fn alter_owner(
                     name.name
                 ));
             }
-            None => false,
+            None => None,
         },
         AlterOwnerKind::MaterializedView => match relation() {
             Some(crate::storage::ResolvedRelation::Table(table)) => {
                 let def = *storage.table_def(table, txn.txid);
-                if storage
-                    .matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
-                    .is_some()
-                {
-                    true
-                } else {
+                let Some(slot) =
+                    storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
+                else {
                     return sql_fail(sql_err!(
                         sqlstate::WRONG_OBJECT_TYPE,
                         "\"{}\" is not a materialized view",
                         name.name
                     ));
-                }
+                };
+                Some(AccessObject {
+                    class: AccessClass::MaterializedView,
+                    slot: slot as u16,
+                })
             }
             Some(_) => {
                 return sql_fail(sql_err!(
@@ -1452,15 +1560,18 @@ pub fn alter_owner(
                     name.name
                 ));
             }
-            None => false,
+            None => None,
         },
         AlterOwnerKind::Sequence => match resolve_sequence(storage, name, txn.txid) {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(Some(slot)) => Some(AccessObject {
+                class: AccessClass::Sequence,
+                slot: slot as u16,
+            }),
+            Ok(None) => None,
             Err(error) => return sql_fail(error),
         },
     };
-    if !found {
+    let Some(object) = object else {
         if if_exists {
             responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
@@ -1485,20 +1596,1336 @@ pub fn alter_owner(
             AlterOwnerKind::Sequence => undefined_kind("sequence", name.name),
             _ => undefined_qual(name),
         });
-    }
-    if !matches!(
-        role,
-        "postgres" | "current_role" | "current_user" | "session_user"
-    ) {
+    };
+    let role = resolve_role_name(role);
+    let Some(new_owner) = storage.find_role_visible(role.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "role \"{}\" does not exist",
-            role
+            role.as_str()
+        ));
+    };
+    let current = super::eval::funcs::system::current_user_owned();
+    let Some(current_role) = storage.find_role_visible(current.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            current.as_str()
+        ));
+    };
+    let superuser = storage.role(current_role).attributes_to(txn.txid).superuser;
+    if !superuser && storage.object_owner(object, txn.txid) != current_role {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of {} {}",
+            noun,
+            name.name
         ));
     }
-    // The catalog has exactly one role and every object is already owned by
-    // it. Reassigning to that same resolved role is the complete state change.
+    if !superuser
+        && current_role != new_owner
+        && !storage.role_can_set(current_role, new_owner, txn.txid)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be able to SET ROLE \"{}\"",
+            role.as_str()
+        ));
+    }
+    if !superuser && object.class != AccessClass::Schema {
+        let (schema, _) = storage.access_object_name(object);
+        if let Err(error) = storage.require_schema_create_as(schema.as_str(), new_owner, txn.txid) {
+            return sql_fail(error);
+        }
+    }
+    let prior = storage.set_object_owner(object, new_owner, txn.txid);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior }) {
+        storage.restore_object_owner(object, prior);
+        return sql_fail(error);
+    }
     responder.command_complete(tag)?;
+    sql_ok()
+}
+
+fn resolve_role_name(written: &str) -> crate::util::StackStr<64> {
+    match written {
+        "current_role" | "current_user" => super::eval::funcs::system::current_user_owned(),
+        "session_user" => super::eval::funcs::system::session_user_owned(),
+        _ => crate::util::StackStr::from_str(written),
+    }
+}
+
+fn require_create_role(storage: &Storage, txid: u32) -> Result<(), SqlError> {
+    let current = super::eval::funcs::system::current_user_owned();
+    let allowed = storage
+        .find_role_visible(current.as_str(), txid)
+        .is_some_and(|slot| {
+            let attributes = storage.role(slot).attributes_to(txid);
+            attributes.superuser || attributes.create_role
+        });
+    if allowed {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to create role"
+        ))
+    }
+}
+
+fn require_role_attribute_authority(
+    storage: &Storage,
+    txid: u32,
+    options: &crate::sql::ast::RoleOptions<'_>,
+) -> Result<(), SqlError> {
+    let current = super::eval::funcs::system::current_user_owned();
+    let slot = storage
+        .find_role_visible(current.as_str(), txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                current.as_str()
+            )
+        })?;
+    let attributes = storage.role(slot).attributes_to(txid);
+    if !attributes.superuser
+        && (options.superuser == Some(true)
+            || options.replication == Some(true)
+            || options.bypass_row_level_security == Some(true))
+    {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to alter superuser, replication, or bypassrls attributes"
+        ));
+    }
+    if !attributes.superuser && options.create_database == Some(true) && !attributes.create_database
+    {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to grant CREATEDB"
+        ));
+    }
+    Ok(())
+}
+
+fn apply_role_options(
+    mut attributes: crate::storage::RoleAttributes,
+    options: &crate::sql::ast::RoleOptions<'_>,
+) -> Result<crate::storage::RoleAttributes, SqlError> {
+    if let Some(value) = options.superuser {
+        attributes.superuser = value;
+    }
+    if let Some(value) = options.inherit {
+        attributes.inherit = value;
+    }
+    if let Some(value) = options.create_role {
+        attributes.create_role = value;
+    }
+    if let Some(value) = options.create_database {
+        attributes.create_database = value;
+    }
+    if let Some(value) = options.can_login {
+        attributes.can_login = value;
+    }
+    if let Some(value) = options.replication {
+        attributes.replication = value;
+    }
+    if let Some(value) = options.bypass_row_level_security {
+        attributes.bypass_row_level_security = value;
+    }
+    if let Some(value) = options.connection_limit {
+        if value < -1 {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid connection limit: {}",
+                value
+            ));
+        }
+        attributes.connection_limit = value;
+    }
+    if let Some(password) = options.password {
+        attributes.password = crate::storage::RolePassword::EMPTY;
+        attributes.has_password = password.is_some();
+        if let Some(password) = password {
+            if password.len() > crate::storage::ROLE_PASSWORD_MAX {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "role password exceeds {} bytes",
+                    crate::storage::ROLE_PASSWORD_MAX
+                ));
+            }
+            let mut salt = [0u8; 16];
+            if unsafe { libc::getentropy(salt.as_mut_ptr().cast(), salt.len()) } != 0 {
+                return Err(sql_err!(
+                    sqlstate::IO_ERROR,
+                    "could not generate role password salt"
+                ));
+            }
+            let verifier = crate::pg::auth::ScramServer::derive(
+                password,
+                salt,
+                crate::pg::auth::SCRAM_ITERATIONS,
+            );
+            attributes.password = crate::storage::RolePassword {
+                salt: verifier.salt,
+                stored_key: verifier.stored_key,
+                server_key: verifier.server_key,
+                iterations: verifier.iterations,
+            };
+        }
+    }
+    if let Some(valid_until) = options.valid_until {
+        attributes.valid_until = crate::util::StackStr::new();
+        attributes.has_valid_until = valid_until.is_some();
+        if let Some(valid_until) = valid_until {
+            if !valid_until.eq_ignore_ascii_case("infinity") {
+                crate::sql::datetime::parse_timestamp(valid_until, true)?;
+            }
+            attributes.valid_until = crate::util::StackStr::from_str(valid_until);
+            if attributes.valid_until.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "VALID UNTIL value exceeds {} bytes",
+                    crate::storage::ROLE_VALID_UNTIL_MAX
+                ));
+            }
+        }
+    }
+    Ok(attributes)
+}
+
+pub fn create_role(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    options: &crate::sql::ast::RoleOptions<'_>,
+    memberships: &crate::sql::ast::RoleMembershipClauses<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_create_role(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
+        return sql_fail(error);
+    }
+    let name = match SqlName::parse(name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let attributes = match apply_role_options(crate::storage::RoleAttributes::ORDINARY, options) {
+        Ok(attributes) => attributes,
+        Err(error) => return sql_fail(error),
+    };
+    let (slot, prior) = match storage.create_role(name, attributes, txn.txid) {
+        Ok(result) => result,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::UpsertRole {
+            name: name.as_str(),
+            attributes,
+        },
+    ) {
+        storage.rollback_role_change(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_role_change(slot, prior);
+        return sql_fail(error);
+    }
+    let membership_count = memberships
+        .in_roles
+        .len()
+        .saturating_add(memberships.role_members.len())
+        .saturating_add(memberships.admin_members.len());
+    if membership_count >= super::txn::MAX_TXN_DDL {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many role memberships in one statement"
+        ));
+    }
+    let grantor = storage.current_role_slot(txn.txid).unwrap_or(0);
+    for written in memberships.in_roles {
+        let resolved = resolve_role_name(written);
+        let Some(parent) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                resolved.as_str()
+            ));
+        };
+        if !storage.role(grantor).attributes_to(txn.txid).superuser
+            && !storage.role_can_admin(grantor, parent, txn.txid)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "admin option for role \"{}\" is required",
+                resolved.as_str()
+            ));
+        }
+        if let Err(error) = stage_role_membership(
+            storage,
+            wal,
+            txn,
+            parent,
+            slot,
+            grantor,
+            crate::storage::RoleMembershipOptions::DEFAULT,
+        ) {
+            return sql_fail(error);
+        }
+    }
+    for (members, admin) in [
+        (memberships.role_members, false),
+        (memberships.admin_members, true),
+    ] {
+        for written in members {
+            let resolved = resolve_role_name(written);
+            let Some(member) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    resolved.as_str()
+                ));
+            };
+            if let Err(error) = stage_role_membership(
+                storage,
+                wal,
+                txn,
+                slot,
+                member,
+                grantor,
+                crate::storage::RoleMembershipOptions {
+                    admin,
+                    ..crate::storage::RoleMembershipOptions::DEFAULT
+                },
+            ) {
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("CREATE ROLE")?;
+    sql_ok()
+}
+
+fn stage_role_membership(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    role: usize,
+    member: usize,
+    grantor: usize,
+    options: crate::storage::RoleMembershipOptions,
+) -> Result<(), SqlError> {
+    if role == member || storage.role_is_member_of(role, member, txn.txid) {
+        return Err(sql_err!(
+            sqlstate::INVALID_GRANT_OPERATION,
+            "role \"{}\" is a member of role \"{}\"",
+            storage.role_name(role, txn.txid).as_str(),
+            storage.role_name(member, txn.txid).as_str()
+        ));
+    }
+    let (membership, prior) =
+        storage.change_role_membership(role, member, grantor, options, true, txn.txid)?;
+    let role_name = storage.role_name(role, txn.txid);
+    let member_name = storage.role_name(member, txn.txid);
+    let grantor_name = storage.role_name(grantor, txn.txid);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::UpsertRoleMembership {
+            role: role_name.as_str(),
+            member: member_name.as_str(),
+            grantor: grantor_name.as_str(),
+            options,
+        },
+    ) {
+        storage.rollback_role_membership_change(membership, prior);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
+        slot: membership as u32,
+        prior,
+    }) {
+        storage.rollback_role_membership_change(membership, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn alter_role(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    options: &crate::sql::ast::RoleOptions<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let resolved = resolve_role_name(name);
+    let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            resolved.as_str()
+        ));
+    };
+    let current = super::eval::funcs::system::current_user_owned();
+    let current_slot = storage
+        .find_role_visible(current.as_str(), txn.txid)
+        .expect("CREATE ROLE privilege check resolved current role");
+    let current_attributes = storage.role(current_slot).attributes_to(txn.txid);
+    let target_attributes = storage.role(slot).attributes_to(txn.txid);
+    if !current_attributes.superuser {
+        if current_slot != slot
+            && (!current_attributes.create_role
+                || target_attributes.superuser
+                || !storage.role_can_admin(current_slot, slot, txn.txid))
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to alter role \"{}\"",
+                resolved.as_str()
+            ));
+        }
+        if current_slot == slot
+            && (options.superuser.is_some()
+                || options.inherit.is_some()
+                || options.create_role.is_some()
+                || options.create_database.is_some()
+                || options.can_login.is_some()
+                || options.replication.is_some()
+                || options.bypass_row_level_security.is_some()
+                || options.connection_limit.is_some())
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to alter role attributes"
+            ));
+        }
+    }
+    if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
+        return sql_fail(error);
+    }
+    let attributes = match apply_role_options(storage.role(slot).attributes_to(txn.txid), options) {
+        Ok(attributes) => attributes,
+        Err(error) => return sql_fail(error),
+    };
+    let prior = match storage.alter_role(slot, attributes, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::UpsertRole {
+            name: storage.role_name(slot, txn.txid).as_str(),
+            attributes,
+        },
+    ) {
+        storage.rollback_role_change(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_role_change(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER ROLE")?;
+    sql_ok()
+}
+
+pub fn rename_role(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    new_name: &str,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_create_role(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let resolved = resolve_role_name(name);
+    let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            resolved.as_str()
+        ));
+    };
+    if resolved.as_str() == super::eval::funcs::system::current_user_owned().as_str() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "current user cannot be renamed"
+        ));
+    }
+    let new_name = match SqlName::parse(new_name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let old_name = storage.role(slot).name_to(txn.txid);
+    let attributes = storage.role(slot).attributes_to(txn.txid);
+    let prior = match storage.rename_role(slot, new_name, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let first_lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        first_lsn,
+        &WalOp::DropRole {
+            name: old_name.as_str(),
+        },
+    ) {
+        storage.rollback_role_change(slot, prior);
+        return sql_fail(error);
+    }
+    let second_lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        second_lsn,
+        &WalOp::UpsertRole {
+            name: new_name.as_str(),
+            attributes,
+        },
+    ) {
+        storage.rollback_role_change(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_role_change(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER ROLE")?;
+    sql_ok()
+}
+
+pub fn drop_role(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_create_role(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let current = super::eval::funcs::system::session_user_owned();
+    for written in names {
+        let resolved = resolve_role_name(written);
+        let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::UNDEFINED_OBJECT,
+                    stack_format!(
+                        128,
+                        "role \"{}\" does not exist, skipping",
+                        resolved.as_str()
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                resolved.as_str()
+            ));
+        };
+        if resolved.as_str() == current.as_str() {
+            return sql_fail(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "current user cannot be dropped"
+            ));
+        }
+        if storage.role_has_membership_dependents(slot, txn.txid)
+            || storage.role_has_object_dependents(slot, txn.txid)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "role \"{}\" cannot be dropped because some objects depend on it",
+                resolved.as_str()
+            ));
+        }
+        let name = storage.role_name(slot, txn.txid);
+        let prior = match storage.drop_role_in(slot, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropRole {
+                name: name.as_str(),
+            },
+        ) {
+            storage.rollback_role_change(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_role_change(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP ROLE")?;
+    sql_ok()
+}
+
+pub fn set_role(
+    storage: &Storage,
+    txn: &TxnState,
+    guc: &crate::sql::guc::GucState,
+    role: Option<&str>,
+    local: bool,
+    reset: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(written) = role else {
+        guc.reset_role(local);
+        responder.command_complete(if reset { "RESET" } else { "SET" })?;
+        return sql_ok();
+    };
+    let resolved = resolve_role_name(written);
+    let Some(target) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            resolved.as_str()
+        ));
+    };
+    let current = super::eval::funcs::system::current_user_owned();
+    let current_superuser = storage
+        .find_role_visible(current.as_str(), txn.txid)
+        .is_some_and(|slot| storage.role(slot).attributes_to(txn.txid).superuser);
+    let current_slot = storage.find_role_visible(current.as_str(), txn.txid);
+    if !current_superuser
+        && !current_slot.is_some_and(|member| storage.role_can_set(member, target, txn.txid))
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to set role \"{}\"",
+            resolved.as_str()
+        ));
+    }
+    guc.set_role(storage.role_name(target, txn.txid).as_str(), local);
+    responder.command_complete("SET")?;
+    sql_ok()
+}
+
+pub fn grant_role(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    roles: &[&str],
+    members: &[&str],
+    options: crate::sql::ast::RoleGrantOptions,
+    responder: &mut Responder,
+) -> Outcome {
+    if roles.len().saturating_mul(members.len()) > super::txn::MAX_TXN_DDL {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many role memberships in one statement (limit {})",
+            super::txn::MAX_TXN_DDL
+        ));
+    }
+    let current = super::eval::funcs::system::current_user_owned();
+    let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            current.as_str()
+        ));
+    };
+    let grantor_superuser = storage.role(grantor).attributes_to(txn.txid).superuser;
+    let mut role_slots = [0usize; crate::storage::MAX_ROLES];
+    let mut member_slots = [0usize; crate::storage::MAX_ROLES];
+    for (index, written) in roles.iter().enumerate() {
+        let resolved = resolve_role_name(written);
+        let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                resolved.as_str()
+            ));
+        };
+        if !grantor_superuser && !storage.role_can_admin(grantor, slot, txn.txid) {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "admin option for role \"{}\" is required",
+                resolved.as_str()
+            ));
+        }
+        role_slots[index] = slot;
+    }
+    for (index, written) in members.iter().enumerate() {
+        let resolved = resolve_role_name(written);
+        let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                resolved.as_str()
+            ));
+        };
+        member_slots[index] = slot;
+    }
+    for &role in &role_slots[..roles.len()] {
+        for &member in &member_slots[..members.len()] {
+            if role == member || storage.role_is_member_of(role, member, txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_GRANT_OPERATION,
+                    "role \"{}\" is a member of role \"{}\"",
+                    storage.role_name(role, txn.txid).as_str(),
+                    storage.role_name(member, txn.txid).as_str()
+                ));
+            }
+            let membership_options = crate::storage::RoleMembershipOptions {
+                admin: options.admin,
+                inherit: options.inherit,
+                set: options.set,
+            };
+            let (slot, prior) = match storage.change_role_membership(
+                role,
+                member,
+                grantor,
+                membership_options,
+                true,
+                txn.txid,
+            ) {
+                Ok(changed) => changed,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            let role_name = storage.role_name(role, txn.txid);
+            let member_name = storage.role_name(member, txn.txid);
+            let grantor_name = storage.role_name(grantor, txn.txid);
+            let operation = WalOp::UpsertRoleMembership {
+                role: role_name.as_str(),
+                member: member_name.as_str(),
+                grantor: grantor_name.as_str(),
+                options: membership_options,
+            };
+            if let Err(error) = wal.stage(txn.txid, lsn, &operation) {
+                storage.rollback_role_membership_change(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_role_membership_change(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("GRANT ROLE")?;
+    sql_ok()
+}
+
+pub fn revoke_role(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    roles: &[&str],
+    members: &[&str],
+    admin_option_only: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    if roles.len().saturating_mul(members.len()) > super::txn::MAX_TXN_DDL {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many role memberships in one statement (limit {})",
+            super::txn::MAX_TXN_DDL
+        ));
+    }
+    let current = super::eval::funcs::system::current_user_owned();
+    let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            current.as_str()
+        ));
+    };
+    let grantor_superuser = storage.role(grantor).attributes_to(txn.txid).superuser;
+    for role_name in roles {
+        let role_name = resolve_role_name(role_name);
+        let Some(role) = storage.find_role_visible(role_name.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                role_name.as_str()
+            ));
+        };
+        if !grantor_superuser && !storage.role_can_admin(grantor, role, txn.txid) {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "admin option for role \"{}\" is required",
+                role_name.as_str()
+            ));
+        }
+        for member_name in members {
+            let member_name = resolve_role_name(member_name);
+            let Some(member) = storage.find_role_visible(member_name.as_str(), txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    member_name.as_str()
+                ));
+            };
+            let Some(existing) = storage.find_role_membership_visible(role, member, txn.txid)
+            else {
+                responder.notice(
+                    sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
+                    stack_format!(
+                        160,
+                        "role \"{}\" is not a member of role \"{}\"",
+                        member_name.as_str(),
+                        role_name.as_str()
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            };
+            let old_options = storage.role_membership(existing).options_to(txn.txid);
+            let (exists, options) = if admin_option_only {
+                (
+                    true,
+                    crate::storage::RoleMembershipOptions {
+                        admin: false,
+                        ..old_options
+                    },
+                )
+            } else {
+                (false, old_options)
+            };
+            let (slot, prior) = match storage
+                .change_role_membership(role, member, grantor, options, exists, txn.txid)
+            {
+                Ok(changed) => changed,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            let role_name = storage.role_name(role, txn.txid);
+            let member_name = storage.role_name(member, txn.txid);
+            let grantor_name = storage.role_name(grantor, txn.txid);
+            let operation = if exists {
+                WalOp::UpsertRoleMembership {
+                    role: role_name.as_str(),
+                    member: member_name.as_str(),
+                    grantor: grantor_name.as_str(),
+                    options,
+                }
+            } else {
+                WalOp::DropRoleMembership {
+                    role: role_name.as_str(),
+                    member: member_name.as_str(),
+                }
+            };
+            if let Err(error) = wal.stage(txn.txid, lsn, &operation) {
+                storage.rollback_role_membership_change(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_role_membership_change(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("REVOKE ROLE")?;
+    sql_ok()
+}
+
+fn privilege_mask(
+    privileges: &[crate::sql::ast::Privilege],
+    class: crate::storage::AccessClass,
+) -> Result<crate::storage::PrivilegeSet, SqlError> {
+    use crate::sql::ast::Privilege;
+    use crate::storage::{AccessClass, PrivilegeSet};
+    let allowed = match class {
+        AccessClass::Table | AccessClass::View | AccessClass::MaterializedView => {
+            PrivilegeSet::TABLE_ALL
+        }
+        AccessClass::Sequence => PrivilegeSet::SEQUENCE_ALL,
+        AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
+        AccessClass::Domain | AccessClass::Enum => PrivilegeSet::TYPE_ALL,
+        AccessClass::Index => PrivilegeSet::NONE,
+    };
+    let mut result = PrivilegeSet::NONE;
+    for privilege in privileges {
+        let bit = match privilege {
+            Privilege::All => allowed,
+            Privilege::Select => PrivilegeSet::SELECT,
+            Privilege::Insert => PrivilegeSet::INSERT,
+            Privilege::Update => PrivilegeSet::UPDATE,
+            Privilege::Delete => PrivilegeSet::DELETE,
+            Privilege::Truncate => PrivilegeSet::TRUNCATE,
+            Privilege::References => PrivilegeSet::REFERENCES,
+            Privilege::Trigger => PrivilegeSet::TRIGGER,
+            Privilege::Usage => PrivilegeSet::USAGE,
+            Privilege::Create => PrivilegeSet::CREATE,
+        };
+        if !allowed.contains(bit) {
+            return Err(sql_err!(
+                sqlstate::INVALID_GRANT_OPERATION,
+                "invalid privilege type for this object"
+            ));
+        }
+        result = result.union(bit);
+    }
+    Ok(result)
+}
+
+fn add_privilege_object(
+    objects: &mut [crate::storage::AccessObject; crate::storage::MAX_ACL_ENTRIES],
+    count: &mut usize,
+    object: crate::storage::AccessObject,
+) -> Result<(), SqlError> {
+    if objects[..*count].contains(&object) {
+        return Ok(());
+    }
+    if *count == objects.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many objects in one privilege statement (limit {})",
+            objects.len()
+        ));
+    }
+    objects[*count] = object;
+    *count += 1;
+    Ok(())
+}
+
+fn resolve_privilege_objects(
+    storage: &Storage,
+    target: crate::sql::ast::PrivilegeTarget<'_>,
+    txid: u32,
+    objects: &mut [crate::storage::AccessObject; crate::storage::MAX_ACL_ENTRIES],
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::PrivilegeObjectKind;
+    use crate::storage::{AccessClass, AccessObject};
+    let mut count = 0usize;
+    for name in target.names {
+        match target.kind {
+            PrivilegeObjectKind::Table => {
+                let object = match storage.resolve_relation(name.schema, name.name, txid) {
+                    Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                        let definition = storage.table_def(slot, txid);
+                        match storage.matview_slot(
+                            definition.schema.as_str(),
+                            definition.name.as_str(),
+                            txid,
+                        ) {
+                            Some(matview) => AccessObject {
+                                class: AccessClass::MaterializedView,
+                                slot: matview as u16,
+                            },
+                            None => AccessObject {
+                                class: AccessClass::Table,
+                                slot: slot as u16,
+                            },
+                        }
+                    }
+                    Some(crate::storage::ResolvedRelation::View(slot)) => AccessObject {
+                        class: AccessClass::View,
+                        slot: slot as u16,
+                    },
+                    _ => return Err(undefined_qual(name)),
+                };
+                add_privilege_object(objects, &mut count, object)?;
+            }
+            PrivilegeObjectKind::Sequence => {
+                let Some(slot) = resolve_sequence(storage, name, txid)? else {
+                    return Err(undefined_kind("sequence", name.name));
+                };
+                add_privilege_object(
+                    objects,
+                    &mut count,
+                    AccessObject {
+                        class: AccessClass::Sequence,
+                        slot: slot as u16,
+                    },
+                )?;
+            }
+            PrivilegeObjectKind::Schema => {
+                let Some(slot) = storage.find_schema_visible(name.name, txid) else {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_SCHEMA_NAME,
+                        "schema \"{}\" does not exist",
+                        name.name
+                    ));
+                };
+                add_privilege_object(
+                    objects,
+                    &mut count,
+                    AccessObject {
+                        class: AccessClass::Schema,
+                        slot: slot as u16,
+                    },
+                )?;
+            }
+            PrivilegeObjectKind::Type => {
+                let domain = match name.schema {
+                    Some(schema) => storage.domain_slot(schema, name.name, txid),
+                    None => storage.resolve_domain_slot(name.name, txid),
+                };
+                let enumeration = match name.schema {
+                    Some(schema) => storage.enum_slot(schema, name.name, txid),
+                    None => storage.resolve_enum_slot(name.name, txid),
+                };
+                let object = domain
+                    .map(|slot| AccessObject {
+                        class: AccessClass::Domain,
+                        slot: slot as u16,
+                    })
+                    .or_else(|| {
+                        enumeration.map(|slot| AccessObject {
+                            class: AccessClass::Enum,
+                            slot: slot as u16,
+                        })
+                    })
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "type \"{}\" does not exist",
+                            name.name
+                        )
+                    })?;
+                add_privilege_object(objects, &mut count, object)?;
+            }
+            PrivilegeObjectKind::AllTablesInSchema => {
+                let schema = name.name;
+                if storage.find_schema_visible(schema, txid).is_none() {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_SCHEMA_NAME,
+                        "schema \"{}\" does not exist",
+                        schema
+                    ));
+                }
+                for slot in 0..storage.table_count() {
+                    if !storage.table(slot).visible_to(txid) {
+                        continue;
+                    }
+                    let definition = storage.table_def(slot, txid);
+                    if definition.schema.as_str() != schema {
+                        continue;
+                    }
+                    let object = storage
+                        .matview_slot(schema, definition.name.as_str(), txid)
+                        .map_or(
+                            AccessObject {
+                                class: AccessClass::Table,
+                                slot: slot as u16,
+                            },
+                            |matview| AccessObject {
+                                class: AccessClass::MaterializedView,
+                                slot: matview as u16,
+                            },
+                        );
+                    add_privilege_object(objects, &mut count, object)?;
+                }
+                for (slot, view) in storage.views_with_slots() {
+                    if view.visible_to(txid) && view.schema.as_str() == schema {
+                        add_privilege_object(
+                            objects,
+                            &mut count,
+                            AccessObject {
+                                class: AccessClass::View,
+                                slot: slot as u16,
+                            },
+                        )?;
+                    }
+                }
+            }
+            PrivilegeObjectKind::AllSequencesInSchema => {
+                let schema = name.name;
+                if storage.find_schema_visible(schema, txid).is_none() {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_SCHEMA_NAME,
+                        "schema \"{}\" does not exist",
+                        schema
+                    ));
+                }
+                for (slot, sequence) in storage.sequences_with_slots() {
+                    if sequence.visible_to(txid) && sequence.schema.as_str() == schema {
+                        add_privilege_object(
+                            objects,
+                            &mut count,
+                            AccessObject {
+                                class: AccessClass::Sequence,
+                                slot: slot as u16,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grant_privileges(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    privileges: &[crate::sql::ast::Privilege],
+    target: crate::sql::ast::PrivilegeTarget<'_>,
+    grantees: &[&str],
+    grant_option: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::storage::{AccessClass, AccessObject, PUBLIC_ROLE};
+    let mut objects = [AccessObject {
+        class: AccessClass::Table,
+        slot: 0,
+    }; crate::storage::MAX_ACL_ENTRIES];
+    let object_count = match resolve_privilege_objects(storage, target, txn.txid, &mut objects) {
+        Ok(count) => count,
+        Err(error) => return sql_fail(error),
+    };
+    let current = super::eval::funcs::system::current_user_owned();
+    let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            current.as_str()
+        ));
+    };
+    if object_count.saturating_mul(grantees.len()) > super::txn::MAX_TXN_DDL {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many privilege changes in one statement"
+        ));
+    }
+    for object in &objects[..object_count] {
+        let requested = match privilege_mask(privileges, object.class) {
+            Ok(mask) => mask,
+            Err(error) => return sql_fail(error),
+        };
+        if !storage.has_object_grant_option(*object, grantor, requested, txn.txid) {
+            let (_, name) = storage.access_object_name(*object);
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for relation {}",
+                name.as_str()
+            ));
+        }
+        for name in grantees {
+            let grantee = if name.eq_ignore_ascii_case("public") {
+                PUBLIC_ROLE
+            } else {
+                let Some(slot) = storage.find_role_visible(name, txn.txid) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "role \"{}\" does not exist",
+                        name
+                    ));
+                };
+                slot as u16
+            };
+            let (old_privileges, old_options) =
+                storage.acl_from(*object, grantee, grantor as u16, txn.txid);
+            let new_options = if grant_option {
+                old_options.union(requested)
+            } else {
+                old_options
+            };
+            let (slot, prior) = match storage.change_acl(
+                *object,
+                grantee,
+                grantor as u16,
+                old_privileges.union(requested),
+                new_options,
+                txn.txid,
+            ) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_acl_pending(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("GRANT")?;
+    sql_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn revoke_privileges(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    grant_option_only: bool,
+    privileges: &[crate::sql::ast::Privilege],
+    target: crate::sql::ast::PrivilegeTarget<'_>,
+    grantees: &[&str],
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::storage::{AccessClass, AccessObject, PUBLIC_ROLE};
+    let mut objects = [AccessObject {
+        class: AccessClass::Table,
+        slot: 0,
+    }; crate::storage::MAX_ACL_ENTRIES];
+    let object_count = match resolve_privilege_objects(storage, target, txn.txid, &mut objects) {
+        Ok(count) => count,
+        Err(error) => return sql_fail(error),
+    };
+    let current = super::eval::funcs::system::current_user_owned();
+    let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            current.as_str()
+        ));
+    };
+    for object in &objects[..object_count] {
+        let requested = match privilege_mask(privileges, object.class) {
+            Ok(mask) => mask,
+            Err(error) => return sql_fail(error),
+        };
+        for name in grantees {
+            let grantee = if name.eq_ignore_ascii_case("public") {
+                PUBLIC_ROLE
+            } else {
+                let Some(slot) = storage.find_role_visible(name, txn.txid) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "role \"{}\" does not exist",
+                        name
+                    ));
+                };
+                slot as u16
+            };
+            let (old_privileges, old_options) =
+                storage.acl_from(*object, grantee, grantor as u16, txn.txid);
+            let removed_options = crate::storage::PrivilegeSet(old_options.0 & requested.0);
+            if grantee != PUBLIC_ROLE && removed_options.0 != 0 {
+                let mut dependent = [0usize; crate::storage::MAX_ACL_ENTRIES];
+                let dependent_count = storage.dependent_acl_slots(
+                    *object,
+                    grantee,
+                    removed_options,
+                    txn.txid,
+                    &mut dependent,
+                );
+                if dependent_count != 0 && !cascade {
+                    return sql_fail(sql_err!(
+                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                        "dependent privileges exist"
+                    ));
+                }
+                if cascade {
+                    let mut queue_roles = [0u16; crate::storage::MAX_ACL_ENTRIES];
+                    let mut queue_privileges =
+                        [crate::storage::PrivilegeSet::NONE; crate::storage::MAX_ACL_ENTRIES];
+                    queue_roles[0] = grantee;
+                    queue_privileges[0] = removed_options;
+                    let mut queue_len = 1usize;
+                    let mut queue_at = 0usize;
+                    while queue_at < queue_len {
+                        let downstream_grantor = queue_roles[queue_at];
+                        let lost_options = queue_privileges[queue_at];
+                        queue_at += 1;
+                        let dependent_count = storage.dependent_acl_slots(
+                            *object,
+                            downstream_grantor,
+                            lost_options,
+                            txn.txid,
+                            &mut dependent,
+                        );
+                        for dependent_slot in &dependent[..dependent_count] {
+                            let entry = *storage.acl_entry(*dependent_slot);
+                            let (dependent_privileges, dependent_options) =
+                                storage.acl_state(*dependent_slot, txn.txid);
+                            let recursively_lost =
+                                crate::storage::PrivilegeSet(dependent_options.0 & lost_options.0);
+                            let (slot, prior) = match storage.change_acl(
+                                entry.object,
+                                entry.grantee,
+                                entry.grantor,
+                                dependent_privileges.without(lost_options),
+                                dependent_options.without(lost_options),
+                                txn.txid,
+                            ) {
+                                Ok(change) => change,
+                                Err(error) => return sql_fail(error),
+                            };
+                            if let Err(error) =
+                                txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
+                                    slot: slot as u32,
+                                    prior,
+                                })
+                            {
+                                storage.restore_acl_pending(slot, prior);
+                                return sql_fail(error);
+                            }
+                            if entry.grantee != PUBLIC_ROLE && recursively_lost.0 != 0 {
+                                if queue_len == queue_roles.len() {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "privilege dependency graph exceeds {} entries",
+                                        queue_roles.len()
+                                    ));
+                                }
+                                queue_roles[queue_len] = entry.grantee;
+                                queue_privileges[queue_len] = recursively_lost;
+                                queue_len += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let new_privileges = if grant_option_only {
+                old_privileges
+            } else {
+                old_privileges.without(requested)
+            };
+            let (slot, prior) = match storage.change_acl(
+                *object,
+                grantee,
+                grantor as u16,
+                new_privileges,
+                old_options.without(requested),
+                txn.txid,
+            ) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_acl_pending(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("REVOKE")?;
     sql_ok()
 }
 
@@ -1553,6 +2980,16 @@ pub fn drop_schema(
         }
         match storage.find_schema_visible(name, txn.txid) {
             Some(slot) => {
+                if let Err(error) = storage.require_owner(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Schema,
+                        slot: slot as u16,
+                    },
+                    txn.txid,
+                    "schema",
+                ) {
+                    return sql_fail(error);
+                }
                 if !slots[..n_slots].contains(&slot) {
                     if n_slots == MAX_DROP_SCHEMAS {
                         return sql_fail(sql_err!(
@@ -3246,6 +4683,19 @@ pub fn drop_materialized_view(
             None => return sql_fail(undefined_kind("materialized view", name.name)),
         };
         let def = *storage.table_def(idx, txn.txid);
+        let matview_slot = storage
+            .matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
+            .expect("resolved materialized view has a catalog entry");
+        if let Err(error) = storage.require_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::MaterializedView,
+                slot: matview_slot as u16,
+            },
+            txn.txid,
+            "materialized view",
+        ) {
+            return sql_fail(error);
+        }
         let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
             dependency.class == crate::storage::DependencyClass::Table
                 && dependency.slot as usize == idx
@@ -3582,6 +5032,16 @@ pub fn alter_sequence(
         Ok(None) => return sql_fail(undefined_kind("sequence", name.name)),
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Sequence,
+            slot: slot as u16,
+        },
+        txn.txid,
+        "sequence",
+    ) {
+        return sql_fail(error);
+    }
     let base = {
         let s = storage.sequence(slot);
         SeqSpec {
@@ -3701,6 +5161,16 @@ pub fn drop_sequence(
             Ok(None) => return sql_fail(undefined_kind("sequence", name.name)),
             Err(e) => return sql_fail(e),
         };
+        if let Err(error) = storage.require_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Sequence,
+                slot: slot as u16,
+            },
+            txn.txid,
+            "sequence",
+        ) {
+            return sql_fail(error);
+        }
         let (schema, sname) = {
             let s = storage.sequence(slot);
             if let Some(owner) = s.owner {
@@ -3881,6 +5351,18 @@ fn build_domain_spec(
                 base_type
             ));
         };
+    if ColType::from_sql_name(base_type).is_none() {
+        if let Some(parent) = storage.find_domain(base_type, txid) {
+            storage.require_type_usage(parent.schema.as_str(), parent.name.as_str(), txid)?;
+        } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
+            let enumeration = storage.enum_def(enum_slot);
+            storage.require_type_usage(
+                enumeration.schema.as_str(),
+                enumeration.name.as_str(),
+                txid,
+            )?;
+        }
+    }
     let default_expr = match default_text {
         Some(t) => {
             validate_domain_expr(t, false, arena)?;
@@ -4037,6 +5519,16 @@ pub fn drop_domain(
                 name.name
             ));
         };
+        if let Err(error) = storage.require_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Domain,
+                slot: slot as u16,
+            },
+            txn.txid,
+            "type",
+        ) {
+            return sql_fail(error);
+        }
         selected[slot] = true;
     }
 
@@ -4297,6 +5789,16 @@ pub fn alter_domain(
             name.name
         ));
     };
+    if let Err(error) = storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Domain,
+            slot: slot as u16,
+        },
+        txn.txid,
+        "type",
+    ) {
+        return sql_fail(error);
+    }
     // Start from the current definition and apply the action.
     let current = *storage.domain(slot);
     let mut spec = crate::storage::DomainSpec {
@@ -4691,6 +6193,16 @@ pub fn drop_enum(
                 name.name
             ));
         };
+        if let Err(error) = storage.require_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Enum,
+                slot: slot as u16,
+            },
+            txn.txid,
+            "type",
+        ) {
+            return sql_fail(error);
+        }
         let (schema, ename) = {
             let e = storage.enum_def(slot);
             (e.schema, e.name)
@@ -5315,6 +6827,16 @@ pub fn alter_type(
             name.name
         ));
     };
+    if let Err(error) = storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Enum,
+            slot: slot as u16,
+        },
+        txn.txid,
+        "type",
+    ) {
+        return sql_fail(error);
+    }
     match action {
         A::AddValue {
             label,
@@ -5719,6 +7241,16 @@ pub fn drop_view(
             _ => None,
         };
         if let Some(slot) = found {
+            if let Err(error) = storage.require_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::View,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "view",
+            ) {
+                return sql_fail(error);
+            }
             let (schema, view_name) = {
                 let v = storage.view(slot);
                 (v.schema, v.name)
@@ -5806,6 +7338,13 @@ pub fn create_index(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table_index, txn.txid),
+        txn.txid,
+        "table",
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -5849,6 +7388,7 @@ pub fn create_index(
         schema: tdef.schema,
         name: sqlname,
         table: tdef.name,
+        ownership: crate::storage::Ownership::BOOTSTRAP,
         columns,
         descending,
         nulls_first,
@@ -5877,10 +7417,7 @@ pub fn create_index(
         storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
-            check_index_tuple_size(
-                &columns[..n_cols],
-                &values[..tdef.n_columns],
-            )?;
+            check_index_tuple_size(&columns[..n_cols], &values[..tdef.n_columns])?;
             if unique {
                 check_unique_indexes(
                     storage,
@@ -5979,6 +7516,17 @@ pub fn drop_index(
             }),
         };
         if let Some(schema) = found {
+            let object = storage
+                .resolve_access_object(
+                    crate::storage::AccessClass::Index,
+                    schema.as_str(),
+                    name.name,
+                    txn.txid,
+                )
+                .expect("resolved index exists");
+            if let Err(error) = storage.require_owner(object, txn.txid, "index") {
+                return sql_fail(error);
+            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(
                 txn.txid,
@@ -6112,6 +7660,16 @@ pub fn copy_begin(
     txid: u32,
 ) -> Result<CopySetup, SqlError> {
     let table_index = resolve_dml_table(storage, &statement.table, txid)?;
+    require_table_privilege(
+        storage,
+        table_index,
+        if statement.to {
+            crate::storage::PrivilegeSet::SELECT
+        } else {
+            crate::storage::PrivilegeSet::INSERT
+        },
+        txid,
+    )?;
     let def = storage.table_def(table_index, txid);
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if statement.columns.is_empty() {
@@ -7331,6 +8889,18 @@ pub fn merge(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    let mut required = crate::storage::PrivilegeSet::NONE;
+    for clause in statement.whens {
+        required = required.union(match clause.action {
+            MergeAction::Insert { .. } => crate::storage::PrivilegeSet::INSERT,
+            MergeAction::Update(_) => crate::storage::PrivilegeSet::UPDATE,
+            MergeAction::Delete => crate::storage::PrivilegeSet::DELETE,
+            MergeAction::DoNothing => crate::storage::PrivilegeSet::NONE,
+        });
+    }
+    if let Err(error) = require_table_privilege(storage, table_index, required, txn.txid) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -7859,6 +9429,14 @@ pub fn insert(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = require_table_privilege(
+        storage,
+        table_index,
+        crate::storage::PrivilegeSet::INSERT,
+        txn.txid,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -8515,6 +10093,14 @@ pub fn update(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = require_table_privilege(
+        storage,
+        table_index,
+        crate::storage::PrivilegeSet::UPDATE,
+        txn.txid,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -8613,17 +10199,19 @@ pub fn update(
     // PostgreSQL obtains a row lock before it computes or publishes any new
     // image. Collecting all target rowids first makes a default wait
     // suspendable without partially executing the statement.
-    let changes_key = targets[..statement.assignments.len()].iter().any(|&column| {
-        def.columns()[column].primary
-            || def.columns()[column].unique
-            || def
-                .uniques()
-                .iter()
-                .any(|constraint| constraint.columns().contains(&(column as u16)))
-            || storage
-                .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid)
-                .any(|index| index.columns[..index.n_cols].contains(&(column as u16)))
-    });
+    let changes_key = targets[..statement.assignments.len()]
+        .iter()
+        .any(|&column| {
+            def.columns()[column].primary
+                || def.columns()[column].unique
+                || def
+                    .uniques()
+                    .iter()
+                    .any(|constraint| constraint.columns().contains(&(column as u16)))
+                || storage
+                    .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid)
+                    .any(|index| index.columns[..index.n_cols].contains(&(column as u16)))
+        });
     let lock_strength = if changes_key {
         crate::sql::ast::LockStrength::Update
     } else {
@@ -8899,6 +10487,14 @@ pub fn delete(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = require_table_privilege(
+        storage,
+        table_index,
+        crate::storage::PrivilegeSet::DELETE,
+        txn.txid,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -9158,6 +10754,14 @@ pub fn truncate(
     // before changing any row. Acquire the whole set before mutation so a
     // wait can replay the statement without exposing a partial truncate.
     for &table_index in &list[..n] {
+        if let Err(error) = require_table_privilege(
+            storage,
+            table_index,
+            crate::storage::PrivilegeSet::TRUNCATE,
+            txn.txid,
+        ) {
+            return sql_fail(error);
+        }
         if let Err(error) = storage.lock_table(
             txn.txid,
             table_index,
@@ -9530,6 +11134,15 @@ fn alter_table_inner(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
+    if emit_completion
+        && let Err(error) = storage.require_owner(
+            storage.table_access_object(table_index, txn.txid),
+            txn.txid,
+            "table",
+        )
+    {
+        return sql_fail(error);
+    }
 
     // The ACCESS EXCLUSIVE acquisition above waits for ordinary readers and
     // writers. This verifies the row-version invariant at the rewrite
@@ -9565,6 +11178,9 @@ fn alter_table_inner(
                 responder.command_complete("ALTER TABLE")?;
             }
             return sql_ok();
+        }
+        if let Err(error) = storage.require_schema_create(new_schema, txn.txid) {
+            return sql_fail(error);
         }
         if storage.relation_name_taken(new_schema, def.name.as_str(), txn.txid) {
             return sql_fail(sql_err!(
@@ -10339,16 +11955,30 @@ fn alter_table_inner(
         }
     }
 
-    // Journal the shape change and the re-homed rows. Every fallible
+    let mut column_mapping = [None; MAX_COLUMNS];
+    let mut wal_column_mapping = [u16::MAX; MAX_COLUMNS];
+    for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
+        if let ColSource::Keep(old_column)
+        | ColSource::Cast {
+            orig: old_column, ..
+        } = *source
+        {
+            column_mapping[old_column] = Some(new_def.columns()[new_column].name);
+            wal_column_mapping[old_column] = new_column as u16;
+        }
+    }
+
+    // Journal the in-place shape change and the re-homed rows. Every fallible
     // content step is already done; only WAL append can fail here, and it does
     // so before any in-memory swap.
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.stage(
         txn.txid,
         lsn,
-        &WalOp::DropTable {
-            schema: def.schema.as_str(),
-            name: def.name.as_str(),
+        &WalOp::BeginTableRewrite {
+            previous_schema: def.schema.as_str(),
+            previous_name: def.name.as_str(),
+            column_mapping: wal_column_mapping,
         },
     ) {
         return sql_fail(e);
@@ -10414,16 +12044,6 @@ fn alter_table_inner(
             }
             Ok(None) => {}
             Err(error) => return sql_fail(error),
-        }
-    }
-    let mut column_mapping = [None; MAX_COLUMNS];
-    for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
-        if let ColSource::Keep(old_column)
-        | ColSource::Cast {
-            orig: old_column, ..
-        } = *source
-        {
-            column_mapping[old_column] = Some(new_def.columns()[new_column].name);
         }
     }
     let rebind = |link: Option<crate::storage::SequenceOwner>, require_generator: bool| {
@@ -11321,6 +12941,34 @@ pub(crate) fn resolve_dml_table(
         Some(crate::storage::ResolvedRelation::Table(slot)) => Ok(slot),
         _ => Err(undefined_qual(name)),
     }
+}
+
+fn require_table_privilege(
+    storage: &Storage,
+    table: usize,
+    privilege: crate::storage::PrivilegeSet,
+    txid: u32,
+) -> Result<(), SqlError> {
+    storage.require_schema_usage(storage.table_def(table, txid).schema.as_str(), txid)?;
+    let role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if storage.has_object_privilege(
+        storage.table_access_object(table, txid),
+        role,
+        privilege,
+        txid,
+    ) {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "permission denied for table {}",
+        storage.table_def(table, txid).name.as_str()
+    ))
 }
 
 /// Public view of the OID-to-ColType mapping for value-level renderers

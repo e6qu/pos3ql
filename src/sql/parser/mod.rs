@@ -834,6 +834,18 @@ impl<'a> Parser<'a> {
                 } else {
                     self.eat_ident("local")?
                 };
+                if self.eat_ident("role")? {
+                    let role = if self.eat_ident("none")? {
+                        None
+                    } else {
+                        Some(self.any_ident("role name")?)
+                    };
+                    return Ok(Stmt::SetRole {
+                        role,
+                        local,
+                        reset: false,
+                    });
+                }
                 // SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS
                 // TRANSACTION ...: retain the characteristics so execution can
                 // reject isolation/read modes it cannot actually provide.
@@ -881,7 +893,13 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident("reset") => {
                 self.advance()?;
-                if self.eat_ident("all")? {
+                if self.eat_ident("role")? {
+                    Ok(Stmt::SetRole {
+                        role: None,
+                        local: false,
+                        reset: true,
+                    })
+                } else if self.eat_ident("all")? {
                     Ok(Stmt::Reset(None))
                 } else {
                     Ok(Stmt::Reset(Some(
@@ -922,6 +940,8 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::RefreshMaterializedView { name })
             }
             Tok::Ident("alter") => self.alter_table(),
+            Tok::Ident("grant") => self.grant_statement(),
+            Tok::Ident("revoke") => self.revoke_statement(),
             Tok::Ident("copy") => self.copy_statement(),
             Tok::Ident("prepare") => self.prepare(),
             Tok::Ident("execute") => self.execute_prepared(),
@@ -1763,6 +1783,7 @@ impl<'a> Parser<'a> {
                 cte: None,
                 with_ordinality: false,
                 lateral,
+                authorization_role: None,
             });
         }
         let first = self.col_ident("table name")?;
@@ -1831,6 +1852,7 @@ impl<'a> Parser<'a> {
             cte: None,
             with_ordinality,
             lateral,
+            authorization_role: None,
         })
     }
 
@@ -1874,6 +1896,7 @@ impl<'a> Parser<'a> {
                 cte: None,
                 with_ordinality: false,
                 lateral: false,
+                authorization_role: None,
             },
             kind: JoinKind::Inner,
             on: None,
@@ -2442,9 +2465,253 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn role_name_list(&mut self, what: &str) -> Result<&'a [&'a str], ParseError> {
+        let mut names = [""; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == names.len() {
+                return Err(self.limit("roles", names.len()));
+            }
+            names[count] = self.any_ident(what)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&names[..count])
+    }
+
+    fn privilege_start(&self) -> bool {
+        matches!(
+            self.peeked,
+            Tok::Ident(
+                "all"
+                    | "select"
+                    | "insert"
+                    | "update"
+                    | "delete"
+                    | "truncate"
+                    | "references"
+                    | "trigger"
+                    | "usage"
+                    | "create"
+            )
+        )
+    }
+
+    fn grant_statement(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("grant")?;
+        if !self.privilege_start() {
+            return self.grant_role_after_keyword();
+        }
+        let privileges = self.privilege_list()?;
+        self.expect_ident("on")?;
+        let target = self.privilege_target()?;
+        self.expect_ident("to")?;
+        let grantees = self.role_name_list("grantee")?;
+        let grant_option = if self.eat_ident("with")? {
+            self.expect_ident("grant")?;
+            self.expect_ident("option")?;
+            true
+        } else {
+            false
+        };
+        Ok(Stmt::GrantPrivileges {
+            privileges,
+            target,
+            grantees,
+            grant_option,
+        })
+    }
+
+    fn grant_role_after_keyword(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let roles = self.role_name_list("role name")?;
+        self.expect_ident("to")?;
+        let members = self.role_name_list("member role name")?;
+        let mut options = crate::sql::ast::RoleGrantOptions::DEFAULT;
+        if self.eat_ident("with")? {
+            loop {
+                if self.eat_ident("admin")? {
+                    let _ = self.eat_ident("option")?;
+                    options.admin = true;
+                } else if self.eat_ident("inherit")? {
+                    options.inherit = self.role_option_boolean()?;
+                } else if self.eat_ident("set")? {
+                    options.set = self.role_option_boolean()?;
+                } else {
+                    break;
+                }
+                let _ = self.eat_op(",")?;
+            }
+        }
+        Ok(Stmt::GrantRole {
+            roles,
+            members,
+            options,
+        })
+    }
+
+    fn privilege_list(&mut self) -> Result<&'a [crate::sql::ast::Privilege], ParseError> {
+        use crate::sql::ast::Privilege;
+        let mut privileges = [Privilege::All; 10];
+        let mut count = 0usize;
+        loop {
+            if count == privileges.len() {
+                return Err(self.limit("privileges", privileges.len()));
+            }
+            privileges[count] = if self.eat_ident("all")? {
+                let _ = self.eat_ident("privileges")?;
+                Privilege::All
+            } else if self.eat_ident("select")? {
+                Privilege::Select
+            } else if self.eat_ident("insert")? {
+                Privilege::Insert
+            } else if self.eat_ident("update")? {
+                Privilege::Update
+            } else if self.eat_ident("delete")? {
+                Privilege::Delete
+            } else if self.eat_ident("truncate")? {
+                Privilege::Truncate
+            } else if self.eat_ident("references")? {
+                Privilege::References
+            } else if self.eat_ident("trigger")? {
+                Privilege::Trigger
+            } else if self.eat_ident("usage")? {
+                Privilege::Usage
+            } else if self.eat_ident("create")? {
+                Privilege::Create
+            } else {
+                return Err(self.unexpected("expected an object privilege"));
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&privileges[..count])
+    }
+
+    fn privilege_target(&mut self) -> Result<crate::sql::ast::PrivilegeTarget<'a>, ParseError> {
+        use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget};
+        let kind = if self.eat_ident("all")? {
+            if self.eat_ident("tables")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                PrivilegeObjectKind::AllTablesInSchema
+            } else if self.eat_ident("sequences")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                PrivilegeObjectKind::AllSequencesInSchema
+            } else {
+                return Err(self.unexpected("expected TABLES or SEQUENCES after ALL"));
+            }
+        } else if self.eat_ident("table")? {
+            PrivilegeObjectKind::Table
+        } else if self.eat_ident("sequence")? {
+            PrivilegeObjectKind::Sequence
+        } else if self.eat_ident("schema")? {
+            PrivilegeObjectKind::Schema
+        } else if self.eat_ident("type")? || self.eat_ident("domain")? {
+            PrivilegeObjectKind::Type
+        } else {
+            // TABLE is PostgreSQL's default object kind.
+            PrivilegeObjectKind::Table
+        };
+        let mut names = [QualName::bare(""); MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == names.len() {
+                return Err(self.limit("privilege targets", names.len()));
+            }
+            names[count] = if matches!(
+                kind,
+                PrivilegeObjectKind::Schema
+                    | PrivilegeObjectKind::AllTablesInSchema
+                    | PrivilegeObjectKind::AllSequencesInSchema
+            ) {
+                QualName::bare(self.col_ident("schema name")?)
+            } else {
+                self.qual_name("object name")?
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(PrivilegeTarget {
+            kind,
+            names: self.arena_slice(&names[..count])?,
+        })
+    }
+
+    fn role_option_boolean(&mut self) -> Result<bool, ParseError> {
+        if self.eat_ident("true")? {
+            Ok(true)
+        } else if self.eat_ident("false")? {
+            Ok(false)
+        } else {
+            Err(self.unexpected("expected TRUE or FALSE"))
+        }
+    }
+
+    fn revoke_statement(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("revoke")?;
+        if self.eat_ident("admin")? {
+            self.expect_ident("option")?;
+            self.expect_ident("for")?;
+            return self.revoke_role_after_keyword(true);
+        }
+        let grant_option_only = if self.eat_ident("grant")? {
+            self.expect_ident("option")?;
+            self.expect_ident("for")?;
+            true
+        } else {
+            false
+        };
+        if !self.privilege_start() {
+            return self.revoke_role_after_keyword(false);
+        }
+        let privileges = self.privilege_list()?;
+        self.expect_ident("on")?;
+        let target = self.privilege_target()?;
+        self.expect_ident("from")?;
+        let grantees = self.role_name_list("grantee")?;
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::RevokePrivileges {
+            grant_option_only,
+            privileges,
+            target,
+            grantees,
+            cascade,
+        })
+    }
+
+    fn revoke_role_after_keyword(
+        &mut self,
+        admin_option_only: bool,
+    ) -> Result<Stmt<'a>, ParseError> {
+        let roles = self.role_name_list("role name")?;
+        self.expect_ident("from")?;
+        let members = self.role_name_list("member role name")?;
+        let _ = self.eat_ident("cascade")? || self.eat_ident("restrict")?;
+        Ok(Stmt::RevokeRole {
+            roles,
+            members,
+            admin_option_only,
+        })
+    }
+
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         use crate::sql::ast::AlterOwnerKind;
+        if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
+            return self.alter_role();
+        }
         if self.eat_ident("schema")? {
             let name = QualName {
                 schema: None,

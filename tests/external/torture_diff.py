@@ -31,7 +31,11 @@ def connect_p3(port):
     while True:
         try:
             return psycopg.connect(
-                host="127.0.0.1", port=port, user="ext", dbname="ext", autocommit=True
+                host="127.0.0.1",
+                port=port,
+                user="postgres",
+                dbname="postgres",
+                autocommit=True,
             )
         except Exception:
             if time.time() > deadline:

@@ -228,6 +228,12 @@ pub enum Stmt<'a> {
     Reset(Option<&'a str>),
     /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ....
     SetTransaction(&'a str),
+    /// SET ROLE role | NONE and RESET ROLE.
+    SetRole {
+        role: Option<&'a str>,
+        local: bool,
+        reset: bool,
+    },
     Show(&'a str),
     /// SHOW ALL: every readable setting as (name, setting, description).
     ShowAll,
@@ -260,6 +266,7 @@ pub enum Stmt<'a> {
     /// schema as their creation target.
     CreateSchema {
         name: &'a str,
+        authorization: Option<&'a str>,
         if_not_exists: bool,
         elements: &'a [&'a Stmt<'a>],
     },
@@ -318,6 +325,139 @@ pub enum Stmt<'a> {
         role: &'a str,
         if_exists: bool,
     },
+    /// CREATE ROLE / USER / GROUP. USER differs only in its default LOGIN
+    /// attribute; GROUP is PostgreSQL's compatibility spelling for ROLE.
+    CreateRole {
+        name: &'a str,
+        options: RoleOptions<'a>,
+        memberships: RoleMembershipClauses<'a>,
+    },
+    /// ALTER ROLE / USER / GROUP name [WITH] role-option ...
+    AlterRole {
+        name: &'a str,
+        options: RoleOptions<'a>,
+    },
+    AlterRoleRename {
+        name: &'a str,
+        new_name: &'a str,
+    },
+    /// DROP ROLE / USER / GROUP [IF EXISTS] name [, ...].
+    DropRole {
+        names: &'a [&'a str],
+        if_exists: bool,
+    },
+    GrantRole {
+        roles: &'a [&'a str],
+        members: &'a [&'a str],
+        options: RoleGrantOptions,
+    },
+    RevokeRole {
+        roles: &'a [&'a str],
+        members: &'a [&'a str],
+        admin_option_only: bool,
+    },
+    GrantPrivileges {
+        privileges: &'a [Privilege],
+        target: PrivilegeTarget<'a>,
+        grantees: &'a [&'a str],
+        grant_option: bool,
+    },
+    RevokePrivileges {
+        grant_option_only: bool,
+        privileges: &'a [Privilege],
+        target: PrivilegeTarget<'a>,
+        grantees: &'a [&'a str],
+        cascade: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privilege {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Usage,
+    Create,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivilegeObjectKind {
+    Table,
+    Sequence,
+    Schema,
+    Type,
+    AllTablesInSchema,
+    AllSequencesInSchema,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivilegeTarget<'a> {
+    pub kind: PrivilegeObjectKind,
+    pub names: &'a [QualName<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleGrantOptions {
+    pub admin: bool,
+    pub inherit: bool,
+    pub set: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleMembershipClauses<'a> {
+    /// Parent roles granted to the new role by `IN ROLE` / `IN GROUP`.
+    pub in_roles: &'a [&'a str],
+    /// Existing roles made members of the new role by `ROLE`.
+    pub role_members: &'a [&'a str],
+    /// Existing roles made members of the new role with admin option.
+    pub admin_members: &'a [&'a str],
+}
+
+impl RoleGrantOptions {
+    pub const DEFAULT: Self = Self {
+        admin: false,
+        inherit: true,
+        set: true,
+    };
+}
+
+/// Attribute changes shared by CREATE ROLE and ALTER ROLE. `None` means the
+/// option was not written (CREATE applies PostgreSQL's defaults; ALTER keeps
+/// the current value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleOptions<'a> {
+    pub superuser: Option<bool>,
+    pub inherit: Option<bool>,
+    pub create_role: Option<bool>,
+    pub create_database: Option<bool>,
+    pub can_login: Option<bool>,
+    pub replication: Option<bool>,
+    pub bypass_row_level_security: Option<bool>,
+    pub connection_limit: Option<i32>,
+    /// `Some(None)` is PASSWORD NULL; `None` means no PASSWORD clause.
+    pub password: Option<Option<&'a str>>,
+    /// Canonical source text of VALID UNTIL, or NULL for infinity.
+    pub valid_until: Option<Option<&'a str>>,
+}
+
+impl RoleOptions<'_> {
+    pub const EMPTY: Self = Self {
+        superuser: None,
+        inherit: None,
+        create_role: None,
+        create_database: None,
+        can_login: None,
+        replication: None,
+        bypass_row_level_security: None,
+        connection_limit: None,
+        password: None,
+        valid_until: None,
+    };
 }
 
 /// One btree index key. PostgreSQL's defaults depend on direction: ascending
@@ -576,6 +716,10 @@ pub struct TableRef<'a> {
     /// `LATERAL (subquery)` / `LATERAL func(...)`: the FROM item may reference
     /// columns of the FROM items to its left, and is re-evaluated per outer row.
     pub lateral: bool,
+    /// Role slot whose privileges apply to this physical relation reference.
+    /// Set only by stored-view expansion; ordinary parsed references use the
+    /// current effective role.
+    pub authorization_role: Option<u16>,
 }
 
 /// Upper bound on `USING (c1, ...)` column-list length (and thus on merged

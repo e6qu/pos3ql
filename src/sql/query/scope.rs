@@ -53,6 +53,10 @@ pub struct QueryScope<'d> {
     pub names: &'d mut [&'d str],
     pub defs: &'d mut [Option<&'d TableDef>],
     pub slots: &'d mut [usize],
+    /// Effective authorization role for each physical relation. Stored views
+    /// populate this with their owner; ordinary references leave it empty and
+    /// execute as the session's current role.
+    pub authorization_roles: &'d mut [Option<u16>],
     /// Derived tables (`FROM (SELECT ...) alias`): the materialized rows,
     /// self-describing-encoded. `None` marks a physical table (scanned from
     /// storage by `slots`).
@@ -145,6 +149,9 @@ impl<'d> QueryScope<'d> {
         let slots = arena
             .alloc_slice_with(table_count, |_| 0)
             .map_err(|_| arena_full())?;
+        let authorization_roles = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let derived = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
@@ -182,6 +189,7 @@ impl<'d> QueryScope<'d> {
             names,
             defs,
             slots,
+            authorization_roles,
             derived,
             external_runs,
             lateral,
@@ -319,7 +327,14 @@ impl<'d> QueryScope<'d> {
             ) {
                 return self.add_catalog(storage, tref, txid, arena, true);
             }
-            return self.add(storage, tref.schema, tref.table, tref.alias, txid);
+            return self.add(
+                storage,
+                tref.schema,
+                tref.table,
+                tref.alias,
+                tref.authorization_role,
+                txid,
+            );
         };
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
@@ -477,7 +492,14 @@ impl<'d> QueryScope<'d> {
             ) {
                 return self.add_catalog(storage, tref, txid, arena, false);
             }
-            return self.add(storage, tref.schema, tref.table, tref.alias, txid);
+            return self.add(
+                storage,
+                tref.schema,
+                tref.table,
+                tref.alias,
+                tref.authorization_role,
+                txid,
+            );
         };
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
@@ -627,6 +649,7 @@ impl<'d> QueryScope<'d> {
         schema: Option<&str>,
         table: &str,
         alias: Option<&'d str>,
+        authorization_role: Option<u16>,
         txid: u32,
     ) -> Result<(), SqlError> {
         // `txid == 0` (schema-only / Describe) resolves against the committed
@@ -675,6 +698,7 @@ impl<'d> QueryScope<'d> {
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def);
         self.slots[self.n] = slot;
+        self.authorization_roles[self.n] = authorization_role;
         self.n += 1;
         Ok(())
     }

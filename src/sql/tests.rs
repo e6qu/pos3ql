@@ -106,6 +106,562 @@ fn test_cursors(budget: &mut Budget) -> crate::sql::cursor::CursorPool {
     crate::sql::cursor::CursorPool::new(&c, budget).unwrap()
 }
 
+#[test]
+fn role_catalog_is_transactional_and_attribute_complete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE analyst LOGIN CREATEDB NOINHERIT CONNECTION LIMIT 3 PASSWORD 'secret'
+             VALID UNTIL '2030-01-02 03:04:05+00';
+         SELECT rolname, rolsuper, rolinherit, rolcreatedb, rolcanlogin,
+                rolconnlimit, rolvaliduntil IS NOT NULL, rolreplication, rolbypassrls
+           FROM pg_roles WHERE rolname = 'analyst';
+         ALTER USER analyst WITH NOLOGIN REPLICATION BYPASSRLS;
+         SELECT rolcanlogin, rolreplication, rolbypassrls
+           FROM pg_roles WHERE rolname = 'analyst';
+         SET ROLE analyst;
+         SELECT current_user, session_user, current_role;
+         RESET ROLE;
+         SELECT current_user, session_user, current_role;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "analyst|f|f|t|t|3|t|f|f",
+            "f|t|t",
+            "analyst|postgres|analyst",
+            "postgres|postgres|postgres",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         CREATE GROUP transient;
+         SELECT count(*) FROM pg_roles WHERE rolname = 'transient';
+         ROLLBACK;
+         SELECT count(*) FROM pg_roles WHERE rolname = 'transient';",
+    );
+    assert_eq!(data_rows(&output), ["1", "0"]);
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP ROLE analyst; SELECT count(*) FROM pg_roles WHERE rolname = 'analyst'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn role_connection_limit_is_reserved_and_released_exactly() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE limited_login LOGIN CONNECTION LIMIT 1",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let login = engine.role_login("limited_login").unwrap();
+    assert!(login.can_login && login.valid);
+    assert!(engine.reserve_role_connection(login));
+    assert!(!engine.reserve_role_connection(login));
+    engine.release_role_connection(login.slot);
+    assert!(engine.reserve_role_connection(login));
+    engine.release_role_connection(login.slot);
+}
+
+#[test]
+fn idle_connection_shutdown_does_not_claim_zero_wal_stage() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 8).unwrap();
+    let guc = GucState::new();
+    assert_eq!(transaction.txid, 0);
+    engine.rollback_txn(&mut transaction, &guc);
+    assert_eq!(transaction.txid, 0);
+}
+
+#[test]
+fn create_role_authority_cannot_escalate_attributes_or_alter_unmanaged_roles() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE role_administrator LOGIN CREATEROLE;
+         CREATE ROLE managed_role;
+         CREATE ROLE unmanaged_role;
+         GRANT managed_role TO role_administrator WITH ADMIN OPTION;",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE role_administrator;
+         ALTER ROLE managed_role LOGIN;
+         ALTER ROLE role_administrator PASSWORD 'changed';
+         CREATE ROLE ordinary_child;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+    let escalation = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE role_administrator; CREATE ROLE escalated SUPERUSER",
+    );
+    assert!(
+        String::from_utf8_lossy(&escalation).contains("must be superuser"),
+        "{}",
+        String::from_utf8_lossy(&escalation)
+    );
+    let unmanaged = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE role_administrator; ALTER ROLE unmanaged_role LOGIN",
+    );
+    assert!(
+        String::from_utf8_lossy(&unmanaged).contains("permission denied to alter role"),
+        "{}",
+        String::from_utf8_lossy(&unmanaged)
+    );
+}
+
+#[test]
+fn role_catalog_replays_from_wal() {
+    let config = test_config("role-wal-replay");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 PASSWORD 'never-store-this';
+         ALTER ROLE durable NOINHERIT CREATEDB;
+         CREATE ROLE durable_member;
+         GRANT durable TO durable_member WITH ADMIN OPTION;",
+    );
+    assert!(!output.is_empty());
+    drop(engine);
+    let wal_bytes =
+        std::fs::read(std::path::Path::new(&config.data_dir).join("journal.wal")).unwrap();
+    assert!(
+        !wal_bytes
+            .windows(b"never-store-this".len())
+            .any(|window| window == b"never-store-this"),
+        "role password leaked into WAL"
+    );
+
+    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT rolname, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit
+           FROM pg_roles WHERE rolname = 'durable';
+         SELECT parent.rolname, child.rolname, membership.admin_option
+           FROM pg_auth_members membership
+           JOIN pg_roles parent ON parent.oid = membership.roleid
+           JOIN pg_roles child ON child.oid = membership.member",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["durable|f|t|t|t|7", "durable|durable_member|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn object_ownership_and_acl_enforce_and_replay() {
+    let config = test_config("object-acl-wal-replay");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE app_owner;
+         CREATE ROLE app_reader;
+         GRANT CREATE ON SCHEMA public TO app_owner;
+         SET ROLE app_owner;
+         CREATE TABLE secured (id int PRIMARY KEY, value text);
+         INSERT INTO secured VALUES (1, 'visible');
+         RESET ROLE;
+         GRANT SELECT ON TABLE secured TO app_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE app_reader; SELECT value FROM secured",
+    );
+    assert_eq!(data_rows(&output), ["visible"]);
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE app_reader; INSERT INTO secured VALUES (2, 'hidden')",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("permission denied for table secured"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE secured OWNER TO app_reader;
+         SELECT tableowner FROM pg_tables WHERE tablename = 'secured';",
+    );
+    assert_eq!(data_rows(&output), ["app_reader"]);
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SET ROLE app_reader;
+         SELECT value FROM secured;
+         INSERT INTO secured VALUES (2, 'owned');
+         SELECT count(*) FROM secured;",
+    );
+    assert_eq!(data_rows(&output), ["visible", "2"]);
+}
+
+#[test]
+fn role_membership_controls_set_role_and_catalog_rows() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         GRANT parent TO child WITH ADMIN OPTION, INHERIT FALSE, SET TRUE;
+         SELECT parent.rolname, child.rolname, membership.admin_option,
+                membership.inherit_option, membership.set_option
+           FROM pg_auth_members membership
+           JOIN pg_roles parent ON parent.oid = membership.roleid
+           JOIN pg_roles child ON child.oid = membership.member;
+         SET ROLE child;
+         SET ROLE parent;
+         SELECT current_user, session_user;
+         RESET ROLE;
+         REVOKE ADMIN OPTION FOR parent FROM child;
+         SELECT admin_option, inherit_option, set_option FROM pg_auth_members;
+         REVOKE parent FROM child;
+         SELECT count(*) FROM pg_auth_members;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["parent|child|t|f|t", "parent|postgres", "f|f|t", "0",],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn create_role_membership_clauses_match_grant_role_state() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE parent;
+         CREATE ROLE ordinary_member;
+         CREATE ROLE administrative_member;
+         CREATE ROLE bundle IN ROLE parent ROLE ordinary_member ADMIN administrative_member;
+         SELECT parent.rolname, child.rolname, membership.admin_option
+           FROM pg_auth_members membership
+           JOIN pg_roles parent ON parent.oid = membership.roleid
+           JOIN pg_roles child ON child.oid = membership.member
+          ORDER BY parent.rolname, child.rolname;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "bundle|administrative_member|t",
+            "bundle|ordinary_member|f",
+            "parent|bundle|f",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
+    let config = test_config("role-view-acl-replay");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE provisional;
+         ALTER ROLE provisional RENAME TO app_owner;
+         CREATE ROLE app_reader;
+         GRANT CREATE ON SCHEMA public TO app_owner;
+         SET ROLE app_owner;
+         CREATE TABLE private_rows (id int, value text);
+         INSERT INTO private_rows VALUES (1, 'through-view');
+         CREATE VIEW exposed_rows AS SELECT value FROM private_rows;
+         CREATE SEQUENCE exposed_sequence;
+         RESET ROLE;
+         GRANT SELECT ON exposed_rows TO app_reader;
+         GRANT USAGE ON SEQUENCE exposed_sequence TO app_reader;
+         SELECT oid, pg_get_userbyid(oid) FROM pg_roles WHERE rolname = 'app_owner';
+         SELECT has_table_privilege('app_reader', 'exposed_rows', 'SELECT'),
+                has_table_privilege('app_reader', 'private_rows', 'SELECT'),
+                has_sequence_privilege('app_reader', 'exposed_sequence', 'USAGE'),
+                has_schema_privilege('app_reader', 'public', 'USAGE');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["16385|app_owner", "t|f|t|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE app_reader;
+         SELECT value FROM exposed_rows;
+         SELECT nextval('exposed_sequence');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["through-view", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE app_reader; SELECT setval('exposed_sequence', 20)",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("permission denied for sequence"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    let dependent = run_with(&mut engine, &mut budget, "DROP ROLE app_owner");
+    assert!(
+        String::from_utf8_lossy(&dependent).contains("some objects depend on it"),
+        "{}",
+        String::from_utf8_lossy(&dependent)
+    );
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SET ROLE app_reader;
+         SELECT value FROM exposed_rows;
+         SELECT has_table_privilege('app_reader', 'exposed_rows', 'SELECT');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["through-view", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn role_ownership_and_acl_survive_cold_object_store_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("role-acl-cold-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-role-acl-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE durable_owner;
+         CREATE ROLE durable_reader IN ROLE durable_owner;
+         CREATE ROLE unprivileged;
+         REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+         GRANT USAGE, CREATE ON SCHEMA public TO durable_owner;
+         GRANT USAGE ON SCHEMA public TO durable_reader;
+         SET ROLE durable_owner;
+         CREATE TABLE durable_private (id int, value text);
+         INSERT INTO durable_private VALUES (1, 'object-authority');
+         CREATE VIEW durable_exposed AS SELECT value FROM durable_private;
+         CREATE SEQUENCE durable_sequence;
+         CREATE TYPE durable_state AS ENUM ('ready', 'blocked');
+         RESET ROLE;
+         REVOKE USAGE ON TYPE durable_state FROM PUBLIC;
+         GRANT SELECT ON durable_exposed TO durable_reader;
+         GRANT USAGE ON SEQUENCE durable_sequence TO durable_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SET ROLE durable_reader;
+         SELECT value FROM durable_exposed;
+         SELECT nextval('durable_sequence');
+         RESET ROLE;
+         SELECT has_schema_privilege('unprivileged', 'public', 'USAGE'),
+                has_table_privilege('durable_reader', 'durable_exposed', 'SELECT'),
+                has_type_privilege('unprivileged', 'durable_state', 'USAGE'),
+                pg_get_userbyid(c.relowner)
+           FROM pg_class c
+          WHERE c.relname = 'durable_private';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["object-authority", "1", "f|t|f|durable_owner",],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn foreign_keys_require_references_privilege_on_parent() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE parent_owner;
+         CREATE ROLE child_builder;
+         GRANT CREATE ON SCHEMA public TO parent_owner, child_builder;
+         SET ROLE parent_owner;
+         CREATE TABLE referenced_parent (id int PRIMARY KEY);
+         RESET ROLE;",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE child_builder;
+         CREATE TABLE denied_child (parent_id int REFERENCES referenced_parent(id));",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("permission denied for table referenced_parent"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT REFERENCES ON referenced_parent TO child_builder;
+         SET ROLE child_builder;
+         CREATE TABLE allowed_child (parent_id int REFERENCES referenced_parent(id));",
+    );
+    assert!(
+        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+}
+
+#[test]
+fn user_defined_type_usage_defaults_to_public_and_can_be_revoked() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE type_owner;
+         CREATE ROLE type_user;
+         GRANT CREATE ON SCHEMA public TO type_owner, type_user;
+         SET ROLE type_owner;
+         CREATE TYPE deployment_state AS ENUM ('ready', 'blocked');
+         RESET ROLE;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE type_user;
+         CREATE TABLE default_type_access (state deployment_state);
+         RESET ROLE;
+         SELECT has_type_privilege('type_user', 'deployment_state', 'USAGE');",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["t"]);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE USAGE ON TYPE deployment_state FROM PUBLIC;
+         SET ROLE type_user;
+         CREATE TABLE denied_type_access (state deployment_state);",
+    );
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(
+        rendered.contains("permission denied for type deployment_state"),
+        "{rendered}"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT has_type_privilege('type_user', 'deployment_state', 'USAGE');",
+    );
+    assert_eq!(data_rows(&output), ["f"]);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT USAGE ON TYPE deployment_state TO type_user;
+         SET ROLE type_user;
+         CREATE TABLE explicit_type_access (state deployment_state);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 fn message_types(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -115,6 +671,21 @@ fn message_types(bytes: &[u8]) -> Vec<u8> {
         i += 1 + len;
     }
     out
+}
+
+fn command_tags(bytes: &[u8]) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let message_type = bytes[index];
+        let length = i32::from_be_bytes(bytes[index + 1..index + 5].try_into().unwrap()) as usize;
+        if message_type == b'C' {
+            let payload = &bytes[index + 5..index + 1 + length - 1];
+            tags.push(core::str::from_utf8(payload).unwrap().to_owned());
+        }
+        index += 1 + length;
+    }
+    tags
 }
 
 /// Extracts text values from DataRow messages, '|'-joined per row.
@@ -147,6 +718,20 @@ fn data_rows(bytes: &[u8]) -> Vec<String> {
         i += 1 + len;
     }
     out
+}
+
+#[test]
+fn reset_role_uses_postgresql_reset_command_tag() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE command_tag_role; SET ROLE command_tag_role; RESET ROLE; SET ROLE NONE",
+    );
+    assert_eq!(
+        command_tags(&output),
+        ["CREATE ROLE", "SET", "RESET", "SET"]
+    );
 }
 
 #[test]
@@ -840,10 +1425,7 @@ fn uncommitted_create_index_is_invisible_to_other_sessions() {
     run_txn(&mut e, &mut b, &mut a, "BEGIN");
     run_txn(&mut e, &mut b, &mut a, "CREATE INDEX t_id ON t (id)");
     let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
-    assert!(
-        conflict.is_empty(),
-        "concurrent create waits: {conflict}"
-    );
+    assert!(conflict.is_empty(), "concurrent create waits: {conflict}");
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
     // After rollback the resumed statement sees that the name is free.
     let reuse = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
@@ -3020,11 +3602,15 @@ fn sequence_advance_in_creating_transaction_survives_restart() {
 #[test]
 fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     let mut config = test_config("sequence_journal_retry");
-    config.wal_bytes = 100;
+    config.wal_bytes = 120;
     let mut budget = Budget::new(1 << 25);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");
-    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
     let slot = engine.storage.sequence_slot("public", "s", 0).unwrap();
     assert!(!engine.storage.sequence(slot).dirty.get());
 
@@ -3757,14 +4343,20 @@ fn altered_table_survives_restart() {
         let mut b = Budget::new(1 << 25);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE a (id int, v text)");
+        run_with(&mut e, &mut b, "CREATE INDEX a_v_idx ON a (v)");
         run_with(&mut e, &mut b, "INSERT INTO a VALUES (1, 'one')");
         run_with(&mut e, &mut b, "ALTER TABLE a ADD COLUMN n int DEFAULT 42");
         run_with(&mut e, &mut b, "ALTER TABLE a RENAME TO b");
     }
     let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
-    let bytes = run_with(&mut e, &mut b, "SELECT id, v, n FROM b");
-    assert_eq!(data_rows(&bytes), ["1|one|42"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT id, v, n FROM b;
+         SELECT tablename FROM pg_indexes WHERE indexname = 'a_v_idx';",
+    );
+    assert_eq!(data_rows(&bytes), ["1|one|42", "b"]);
 }
 
 #[test]
@@ -7262,7 +7854,12 @@ fn rollback_to_savepoint_releases_only_subtransaction_locks() {
         &mut owner,
         "LOCK TABLE savepoint_locks IN ACCESS SHARE MODE",
     );
-    run_txn(&mut engine, &mut budget, &mut owner, "SAVEPOINT before_share");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SAVEPOINT before_share",
+    );
     run_txn(
         &mut engine,
         &mut budget,
@@ -9323,13 +9920,13 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
         ]
     );
     let union_output = run_with(
-            &mut restarted,
-            &mut restarted_budget,
-            "SELECT id FROM external_rows WHERE id <= 4
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT id FROM external_rows WHERE id <= 4
              UNION
              SELECT id FROM external_rows WHERE id BETWEEN 3 AND 6
              ORDER BY id DESC",
-        );
+    );
     assert_eq!(
         data_rows(&union_output),
         ["6", "5", "4", "3", "2", "1"],

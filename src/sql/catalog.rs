@@ -68,6 +68,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_sequences"
                 | "pg_sequence"
                 | "pg_roles"
+                | "pg_authid"
                 | "pg_database"
                 | "pg_am"
                 | "pg_index"
@@ -158,8 +159,8 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_type") => pg_type(storage, arena),
-        (false, "pg_namespace") => pg_namespace(storage, arena),
+        (false, "pg_type") => pg_type(storage, txid, arena),
+        (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
         (false, "pg_am") => finish(
@@ -772,14 +773,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_auth_members") => finish(
-            def_of(
-                "pg_auth_members",
-                &[("roleid", ColType::Int4), ("member", ColType::Int4)],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_auth_members") => pg_auth_members(storage, txid, arena),
         (false, "pg_db_role_setting") => finish(
             def_of(
                 "pg_db_role_setting",
@@ -864,47 +858,8 @@ pub fn synthesize<'a>(
                 arena,
             )
         }
-        (false, "pg_roles") => {
-            let user = super::eval::funcs::system::session_user_owned();
-            finish(
-                def_of(
-                    "pg_roles",
-                    &[
-                        ("oid", ColType::Int4),
-                        ("rolname", ColType::Name),
-                        ("rolsuper", ColType::Bool),
-                        ("rolinherit", ColType::Bool),
-                        ("rolcreaterole", ColType::Bool),
-                        ("rolcreatedb", ColType::Bool),
-                        ("rolcanlogin", ColType::Bool),
-                        ("rolconnlimit", ColType::Int4),
-                        ("rolvaliduntil", ColType::Timestamptz),
-                        ("rolreplication", ColType::Bool),
-                        ("rolbypassrls", ColType::Bool),
-                    ],
-                ),
-                &[row(
-                    &[
-                        Datum::Int4(10),
-                        text(
-                            arena.alloc_str(user.as_str()).map_err(|_| arena_full())?,
-                            arena,
-                        )?,
-                        Datum::Bool(true),
-                        Datum::Bool(true),
-                        Datum::Bool(true),
-                        Datum::Bool(true),
-                        Datum::Bool(true),
-                        Datum::Int4(-1),
-                        Datum::Null,
-                        Datum::Bool(true),
-                        Datum::Bool(true),
-                    ],
-                    arena,
-                )?],
-                arena,
-            )
-        }
+        (false, "pg_roles") => pg_roles(storage, txid, arena),
+        (false, "pg_authid") => pg_authid(storage, txid, arena),
         (false, "pg_description") => pg_description(storage, txid, arena),
         (false, "pg_seclabels") => finish(
             def_of(
@@ -974,7 +929,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_matviews") => pg_matviews(storage, txid, arena),
-        (false, "pg_sequences") => pg_sequences(storage, arena),
+        (false, "pg_sequences") => pg_sequences(storage, txid, arena),
         (false, "pg_sequence") => pg_sequence(storage, arena),
         (false, "pg_database") => finish(
             def_of(
@@ -1027,6 +982,139 @@ fn table_oid(_storage: &Storage, slot: usize) -> i32 {
     FIRST_USER_OID + slot as i32
 }
 
+fn owner_oid(storage: &Storage, class: crate::storage::AccessClass, slot: usize, txid: u32) -> i32 {
+    Storage::role_oid(storage.object_owner(
+        crate::storage::AccessObject {
+            class,
+            slot: slot as u16,
+        },
+        txid,
+    ))
+}
+
+fn owner_name<'a>(
+    storage: &Storage,
+    class: crate::storage::AccessClass,
+    slot: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let role = storage.object_owner(
+        crate::storage::AccessObject {
+            class,
+            slot: slot as u16,
+        },
+        txid,
+    );
+    text(storage.role_name(role, txid).as_str(), arena)
+}
+
+fn acl<'a>(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use core::fmt::Write;
+    let has_entries = storage.acl_entries().any(|(slot, entry)| {
+        entry.object == object
+            && (storage.acl_state(slot, txid).0.0 != 0
+                || (matches!(
+                    object.class,
+                    crate::storage::AccessClass::Domain | crate::storage::AccessClass::Enum
+                ) && entry.grantee == crate::storage::PUBLIC_ROLE))
+    });
+    if !has_entries {
+        return Ok(Datum::Null);
+    }
+    let mut values = [Datum::Null; crate::storage::MAX_ACL_ENTRIES + 1];
+    let owner = storage.object_owner(object, txid);
+    let owner_name = storage.role_name(owner, txid);
+    let all = match object.class {
+        crate::storage::AccessClass::Table
+        | crate::storage::AccessClass::View
+        | crate::storage::AccessClass::MaterializedView => crate::storage::PrivilegeSet::TABLE_ALL,
+        crate::storage::AccessClass::Sequence => crate::storage::PrivilegeSet::SEQUENCE_ALL,
+        crate::storage::AccessClass::Schema => crate::storage::PrivilegeSet::SCHEMA_ALL,
+        crate::storage::AccessClass::Domain | crate::storage::AccessClass::Enum => {
+            crate::storage::PrivilegeSet::TYPE_ALL
+        }
+        crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
+    };
+    let render = |grantee: &str,
+                  grantor: &str,
+                  privileges: crate::storage::PrivilegeSet,
+                  grant_options: crate::storage::PrivilegeSet,
+                  output: &mut StackStr<256>| {
+        let _ = write!(output, "{grantee}=");
+        let letters = [
+            (crate::storage::PrivilegeSet::SELECT, 'r'),
+            (crate::storage::PrivilegeSet::INSERT, 'a'),
+            (crate::storage::PrivilegeSet::UPDATE, 'w'),
+            (crate::storage::PrivilegeSet::DELETE, 'd'),
+            (crate::storage::PrivilegeSet::TRUNCATE, 'D'),
+            (crate::storage::PrivilegeSet::REFERENCES, 'x'),
+            (crate::storage::PrivilegeSet::TRIGGER, 't'),
+            (crate::storage::PrivilegeSet::USAGE, 'U'),
+            (crate::storage::PrivilegeSet::CREATE, 'C'),
+        ];
+        for (privilege, letter) in letters {
+            if privileges.contains(privilege) {
+                let _ = write!(output, "{letter}");
+                if grant_options.contains(privilege) {
+                    let _ = write!(output, "*");
+                }
+            }
+        }
+        let _ = write!(output, "/{grantor}");
+    };
+    let mut owner_acl = StackStr::<256>::new();
+    render(
+        owner_name.as_str(),
+        owner_name.as_str(),
+        all,
+        crate::storage::PrivilegeSet::NONE,
+        &mut owner_acl,
+    );
+    values[0] = Datum::Text(
+        arena
+            .alloc_str(owner_acl.as_str())
+            .map_err(|_| arena_full())?,
+    );
+    let mut count = 1usize;
+    for (slot, entry) in storage.acl_entries() {
+        if entry.object != object {
+            continue;
+        }
+        let (privileges, grant_options) = storage.acl_state(slot, txid);
+        if privileges.0 == 0 {
+            continue;
+        }
+        let grantee_name = (entry.grantee != crate::storage::PUBLIC_ROLE)
+            .then(|| storage.role_name(entry.grantee as usize, txid));
+        let grantee = grantee_name.as_ref().map_or("", |name| name.as_str());
+        let grantor = storage.role_name(entry.grantor as usize, txid);
+        let mut rendered = StackStr::<256>::new();
+        render(
+            grantee,
+            grantor.as_str(),
+            privileges,
+            grant_options,
+            &mut rendered,
+        );
+        values[count] = Datum::Text(
+            arena
+                .alloc_str(rendered.as_str())
+                .map_err(|_| arena_full())?,
+        );
+        count += 1;
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Text,
+        raw: super::array::build(&values[..count], arena)?,
+    })
+}
+
 /// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
 /// schema's OID is derived from its registry slot, above the table range.
 const FIRST_SCHEMA_OID: i32 = 80_000;
@@ -1038,6 +1126,17 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
             .find_schema(schema)
             .map(|slot| FIRST_SCHEMA_OID + slot as i32)
             .unwrap_or(0),
+    }
+}
+
+pub(crate) fn schema_name_by_oid(storage: &Storage, oid: i32) -> Option<&str> {
+    match oid {
+        PUBLIC_NS_OID => Some("public"),
+        PG_CATALOG_NS_OID => Some("pg_catalog"),
+        _ => storage
+            .live_schemas()
+            .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
+            .map(|(_, schema)| schema.name.as_str()),
     }
 }
 
@@ -2205,7 +2304,7 @@ fn pg_class<'a>(
             ("relreplident", ColType::Bpchar),
             ("tableoid", ColType::Int4),
             ("reltype", ColType::Int4),
-            ("relacl", ColType::Text),
+            ("relacl", ColType::Array(super::types::ArrElem::Text)),
             ("relallvisible", ColType::Int4),
             ("relallfrozen", ColType::Int4),
             ("relfrozenxid", ColType::Int4),
@@ -2265,6 +2364,19 @@ fn pg_class<'a>(
         } else {
             "r"
         };
+        let relation_object = storage
+            .matview_slot(table_def.schema.as_str(), table_def.name.as_str(), txid)
+            .map_or(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Table,
+                    slot: slot as u16,
+                },
+                |matview| crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::MaterializedView,
+                    slot: matview as u16,
+                },
+            );
+        let relation_owner = Storage::role_oid(storage.object_owner(relation_object, txid));
         out[n] = row(
             &[
                 Datum::Int4(toid),
@@ -2274,8 +2386,8 @@ fn pg_class<'a>(
                 Datum::Int4(table_def.n_columns as i32),
                 Datum::Float8(reltuples),
                 Datum::Int4(relpages),
-                Datum::Int4(0),        // relam
-                Datum::Int4(10),       // relowner (a role oid)
+                Datum::Int4(0), // relam
+                Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
                 Datum::Bool(has_index),
                 Datum::Bool(false),        // relhasrules
@@ -2290,7 +2402,7 @@ fn pg_class<'a>(
                 text("d", arena)?,         // relreplident: default
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
-                Datum::Null,
+                acl(storage, relation_object, txid, arena)?,
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
@@ -2321,7 +2433,12 @@ fn pg_class<'a>(
                 Datum::Float8(0.0),
                 Datum::Int4(0),   // relpages
                 Datum::Int4(403), // relam: btree
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Table,
+                    info.table_slot,
+                    txid,
+                )),
                 Datum::Int4(0), // relchecks
                 Datum::Bool(false),
                 Datum::Bool(false),
@@ -2364,7 +2481,12 @@ fn pg_class<'a>(
                 Datum::Float8(1.0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Sequence,
+                    slot,
+                    txid,
+                )),
                 Datum::Int4(0),
                 Datum::Bool(false),
                 Datum::Bool(false),
@@ -2379,7 +2501,15 @@ fn pg_class<'a>(
                 text("n", arena)?, // relreplident: nothing (sequences)
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(0),
-                Datum::Null,
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Sequence,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
@@ -2410,7 +2540,12 @@ fn pg_class<'a>(
                 Datum::Float8(0.0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::View,
+                    slot,
+                    txid,
+                )),
                 Datum::Int4(0),
                 Datum::Bool(false),
                 Datum::Bool(true), // a view is represented by a rewrite rule
@@ -2425,7 +2560,15 @@ fn pg_class<'a>(
                 text("n", arena)?,
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
-                Datum::Null,
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::View,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
@@ -3312,7 +3455,7 @@ fn pg_enum<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
     finish(def, &out[..n], arena)
 }
 
-fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_type",
         &[
@@ -3451,9 +3594,22 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 },
                 text("", arena)?,
                 text("", arena)?,
-                Datum::Null,
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Domain,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
                 Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Domain,
+                    slot,
+                    txid,
+                )),
                 Datum::Bool(true),
                 text(if d.base.typlen() < 0 { "x" } else { "p" }, arena)?,
             ],
@@ -3486,7 +3642,12 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Domain,
+                    slot,
+                    txid,
+                )),
                 Datum::Bool(true),
                 text("x", arena)?,
             ],
@@ -3519,9 +3680,22 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 Datum::Null,
                 text("", arena)?,
                 text("", arena)?,
-                Datum::Null,
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Enum,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
                 Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Enum,
+                    slot,
+                    txid,
+                )),
                 Datum::Bool(true),
                 text("p", arena)?,
             ],
@@ -3554,7 +3728,12 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Enum,
+                    slot,
+                    txid,
+                )),
                 Datum::Bool(true),
                 text("x", arena)?,
             ],
@@ -3587,7 +3766,21 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
+                Datum::Int4(
+                    storage
+                        .matview_slot(table.def.schema.as_str(), table.def.name.as_str(), txid)
+                        .map_or(
+                            owner_oid(storage, crate::storage::AccessClass::Table, slot, txid),
+                            |matview| {
+                                owner_oid(
+                                    storage,
+                                    crate::storage::AccessClass::MaterializedView,
+                                    matview,
+                                    txid,
+                                )
+                            },
+                        ),
+                ),
                 Datum::Bool(true),
                 text("x", arena)?,
             ],
@@ -3619,7 +3812,12 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
                 text("", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::View,
+                    slot,
+                    txid,
+                )),
                 Datum::Bool(true),
                 text("x", arena)?,
             ],
@@ -3630,7 +3828,11 @@ fn pg_type<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
     finish(def, &out[..n], arena)
 }
 
-fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_namespace<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_namespace",
         &[
@@ -3638,7 +3840,7 @@ fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
             ("oid", ColType::Int4),
             ("nspname", ColType::Text),
             ("nspowner", ColType::Int4),
-            ("nspacl", ColType::Text),
+            ("nspacl", ColType::Array(super::types::ArrElem::Text)),
         ],
     );
     let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
@@ -3654,7 +3856,7 @@ fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
         arena,
     )?;
     let mut n = 1;
-    for (_, schema) in storage.live_schemas() {
+    for (slot, schema) in storage.live_schemas() {
         out[n] = row(
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
@@ -3665,8 +3867,21 @@ fn pg_namespace<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
-                Datum::Int4(10),
-                Datum::Null,
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Schema,
+                    slot,
+                    txid,
+                )),
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Schema,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
             ],
             arena,
         )?;
@@ -3792,18 +4007,273 @@ fn pg_tables<'a>(
                     arena,
                 )?,
                 text(table.name.as_str(), arena)?,
-                text(
-                    arena
-                        .alloc_str(crate::sql::eval::funcs::system::session_user_owned().as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
+                storage
+                    .matview_slot(table.schema.as_str(), table.name.as_str(), txid)
+                    .map_or_else(
+                        || {
+                            owner_name(
+                                storage,
+                                crate::storage::AccessClass::Table,
+                                slot,
+                                txid,
+                                arena,
+                            )
+                        },
+                        |matview| {
+                            owner_name(
+                                storage,
+                                crate::storage::AccessClass::MaterializedView,
+                                matview,
+                                txid,
+                                arena,
+                            )
+                        },
+                    )?,
             ],
             arena,
         )?;
         n += 1;
     }
     finish(def, &out[..n], arena)
+}
+
+fn pg_roles<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_roles",
+        &[
+            ("oid", ColType::Int4),
+            ("rolname", ColType::Name),
+            ("rolsuper", ColType::Bool),
+            ("rolinherit", ColType::Bool),
+            ("rolcreaterole", ColType::Bool),
+            ("rolcreatedb", ColType::Bool),
+            ("rolcanlogin", ColType::Bool),
+            ("rolconnlimit", ColType::Int4),
+            ("rolvaliduntil", ColType::Timestamptz),
+            ("rolreplication", ColType::Bool),
+            ("rolbypassrls", ColType::Bool),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let mut count = 0usize;
+    for slot in 0..storage.role_count() {
+        let role = storage.role(slot);
+        if !role.visible_to(txid) {
+            continue;
+        }
+        let attributes = role.attributes_to(txid);
+        let valid_until = if !attributes.has_valid_until
+            || attributes
+                .valid_until
+                .as_str()
+                .eq_ignore_ascii_case("infinity")
+        {
+            Datum::Null
+        } else {
+            Datum::Timestamptz(crate::sql::datetime::parse_timestamp(
+                attributes.valid_until.as_str(),
+                true,
+            )?)
+        };
+        output[count] = row(
+            &[
+                Datum::Int4(Storage::role_oid(slot)),
+                text(
+                    arena
+                        .alloc_str(role.name_to(txid).as_str())
+                        .map_err(|_| arena_full())?,
+                    arena,
+                )?,
+                Datum::Bool(attributes.superuser),
+                Datum::Bool(attributes.inherit),
+                Datum::Bool(attributes.create_role),
+                Datum::Bool(attributes.create_database),
+                Datum::Bool(attributes.can_login),
+                Datum::Int4(attributes.connection_limit),
+                valid_until,
+                Datum::Bool(attributes.replication),
+                Datum::Bool(attributes.bypass_row_level_security),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(def, &output[..count], arena)
+}
+
+fn append_base64<const N: usize>(bytes: &[u8], output: &mut StackStr<N>) {
+    use core::fmt::Write;
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let remaining = bytes.len() - at;
+        let first = bytes[at];
+        let second = if remaining > 1 { bytes[at + 1] } else { 0 };
+        let third = if remaining > 2 { bytes[at + 2] } else { 0 };
+        let _ = output.write_char(ALPHABET[(first >> 2) as usize] as char);
+        let _ =
+            output.write_char(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        let _ = output.write_char(if remaining > 1 {
+            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        let _ = output.write_char(if remaining > 2 {
+            ALPHABET[(third & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        at += 3;
+    }
+}
+
+fn pg_authid<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if !storage.role(current).attributes_to(txid).superuser {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for table pg_authid"
+        ));
+    }
+    let def = def_of(
+        "pg_authid",
+        &[
+            ("oid", ColType::Int4),
+            ("rolname", ColType::Name),
+            ("rolsuper", ColType::Bool),
+            ("rolinherit", ColType::Bool),
+            ("rolcreaterole", ColType::Bool),
+            ("rolcreatedb", ColType::Bool),
+            ("rolcanlogin", ColType::Bool),
+            ("rolreplication", ColType::Bool),
+            ("rolbypassrls", ColType::Bool),
+            ("rolconnlimit", ColType::Int4),
+            ("rolpassword", ColType::Text),
+            ("rolvaliduntil", ColType::Timestamptz),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let mut count = 0usize;
+    for slot in 0..storage.role_count() {
+        let role = storage.role(slot);
+        if !role.visible_to(txid) {
+            continue;
+        }
+        let attributes = role.attributes_to(txid);
+        let password = if attributes.has_password {
+            use core::fmt::Write;
+            let mut verifier = StackStr::<192>::new();
+            let _ = write!(
+                verifier,
+                "SCRAM-SHA-256${}:",
+                attributes.password.iterations
+            );
+            append_base64(&attributes.password.salt, &mut verifier);
+            let _ = verifier.write_char('$');
+            append_base64(&attributes.password.stored_key, &mut verifier);
+            let _ = verifier.write_char(':');
+            append_base64(&attributes.password.server_key, &mut verifier);
+            if verifier.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "SCRAM verifier exceeds catalog rendering limit"
+                ));
+            }
+            Datum::Text(
+                arena
+                    .alloc_str(verifier.as_str())
+                    .map_err(|_| arena_full())?,
+            )
+        } else {
+            Datum::Null
+        };
+        let valid_until = if !attributes.has_valid_until
+            || attributes
+                .valid_until
+                .as_str()
+                .eq_ignore_ascii_case("infinity")
+        {
+            Datum::Null
+        } else {
+            Datum::Timestamptz(crate::sql::datetime::parse_timestamp(
+                attributes.valid_until.as_str(),
+                true,
+            )?)
+        };
+        output[count] = row(
+            &[
+                Datum::Int4(Storage::role_oid(slot)),
+                text(role.name_to(txid).as_str(), arena)?,
+                Datum::Bool(attributes.superuser),
+                Datum::Bool(attributes.inherit),
+                Datum::Bool(attributes.create_role),
+                Datum::Bool(attributes.create_database),
+                Datum::Bool(attributes.can_login),
+                Datum::Bool(attributes.replication),
+                Datum::Bool(attributes.bypass_row_level_security),
+                Datum::Int4(attributes.connection_limit),
+                password,
+                valid_until,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(def, &output[..count], arena)
+}
+
+fn pg_auth_members<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_auth_members",
+        &[
+            ("roleid", ColType::Int4),
+            ("member", ColType::Int4),
+            ("grantor", ColType::Int4),
+            ("admin_option", ColType::Bool),
+            ("inherit_option", ColType::Bool),
+            ("set_option", ColType::Bool),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_ROLE_MEMBERSHIPS] =
+        [&[]; crate::storage::MAX_ROLE_MEMBERSHIPS];
+    let mut count = 0usize;
+    for slot in 0..storage.role_membership_count() {
+        let membership = storage.role_membership(slot);
+        if !membership.visible_to(txid) {
+            continue;
+        }
+        let options = membership.options_to(txid);
+        output[count] = row(
+            &[
+                Datum::Int4(Storage::role_oid(membership.role as usize)),
+                Datum::Int4(Storage::role_oid(membership.member as usize)),
+                Datum::Int4(Storage::role_oid(membership.grantor as usize)),
+                Datum::Bool(options.admin),
+                Datum::Bool(options.inherit),
+                Datum::Bool(options.set),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(def, &output[..count], arena)
 }
 
 fn pg_views<'a>(
@@ -3831,10 +4301,11 @@ fn pg_views<'a>(
             &[
                 text(view.schema.as_str(), arena)?,
                 text(view.name.as_str(), arena)?,
-                text(
-                    arena
-                        .alloc_str(crate::sql::eval::funcs::system::session_user_owned().as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
+                owner_name(
+                    storage,
+                    crate::storage::AccessClass::View,
+                    slot,
+                    txid,
                     arena,
                 )?,
                 text(view.sql.as_str(), arena)?,
@@ -3884,10 +4355,11 @@ fn pg_matviews<'a>(
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
-                text(
-                    arena
-                        .alloc_str(crate::sql::eval::funcs::system::session_user_owned().as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
+                owner_name(
+                    storage,
+                    crate::storage::AccessClass::MaterializedView,
+                    slot,
+                    txid,
                     arena,
                 )?,
                 Datum::Null,
@@ -3907,7 +4379,11 @@ fn pg_matviews<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn pg_sequences<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_sequences<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_sequences",
         &[
@@ -3926,7 +4402,7 @@ fn pg_sequences<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for seq in storage.live_sequences() {
+    for (slot, seq) in storage.sequences_with_slots() {
         if n == out.len() {
             break;
         }
@@ -3941,8 +4417,11 @@ fn pg_sequences<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
             &[
                 text(seq.schema.as_str(), arena)?,
                 text(seq.name.as_str(), arena)?,
-                text(
-                    crate::sql::eval::funcs::system::session_user_owned().as_str(),
+                owner_name(
+                    storage,
+                    crate::storage::AccessClass::Sequence,
+                    slot,
+                    txid,
                     arena,
                 )?,
                 text(seq.data_type.sql_name(), arena)?,

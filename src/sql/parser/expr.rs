@@ -10,7 +10,7 @@
 use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
-use super::{is_base_prefixed, is_reserved_keyword, ParseError, Parser, MAX_LIST};
+use super::{MAX_LIST, ParseError, Parser, is_base_prefixed, is_reserved_keyword};
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 
 impl<'a> Parser<'a> {
@@ -30,7 +30,11 @@ impl<'a> Parser<'a> {
             if self.peeked == Tok::Op("::") {
                 self.advance()?;
                 let (type_name, type_mod) = self.type_name_mod()?;
-                left = self.arena_expr(Expr::Cast { operand: left, type_name, type_mod })?;
+                left = self.arena_expr(Expr::Cast {
+                    operand: left,
+                    type_name,
+                    type_mod,
+                })?;
                 continue;
             }
             // `IS [NOT] NULL/TRUE/FALSE/UNKNOWN/DISTINCT FROM` binds looser than
@@ -42,7 +46,10 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 let negated = self.eat_ident("not")?;
                 if self.eat_ident("null")? || self.eat_ident("unknown")? {
-                    left = self.arena_expr(Expr::IsNull { operand: left, negated })?;
+                    left = self.arena_expr(Expr::IsNull {
+                        operand: left,
+                        negated,
+                    })?;
                     continue;
                 }
                 let is_true = self.eat_ident("true")?;
@@ -52,12 +59,20 @@ impl<'a> Parser<'a> {
                     let cond = if is_true {
                         left
                     } else {
-                        self.arena_expr(Expr::Unary { operator: UnaryOp::Not, operand: left })?
+                        self.arena_expr(Expr::Unary {
+                            operator: UnaryOp::Not,
+                            operand: left,
+                        })?
                     };
                     let then_v = self.arena_expr(Expr::Bool(!negated))?;
                     let else_v = self.arena_expr(Expr::Bool(negated))?;
                     let whens = self.arena_slice(&[(cond, then_v)])?;
-                    left = self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(else_v), synthetic: true })?;
+                    left = self.arena_expr(Expr::Case {
+                        operand: None,
+                        whens,
+                        otherwise: Some(else_v),
+                        synthetic: true,
+                    })?;
                     continue;
                 }
                 if self.eat_ident("distinct")? {
@@ -66,20 +81,32 @@ impl<'a> Parser<'a> {
                     left = self.build_distinct_from(left, right, negated)?;
                     continue;
                 }
-                return Err(self.err_here("expected NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS"));
+                return Err(
+                    self.err_here("expected NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS")
+                );
             }
             // Array subscript `base[index]` or slice `base[lo:hi]` (1-based,
             // either slice bound optional: `[lo:]`, `[:hi]`, `[:]`).
             if self.peeked == Tok::Op("[") {
                 self.advance()?;
-                let lower =
-                    if self.peeked == Tok::Op(":") { None } else { Some(self.expression(0)?) };
+                let lower = if self.peeked == Tok::Op(":") {
+                    None
+                } else {
+                    Some(self.expression(0)?)
+                };
                 if self.peeked == Tok::Op(":") {
                     self.advance()?;
-                    let upper =
-                        if self.peeked == Tok::Op("]") { None } else { Some(self.expression(0)?) };
+                    let upper = if self.peeked == Tok::Op("]") {
+                        None
+                    } else {
+                        Some(self.expression(0)?)
+                    };
                     self.expect_op("]")?;
-                    left = self.arena_expr(Expr::Slice { base: left, lower, upper })?;
+                    left = self.arena_expr(Expr::Slice {
+                        base: left,
+                        lower,
+                        upper,
+                    })?;
                 } else {
                     self.expect_op("]")?;
                     let index = lower.expect("non-slice subscript has an index");
@@ -165,10 +192,15 @@ impl<'a> Parser<'a> {
                     // Infix NOT must introduce one of these forms.
                     if !matches!(
                         self.peeked,
-                        Tok::Ident("in") | Tok::Ident("between") | Tok::Ident("like")
-                            | Tok::Ident("ilike") | Tok::Ident("similar")
+                        Tok::Ident("in")
+                            | Tok::Ident("between")
+                            | Tok::Ident("like")
+                            | Tok::Ident("ilike")
+                            | Tok::Ident("similar")
                     ) {
-                        return Err(self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT"));
+                        return Err(
+                            self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT")
+                        );
                     }
                     true
                 } else {
@@ -220,7 +252,12 @@ impl<'a> Parser<'a> {
                     let low = self.expression(5)?;
                     self.expect_ident("and")?;
                     let high = self.expression(5)?;
-                    left = self.arena_expr(Expr::Between { operand: left, low, high, negated })?;
+                    left = self.arena_expr(Expr::Between {
+                        operand: left,
+                        low,
+                        high,
+                        negated,
+                    })?;
                     if symmetric {
                         // `x BETWEEN SYMMETRIC a AND b` holds when x lies between
                         // the two bounds in either order, which is the pair of
@@ -253,7 +290,11 @@ impl<'a> Parser<'a> {
                         self.expect_op("(")?;
                         let array = self.expression(0)?;
                         self.expect_op(")")?;
-                        let operator = if ilike { BinaryOp::ILike } else { BinaryOp::Like };
+                        let operator = if ilike {
+                            BinaryOp::ILike
+                        } else {
+                            BinaryOp::Like
+                        };
                         // NOT LIKE ANY == NOT (LIKE ALL), and vice versa.
                         let inner = self.arena_expr(Expr::AnyAll {
                             operand: left,
@@ -313,7 +354,9 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if negated {
-                    return Err(self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT"));
+                    return Err(
+                        self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT")
+                    );
                 }
             }
             // POSIX regex match operators bind like comparisons.
@@ -339,7 +382,10 @@ impl<'a> Parser<'a> {
             self.advance()?;
             // Quantified comparison: `operand operator ANY/ALL (array)` or
             // `... (subquery)`.
-            if matches!(self.peeked, Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")) {
+            if matches!(
+                self.peeked,
+                Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")
+            ) {
                 let all = self.peeked == Tok::Ident("all");
                 self.advance()?;
                 self.expect_op("(")?;
@@ -367,17 +413,31 @@ impl<'a> Parser<'a> {
                         })?
                     } else {
                         let array = self.arena_expr(Expr::ArraySubquery(boxed))?;
-                        self.arena_expr(Expr::AnyAll { operand: left, operator, array, all })?
+                        self.arena_expr(Expr::AnyAll {
+                            operand: left,
+                            operator,
+                            array,
+                            all,
+                        })?
                     };
                     continue;
                 }
                 let array = self.expression(0)?;
                 self.expect_op(")")?;
-                left = self.arena_expr(Expr::AnyAll { operand: left, operator, array, all })?;
+                left = self.arena_expr(Expr::AnyAll {
+                    operand: left,
+                    operator,
+                    array,
+                    all,
+                })?;
                 continue;
             }
             let right = self.expression(operator.precedence() + 1)?;
-            left = self.arena_expr(Expr::Binary { operator, left, right })?;
+            left = self.arena_expr(Expr::Binary {
+                operator,
+                left,
+                right,
+            })?;
         }
     }
 
@@ -390,10 +450,9 @@ impl<'a> Parser<'a> {
                 // token is integral unless it has a decimal point or exponent.
                 let prefixed = is_base_prefixed(text);
                 let looks_integral = prefixed || !text.contains(['.', 'e', 'E']);
-                if looks_integral
-                    && let Some(v) = crate::sql::eval::parse_int_literal(text) {
-                        return self.arena_expr(Expr::Int(v));
-                    }
+                if looks_integral && let Some(v) = crate::sql::eval::parse_int_literal(text) {
+                    return self.arena_expr(Expr::Int(v));
+                }
                 // Decimal / exponent literals are NUMERIC in PostgreSQL; keep
                 // the text and parse it exactly at eval time.
                 self.arena_expr(Expr::NumericLit(text))
@@ -502,7 +561,10 @@ impl<'a> Parser<'a> {
             Tok::Op("~") => {
                 self.advance()?;
                 let operand = self.expression(8)?;
-                self.arena_expr(Expr::Unary { operator: UnaryOp::BitNot, operand })
+                self.arena_expr(Expr::Unary {
+                    operator: UnaryOp::BitNot,
+                    operand,
+                })
             }
             Tok::Op("-") => {
                 self.advance()?;
@@ -518,13 +580,17 @@ impl<'a> Parser<'a> {
                     let cast_follows = self.next_is_cast()?;
                     if integral
                         && !cast_follows
-                        && let Some(v) = crate::sql::eval::parse_int_literal(text) {
-                            self.advance()?;
-                            return self.arena_expr(Expr::Int(-v));
-                        }
+                        && let Some(v) = crate::sql::eval::parse_int_literal(text)
+                    {
+                        self.advance()?;
+                        return self.arena_expr(Expr::Int(-v));
+                    }
                 }
                 let operand = self.expression(8)?;
-                self.arena_expr(Expr::Unary { operator: UnaryOp::Neg, operand })
+                self.arena_expr(Expr::Unary {
+                    operator: UnaryOp::Neg,
+                    operand,
+                })
             }
             Tok::Op("+") => {
                 self.advance()?;
@@ -533,7 +599,10 @@ impl<'a> Parser<'a> {
             Tok::Ident("not") => {
                 self.advance()?;
                 let operand = self.expression(3)?;
-                self.arena_expr(Expr::Unary { operator: UnaryOp::Not, operand })
+                self.arena_expr(Expr::Unary {
+                    operator: UnaryOp::Not,
+                    operand,
+                })
             }
             Tok::Ident("null") => {
                 self.advance()?;
@@ -637,7 +706,11 @@ impl<'a> Parser<'a> {
                 self.expect_ident("as")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
                 self.expect_op(")")?;
-                self.arena_expr(Expr::Cast { operand, type_name, type_mod })
+                self.arena_expr(Expr::Cast {
+                    operand,
+                    type_name,
+                    type_mod,
+                })
             }
             Tok::Ident(name) => {
                 // The reserved-word test below runs after the cursor has moved,
@@ -660,7 +733,8 @@ impl<'a> Parser<'a> {
                 // `ARRAY[...]` array constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("[") {
                     self.advance()?;
-                    let mut items: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
+                    let mut items: [&'a Expr<'a>; MAX_LIST] =
+                        [self.arena_expr(Expr::Null)?; MAX_LIST];
                     let mut n = 0;
                     if self.peeked != Tok::Op("]") {
                         loop {
@@ -701,20 +775,25 @@ impl<'a> Parser<'a> {
                 // exactly `'2020-01-01'::date`. Only fires when the name is a
                 // known type immediately followed by a string.
                 if let Tok::Str(lit) = self.peeked
-                    && crate::sql::types::ColType::from_sql_name(name).is_some() {
-                        self.advance()?;
-                        // `INTERVAL '1' DAY`: the SQL-standard trailing unit
-                        // qualifier interprets an otherwise-unitless value in
-                        // that field, so it is folded into the literal before
-                        // the cast rather than left dangling.
-                        let lit = if name.eq_ignore_ascii_case("interval") {
-                            self.interval_with_qualifier(lit)?
-                        } else {
-                            lit
-                        };
-                        let operand = self.arena_expr(Expr::Str(lit))?;
-                        return self.arena_expr(Expr::Cast { operand, type_name: name, type_mod: -1 });
-                    }
+                    && crate::sql::types::ColType::from_sql_name(name).is_some()
+                {
+                    self.advance()?;
+                    // `INTERVAL '1' DAY`: the SQL-standard trailing unit
+                    // qualifier interprets an otherwise-unitless value in
+                    // that field, so it is folded into the literal before
+                    // the cast rather than left dangling.
+                    let lit = if name.eq_ignore_ascii_case("interval") {
+                        self.interval_with_qualifier(lit)?
+                    } else {
+                        lit
+                    };
+                    let operand = self.arena_expr(Expr::Str(lit))?;
+                    return self.arena_expr(Expr::Cast {
+                        operand,
+                        type_name: name,
+                        type_mod: -1,
+                    });
+                }
                 if self.peeked == Tok::Op(".") {
                     self.advance()?;
                     if self.peeked == Tok::Op("*") {
@@ -759,13 +838,24 @@ impl<'a> Parser<'a> {
                 // temporal ones also take an optional precision.
                 if matches!(
                     name,
-                    "current_date" | "current_timestamp" | "current_time" | "localtimestamp"
-                        | "localtime" | "current_user" | "session_user" | "user"
-                        | "current_catalog" | "current_schema"
+                    "current_date"
+                        | "current_timestamp"
+                        | "current_time"
+                        | "localtimestamp"
+                        | "localtime"
+                        | "current_user"
+                        | "current_role"
+                        | "session_user"
+                        | "user"
+                        | "current_catalog"
+                        | "current_schema"
                 ) {
                     let mut args: &[&'a Expr<'a>] = &[];
                     if self.peeked == Tok::Op("(")
-                        && matches!(name, "current_timestamp" | "current_time" | "localtimestamp" | "localtime")
+                        && matches!(
+                            name,
+                            "current_timestamp" | "current_time" | "localtimestamp" | "localtime"
+                        )
                     {
                         self.advance()?;
                         let precision = self.expression(0)?;
@@ -787,9 +877,15 @@ impl<'a> Parser<'a> {
                 // expression. It cannot come earlier — `ARRAY` is reserved and
                 // so is `current_date`, yet both are ordinary expressions.
                 if is_reserved_keyword(name) {
-                    return Err(ParseError { at: name_at, ..self.unexpected("expected an expression") });
+                    return Err(ParseError {
+                        at: name_at,
+                        ..self.unexpected("expected an expression")
+                    });
                 }
-                self.arena_expr(Expr::Column { qualifier: None, name })
+                self.arena_expr(Expr::Column {
+                    qualifier: None,
+                    name,
+                })
             }
             Tok::QuotedIdent(name) => {
                 self.advance()?;
@@ -823,16 +919,31 @@ impl<'a> Parser<'a> {
                         name: column,
                     });
                 }
-                self.arena_expr(Expr::Column { qualifier: None, name })
+                self.arena_expr(Expr::Column {
+                    qualifier: None,
+                    name,
+                })
             }
             _ => Err(self.unexpected("expected an expression")),
         }
     }
 
     /// Builds a simple function call `name(args)` (no star/distinct/over).
-    pub(super) fn plain_call(&mut self, name: &'a str, args: &[&'a Expr<'a>]) -> Result<&'a Expr<'a>, ParseError> {
+    pub(super) fn plain_call(
+        &mut self,
+        name: &'a str,
+        args: &[&'a Expr<'a>],
+    ) -> Result<&'a Expr<'a>, ParseError> {
         let args = self.arena_slice(args)?;
-        self.arena_expr(Expr::Call { name, args, star: false, distinct: false, order_by: &[], over: None, filter: None })
+        self.arena_expr(Expr::Call {
+            name,
+            args,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
     }
 
     pub(super) fn call(&mut self, name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
@@ -951,8 +1062,7 @@ impl<'a> Parser<'a> {
             // named fields, any subset, positional or `field => value`. Desugar
             // to a fixed seven-argument positional call (missing fields = 0) so
             // the AST and evaluator stay unaware of argument names.
-            const FIELDS: [&str; 7] =
-                ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+            const FIELDS: [&str; 7] = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
             let zero = self.arena_expr(Expr::Int(0))?;
             let mut slots: [&'a Expr<'a>; 7] = [zero; 7];
             let mut pos = 0usize;
@@ -964,8 +1074,15 @@ impl<'a> Parser<'a> {
                         // Named argument: the parsed expression must be a bare
                         // field name; map it to its fixed slot.
                         let field = match first {
-                            Expr::Column { qualifier: None, name } => *name,
-                            _ => return Err(self.err_here("make_interval argument name must be a field")),
+                            Expr::Column {
+                                qualifier: None,
+                                name,
+                            } => *name,
+                            _ => {
+                                return Err(
+                                    self.err_here("make_interval argument name must be a field")
+                                );
+                            }
                         };
                         let idx = FIELDS.iter().position(|f| f.eq_ignore_ascii_case(field));
                         let idx = match idx {
@@ -1056,7 +1173,15 @@ impl<'a> Parser<'a> {
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = self.arena_slice(&args[..n])?;
-        self.arena_expr(Expr::Call { name, args, star: false, distinct, order_by, over, filter })
+        self.arena_expr(Expr::Call {
+            name,
+            args,
+            star: false,
+            distinct,
+            order_by,
+            over,
+            filter,
+        })
     }
 
     /// Consumes an operator or identifier token, returning its text (used
@@ -1106,7 +1231,11 @@ impl<'a> Parser<'a> {
             "||" => BinaryOp::Concat,
             _ => return Err(self.err_here("unsupported operator in OPERATOR()")),
         };
-        self.arena_expr(Expr::Binary { operator: bop, left, right })
+        self.arena_expr(Expr::Binary {
+            operator: bop,
+            left,
+            right,
+        })
     }
 
     /// Desugars `left IS [NOT] DISTINCT FROM right` into a null-safe `CASE`:
@@ -1138,16 +1267,22 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("expected MONTH after YEAR TO"));
             }
             let Some(start) = clock_field_ordinal(word) else {
-                return Err(self.err_here("INTERVAL range must run from a coarser field to a finer"));
+                return Err(
+                    self.err_here("INTERVAL range must run from a coarser field to a finer")
+                );
             };
             let Some((end_word, _)) = self.peek_interval_field() else {
                 return Err(self.err_here("expected an interval field after TO"));
             };
             let Some(end) = clock_field_ordinal(end_word) else {
-                return Err(self.err_here("INTERVAL range must run from a coarser field to a finer"));
+                return Err(
+                    self.err_here("INTERVAL range must run from a coarser field to a finer")
+                );
             };
             if end <= start {
-                return Err(self.err_here("INTERVAL range must run from a coarser field to a finer"));
+                return Err(
+                    self.err_here("INTERVAL range must run from a coarser field to a finer")
+                );
             }
             self.advance()?;
             return self.clock_range(lit, start, end);
@@ -1189,7 +1324,11 @@ impl<'a> Parser<'a> {
         // number that is simply too large for its field is out of range (22015).
         let bad_syntax = || ParseError {
             at: self.peek_at,
-            message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
+            message: crate::stack_format!(
+                96,
+                "invalid input syntax for type interval: \"{}\"",
+                lit
+            ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
         };
         let value = lit.trim();
@@ -1208,7 +1347,13 @@ impl<'a> Parser<'a> {
                 if months.parse::<u32>().map_err(|_| out_of_range())? > 11 {
                     return Err(out_of_range());
                 }
-                crate::stack_format!(48, "{s}{y} year {s}{m} month", s = sign, y = years, m = months)
+                crate::stack_format!(
+                    48,
+                    "{s}{y} year {s}{m} month",
+                    s = sign,
+                    y = years,
+                    m = months
+                )
             }
             None => {
                 if !all_digits(rest) {
@@ -1234,7 +1379,11 @@ impl<'a> Parser<'a> {
     fn clock_range(&mut self, lit: &'a str, start: u8, end: u8) -> Result<&'a str, ParseError> {
         let bad = || ParseError {
             at: self.peek_at,
-            message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
+            message: crate::stack_format!(
+                96,
+                "invalid input syntax for type interval: \"{}\"",
+                lit
+            ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
         };
         let value = lit.trim();
@@ -1269,7 +1418,11 @@ impl<'a> Parser<'a> {
         };
         // The field a two-part clock begins at: HOUR after a day or when the
         // range starts at DAY/HOUR, MINUTE when the range starts at MINUTE.
-        let clock_start = if start == FIELD_MINUTE { FIELD_MINUTE } else { FIELD_HOUR };
+        let clock_start = if start == FIELD_MINUTE {
+            FIELD_MINUTE
+        } else {
+            FIELD_HOUR
+        };
         let mut parts = clock.split(':');
         let a = parts.next().unwrap_or("");
         let b = parts.next();
@@ -1355,7 +1508,11 @@ impl<'a> Parser<'a> {
         if !is_number {
             return Err(ParseError {
                 at: self.peek_at,
-                message: crate::stack_format!(96, "invalid input syntax for type interval: \"{}\"", lit),
+                message: crate::stack_format!(
+                    96,
+                    "invalid input syntax for type interval: \"{}\"",
+                    lit
+                ),
                 sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             });
         }
@@ -1394,16 +1551,43 @@ impl<'a> Parser<'a> {
         right: &'a Expr<'a>,
         negated: bool,
     ) -> Result<&'a Expr<'a>, ParseError> {
-        let l_null = self.arena_expr(Expr::IsNull { operand: left, negated: false })?;
-        let r_null = self.arena_expr(Expr::IsNull { operand: right, negated: false })?;
-        let both = self.arena_expr(Expr::Binary { operator: BinaryOp::And, left: l_null, right: r_null })?;
-        let either = self.arena_expr(Expr::Binary { operator: BinaryOp::Or, left: l_null, right: r_null })?;
-        let cmp_op = if negated { BinaryOp::Eq } else { BinaryOp::NotEq };
-        let cmp = self.arena_expr(Expr::Binary { operator: cmp_op, left, right })?;
+        let l_null = self.arena_expr(Expr::IsNull {
+            operand: left,
+            negated: false,
+        })?;
+        let r_null = self.arena_expr(Expr::IsNull {
+            operand: right,
+            negated: false,
+        })?;
+        let both = self.arena_expr(Expr::Binary {
+            operator: BinaryOp::And,
+            left: l_null,
+            right: r_null,
+        })?;
+        let either = self.arena_expr(Expr::Binary {
+            operator: BinaryOp::Or,
+            left: l_null,
+            right: r_null,
+        })?;
+        let cmp_op = if negated {
+            BinaryOp::Eq
+        } else {
+            BinaryOp::NotEq
+        };
+        let cmp = self.arena_expr(Expr::Binary {
+            operator: cmp_op,
+            left,
+            right,
+        })?;
         let both_val = self.arena_expr(Expr::Bool(negated))?;
         let either_val = self.arena_expr(Expr::Bool(!negated))?;
         let whens = self.arena_slice(&[(both, both_val), (either, either_val)])?;
-        self.arena_expr(Expr::Case { operand: None, whens, otherwise: Some(cmp), synthetic: true })
+        self.arena_expr(Expr::Case {
+            operand: None,
+            whens,
+            otherwise: Some(cmp),
+            synthetic: true,
+        })
     }
 
     pub(super) fn peek_binary_op(&self) -> Option<BinaryOp> {

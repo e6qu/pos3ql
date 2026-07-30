@@ -9,24 +9,35 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::mem::arena::Arena;
-use crate::pg::auth::{AuthMode, ScramFlow, ScramServer, ScramStep};
-use crate::mem::buffer::FixedBuf;
 use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::buffer::FixedBuf;
+use crate::pg::auth::{AuthMode, ScramFlow, ScramServer, ScramStep};
+use crate::sql::Engine;
 use crate::sql::eval::sqlstate;
-use crate::sql::parser::Parser;
 use crate::sql::guc::GucState;
+use crate::sql::parser::Parser;
 use crate::sql::prep::SqlPreparedPool;
 use crate::sql::txn::TxnState;
 use crate::sql::types::Datum;
-use crate::sql::Engine;
 use crate::storage::SqlName;
+use crate::util::StackStr;
 
-use super::respond::{Responder, ResultFmt, MAX_RESULT_COLS};
-use super::wire::{self, MsgIn, WireFull};
 use super::REPORTED_SERVER_VERSION;
+use super::respond::{MAX_RESULT_COLS, Responder, ResultFmt};
+use super::wire::{self, MsgIn, WireFull};
 
 /// Most parameters one Bind may carry.
 pub const MAX_BIND_PARAMS: usize = 32;
+
+fn reject_role_login(
+    mode: AuthMode,
+    role: crate::sql::RoleLogin,
+    bootstrap_fallback: bool,
+) -> bool {
+    let missing_verifier =
+        !matches!(mode, AuthMode::Trust) && role.password.is_none() && !bootstrap_fallback;
+    !role.can_login || !role.valid || missing_verifier
+}
 
 struct Prepared {
     active: bool,
@@ -94,6 +105,12 @@ pub struct Conn {
     pub cursors: crate::sql::cursor::CursorPool,
     pub guc: GucState,
     scram: ScramFlow,
+    role_scram: Option<ScramServer>,
+    auth_role_password: Option<crate::storage::RolePassword>,
+    auth_login: Option<crate::sql::RoleLogin>,
+    authenticated_role: Option<u16>,
+    auth_password: StackStr<256>,
+    auth_reject: bool,
     /// A COPY FROM STDIN in flight: the connection is in copy-in mode, and
     /// frontend messages are CopyData/CopyDone/CopyFail until it ends.
     copy: Option<CopyInProgress>,
@@ -160,6 +177,12 @@ impl Conn {
             cursors: crate::sql::cursor::CursorPool::new(config, budget)?,
             guc: GucState::new(),
             scram: ScramFlow::new(),
+            role_scram: None,
+            auth_role_password: None,
+            auth_login: None,
+            authenticated_role: None,
+            auth_password: StackStr::new(),
+            auth_reject: false,
             copy: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
             prepared,
@@ -197,6 +220,12 @@ impl Conn {
         // left in flight by an abrupt disconnect.
         self.guc = GucState::new();
         self.scram = ScramFlow::new();
+        self.role_scram = None;
+        self.auth_role_password = None;
+        self.auth_login = None;
+        self.authenticated_role = None;
+        self.auth_password = StackStr::new();
+        self.auth_reject = false;
         self.copy = None;
         self.copy_buf.clear();
         self.phase = Phase::Startup;
@@ -234,6 +263,10 @@ impl Conn {
     /// NotificationResponse).
     pub fn id(&self) -> i32 {
         self.id
+    }
+
+    pub(crate) fn authenticated_role(&self) -> Option<u16> {
+        self.authenticated_role
     }
 
     /// Appends an asynchronous NotificationResponse ('A': int32 PID, channel,
@@ -333,9 +366,9 @@ impl Conn {
     ) -> After {
         loop {
             let after = match self.phase {
-                Phase::Startup => self.process_startup(cancel_key, auth, tls_config),
+                Phase::Startup => self.process_startup(engine, cancel_key, auth, tls_config),
                 Phase::AwaitPassword | Phase::AwaitSaslInit | Phase::AwaitSaslFinal => {
-                    self.process_auth(cancel_key, auth)
+                    self.process_auth(engine, cancel_key, auth)
                 }
                 Phase::Ready | Phase::SkipToSync => self.process_message(engine),
             };
@@ -349,9 +382,7 @@ impl Conn {
     }
 
     pub fn retry_parked(&mut self, engine: &mut Engine, generation: u64) -> After {
-        if !self.parked
-            || (self.parked_generation == generation && !self.lock_timeout_expired())
-        {
+        if !self.parked || (self.parked_generation == generation && !self.lock_timeout_expired()) {
             return After::Continue;
         }
         self.parked = false;
@@ -398,6 +429,7 @@ impl Conn {
 
     fn process_startup(
         &mut self,
+        engine: &mut Engine,
         cancel_key: &[u8],
         auth: &AuthContext,
         tls_config: Option<&std::sync::Arc<rustls::ServerConfig>>,
@@ -458,7 +490,7 @@ impl Conn {
                 Step::Close
             }
             version if version >> 16 == 3 => {
-                let result = self.handle_startup_packet(len, version, cancel_key, auth);
+                let result = self.handle_startup_packet(engine, len, version, cancel_key, auth);
                 self.recv.consume(len);
                 result
             }
@@ -475,6 +507,7 @@ impl Conn {
 
     fn handle_startup_packet(
         &mut self,
+        engine: &mut Engine,
         len: usize,
         version: i32,
         cancel_key: &[u8],
@@ -521,15 +554,19 @@ impl Conn {
                 // as PostgreSQL does — never silently left at a wrong default.
                 _ => {
                     if guc_error.is_none()
-                        && let Err(e) = self.guc.set(key, value, false) {
-                            guc_error = Some(e);
-                        }
+                        && let Err(e) = self.guc.set(key, value, false)
+                    {
+                        guc_error = Some(e);
+                    }
                 }
             }
         }
         if !user_seen {
             let mut responder = Responder::new(&mut self.send);
-            let _ = responder.error("28000", "no PostgreSQL user name specified in startup packet");
+            let _ = responder.error(
+                "28000",
+                "no PostgreSQL user name specified in startup packet",
+            );
             return Step::Close;
         }
         if let Some(e) = guc_error {
@@ -539,6 +576,33 @@ impl Conn {
         }
 
         self.minor = requested_minor.min(wire::NEWEST_MINOR as u16);
+        self.auth_password = StackStr::new();
+        self.auth_reject = false;
+        self.role_scram = None;
+        self.auth_role_password = None;
+        self.auth_login = None;
+        if let Some(role) = engine.role_login(self.guc.session_user()) {
+            self.auth_login = Some(role);
+            let bootstrap_fallback =
+                self.guc.session_user() == "postgres" && !auth.password.is_empty();
+            self.auth_reject = reject_role_login(auth.mode, role, bootstrap_fallback);
+            if let Some(password) = role.password {
+                self.auth_role_password = Some(password);
+                self.role_scram = Some(ScramServer {
+                    salt: password.salt,
+                    stored_key: password.stored_key,
+                    server_key: password.server_key,
+                    iterations: password.iterations,
+                });
+            } else if bootstrap_fallback {
+                self.auth_password = StackStr::from_str(&auth.password);
+            }
+        } else {
+            // Unknown roles authenticate through the configured verifier only
+            // to keep the exchange shape constant, but are always rejected.
+            self.auth_password = StackStr::from_str(&auth.password);
+            self.auth_reject = true;
+        }
 
         // Version negotiation happens before any auth request.
         {
@@ -556,7 +620,12 @@ impl Conn {
         }
 
         match auth.mode {
-            AuthMode::Trust => self.finish_startup(cancel_key),
+            AuthMode::Trust if !self.auth_reject => self.finish_startup(engine, cancel_key),
+            AuthMode::Trust => {
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error("28000", "role is not permitted to log in");
+                Step::Close
+            }
             AuthMode::Password => {
                 let mut responder = Responder::new(&mut self.send);
                 if responder.auth_cleartext_password().is_err() {
@@ -578,7 +647,21 @@ impl Conn {
     }
 
     /// AuthenticationOk, parameter statuses, key data, ReadyForQuery.
-    fn finish_startup(&mut self, cancel_key: &[u8]) -> Step {
+    fn finish_startup(&mut self, engine: &mut Engine, cancel_key: &[u8]) -> Step {
+        if self.authenticated_role.is_none() {
+            let Some(login) = self.auth_login else {
+                return Step::Close;
+            };
+            if !engine.reserve_role_connection(login) {
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error(
+                    sqlstate::TOO_MANY_CONNECTIONS,
+                    "too many connections for role",
+                );
+                return Step::Close;
+            }
+            self.authenticated_role = Some(login.slot);
+        }
         let minor = self.minor;
         let id = self.id;
         let mut responder = Responder::new(&mut self.send);
@@ -597,7 +680,11 @@ impl Conn {
                 responder.parameter_status(k, v)?;
             }
             // 3.0 fixes the cancel key at 4 bytes; 3.2 allows up to 256.
-            let key = if minor >= 2 { cancel_key } else { &cancel_key[..4] };
+            let key = if minor >= 2 {
+                cancel_key
+            } else {
+                &cancel_key[..4]
+            };
             responder.backend_key_data(id, key)?;
             responder.ready_for_query(b'I')?;
             Ok(())
@@ -610,7 +697,7 @@ impl Conn {
     }
 
     /// Password / SASL messages during authentication.
-    fn process_auth(&mut self, cancel_key: &[u8], auth: &AuthContext) -> Step {
+    fn process_auth(&mut self, engine: &mut Engine, cancel_key: &[u8], auth: &AuthContext) -> Step {
         let data = self.recv.readable();
         if data.len() < 5 {
             return Step::NeedMoreData;
@@ -647,20 +734,31 @@ impl Conn {
                     return Step::Close;
                 };
                 // Fixed-pattern comparison over both strings.
-                let ok = pass.len() == auth.password.len()
-                    && pass
-                        .bytes()
-                        .zip(auth.password.bytes())
-                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                        == 0;
+                let expected = self.auth_password.as_str();
+                let ok = if let Some(verifier) = self.auth_role_password {
+                    let candidate = ScramServer::derive(pass, verifier.salt, verifier.iterations);
+                    candidate
+                        .stored_key
+                        .iter()
+                        .zip(verifier.stored_key)
+                        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+                        == 0
+                } else {
+                    pass.len() == expected.len()
+                        && pass
+                            .bytes()
+                            .zip(expected.bytes())
+                            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                            == 0
+                } && !self.auth_reject;
                 if ok {
-                    self.finish_startup(cancel_key)
+                    self.finish_startup(engine, cancel_key)
                 } else {
                     auth_failed(&mut self.send)
                 }
             }
             Phase::AwaitSaslInit => {
-                let Some(server) = &auth.scram else {
+                let Some(server) = self.role_scram.as_ref().or(auth.scram.as_ref()) else {
                     return Step::Close;
                 };
                 let mut m = MsgIn::new(payload);
@@ -677,9 +775,7 @@ impl Conn {
                     return Step::Close;
                 };
                 let mut nonce = [0u8; 18];
-                let rc = unsafe {
-                    libc::getentropy(nonce.as_mut_ptr().cast(), nonce.len())
-                };
+                let rc = unsafe { libc::getentropy(nonce.as_mut_ptr().cast(), nonce.len()) };
                 if rc != 0 {
                     return Step::Close;
                 }
@@ -696,13 +792,14 @@ impl Conn {
                 }
             }
             Phase::AwaitSaslFinal => {
-                let Some(server) = &auth.scram else {
+                let Some(server) = self.role_scram.as_ref().or(auth.scram.as_ref()) else {
                     return Step::Close;
                 };
                 let Ok(client_final) = core::str::from_utf8(payload) else {
                     return Step::Close;
                 };
                 match self.scram.finish(server, client_final) {
+                    Ok(ScramStep::Final(_)) if self.auth_reject => auth_failed(&mut self.send),
                     Ok(ScramStep::Final(sig)) => {
                         {
                             let mut responder = Responder::new(&mut self.send);
@@ -710,7 +807,7 @@ impl Conn {
                                 return Step::Close;
                             }
                         }
-                        self.finish_startup(cancel_key)
+                        self.finish_startup(engine, cancel_key)
                     }
                     _ => auth_failed(&mut self.send),
                 }
@@ -777,7 +874,10 @@ impl Conn {
             wire::FMSG_CLOSE => self.handle_close(total),
             _ => {
                 let mut responder = Responder::new(&mut self.send);
-                let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, "unknown frontend message type");
+                let _ = responder.error(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "unknown frontend message type",
+                );
                 Step::Close
             }
         };
@@ -786,7 +886,6 @@ impl Conn {
         }
         step
     }
-
 
     /// Frontend traffic while a COPY FROM STDIN is in flight. CopyData
     /// chunks accumulate into whole lines; the first error stops storing
@@ -818,7 +917,11 @@ impl Conn {
                 } else {
                     sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
                 };
-                if sent.is_err() { Step::Close } else { Step::Continue }
+                if sent.is_err() {
+                    Step::Close
+                } else {
+                    Step::Continue
+                }
             }
             wire::FMSG_TERMINATE => Step::Close,
             // Flush and Sync during copy-in are ignored, as PostgreSQL does.
@@ -841,7 +944,11 @@ impl Conn {
                 } else {
                     sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
                 };
-                if sent.is_err() { Step::Close } else { Step::Continue }
+                if sent.is_err() {
+                    Step::Close
+                } else {
+                    Step::Continue
+                }
             }
         }
     }
@@ -864,7 +971,14 @@ impl Conn {
             }
         }
         // Binary framing is length-based, not line-based.
-        if self.copy.as_ref().expect("in copy-in mode").setup.fmt.binary {
+        if self
+            .copy
+            .as_ref()
+            .expect("in copy-in mode")
+            .setup
+            .fmt
+            .binary
+        {
             self.copy_binary_chunk(engine);
             return;
         }
@@ -924,7 +1038,7 @@ impl Conn {
     /// length-framed row until the -1 trailer. A row spanning several CopyData
     /// chunks is assembled in `copy_buf` before it is decoded.
     fn copy_binary_chunk(&mut self, engine: &mut Engine) {
-        use crate::sql::copy::{binary_frame, binary_header, BinaryFrame, BinaryHeader};
+        use crate::sql::copy::{BinaryFrame, BinaryHeader, binary_frame, binary_header};
         let copy = self.copy.as_mut().expect("in copy-in mode");
         if copy.binary_header_pending {
             match binary_header(self.copy_buf.readable()) {
@@ -1005,7 +1119,13 @@ impl Conn {
         // Binary rows are fully consumed as they complete in copy_binary_chunk;
         // any leftover at CopyDone is a truncated stream, but the count already
         // reflects the rows that landed, so nothing more is decoded here.
-        let binary = self.copy.as_ref().expect("in copy-in mode").setup.fmt.binary;
+        let binary = self
+            .copy
+            .as_ref()
+            .expect("in copy-in mode")
+            .setup
+            .fmt
+            .binary;
         // A final line without a trailing newline is still a line (text/CSV).
         if !binary && !self.copy_buf.is_empty() {
             let copy = self.copy.as_mut().expect("in copy-in mode");
@@ -1038,13 +1158,16 @@ impl Conn {
                 engine.copy_abort(&mut self.txn, &self.guc);
                 Err(e)
             }
-            None => engine.copy_finish(&mut self.txn, &self.guc).map(|()| copy.count),
+            None => engine
+                .copy_finish(&mut self.txn, &self.guc)
+                .map(|()| copy.count),
         };
         let failed = outcome.is_err();
         let mut responder = Responder::new(&mut self.send);
         let sent = match outcome {
-            Ok(count) => responder
-                .command_complete(crate::stack_format!(32, "COPY {count}").as_str()),
+            Ok(count) => {
+                responder.command_complete(crate::stack_format!(32, "COPY {count}").as_str())
+            }
             Err(e) => responder.error(e.sqlstate, e.message.as_str()),
         };
         if extended && failed {
@@ -1055,7 +1178,11 @@ impl Conn {
         } else {
             sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
         };
-        if sent.is_err() { Step::Close } else { Step::Continue }
+        if sent.is_err() {
+            Step::Close
+        } else {
+            Step::Continue
+        }
     }
 
     fn handle_parse(&mut self, total: usize) -> Step {
@@ -1077,7 +1204,12 @@ impl Conn {
         };
         let _ = &mut msg;
         let Ok((name, query, param_oids)) = parse() else {
-            return ext_err(&mut self.send, &mut self.phase, sqlstate::PROTOCOL_VIOLATION, "malformed Parse message");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::PROTOCOL_VIOLATION,
+                "malformed Parse message",
+            );
         };
 
         // Validate now so Parse errors surface at Parse, like PostgreSQL.
@@ -1085,25 +1217,43 @@ impl Conn {
         let n_params = {
             let mut parser = match Parser::new(query, &self.arena) {
                 Ok(p) => p,
-                Err(e) => return ext_err(&mut self.send, &mut self.phase, sqlstate::SYNTAX_ERROR, e.message.as_str()),
+                Err(e) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        sqlstate::SYNTAX_ERROR,
+                        e.message.as_str(),
+                    );
+                }
             };
             match parser.next_stmt() {
                 Ok(_first) => {}
-                Err(e) => return ext_err(&mut self.send, &mut self.phase, sqlstate::SYNTAX_ERROR, e.message.as_str()),
+                Err(e) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        sqlstate::SYNTAX_ERROR,
+                        e.message.as_str(),
+                    );
+                }
             }
             match parser.next_stmt() {
                 Ok(None) => {}
                 _ => {
-                    return ext_err(&mut self.send, &mut self.phase, 
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
                         sqlstate::SYNTAX_ERROR,
                         "cannot insert multiple commands into a prepared statement",
-                    )
+                    );
                 }
             }
             parser.max_param()
         };
         if n_params as usize > MAX_BIND_PARAMS {
-            return ext_err(&mut self.send, &mut self.phase, 
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many parameters (the limit is 32)",
             );
@@ -1111,14 +1261,18 @@ impl Conn {
 
         // Named statements may not be redefined; the unnamed one always is.
         let slot = if name.is_empty() {
-            self.prepared.iter().position(|p| p.active && p.name.as_str().is_empty())
+            self.prepared
+                .iter()
+                .position(|p| p.active && p.name.as_str().is_empty())
                 .or_else(|| self.prepared.iter().position(|p| !p.active))
         } else if self
             .prepared
             .iter()
             .any(|p| p.active && p.name.as_str() == name)
         {
-            return ext_err(&mut self.send, &mut self.phase, 
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
                 crate::sql::eval::sqlstate::DUPLICATE_PREPARED_STATEMENT,
                 "prepared statement already exists",
             );
@@ -1126,16 +1280,31 @@ impl Conn {
             self.prepared.iter().position(|p| !p.active)
         };
         let Some(slot) = slot else {
-            return ext_err(&mut self.send, &mut self.phase, "54000", "too many prepared statements");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                "54000",
+                "too many prepared statements",
+            );
         };
         let Ok(sql_name) = SqlName::parse(name) else {
-            return ext_err(&mut self.send, &mut self.phase, "42622", "statement name too long");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                "42622",
+                "statement name too long",
+            );
         };
         let entry = &mut self.prepared[slot];
         entry.text.clear();
         if !entry.text.append(query.as_bytes()) {
             entry.active = false;
-            return ext_err(&mut self.send, &mut self.phase, "54000", "statement text exceeds prepared_bytes");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                "54000",
+                "statement text exceeds prepared_bytes",
+            );
         }
         entry.active = true;
         entry.name = sql_name;
@@ -1213,7 +1382,15 @@ impl Conn {
                 }
             }
             let result_formats = ResultFmt::new(rcodes, n_rfmt.min(MAX_RESULT_COLS) as u16);
-            Ok((portal, statement, n_params, spans, formats, values, result_formats))
+            Ok((
+                portal,
+                statement,
+                n_params,
+                spans,
+                formats,
+                values,
+                result_formats,
+            ))
         };
         let (portal_name, stmt_name, n_params, spans, formats, values, result_formats) =
             match parse() {
@@ -1224,7 +1401,7 @@ impl Conn {
                         &mut self.phase,
                         sqlstate::PROTOCOL_VIOLATION,
                         "malformed Bind message",
-                    )
+                    );
                 }
                 Err(BindProblem::TooManyResultCols) => {
                     return ext_err(
@@ -1232,7 +1409,7 @@ impl Conn {
                         &mut self.phase,
                         crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many result columns requested in binary format",
-                    )
+                    );
                 }
                 Err(BindProblem::TooManyParams) => {
                     return ext_err(
@@ -1240,7 +1417,7 @@ impl Conn {
                         &mut self.phase,
                         crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many parameters (the limit is 32)",
-                    )
+                    );
                 }
             };
 
@@ -1249,10 +1426,17 @@ impl Conn {
             .iter()
             .position(|p| p.active && p.name.as_str() == stmt_name)
         else {
-            return ext_err(&mut self.send, &mut self.phase, "26000", "prepared statement does not exist");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                "26000",
+                "prepared statement does not exist",
+            );
         };
         if n_params != self.prepared[stmt_slot].n_params as usize {
-            return ext_err(&mut self.send, &mut self.phase, 
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
                 sqlstate::PROTOCOL_VIOLATION,
                 "bind parameter count differs from the statement",
             );
@@ -1263,7 +1447,12 @@ impl Conn {
                 && len != u32::MAX
                 && core::str::from_utf8(&values[offset as usize..(offset + len) as usize]).is_err()
             {
-                return ext_err(&mut self.send, &mut self.phase, "22021", "invalid UTF-8 in parameter value");
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    "22021",
+                    "invalid UTF-8 in parameter value",
+                );
             }
         }
 
@@ -1276,13 +1465,23 @@ impl Conn {
             return ext_err(&mut self.send, &mut self.phase, "54000", "too many portals");
         };
         let Ok(sql_name) = SqlName::parse(portal_name) else {
-            return ext_err(&mut self.send, &mut self.phase, "42622", "portal name too long");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                "42622",
+                "portal name too long",
+            );
         };
         // Copy the raw parameter area; spans index into it.
         let portal = &mut self.portals[slot];
         portal.params.clear();
         if !portal.params.append(values) {
-            return ext_err(&mut self.send, &mut self.phase, "54000", "parameters exceed portal_bytes");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                "54000",
+                "parameters exceed portal_bytes",
+            );
         }
         portal.active = true;
         portal.name = sql_name;
@@ -1305,7 +1504,12 @@ impl Conn {
         let payload = &self.recv.readable()[5..total];
         let mut m = MsgIn::new(payload);
         let (Ok(kind), Ok(name)) = (m.u8(), m.cstr()) else {
-            return ext_err(&mut self.send, &mut self.phase, sqlstate::PROTOCOL_VIOLATION, "malformed Describe message");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::PROTOCOL_VIOLATION,
+                "malformed Describe message",
+            );
         };
         let mut portal_formats = ResultFmt::ALL_TEXT;
         let stmt_slot = match kind {
@@ -1322,10 +1526,12 @@ impl Conn {
                     self.portals[i].statement
                 }),
             _ => {
-                return ext_err(&mut self.send, &mut self.phase, 
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
                     sqlstate::PROTOCOL_VIOLATION,
                     "Describe expects 'S' or 'P'",
-                )
+                );
             }
         };
         let Some(slot) = stmt_slot else {
@@ -1355,7 +1561,9 @@ impl Conn {
             .expect("stored from valid UTF-8");
         let mut responder = Responder::for_describe(&mut self.send, portal_formats);
         if kind == b'S'
-            && responder.parameter_description(&param_oids[..n_params as usize]).is_err()
+            && responder
+                .parameter_description(&param_oids[..n_params as usize])
+                .is_err()
         {
             return Step::Close;
         }
@@ -1373,14 +1581,24 @@ impl Conn {
         let payload = &self.recv.readable()[5..total];
         let mut m = MsgIn::new(payload);
         let (Ok(name), Ok(max_rows)) = (m.cstr(), m.i32()) else {
-            return ext_err(&mut self.send, &mut self.phase, sqlstate::PROTOCOL_VIOLATION, "malformed Execute message");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::PROTOCOL_VIOLATION,
+                "malformed Execute message",
+            );
         };
         let Some(portal_slot) = self
             .portals
             .iter()
             .position(|p| p.active && p.name.as_str() == name)
         else {
-            return ext_err(&mut self.send, &mut self.phase, "34000", "portal does not exist");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                "34000",
+                "portal does not exist",
+            );
         };
 
         // A portal already producing rows (executed==true) always drains
@@ -1396,7 +1614,12 @@ impl Conn {
             let portal = &mut self.portals[portal_slot];
             let prepared = &self.prepared[portal.statement];
             if !prepared.active {
-                return ext_err(&mut self.send, &mut self.phase, "26000", "prepared statement no longer exists");
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    "26000",
+                    "prepared statement no longer exists",
+                );
             }
             let text =
                 core::str::from_utf8(prepared.text.readable()).expect("stored from valid UTF-8");
@@ -1414,13 +1637,18 @@ impl Conn {
             // which the client cannot subtype and so sends untyped. Mirrors what
             // Describe already does; text params are unaffected.
             let mut param_oids = prepared.param_oids;
-            let has_untyped_binary = (0..portal.n_params as usize)
-                .any(|i| portal.binary[i] && param_oids[i] == 0);
+            let has_untyped_binary =
+                (0..portal.n_params as usize).any(|i| portal.binary[i] && param_oids[i] == 0);
             if has_untyped_binary {
                 param_oids =
                     engine.infer_param_types(text, &self.arena, &self.txn, &prepared.param_oids);
             }
-            for (i, &(offset, len)) in portal.spans.iter().take(portal.n_params as usize).enumerate() {
+            for (i, &(offset, len)) in portal
+                .spans
+                .iter()
+                .take(portal.n_params as usize)
+                .enumerate()
+            {
                 if len == u32::MAX {
                     params[i] = Datum::Null;
                     continue;
@@ -1430,7 +1658,12 @@ impl Conn {
                     match decode_binary_param(param_oids[i], bytes, &self.arena) {
                         Ok(v) => params[i] = v,
                         Err(message) => {
-                            return ext_err(&mut self.send, &mut self.phase, sqlstate::FEATURE_NOT_SUPPORTED, message)
+                            return ext_err(
+                                &mut self.send,
+                                &mut self.phase,
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                message,
+                            );
                         }
                     }
                 } else {
@@ -1580,7 +1813,12 @@ impl Conn {
         let payload = &self.recv.readable()[5..total];
         let mut m = MsgIn::new(payload);
         let (Ok(kind), Ok(name)) = (m.u8(), m.cstr()) else {
-            return ext_err(&mut self.send, &mut self.phase, sqlstate::PROTOCOL_VIOLATION, "malformed Close message");
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::PROTOCOL_VIOLATION,
+                "malformed Close message",
+            );
         };
         match kind {
             b'S' => {
@@ -1602,10 +1840,12 @@ impl Conn {
                 }
             }
             _ => {
-                return ext_err(&mut self.send, &mut self.phase, 
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
                     sqlstate::PROTOCOL_VIOLATION,
                     "Close expects 'S' or 'P'",
-                )
+                );
             }
         }
         let mut responder = Responder::new(&mut self.send);
@@ -1785,7 +2025,7 @@ struct CopyInProgress {
 }
 
 fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {
-    use crate::pg::wire::{MsgOut, MSG_PORTAL_SUSPENDED};
+    use crate::pg::wire::{MSG_PORTAL_SUSPENDED, MsgOut};
     MsgOut::begin(responder.buffer, MSG_PORTAL_SUSPENDED).finish()
 }
 
@@ -1854,10 +2094,17 @@ pub(crate) fn decode_binary_param<'a>(
             let micros = i64::from_be_bytes(b[0..8].try_into().unwrap());
             let days = i32::from_be_bytes(b[8..12].try_into().unwrap());
             let months = i32::from_be_bytes(b[12..16].try_into().unwrap());
-            Ok(Datum::Interval(crate::sql::types::Interval { months, days, micros }))
+            Ok(Datum::Interval(crate::sql::types::Interval {
+                months,
+                days,
+                micros,
+            }))
         }
         oids::JSON => core::str::from_utf8(bytes)
-            .map(|t| Datum::Json { text: t, jsonb: false })
+            .map(|t| Datum::Json {
+                text: t,
+                jsonb: false,
+            })
             .map_err(|_| "invalid UTF-8 in binary json parameter"),
         oids::JSONB => {
             // jsonb send format: a 1-byte version (0x01) then the JSON text.
@@ -1866,7 +2113,10 @@ pub(crate) fn decode_binary_param<'a>(
                 return Err("unsupported jsonb binary version");
             }
             core::str::from_utf8(rest)
-                .map(|t| Datum::Json { text: t, jsonb: true })
+                .map(|t| Datum::Json {
+                    text: t,
+                    jsonb: true,
+                })
                 .map_err(|_| "invalid UTF-8 in binary jsonb parameter")
         }
         oids::NUMERIC => {
@@ -1893,7 +2143,11 @@ pub(crate) fn decode_binary_param<'a>(
                 bits: bytes[1],
                 addr,
             };
-            Ok(if oid == oids::CIDR { Datum::Cidr(net) } else { Datum::Inet(net) })
+            Ok(if oid == oids::CIDR {
+                Datum::Cidr(net)
+            } else {
+                Datum::Inet(net)
+            })
         }
         oids::MACADDR => {
             let b: [u8; 6] = bytes.try_into().map_err(|_| wrong)?;
@@ -1942,7 +2196,11 @@ fn binary_numeric_to_str(
         return finish_numeric(out, wrong);
     }
     let digit = |i: i32| -> i16 {
-        if i >= 0 && (i as usize) < ndigits { rd(8 + i as usize * 2) } else { 0 }
+        if i >= 0 && (i as usize) < ndigits {
+            rd(8 + i as usize * 2)
+        } else {
+            0
+        }
     };
     if sign == 0x4000 {
         let _ = out.write_char('-');
@@ -1980,8 +2238,15 @@ fn binary_numeric_to_str(
     finish_numeric(out, wrong)
 }
 
-fn finish_numeric(out: &crate::util::StackStr<96>, wrong: &'static str) -> Result<(), &'static str> {
-    if out.is_truncated() { Err(wrong) } else { Ok(()) }
+fn finish_numeric(
+    out: &crate::util::StackStr<96>,
+    wrong: &'static str,
+) -> Result<(), &'static str> {
+    if out.is_truncated() {
+        Err(wrong)
+    } else {
+        Ok(())
+    }
 }
 
 /// The four decimal digits of one base-10000 group, zero-padded.
@@ -2022,10 +2287,7 @@ mod tests {
         // PostgreSQL binary numeric: i16 ndigits, weight, sign, dscale, then
         // base-10000 digit groups (big-endian). Values verified against PG 18.4.
         // 2.50 -> ndigits 2, weight 0, sign +, dscale 2, digits [2, 5000].
-        assert_eq!(
-            num_str(&[0, 2, 0, 0, 0, 0, 0, 2, 0, 2, 0x13, 0x88]),
-            "2.50"
-        );
+        assert_eq!(num_str(&[0, 2, 0, 0, 0, 0, 0, 2, 0, 2, 0x13, 0x88]), "2.50");
         // -0.50 -> ndigits 1, weight -1, sign 0x4000, dscale 2, digit [5000].
         assert_eq!(
             num_str(&[0, 1, 0xFF, 0xFF, 0x40, 0, 0, 2, 0x13, 0x88]),
@@ -2038,5 +2300,21 @@ mod tests {
         );
         // NaN -> sign 0xC000.
         assert_eq!(num_str(&[0, 0, 0, 0, 0xC0, 0, 0, 0]), "NaN");
+    }
+
+    #[test]
+    fn trust_authentication_does_not_require_a_password_verifier() {
+        let login = crate::sql::RoleLogin {
+            slot: 0,
+            can_login: true,
+            valid: true,
+            superuser: true,
+            connection_limit: -1,
+            password: None,
+        };
+        assert!(!reject_role_login(AuthMode::Trust, login, false));
+        assert!(reject_role_login(AuthMode::Password, login, false));
+        assert!(reject_role_login(AuthMode::ScramSha256, login, false));
+        assert!(!reject_role_login(AuthMode::Password, login, true));
     }
 }

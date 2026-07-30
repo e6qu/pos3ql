@@ -26,8 +26,8 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
     CheckConstraint, ColumnMeta, ColumnStatistics, DependencyClass, FkAction, ForeignKey,
-    MAX_COLUMNS, MAX_INDEX_COLS, OwnedDatum, SqlName, StoredQueryDependencies, TableDef,
-    TableStatistics, UniqueKey,
+    MAX_COLUMNS, MAX_INDEX_COLS, OwnedDatum, RoleAttributes, SqlName, StoredQueryDependencies,
+    TableDef, TableStatistics, UniqueKey,
 };
 
 use crc32c::crc32c;
@@ -60,6 +60,14 @@ const KIND_CREATE_ENUM: u8 = 23;
 const KIND_DROP_ENUM: u8 = 24;
 const KIND_RENAME_ENUM: u8 = 25;
 const KIND_ANALYZE: u8 = 26;
+const KIND_UPSERT_ROLE: u8 = 27;
+const KIND_DROP_ROLE: u8 = 28;
+const KIND_UPSERT_ROLE_MEMBERSHIP: u8 = 29;
+const KIND_DROP_ROLE_MEMBERSHIP: u8 = 30;
+const KIND_SET_OBJECT_OWNER: u8 = 31;
+const KIND_SET_OBJECT_ACL: u8 = 32;
+const KIND_REWRITE_TABLE: u8 = 33;
+const LAST_KIND: u8 = KIND_REWRITE_TABLE;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -218,6 +226,15 @@ impl WalTableStatistics<'_> {
 )]
 pub(crate) enum WalOp<'a> {
     CreateTable(TableDef),
+    /// Begins ALTER TABLE's in-place definition/row rewrite. The immediately
+    /// following CreateTable record supplies the final definition; this marker
+    /// carries the old identity and composed column ordinals without inflating
+    /// every WAL operation by another inline TableDef.
+    BeginTableRewrite {
+        previous_schema: &'a str,
+        previous_name: &'a str,
+        column_mapping: [u16; MAX_COLUMNS],
+    },
     DropTable {
         schema: &'a str,
         name: &'a str,
@@ -372,6 +389,40 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         table: &'a str,
         statistics: WalTableStatistics<'a>,
+    },
+    /// Absolute role definition, shared by CREATE and ALTER so replay is
+    /// idempotent and a manifest/WAL handoff cannot expose a partial option set.
+    UpsertRole {
+        name: &'a str,
+        attributes: RoleAttributes,
+    },
+    DropRole {
+        name: &'a str,
+    },
+    UpsertRoleMembership {
+        role: &'a str,
+        member: &'a str,
+        grantor: &'a str,
+        options: crate::storage::RoleMembershipOptions,
+    },
+    DropRoleMembership {
+        role: &'a str,
+        member: &'a str,
+    },
+    SetObjectOwner {
+        class: u8,
+        schema: &'a str,
+        name: &'a str,
+        owner: &'a str,
+    },
+    SetObjectAcl {
+        class: u8,
+        schema: &'a str,
+        name: &'a str,
+        grantee: &'a str,
+        grantor: &'a str,
+        privileges: crate::storage::PrivilegeSet,
+        grant_options: crate::storage::PrivilegeSet,
     },
 }
 
@@ -562,7 +613,7 @@ impl Wal {
                 let payload_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_ANALYZE).contains(&kind)
+                if !(KIND_CREATE..=LAST_KIND).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -928,6 +979,13 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
         WalOp::Analyze { .. } => KIND_ANALYZE,
+        WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
+        WalOp::DropRole { .. } => KIND_DROP_ROLE,
+        WalOp::UpsertRoleMembership { .. } => KIND_UPSERT_ROLE_MEMBERSHIP,
+        WalOp::DropRoleMembership { .. } => KIND_DROP_ROLE_MEMBERSHIP,
+        WalOp::SetObjectOwner { .. } => KIND_SET_OBJECT_OWNER,
+        WalOp::SetObjectAcl { .. } => KIND_SET_OBJECT_ACL,
+        WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
     }
 }
 
@@ -978,6 +1036,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             }
             n
         }
+        WalOp::BeginTableRewrite {
+            previous_schema,
+            previous_name,
+            column_mapping,
+        } => 1 + previous_schema.len() + 1 + previous_name.len() + column_mapping.len() * 2,
         WalOp::DropTable { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::Upsert {
             schema, table, row, ..
@@ -1123,6 +1186,30 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             statistics,
         } => 1 + table.len() + 1 + schema.len() + statistics.encoded_len(),
+        WalOp::UpsertRole { name, attributes } => {
+            1 + name.len() + 2 + 4 + 16 + 32 + 32 + 4 + 1 + attributes.valid_until.as_str().len()
+        }
+        WalOp::DropRole { name } => 1 + name.len(),
+        WalOp::UpsertRoleMembership {
+            role,
+            member,
+            grantor,
+            ..
+        } => 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
+        WalOp::DropRoleMembership { role, member } => 1 + role.len() + 1 + member.len(),
+        WalOp::SetObjectOwner {
+            schema,
+            name,
+            owner,
+            ..
+        } => 1 + 1 + schema.len() + 1 + name.len() + 1 + owner.len(),
+        WalOp::SetObjectAcl {
+            schema,
+            name,
+            grantee,
+            grantor,
+            ..
+        } => 1 + 1 + schema.len() + 1 + name.len() + 1 + grantee.len() + 1 + grantor.len() + 4,
     }
 }
 
@@ -1204,6 +1291,17 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= name_bytes(buffer, def.schema.as_str());
             for fk in def.fkeys() {
                 ok &= name_bytes(buffer, fk.parent_schema.as_str());
+            }
+            ok
+        }
+        WalOp::BeginTableRewrite {
+            previous_schema,
+            previous_name,
+            column_mapping,
+        } => {
+            let mut ok = name_bytes(buffer, previous_schema) && name_bytes(buffer, previous_name);
+            for column in column_mapping {
+                ok &= buffer.append(&column.to_le_bytes());
             }
             ok
         }
@@ -1445,6 +1543,71 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
+        WalOp::UpsertRole { name, attributes } => {
+            let flags = u16::from(attributes.superuser)
+                | (u16::from(attributes.inherit) << 1)
+                | (u16::from(attributes.create_role) << 2)
+                | (u16::from(attributes.create_database) << 3)
+                | (u16::from(attributes.can_login) << 4)
+                | (u16::from(attributes.replication) << 5)
+                | (u16::from(attributes.bypass_row_level_security) << 6)
+                | (u16::from(attributes.has_password) << 7)
+                | (u16::from(attributes.has_valid_until) << 8);
+            name_bytes(buffer, name)
+                && buffer.append(&flags.to_le_bytes())
+                && buffer.append(&attributes.connection_limit.to_le_bytes())
+                && buffer.append(&attributes.password.salt)
+                && buffer.append(&attributes.password.stored_key)
+                && buffer.append(&attributes.password.server_key)
+                && buffer.append(&attributes.password.iterations.to_le_bytes())
+                && name_bytes(buffer, attributes.valid_until.as_str())
+        }
+        WalOp::DropRole { name } => name_bytes(buffer, name),
+        WalOp::UpsertRoleMembership {
+            role,
+            member,
+            grantor,
+            options,
+        } => {
+            let flags = u8::from(options.admin)
+                | (u8::from(options.inherit) << 1)
+                | (u8::from(options.set) << 2);
+            name_bytes(buffer, role)
+                && name_bytes(buffer, member)
+                && name_bytes(buffer, grantor)
+                && buffer.append(&[flags])
+        }
+        WalOp::DropRoleMembership { role, member } => {
+            name_bytes(buffer, role) && name_bytes(buffer, member)
+        }
+        WalOp::SetObjectOwner {
+            class,
+            schema,
+            name,
+            owner,
+        } => {
+            buffer.append(&[*class])
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, owner)
+        }
+        WalOp::SetObjectAcl {
+            class,
+            schema,
+            name,
+            grantee,
+            grantor,
+            privileges,
+            grant_options,
+        } => {
+            buffer.append(&[*class])
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, grantee)
+                && name_bytes(buffer, grantor)
+                && buffer.append(&privileges.0.to_le_bytes())
+                && buffer.append(&grant_options.0.to_le_bytes())
+        }
         WalOp::Analyze {
             schema,
             table,
@@ -1558,8 +1721,7 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
         }
         let distinct_values = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
         at += 8;
-        let distinct_fraction_ppm =
-            u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        let distinct_fraction_ppm = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
         at += 4;
         if distinct_fraction_ppm > 1_000_000 {
             return None;
@@ -1772,6 +1934,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }
             }
             (at == payload.len()).then_some(WalOp::CreateTable(def))
+        }
+        KIND_REWRITE_TABLE => {
+            let previous_schema = take_name(&mut at)?;
+            let previous_name = take_name(&mut at)?;
+            let mut column_mapping = [u16::MAX; MAX_COLUMNS];
+            for target in &mut column_mapping {
+                *target = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+            }
+            (at == payload.len()).then_some(WalOp::BeginTableRewrite {
+                previous_schema,
+                previous_name,
+                column_mapping,
+            })
         }
         KIND_DROP => {
             let name = take_name(&mut at)?;
@@ -2150,6 +2326,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at: 0,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
+                ownership: crate::storage::Ownership::BOOTSTRAP,
                 base_domain,
                 base_domain_schema,
                 base,
@@ -2189,6 +2366,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at: 0,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
+                ownership: crate::storage::Ownership::BOOTSTRAP,
                 members,
                 n_members,
                 live: false,
@@ -2247,6 +2425,118 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 table,
                 statistics: WalTableStatistics::Encoded(encoded),
+            })
+        }
+        KIND_UPSERT_ROLE => {
+            let name = take_name(&mut at)?;
+            let flags = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            if flags & !0x01ff != 0 {
+                return None;
+            }
+            let connection_limit = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let salt = payload.get(at..at + 16)?.try_into().ok()?;
+            at += 16;
+            let stored_key = payload.get(at..at + 32)?.try_into().ok()?;
+            at += 32;
+            let server_key = payload.get(at..at + 32)?.try_into().ok()?;
+            at += 32;
+            let iterations = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let valid_until = take_name(&mut at)?;
+            if at != payload.len()
+                || valid_until.len() > crate::storage::ROLE_VALID_UNTIL_MAX
+                || (flags & (1 << 7) != 0 && iterations == 0)
+            {
+                return None;
+            }
+            Some(WalOp::UpsertRole {
+                name,
+                attributes: RoleAttributes {
+                    superuser: flags & 1 != 0,
+                    inherit: flags & (1 << 1) != 0,
+                    create_role: flags & (1 << 2) != 0,
+                    create_database: flags & (1 << 3) != 0,
+                    can_login: flags & (1 << 4) != 0,
+                    replication: flags & (1 << 5) != 0,
+                    bypass_row_level_security: flags & (1 << 6) != 0,
+                    connection_limit,
+                    password: crate::storage::RolePassword {
+                        salt,
+                        stored_key,
+                        server_key,
+                        iterations,
+                    },
+                    has_password: flags & (1 << 7) != 0,
+                    valid_until: crate::util::StackStr::from_str(valid_until),
+                    has_valid_until: flags & (1 << 8) != 0,
+                },
+            })
+        }
+        KIND_DROP_ROLE => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropRole { name })
+        }
+        KIND_UPSERT_ROLE_MEMBERSHIP => {
+            let role = take_name(&mut at)?;
+            let member = take_name(&mut at)?;
+            let grantor = take_name(&mut at)?;
+            let flags = *payload.get(at)?;
+            at += 1;
+            if at != payload.len() || flags & !0x07 != 0 {
+                return None;
+            }
+            Some(WalOp::UpsertRoleMembership {
+                role,
+                member,
+                grantor,
+                options: crate::storage::RoleMembershipOptions {
+                    admin: flags & 1 != 0,
+                    inherit: flags & 2 != 0,
+                    set: flags & 4 != 0,
+                },
+            })
+        }
+        KIND_DROP_ROLE_MEMBERSHIP => {
+            let role = take_name(&mut at)?;
+            let member = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropRoleMembership { role, member })
+        }
+        KIND_SET_OBJECT_OWNER => {
+            let class = *payload.get(at)?;
+            at += 1;
+            crate::storage::AccessClass::from_u8(class)?;
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let owner = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::SetObjectOwner {
+                class,
+                schema,
+                name,
+                owner,
+            })
+        }
+        KIND_SET_OBJECT_ACL => {
+            let class = *payload.get(at)?;
+            at += 1;
+            crate::storage::AccessClass::from_u8(class)?;
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let grantee = take_name(&mut at)?;
+            let grantor = take_name(&mut at)?;
+            let privileges = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::SetObjectAcl {
+                class,
+                schema,
+                name,
+                grantee,
+                grantor,
+                privileges: crate::storage::PrivilegeSet(privileges),
+                grant_options: crate::storage::PrivilegeSet(grant_options),
             })
         }
         _ => None,
@@ -2763,6 +3053,52 @@ mod tests {
         )
         .unwrap();
         wal.commit();
+    }
+
+    #[test]
+    fn table_rewrite_marker_roundtrip_preserves_column_mapping() {
+        let dir = temp_dir("table-rewrite-roundtrip");
+        let config = test_config(&dir);
+        let mut column_mapping = [u16::MAX; MAX_COLUMNS];
+        column_mapping[0] = 0;
+        column_mapping[1] = 1;
+        let mut budget = Budget::new(1 << 20);
+        {
+            let mut wal = Wal::open(&config, &mut budget).unwrap();
+            wal.append_committed(
+                1,
+                &WalOp::BeginTableRewrite {
+                    previous_schema: "public",
+                    previous_name: "t",
+                    column_mapping,
+                },
+            )
+            .unwrap();
+            wal.commit();
+        }
+        let mut replay_budget = Budget::new(1 << 20);
+        let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
+        let mut seen = false;
+        wal.replay(0, |lsn, operation| {
+            let WalOp::BeginTableRewrite {
+                previous_schema,
+                previous_name,
+                column_mapping,
+            } = operation
+            else {
+                panic!("expected table rewrite");
+            };
+            assert_eq!(lsn, 1);
+            assert_eq!(previous_schema, "public");
+            assert_eq!(previous_name, "t");
+            assert_eq!(column_mapping[0], 0);
+            assert_eq!(column_mapping[1], 1);
+            assert!(column_mapping[2..].iter().all(|column| *column == u16::MAX));
+            seen = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen);
     }
 
     #[test]

@@ -1410,8 +1410,28 @@ capstone. This section is the plan of record for all of it.
 - **VACUUM — real operation done.** It drives the LSM checkpoint/compaction and
   object garbage-collection machinery; it is not an accept-and-ignore utility
   command.
-- **Roles and GRANT** — effectively single-user today; privilege enforcement
-  is part of "mature".
+- **Roles, ownership, and object ACLs — complete for the modeled object
+  classes.** Roles/users/groups are transactional catalog objects with SCRAM
+  verifiers, expiry and connection limits; membership edges carry PostgreSQL
+  18's ADMIN/INHERIT/SET options and support creation-time `IN ROLE`/`ROLE`/
+  `ADMIN` clauses. Ownership and grant chains cover schemas, tables, views,
+  materialized views, sequences, domains, enums, and indexes. DDL requires
+  ownership, schema `CREATE`/`USAGE`, type `USAGE`, and foreign-key
+  `REFERENCES`; DML, view-owner execution, and sequence operations enforce
+  their exact object privileges. `GRANT`/`REVOKE` grant options and recursive
+  CASCADE are transactional, WAL-backed, and manifest-backed, and
+  `pg_roles`/`pg_authid`/`pg_auth_members`, catalog ACL arrays, ownership
+  columns, and `has_*_privilege` expose the same state. A wiped-RAM-and-disk
+  recovery test proves the role graph, owners, and explicit ACL tombstones
+  come from the provider-neutral object store. RAM and disk remain disposable
+  caches; no provider identity enters authorization, checkpoint, WAL, or
+  recovery code. ALTER TABLE recovery likewise preserves the catalog identity:
+  its WAL marker and final-definition pair rewrite rows and shape in place, so
+  retained indexes, ownership, ACLs, and dependency edges survive local and
+  object-store replay rather than being cascaded away by a synthetic drop.
+  Broader PostgreSQL command/object classes remain measured in
+  `tests/postgresql18_commands.tsv`; that inventory is not collapsed into a
+  false claim that the whole server surface is complete.
 - **LISTEN / NOTIFY** — done: `LISTEN`/`UNLISTEN [*]`/`NOTIFY channel[, payload]`
   with PostgreSQL's transactional semantics (delivered at commit, discarded on
   rollback, subtransaction-aware, same-transaction de-duplication) and
@@ -2095,7 +2115,7 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
 
 ## Verification
 
-- `cargo test` — 509 unit/property tests plus the integration suites
+- `cargo test` — 534 unit/property tests plus the integration suites
   (memory guard incl. unwind safety and the TLS budget scope, differential
   FixedMap vs std, PCG32/CRC-32C/SHA-256/SHA-512/HMAC/SigV4 official vectors,
   row codec fuzz-by-truncation, WAL corruption/floor/stale-tail, engine

@@ -94,6 +94,7 @@ fn expand_ctes_with_path<'a>(
             depth: 0,
             path,
             dependencies,
+            authorization_role: None,
             qualifier: None,
         };
         // A self-referencing recursive CTE cannot be inlined; this schema-only
@@ -120,6 +121,7 @@ fn expand_ctes_with_path<'a>(
         depth: 0,
         path,
         dependencies,
+        authorization_role: None,
         qualifier: None,
     };
     subst_select(sel, context, arena)
@@ -217,6 +219,7 @@ pub fn rewrite_view_dml<'a>(
         depth: 0,
         path: None,
         dependencies: None,
+        authorization_role: None,
         qualifier: Some(ViewQualifier {
             from: view_name,
             to: base_name,
@@ -376,6 +379,7 @@ fn with_exec_context<'a, 's, R>(
             depth: 0,
             path: None,
             dependencies: None,
+            authorization_role: None,
             qualifier: None,
         };
         if cte.dml.is_some() {
@@ -410,6 +414,7 @@ fn with_exec_context<'a, 's, R>(
         depth: 0,
         path: None,
         dependencies: None,
+        authorization_role: None,
         qualifier: None,
     };
     build(context)
@@ -536,6 +541,9 @@ struct Subst<'c, 'a, 's> {
     /// path cannot re-bind them. `None` at the statement level.
     path: Option<crate::storage::PathContext>,
     dependencies: Option<&'s crate::storage::StoredQueryDependencies>,
+    /// Privilege identity inherited while expanding a stored view body.
+    /// `None` means the current effective role at the statement boundary.
+    authorization_role: Option<u16>,
     /// DML on an auto-updatable view is executed against its base table.
     /// Qualified target references must follow that rewrite too.
     qualifier: Option<ViewQualifier<'a>>,
@@ -856,6 +864,7 @@ fn materialize_recursive<'a>(
             depth: 0,
             path: None,
             dependencies: None,
+            authorization_role: None,
             qualifier: None,
         };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
@@ -1267,6 +1276,7 @@ fn subst_tableref<'a>(
             cte: Some(m),
             with_ordinality: false,
             lateral: false,
+            authorization_role: None,
         });
     }
     // An unqualified name matching a CTE becomes a derived table over the
@@ -1291,6 +1301,7 @@ fn subst_tableref<'a>(
             cte: None,
             with_ordinality: false,
             lateral: false,
+            authorization_role: None,
         });
     }
     // A name resolving to a view (not shadowed by a CTE, and not out-resolved
@@ -1332,6 +1343,38 @@ fn subst_tableref<'a>(
             ));
         }
         let view = context.storage.view(slot);
+        let requester = match context.authorization_role {
+            Some(role) => role as usize,
+            None => context
+                .storage
+                .current_role_slot(context.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "current role is not present in the role catalog"
+                    )
+                })?,
+        };
+        context
+            .storage
+            .require_schema_usage_as(view.schema.as_str(), requester, context.txid)?;
+        let view_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: slot as u16,
+        };
+        if !context.storage.has_object_privilege(
+            view_object,
+            requester,
+            crate::storage::PrivilegeSet::SELECT,
+            context.txid,
+        ) {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for view {}",
+                view.name.as_str()
+            ));
+        }
+        let owner = context.storage.object_owner(view_object, context.txid) as u16;
         let view_sql = arena
             .alloc_str(view.sql.as_str())
             .map_err(|_| arena_full())?;
@@ -1351,6 +1394,7 @@ fn subst_tableref<'a>(
             depth: context.depth + 1,
             path: Some(view_path),
             dependencies: Some(context.storage.view_dependencies(slot)),
+            authorization_role: Some(owner),
             qualifier: None,
         };
         let expanded = subst_select(vsel, inner, arena)?;
@@ -1364,6 +1408,7 @@ fn subst_tableref<'a>(
             cte: None,
             with_ordinality: false,
             lateral: false,
+            authorization_role: None,
         });
     }
     // Inside a view body, pin a table reference to the schema it resolved to
@@ -1382,6 +1427,7 @@ fn subst_tableref<'a>(
             schema: Some(schema),
             table,
             alias: Some(t.alias.unwrap_or(t.table)),
+            authorization_role: context.authorization_role,
             ..*t
         });
     }

@@ -5,12 +5,12 @@
 //! the parser as a second `impl Parser` block: these share the cursor and the
 //! token helpers with every other statement, but nothing else refers to them.
 
-use crate::sql::eval::sqlstate;
 use super::{
-    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, QualName,
-    Stmt, TableConstraint, Tok, MAX_LIST,
+    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, MAX_LIST, ParseError, Parser,
+    QualName, Stmt, TableConstraint, Tok,
 };
-use crate::sql::ast::{AlterDomainAction, AlterTypeAction, CreateDomain, DomainCheck};
+use crate::sql::ast::{AlterDomainAction, AlterTypeAction, CreateDomain, DomainCheck, RoleOptions};
+use crate::sql::eval::sqlstate;
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
 
@@ -55,7 +55,136 @@ impl<'a> Parser<'a> {
         if self.eat_ident("type")? {
             return self.create_type();
         }
+        if self.eat_ident("role")? {
+            return self.create_role(false);
+        }
+        if self.eat_ident("user")? {
+            return self.create_role(true);
+        }
+        if self.eat_ident("group")? {
+            return self.create_role(false);
+        }
         self.create_table()
+    }
+
+    fn create_role(&mut self, user_spelling: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.any_ident("role name")?;
+        let _ = self.eat_ident("with")?;
+        let mut options = RoleOptions::EMPTY;
+        let mut in_roles: &'a [&'a str] = &[];
+        let mut role_members: &'a [&'a str] = &[];
+        let mut admin_members: &'a [&'a str] = &[];
+        loop {
+            if self.role_option(&mut options)? {
+                continue;
+            }
+            if self.eat_ident("in")? {
+                if !self.eat_ident("role")? {
+                    self.expect_ident("group")?;
+                }
+                in_roles = self.role_name_list("role name")?;
+            } else if self.eat_ident("role")? {
+                role_members = self.role_name_list("member role name")?;
+            } else if self.eat_ident("admin")? {
+                admin_members = self.role_name_list("member role name")?;
+            } else {
+                break;
+            }
+        }
+        if options.can_login.is_none() {
+            options.can_login = Some(user_spelling);
+        }
+        Ok(Stmt::CreateRole {
+            name,
+            options,
+            memberships: crate::sql::ast::RoleMembershipClauses {
+                in_roles,
+                role_members,
+                admin_members,
+            },
+        })
+    }
+
+    pub(super) fn alter_role(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.any_ident("role name")?;
+        if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            return Ok(Stmt::AlterRoleRename {
+                name,
+                new_name: self.any_ident("new role name")?,
+            });
+        }
+        let _ = self.eat_ident("with")?;
+        let options = self.role_options()?;
+        if options == RoleOptions::EMPTY {
+            return Err(self.unexpected("expected a role option"));
+        }
+        Ok(Stmt::AlterRole { name, options })
+    }
+
+    fn role_options(&mut self) -> Result<RoleOptions<'a>, ParseError> {
+        let mut options = RoleOptions::EMPTY;
+        while self.role_option(&mut options)? {}
+        Ok(options)
+    }
+
+    fn role_option(&mut self, options: &mut RoleOptions<'a>) -> Result<bool, ParseError> {
+        if self.eat_ident("superuser")? {
+            options.superuser = Some(true);
+        } else if self.eat_ident("nosuperuser")? {
+            options.superuser = Some(false);
+        } else if self.eat_ident("inherit")? {
+            options.inherit = Some(true);
+        } else if self.eat_ident("noinherit")? {
+            options.inherit = Some(false);
+        } else if self.eat_ident("createrole")? {
+            options.create_role = Some(true);
+        } else if self.eat_ident("nocreaterole")? {
+            options.create_role = Some(false);
+        } else if self.eat_ident("createdb")? {
+            options.create_database = Some(true);
+        } else if self.eat_ident("nocreatedb")? {
+            options.create_database = Some(false);
+        } else if self.eat_ident("login")? {
+            options.can_login = Some(true);
+        } else if self.eat_ident("nologin")? {
+            options.can_login = Some(false);
+        } else if self.eat_ident("replication")? {
+            options.replication = Some(true);
+        } else if self.eat_ident("noreplication")? {
+            options.replication = Some(false);
+        } else if self.eat_ident("bypassrls")? {
+            options.bypass_row_level_security = Some(true);
+        } else if self.eat_ident("nobypassrls")? {
+            options.bypass_row_level_security = Some(false);
+        } else if self.eat_ident("connection")? {
+            self.expect_ident("limit")?;
+            let negative = self.eat_op("-")?;
+            let Tok::Num(raw) = self.peeked else {
+                return Err(self.unexpected("expected connection limit"));
+            };
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| self.unexpected("connection limit is out of range"))?;
+            self.advance()?;
+            options.connection_limit = Some(if negative { -parsed } else { parsed });
+        } else if self.eat_ident("password")? {
+            options.password = Some(if self.eat_ident("null")? {
+                None
+            } else {
+                Some(self.str_literal("password")?)
+            });
+        } else if self.eat_ident("valid")? {
+            self.expect_ident("until")?;
+            options.valid_until = Some(if self.eat_ident("null")? {
+                None
+            } else {
+                Some(self.str_literal("VALID UNTIL")?)
+            });
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// The shared tail of `CREATE TABLE ... AS` / `CREATE MATERIALIZED VIEW`:
@@ -79,7 +208,14 @@ impl<'a> Parser<'a> {
         } else {
             true
         };
-        Ok(Stmt::CreateTableAs { name, columns, sql, with_data, if_not_exists, materialized })
+        Ok(Stmt::CreateTableAs {
+            name,
+            columns,
+            sql,
+            with_data,
+            if_not_exists,
+            materialized,
+        })
     }
 
     /// `CREATE SEQUENCE [IF NOT EXISTS] name [options]` ("create sequence"
@@ -94,7 +230,11 @@ impl<'a> Parser<'a> {
         };
         let name = self.qual_name("sequence name")?;
         let options = self.seq_options(false)?;
-        Ok(Stmt::CreateSequence { name, if_not_exists, options })
+        Ok(Stmt::CreateSequence {
+            name,
+            if_not_exists,
+            options,
+        })
     }
 
     /// `CREATE DOMAIN name [AS] basetype[(typmod)] [constraint...]` ("domain"
@@ -106,7 +246,10 @@ impl<'a> Parser<'a> {
         let (base_type, base_type_mod) = self.type_name_mod()?;
         let mut not_null = false;
         let mut default_text = None;
-        let mut checks = [DomainCheck { name: None, expression: "" }; MAX_LIST];
+        let mut checks = [DomainCheck {
+            name: None,
+            expression: "",
+        }; MAX_LIST];
         let mut n_checks = 0;
         loop {
             let cname = if self.eat_ident("constraint")? {
@@ -123,7 +266,10 @@ impl<'a> Parser<'a> {
                 if n_checks == MAX_LIST {
                     return Err(self.limit("domain CHECK constraints", MAX_LIST));
                 }
-                checks[n_checks] = DomainCheck { name: cname, expression: self.check_text()? };
+                checks[n_checks] = DomainCheck {
+                    name: cname,
+                    expression: self.check_text()?,
+                };
                 n_checks += 1;
             } else if cname.is_none() && self.eat_ident("default")? {
                 let start = self.peek_at;
@@ -170,7 +316,10 @@ impl<'a> Parser<'a> {
                 None
             };
             self.expect_ident("check")?;
-            AlterDomainAction::AddCheck(DomainCheck { name: cname, expression: self.check_text()? })
+            AlterDomainAction::AddCheck(DomainCheck {
+                name: cname,
+                expression: self.check_text()?,
+            })
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {
                 let if_exists = if self.eat_ident("if")? {
@@ -179,7 +328,10 @@ impl<'a> Parser<'a> {
                 } else {
                     false
                 };
-                AlterDomainAction::DropConstraint { name: self.col_ident("constraint name")?, if_exists }
+                AlterDomainAction::DropConstraint {
+                    name: self.col_ident("constraint name")?,
+                    if_exists,
+                }
             } else if self.eat_ident("not")? {
                 self.expect_ident("null")?;
                 AlterDomainAction::DropNotNull
@@ -195,7 +347,9 @@ impl<'a> Parser<'a> {
                 self.expect_ident("default")?;
                 let start = self.peek_at;
                 let _ = self.expression(0)?;
-                AlterDomainAction::SetDefault(self.arena_str(self.text[start..self.peek_at].trim_end())?)
+                AlterDomainAction::SetDefault(
+                    self.arena_str(self.text[start..self.peek_at].trim_end())?,
+                )
             }
         } else {
             return Err(self.err_here("expected ADD, DROP or SET after ALTER DOMAIN"));
@@ -213,7 +367,11 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
-        Ok(Stmt::DropDomain { names, if_exists, cascade })
+        Ok(Stmt::DropDomain {
+            names,
+            if_exists,
+            cascade,
+        })
     }
 
     /// `CREATE TYPE name AS ENUM ('label', ...)` ("create type" consumed). Only
@@ -224,10 +382,7 @@ impl<'a> Parser<'a> {
         if !self.eat_ident("enum")? {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(
-                    96,
-                    "only CREATE TYPE ... AS ENUM is supported"
-                ),
+                message: stack_format!(96, "only CREATE TYPE ... AS ENUM is supported"),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             });
         }
@@ -247,7 +402,10 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        Ok(Stmt::CreateEnum { name, labels: self.arena_slice(&labels[..n])? })
+        Ok(Stmt::CreateEnum {
+            name,
+            labels: self.arena_slice(&labels[..n])?,
+        })
     }
 
     /// `ALTER TYPE name <action>` ("alter type" consumed).
@@ -273,7 +431,12 @@ impl<'a> Parser<'a> {
             } else {
                 (None, None)
             };
-            AlterTypeAction::AddValue { label, if_not_exists, before, after }
+            AlterTypeAction::AddValue {
+                label,
+                if_not_exists,
+                before,
+                after,
+            }
         } else if self.eat_ident("rename")? {
             if self.eat_ident("value")? {
                 let from = self.str_literal("enum label")?;
@@ -299,7 +462,11 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
-        Ok(Stmt::DropType { names, if_exists, cascade })
+        Ok(Stmt::DropType {
+            names,
+            if_exists,
+            cascade,
+        })
     }
 
     /// `ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]]` ("alter
@@ -316,7 +483,11 @@ impl<'a> Parser<'a> {
             return self.alter_owner(crate::sql::ast::AlterOwnerKind::Sequence, name, if_exists);
         }
         let options = self.seq_options(true)?;
-        Ok(Stmt::AlterSequence { name, if_exists, options })
+        Ok(Stmt::AlterSequence {
+            name,
+            if_exists,
+            options,
+        })
     }
 
     /// The shared CREATE/ALTER SEQUENCE option list. `allow_restart` enables the
@@ -364,12 +535,18 @@ impl<'a> Parser<'a> {
                     if self.eat_op(".")? {
                         let third = self.col_ident("owner column")?;
                         Some(Some(SeqOwner {
-                            table: QualName { schema: Some(first), name: second },
+                            table: QualName {
+                                schema: Some(first),
+                                name: second,
+                            },
                             column: third,
                         }))
                     } else {
                         Some(Some(SeqOwner {
-                            table: QualName { schema: None, name: first },
+                            table: QualName {
+                                schema: None,
+                                name: first,
+                            },
                             column: second,
                         }))
                     }
@@ -472,7 +649,11 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(ColGen::Identity(IdentitySpec { always, sequence_name, options }))
+        Ok(ColGen::Identity(IdentitySpec {
+            always,
+            sequence_name,
+            options,
+        }))
     }
 
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] AS <query>
@@ -511,9 +692,8 @@ impl<'a> Parser<'a> {
 
     /// CREATE SCHEMA [IF NOT EXISTS] { name [AUTHORIZATION role] |
     /// AUTHORIZATION role } [schema_element ...] ("create schema" consumed).
-    /// The only role this engine has is the session's bootstrap user; naming
-    /// any other errors as PostgreSQL does. Schema elements are the embedded
-    /// CREATE statements, run with the new schema as their creation target.
+    /// Schema elements are the embedded CREATE statements, run with the new
+    /// schema as their creation target.
     fn create_schema(&mut self) -> Result<Stmt<'a>, ParseError> {
         let if_not_exists = if self.eat_ident("if")? {
             self.expect_ident("not")?;
@@ -527,15 +707,10 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.col_ident("schema name")?)
         };
+        let mut authorization = None;
         let name = if self.eat_ident("authorization")? {
             let role = self.col_ident("role name")?;
-            if role != "postgres" {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(96, "role \"{}\" does not exist", role),
-                    sqlstate: sqlstate::UNDEFINED_OBJECT,
-                });
-            }
+            authorization = Some(role);
             // An omitted name defaults to the role's name, as PostgreSQL.
             name.unwrap_or(role)
         } else {
@@ -555,9 +730,9 @@ impl<'a> Parser<'a> {
                 element,
                 Stmt::CreateTable(_) | Stmt::CreateView { .. } | Stmt::CreateIndex { .. }
             ) {
-                return Err(self.err_here(
-                    "CREATE SCHEMA elements may be CREATE TABLE, VIEW, or INDEX",
-                ));
+                return Err(
+                    self.err_here("CREATE SCHEMA elements may be CREATE TABLE, VIEW, or INDEX")
+                );
             }
             elements[n] = self
                 .arena
@@ -567,6 +742,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Stmt::CreateSchema {
             name,
+            authorization,
             if_not_exists,
             elements: self.arena_slice(&elements[..n])?,
         })
@@ -583,7 +759,11 @@ impl<'a> Parser<'a> {
             if !method.eq_ignore_ascii_case("btree") {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "index access method \"{}\" is not supported", method),
+                    message: stack_format!(
+                        96,
+                        "index access method \"{}\" is not supported",
+                        method
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 });
             }
@@ -627,7 +807,12 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         let columns = self.arena_slice(&columns[..n])?;
-        Ok(Stmt::CreateIndex { name, table, columns, unique })
+        Ok(Stmt::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        })
     }
 
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
@@ -640,7 +825,11 @@ impl<'a> Parser<'a> {
         let _ = self.query()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
-        Ok(Stmt::CreateView { name, or_replace, sql })
+        Ok(Stmt::CreateView {
+            name,
+            or_replace,
+            sql,
+        })
     }
 
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).
@@ -654,7 +843,11 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_ident("restrict")?;
                 false
             };
-            return Ok(Stmt::DropView { names, if_exists, cascade });
+            return Ok(Stmt::DropView {
+                names,
+                if_exists,
+                cascade,
+            });
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
@@ -665,7 +858,11 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_ident("restrict")?;
                 false
             };
-            return Ok(Stmt::DropMaterializedView { names, if_exists, cascade });
+            return Ok(Stmt::DropMaterializedView {
+                names,
+                if_exists,
+                cascade,
+            });
         }
         if self.eat_ident("index")? {
             let (names, if_exists) = self.drop_targets("index name")?;
@@ -682,13 +879,41 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_ident("restrict")?;
                 false
             };
-            return Ok(Stmt::DropSequence { names, if_exists, cascade });
+            return Ok(Stmt::DropSequence {
+                names,
+                if_exists,
+                cascade,
+            });
         }
         if self.eat_ident("domain")? {
             return self.drop_domain();
         }
         if self.eat_ident("type")? {
             return self.drop_type();
+        }
+        if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = [""; 16];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("roles", names.len()));
+                }
+                names[count] = self.any_ident("role name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            return Ok(Stmt::DropRole {
+                names: self.arena_slice(&names[..count])?,
+                if_exists,
+            });
         }
         self.drop_table()
     }
@@ -720,14 +945,15 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
-        Ok(Stmt::DropSchema { names: self.arena_slice(&names[..n])?, if_exists, cascade })
+        Ok(Stmt::DropSchema {
+            names: self.arena_slice(&names[..n])?,
+            if_exists,
+            cascade,
+        })
     }
 
     /// `[IF EXISTS] name [, ...]` after a DROP keyword.
-    fn drop_targets(
-        &mut self,
-        what: &str,
-    ) -> Result<(&'a [QualName<'a>], bool), ParseError> {
+    fn drop_targets(&mut self, what: &str) -> Result<(&'a [QualName<'a>], bool), ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
             true
@@ -742,7 +968,10 @@ impl<'a> Parser<'a> {
             }
             let first = self.any_ident(what)?;
             names[n] = if self.eat_op(".")? {
-                QualName { schema: Some(first), name: self.any_ident(what)? }
+                QualName {
+                    schema: Some(first),
+                    name: self.any_ident(what)?,
+                }
             } else {
                 QualName::bare(first)
             };
@@ -798,13 +1027,33 @@ impl<'a> Parser<'a> {
             // Otherwise it is a column definition whose name we already read.
             pending_first_col = Some(first_ident);
         }
-        let mut columns = [ColumnDef { name: "", type_name: "", type_mod: -1, not_null: false, unique: false, primary: false, default: None, default_text: None, generated_text: None, identity: None }; MAX_LIST];
+        let mut columns = [ColumnDef {
+            name: "",
+            type_name: "",
+            type_mod: -1,
+            not_null: false,
+            unique: false,
+            primary: false,
+            default: None,
+            default_text: None,
+            generated_text: None,
+            identity: None,
+        }; MAX_LIST];
         let mut n = 0;
-        let mut cons = [TableConstraint::Unique { name: None, columns: &[] }; MAX_LIST];
+        let mut cons = [TableConstraint::Unique {
+            name: None,
+            columns: &[],
+        }; MAX_LIST];
         let mut n_cons = 0;
-        let mut likes =
-            [LikeClause { at: 0, source: QualName::bare(""), defaults: false, constraints: false, indexes: false, identity: false, generated: false };
-                MAX_LIST];
+        let mut likes = [LikeClause {
+            at: 0,
+            source: QualName::bare(""),
+            defaults: false,
+            constraints: false,
+            indexes: false,
+            identity: false,
+            generated: false,
+        }; MAX_LIST];
         let mut n_likes = 0;
         loop {
             if n == MAX_LIST {
@@ -839,7 +1088,10 @@ impl<'a> Parser<'a> {
                 // Table-level constraints: PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY.
                 if matches!(
                     self.peeked,
-                    Tok::Ident("primary") | Tok::Ident("unique") | Tok::Ident("check") | Tok::Ident("foreign")
+                    Tok::Ident("primary")
+                        | Tok::Ident("unique")
+                        | Tok::Ident("check")
+                        | Tok::Ident("foreign")
                 ) {
                     let c = self.table_constraint(cons_name)?;
                     if n_cons == MAX_LIST {
@@ -954,7 +1206,18 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            columns[n] = ColumnDef { name: col_name, type_name, type_mod, not_null, unique, primary, default, default_text, generated_text, identity };
+            columns[n] = ColumnDef {
+                name: col_name,
+                type_name,
+                type_mod,
+                not_null,
+                unique,
+                primary,
+                default,
+                default_text,
+                generated_text,
+                identity,
+            };
             n += 1;
             if !self.eat_op(",")? {
                 break;
@@ -964,15 +1227,28 @@ impl<'a> Parser<'a> {
         let columns = self.arena_slice(&columns[..n])?;
         let constraints = self.arena_slice(&cons[..n_cons])?;
         let likes = self.arena_slice(&likes[..n_likes])?;
-        Ok(Stmt::CreateTable(CreateTable { name, columns, constraints, likes, if_not_exists }))
+        Ok(Stmt::CreateTable(CreateTable {
+            name,
+            columns,
+            constraints,
+            likes,
+            if_not_exists,
+        }))
     }
 
     /// The rest of a `LIKE source [ { INCLUDING | EXCLUDING } option ]...`
     /// element, `LIKE` already consumed. `at` is how many columns precede it.
     fn like_clause(&mut self, at: usize) -> Result<LikeClause<'a>, ParseError> {
         let source = self.qual_name("source table name")?;
-        let mut clause =
-            LikeClause { at, source, defaults: false, constraints: false, indexes: false, identity: false, generated: false };
+        let mut clause = LikeClause {
+            at,
+            source,
+            defaults: false,
+            constraints: false,
+            indexes: false,
+            identity: false,
+            generated: false,
+        };
         loop {
             let including = if self.eat_ident("including")? {
                 true
@@ -1006,7 +1282,7 @@ impl<'a> Parser<'a> {
                             other
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    })
+                    });
                 }
                 _ => return Err(self.err_here("expected a LIKE option after INCLUDING/EXCLUDING")),
             }
@@ -1034,7 +1310,10 @@ impl<'a> Parser<'a> {
     }
 
     /// A table-level PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY constraint.
-    pub(super) fn table_constraint(&mut self, name: Option<&'a str>) -> Result<TableConstraint<'a>, ParseError> {
+    pub(super) fn table_constraint(
+        &mut self,
+        name: Option<&'a str>,
+    ) -> Result<TableConstraint<'a>, ParseError> {
         if self.eat_ident("primary")? {
             self.expect_ident("key")?;
             let columns = self.column_name_list()?;
@@ -1055,14 +1334,21 @@ impl<'a> Parser<'a> {
 
     /// A CHECK (predicate): captures the predicate's source text for durable
     /// storage alongside the parsed expression.
-    fn check_constraint(&mut self, name: Option<&'a str>) -> Result<TableConstraint<'a>, ParseError> {
+    fn check_constraint(
+        &mut self,
+        name: Option<&'a str>,
+    ) -> Result<TableConstraint<'a>, ParseError> {
         self.expect_op("(")?;
         let start = self.peek_at;
         let expression = self.expression(0)?;
         let text = self.text[start..self.peek_at].trim_end();
         let text = self.arena_str(text)?;
         self.expect_op(")")?;
-        Ok(TableConstraint::Check { name, expression, text })
+        Ok(TableConstraint::Check {
+            name,
+            expression,
+            text,
+        })
     }
 
     /// The part of a FOREIGN KEY after `REFERENCES`: parent table, optional
@@ -1133,5 +1419,10 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
-        Ok(Stmt::DropTable(DropTable { names, if_exists, cascade }))
-    }}
+        Ok(Stmt::DropTable(DropTable {
+            names,
+            if_exists,
+            cascade,
+        }))
+    }
+}

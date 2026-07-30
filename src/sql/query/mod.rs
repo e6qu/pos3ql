@@ -87,7 +87,10 @@ use window::{
     cmp_key_rows, dedup_window_rows, project_window_rows, rewrite_grouped_windows, window_select,
 };
 
-pub const MAX_JOIN_TABLES: usize = 9; // base + 8 joins
+/// Static executor capacity for one range table. PostgreSQL itself has a
+/// finite range-table bound; this removes the old SQLLogicTest-visible
+/// base-plus-eight special case while keeping all scratch startup-bounded.
+pub const MAX_JOIN_TABLES: usize = 16;
 const MAX_AGGS: usize = 16;
 
 use core::cell::Cell;

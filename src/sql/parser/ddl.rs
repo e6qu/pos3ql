@@ -589,13 +589,37 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("(")?;
-        let mut columns = [""; MAX_LIST];
+        let mut columns = [crate::sql::ast::IndexColumn {
+            name: "",
+            descending: false,
+            nulls_first: false,
+        }; MAX_LIST];
         let mut n = 0;
         loop {
             if n == MAX_LIST {
                 return Err(self.limit("index columns", MAX_LIST));
             }
-            columns[n] = self.col_ident("column name")?;
+            let name = self.col_ident("column name")?;
+            let descending = if self.eat_ident("asc")? {
+                false
+            } else {
+                self.eat_ident("desc")?
+            };
+            let nulls_first = if self.eat_ident("nulls")? {
+                if self.eat_ident("first")? {
+                    true
+                } else {
+                    self.expect_ident("last")?;
+                    false
+                }
+            } else {
+                descending
+            };
+            columns[n] = crate::sql::ast::IndexColumn {
+                name,
+                descending,
+                nulls_first,
+            };
             n += 1;
             if !self.eat_op(",")? {
                 break;

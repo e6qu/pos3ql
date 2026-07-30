@@ -90,19 +90,15 @@ pub struct Config {
     /// seam. Implies `object_store_on`; refused by the real server binary (the
     /// virtual bucket allocates freely and exists for simulation tests).
     pub object_store_sim: bool,
-    /// Upload committed WAL batches to durable object storage (backup / RPO).
-    /// Requires `object_store = on`, and defaults on with it — the local disk
-    /// is a cache, so an acknowledged commit must not live only there.
+    /// Upload committed WAL batches to durable object storage. Required with
+    /// `object_store = on`: the local disk is a cache, so an acknowledged
+    /// commit must not live only there.
     pub wal_upload: bool,
-    /// Make WAL upload synchronous: a commit blocks until its batch is in the
-    /// bucket (RPO=0 against total local-disk loss), at the cost of object-store
-    /// latency on every commit. Defaults on with object storage and WAL upload
-    /// (commit-durable-on-bucket, the plan of record); set off explicitly to
-    /// trade the tail of durability for local-fsync commit latency.
+    /// A commit blocks until its WAL batch is in the bucket (RPO=0 against
+    /// total local-disk loss). Required with object storage.
     pub wal_upload_sync: bool,
-    /// Accumulation buffer for asynchronous WAL upload. Commits batch into it
-    /// between drains; when it fills, a commit drains synchronously
-    /// (backpressure). Must exceed wal_buffer_bytes.
+    /// Scratch for staging a committed WAL batch before its object PUT. Must
+    /// hold at least one full journal batch.
     pub wal_upload_buffer_bytes: usize,
     /// Endpoint for the configured adapter. The first adapter speaks the
     /// S3-compatible HTTP API used by AWS, MinIO, and compatibility gateways.
@@ -356,17 +352,22 @@ impl Config {
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
-        // Commit-durable-on-bucket is the default whenever object storage is
-        // on: a database whose disk is a mere cache must not quietly leave
-        // acknowledged commits living only on that disk. An explicit
-        // `wal_upload = off` / `wal_upload_sync = off` still wins — the
-        // opt-out is a stated choice, never an accident of omission.
+        // With object storage enabled it is the durable authority, not an
+        // asynchronous backup of local disk. Every acknowledged WAL batch
+        // must therefore be present there; RAM and disk remain caches.
         if config.object_store_on {
             if !seen.iter().any(|s| s == "wal_upload") {
                 config.wal_upload = true;
             }
             if config.wal_upload && !seen.iter().any(|s| s == "wal_upload_sync") {
                 config.wal_upload_sync = true;
+            }
+            if !config.wal_upload || !config.wal_upload_sync {
+                return Err(ConfigError::at(
+                    0,
+                    "object_store requires wal_upload = on and wal_upload_sync = on; local disk is a cache, not a durable fallback"
+                        .to_string(),
+                ));
             }
         }
         // Server TLS needs a certificate and a key: refuse a half-configured
@@ -551,11 +552,8 @@ sql_arena_bytes = 4096
     fn object_store_defaults_to_commit_durable_on_bucket() {
         let c = Config::parse("object_store = on\n").unwrap();
         assert!(c.wal_upload && c.wal_upload_sync, "the plan-of-record default");
-        // Explicit settings win over the resolved defaults.
-        let c = Config::parse("object_store = on\nwal_upload = off\n").unwrap();
-        assert!(!c.wal_upload && !c.wal_upload_sync);
-        let c = Config::parse("object_store = on\nwal_upload_sync = off\n").unwrap();
-        assert!(c.wal_upload && !c.wal_upload_sync, "async upload, stated");
+        assert!(Config::parse("object_store = on\nwal_upload = off\n").is_err());
+        assert!(Config::parse("object_store = on\nwal_upload_sync = off\n").is_err());
         // Without object storage nothing is implied.
         let c = Config::parse("").unwrap();
         assert!(!c.object_store_on && !c.wal_upload && !c.wal_upload_sync);

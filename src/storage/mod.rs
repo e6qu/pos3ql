@@ -913,6 +913,7 @@ pub(crate) struct Enforcer {
     slot: u32,
     columns: [u16; MAX_INDEX_COLS],
     n_cols: usize,
+    durable: Option<crate::store::ValueIndexHandle>,
 }
 
 impl Enforcer {
@@ -1578,9 +1579,7 @@ impl SequenceDef {
 /// Maximum columns in an index key.
 pub(crate) const MAX_INDEX_COLS: usize = 8;
 
-/// A named index over a table's columns. Our engine does full scans, so an
-/// index never accelerates a query; it exists as a durable catalog object and,
-/// when `unique`, enforces a uniqueness constraint on its column tuple.
+/// A named btree index over a table's columns.
 #[derive(Clone, Copy)]
 pub struct IndexDef {
     /// The schema of both the index and its table (an index always lives in
@@ -1589,6 +1588,8 @@ pub struct IndexDef {
     pub name: SqlName,
     pub table: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
+    pub descending: [bool; MAX_INDEX_COLS],
+    pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
     pub unique: bool,
     pub live: bool,
@@ -1881,12 +1882,15 @@ pub(crate) struct SpillReader {
     /// per spill-list member plus an index buffer for cursor advances.
     /// Exhaustion is a loud error naming the bound.
     scan_contexts: [std::cell::RefCell<ScanContext>; SCAN_CONTEXTS],
+    /// Independent buffers for persistent value probes. A probe may invoke an
+    /// authoritative spilled-row recheck, so it must not borrow row scratch.
+    value_scratch: [std::cell::RefCell<ValueIndexScratch>; 2],
 }
 
 /// How many row-state walks may be live at once: a full join
 /// ([`crate::sql::query::MAX_JOIN_TABLES`] deep), plus a constraint or
 /// validation scan running inside the innermost callback, with headroom.
-const SCAN_CONTEXTS: usize = 12;
+const SCAN_CONTEXTS: usize = crate::sql::query::MAX_JOIN_TABLES + 4;
 
 /// One merged walk's working memory: the current data block per member and
 /// a shared buffer for index-block navigation on block advances.
@@ -1927,6 +1931,11 @@ struct SpillScratch {
     bounce_buf: Box<[u8]>,
 }
 
+struct ValueIndexScratch {
+    roster: Box<[u8]>,
+    data: Box<[u8]>,
+}
+
 impl SpillReader {
     /// Startup-only: reserves the reader scratch from the budget.
     pub(crate) fn new(
@@ -1942,6 +1951,10 @@ impl SpillReader {
         budget.draw(
             SCAN_CONTEXTS * (MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD,
             "row-state walk contexts",
+        )?;
+        budget.draw(
+            4 * crate::store::MAX_PAYLOAD,
+            "persistent value-index readers",
         )?;
         let fresh = || {
             std::cell::RefCell::new(SpillScratch {
@@ -1959,10 +1972,17 @@ impl SpillReader {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             })
         };
+        let value = || {
+            std::cell::RefCell::new(ValueIndexScratch {
+                roster: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                data: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            })
+        };
         Ok(Self {
             blocks,
             scratch: [fresh(), fresh()],
             scan_contexts: core::array::from_fn(|_| context()),
+            value_scratch: [value(), value()],
         })
     }
 
@@ -1970,6 +1990,7 @@ impl SpillReader {
     pub(crate) fn budget_bytes() -> usize {
         2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             + SCAN_CONTEXTS * (MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+            + 4 * crate::store::MAX_PAYLOAD
     }
 }
 
@@ -2261,6 +2282,8 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     table: SqlName::parse("").expect("empty name fits"),
                     columns: [0; MAX_INDEX_COLS],
+                    descending: [false; MAX_INDEX_COLS],
+                    nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
                     unique: false,
                     live: false,
@@ -4179,7 +4202,7 @@ impl Storage {
         columns: &[u16],
         hash: u64,
         mut visit: impl FnMut(u64),
-    ) -> bool {
+    ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         for i in 0..table.n_enforcers {
             let e = table.enforcers[i].expect("enforcer present");
@@ -4190,10 +4213,63 @@ impl Storage {
                     .expect("value index pool present")
                     .get(e.slot);
                 index.probe(hash, &mut visit);
-                return index.is_complete();
+                if index.is_complete() {
+                    return Ok(true);
+                }
+                let Some(handle) = e.durable else {
+                    return Ok(false);
+                };
+                if self.commit_snapshot < handle.published_lsn {
+                    return Ok(false);
+                }
+                let Some(spill) = &self.spill else {
+                    return Ok(false);
+                };
+                let Some(mut scratch) = spill
+                    .value_scratch
+                    .iter()
+                    .find_map(|candidate| candidate.try_borrow_mut().ok())
+                else {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "persistent value probes nested deeper than reader scratch"
+                    ));
+                };
+                let scratch = &mut *scratch;
+                crate::store::ValueIndexReader::over(&mut scratch.roster, &mut scratch.data)
+                    .probe(
+                        &mut *spill.blocks.borrow_mut(),
+                        &handle,
+                        hash,
+                        |rowid, _, _| visit(rowid),
+                    )
+                    .map_err(|error| {
+                        sql_err!(
+                            sqlstate::IO_ERROR,
+                            "persistent value-index read: {:?}",
+                            error
+                        )
+                    })?;
+                // The published generation is a complete base. Every later
+                // committed change remains in the bounded resident overlay
+                // until its replacement generation publishes.
+                let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
+                for (&rowid, state) in self.tables[table_index].rows.iter() {
+                    let Some(home) = state.committed else {
+                        continue;
+                    };
+                    let n = self.row_enforcer_hashes(table_index, rowid, home, &mut hashes)?;
+                    if hashes[..n]
+                        .iter()
+                        .any(|(binding, candidate)| *binding == i && *candidate == hash)
+                    {
+                        visit(rowid);
+                    }
+                }
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     pub fn value_cache_complete(&self, table_index: usize, columns: &[u16]) -> bool {
@@ -4207,6 +4283,202 @@ impl Storage {
                     .expect("value index pool present")
                     .get(enforcer.slot)
                     .is_complete()
+        })
+    }
+
+    pub fn value_probe_complete(&self, table_index: usize, columns: &[u16]) -> bool {
+        let table = &self.tables[table_index];
+        (0..table.n_enforcers).any(|index| {
+            let enforcer = table.enforcers[index].expect("enforcer present");
+            enforcer.columns() == columns
+                && (self
+                    .value_indexes
+                    .as_ref()
+                    .expect("value index pool present")
+                    .get(enforcer.slot)
+                    .is_complete()
+                    || enforcer
+                        .durable
+                        .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn))
+        })
+    }
+
+    pub fn value_durable_complete(&self, table_index: usize, columns: &[u16]) -> bool {
+        let table = &self.tables[table_index];
+        (0..table.n_enforcers).any(|index| {
+            let enforcer = table.enforcers[index].expect("enforcer present");
+            enforcer.columns() == columns
+                && enforcer
+                    .durable
+                    .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
+        })
+    }
+
+    /// Walks a manifest-published key generation and the resident changes
+    /// newer than it. Encoded keys borrow reader scratch only for the callback.
+    pub fn walk_value_index(
+        &self,
+        table_index: usize,
+        columns: &[u16],
+        mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        let table = &self.tables[table_index];
+        let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
+            let enforcer = table.enforcers[binding].expect("enforcer");
+            (enforcer.columns() == columns).then_some((binding, enforcer.durable?))
+        }) else {
+            return Ok(false);
+        };
+        if self.commit_snapshot < handle.published_lsn {
+            return Ok(false);
+        }
+        let Some(spill) = &self.spill else {
+            return Ok(false);
+        };
+        let Some(mut scratch) = spill
+            .value_scratch
+            .iter()
+            .find_map(|candidate| candidate.try_borrow_mut().ok())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "persistent value scans nested deeper than reader scratch"
+            ));
+        };
+        {
+            let ValueIndexScratch { roster, data } = &mut *scratch;
+            let mut callback_error = Ok(());
+            crate::store::ValueIndexReader::over(roster, data)
+                .walk(
+                    &mut *spill.blocks.borrow_mut(),
+                    &handle,
+                    |_, rowid, _, key| {
+                        if callback_error.is_ok()
+                            && let Err(error) = visit(rowid, key)
+                        {
+                            callback_error = Err(error);
+                        }
+                    },
+                )
+                .map_err(|error| {
+                    sql_err!(
+                        sqlstate::IO_ERROR,
+                        "persistent value-index read: {:?}",
+                        error
+                    )
+                })?;
+            callback_error?;
+        }
+        // Overlay entries supersede or extend the published base. Duplicate
+        // rowids are harmless because the ordinary WHERE/MVCC path rechecks
+        // them; callers sort and deduplicate candidates before execution.
+        for (&rowid, state) in table.rows.iter() {
+            let Some(home) = state.committed else {
+                continue;
+            };
+            let key_buffer = &mut scratch.roster;
+            let (len, _) =
+                self.encode_value_binding_key(table_index, binding, rowid, home, key_buffer)?;
+            visit(rowid, &key_buffer[..len])?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn value_binding_count(&self, table_index: usize) -> usize {
+        self.tables[table_index].n_enforcers
+    }
+
+    pub(crate) fn value_binding_columns(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> ([u16; MAX_INDEX_COLS], usize) {
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        (enforcer.columns, enforcer.n_cols)
+    }
+
+    pub(crate) fn value_binding_handle(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> Option<crate::store::ValueIndexHandle> {
+        self.tables[table_index].enforcers[binding]
+            .expect("binding")
+            .durable
+    }
+
+    pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let columns = enforcer.columns();
+        let definition = &self.tables[table_index].def;
+        definition
+            .columns()
+            .iter()
+            .enumerate()
+            .any(|(column, metadata)| metadata.unique && columns == [column as u16])
+            || definition
+                .uniques()
+                .iter()
+                .any(|unique| unique.columns() == columns)
+            || self.indexes.iter().any(|index| {
+                index.live
+                    && index.schema == definition.schema
+                    && index.table == definition.name
+                    && &index.columns[..index.n_cols] == columns
+            })
+    }
+
+    pub(crate) fn install_value_binding(
+        &mut self,
+        table_index: usize,
+        columns: &[u16],
+        handle: Option<crate::store::ValueIndexHandle>,
+    ) -> Result<(), SqlError> {
+        let n_enforcers = self.tables[table_index].n_enforcers;
+        let Some(enforcer) = self.tables[table_index].enforcers[..n_enforcers]
+            .iter_mut()
+            .flatten()
+            .find(|enforcer| enforcer.columns() == columns)
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "manifest value index has no catalog binding"
+            ));
+        };
+        enforcer.durable = handle;
+        Ok(())
+    }
+
+    /// Encodes one binding's key tuple into caller-owned checkpoint scratch.
+    pub(crate) fn encode_value_binding_key(
+        &self,
+        table_index: usize,
+        binding: usize,
+        rowid: u64,
+        home: RowHome,
+        output: &mut [u8],
+    ) -> Result<(usize, u64), SqlError> {
+        let table = &self.tables[table_index];
+        let enforcer = table.enforcers[binding].expect("binding");
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = table.def.schema(&mut schema);
+        self.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+            let mut key = [Datum::Null; MAX_INDEX_COLS];
+            for (at, column) in enforcer.columns().iter().enumerate() {
+                key[at] = values[*column as usize];
+            }
+            let key = &key[..enforcer.n_cols];
+            let len = rowenc::encoded_len(key);
+            if len > crate::store::VALUE_INDEX_KEY_MAX || len > output.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "index tuple exceeds the persistent block-key limit"
+                ));
+            }
+            rowenc::encode(key, &mut output[..len]);
+            Ok((len, hash_key(&values, enforcer.columns())))
         })
     }
 
@@ -4284,6 +4556,14 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
+        // DDL reshapes the cache slots, but an unchanged column tuple keeps
+        // its manifest-published object generation.
+        let mut published = [([0u16; MAX_INDEX_COLS], 0usize, None); MAX_VALUE_ENFORCERS];
+        let n_published = self.tables[table_index].n_enforcers;
+        for (index, entry) in published.iter_mut().enumerate().take(n_published) {
+            let enforcer = self.tables[table_index].enforcers[index].expect("enforcer");
+            *entry = (enforcer.columns, enforcer.n_cols, enforcer.durable);
+        }
         self.release_enforcers(table_index);
         let mut want = [([0u16; MAX_INDEX_COLS], 0usize); MAX_VALUE_ENFORCERS];
         let mut n_want = 0usize;
@@ -4358,6 +4638,12 @@ impl Storage {
                 slot,
                 columns: want[w].0,
                 n_cols: want[w].1,
+                durable: published[..n_published]
+                    .iter()
+                    .find(|(columns, n_columns, _)| {
+                        *n_columns == want[w].1 && columns[..*n_columns] == want[w].0[..want[w].1]
+                    })
+                    .and_then(|(_, _, handle)| *handle),
             });
             // Keep the installed prefix visible to `release_enforcers`, so an
             // acquire failure later in this loop returns every slot already

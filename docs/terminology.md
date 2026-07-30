@@ -70,6 +70,8 @@ short names are kept (rule 3) and defined here.
   and the leveled read/compaction half is roadmapped — see [PLAN.md](../PLAN.md).)
 - **`checkpoint`** — snapshot live tables to SST objects and publish the
   compare-and-swap *manifest*; cold-start rehydration from the bucket.
+  Publication is gated while transactional catalog WAL can still roll back,
+  but not by read-only historical snapshots.
 - **`sim`** (simulator) — the deterministic simulators (VOPR): the VSR
   whole-cluster simulator, and the storage VOPR (`sim::storage`) driving the
   engine's storage stack against the virtual bucket.
@@ -90,12 +92,11 @@ vocabulary — with the meaning they carry in this codebase.
   in-memory table and are later flushed to immutable sorted files, with
   background compaction. *Current state:* memtable + block SSTs with
   spill-under-pressure, delta flushes with tombstones, and paced pair
-  merges; the remaining distance (a block-resident row map, beat-paced
-  merges) is the maturity roadmap in [PLAN.md](../PLAN.md).
+  merges, plus manifest-published secondary-index key generations.
 - **memtable** — the in-memory, sorted write buffer at the top of the LSM
   (`memtable_bytes`). Under memory pressure committed row *bytes* spill to
-  the bucket and page back through the cache tiers; the per-row map stays
-  in RAM (making it block-resident is the maturity roadmap's gap 2).
+  the bucket and page back through the cache tiers; the bounded per-row map
+  is a working-set overlay, not a durable dataset index.
 - **Sorted String Table (SST)** — an immutable, sorted, block-structured
   object of row versions on object storage: versioned SSTs sort
   `(rowid, commit_lsn DESC)` live values and tombstones into data blocks,
@@ -133,6 +134,13 @@ vocabulary — with the meaning they carry in this codebase.
 - **filter ladder** — the SST writer inserts every key into three candidate
   bloom sizes and keeps the smallest still giving about ten bits per key,
   so filters are sized to their SSTs instead of a fixed 128 KiB.
+- **secondary-index generation** — the immutable key-only block set for one
+  constrained or named index tuple at one manifest publication. Entries carry
+  the encoded tuple, equality hash, rowid, and commit LSN; immutable chained
+  roster roots name every data block without a flat one-block ceiling. A dirty
+  checkpoint rebuilds the generation (compaction), and the manifest CAS
+  publishes it atomically with row SSTs. RAM value maps and local disk frames
+  cache this object-resident state.
 - **content-addressed** — an object keyed by the hash of its bytes, hence
   immutable and safe to cache indefinitely and to reference across an eventually
   consistent LIST.
@@ -144,9 +152,10 @@ vocabulary — with the meaning they carry in this codebase.
   work run between query messages (and by the idle event loop): one
   table's slice, one stretch of a paced merge, or the publish itself. The
   publish beat runs only when no table has changed since its slice, which
-  per-table generations guarantee. Merge beats and sweep beats alternate
-  when both want the engine. The word *beat* is TigerBeetle's, for the
-  same amortize-the-work idea.
+  per-table generations guarantee, and only when no transaction has
+  rollback-capable catalog WAL. Merge beats and sweep beats alternate when
+  both want the engine. The word *beat* is TigerBeetle's, for the same
+  amortize-the-work idea.
 - **paced merge (merge job)** — compaction as a background job crossing
   beats: a table's spill list at the merge trigger gets its cheapest
   adjacent pair merged — the schedule built a few block *reads* per beat,
@@ -157,22 +166,23 @@ vocabulary — with the meaning they carry in this codebase.
   publishes.
 - **Write-Ahead Log (WAL)** — the durable operation log; here it doubles as the
   VSR journal. Every committed row image and definition change is appended
-  and fsynced before the commit acknowledges (the local durability point),
-  and replay after a crash rebuilds state from the last checkpoint forward.
+  and fsynced locally; with object storage enabled, its segment PUT must also
+  complete before the commit acknowledges. Replay after a crash rebuilds state
+  from the last checkpoint forward.
 - **WAL segment** — a committed WAL batch uploaded to the bucket as one
   object, keyed by its first LSN. A segment only *grows* under its key: a
   failed upload keeps the batch marker, so the retry carries the old bytes
   plus newly committed ones. Cold start replays segments newer than the
   manifest; a checkpoint prunes segments it made redundant.
-- **commit-durable-on-bucket** — the default posture with
+- **commit-durable-on-bucket** — the required durable posture with
   `object_store = on`
   (`wal_upload_sync`): a commit acknowledges only after its WAL segment is
   in the bucket, so wiping the local disk at any instant loses nothing
   acknowledged — the disk is formally a cache.
-- **RPO (recovery point objective)** — how much acknowledged work a
-  disaster may lose. RPO=0 against total node loss is what
-  commit-durable-on-bucket buys; the asynchronous drain trades a
-  drain-window of RPO for local-fsync commit latency.
+- **RPO (recovery point objective)** — how much acknowledged work a disaster
+  may lose. RPO=0 against total node loss is what commit-durable-on-bucket
+  provides; pos3ql does not offer an asynchronous-durability opt-out while
+  object storage is enabled.
 - **group commit** — amortizing the per-commit durability round-trip by
   covering many concurrent commits with one fsync/PUT before their acks.
   The WAL's local fsync already batches per transaction; the
@@ -228,8 +238,10 @@ vocabulary — with the meaning they carry in this codebase.
   heap-resident committed rows plus the tombstones recorded since the last
   checkpoint, appended as one new list member — instead of rewriting
   everything it already made durable.
-- **roster** — one block per SST listing every block identity the SST
-  comprises, so the garbage sweeper enumerates an SST with a single read.
+- **roster** — immutable object-block membership metadata. An SST has one
+  roster block listing its identities; a secondary-index generation uses
+  chained roster roots so its membership is not capped by one block. Garbage
+  collection follows these rosters instead of provider-specific object rules.
 - **overlay (row map)** — the in-RAM `Table.rows` map after the "map
   spills" step: it holds only pending changes, heap-resident rows, deletion
   markers, and hot entries — an entry *shadows* whatever the spill list
@@ -240,10 +252,11 @@ vocabulary — with the meaning they carry in this codebase.
   pending image: a committed DELETE of a bucket-resident row leaves one to
   shadow the spill list until the next publish's install writes the
   tombstone into the SSTs themselves, at which point the markers purge.
-- **generation** (`Table::mark_dirty`) — a per-table counter bumped on
+- **table generation** (`Table::mark_dirty`, field `generation`) — a per-table counter bumped on
   every committed change; the sliced checkpoint compares it against the
-  generation its slice captured, which is how a publish knows no table
-  changed after its slice.
+  value its slice captured, which is how a publish knows no table changed
+  after its slice. Distinct from a *secondary-index generation*, which is a
+  published immutable block set.
 - **transaction id (`transaction_id`)** — the identifier of a transaction's
   snapshot, used for row visibility. (Field name: previously `txid`.)
 

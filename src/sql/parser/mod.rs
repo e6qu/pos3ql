@@ -1687,7 +1687,7 @@ impl<'a> Parser<'a> {
             using_columns: None,
             natural: false,
         };
-        let mut joins = [dummy; 8];
+        let mut joins = [dummy; crate::sql::query::MAX_JOIN_TABLES - 1];
         let mut n = 0;
         loop {
             let natural = self.eat_ident("natural")?;

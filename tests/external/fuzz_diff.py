@@ -30,9 +30,22 @@ except ImportError:
     print("psycopg not installed; skipping fuzz_diff", file=sys.stderr)
     sys.exit(0)
 
-UNSUPPORTED_STATES = {
-    "0A000", "42601", "42883", "42704", "42846", "54000", "22023",
-}
+def is_unsupported(result):
+    if result[0] != "err":
+        return False
+    state = result[1]
+    message = result[2].lower() if len(result) > 2 else ""
+    if state == "0A000":
+        return True
+    if state in {"42883", "42704"}:
+        return True
+    if state == "42601":
+        return "not supported" in message or "fixed limit" in message
+    if state == "54000":
+        return any(word in message for word in ("limit", "arena", "full", "exhausted"))
+    if state == "22023":
+        return "not supported" in message
+    return False
 
 # Fixed schema the fuzzer queries. Columns span the type/nullability space.
 SCHEMA = [
@@ -286,7 +299,8 @@ def run_one(cur, sql):
         return ("ok", rows)
     except psycopg.Error as e:
         state = getattr(getattr(e, "diag", None), "sqlstate", None) or "?????"
-        return ("err", state)
+        message = getattr(getattr(e, "diag", None), "message_primary", None) or str(e)
+        return ("err", state, message.strip().replace("\n", " ")[:90])
     except Exception as e:
         # A decode error means the server's RowDescription type disagrees
         # with the value it sent — a real protocol bug, surfaced as a
@@ -407,9 +421,9 @@ def classify(pg_res, p3_res):
     if pg_res[0] == "err" and p3_res[0] == "err":
         if pg_res[1] == p3_res[1]:
             return "match"
-        return "unsupported" if p3_res[1] in UNSUPPORTED_STATES else "divergence"
+        return "unsupported" if is_unsupported(p3_res) else "divergence"
     if pg_res[0] == "ok" and p3_res[0] == "err":
-        return "unsupported" if p3_res[1] in UNSUPPORTED_STATES else "divergence"
+        return "unsupported" if is_unsupported(p3_res) else "divergence"
     if pg_res[0] == "err" and p3_res[0] == "ok":
         return "divergence"
     return "match" if key(pg_res[1]) == key(p3_res[1]) else "divergence"

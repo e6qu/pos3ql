@@ -253,19 +253,14 @@ impl Server {
     /// The event loop. Runs until SIGTERM/SIGINT, then drains connections,
     /// takes a final checkpoint, and returns cleanly.
     pub fn run(&mut self) -> std::io::Result<()> {
-        // Backoff for the asynchronous WAL-upload drain and the idle
-        // checkpoint beats: zero while healthy (work eagerly between
-        // events), one second after a failure so a persistently-unreachable
-        // bucket cannot spin the loop.
-        let mut upload_backoff = Duration::ZERO;
+        // Checkpoint beats run eagerly while healthy and back off for one
+        // second after an object-store failure.
         let mut beat_backoff = Duration::ZERO;
         while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-            // While committed WAL awaits asynchronous upload or a checkpoint
-            // sweep is mid-flight, poll with the backoff timeout so the loop
-            // returns to that work; otherwise block until the next event.
-            let timeout = if self.engine.has_pending_wal_upload() {
-                Some(upload_backoff)
-            } else if self.engine.checkpoint_work_pending() {
+            // While a checkpoint sweep is mid-flight, poll with the backoff
+            // timeout so the loop returns to that work; otherwise block until
+            // the next event.
+            let timeout = if self.engine.checkpoint_work_pending() {
                 Some(beat_backoff)
             } else {
                 None
@@ -285,16 +280,6 @@ impl Server {
                 } else {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
-            }
-            // Upload committed WAL off the commit path so request handling and
-            // Object-store latency never gates requests; back off if the
-            // durable tier errors.
-            if self.engine.has_pending_wal_upload() {
-                upload_backoff = if self.engine.drain_wal_upload() {
-                    Duration::ZERO
-                } else {
-                    Duration::from_secs(1)
-                };
             }
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client

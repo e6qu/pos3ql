@@ -1097,6 +1097,8 @@ struct IdxInfo {
     table_slot: usize,
     name: StackStr<64>,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
+    descending: [bool; crate::storage::MAX_INDEX_COLS],
+    nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
     is_primary: bool,
     is_unique: bool,
@@ -1128,7 +1130,12 @@ fn collect_indexes(
         let table_name = def.name.as_str();
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
-        let mut mk = |columns: &[u16], is_primary: bool, is_unique: bool, name: StackStr<64>| {
+        let mut mk = |columns: &[u16],
+                      descending: [bool; crate::storage::MAX_INDEX_COLS],
+                      nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
+                      is_primary: bool,
+                      is_unique: bool,
+                      name: StackStr<64>| {
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
             let info = IdxInfo {
@@ -1137,6 +1144,8 @@ fn collect_indexes(
                 table_slot: slot,
                 name,
                 columns: c,
+                descending,
+                nulls_first,
                 n_cols: columns.len(),
                 is_primary,
                 is_unique,
@@ -1148,12 +1157,32 @@ fn collect_indexes(
         for (ci, col) in def.columns().iter().enumerate() {
             if col.primary {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
-                push(mk(&[ci as u16], true, true, name), &mut n);
+                push(
+                    mk(
+                        &[ci as u16],
+                        [false; crate::storage::MAX_INDEX_COLS],
+                        [false; crate::storage::MAX_INDEX_COLS],
+                        true,
+                        true,
+                        name,
+                    ),
+                    &mut n,
+                );
             } else if col.unique {
                 let name = stack_str_64(
                     stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
                 );
-                push(mk(&[ci as u16], false, true, name), &mut n);
+                push(
+                    mk(
+                        &[ci as u16],
+                        [false; crate::storage::MAX_INDEX_COLS],
+                        [false; crate::storage::MAX_INDEX_COLS],
+                        false,
+                        true,
+                        name,
+                    ),
+                    &mut n,
+                );
             }
         }
         // Multi-column PK / UNIQUE constraints.
@@ -1161,6 +1190,8 @@ fn collect_indexes(
             push(
                 mk(
                     uk.columns(),
+                    [false; crate::storage::MAX_INDEX_COLS],
+                    [false; crate::storage::MAX_INDEX_COLS],
                     uk.is_primary,
                     true,
                     stack_str_64(uk.name.as_str()),
@@ -1173,6 +1204,8 @@ fn collect_indexes(
             push(
                 mk(
                     &index.columns[..index.n_cols],
+                    index.descending,
+                    index.nulls_first,
                     false,
                     index.unique,
                     stack_str_64(index.name.as_str()),
@@ -1947,6 +1980,16 @@ pub fn index_def_text<'a>(
                 let _ = s.write_str(", ");
             }
             let _ = s.write_str(col_name(k));
+            if info.descending[k] {
+                let _ = s.write_str(" DESC");
+            }
+            if info.nulls_first[k] != info.descending[k] {
+                let _ = s.write_str(if info.nulls_first[k] {
+                    " NULLS FIRST"
+                } else {
+                    " NULLS LAST"
+                });
+            }
         }
         let _ = s.write_str(")");
         return Ok(Some(alloc_rendered(
@@ -3563,6 +3606,16 @@ fn pg_indexes<'a>(
                 }
                 let _ =
                     indexdef.write_str(table_def.columns()[info.columns[k] as usize].name.as_str());
+                if info.descending[k] {
+                    let _ = indexdef.write_str(" DESC");
+                }
+                if info.nulls_first[k] != info.descending[k] {
+                    let _ = indexdef.write_str(if info.nulls_first[k] {
+                        " NULLS FIRST"
+                    } else {
+                        " NULLS LAST"
+                    });
+                }
             }
             let _ = indexdef.write_str(")");
         }

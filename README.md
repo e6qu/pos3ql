@@ -25,12 +25,13 @@ engineering discipline.
   `disk_cache_bytes`), and under memory pressure committed row bytes spill to
   the bucket and page back through the caches, so ingest is not bounded by
   RAM *bytes* or total row count. With object storage enabled, synchronous WAL
-  upload is the default, so acknowledged data is already in the durable tier
-  and local disk is disposable. Value indexes in RAM are bounded acceleration
-  caches, never correctness authorities: once incomplete they fall through to
-  the object-resident row image. The persistent secondary-index forest needed
-  to make those probes scale independently of cache capacity remains tracked
-  in the *Maturity roadmap* in [PLAN.md](PLAN.md).
+  upload is required, so acknowledged data is already in the durable tier
+  and local disk is disposable. Secondary-index key generations live in the
+  same provider-neutral block grid and manifest as row SSTs; bounded RAM value
+  maps and local disk frames only cache them. Equality/uniqueness probes avoid
+  object-scale row walks, range predicates scan encoded keys and recheck their
+  candidates against authoritative MVCC rows, and each dirty checkpoint
+  compacts stale entries by rebuilding the immutable generation.
 - **Static allocation.** All memory is acquired at startup, sized from
   config. No heap allocation after init — enforced by a guarding global
   allocator. Every pool and queue has a fixed limit; exhaustion is a loud
@@ -41,7 +42,7 @@ engineering discipline.
   a seed.
 - **1..N replicas.** Consensus is Viewstamped Replication (the protocol
   TigerBeetle uses); a single node is a cluster of one. The production server
-  is single-node today and synchronously uploads WAL by default when object
+  is single-node today and synchronously uploads WAL whenever object
   storage is enabled; live quorum write-routing remains roadmap work.
 
 ## Dependency policy
@@ -151,23 +152,21 @@ client is acknowledged: the WAL is CRC-checksummed and fsynced with
 power loss replays cleanly on restart (to the extent the disk honors the sync).
 That is the floor and it is not configurable.
 
-Durability *against loss of the local disk itself* is tiered by configuration:
+Durability *against loss of the local disk itself* is explicit by mode:
 
 | Mode | Commit latency | Survives process crash | Survives total local-disk loss |
 |------|----------------|------------------------|--------------------------------|
-| `object_store = off` (or `wal_upload = off`) | local fsync | yes (WAL replay) | only up to the last `CHECKPOINT` snapshot in the durable object namespace |
-| `wal_upload = on`, `wal_upload_sync = off` | local fsync | yes | **eventually** — object upload is drained off the commit path, so a transaction committed within the last drain window is lost from the durable tier if the disk is also lost in that window |
-| `wal_upload_sync = on` (**default with object storage on**) | local fsync **+ object-store round-trip** | yes | yes (RPO=0 — the batch is in the durable tier before the ack) |
-| Multi-replica VSR | quorum-disk | yes | yes (quorum) | *(not yet active — see PLAN.md)* |
+| `object_store = off` (development/local-only mode) | local fsync | yes (WAL replay) | no |
+| `object_store = on` | local fsync **+ object-store round-trip** | yes | yes (RPO=0 — the batch is in the durable tier before the ack) |
+| Multi-replica VSR *(roadmap)* | quorum ordering **and object-store WAL durability before ack** | yes | yes; replica disks remain caches |
 
 `CHECKPOINT` snapshots every table to the bucket behind a compare-and-swap
 manifest; a node with a wiped disk cold-starts entirely from the last snapshot
-plus any newer uploaded WAL segments. **Commit-durable-on-bucket is the
-default whenever object storage is on**: the local disk is a mere cache, so an
-acknowledged commit must not live only there. Set `wal_upload_sync = off` to
-trade that for local-fsync commit latency with an asynchronous drain; the
-low-latency path to RPO=0 is VSR replication, not single-node synchronous
-upload.
+plus any newer uploaded WAL segments. With object storage on,
+`wal_upload = on` and `wal_upload_sync = on` are required, not optional
+performance postures: an acknowledged commit may never live only on a replica
+disk. VSR will add ordering, failover, and group-commit opportunity without
+changing that durable authority.
 
 ## Limitations
 
@@ -194,7 +193,10 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   since its slice — so a checkpoint no longer stalls connections for its
   whole duration, but a single very large table's slice still blocks while
   it writes (per-block beats are the roadmap's Stage E). The explicit
-  `CHECKPOINT` statement and the cold-start load remain atomic.
+  `CHECKPOINT` statement and the cold-start load remain atomic. Publication
+  waits while a transaction has rollback-capable catalog WAL, preventing a
+  manifest replay floor from passing uncommitted DDL; read-only historical
+  snapshots continue to coexist with checkpoints.
 - **The row map is an overlay, not an index.** `table_rows` bounds the
   *working set* — pending changes plus rows not yet shed under pressure —
   not the dataset: rows beyond it live only in the bucket's SSTs and are
@@ -206,13 +208,14 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   manifest publication. Versioned SSTs in the provider-neutral object store
   retain snapshots across long update/checkpoint churn; RAM and disk cache
   loss changes latency, never visibility or durability.
-- **Value indexes are bounded caches.** Primary/unique constraints and named
-  indexes share startup-sized `value → rowid` caches. A complete cache serves
-  uniqueness and single-table equality probes directly; an exhausted cache is
-  marked incomplete and the same operation scans the authoritative row SSTs.
-  `value_index_rows` therefore controls acceleration coverage, not table size
-  or correctness. The persistent value-keyed SST forest that removes the
-  fallback scan at object scale remains on the roadmap.
+- **Value-index RAM is a bounded cache.** Primary/unique constraints and named
+  indexes share startup-sized `value → rowid` maps backed by immutable
+  key-only object generations. `value_index_rows` controls hot acceleration
+  coverage, not table size or correctness. Equality, composite uniqueness, and
+  range candidates remain correct after cache loss; authoritative MVCC row
+  rechecks make stale generation entries false positives only, and checkpoint
+  rebuilds compact them away. Chained immutable roster roots avoid a flat
+  generation-size ceiling; historical snapshots use the full MVCC row walk.
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
   exceeding any is a loud error, never silent growth.

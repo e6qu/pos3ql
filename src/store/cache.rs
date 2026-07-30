@@ -19,7 +19,7 @@
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;
 
-use super::{BlockId, BlockStore, BlockType, StoreError, MAX_PAYLOAD};
+use super::{BlockId, BlockIoStats, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
 /// What a frame is holding, if anything.
 #[derive(Clone, Copy)]
@@ -68,7 +68,10 @@ impl<S: BlockStore> BlockCache<S> {
         inner: S,
         frame_count: usize,
     ) -> Result<Self, BudgetError> {
-        assert!(frame_count > 0, "a cache with no frames would miss on every read");
+        assert!(
+            frame_count > 0,
+            "a cache with no frames would miss on every read"
+        );
         budget.draw_array(frame_count, MAX_PAYLOAD, what)?;
         budget.draw_array(frame_count, size_of::<Frame>(), what)?;
         let index = FixedMap::new(budget, what, frame_count)?;
@@ -95,7 +98,6 @@ impl<S: BlockStore> BlockCache<S> {
     pub(crate) fn frames_for(bytes: usize) -> usize {
         bytes / MAX_PAYLOAD
     }
-
 
     /// Whether the block is resident in a frame, as distinct from reachable
     /// through the store behind. Only the tests care about the difference —
@@ -137,11 +139,17 @@ impl<S: BlockStore> BlockCache<S> {
         let frame = self.claim_frame();
         self.slots[frame * MAX_PAYLOAD..frame * MAX_PAYLOAD + payload.len()]
             .copy_from_slice(payload);
-        self.frames[frame] =
-            Frame { id: Some(id), len: payload.len(), block_type, referenced: true };
+        self.frames[frame] = Frame {
+            id: Some(id),
+            len: payload.len(),
+            block_type,
+            referenced: true,
+        };
         // The index has one slot per frame and the frame was just freed, so
         // this cannot overflow; a failure would mean the two disagree.
-        self.index.insert(id, frame).expect("index has a slot per frame");
+        self.index
+            .insert(id, frame)
+            .expect("index has a slot per frame");
     }
 }
 
@@ -192,17 +200,24 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         }
         self.inner.contains(id)
     }
+
+    fn io_stats(&self) -> BlockIoStats {
+        let mut stats = self.inner.io_stats();
+        stats.ram_hits = stats.ram_hits.saturating_add(self.stats.hits);
+        stats.ram_misses = stats.ram_misses.saturating_add(self.stats.misses);
+        stats
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::memory::MemoryBlockStore;
+    use super::*;
 
     fn cache(frames: usize) -> BlockCache<MemoryBlockStore> {
         let mut budget = Budget::new((frames + 4) * MAX_PAYLOAD + (16 << 20));
-        let inner = MemoryBlockStore::new(&mut budget, "test store", 4 << 20, 256)
-            .expect("store fits");
+        let inner =
+            MemoryBlockStore::new(&mut budget, "test store", 4 << 20, 256).expect("store fits");
         BlockCache::new(&mut budget, "test cache", inner, frames).expect("cache fits")
     }
 
@@ -231,7 +246,11 @@ mod tests {
         assert_eq!(read(&mut c, &id), b"cold block");
         assert_eq!(c.stats().misses, 1);
         assert_eq!(read(&mut c, &id), b"cold block");
-        assert_eq!(c.stats().hits, 1, "the second read was served from the frame");
+        assert_eq!(
+            c.stats().hits,
+            1,
+            "the second read was served from the frame"
+        );
     }
 
     #[test]
@@ -242,7 +261,10 @@ mod tests {
         let ids: Vec<_> = (0..6u8)
             .map(|i| c.put(&[i; 64], BlockType::SstData, i as u64).unwrap())
             .collect();
-        assert!(c.stats().evictions > 0, "six blocks through two frames must evict");
+        assert!(
+            c.stats().evictions > 0,
+            "six blocks through two frames must evict"
+        );
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(read(&mut c, id), vec![i as u8; 64], "block {i} was lost");
         }
@@ -262,12 +284,21 @@ mod tests {
         // One more admission sweeps the hand across all three, clearing them,
         // and evicts `a` — leaving `b` and `d` resident with their bits down.
         c.put(b"eeee", BlockType::SstData, 3).unwrap();
-        assert!(!c.contains_in_cache(&a), "the sweep should have taken the oldest");
+        assert!(
+            !c.contains_in_cache(&a),
+            "the sweep should have taken the oldest"
+        );
         // Touch `b`, so the hand must pass over it and take `d` instead.
         assert_eq!(read(&mut c, &b), b"bbbb");
         c.put(b"ffff", BlockType::SstData, 4).unwrap();
-        assert!(c.contains_in_cache(&b), "a touched block was evicted before an untouched one");
-        assert!(!c.contains_in_cache(&d), "the untouched neighbour should have gone");
+        assert!(
+            c.contains_in_cache(&b),
+            "a touched block was evicted before an untouched one"
+        );
+        assert!(
+            !c.contains_in_cache(&d),
+            "the untouched neighbour should have gone"
+        );
     }
 
     #[test]
@@ -283,7 +314,10 @@ mod tests {
                 stored += 1;
             } else {
                 let id = BlockId::of(&[i; 256]);
-                assert!(!c.contains(&id).unwrap(), "cached a block the store refused");
+                assert!(
+                    !c.contains(&id).unwrap(),
+                    "cached a block the store refused"
+                );
                 break;
             }
         }
@@ -295,9 +329,15 @@ mod tests {
         let mut c = cache(4);
         let id = c.put(b"0123456789", BlockType::SstData, 1).unwrap();
         let mut small = [0u8; 4];
-        assert_eq!(c.get(&id, &mut small).err(), Some(StoreError::BufferTooSmall));
+        assert_eq!(
+            c.get(&id, &mut small).err(),
+            Some(StoreError::BufferTooSmall)
+        );
         // And again once it is definitely a hit.
-        assert_eq!(c.get(&id, &mut small).err(), Some(StoreError::BufferTooSmall));
+        assert_eq!(
+            c.get(&id, &mut small).err(),
+            Some(StoreError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -313,8 +353,14 @@ mod tests {
     #[test]
     fn frames_for_a_budget_is_whole_frames() {
         assert_eq!(BlockCache::<MemoryBlockStore>::frames_for(0), 0);
-        assert_eq!(BlockCache::<MemoryBlockStore>::frames_for(MAX_PAYLOAD - 1), 0);
+        assert_eq!(
+            BlockCache::<MemoryBlockStore>::frames_for(MAX_PAYLOAD - 1),
+            0
+        );
         assert_eq!(BlockCache::<MemoryBlockStore>::frames_for(MAX_PAYLOAD), 1);
-        assert_eq!(BlockCache::<MemoryBlockStore>::frames_for(MAX_PAYLOAD * 3 + 7), 3);
+        assert_eq!(
+            BlockCache::<MemoryBlockStore>::frames_for(MAX_PAYLOAD * 3 + 7),
+            3
+        );
     }
 }

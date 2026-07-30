@@ -28,7 +28,10 @@ use std::path::Path;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;
 
-use super::{decode, encode, BlockId, BlockStore, BlockType, StoreError, BLOCK_SIZE, MAX_PAYLOAD};
+use super::{
+    BLOCK_SIZE, BlockId, BlockIoStats, BlockStore, BlockType, MAX_PAYLOAD, StoreError, decode,
+    encode,
+};
 
 /// One slot holds a whole framed block. Fixed so a block's slot is its index
 /// times this, with no allocation table to consult.
@@ -77,9 +80,16 @@ impl<S: BlockStore> DiskCache<S> {
         path: &Path,
         slot_count: usize,
     ) -> Result<Self, DiskError> {
-        assert!(slot_count > 0, "a cache with no slots would miss on every read");
-        budget.draw_array(slot_count, size_of::<Slot>(), what).map_err(DiskError::Budget)?;
-        budget.draw_array(SLOT_SIZE, 1, what).map_err(DiskError::Budget)?;
+        assert!(
+            slot_count > 0,
+            "a cache with no slots would miss on every read"
+        );
+        budget
+            .draw_array(slot_count, size_of::<Slot>(), what)
+            .map_err(DiskError::Budget)?;
+        budget
+            .draw_array(SLOT_SIZE, 1, what)
+            .map_err(DiskError::Budget)?;
         let index = FixedMap::new(budget, what, slot_count).map_err(DiskError::Budget)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -143,19 +153,33 @@ impl<S: BlockStore> DiskCache<S> {
             return;
         };
         let slot = self.claim_slot();
-        if self.file.write_at(&self.scratch[..n], (slot * SLOT_SIZE) as u64).is_err() {
+        if self
+            .file
+            .write_at(&self.scratch[..n], (slot * SLOT_SIZE) as u64)
+            .is_err()
+        {
             // The slot is left empty; nothing points at a half-written block.
             return;
         }
-        self.slots[slot] = Slot { id: Some(id), len: n, referenced: true };
-        self.index.insert(id, slot).expect("index has a slot per file slot");
+        self.slots[slot] = Slot {
+            id: Some(id),
+            len: n,
+            referenced: true,
+        };
+        self.index
+            .insert(id, slot)
+            .expect("index has a slot per file slot");
     }
 
     /// Drops a slot whose bytes did not read back as the block the index
     /// expected. A torn write or a rotted platter shows up here, and the block
     /// is re-fetched from the store, so the caller never sees the damage.
     fn drop_corrupt(&mut self, id: &BlockId, slot: usize) {
-        self.slots[slot] = Slot { id: None, len: 0, referenced: false };
+        self.slots[slot] = Slot {
+            id: None,
+            len: 0,
+            referenced: false,
+        };
         self.index.remove(id);
         self.stats.corrupt_slots += 1;
     }
@@ -187,7 +211,11 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
         if let Some(&slot) = self.index.get(id) {
             let len = self.slots[slot].len;
-            if self.file.read_at(&mut self.scratch[..len], (slot * SLOT_SIZE) as u64).is_ok() {
+            if self
+                .file
+                .read_at(&mut self.scratch[..len], (slot * SLOT_SIZE) as u64)
+                .is_ok()
+            {
                 // Verified, because the bytes came off a disk that a crash may
                 // have torn. A mismatch is treated as a miss, not an error.
                 if let Ok(block) = decode(&self.scratch[..len], true)
@@ -221,12 +249,19 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
         }
         self.inner.contains(id)
     }
+
+    fn io_stats(&self) -> BlockIoStats {
+        let mut stats = self.inner.io_stats();
+        stats.disk_hits = stats.disk_hits.saturating_add(self.stats.hits);
+        stats.disk_misses = stats.disk_misses.saturating_add(self.stats.misses);
+        stats
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::memory::MemoryBlockStore;
+    use super::*;
 
     struct Fixture {
         cache: DiskCache<MemoryBlockStore>,
@@ -284,7 +319,11 @@ mod tests {
     fn eviction_loses_nothing_because_the_store_still_has_it() {
         let mut f = fixture(2);
         let ids: Vec<_> = (0..8u8)
-            .map(|i| f.cache.put(&[i; 128], BlockType::SstData, i as u64).unwrap())
+            .map(|i| {
+                f.cache
+                    .put(&[i; 128], BlockType::SstData, i as u64)
+                    .unwrap()
+            })
             .collect();
         assert!(f.cache.stats().evictions > 0);
         for (i, id) in ids.iter().enumerate() {
@@ -298,14 +337,24 @@ mod tests {
         // never reach the caller, because the block is re-fetched from the
         // store and the slot is dropped.
         let mut f = fixture(8);
-        let id = f.cache.put(b"the true block", BlockType::SstData, 1).unwrap();
+        let id = f
+            .cache
+            .put(b"the true block", BlockType::SstData, 1)
+            .unwrap();
         let slot = *f.cache.index.get(&id).unwrap();
         // Tear the slot: flip a byte inside the framed block on the platter.
         f.cache
             .file
-            .write_at(&[0xff; 4], (slot * SLOT_SIZE + super::super::HEADER_LEN) as u64)
+            .write_at(
+                &[0xff; 4],
+                (slot * SLOT_SIZE + super::super::HEADER_LEN) as u64,
+            )
             .unwrap();
-        assert_eq!(read(&mut f.cache, &id), b"the true block", "the caller saw damage");
+        assert_eq!(
+            read(&mut f.cache, &id),
+            b"the true block",
+            "the caller saw damage"
+        );
         // Counted as damage, and re-admitted on the same read, so a repeat
         // read now finds the freshly-written slot rather than the torn one.
         assert_eq!(f.cache.stats().corrupt_slots, 1);
@@ -318,12 +367,18 @@ mod tests {
         // the index names — identity is what catches it, not the checksum,
         // which the stale block passes on its own terms.
         let mut f = fixture(8);
-        let real = f.cache.put(b"the wanted block", BlockType::SstData, 1).unwrap();
+        let real = f
+            .cache
+            .put(b"the wanted block", BlockType::SstData, 1)
+            .unwrap();
         let slot = *f.cache.index.get(&real).unwrap();
         // Overwrite the slot with a different, internally-valid framed block.
         let mut other = vec![0u8; SLOT_SIZE];
         let (_, n) = encode(b"a different block", BlockType::SstData, 2, &mut other).unwrap();
-        f.cache.file.write_at(&other[..n], (slot * SLOT_SIZE) as u64).unwrap();
+        f.cache
+            .file
+            .write_at(&other[..n], (slot * SLOT_SIZE) as u64)
+            .unwrap();
         // Read wants `real`; the slot holds something else, so it is a miss that
         // the store answers correctly.
         assert_eq!(read(&mut f.cache, &real), b"the wanted block");
@@ -335,13 +390,19 @@ mod tests {
         let mut f = fixture(8);
         let id = f.cache.put(b"0123456789", BlockType::SstData, 1).unwrap();
         let mut small = [0u8; 4];
-        assert_eq!(f.cache.get(&id, &mut small).err(), Some(StoreError::BufferTooSmall));
+        assert_eq!(
+            f.cache.get(&id, &mut small).err(),
+            Some(StoreError::BufferTooSmall)
+        );
     }
 
     #[test]
     fn slots_for_a_budget_is_whole_slots() {
         assert_eq!(DiskCache::<MemoryBlockStore>::slots_for(0), 0);
         assert_eq!(DiskCache::<MemoryBlockStore>::slots_for(SLOT_SIZE - 1), 0);
-        assert_eq!(DiskCache::<MemoryBlockStore>::slots_for(SLOT_SIZE * 4 + 9), 4);
+        assert_eq!(
+            DiskCache::<MemoryBlockStore>::slots_for(SLOT_SIZE * 4 + 9),
+            4
+        );
     }
 }

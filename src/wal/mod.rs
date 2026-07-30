@@ -25,8 +25,9 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnMeta, DependencyClass, FkAction, ForeignKey, OwnedDatum, SqlName,
-    StoredQueryDependencies, TableDef, UniqueKey, MAX_COLUMNS, MAX_INDEX_COLS,
+    CheckConstraint, ColumnMeta, ColumnStatistics, DependencyClass, FkAction, ForeignKey,
+    MAX_COLUMNS, MAX_INDEX_COLS, OwnedDatum, SqlName, StoredQueryDependencies, TableDef,
+    TableStatistics, UniqueKey,
 };
 
 use crc32c::crc32c;
@@ -58,6 +59,7 @@ const KIND_DROP_DOMAIN: u8 = 22;
 const KIND_CREATE_ENUM: u8 = 23;
 const KIND_DROP_ENUM: u8 = 24;
 const KIND_RENAME_ENUM: u8 = 25;
+const KIND_ANALYZE: u8 = 26;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -75,7 +77,7 @@ fn append_stored_dependency_name(buffer: &mut FixedBuf, name: &str) -> bool {
 /// of [`WalOp`] prevents every WAL operation from inheriting the largest
 /// variant's stack footprint.
 #[derive(Debug, Clone, Copy)]
-pub enum WalStoredQueryDependencies<'a> {
+pub(crate) enum WalStoredQueryDependencies<'a> {
     Captured(&'a StoredQueryDependencies),
     Encoded(&'a [u8]),
     LegacyEmpty,
@@ -130,7 +132,7 @@ impl WalStoredQueryDependencies<'_> {
     }
 
     #[inline(never)]
-    pub fn materialize(self) -> Result<StoredQueryDependencies, SqlError> {
+    pub(crate) fn materialize(self) -> Result<StoredQueryDependencies, SqlError> {
         match self {
             Self::Captured(dependencies) => Ok(*dependencies),
             Self::Encoded(bytes) => decode_stored_query_dependencies(bytes).ok_or_else(|| {
@@ -144,12 +146,77 @@ impl WalStoredQueryDependencies<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalTableStatistics<'a> {
+    Captured(&'a TableStatistics),
+    Encoded(&'a [u8]),
+}
+
+impl WalTableStatistics<'_> {
+    fn encoded_len(self) -> usize {
+        match self {
+            Self::Captured(statistics) => {
+                8 + 4
+                    + 8
+                    + 1
+                    + statistics
+                        .columns
+                        .iter()
+                        .filter(|column| column.valid)
+                        .count()
+                        * (1 + 4 + 8 + 4 + 4)
+            }
+            Self::Encoded(bytes) => bytes.len(),
+        }
+    }
+
+    fn append(self, buffer: &mut FixedBuf) -> bool {
+        match self {
+            Self::Captured(statistics) => {
+                let valid_columns = statistics
+                    .columns
+                    .iter()
+                    .filter(|column| column.valid)
+                    .count();
+                let mut ok = buffer.append(&statistics.rows.to_le_bytes())
+                    && buffer.append(&statistics.average_row_width.to_le_bytes())
+                    && buffer.append(&statistics.analyzed_generation.to_le_bytes())
+                    && buffer.append(&[valid_columns as u8]);
+                for (index, column) in statistics.columns.iter().enumerate() {
+                    if !column.valid {
+                        continue;
+                    }
+                    ok &= buffer.append(&[index as u8])
+                        && buffer.append(&column.null_fraction_ppm.to_le_bytes())
+                        && buffer.append(&column.distinct_values.to_le_bytes())
+                        && buffer.append(&column.distinct_fraction_ppm.to_le_bytes())
+                        && buffer.append(&column.average_width.to_le_bytes());
+                }
+                ok
+            }
+            Self::Encoded(bytes) => buffer.append(bytes),
+        }
+    }
+
+    pub(crate) fn materialize(self) -> Result<TableStatistics, SqlError> {
+        match self {
+            Self::Captured(statistics) => Ok(*statistics),
+            Self::Encoded(bytes) => decode_table_statistics(bytes).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt table statistics in journal"
+                )
+            }),
+        }
+    }
+}
+
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
     reason = "TableDef is a fixed inline array by design (no heap); WalOp lives briefly on the stack"
 )]
-pub enum WalOp<'a> {
+pub(crate) enum WalOp<'a> {
     CreateTable(TableDef),
     DropTable {
         schema: &'a str,
@@ -301,6 +368,11 @@ pub enum WalOp<'a> {
         subid: u32,
         text: Option<&'a str>,
     },
+    Analyze {
+        schema: &'a str,
+        table: &'a str,
+        statistics: WalTableStatistics<'a>,
+    },
 }
 
 pub struct Wal {
@@ -334,7 +406,10 @@ pub enum WalSetupError {
     Io(&'static str, std::io::Error),
     /// The journal on disk is larger than `wal_bytes` — refusing to
     /// truncate someone's log because a config shrank.
-    ShrinkRefused { file: u64, config: u64 },
+    ShrinkRefused {
+        file: u64,
+        config: u64,
+    },
     Replay(SqlError),
 }
 
@@ -450,7 +525,7 @@ impl Wal {
     /// applied — they are already covered by the checkpoint the caller
     /// loaded (a crash between manifest publication and journal reset
     /// leaves such records behind). Startup only.
-    pub fn replay(
+    pub(crate) fn replay(
         &mut self,
         floor: u64,
         mut apply: impl for<'a> FnMut(u64, WalOp<'a>) -> Result<(), SqlError>,
@@ -487,7 +562,7 @@ impl Wal {
                 let payload_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=KIND_RENAME_ENUM).contains(&kind)
+                if !(KIND_CREATE..=KIND_ANALYZE).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= self.last_lsn
                 {
@@ -518,7 +593,10 @@ impl Wal {
     }
 
     fn stage_index(&self, transaction_id: u32) -> Option<usize> {
-        assert_ne!(transaction_id, 0, "zero is reserved for an unclaimed WAL stage");
+        assert_ne!(
+            transaction_id, 0,
+            "zero is reserved for an unclaimed WAL stage"
+        );
         self.stages
             .iter()
             .position(|stage| stage.transaction_id == transaction_id)
@@ -528,7 +606,11 @@ impl Wal {
         if let Some(index) = self.stage_index(transaction_id) {
             return Ok(index);
         }
-        let Some(index) = self.stages.iter().position(|stage| stage.transaction_id == 0) else {
+        let Some(index) = self
+            .stages
+            .iter()
+            .position(|stage| stage.transaction_id == 0)
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "concurrent WAL staging exceeds max_connections ({})",
@@ -545,6 +627,28 @@ impl Wal {
     pub fn stage_mark(&self, transaction_id: u32) -> usize {
         self.stage_index(transaction_id)
             .map_or(0, |index| self.stages[index].buffer.mark())
+    }
+
+    /// Current record/byte totals in one transaction's private stage.
+    /// EXPLAIN WAL snapshots this before and after execution; publication
+    /// still owns the same bytes and does not depend on the telemetry.
+    pub(crate) fn stage_stats(&self, transaction_id: u32) -> (u64, u64) {
+        let Some(index) = self.stage_index(transaction_id) else {
+            return (0, 0);
+        };
+        let staged = self.stages[index].buffer.readable();
+        let mut offset = 0usize;
+        let mut records = 0u64;
+        while offset < staged.len() {
+            debug_assert!(staged.len() - offset >= HEADER_LEN);
+            let payload_len =
+                u32::from_le_bytes(staged[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let total = HEADER_LEN + payload_len;
+            debug_assert!(offset + total <= staged.len());
+            offset += total;
+            records = records.saturating_add(1);
+        }
+        (records, staged.len() as u64)
     }
 
     pub fn truncate_stage(&mut self, transaction_id: u32, mark: usize) {
@@ -568,7 +672,7 @@ impl Wal {
     /// Encodes one record into a transaction-private buffer. The LSN is
     /// provisional: commit rewrites staged records into commit order before
     /// their CRCs are finalized in the durable batch.
-    pub fn stage(
+    pub(crate) fn stage(
         &mut self,
         transaction_id: u32,
         provisional_lsn: u64,
@@ -581,11 +685,7 @@ impl Wal {
     /// Publishes exactly one transaction's staged records into the durable
     /// batch, assigning monotonically increasing commit-order LSNs. Returns
     /// the last assigned LSN, or `lsn_floor` for a transaction with no WAL.
-    pub fn commit_stage(
-        &mut self,
-        transaction_id: u32,
-        lsn_floor: u64,
-    ) -> Result<u64, SqlError> {
+    pub fn commit_stage(&mut self, transaction_id: u32, lsn_floor: u64) -> Result<u64, SqlError> {
         let Some(index) = self.stage_index(transaction_id) else {
             return Ok(lsn_floor);
         };
@@ -611,9 +711,9 @@ impl Wal {
             staged_offset += total;
             record_count += 1;
         }
-        let final_lsn = lsn_floor.checked_add(record_count).ok_or_else(|| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
-        })?;
+        let final_lsn = lsn_floor
+            .checked_add(record_count)
+            .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted"))?;
         if self.buffer.capacity() - self.buffer.len() < staged_len {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -636,11 +736,17 @@ impl Wal {
             self.buffer.is_empty(),
             "a prior committed WAL batch must be flushed before another commit"
         );
-        assert!(lsn_floor >= self.last_lsn, "commit LSN floor must not regress");
+        assert!(
+            lsn_floor >= self.last_lsn,
+            "commit LSN floor must not regress"
+        );
 
         let durable_mark = self.buffer.mark();
         let appended = self.buffer.append(self.stages[index].buffer.readable());
-        assert!(appended, "stage size was checked against durable buffer capacity");
+        assert!(
+            appended,
+            "stage size was checked against durable buffer capacity"
+        );
 
         let mut next_lsn = lsn_floor;
         let mut offset = durable_mark;
@@ -678,8 +784,9 @@ impl Wal {
     /// tests; transactional SQL must use [`Self::stage`] and
     /// [`Self::commit_stage`].
     #[cfg(test)]
-    pub fn append_committed(&mut self, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
-        if self.write_offset + self.buffer.len() as u64
+    pub(crate) fn append_committed(&mut self, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
+        if self.write_offset
+            + self.buffer.len() as u64
             + (HEADER_LEN + encoded_payload_len(operation)) as u64
             > self.capacity
         {
@@ -705,7 +812,11 @@ impl Wal {
         if self.batch_first_lsn == 0 {
             return None;
         }
-        Some((self.batch_first_lsn, self.batch_start_offset, self.write_offset))
+        Some((
+            self.batch_first_lsn,
+            self.batch_start_offset,
+            self.write_offset,
+        ))
     }
 
     /// Bytes of committed-but-not-yet-uploaded WAL accumulated in the current
@@ -816,6 +927,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateEnum(_) => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
+        WalOp::Analyze { .. } => KIND_ANALYZE,
     }
 }
 
@@ -848,10 +960,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             // foreign keys
             n += 1;
             for fk in def.fkeys() {
-                n += 1 + fk.name.as_str().len()
-                    + 1 + fk.n_cols * 2
-                    + 1 + fk.parent.as_str().len()
-                    + 1 + fk.n_parent_cols * 2
+                n += 1
+                    + fk.name.as_str().len()
+                    + 1
+                    + fk.n_cols * 2
+                    + 1
+                    + fk.parent.as_str().len()
+                    + 1
+                    + fk.n_parent_cols * 2
                     + 2;
             }
             // Trailing schema block (absent in journals from before schemas
@@ -863,11 +979,17 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n
         }
         WalOp::DropTable { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::Upsert { schema, table, row, .. } => {
-            1 + table.len() + 8 + 4 + row.len() + 1 + schema.len()
-        }
+        WalOp::Upsert {
+            schema, table, row, ..
+        } => 1 + table.len() + 8 + 4 + row.len() + 1 + schema.len(),
         WalOp::Delete { schema, table, .. } => 1 + table.len() + 8 + 1 + schema.len(),
-        WalOp::CreateView { schema, name, sql, path, dependencies } => {
+        WalOp::CreateView {
+            schema,
+            name,
+            sql,
+            path,
+            dependencies,
+        } => {
             1 + name.len()
                 + 2
                 + sql.len()
@@ -878,21 +1000,34 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::CreateIndex { schema, name, table, n_cols, .. } => {
-            1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2 + 1 + schema.len() + 1 + n_cols
-        }
+        WalOp::CreateIndex {
+            schema,
+            name,
+            table,
+            n_cols,
+            ..
+        } => 1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2 + 1 + schema.len() + 1 + n_cols,
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SequenceSet { schema, table, .. } => {
-            1 + table.len() + 2 + 8 + 1 + schema.len()
-        }
+        WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
-        WalOp::SetTableSchema { schema, name, new_schema } => {
-            1 + schema.len() + 1 + name.len() + 1 + new_schema.len()
-        }
-        WalOp::DropTableFk { schema, table, fk_name } => {
-            1 + schema.len() + 1 + table.len() + 1 + fk_name.len()
-        }
-        WalOp::CreateMatview { schema, name, sql, path, dependencies, .. } => {
+        WalOp::SetTableSchema {
+            schema,
+            name,
+            new_schema,
+        } => 1 + schema.len() + 1 + name.len() + 1 + new_schema.len(),
+        WalOp::DropTableFk {
+            schema,
+            table,
+            fk_name,
+        } => 1 + schema.len() + 1 + table.len() + 1 + fk_name.len(),
+        WalOp::CreateMatview {
+            schema,
+            name,
+            sql,
+            path,
+            dependencies,
+            ..
+        } => {
             1 + name.len()
                 + 2
                 + sql.len()
@@ -904,9 +1039,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropMatview { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SetMatviewPopulated { schema, name, .. } => {
-            1 + name.len() + 1 + schema.len() + 1
-        }
+        WalOp::SetMatviewPopulated { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 1,
         WalOp::CreateSequence {
             schema,
             name,
@@ -985,7 +1118,19 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::Comment {
             schema, name, text, ..
         } => 1 + name.len() + 1 + schema.len() + 1 + 4 + 1 + text.map_or(0, |t| 2 + t.len()),
+        WalOp::Analyze {
+            schema,
+            table,
+            statistics,
+        } => 1 + table.len() + 1 + schema.len() + statistics.encoded_len(),
     }
+}
+
+/// Bytes this operation occupies in the journal, including its fixed record
+/// header. EXPLAIN uses the production codec's sizing rule so WAL telemetry
+/// cannot drift from the bytes commit will write.
+pub(crate) fn encoded_record_len(operation: &WalOp) -> usize {
+    HEADER_LEN + encoded_payload_len(operation)
 }
 
 fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
@@ -1062,22 +1207,35 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::DropTable { schema, name } => {
-            name_bytes(buffer, name) && name_bytes(buffer, schema)
-        }
-        WalOp::Upsert { schema, table, rowid, row } => {
+        WalOp::DropTable { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::Upsert {
+            schema,
+            table,
+            rowid,
+            row,
+        } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
                 && buffer.append(&(row.len() as u32).to_le_bytes())
                 && buffer.append(row)
                 && name_bytes(buffer, schema)
         }
-        WalOp::Delete { schema, table, rowid } => {
+        WalOp::Delete {
+            schema,
+            table,
+            rowid,
+        } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
                 && name_bytes(buffer, schema)
         }
-        WalOp::CreateView { schema, name, sql, path, dependencies } => {
+        WalOp::CreateView {
+            schema,
+            name,
+            sql,
+            path,
+            dependencies,
+        } => {
             name_bytes(buffer, name)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
@@ -1086,9 +1244,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(path.as_bytes())
                 && dependencies.append(buffer)
         }
-        WalOp::DropView { schema, name } => {
-            name_bytes(buffer, name) && name_bytes(buffer, schema)
-        }
+        WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
         WalOp::CreateIndex {
             schema,
             name,
@@ -1112,10 +1268,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::DropIndex { schema, name } => {
-            name_bytes(buffer, name) && name_bytes(buffer, schema)
-        }
-        WalOp::SequenceSet { schema, table, column, last } => {
+        WalOp::DropIndex { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::SequenceSet {
+            schema,
+            table,
+            column,
+            last,
+        } => {
             let mut ok = name_bytes(buffer, table);
             ok &= buffer.append(&column.to_le_bytes());
             ok &= buffer.append(&last.to_le_bytes());
@@ -1123,17 +1282,26 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => name_bytes(buffer, name),
-        WalOp::SetTableSchema { schema, name, new_schema } => {
-            name_bytes(buffer, schema)
-                && name_bytes(buffer, name)
-                && name_bytes(buffer, new_schema)
+        WalOp::SetTableSchema {
+            schema,
+            name,
+            new_schema,
+        } => {
+            name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_schema)
         }
-        WalOp::DropTableFk { schema, table, fk_name } => {
-            name_bytes(buffer, schema)
-                && name_bytes(buffer, table)
-                && name_bytes(buffer, fk_name)
-        }
-        WalOp::CreateMatview { schema, name, sql, path, dependencies, populated } => {
+        WalOp::DropTableFk {
+            schema,
+            table,
+            fk_name,
+        } => name_bytes(buffer, schema) && name_bytes(buffer, table) && name_bytes(buffer, fk_name),
+        WalOp::CreateMatview {
+            schema,
+            name,
+            sql,
+            path,
+            dependencies,
+            populated,
+        } => {
             name_bytes(buffer, name)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
@@ -1146,7 +1314,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::DropMatview { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
-        WalOp::SetMatviewPopulated { schema, name, populated } => {
+        WalOp::SetMatviewPopulated {
+            schema,
+            name,
+            populated,
+        } => {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&[u8::from(*populated)])
@@ -1273,6 +1445,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
+        WalOp::Analyze {
+            schema,
+            table,
+            statistics,
+        } => name_bytes(buffer, table) && name_bytes(buffer, schema) && statistics.append(buffer),
     }
 }
 
@@ -1348,6 +1525,58 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     Some(dependencies)
 }
 
+fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
+    let mut at = 0usize;
+    let rows = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+    at += 8;
+    let average_row_width = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+    at += 4;
+    let analyzed_generation = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+    at += 8;
+    let count = *payload.get(at)? as usize;
+    at += 1;
+    if count > MAX_COLUMNS {
+        return None;
+    }
+    let mut statistics = TableStatistics {
+        valid: true,
+        rows,
+        average_row_width,
+        analyzed_generation,
+        columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
+    };
+    for _ in 0..count {
+        let column = *payload.get(at)? as usize;
+        at += 1;
+        if column >= MAX_COLUMNS || statistics.columns[column].valid {
+            return None;
+        }
+        let null_fraction_ppm = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        if null_fraction_ppm > 1_000_000 {
+            return None;
+        }
+        let distinct_values = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+        at += 8;
+        let distinct_fraction_ppm =
+            u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        if distinct_fraction_ppm > 1_000_000 {
+            return None;
+        }
+        let average_width = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        statistics.columns[column] = ColumnStatistics {
+            valid: true,
+            null_fraction_ppm,
+            distinct_values,
+            distinct_fraction_ppm,
+            average_width,
+        };
+    }
+    (at == payload.len()).then_some(statistics)
+}
+
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Option<&str> {
@@ -1360,8 +1589,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
     match kind {
         KIND_CREATE => {
             let name = take_name(&mut at)?;
-            let n_cols =
-                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+            let n_cols = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             if n_cols > MAX_COLUMNS {
                 return None;
@@ -1535,8 +1763,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if at < payload.len() {
                 def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
                 for f in 0..def.n_fkeys {
-                    def.fkeys[f].parent_schema =
-                        SqlName::parse(take_name(&mut at)?).ok()?;
+                    def.fkeys[f].parent_schema = SqlName::parse(take_name(&mut at)?).ok()?;
                 }
             } else {
                 def.schema = SqlName::parse("public").ok()?;
@@ -1548,32 +1775,51 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_DROP => {
             let name = take_name(&mut at)?;
-            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            let schema = if at < payload.len() {
+                take_name(&mut at)?
+            } else {
+                "public"
+            };
             (at == payload.len()).then_some(WalOp::DropTable { schema, name })
         }
         KIND_UPSERT => {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            let row_len =
-                u32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap()) as usize;
+            let row_len = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap()) as usize;
             at += 4;
             let row = payload.get(at..at + row_len)?;
             at += row_len;
-            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
-            (at == payload.len()).then_some(WalOp::Upsert { schema, table, rowid, row })
+            let schema = if at < payload.len() {
+                take_name(&mut at)?
+            } else {
+                "public"
+            };
+            (at == payload.len()).then_some(WalOp::Upsert {
+                schema,
+                table,
+                rowid,
+                row,
+            })
         }
         KIND_DELETE => {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
-            (at == payload.len()).then_some(WalOp::Delete { schema, table, rowid })
+            let schema = if at < payload.len() {
+                take_name(&mut at)?
+            } else {
+                "public"
+            };
+            (at == payload.len()).then_some(WalOp::Delete {
+                schema,
+                table,
+                rowid,
+            })
         }
         KIND_CREATE_VIEW => {
             let name = take_name(&mut at)?;
-            let sql_len =
-                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+            let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let raw = payload.get(at..at + sql_len)?;
             at += sql_len;
@@ -1600,18 +1846,25 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 WalStoredQueryDependencies::LegacyEmpty
             };
             (at == payload.len()).then_some(WalOp::CreateView {
-                schema, name, sql, path, dependencies,
+                schema,
+                name,
+                sql,
+                path,
+                dependencies,
             })
         }
         KIND_DROP_VIEW => {
             let name = take_name(&mut at)?;
-            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            let schema = if at < payload.len() {
+                take_name(&mut at)?
+            } else {
+                "public"
+            };
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
         }
         KIND_CREATE_MATVIEW => {
             let name = take_name(&mut at)?;
-            let sql_len =
-                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+            let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let sql = core::str::from_utf8(payload.get(at..at + sql_len)?).ok()?;
             at += sql_len;
@@ -1634,7 +1887,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 WalStoredQueryDependencies::LegacyEmpty
             };
             (at == payload.len()).then_some(WalOp::CreateMatview {
-                schema, name, sql, path, dependencies, populated,
+                schema,
+                name,
+                sql,
+                path,
+                dependencies,
+                populated,
             })
         }
         KIND_DROP_MATVIEW => {
@@ -1647,8 +1905,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let schema = take_name(&mut at)?;
             let populated = *payload.get(at)? != 0;
             at += 1;
-            (at == payload.len())
-                .then_some(WalOp::SetMatviewPopulated { schema, name, populated })
+            (at == payload.len()).then_some(WalOp::SetMatviewPopulated {
+                schema,
+                name,
+                populated,
+            })
         }
         KIND_CREATE_INDEX => {
             let name = take_name(&mut at)?;
@@ -1665,7 +1926,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                 at += 2;
             }
-            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            let schema = if at < payload.len() {
+                take_name(&mut at)?
+            } else {
+                "public"
+            };
             let mut descending = [false; MAX_INDEX_COLS];
             let mut nulls_first = [false; MAX_INDEX_COLS];
             if at < payload.len() {
@@ -1696,7 +1961,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_DROP_INDEX => {
             let name = take_name(&mut at)?;
-            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            let schema = if at < payload.len() {
+                take_name(&mut at)?
+            } else {
+                "public"
+            };
             (at == payload.len()).then_some(WalOp::DropIndex { schema, name })
         }
         KIND_SEQUENCE_SET => {
@@ -1705,8 +1974,17 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 2;
             let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
-            (at == payload.len()).then_some(WalOp::SequenceSet { schema, table, column, last })
+            let schema = if at < payload.len() {
+                take_name(&mut at)?
+            } else {
+                "public"
+            };
+            (at == payload.len()).then_some(WalOp::SequenceSet {
+                schema,
+                table,
+                column,
+                last,
+            })
         }
         KIND_CREATE_SEQUENCE => {
             let name = take_name(&mut at)?;
@@ -1783,8 +2061,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 8;
             let is_called = *payload.get(at)? != 0;
             at += 1;
-            (at == payload.len())
-                .then_some(WalOp::SequenceAdvance { schema, name, last, is_called })
+            (at == payload.len()).then_some(WalOp::SequenceAdvance {
+                schema,
+                name,
+                last,
+                is_called,
+            })
         }
         KIND_COMMENT => {
             let name = take_name(&mut at)?;
@@ -1804,7 +2086,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             } else {
                 None
             };
-            (at == payload.len()).then_some(WalOp::Comment { class, schema, name, subid, text })
+            (at == payload.len()).then_some(WalOp::Comment {
+                class,
+                schema,
+                name,
+                subid,
+                text,
+            })
         }
         KIND_CREATE_DOMAIN => {
             let name = take_name(&mut at)?;
@@ -1887,13 +2175,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if n_members > crate::storage::MAX_ENUM_LABELS {
                 return None;
             }
-            let mut members =
-                [crate::storage::EnumMember::EMPTY; crate::storage::MAX_ENUM_LABELS];
+            let mut members = [crate::storage::EnumMember::EMPTY; crate::storage::MAX_ENUM_LABELS];
             for member in members.iter_mut().take(n_members) {
                 let label = take_name(&mut at)?;
                 let sort = f64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
                 at += 8;
-                *member = crate::storage::EnumMember { label: SqlName::parse(label).ok()?, sort };
+                *member = crate::storage::EnumMember {
+                    label: SqlName::parse(label).ok()?,
+                    sort,
+                };
             }
             (at == payload.len()).then_some(WalOp::CreateEnum(crate::storage::EnumDef {
                 created_at: 0,
@@ -1932,14 +2222,32 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_schema = take_name(&mut at)?;
-            (at == payload.len())
-                .then_some(WalOp::SetTableSchema { schema, name, new_schema })
+            (at == payload.len()).then_some(WalOp::SetTableSchema {
+                schema,
+                name,
+                new_schema,
+            })
         }
         KIND_DROP_FK => {
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let fk_name = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropTableFk { schema, table, fk_name })
+            (at == payload.len()).then_some(WalOp::DropTableFk {
+                schema,
+                table,
+                fk_name,
+            })
+        }
+        KIND_ANALYZE => {
+            let table = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let encoded = payload.get(at..)?;
+            decode_table_statistics(encoded)?;
+            Some(WalOp::Analyze {
+                schema,
+                table,
+                statistics: WalTableStatistics::Encoded(encoded),
+            })
         }
         _ => None,
     }
@@ -2008,7 +2316,13 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
         }
-        Some(OwnedDatum::Numeric { sign, weight, dscale, nbytes, digits }) => {
+        Some(OwnedDatum::Numeric {
+            sign,
+            weight,
+            dscale,
+            nbytes,
+            digits,
+        }) => {
             out[0] = 7;
             out[1] = *sign;
             out[2..4].copy_from_slice(&weight.to_le_bytes());
@@ -2018,7 +2332,11 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             7 + *nbytes as usize
         }
         Some(OwnedDatum::Inet(n)) | Some(OwnedDatum::Cidr(n)) => {
-            out[0] = if matches!(d, Some(OwnedDatum::Cidr(_))) { 9 } else { 8 };
+            out[0] = if matches!(d, Some(OwnedDatum::Cidr(_))) {
+                9
+            } else {
+                8
+            };
             out[1] = n.family;
             out[2] = n.bits;
             out[3..19].copy_from_slice(&n.addr);
@@ -2034,7 +2352,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[1..9].copy_from_slice(b);
             9
         }
-        Some(OwnedDatum::Enum { slot, sort, len, bytes }) => {
+        Some(OwnedDatum::Enum {
+            slot,
+            sort,
+            len,
+            bytes,
+        }) => {
             out[0] = 12;
             out[1..3].copy_from_slice(&slot.to_le_bytes());
             out[3..11].copy_from_slice(&sort.to_le_bytes());
@@ -2070,7 +2393,9 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         5 => {
             let b = payload.get(*at..*at + 8)?;
             *at += 8;
-            Some(OwnedDatum::Float8(f64::from_le_bytes(b.try_into().unwrap())))
+            Some(OwnedDatum::Float8(f64::from_le_bytes(
+                b.try_into().unwrap(),
+            )))
         }
         6 => {
             let len = *payload.get(*at)? as usize;
@@ -2083,7 +2408,10 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             core::str::from_utf8(raw).ok()?;
             let mut bytes = [0u8; crate::storage::MAX_DEFAULT_TEXT];
             bytes[..len].copy_from_slice(raw);
-            Some(OwnedDatum::Text { len: len as u8, bytes })
+            Some(OwnedDatum::Text {
+                len: len as u8,
+                bytes,
+            })
         }
         7 => {
             let sign = *payload.get(*at)?;
@@ -2098,7 +2426,13 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             *at += nbytes;
             let mut digits = [0u8; crate::storage::MAX_DEFAULT_TEXT];
             digits[..nbytes].copy_from_slice(raw);
-            Some(OwnedDatum::Numeric { sign, weight, dscale, nbytes: nbytes as u8, digits })
+            Some(OwnedDatum::Numeric {
+                sign,
+                weight,
+                dscale,
+                nbytes: nbytes as u8,
+                digits,
+            })
         }
         8 | 9 => {
             let b = payload.get(*at..*at + 18)?;
@@ -2108,7 +2442,11 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
                 bits: b[1],
                 addr: b[2..18].try_into().unwrap(),
             };
-            Some(if tag == 9 { OwnedDatum::Cidr(net) } else { OwnedDatum::Inet(net) })
+            Some(if tag == 9 {
+                OwnedDatum::Cidr(net)
+            } else {
+                OwnedDatum::Inet(net)
+            })
         }
         10 => {
             let b = payload.get(*at..*at + 6)?;
@@ -2133,13 +2471,16 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             core::str::from_utf8(raw).ok()?;
             let mut bytes = [0u8; crate::storage::MAX_DEFAULT_TEXT];
             bytes[..len].copy_from_slice(raw);
-            Some(OwnedDatum::Enum { slot, sort, len: len as u8, bytes })
+            Some(OwnedDatum::Enum {
+                slot,
+                sort,
+                len: len as u8,
+                bytes,
+            })
         }
         _ => return None,
     })
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -2148,8 +2489,7 @@ mod tests {
     #[test]
     fn operation_size_is_bounded_by_the_table_definition_variant() {
         assert!(
-            core::mem::size_of::<WalOp<'static>>()
-                <= core::mem::size_of::<TableDef>() + 64,
+            core::mem::size_of::<WalOp<'static>>() <= core::mem::size_of::<TableDef>() + 64,
             "WalOp grew to {} bytes",
             core::mem::size_of::<WalOp<'static>>()
         );
@@ -2164,11 +2504,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "pos3ql-wal-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir = std::env::temp_dir().join(format!("pos3ql-wal-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         dir.to_str().unwrap().to_string()
     }
@@ -2360,7 +2696,13 @@ mod tests {
             .unwrap();
             wal.append_committed(
                 9,
-                &WalOp::Comment { class: 1, schema: "", name: "s", subid: 0, text: None },
+                &WalOp::Comment {
+                    class: 1,
+                    schema: "",
+                    name: "s",
+                    subid: 0,
+                    text: None,
+                },
             )
             .unwrap();
             wal.commit();
@@ -2373,17 +2715,35 @@ mod tests {
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
         assert!(seen[0].contains("t_check"), "check: {}", seen[0]);
-        assert!(seen[0].contains("t_id_fkey") && seen[0].contains("parent"), "fkey: {}", seen[0]);
+        assert!(
+            seen[0].contains("t_id_fkey") && seen[0].contains("parent"),
+            "fkey: {}",
+            seen[0]
+        );
         assert!(seen[1].contains("rowid: 1"));
         assert!(seen[3].starts_with("4:DropTable"));
         // Sequence ops survive the encode/replay round-trip.
-        assert!(seen[4].contains("CreateSequence"), "seq create: {}", seen[4]);
-        assert!(seen[4].contains("cycle: true") && seen[4].contains("increment: 2"), "seq params: {}", seen[4]);
-        assert!(seen[5].contains("SequenceAdvance") && seen[5].contains("last: 42"), "seq advance: {}", seen[5]);
+        assert!(
+            seen[4].contains("CreateSequence"),
+            "seq create: {}",
+            seen[4]
+        );
+        assert!(
+            seen[4].contains("cycle: true") && seen[4].contains("increment: 2"),
+            "seq params: {}",
+            seen[4]
+        );
+        assert!(
+            seen[5].contains("SequenceAdvance") && seen[5].contains("last: 42"),
+            "seq advance: {}",
+            seen[5]
+        );
         assert!(seen[6].contains("DropSequence"), "seq drop: {}", seen[6]);
         // Comment ops survive the encode/replay round-trip (set and removal).
         assert!(
-            seen[7].contains("Comment") && seen[7].contains("subid: 2") && seen[7].contains("a column comment"),
+            seen[7].contains("Comment")
+                && seen[7].contains("subid: 2")
+                && seen[7].contains("a column comment"),
             "comment set: {}",
             seen[7]
         );
@@ -2541,7 +2901,11 @@ mod tests {
         config.max_connections = 2;
         let mut budget = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget).unwrap();
-        let operation = WalOp::Delete { schema: "public", table: "t", rowid: 1 };
+        let operation = WalOp::Delete {
+            schema: "public",
+            table: "t",
+            rowid: 1,
+        };
         wal.stage(1, 1, &operation).unwrap();
         wal.stage(2, 2, &operation).unwrap();
         let error = wal.stage(3, 3, &operation).unwrap_err();
@@ -2573,14 +2937,23 @@ mod tests {
         // Flip one byte in the second record's payload.
         let path = format!("{dir}/journal.wal");
         let mut bytes = std::fs::read(&path).unwrap();
-        let record_len = HEADER_LEN + encoded_payload_len(&WalOp::Delete { schema: "public", table: "t", rowid: 1 });
+        let record_len = HEADER_LEN
+            + encoded_payload_len(&WalOp::Delete {
+                schema: "public",
+                table: "t",
+                rowid: 1,
+            });
         bytes[record_len + HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 1, "only the record before the corruption survives");
+        assert_eq!(
+            seen.len(),
+            1,
+            "only the record before the corruption survives"
+        );
     }
 
     #[test]
@@ -2719,8 +3092,16 @@ mod tests {
         let mut wal = Wal::open(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for lsn in 1..=16 {
-                wal.stage(1, lsn, &WalOp::Delete { schema: "public", table: "t", rowid: lsn })
-                    .unwrap();
+                wal.stage(
+                    1,
+                    lsn,
+                    &WalOp::Delete {
+                        schema: "public",
+                        table: "t",
+                        rowid: lsn,
+                    },
+                )
+                .unwrap();
             }
             assert_eq!(wal.commit_stage(1, 16).unwrap(), 32);
         });

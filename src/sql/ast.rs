@@ -18,6 +18,58 @@ pub struct MaintenanceTarget<'a> {
     pub columns: &'a [&'a str],
 }
 
+/// EXPLAIN's output representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainFormat {
+    Text,
+    Json,
+    Xml,
+    Yaml,
+}
+
+/// Whether EXPLAIN ANALYZE measures result serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainSerialize {
+    None,
+    Text,
+    Binary,
+}
+
+/// PostgreSQL EXPLAIN options. Keeping the complete option state in the AST
+/// prevents accepted syntax from being forgotten between parse and execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplainOptions {
+    pub analyze: bool,
+    pub verbose: bool,
+    pub costs: bool,
+    pub settings: bool,
+    pub buffers: bool,
+    pub wal: bool,
+    pub timing: bool,
+    pub summary: bool,
+    pub memory: bool,
+    pub generic_plan: bool,
+    pub serialize: ExplainSerialize,
+    pub format: ExplainFormat,
+}
+
+impl ExplainOptions {
+    pub const DEFAULT: Self = Self {
+        analyze: false,
+        verbose: false,
+        costs: true,
+        settings: false,
+        buffers: false,
+        wal: false,
+        timing: true,
+        summary: false,
+        memory: false,
+        generic_plan: false,
+        serialize: ExplainSerialize::None,
+        format: ExplainFormat::Text,
+    };
+}
+
 impl<'a> QualName<'a> {
     pub fn bare(name: &'a str) -> Self {
         QualName { schema: None, name }
@@ -27,6 +79,12 @@ impl<'a> QualName<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stmt<'a> {
     Select(Select<'a>),
+    /// EXPLAIN [(options)] statement. The referenced statement is arena-owned
+    /// so the recursive AST remains finite and allocation-free at execution.
+    Explain {
+        options: ExplainOptions,
+        statement: &'a Stmt<'a>,
+    },
     /// A `WITH` clause whose main statement modifies data. Query main
     /// statements carry their CTEs directly on [`Select`] / [`SetQuery`];
     /// keeping DML in this wrapper avoids four duplicate `with` fields and

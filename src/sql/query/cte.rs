@@ -12,14 +12,14 @@ use crate::sql::ast::{
     MergeWhen, OnConflict, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree, Stmt, TableRef,
     Update,
 };
-use crate::sql::eval::{sqlstate, SqlError};
+use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::{ColDesc, Datum};
 use crate::sql_err;
 use crate::storage::Storage;
 
 use super::setops::{describe_set_body, materialize_set_body};
-use super::{arena_full, check_timeout, MAX_JOIN_TABLES};
+use super::{MAX_JOIN_TABLES, arena_full, check_timeout};
 
 /// Expands a statement's `WITH` list (and any view reference) for the
 /// describe path, which needs the shape but not the rows.
@@ -69,7 +69,10 @@ fn expand_ctes_with_path<'a>(
         return Ok(sel);
     }
     if sel.with.len() > crate::sql::parser::MAX_CTES {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many WITH entries"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "too many WITH entries"
+        ));
     }
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
     let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
@@ -77,7 +80,11 @@ fn expand_ctes_with_path<'a>(
     let mut n = 0;
     for cte in sel.with {
         if resolved[..n].iter().any(|(name, _, _)| *name == cte.name) {
-            return Err(sql_err!(sqlstate::DUPLICATE_ALIAS, "WITH query name \"{}\" specified more than once", cte.name));
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "WITH query name \"{}\" specified more than once",
+                cte.name
+            ));
         }
         let context = Subst {
             ctes: &resolved[..n],
@@ -293,7 +300,10 @@ fn expand_view_returning<'a>(
     });
     let output_len = items.len().saturating_add(extra);
     if output_len > MAX_PROJ {
-        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "RETURNING list is too wide"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "RETURNING list is too wide"
+        ));
     }
     let mut output = [SelectItem::Wildcard; MAX_PROJ];
     let mut count = 0usize;
@@ -337,7 +347,10 @@ fn with_exec_context<'a, 's, R>(
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's>) -> Result<R, SqlError>,
 ) -> Result<R, SqlError> {
     if with.len() > crate::sql::parser::MAX_CTES {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many WITH entries"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "too many WITH entries"
+        ));
     }
     let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
         [("", placeholder, &[]); crate::sql::parser::MAX_CTES];
@@ -380,8 +393,7 @@ fn with_exec_context<'a, 's, R>(
             materialized[nm] = (cte.name, materialized_cte);
             nm += 1;
         } else if cte.recursive && select_references(cte.query, cte.name) > 0 {
-            let recursive =
-                materialize_recursive(cte, context, storage, txid, arena, params)?;
+            let recursive = materialize_recursive(cte, context, storage, txid, arena, params)?;
             materialized[nm] = (cte.name, recursive);
             nm += 1;
         } else {
@@ -419,7 +431,7 @@ pub fn describe_set_query<'a>(
 /// Expands WITH CTEs and view references across a whole set-operation tree
 /// (schema-only: a self-referencing recursive CTE binds its non-recursive
 /// term's shape, as in [`expand_ctes`]).
-pub(super) fn expand_set_tree<'a>(
+pub(crate) fn expand_set_tree<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
     storage: &'a Storage,
@@ -480,8 +492,11 @@ fn wrap_set_tree_with<'a>(
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
 
-static EMPTY_CTE: MaterializedCte<'static> =
-    MaterializedCte { column_names: &[], column_types: &[], rows: &[] };
+static EMPTY_CTE: MaterializedCte<'static> = MaterializedCte {
+    column_names: &[],
+    column_types: &[],
+    rows: &[],
+};
 
 static EMPTY_SELECT: Select<'static> = Select {
     items: &[],
@@ -589,9 +604,9 @@ fn set_tree_references(tree: &SetTree, name: &str) -> usize {
 fn expr_references(e: &Expr, name: &str) -> usize {
     match e {
         Expr::Subquery(s) | Expr::Exists(s) | Expr::ArraySubquery(s) => select_references(s, name),
-        Expr::InSubquery { operand, select, .. } => {
-            expr_references(operand, name) + select_references(select, name)
-        }
+        Expr::InSubquery {
+            operand, select, ..
+        } => expr_references(operand, name) + select_references(select, name),
         Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
             expr_references(operand, name)
         }
@@ -603,15 +618,25 @@ fn expr_references(e: &Expr, name: &str) -> usize {
             expr_references(operand, name)
                 + list.iter().map(|x| expr_references(x, name)).sum::<usize>()
         }
-        Expr::Between { operand, low, high, .. } => {
+        Expr::Between {
+            operand, low, high, ..
+        } => {
             expr_references(operand, name)
                 + expr_references(low, name)
                 + expr_references(high, name)
         }
-        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            expr_references(operand, name) + expr_references(pattern, name)
+        Expr::Like {
+            operand, pattern, ..
         }
-        Expr::Case { operand, whens, otherwise, .. } => {
+        | Expr::Match {
+            operand, pattern, ..
+        } => expr_references(operand, name) + expr_references(pattern, name),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
             operand.map_or(0, |o| expr_references(o, name))
                 + whens
                     .iter()
@@ -637,10 +662,7 @@ fn expr_references(e: &Expr, name: &str) -> usize {
 fn direct_references(tree: &SetTree, name: &str) -> usize {
     let direct = |t: &TableRef| -> usize {
         usize::from(
-            t.schema.is_none()
-                && t.subquery.is_none()
-                && t.func_args.is_none()
-                && t.table == name,
+            t.schema.is_none() && t.subquery.is_none() && t.func_args.is_none() && t.table == name,
         )
     };
     match tree {
@@ -666,7 +688,13 @@ fn recursive_parts<'a>(
     q: &'a Select<'a>,
     name: &str,
 ) -> Result<(&'a SetTree<'a>, &'a SetTree<'a>, bool), SqlError> {
-    let Some(&SetTree::Op { operator: SetOp::Union, all, left, right }) = q.set_body else {
+    let Some(&SetTree::Op {
+        operator: SetOp::Union,
+        all,
+        left,
+        right,
+    }) = q.set_body
+    else {
         return Err(sql_err!(
             crate::sql::eval::sqlstate::INVALID_RECURSION,
             "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] recursive-term",
@@ -772,14 +800,18 @@ fn materialize_recursive<'a>(
             // own every output name in the statement arena.
             *slot = arena.alloc_str(name).map_err(|_| arena_full())?;
         }
-        arena.alloc_slice_copy(&names[..ncols]).map_err(|_| arena_full())?
+        arena
+            .alloc_slice_copy(&names[..ncols])
+            .map_err(|_| arena_full())?
     };
     let column_types: &'a [(i32, i16)] = {
         let mut types = [(0i32, 0i16); MAX_PROJ];
         for (i, slot) in types.iter_mut().enumerate().take(ncols) {
             *slot = (described[i].type_oid, described[i].typlen);
         }
-        arena.alloc_slice_copy(&types[..ncols]).map_err(|_| arena_full())?
+        arena
+            .alloc_slice_copy(&types[..ncols])
+            .map_err(|_| arena_full())?
     };
 
     // Base rows; UNION (without ALL) deduplicates them among themselves.
@@ -809,7 +841,11 @@ fn materialize_recursive<'a>(
         // Bind the CTE name to the previous iteration's rows and evaluate the
         // recursive term.
         let working_cte = arena
-            .alloc(MaterializedCte { column_names, column_types, rows: working })
+            .alloc(MaterializedCte {
+                column_names,
+                column_types,
+                rows: working,
+            })
             .map_err(|_| arena_full())?;
         let binding = [(cte.name, &*working_cte)];
         let context = Subst {
@@ -876,7 +912,11 @@ fn materialize_recursive<'a>(
     }
 
     Ok(&*arena
-        .alloc(MaterializedCte { column_names, column_types, rows: all_rows })
+        .alloc(MaterializedCte {
+            column_names,
+            column_types,
+            rows: all_rows,
+        })
         .map_err(|_| arena_full())?)
 }
 
@@ -899,16 +939,29 @@ fn subst_select<'a>(
     let group_by = subst_expr_slice(s.group_by, context, arena)?;
     // Grouping-set bitmasks index into `group_by`; substitution preserves the
     // column order and count, so they carry over unchanged.
-    let grouping_sets = arena.alloc_slice_copy(s.grouping_sets).map_err(|_| arena_full())?;
-    let mut order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
-        crate::sql::parser::MAX_LIST];
+    let grouping_sets = arena
+        .alloc_slice_copy(s.grouping_sets)
+        .map_err(|_| arena_full())?;
+    let mut order = [OrderBy {
+        expression: &Expr::Null,
+        descending: false,
+        nulls_first: false,
+    }; crate::sql::parser::MAX_LIST];
     if s.order_by.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "ORDER BY list too long"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "ORDER BY list too long"
+        ));
     }
     for (i, ob) in s.order_by.iter().enumerate() {
-        order[i] = OrderBy { expression: subst_expr(ob.expression, context, arena)?, ..*ob };
+        order[i] = OrderBy {
+            expression: subst_expr(ob.expression, context, arena)?,
+            ..*ob
+        };
     }
-    let order_by = arena.alloc_slice_copy(&order[..s.order_by.len()]).map_err(|_| arena_full())?;
+    let order_by = arena
+        .alloc_slice_copy(&order[..s.order_by.len()])
+        .map_err(|_| arena_full())?;
     let set_body = match s.set_body {
         Some(tree) => Some(subst_set_tree(tree, context, arena)?),
         None => None,
@@ -977,7 +1030,10 @@ fn subst_assignments<'a>(
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
     if source.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "assignment list too long"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "assignment list too long"
+        ));
     }
     let mut assignments = [("", &Expr::Null); crate::sql::parser::MAX_LIST];
     for (index, (column, expression)) in source.iter().enumerate() {
@@ -995,10 +1051,12 @@ fn subst_insert<'a>(
     arena: &'a Arena,
 ) -> Result<Insert<'a>, SqlError> {
     if statement.rows.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "VALUES list too long"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "VALUES list too long"
+        ));
     }
-    let mut rows: [&[&Expr]; crate::sql::parser::MAX_LIST] =
-        [&[]; crate::sql::parser::MAX_LIST];
+    let mut rows: [&[&Expr]; crate::sql::parser::MAX_LIST] = [&[]; crate::sql::parser::MAX_LIST];
     for (index, row) in statement.rows.iter().enumerate() {
         rows[index] = subst_expr_slice(row, context, arena)?;
     }
@@ -1079,7 +1137,10 @@ fn subst_merge<'a>(
     arena: &'a Arena,
 ) -> Result<Merge<'a>, SqlError> {
     if statement.whens.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "MERGE action list too long"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "MERGE action list too long"
+        ));
     }
     let mut whens = [MergeWhen {
         matched: false,
@@ -1129,7 +1190,12 @@ fn subst_set_tree<'a>(
 ) -> Result<&'a SetTree<'a>, SqlError> {
     let out = match tree {
         SetTree::Select(s) => SetTree::Select(subst_select(s, context, arena)?),
-        SetTree::Op { operator, all, left, right } => SetTree::Op {
+        SetTree::Op {
+            operator,
+            all,
+            left,
+            right,
+        } => SetTree::Op {
             operator: *operator,
             all: *all,
             left: subst_set_tree(left, context, arena)?,
@@ -1145,8 +1211,13 @@ fn subst_from<'a>(
     arena: &'a Arena,
 ) -> Result<FromClause<'a>, SqlError> {
     let base = subst_tableref(&f.base, context, arena)?;
-    let dummy =
-        Join { table: f.base, kind: JoinKind::Inner, on: None, using_columns: None, natural: false };
+    let dummy = Join {
+        table: f.base,
+        kind: JoinKind::Inner,
+        on: None,
+        using_columns: None,
+        natural: false,
+    };
     let mut joins = [dummy; MAX_JOIN_TABLES - 1];
     if f.joins.len() > joins.len() {
         return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many joins"));
@@ -1160,7 +1231,9 @@ fn subst_from<'a>(
             natural: j.natural,
         };
     }
-    let joins = arena.alloc_slice_copy(&joins[..f.joins.len()]).map_err(|_| arena_full())?;
+    let joins = arena
+        .alloc_slice_copy(&joins[..f.joins.len()])
+        .map_err(|_| arena_full())?;
     Ok(FromClause { base, joins })
 }
 
@@ -1179,7 +1252,10 @@ fn subst_tableref<'a>(
     // its precomputed row set.
     if t.schema.is_none()
         && t.func_args.is_none()
-        && let Some((_, m)) = context.materialized.iter().find(|(name, _)| *name == t.table)
+        && let Some((_, m)) = context
+            .materialized
+            .iter()
+            .find(|(name, _)| *name == t.table)
     {
         return Ok(TableRef {
             schema: None,
@@ -1200,9 +1276,11 @@ fn subst_tableref<'a>(
     if t.schema.is_none()
         && let Some((_, q, columns)) = context.ctes.iter().find(|(name, _, _)| *name == t.table)
     {
-        let renames = t
-            .col_alias
-            .or(if columns.is_empty() { None } else { Some(columns) });
+        let renames = t.col_alias.or(if columns.is_empty() {
+            None
+        } else {
+            Some(columns)
+        });
         return Ok(TableRef {
             schema: None,
             table: "",
@@ -1227,12 +1305,12 @@ fn subst_tableref<'a>(
                 return None;
             }
             match dependency.class {
-                crate::storage::DependencyClass::Table => {
-                    Some(crate::storage::ResolvedRelation::Table(dependency.slot as usize))
-                }
-                crate::storage::DependencyClass::View => {
-                    Some(crate::storage::ResolvedRelation::View(dependency.slot as usize))
-                }
+                crate::storage::DependencyClass::Table => Some(
+                    crate::storage::ResolvedRelation::Table(dependency.slot as usize),
+                ),
+                crate::storage::DependencyClass::View => Some(
+                    crate::storage::ResolvedRelation::View(dependency.slot as usize),
+                ),
                 _ => None,
             }
         })
@@ -1241,7 +1319,9 @@ fn subst_tableref<'a>(
         Some(p) => context
             .storage
             .resolve_relation_under(&p, t.schema, t.table, context.txid),
-        None => context.storage.resolve_relation(t.schema, t.table, context.txid),
+        None => context
+            .storage
+            .resolve_relation(t.schema, t.table, context.txid),
     });
     if let Some(crate::storage::ResolvedRelation::View(slot)) = resolved {
         if context.depth >= MAX_VIEW_DEPTH {
@@ -1252,14 +1332,14 @@ fn subst_tableref<'a>(
             ));
         }
         let view = context.storage.view(slot);
-        let view_sql =
-            arena.alloc_str(view.sql.as_str()).map_err(|_| arena_full())?;
+        let view_sql = arena
+            .alloc_str(view.sql.as_str())
+            .map_err(|_| arena_full())?;
         let user = crate::sql::eval::funcs::system::session_user_owned();
-        let view_path = context.storage.compute_path(
-            view.creation_path.as_str(),
-            user.as_str(),
-            context.txid,
-        );
+        let view_path =
+            context
+                .storage
+                .compute_path(view.creation_path.as_str(), user.as_str(), context.txid);
         let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
         // The view body has its own scope: no outer CTEs, deeper view depth,
         // and the creator's path for its own references.
@@ -1289,13 +1369,15 @@ fn subst_tableref<'a>(
     // Inside a view body, pin a table reference to the schema it resolved to
     // under the creator's path, so the reader's session path cannot re-bind
     // it.
-    if let (Some(_), Some(crate::storage::ResolvedRelation::Table(slot))) =
-        (context.path, resolved)
+    if let (Some(_), Some(crate::storage::ResolvedRelation::Table(slot))) = (context.path, resolved)
     {
         let def = context.storage.table_def(slot, context.txid);
-        let schema =
-            arena.alloc_str(def.schema.as_str()).map_err(|_| arena_full())?;
-        let table = arena.alloc_str(def.name.as_str()).map_err(|_| arena_full())?;
+        let schema = arena
+            .alloc_str(def.schema.as_str())
+            .map_err(|_| arena_full())?;
+        let table = arena
+            .alloc_str(def.name.as_str())
+            .map_err(|_| arena_full())?;
         return Ok(TableRef {
             schema: Some(schema),
             table,
@@ -1327,33 +1409,49 @@ fn subst_expr_slice<'a>(
     }
     let mut tmp = [&Expr::Null; crate::sql::parser::MAX_LIST];
     if xs.len() > tmp.len() {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "expression list too long"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "expression list too long"
+        ));
     }
     for (i, x) in xs.iter().enumerate() {
         tmp[i] = subst_expr(x, context, arena)?;
     }
-    Ok(&*arena.alloc_slice_copy(&tmp[..xs.len()]).map_err(|_| arena_full())?)
+    Ok(&*arena
+        .alloc_slice_copy(&tmp[..xs.len()])
+        .map_err(|_| arena_full())?)
 }
 
 /// True if `e` contains a subquery anywhere (so it needs rebuilding when CTEs
 /// are substituted). Leaves and subquery-free trees are returned unchanged.
 fn expr_has_subquery(e: &Expr) -> bool {
     match e {
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => true,
-        Expr::Unary { operand, .. }
-        | Expr::Cast { operand, .. }
-        | Expr::IsNull { operand, .. } => expr_has_subquery(operand),
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
+            true
+        }
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
+            expr_has_subquery(operand)
+        }
         Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
-        Expr::Call { args, order_by, over, filter, .. } => {
+        Expr::Call {
+            args,
+            order_by,
+            over,
+            filter,
+            ..
+        } => {
             args.iter().any(|a| expr_has_subquery(a))
                 || order_by.iter().any(|o| expr_has_subquery(o.expression))
                 || filter.is_some_and(expr_has_subquery)
                 || over.is_some_and(|window| {
-                    window.partition_by.iter().any(|expression| expr_has_subquery(expression))
-                        || window.order_by.iter().any(|order| {
-                            expr_has_subquery(order.expression)
-                        })
+                    window
+                        .partition_by
+                        .iter()
+                        .any(|expression| expr_has_subquery(expression))
+                        || window
+                            .order_by
+                            .iter()
+                            .any(|order| expr_has_subquery(order.expression))
                         || window.frame.is_some_and(|frame| {
                             frame_bound_has_subquery(frame.start)
                                 || frame_bound_has_subquery(frame.end)
@@ -1363,20 +1461,32 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::InList { operand, list, .. } => {
             expr_has_subquery(operand) || list.iter().any(|a| expr_has_subquery(a))
         }
-        Expr::Between { operand, low, high, .. } => {
-            expr_has_subquery(operand) || expr_has_subquery(low) || expr_has_subquery(high)
-        }
-        Expr::Like { operand, pattern, escape, .. } => {
+        Expr::Between {
+            operand, low, high, ..
+        } => expr_has_subquery(operand) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::Like {
+            operand,
+            pattern,
+            escape,
+            ..
+        } => {
             expr_has_subquery(operand)
                 || expr_has_subquery(pattern)
                 || escape.is_some_and(expr_has_subquery)
         }
-        Expr::Match { operand, pattern, .. } => {
-            expr_has_subquery(operand) || expr_has_subquery(pattern)
-        }
-        Expr::Case { operand, whens, otherwise, .. } => {
+        Expr::Match {
+            operand, pattern, ..
+        } => expr_has_subquery(operand) || expr_has_subquery(pattern),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
             operand.is_some_and(expr_has_subquery)
-                || whens.iter().any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
                 || otherwise.is_some_and(expr_has_subquery)
         }
         Expr::Array(items) => items.iter().any(|item| expr_has_subquery(item)),
@@ -1441,9 +1551,19 @@ fn rewrite_stored_type_name<'a>(
         return Ok(type_name);
     };
     let rendered = if array {
-        crate::stack_format!(192, "{}.{}[]", dependency.schema.as_str(), dependency.name.as_str())
+        crate::stack_format!(
+            192,
+            "{}.{}[]",
+            dependency.schema.as_str(),
+            dependency.name.as_str()
+        )
     } else {
-        crate::stack_format!(192, "{}.{}", dependency.schema.as_str(), dependency.name.as_str())
+        crate::stack_format!(
+            192,
+            "{}.{}",
+            dependency.schema.as_str(),
+            dependency.name.as_str()
+        )
     };
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }
@@ -1460,7 +1580,11 @@ fn subst_expr<'a>(
         Expr::Subquery(s) => Expr::Subquery(subst_select(s, context, arena)?),
         Expr::ArraySubquery(s) => Expr::ArraySubquery(subst_select(s, context, arena)?),
         Expr::Exists(s) => Expr::Exists(subst_select(s, context, arena)?),
-        Expr::InSubquery { operand, select, negated } => Expr::InSubquery {
+        Expr::InSubquery {
+            operand,
+            select,
+            negated,
+        } => Expr::InSubquery {
             operand: subst_expr(operand, context, arena)?,
             select: subst_select(select, context, arena)?,
             negated: *negated,
@@ -1469,12 +1593,20 @@ fn subst_expr<'a>(
             operator: *operator,
             operand: subst_expr(operand, context, arena)?,
         },
-        Expr::Binary { operator, left, right } => Expr::Binary {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+        } => Expr::Binary {
             operator: *operator,
             left: subst_expr(left, context, arena)?,
             right: subst_expr(right, context, arena)?,
         },
-        Expr::Cast { operand, type_name, type_mod } => Expr::Cast {
+        Expr::Cast {
+            operand,
+            type_name,
+            type_mod,
+        } => Expr::Cast {
             operand: subst_expr(operand, context, arena)?,
             type_name: rewrite_stored_type_name(type_name, context, arena)?,
             type_mod: *type_mod,
@@ -1483,14 +1615,31 @@ fn subst_expr<'a>(
             operand: subst_expr(operand, context, arena)?,
             negated: *negated,
         },
-        Expr::Call { name, args, star, distinct, order_by, over, filter } => {
-            let mut ob = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
-                crate::sql::parser::MAX_LIST];
+        Expr::Call {
+            name,
+            args,
+            star,
+            distinct,
+            order_by,
+            over,
+            filter,
+        } => {
+            let mut ob = [OrderBy {
+                expression: &Expr::Null,
+                descending: false,
+                nulls_first: false,
+            }; crate::sql::parser::MAX_LIST];
             if order_by.len() > ob.len() {
-                return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "aggregate ORDER BY list too long"));
+                return Err(sql_err!(
+                    sqlstate::TOO_MANY_ARGUMENTS,
+                    "aggregate ORDER BY list too long"
+                ));
             }
             for (i, o) in order_by.iter().enumerate() {
-                ob[i] = OrderBy { expression: subst_expr(o.expression, context, arena)?, ..*o };
+                ob[i] = OrderBy {
+                    expression: subst_expr(o.expression, context, arena)?,
+                    ..*o
+                };
             }
             let order_by = arena
                 .alloc_slice_copy(&ob[..order_by.len()])
@@ -1498,8 +1647,11 @@ fn subst_expr<'a>(
             let over = match over {
                 None => None,
                 Some(w) => {
-                    let mut ob2 = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
-                        crate::sql::parser::MAX_LIST];
+                    let mut ob2 = [OrderBy {
+                        expression: &Expr::Null,
+                        descending: false,
+                        nulls_first: false,
+                    }; crate::sql::parser::MAX_LIST];
                     if w.order_by.len() > ob2.len() {
                         return Err(sql_err!(
                             sqlstate::TOO_MANY_ARGUMENTS,
@@ -1507,7 +1659,10 @@ fn subst_expr<'a>(
                         ));
                     }
                     for (i, o) in w.order_by.iter().enumerate() {
-                        ob2[i] = OrderBy { expression: subst_expr(o.expression, context, arena)?, ..*o };
+                        ob2[i] = OrderBy {
+                            expression: subst_expr(o.expression, context, arena)?,
+                            ..*o
+                        };
                     }
                     let frame = match w.frame {
                         Some(frame) => Some(crate::sql::ast::WindowFrame {
@@ -1519,7 +1674,9 @@ fn subst_expr<'a>(
                     };
                     let spec = crate::sql::ast::WindowSpec {
                         partition_by: subst_expr_slice(w.partition_by, context, arena)?,
-                        order_by: arena.alloc_slice_copy(&ob2[..w.order_by.len()]).map_err(|_| arena_full())?,
+                        order_by: arena
+                            .alloc_slice_copy(&ob2[..w.order_by.len()])
+                            .map_err(|_| arena_full())?,
                         frame,
                     };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
@@ -1539,40 +1696,73 @@ fn subst_expr<'a>(
                 filter,
             }
         }
-        Expr::InList { operand, list, negated } => Expr::InList {
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => Expr::InList {
             operand: subst_expr(operand, context, arena)?,
             list: subst_expr_slice(list, context, arena)?,
             negated: *negated,
         },
-        Expr::Between { operand, low, high, negated } => Expr::Between {
+        Expr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
             operand: subst_expr(operand, context, arena)?,
             low: subst_expr(low, context, arena)?,
             high: subst_expr(high, context, arena)?,
             negated: *negated,
         },
-        Expr::Like { operand, pattern, negated, case_insensitive, escape } => Expr::Like {
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            escape,
+        } => Expr::Like {
             operand: subst_expr(operand, context, arena)?,
             pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
             case_insensitive: *case_insensitive,
             escape: opt_subst(*escape, context, arena)?,
         },
-        Expr::Match { operand, pattern, negated, case_insensitive } => Expr::Match {
+        Expr::Match {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => Expr::Match {
             operand: subst_expr(operand, context, arena)?,
             pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
             case_insensitive: *case_insensitive,
         },
-        Expr::Case { operand, whens, otherwise, synthetic } => {
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            synthetic,
+        } => {
             let operand = opt_subst(*operand, context, arena)?;
             let mut ws = [(&Expr::Null, &Expr::Null); crate::sql::parser::MAX_LIST];
             if whens.len() > ws.len() {
-                return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "CASE has too many WHEN branches"));
+                return Err(sql_err!(
+                    sqlstate::TOO_MANY_ARGUMENTS,
+                    "CASE has too many WHEN branches"
+                ));
             }
             for (i, (c, r)) in whens.iter().enumerate() {
-                ws[i] = (subst_expr(c, context, arena)?, subst_expr(r, context, arena)?);
+                ws[i] = (
+                    subst_expr(c, context, arena)?,
+                    subst_expr(r, context, arena)?,
+                );
             }
-            let whens = arena.alloc_slice_copy(&ws[..whens.len()]).map_err(|_| arena_full())?;
+            let whens = arena
+                .alloc_slice_copy(&ws[..whens.len()])
+                .map_err(|_| arena_full())?;
             Expr::Case {
                 operand,
                 whens,
@@ -1594,7 +1784,12 @@ fn subst_expr<'a>(
             base: subst_expr(base, context, arena)?,
             field,
         },
-        Expr::AnyAll { operand, operator, array, all } => Expr::AnyAll {
+        Expr::AnyAll {
+            operand,
+            operator,
+            array,
+            all,
+        } => Expr::AnyAll {
             operand: subst_expr(operand, context, arena)?,
             operator: *operator,
             array: subst_expr(array, context, arena)?,
@@ -1611,13 +1806,21 @@ fn subst_expr<'a>(
             Some(rewrite) if *qualifier == rewrite.from => rewrite.to,
             _ => qualifier,
         }),
-        Expr::SchemaColumn { schema, table, name } => match context.qualifier {
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => match context.qualifier {
             Some(rewrite) if *table == rewrite.from => Expr::SchemaColumn {
                 schema: rewrite.to_schema,
                 table: rewrite.to,
                 name,
             },
-            _ => Expr::SchemaColumn { schema, table, name },
+            _ => Expr::SchemaColumn {
+                schema,
+                table,
+                name,
+            },
         },
         // Leaves never reach here (guarded by expr_has_subquery above).
         other => *other,

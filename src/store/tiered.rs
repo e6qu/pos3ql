@@ -16,9 +16,9 @@ use std::path::Path;
 
 use crate::mem::budget::Budget;
 
+use super::BlockStore;
 use super::cache::BlockCache;
 use super::disk::{DiskCache, DiskError};
-use super::BlockStore;
 
 /// One tier's byte budget, and how many whole units of that tier it buys. A
 /// budget smaller than one unit buys nothing and is reported as such, so the
@@ -31,11 +31,17 @@ pub(crate) struct TierSizing {
 
 impl TierSizing {
     fn ram(bytes: usize) -> Self {
-        TierSizing { bytes, units: BlockCache::<super::memory::MemoryBlockStore>::frames_for(bytes) }
+        TierSizing {
+            bytes,
+            units: BlockCache::<super::memory::MemoryBlockStore>::frames_for(bytes),
+        }
     }
 
     fn disk(bytes: usize) -> Self {
-        TierSizing { bytes, units: DiskCache::<super::memory::MemoryBlockStore>::slots_for(bytes) }
+        TierSizing {
+            bytes,
+            units: DiskCache::<super::memory::MemoryBlockStore>::slots_for(bytes),
+        }
     }
 }
 
@@ -84,7 +90,13 @@ pub(crate) fn build<S: BlockStore>(
 ) -> Result<TieredStore<S>, DiskError> {
     let over_disk = if plan.disk.units > 0 {
         let path = cache_dir.join("block-cache");
-        Layer::Disk(DiskCache::open(budget, "disk cache", base, &path, plan.disk.units)?)
+        Layer::Disk(DiskCache::open(
+            budget,
+            "disk cache",
+            base,
+            &path,
+            plan.disk.units,
+        )?)
     } else {
         Layer::Base(base)
     };
@@ -135,6 +147,13 @@ impl<S: BlockStore> BlockStore for Layer<S> {
             Layer::Disk(d) => d.contains(id),
         }
     }
+
+    fn io_stats(&self) -> super::BlockIoStats {
+        match self {
+            Layer::Base(store) => store.io_stats(),
+            Layer::Disk(cache) => cache.io_stats(),
+        }
+    }
 }
 
 /// The assembled read path. Which tiers it has is fixed at build time, so the
@@ -173,6 +192,13 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(c) => c.contains(id),
             TieredStore::WithoutRam(l) => l.contains(id),
+        }
+    }
+
+    fn io_stats(&self) -> super::BlockIoStats {
+        match self {
+            TieredStore::WithRam(cache) => cache.io_stats(),
+            TieredStore::WithoutRam(layer) => layer.io_stats(),
         }
     }
 }
@@ -228,7 +254,10 @@ mod tests {
     #[test]
     fn zero_is_not_undersized_it_is_absent() {
         let plan = StackPlan::resolve(0, 0);
-        assert!(!plan.undersized_ram(), "zero means the tier was not asked for");
+        assert!(
+            !plan.undersized_ram(),
+            "zero means the tier was not asked for"
+        );
         assert!(!plan.undersized_disk());
     }
 
@@ -238,7 +267,9 @@ mod tests {
         let plan = StackPlan::resolve(FRAME * 4, SLOT * 8);
         let mut stack = build(&mut budget, store, plan, &dir()).expect("builds");
         assert!(matches!(stack, TieredStore::WithRam(_)));
-        let id = stack.put(b"through every tier", BlockType::SstData, 1).unwrap();
+        let id = stack
+            .put(b"through every tier", BlockType::SstData, 1)
+            .unwrap();
         assert_eq!(read(&mut stack, &id), b"through every tier");
         assert!(stack.contains(&id).unwrap());
     }
@@ -261,7 +292,9 @@ mod tests {
         let plan = StackPlan::resolve(0, 0);
         let mut stack = build(&mut budget, store, plan, &dir()).expect("builds");
         assert!(matches!(stack, TieredStore::WithoutRam(Layer::Base(_))));
-        let id = stack.put(b"straight to store", BlockType::SstData, 1).unwrap();
+        let id = stack
+            .put(b"straight to store", BlockType::SstData, 1)
+            .unwrap();
         assert_eq!(read(&mut stack, &id), b"straight to store");
     }
 
@@ -288,6 +321,9 @@ mod tests {
         let absent = BlockId::of(b"never written");
         assert!(!stack.contains(&absent).unwrap());
         let mut out = [0u8; 64];
-        assert_eq!(stack.get(&absent, &mut out).err(), Some(super::super::StoreError::NotFound));
+        assert_eq!(
+            stack.get(&absent, &mut out).err(),
+            Some(super::super::StoreError::NotFound)
+        );
     }
 }

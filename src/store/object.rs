@@ -14,7 +14,7 @@
 
 use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
 
-use super::{decode, encode, BlockId, BlockStore, BlockType, StoreError, HEADER_LEN};
+use super::{BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, StoreError, decode, encode};
 
 /// Blocks kept as objects under a key prefix.
 pub(crate) struct ObjectBlockStore<'c> {
@@ -35,9 +35,12 @@ impl<'c> ObjectBlockStore<'c> {
         prefix: &'static str,
         scratch: &'c mut [u8],
     ) -> Self {
-        Self { client, prefix, scratch }
+        Self {
+            client,
+            prefix,
+            scratch,
+        }
     }
-
 }
 
 /// `<prefix><64 hex chars>`, written into a caller-provided buffer so that
@@ -75,7 +78,9 @@ fn put_block(
     // No precondition: the key is the content, so writing a block that is
     // already there writes the same bytes. Conditional-create would turn a
     // harmless retry into an error the caller would have to interpret.
-    client.put(key, &scratch[..n], Precondition::None).map_err(store_error)?;
+    client
+        .put(key, &scratch[..n], Precondition::None)
+        .map_err(store_error)?;
     Ok(id)
 }
 
@@ -109,13 +114,19 @@ pub(crate) struct OwnedObjectStore {
     client: ObjectStore,
     prefix: &'static str,
     scratch: Vec<u8>,
+    stats: BlockIoStats,
 }
 
 impl OwnedObjectStore {
     /// Startup-only: the scratch Vec is reserved once, before the allocator
     /// freezes, and never grows.
     pub(crate) fn new(client: ObjectStore, prefix: &'static str) -> Self {
-        Self { client, prefix, scratch: vec![0u8; super::BLOCK_SIZE] }
+        Self {
+            client,
+            prefix,
+            scratch: vec![0u8; super::BLOCK_SIZE],
+            stats: BlockIoStats::default(),
+        }
     }
 }
 
@@ -126,21 +137,37 @@ impl BlockStore for OwnedObjectStore {
         block_type: BlockType,
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
-        put_block(&mut self.client, self.prefix, &mut self.scratch, payload, block_type, lsn)
+        let result = put_block(
+            &mut self.client,
+            self.prefix,
+            &mut self.scratch,
+            payload,
+            block_type,
+            lsn,
+        );
+        self.stats.object_puts = self.stats.object_puts.saturating_add(1);
+        result
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        get_block(&mut self.client, self.prefix, id, into)
+        let result = get_block(&mut self.client, self.prefix, id, into);
+        self.stats.object_gets = self.stats.object_gets.saturating_add(1);
+        result
     }
 
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
+        self.stats.object_contains = self.stats.object_contains.saturating_add(1);
         match self.client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
             Ok(_) => Ok(true),
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
         }
+    }
+
+    fn io_stats(&self) -> BlockIoStats {
+        self.stats
     }
 }
 
@@ -151,7 +178,14 @@ impl BlockStore for ObjectBlockStore<'_> {
         block_type: BlockType,
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
-        put_block(self.client, self.prefix, self.scratch, payload, block_type, lsn)
+        put_block(
+            self.client,
+            self.prefix,
+            self.scratch,
+            payload,
+            block_type,
+            lsn,
+        )
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {

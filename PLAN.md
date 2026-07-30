@@ -727,6 +727,44 @@ Stage-F forced-spill mode (fidelity unchanged while the whole path is rewired fo
 storage). **Risk:** Pillar 3 is the largest refactor; keep it incremental and diff-gated so
 fidelity never regresses.
 
+**Adaptive-planning slice (2026-07-30).** The first half of pillar 1 and its
+PostgreSQL-facing observability are now concrete. `ANALYZE` computes
+MVCC-visible row count, average row width, null fraction, and bounded
+HyperLogLog distinct estimates; targeted analysis preserves untouched column
+statistics, and empty targets disappear from `pg_stats` as they do in
+PostgreSQL. The manifest carries the statistics through a total local-cache
+loss, and `pg_class.reltuples`/`relpages` plus `pg_stats` expose them to
+clients. Column statistics use a startup-sized transaction-version slab and
+ordinary savepoint/rollback visibility; relation estimates update in place,
+matching PostgreSQL's deliberate `pg_statistic`/`pg_class` split. Both images
+are WAL-recoverable before their next manifest checkpoint. The planner consumes
+those estimates for predicate selectivity,
+cardinality-aware join ordering, and durable single-column index scans. One
+provider-neutral telemetry vector counts RAM hits/misses, disk hits/misses,
+and object GET/PUT/contains operations at the `BlockStore` boundary; no
+planner code knows an S3, MinIO, Google Cloud Storage, or Azure implementation.
+
+`EXPLAIN` now prints the real bounded plan for SELECT, set operations, and
+data modification in text, JSON, XML, or YAML. `ANALYZE`, `VERBOSE`, `COSTS`,
+`BUFFERS`, `WAL`, `TIMING`, `SUMMARY`, `MEMORY`, `SERIALIZE`, `SETTINGS`, and
+`GENERIC_PLAN` are parsed with PostgreSQL 18's invalid-combination checks.
+Execution metrics come from the ordinary executor, cache/object counters,
+wire serializer, and production WAL codec; planning itself performs no block
+read. A forced object-resident regression wipes RAM and disk state, proves
+EXPLAIN causes zero GETs, and proves a primary-key equality plan fetches fewer
+durable objects than a full scan. The durable authority is unchanged: rows,
+indexes, statistics, and WAL publication remain behind the common object-store
+interface, while RAM and local disk only accelerate reads.
+
+Pillar 1 still needs richer multi-column and distribution statistics, more
+access paths, and cost calibration against real provider traces. Pillars 2–4
+remain the async fixed-pool I/O scheduler, block-at-a-time executor, and PAX
+late materialization described above. PostgreSQL's temporary-file spill for
+materialized sort/group/set/window work also remains a fidelity gap (B-006);
+the current row-source/output-arena lifetime coupling must be split before a
+bounded external operator can release one input batch while retaining its
+output run.
+
 ### First slice (de-risks the whole plan)
 
 Land **A + a minimal B + the Stage-F forced-spill test harness** together, then run the
@@ -1283,12 +1321,20 @@ capstone. This section is the plan of record for all of it.
   rewrites the same row inside one explicit transaction. The DML-main implementation split
   catalog and arena lifetimes in the CTE substitution graph, so the rebuilt AST
   releases its immutable catalog borrow before storage mutates.
-- **EXPLAIN is absent** — humans and tools expect it; it becomes genuinely
-  informative once Stage I's cost model exists (the plan it prints should be
-  the real one).
-- **VACUUM / ANALYZE** — silent no-ops are banned, rightly; the mature move
-  gives them real semantics: VACUUM triggers compaction/GC, ANALYZE gathers
-  the statistics Stage I's cost model needs anyway.
+- **EXPLAIN / ANALYZE statistics — first real slice done.** `ANALYZE` builds
+  persistent MVCC-visible table/column statistics and exposes them through
+  `pg_class` and `pg_stats`. Its fixed version slab gives column statistics
+  PostgreSQL's transactional/savepoint visibility while relation estimates
+  retain PostgreSQL's in-place behavior; WAL recovery and provider-neutral
+  manifests preserve both. The planner uses them for selectivity, join order,
+  and persistent-index access. `EXPLAIN` renders that real plan in PostgreSQL's
+  four formats, and `EXPLAIN ANALYZE` executes through the normal path with
+  provider-neutral cache/object, WAL, memory, and serialization measurements.
+  Richer statistics and the remaining Stage I executor pillars are described
+  in the Stage I status above.
+- **VACUUM — real operation done.** It drives the LSM checkpoint/compaction and
+  object garbage-collection machinery; it is not an accept-and-ignore utility
+  command.
 - **Roles and GRANT** — effectively single-user today; privilege enforcement
   is part of "mature".
 - **LISTEN / NOTIFY** — done: `LISTEN`/`UNLISTEN [*]`/`NOTIFY channel[, payload]`
@@ -1472,13 +1518,19 @@ versions and tombstones — subsuming any named table; with
 `object_store = off` there is
 no store to compact to and it succeeds with nothing to reclaim, as PostgreSQL
 does on a clean table. It is non-transactional (25001 inside a block).
-`ANALYZE [options] [table [(cols)] [, ...]]` is accepted and returns its tag:
-this planner reads live table state rather than a stored statistics catalog,
-so there is no statistics artifact to build and none is client-observable
-(not a silent skip — there is genuinely nothing to compute or expose), and it
-is allowed inside a transaction. Options and per-table/column targets are
-parsed. Corpus `48_vacuum_analyze` (the `VERBOSE` form omitted — it prints
-INFO progress this engine does not emit).
+`ANALYZE [options] [table [(cols)] [, ...]]` is allowed inside a transaction.
+The original implementation only validated and walked its targets. The
+adaptive-planning slice completed the semantics: it computes MVCC-visible
+table/cardinality/width statistics and per-column null/distinct/width
+statistics, updates only named columns for a targeted analysis, persists the
+result through WAL and the provider-neutral manifest, exposes it through
+`pg_class` and `pg_stats`, and feeds the actual planner. PostgreSQL's unusual
+transaction boundary is preserved: column statistics are private until commit
+and roll back through savepoints, while relation row/page estimates update in
+place and survive rollback. Corpus `48_vacuum_analyze` retains the syntax/error
+contract; engine tests cover targeted updates, empty tables, cross-session and
+savepoint visibility, WAL recovery, planner use, and cold object-store restart.
+(`VERBOSE` remains omitted because its INFO progress stream is not implemented.)
 
 ### ON CONFLICT arbiter fidelity (2026-07-27)
 

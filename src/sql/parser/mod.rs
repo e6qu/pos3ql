@@ -573,9 +573,169 @@ impl<'a> Parser<'a> {
         Ok(Stmt::LockTable { tables, nowait })
     }
 
+    fn explain_bool(&mut self) -> Result<bool, ParseError> {
+        if self.eat_ident("true")? || self.eat_ident("on")? {
+            Ok(true)
+        } else if self.eat_ident("false")? || self.eat_ident("off")? {
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// EXPLAIN [ANALYZE] [VERBOSE] statement and the parenthesized option
+    /// grammar shared by current PostgreSQL releases.
+    fn explain(&mut self) -> Result<Stmt<'a>, ParseError> {
+        use crate::sql::ast::{ExplainFormat, ExplainOptions, ExplainSerialize};
+
+        self.advance()?; // explain
+        let mut options = ExplainOptions::DEFAULT;
+        let mut summary_specified = false;
+        let mut timing_enabled_explicitly = false;
+        if self.eat_op("(")? {
+            loop {
+                let option = self.any_ident("EXPLAIN option")?;
+                if option.eq_ignore_ascii_case("format") {
+                    let format = self.any_ident("EXPLAIN format")?;
+                    options.format = if format.eq_ignore_ascii_case("text") {
+                        ExplainFormat::Text
+                    } else if format.eq_ignore_ascii_case("json") {
+                        ExplainFormat::Json
+                    } else if format.eq_ignore_ascii_case("xml") {
+                        ExplainFormat::Xml
+                    } else if format.eq_ignore_ascii_case("yaml") {
+                        ExplainFormat::Yaml
+                    } else {
+                        return Err(
+                            self.err_here("unrecognized value for EXPLAIN option \"format\"")
+                        );
+                    };
+                } else if option.eq_ignore_ascii_case("serialize") {
+                    options.serialize = match self.peeked {
+                        Tok::Op(",") | Tok::Op(")") => ExplainSerialize::Text,
+                        Tok::Ident(format) if format.eq_ignore_ascii_case("none") => {
+                            self.advance()?;
+                            ExplainSerialize::None
+                        }
+                        Tok::Ident(format) if format.eq_ignore_ascii_case("text") => {
+                            self.advance()?;
+                            ExplainSerialize::Text
+                        }
+                        Tok::Ident(format) if format.eq_ignore_ascii_case("binary") => {
+                            self.advance()?;
+                            ExplainSerialize::Binary
+                        }
+                        Tok::Ident(_) => {
+                            return Err(self
+                                .err_here("unrecognized value for EXPLAIN option \"serialize\""));
+                        }
+                        _ => {
+                            return Err(self.err_here("expected EXPLAIN serialize format"));
+                        }
+                    };
+                } else {
+                    let enabled = self.explain_bool()?;
+                    if option.eq_ignore_ascii_case("analyze")
+                        || option.eq_ignore_ascii_case("analyse")
+                    {
+                        options.analyze = enabled;
+                    } else if option.eq_ignore_ascii_case("verbose") {
+                        options.verbose = enabled;
+                    } else if option.eq_ignore_ascii_case("costs") {
+                        options.costs = enabled;
+                    } else if option.eq_ignore_ascii_case("settings") {
+                        options.settings = enabled;
+                    } else if option.eq_ignore_ascii_case("buffers") {
+                        options.buffers = enabled;
+                    } else if option.eq_ignore_ascii_case("wal") {
+                        options.wal = enabled;
+                    } else if option.eq_ignore_ascii_case("timing") {
+                        options.timing = enabled;
+                        timing_enabled_explicitly = enabled;
+                    } else if option.eq_ignore_ascii_case("summary") {
+                        options.summary = enabled;
+                        summary_specified = true;
+                    } else if option.eq_ignore_ascii_case("memory") {
+                        options.memory = enabled;
+                    } else if option.eq_ignore_ascii_case("generic_plan") {
+                        options.generic_plan = enabled;
+                    } else {
+                        return Err(self.err_here("unrecognized EXPLAIN option"));
+                    }
+                }
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        } else {
+            loop {
+                if self.eat_ident("analyze")? || self.eat_ident("analyse")? {
+                    options.analyze = true;
+                } else if self.eat_ident("verbose")? {
+                    options.verbose = true;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !summary_specified {
+            options.summary = options.analyze;
+        }
+        if options.buffers && !options.analyze {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "EXPLAIN option BUFFERS requires ANALYZE"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        if options.wal && !options.analyze {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "EXPLAIN option WAL requires ANALYZE"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        if timing_enabled_explicitly && !options.analyze {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "EXPLAIN option TIMING requires ANALYZE"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        if options.serialize != ExplainSerialize::None && !options.analyze {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "EXPLAIN option SERIALIZE requires ANALYZE"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        if options.generic_plan && options.analyze {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
+                ),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        let statement = self.statement()?;
+        if matches!(statement, Stmt::Explain { .. }) {
+            return Err(self.err_here("EXPLAIN cannot be nested"));
+        }
+        let statement = self
+            .arena
+            .alloc(statement)
+            .map(|statement| &*statement)
+            .map_err(|_| self.err_here("statement too large"))?;
+        Ok(Stmt::Explain { options, statement })
+    }
+
     fn statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         match self.peeked {
             Tok::Ident("select") | Tok::Ident("values") | Tok::Op("(") => self.query(),
+            Tok::Ident("explain") => self.explain(),
             Tok::Ident("with") => self.with_query(),
             Tok::Ident("create") => self.create(),
             Tok::Ident("drop") => self.drop_stmt(),

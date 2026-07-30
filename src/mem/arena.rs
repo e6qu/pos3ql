@@ -19,6 +19,14 @@ pub struct Arena {
     high_water: Cell<usize>,
 }
 
+/// An allocation frontier retained while short-lived work above it is
+/// recycled. The marker is arena-specific and intentionally opaque.
+#[derive(Clone, Copy)]
+pub(crate) struct ArenaMark {
+    arena: *const Arena,
+    offset: usize,
+}
+
 // The arena owns its buffer; the raw pointer is not shared outside the
 // lifetimes handed out by `alloc*`, so moving the arena to another thread is
 // sound. `Cell` keeps it !Sync, which is correct.
@@ -153,6 +161,28 @@ impl Arena {
     /// guarantees no allocation handed out earlier is still alive.
     pub fn reset(&mut self) {
         self.offset.set(0);
+    }
+
+    /// Marks the current frontier for allocation-free per-row scratch reuse.
+    pub(crate) fn mark(&self) -> ArenaMark {
+        ArenaMark {
+            arena: self,
+            offset: self.offset.get(),
+        }
+    }
+
+    /// Recycles every allocation made after `mark`.
+    ///
+    /// # Safety
+    ///
+    /// No reference into the discarded suffix may be used after this call.
+    /// This is reserved for executor choke points that encode or emit every
+    /// per-row value before rewinding; long-lived AST/scope state is allocated
+    /// below the mark.
+    pub(crate) unsafe fn rewind_to(&self, mark: ArenaMark) {
+        assert!(core::ptr::eq(mark.arena, self), "arena mark belongs to another arena");
+        assert!(mark.offset <= self.offset.get(), "arena mark is ahead of the frontier");
+        self.offset.set(mark.offset);
     }
 
     pub fn used(&self) -> usize {

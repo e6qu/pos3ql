@@ -473,6 +473,58 @@ pub(crate) fn scan_source<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    scan_source_mode(
+        storage, scope, from, txid, where_clause, arena, params, hooks, outer, false, f,
+    )
+}
+
+/// Streaming variant of [`scan_source`] that recycles every source row and
+/// its evaluation scratch after the callback returns. The callback must
+/// consume or copy every arena-backed value before returning.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_source_recycling<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    scan_source_mode(
+        storage, scope, from, txid, where_clause, arena, params, hooks, outer, true, f,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_source_mode<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    recycle_rows: bool,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    fn recycled<R>(arena: &Arena, enabled: bool, operation: impl FnOnce() -> R) -> R {
+        let mark = enabled.then(|| arena.mark());
+        let result = operation();
+        if let Some(mark) = mark {
+            // SAFETY: recycling callers consume their source row inside
+            // `operation`; no reference into its arena suffix is observed
+            // after this point.
+            unsafe { arena.rewind_to(mark) };
+        }
+        result
+    }
+
     // Simplify plan-time-decided boolean arms, fold `col IS [NOT] NULL` on
     // NOT-NULL columns, then order the WHERE conjuncts by PostgreSQL's clause
     // cost once, up front, so the per-row leaf evaluates them cheapest-first
@@ -595,6 +647,7 @@ pub(crate) fn scan_source<'a>(
         order: &[usize],
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        recycle_rows: bool,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -634,90 +687,50 @@ pub(crate) fn scan_source<'a>(
             let rows = materialize_lateral(storage, txid, tref, arena, params, &chained)?;
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
-                bound[order[depth]] = Some(bytes);
-                if !candidate_passes(
-                    scope,
-                    bound,
-                    order,
-                    depth + 1,
-                    on,
-                    pushdown[depth],
-                    decode_buffers,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                )? {
-                    continue;
-                }
-                matched_any = true;
-                if let Some(m) = matched[depth] {
-                    m[index].set(true);
-                }
-                if !level(
-                    storage,
-                    scope,
-                    from,
-                    txid,
-                    where_clause,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                    depth + 1,
-                    bound,
-                    matched,
-                    pushdown,
-                    order,
-                    indexed,
-                    decode_buffers,
-                    f,
-                )? {
+                let keep_scanning = recycled(arena, recycle_rows, || {
+                    bound[order[depth]] = Some(bytes);
+                    if !candidate_passes(
+                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        decode_buffers, arena, params, hooks, outer,
+                    )? {
+                        return Ok(true);
+                    }
+                    matched_any = true;
+                    if let Some(m) = matched[depth] {
+                        m[index].set(true);
+                    }
+                    level(
+                        storage, scope, from, txid, where_clause, arena, params, hooks,
+                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        decode_buffers, recycle_rows, f,
+                    )
+                })?;
+                if !keep_scanning {
                     return Ok(false);
                 }
             }
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
-                bound[order[depth]] = Some(bytes);
-                if !candidate_passes(
-                    scope,
-                    bound,
-                    order,
-                    depth + 1,
-                    on,
-                    pushdown[depth],
-                    decode_buffers,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                )? {
-                    continue;
-                }
-                matched_any = true;
-                if let Some(m) = matched[depth] {
-                    m[index].set(true);
-                }
-                if !level(
-                    storage,
-                    scope,
-                    from,
-                    txid,
-                    where_clause,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                    depth + 1,
-                    bound,
-                    matched,
-                    pushdown,
-                    order,
-                    indexed,
-                    decode_buffers,
-                    f,
-                )? {
+                let keep_scanning = recycled(arena, recycle_rows, || {
+                    bound[order[depth]] = Some(bytes);
+                    if !candidate_passes(
+                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        decode_buffers, arena, params, hooks, outer,
+                    )? {
+                        return Ok(true);
+                    }
+                    matched_any = true;
+                    if let Some(m) = matched[depth] {
+                        m[index].set(true);
+                    }
+                    level(
+                        storage, scope, from, txid, where_clause, arena, params, hooks,
+                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        decode_buffers, recycle_rows, f,
+                    )
+                })?;
+                if !keep_scanning {
                     return Ok(false);
                 }
             }
@@ -774,46 +787,26 @@ pub(crate) fn scan_source<'a>(
             });
             for (this, &(rowid, home)) in ordered[..fill].iter().enumerate() {
                 check_timeout()?;
-                bound[order[depth]] =
-                    Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
-                if !candidate_passes(
-                    scope,
-                    bound,
-                    order,
-                    depth + 1,
-                    on,
-                    pushdown[depth],
-                    decode_buffers,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                )? {
-                    continue;
-                }
-                matched_any = true;
-                if let Some(m) = matched[depth] {
-                    m[this].set(true);
-                }
-                if !level(
-                    storage,
-                    scope,
-                    from,
-                    txid,
-                    where_clause,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                    depth + 1,
-                    bound,
-                    matched,
-                    pushdown,
-                    order,
-                    indexed,
-                    decode_buffers,
-                    f,
-                )? {
+                let keep_scanning = recycled(arena, recycle_rows, || {
+                    bound[order[depth]] =
+                        Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
+                    if !candidate_passes(
+                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        decode_buffers, arena, params, hooks, outer,
+                    )? {
+                        return Ok(true);
+                    }
+                    matched_any = true;
+                    if let Some(m) = matched[depth] {
+                        m[this].set(true);
+                    }
+                    level(
+                        storage, scope, from, txid, where_clause, arena, params, hooks,
+                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        decode_buffers, recycle_rows, f,
+                    )
+                })?;
+                if !keep_scanning {
                     return Ok(false);
                 }
             }
@@ -827,47 +820,27 @@ pub(crate) fn scan_source<'a>(
                 let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
                 let this = index;
                 index += 1;
-                if !candidate_passes(
-                    scope,
-                    bound,
-                    order,
-                    depth + 1,
-                    on,
-                    pushdown[depth],
-                    decode_buffers,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                )? {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                matched_any = true;
-                if let Some(m) = matched[depth] {
-                    m[this].set(true);
-                }
-                if !level(
-                    storage,
-                    scope,
-                    from,
-                    txid,
-                    where_clause,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                    depth + 1,
-                    bound,
-                    matched,
-                    pushdown,
-                    order,
-                    indexed,
-                    decode_buffers,
-                    f,
-                )? {
+                let keep_scanning = recycled(arena, recycle_rows, || {
+                    bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
+                    if !candidate_passes(
+                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        decode_buffers, arena, params, hooks, outer,
+                    )? {
+                        return Ok(true);
+                    }
+                    matched_any = true;
+                    if let Some(m) = matched[depth] {
+                        m[this].set(true);
+                    }
+                    level(
+                        storage, scope, from, txid, where_clause, arena, params, hooks,
+                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        decode_buffers, recycle_rows, f,
+                    )
+                })?;
+                if !keep_scanning {
                     aborted = true;
                     return Ok(ControlFlow::Break(()));
                 }
@@ -898,6 +871,7 @@ pub(crate) fn scan_source<'a>(
                 order,
                 indexed,
                 decode_buffers,
+                recycle_rows,
                 f,
             )? {
                 return Ok(false);
@@ -1039,6 +1013,7 @@ pub(crate) fn scan_source<'a>(
         order,
         indexed.as_ref(),
         decode_buffers,
+        recycle_rows,
         f,
     )?;
 
@@ -1081,12 +1056,16 @@ pub(crate) fn scan_source<'a>(
                 order,
                 indexed.as_ref(),
                 decode_buffers,
+                recycle_rows,
                 f,
             )
         };
         if let Some(rows) = scope.derived[d] {
             for (index, bytes) in rows.iter().enumerate() {
-                if !m[index].get() && !emit_unmatched(bytes, f)? {
+                let keep_scanning = recycled(arena, recycle_rows, || {
+                    if m[index].get() { Ok(true) } else { emit_unmatched(bytes, f) }
+                })?;
+                if !keep_scanning {
                     return Ok(());
                 }
             }
@@ -1101,9 +1080,15 @@ pub(crate) fn scan_source<'a>(
                 };
                 let this = index;
                 index += 1;
-                if !m[this].get()
-                    && !emit_unmatched(storage.row_bytes(scope.slots[d], rowid, home, arena)?, f)?
-                {
+                let keep_scanning = recycled(arena, recycle_rows, || {
+                    if m[this].get() {
+                        Ok(true)
+                    } else {
+                        let bytes = storage.row_bytes(scope.slots[d], rowid, home, arena)?;
+                        emit_unmatched(bytes, f)
+                    }
+                })?;
+                if !keep_scanning {
                     done = true;
                     return Ok(ControlFlow::Break(()));
                 }

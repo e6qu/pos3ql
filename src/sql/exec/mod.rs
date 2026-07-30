@@ -136,12 +136,13 @@ pub use describe::{
 pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeric_tower};
 
 mod projected;
+pub(crate) use projected::{
+    compare_projected_prefix, encode_projected_by, encode_projected_by_into,
+    projected_row_len_by, projected_row_width,
+};
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
     encode_projected_pub, projected_prefix_len, projected_value_len, sort_dedup_projected,
-};
-pub(crate) use projected::{
-    encode_projected_by, projected_row_width,
 };
 
 mod ddl;

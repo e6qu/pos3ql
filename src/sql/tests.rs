@@ -2239,7 +2239,10 @@ fn range_table_covers_wide_conformance_queries() {
         .collect::<Vec<_>>()
         .join(" AND ");
     let query = format!("SELECT count(*) FROM {from} WHERE {qualification}");
-    assert_eq!(data_rows(&run_with(&mut engine, &mut budget, &query)), ["1"]);
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, &query)),
+        ["1"]
+    );
 }
 
 #[test]
@@ -8564,6 +8567,121 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
         "durable index pruning must fetch fewer objects: selective={selective_gets}, full={full_gets}"
     );
     drop(selective);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("external-runs-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-external-runs-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 1 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 16 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    config.table_rows = 4096;
+    config.memtable_bytes = 4 << 20;
+    // The sorted projection is about 1.5 MiB. This bound proves execution
+    // recycles batches instead of retaining the result in the work arena.
+    config.work_arena_bytes = 512 << 10;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE external_rows (id int PRIMARY KEY, payload text)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    for start in (1..=3000).step_by(50) {
+        let end = start + 49;
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO external_rows \
+                 SELECT i, lpad(i::text, 512, '0') \
+                 FROM generate_series({start}, {end}) AS g(i)"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "rows {start}..={end}: {}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    // Both cache tiers disappear. The table and the execution runs must use
+    // the provider-neutral object tier; local files cannot be authoritative.
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let before = restarted.storage.block_io_stats();
+    let ordered = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT id FROM external_rows ORDER BY payload DESC LIMIT 10",
+    );
+    assert_eq!(
+        data_rows(&ordered),
+        [
+            "3000", "2999", "2998", "2997", "2996", "2995", "2994", "2993", "2992", "2991"
+        ],
+        "{}",
+        String::from_utf8_lossy(&ordered),
+    );
+    let traffic = restarted.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        traffic.object_gets > 0 && traffic.object_puts > 0,
+        "cold input and external runs must cross the durable block boundary: {traffic:?}"
+    );
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT DISTINCT ON (id % 10) id % 10, id \
+             FROM external_rows ORDER BY id % 10, id DESC",
+        )),
+        [
+            "0|3000", "1|2991", "2|2992", "3|2993", "4|2994", "5|2995", "6|2996", "7|2997",
+            "8|2998", "9|2999"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT DISTINCT id % 17 FROM external_rows",
+        )),
+        [
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
+            "14", "15", "16"
+        ]
+    );
+    let ties = data_rows(&run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT id / 1000 FROM external_rows \
+         ORDER BY id / 1000 FETCH FIRST 1 ROW WITH TIES",
+    ));
+    assert_eq!(ties.len(), 999);
+    assert!(ties.iter().all(|value| value == "0"));
+
+    drop(restarted);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

@@ -37,9 +37,11 @@ mod value;
 
 pub(crate) mod lz4;
 
+#[cfg(test)]
+pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
-pub(crate) use sst::{MAX_ASSEMBLED, SstError, SstWriter};
-pub(crate) use sst::{SstHandle, SstKey, SstReader};
+pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
+pub(crate) use sst::{SstCursor, SstHandle, SstKey, SstReader};
 pub(crate) use sst::{block_keys_at, data_block_total, locate_data_block, read_data_block};
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};

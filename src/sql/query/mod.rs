@@ -36,7 +36,7 @@ use materialize::{ScopeSchema, finalize_projected_row, materialized_rows, materi
 
 mod scan;
 pub use scan::JoinRow;
-use scan::{Chained, scan_source};
+use scan::{Chained, scan_source, scan_source_recycling};
 
 mod scope;
 pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
@@ -2394,7 +2394,10 @@ pub fn constant_select<'a>(
     // FETCH FIRST ... WITH TIES over a FROM-less SRF result: keep rows tying
     // with the last on the ORDER BY keys (hidden columns after `width`).
     if statement.with_ties && limit > 0 {
-        end = materialize::extend_ties(out_rows, width, statement.order_by.len(), end);
+        end = match materialize::extend_ties(out_rows, width, statement.order_by.len(), end) {
+            Ok(end) => end,
+            Err(error) => return sql_fail(error),
+        };
     }
     let mut rows = 0u64;
     for row in &out_rows[start..end] {

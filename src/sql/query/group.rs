@@ -571,7 +571,15 @@ pub(super) fn grouped_select<'a>(
     // FETCH FIRST ... WITH TIES: extend past the limit while rows tie with the
     // last on the ORDER BY keys (hidden columns after `width`).
     if statement.with_ties && limit > 0 {
-        end = super::materialize::extend_ties(out_rows, width, statement.order_by.len(), end);
+        end = match super::materialize::extend_ties(
+            out_rows,
+            width,
+            statement.order_by.len(),
+            end,
+        ) {
+            Ok(end) => end,
+            Err(error) => return sql_fail(error),
+        };
     }
     let mut emitted = 0u64;
     for row in &out_rows[start..end] {

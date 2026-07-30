@@ -96,6 +96,9 @@ impl PartialOrd for SstKey {
 /// blocks' identities, and the head chunk inline.
 const LEGACY_ENTRY_HEADER: usize = 12;
 const VERSIONED_ENTRY_HEADER: usize = 20;
+/// Largest row an execution cursor can read without following an overflow
+/// chain. External runs enforce this before handing a row to the writer.
+pub(crate) const MAX_INLINE_ROW: usize = MAX_PAYLOAD - VERSIONED_ENTRY_HEADER;
 
 /// High bit of the entry length: the row continues in overflow blocks.
 const CHAIN_FLAG: u32 = 1 << 31;
@@ -543,6 +546,92 @@ pub(crate) struct SstReader<'a> {
     /// Scratch a range scan assembles a chained row into (a point lookup
     /// assembles straight into the caller's buffer instead).
     assembly: &'a mut [u8],
+}
+
+/// Allocation-free, suspendable traversal of one SST in key order.
+///
+/// [`SstReader::scan`] is deliberately callback-shaped for storage walks, but
+/// an external merge needs one current row from several runs at once. This
+/// cursor keeps only the data-block ordinal and byte offset; all buffers are
+/// caller-owned startup scratch, and every advance still reads through the
+/// same [`BlockStore`] cache stack.
+#[derive(Clone, Copy)]
+pub(crate) struct SstCursor {
+    handle: SstHandle,
+    block_ordinal: usize,
+    offset: usize,
+    data_len: usize,
+    loaded: bool,
+    done: bool,
+}
+
+impl SstCursor {
+    pub(crate) fn new(handle: SstHandle) -> Self {
+        Self {
+            handle,
+            block_ordinal: 0,
+            offset: 0,
+            data_len: 0,
+            loaded: false,
+            done: false,
+        }
+    }
+
+    /// Copies the next live row into `out`, returning `(key, length)`.
+    ///
+    /// External execution never writes tombstones and caps one projected row
+    /// at one block payload. Encountering either a tombstone or a chained row
+    /// is therefore corruption of an execution run, not an alternate result.
+    pub(crate) fn next_copy(
+        &mut self,
+        store: &mut dyn BlockStore,
+        index: &mut [u8],
+        data: &mut [u8],
+        bounce: &mut [u8],
+        out: &mut [u8],
+    ) -> Result<Option<(u64, usize)>, SstError> {
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            if !self.loaded || self.offset >= self.data_len {
+                let Some(id) = locate_data_block(store, &self.handle, index, self.block_ordinal)?
+                else {
+                    self.done = true;
+                    return Ok(None);
+                };
+                self.data_len = read_data_block(store, &id, data, bounce)?;
+                self.block_ordinal += 1;
+                self.offset = 0;
+                self.loaded = true;
+                if self.data_len == 0 {
+                    continue;
+                }
+            }
+
+            let remaining = &data[self.offset..self.data_len];
+            let before = remaining.len();
+            let mut entries = DataBlock {
+                bytes: remaining,
+                versioned: self.handle.versioned,
+            };
+            let Some(entry) = entries.next() else {
+                return Err(SstError::Store(StoreError::Corrupt(
+                    super::BlockError::Truncated,
+                )));
+            };
+            self.offset += before - entries.bytes.len();
+            if entry.tombstone || entry.is_chained() || entry.total_len > out.len() {
+                return Err(if entry.total_len > out.len() {
+                    SstError::RowTooLarge
+                } else {
+                    SstError::Store(StoreError::Corrupt(super::BlockError::Payload))
+                });
+            }
+            out[..entry.total_len].copy_from_slice(entry.head);
+            return Ok(Some((entry.key.rowid, entry.total_len)));
+        }
+    }
 }
 
 /// One SST's best version for a snapshot. `len == None` is a deletion marker.

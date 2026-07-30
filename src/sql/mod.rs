@@ -15,6 +15,7 @@ pub(crate) mod external;
 pub mod guc;
 pub mod json;
 pub mod lexer;
+pub(crate) mod lock;
 pub mod md5;
 pub mod net;
 pub mod notify;
@@ -144,6 +145,24 @@ pub struct Engine {
     current_conn_id: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionStatus {
+    Complete,
+    /// The current statement emitted no client-visible output and is parked
+    /// on a row lock. Statements before it in the same simple-query message
+    /// completed exactly once and are skipped when the message resumes.
+    Blocked {
+        completed_statements: usize,
+        output_mark: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtendedExecutionStatus {
+    Complete(bool),
+    Blocked,
+}
+
 #[derive(Clone, Copy)]
 struct TransactionCharacteristics {
     isolation: Option<IsolationLevel>,
@@ -168,20 +187,24 @@ fn transaction_characteristics(text: &str) -> Result<TransactionCharacteristics,
             let Some(first) = words.next() else {
                 return Err(level);
             };
-            let Some(second) = words.next() else {
-                return Err(first);
-            };
             if !level.eq_ignore_ascii_case("level") {
                 return Err(level);
             }
-            if first.eq_ignore_ascii_case("read") && second.eq_ignore_ascii_case("committed") {
-                parsed.isolation = Some(IsolationLevel::ReadCommitted);
-            } else if first.eq_ignore_ascii_case("repeatable")
-                && second.eq_ignore_ascii_case("read")
-            {
-                parsed.isolation = Some(IsolationLevel::RepeatableRead);
+            if first.eq_ignore_ascii_case("serializable") {
+                parsed.isolation = Some(IsolationLevel::Serializable);
             } else {
-                return Err(first);
+                let Some(second) = words.next() else {
+                    return Err(first);
+                };
+                if first.eq_ignore_ascii_case("read") && second.eq_ignore_ascii_case("committed") {
+                    parsed.isolation = Some(IsolationLevel::ReadCommitted);
+                } else if first.eq_ignore_ascii_case("repeatable")
+                    && second.eq_ignore_ascii_case("read")
+                {
+                    parsed.isolation = Some(IsolationLevel::RepeatableRead);
+                } else {
+                    return Err(first);
+                }
             }
         } else if word.eq_ignore_ascii_case("read") {
             let Some(mode) = words.next() else {
@@ -291,30 +314,11 @@ fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u64 {
 fn statement_changes_schema(statement: &Stmt<'_>) -> bool {
     matches!(
         statement,
-        Stmt::CreateTable(_)
-            | Stmt::DropTable(_)
-            | Stmt::Truncate { .. }
-            | Stmt::CreateView { .. }
-            | Stmt::DropView { .. }
-            | Stmt::CreateTableAs { .. }
-            | Stmt::RefreshMaterializedView { .. }
-            | Stmt::DropMaterializedView { .. }
-            | Stmt::CreateSequence { .. }
-            | Stmt::AlterSequence { .. }
-            | Stmt::DropSequence { .. }
-            | Stmt::CreateDomain(_)
-            | Stmt::AlterDomain { .. }
+        Stmt::AlterDomain { .. }
             | Stmt::DropDomain { .. }
-            | Stmt::CreateEnum { .. }
             | Stmt::AlterType { .. }
             | Stmt::DropType { .. }
-            | Stmt::CreateIndex { .. }
-            | Stmt::DropIndex { .. }
-            | Stmt::AlterTable(_)
-            | Stmt::CreateSchema { .. }
             | Stmt::DropSchema { .. }
-            | Stmt::Comment { .. }
-            | Stmt::AlterOwner { .. }
     )
 }
 
@@ -470,11 +474,20 @@ impl Engine {
         if !txn.is_active() {
             return Ok(());
         }
+        if txn.isolation == IsolationLevel::Serializable
+            && (!txn.touched().is_empty() || !txn.ddl().is_empty())
+            && let Err(error) = self.storage.validate_serializable(txn.txid)
+        {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         // This transaction no longer needs its historical view. Release it
         // before promotion so only other live snapshots cause old row images
         // to be retained.
         self.storage.release_snapshot(txn.txid);
+        self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
+        self.storage.release_row_locks(txn.txid);
         // A failed synchronous upload keeps its batch marker, so the next
         // commit retries it. Whether *this* transaction added records to
         // that batch decides who owns a retry failure below: the statement
@@ -940,7 +953,9 @@ impl Engine {
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         self.storage.release_snapshot(txn.txid);
+        self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
+        self.storage.release_row_locks(txn.txid);
         // Reverse-replay every write to its prior image (newest first), so a
         // row written multiple times unwinds to its pre-transaction state.
         for &(table, rowid, prior) in txn.touched().iter().rev() {
@@ -957,6 +972,50 @@ impl Engine {
         self.wal.discard_stage(txn.txid);
         guc.rollback_transaction();
         txn.clear();
+    }
+
+    /// A deadlock victim releases pending versions and locks immediately,
+    /// while ReadyForQuery continues to report an aborted explicit block until
+    /// the client issues COMMIT or ROLLBACK.
+    fn abort_explicit_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
+        let txid = txn.txid;
+        self.rollback_txn(txn, guc);
+        txn.txid = txid;
+        txn.mode = TxnMode::Explicit;
+        txn.failed = true;
+    }
+
+    /// Restores transaction-owned state a partially executed statement built
+    /// before discovering a lock wait. Transaction-level locks remain held
+    /// while the protocol message is parked.
+    fn rollback_waiting_statement(
+        &mut self,
+        txn: &mut TxnState,
+        mark: txn::StatementMark,
+    ) {
+        for index in (mark.touched..txn.touched().len()).rev() {
+            let (table, rowid, prior) = txn.touched()[index];
+            self.storage
+                .restore_pending(table as usize, rowid, txn.txid, prior);
+        }
+        for index in (mark.ddl..txn.ddl().len()).rev() {
+            self.rollback_ddl(txn.ddl()[index], txn.txid);
+        }
+        for index in (mark.statistics..txn.statistics_undo().len()).rev() {
+            self.storage.rollback_table_statistics(
+                txn.statistics_undo()[index].table as usize,
+                txn.txid,
+            );
+        }
+        txn.rewind_touched(mark.touched);
+        txn.rewind_ddl(mark.ddl);
+        txn.rewind_statistics(mark.statistics);
+        txn.rewind_notifications(
+            mark.notifications,
+            mark.notification_payload,
+            mark.listen_ops,
+        );
+        self.wal.truncate_stage(txn.txid, mark.wal);
     }
 
     /// Rolls back to the savepoint at `index`: undoes every row write and DDL
@@ -982,6 +1041,7 @@ impl Engine {
         txn.rewind_ddl(sp.ddl_mark);
         txn.rewind_statistics(sp.statistics_mark);
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
+        self.storage.rollback_locks_to(txn.txid, sp.lock_mark);
         txn.rollback_savepoints_after(index);
         self.wal.truncate_stage(txn.txid, sp.wal_mark);
         guc.rollback_to_savepoint(index);
@@ -1060,6 +1120,36 @@ impl Engine {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn lock_maintenance_targets(
+        &self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if targets.is_empty() {
+            for slot in 0..self.storage.table_count() {
+                if self.storage.table(slot).visible_to(txid) {
+                    self.storage.lock_table(
+                        txid,
+                        slot,
+                        ast::TableLockMode::ShareUpdateExclusive,
+                        false,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        for target in targets {
+            let slot = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
+            self.storage.lock_table(
+                txid,
+                slot,
+                ast::TableLockMode::ShareUpdateExclusive,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -1310,11 +1400,33 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
         conn_id: i32,
-    ) -> Result<(), WireFull> {
+    ) -> Result<ExecutionStatus, WireFull> {
+        self.execute_simple_from(
+            text, 0, arena, txn, sqlprep, cursors, guc, responder, conn_id, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_simple_from(
+        &mut self,
+        text: &str,
+        resume_statement: usize,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+        conn_id: i32,
+        lock_timeout_expired: bool,
+    ) -> Result<ExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
-            Err(e) => return report_parse_error(responder, &e),
+            Err(e) => {
+                report_parse_error(responder, &e)?;
+                return Ok(ExecutionStatus::Complete);
+            }
         };
         // The whole message runs in one implicit transaction unless an
         // explicit block is open — an error undoes the entire message,
@@ -1324,10 +1436,15 @@ impl Engine {
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit, guc);
-        let mut executed_any = false;
+        let mut executed_any = resume_statement > 0;
+        let mut statement_index = 0usize;
         loop {
             match parser.next_stmt() {
                 Ok(Some(statement)) => {
+                    if statement_index < resume_statement {
+                        statement_index += 1;
+                        continue;
+                    }
                     if self.pending_copy.take().is_some() {
                         // COPY FROM STDIN takes over the connection; a
                         // statement after it in the same string has nowhere
@@ -1338,22 +1455,44 @@ impl Engine {
                             "COPY FROM STDIN must be the last statement in a query string"
                         );
                         responder.error(e.sqlstate, e.message.as_str())?;
-                        return Ok(());
+                        return Ok(ExecutionStatus::Complete);
                     }
                     executed_any = true;
+                    let output_mark = responder.buffer.mark();
+                    let statement_mark = txn.statement_mark(
+                        self.wal.stage_mark(txn.txid),
+                        self.storage.lock_mark(),
+                    );
                     emit_parse_warnings(&mut parser, responder)?;
                     let outcome = self.execute_stmt(
                         &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
                     );
-                    if let Err(e) = outcome? {
-                        if txn.is_explicit() {
+                    if let Err(mut e) = outcome? {
+                        if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                            self.rollback_waiting_statement(txn, statement_mark);
+                            if !lock_timeout_expired {
+                                return Ok(ExecutionStatus::Blocked {
+                                    completed_statements: statement_index,
+                                    output_mark,
+                                });
+                            }
+                            self.storage.rollback_locks_to(txn.txid, statement_mark.lock);
+                            e = sql_err!(
+                                sqlstate::LOCK_NOT_AVAILABLE,
+                                "canceling statement due to lock timeout"
+                            );
+                        }
+                        if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                            self.abort_explicit_txn(txn, guc);
+                        } else if txn.is_explicit() {
                             txn.failed = true;
                         } else {
                             self.rollback_txn(txn, guc);
                         }
                         responder.error(e.sqlstate, e.message.as_str())?;
-                        return Ok(());
+                        return Ok(ExecutionStatus::Complete);
                     }
+                    statement_index += 1;
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -1362,7 +1501,8 @@ impl Engine {
                     } else {
                         self.rollback_txn(txn, guc);
                     }
-                    return report_parse_error(responder, &e);
+                    report_parse_error(responder, &e)?;
+                    return Ok(ExecutionStatus::Complete);
                 }
             }
         }
@@ -1377,7 +1517,11 @@ impl Engine {
         {
             responder.error(e.sqlstate, e.message.as_str())?;
         }
-        Ok(())
+        Ok(ExecutionStatus::Complete)
+    }
+
+    pub fn lock_generation(&self) -> u64 {
+        self.storage.lock_generation()
     }
 
     /// Extended-protocol Execute: exactly one statement, already-validated
@@ -1395,13 +1539,14 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
         conn_id: i32,
-    ) -> Result<bool, WireFull> {
+        lock_timeout_expired: bool,
+    ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
                 report_parse_error(responder, &e)?;
-                return Ok(false);
+                return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
         // Freeze this statement's clock before anything anchors a transaction
@@ -1409,6 +1554,8 @@ impl Engine {
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit, guc);
+        let statement_mark =
+            txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         let outcome = match parser.next_stmt() {
             Ok(Some(statement)) => {
                 emit_parse_warnings(&mut parser, responder)?;
@@ -1422,13 +1569,15 @@ impl Engine {
                 Ok(())
             }
             Err(e) => {
-                if txn.is_explicit() {
+                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.abort_explicit_txn(txn, guc);
+                } else if txn.is_explicit() {
                     txn.failed = true;
                 } else {
                     self.rollback_txn(txn, guc);
                 }
                 report_parse_error(responder, &e)?;
-                return Ok(false);
+                return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
         match outcome {
@@ -1438,18 +1587,31 @@ impl Engine {
                     && let Err(e) = self.commit_txn(txn, guc)
                 {
                     responder.error(e.sqlstate, e.message.as_str())?;
-                    return Ok(false);
+                    return Ok(ExtendedExecutionStatus::Complete(false));
                 }
-                Ok(true)
+                Ok(ExtendedExecutionStatus::Complete(true))
             }
-            Err(e) => {
-                if txn.is_explicit() {
+            Err(mut e) => {
+                if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                    self.rollback_waiting_statement(txn, statement_mark);
+                    if !lock_timeout_expired {
+                        return Ok(ExtendedExecutionStatus::Blocked);
+                    }
+                    self.storage.rollback_locks_to(txn.txid, statement_mark.lock);
+                    e = sql_err!(
+                        sqlstate::LOCK_NOT_AVAILABLE,
+                        "canceling statement due to lock timeout"
+                    );
+                }
+                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.abort_explicit_txn(txn, guc);
+                } else if txn.is_explicit() {
                     txn.failed = true;
                 } else {
                     self.rollback_txn(txn, guc);
                 }
                 responder.error(e.sqlstate, e.message.as_str())?;
-                Ok(false)
+                Ok(ExtendedExecutionStatus::Complete(false))
             }
         }
     }
@@ -2530,14 +2692,17 @@ impl Engine {
         }
         // Historical row images currently share the committed table
         // definition. Prevent a concurrent definition rewrite from making an
-        // old row undecodable; this is the fail-fast form of PostgreSQL's
-        // ACCESS SHARE versus ACCESS EXCLUSIVE lock conflict.
-        if (self.storage.has_active_snapshots() || self.storage.has_access_share_locks())
-            && statement_changes_schema(statement)
+        // old row undecodable by joining the same wait graph as relation and
+        // row locks.
+        if statement_changes_schema(statement)
+            && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
         {
+            if let Err(error) = self.storage.wait_for_transaction(txn.txid, blocker) {
+                return Ok(Err(error));
+            }
             return Ok(Err(sql_err!(
-                sqlstate::LOCK_NOT_AVAILABLE,
-                "could not obtain schema lock while a historical snapshot is active"
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for a schema lock"
             )));
         }
         // A new command: advance the command-id (so this statement's writes are
@@ -2559,8 +2724,16 @@ impl Engine {
         );
         let commit_snapshot = if takes_snapshot {
             let snapshot = txn.statement_snapshot(self.storage.lsn());
-            if txn.isolation == IsolationLevel::RepeatableRead
+            if matches!(
+                txn.isolation,
+                IsolationLevel::RepeatableRead | IsolationLevel::Serializable
+            )
                 && let Err(error) = self.storage.register_snapshot(txn.txid, snapshot)
+            {
+                return Ok(Err(error));
+            }
+            if txn.isolation == IsolationLevel::Serializable
+                && let Err(error) = self.storage.begin_serializable(txn.txid)
             {
                 return Ok(Err(error));
             }
@@ -3189,7 +3362,11 @@ impl Engine {
                 self.ensure_txn(txn, TxnMode::Implicit, guc);
                 Ok(Ok(()))
             }
-            Stmt::LockTable { tables, nowait: _ } => {
+            Stmt::LockTable {
+                tables,
+                mode,
+                nowait,
+            } => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
                         sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -3204,7 +3381,7 @@ impl Engine {
                     };
                 }
                 for &slot in &slots[..tables.len()] {
-                    if let Err(error) = self.storage.lock_table_access_share(txn.txid, slot) {
+                    if let Err(error) = self.storage.lock_table(txn.txid, slot, *mode, *nowait) {
                         return Ok(Err(error));
                     }
                 }
@@ -3219,7 +3396,7 @@ impl Engine {
                     )));
                 }
                 let mark = self.wal.stage_mark(txn.txid);
-                if let Err(e) = txn.savepoint(name, mark) {
+                if let Err(e) = txn.savepoint(name, mark, self.storage.lock_mark()) {
                     return Ok(Err(e));
                 }
                 guc.savepoint();
@@ -3360,6 +3537,17 @@ impl Engine {
                     Ok(s) => s,
                     Err(e) => return Ok(Err(e)),
                 };
+                let mode = if c.to {
+                    ast::TableLockMode::AccessShare
+                } else {
+                    ast::TableLockMode::RowExclusive
+                };
+                if let Err(error) =
+                    self.storage
+                        .lock_table(txn.txid, setup.table_index, mode, false)
+                {
+                    return Ok(Err(error));
+                }
                 if c.to {
                     match exec::copy_out(&self.storage, txn.txid, &setup, arena, responder) {
                         Ok(count) => {
@@ -3395,6 +3583,9 @@ impl Engine {
             // storage there is nothing to compact to, and — as VACUUM on a
             // table with nothing to reclaim does in PostgreSQL — it succeeds.
             Stmt::Vacuum { targets, analyze } => {
+                if let Err(error) = self.lock_maintenance_targets(targets, txn.txid) {
+                    return Ok(Err(error));
+                }
                 let validation = if *analyze {
                     self.analyze_targets(targets, txn).map(|_| ())
                 } else {
@@ -3415,6 +3606,9 @@ impl Engine {
             // MVCC-visible row state. Cardinality and widths are exact for that
             // snapshot; distinct counts use the fixed-size estimator.
             Stmt::Analyze(targets) => {
+                if let Err(error) = self.lock_maintenance_targets(targets, txn.txid) {
+                    return Ok(Err(error));
+                }
                 if let Err(error) = self.analyze_targets(targets, txn) {
                     return Ok(Err(error));
                 }

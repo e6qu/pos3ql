@@ -1,11 +1,12 @@
 //! Per-connection transaction state.
 //!
-//! Semantics: READ COMMITTED, fail-fast. A statement outside an explicit
+//! Semantics: PostgreSQL MVCC snapshots plus bounded transaction locking. A
+//! statement outside an explicit
 //! block runs in an implicit transaction spanning its whole simple-query
 //! message (so an error rolls the entire message back, as PostgreSQL
 //! does). Writers see their own changes; everyone else sees the last
-//! committed image; a write conflict raises 40001 immediately instead of
-//! blocking (single-threaded execution cannot wait).
+//! committed image; conflicting row locks park the connection without
+//! blocking the single-threaded reactor.
 
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
@@ -29,6 +30,8 @@ pub struct Savepoint {
     pub ddl_mark: usize,
     pub statistics_mark: usize,
     pub wal_mark: usize,
+    /// Shared table/row lock acquisition clock at savepoint creation.
+    pub lock_mark: u64,
     /// Pending-notification and pending-listen-op lengths (and the notification
     /// payload-buffer offset) at savepoint time, so ROLLBACK TO discards the
     /// notifications/registrations a rolled-back subtransaction produced, as
@@ -38,6 +41,20 @@ pub struct Savepoint {
     pub listen_mark: usize,
     /// The `failed` flag at savepoint time, restored on ROLLBACK TO.
     pub failed: bool,
+}
+
+/// Undo positions captured at a statement boundary. Unlike a SQL savepoint it
+/// has no name and does not consume the savepoint pool.
+#[derive(Clone, Copy)]
+pub(crate) struct StatementMark {
+    pub touched: usize,
+    pub ddl: usize,
+    pub statistics: usize,
+    pub wal: usize,
+    pub lock: u64,
+    pub notifications: usize,
+    pub notification_payload: usize,
+    pub listen_ops: usize,
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
@@ -56,6 +73,7 @@ pub enum TxnMode {
 pub enum IsolationLevel {
     ReadCommitted,
     RepeatableRead,
+    Serializable,
 }
 
 pub struct TxnState {
@@ -281,7 +299,9 @@ impl TxnState {
         self.snapshot_taken = true;
         match self.isolation {
             IsolationLevel::ReadCommitted => current_lsn,
-            IsolationLevel::RepeatableRead => *self.snapshot_lsn.get_or_insert(current_lsn),
+            IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
+                *self.snapshot_lsn.get_or_insert(current_lsn)
+            }
         }
     }
 
@@ -417,7 +437,12 @@ impl TxnState {
 
     /// Establishes a savepoint at the current undo position. A duplicate name
     /// is allowed (PostgreSQL shadows the older one).
-    pub fn savepoint(&mut self, name: &str, wal_mark: usize) -> Result<(), SqlError> {
+    pub fn savepoint(
+        &mut self,
+        name: &str,
+        wal_mark: usize,
+        lock_mark: u64,
+    ) -> Result<(), SqlError> {
         let sp = Savepoint {
             name: {
                 let mut s = StackStr::new();
@@ -428,6 +453,7 @@ impl TxnState {
             ddl_mark: self.ddl.len(),
             statistics_mark: self.statistics_undo.len(),
             wal_mark,
+            lock_mark,
             notify_mark: self.pending_notifies.len(),
             notify_payload_mark: self.notify_payloads.mark(),
             listen_mark: self.pending_listen_ops.len(),
@@ -440,6 +466,19 @@ impl TxnState {
                 MAX_SAVEPOINTS
             )
         })
+    }
+
+    pub(crate) fn statement_mark(&self, wal: usize, lock: u64) -> StatementMark {
+        StatementMark {
+            touched: self.touched.len(),
+            ddl: self.ddl.len(),
+            statistics: self.statistics_undo.len(),
+            wal,
+            lock,
+            notifications: self.pending_notifies.len(),
+            notification_payload: self.notify_payloads.mark(),
+            listen_ops: self.pending_listen_ops.len(),
+        }
     }
 
     /// Index of the most recent savepoint with this name.

@@ -109,11 +109,10 @@ pub enum Stmt<'a> {
     ReleaseSavepoint(&'a str),
     /// ROLLBACK TO [SAVEPOINT] name.
     RollbackToSavepoint(&'a str),
-    /// LOCK [TABLE] relation [, ...] IN ACCESS SHARE MODE [NOWAIT].
-    /// ACCESS SHARE is the pg_dump consistency lock; stronger modes remain
-    /// loud until the wait/deadlock scheduler exists.
+    /// LOCK [TABLE] relation [, ...] [IN lockmode MODE] [NOWAIT].
     LockTable {
         tables: &'a [QualName<'a>],
+        mode: TableLockMode,
         nowait: bool,
     },
     DropTable(DropTable<'a>),
@@ -490,6 +489,19 @@ pub enum LockWait {
     NoWait,
     /// Omit the locked row from the result.
     SkipLocked,
+}
+
+/// PostgreSQL's table-level lock modes, weakest to strongest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableLockMode {
+    AccessShare,
+    RowShare,
+    RowExclusive,
+    ShareUpdateExclusive,
+    Share,
+    ShareRowExclusive,
+    Exclusive,
+    AccessExclusive,
 }
 
 /// A single `FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE } [OF t, …]

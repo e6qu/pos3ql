@@ -260,10 +260,16 @@ impl Server {
             // While a checkpoint sweep is mid-flight, poll with the backoff
             // timeout so the loop returns to that work; otherwise block until
             // the next event.
-            let timeout = if self.engine.checkpoint_work_pending() {
+            let checkpoint_timeout = if self.engine.checkpoint_work_pending() {
                 Some(beat_backoff)
             } else {
                 None
+            };
+            let timeout = match (checkpoint_timeout, self.next_lock_wait_timeout()) {
+                (Some(checkpoint), Some(lock)) => Some(checkpoint.min(lock)),
+                (Some(checkpoint), None) => Some(checkpoint),
+                (None, Some(lock)) => Some(lock),
+                (None, None) => None,
             };
             let n = self.reactor.poll(timeout)?;
             for i in 0..n {
@@ -281,6 +287,9 @@ impl Server {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
             }
+            // A lock timeout can be the event that woke the reactor, with no
+            // socket readiness and no lock-generation change.
+            self.wake_lock_waiters();
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
@@ -423,6 +432,46 @@ impl Server {
         // in the engine outbox; fan them out to every listening connection.
         if self.engine.has_notifications() {
             self.deliver_notifications();
+        }
+    }
+
+    fn next_lock_wait_timeout(&self) -> Option<Duration> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.conn.lock_wait_remaining())
+            .min()
+    }
+
+    /// Retries parked protocol messages after a transaction released row
+    /// locks. Each connection retains its frontend message and simple-query
+    /// statement index, so wakeup neither reparses client state nor replays
+    /// completed commands.
+    fn wake_lock_waiters(&mut self) {
+        // A retry can itself abort a deadlock victim and release locks. Loop
+        // until one complete pass observes a stable generation so every newly
+        // unblocked connection is considered in the same reactor turn.
+        for _ in 0..=self.slots.len() {
+            let generation = self.engine.lock_generation();
+            for index in 0..self.slots.len() {
+                if !self.slots[index].conn.is_open() {
+                    continue;
+                }
+                match self.slots[index]
+                    .conn
+                    .retry_parked(&mut self.engine, generation)
+                {
+                    After::Continue => self.sync_write_interest(index),
+                    After::Close => {
+                        let slot = &mut self.slots[index];
+                        self.engine
+                            .rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
+                        self.release(index);
+                    }
+                }
+            }
+            if self.engine.lock_generation() == generation {
+                break;
+            }
         }
     }
 

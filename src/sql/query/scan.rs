@@ -228,6 +228,9 @@ fn indexed_candidates<'a>(
 pub struct JoinRow<'s, 'v, 'd> {
     pub scope: &'s QueryScope<'d>,
     pub values: [Option<&'s [Datum<'v>]>; MAX_JOIN_TABLES],
+    /// Stable MVCC identities for physical base-table contributors. Derived
+    /// rows, function rows, and outer-join null sides carry `None`.
+    pub rowids: &'s [Option<u64>],
 }
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
@@ -513,6 +516,17 @@ fn scan_source_mode<'a>(
     recycle_rows: bool,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    for table in 0..scope.n {
+        if scope.derived[table].is_none() {
+            storage.lock_table(
+                txid,
+                scope.slots[table],
+                crate::sql::ast::TableLockMode::AccessShare,
+                false,
+            )?;
+            storage.record_serializable_read(txid, scope.slots[table]);
+        }
+    }
     fn recycled<R>(arena: &Arena, enabled: bool, operation: impl FnOnce() -> R) -> R {
         let mark = enabled.then(|| arena.mark());
         let result = operation();
@@ -545,6 +559,7 @@ fn scan_source_mode<'a>(
     fn assemble<'s, 'v, 'd>(
         scope: &'s QueryScope<'d>,
         bound: &[Option<&'v [u8]>],
+        bound_rowids: &'s [Option<u64>],
         order: &[usize],
         count: usize,
         buffers: &'s mut [[Datum<'v>; MAX_COLUMNS]],
@@ -578,13 +593,18 @@ fn scan_source_mode<'a>(
                 None => values[t] = Some(&[]), // outer-join null row
             }
         }
-        Ok(JoinRow { scope, values })
+        Ok(JoinRow {
+            scope,
+            values,
+            rowids: &bound_rowids[..scope.n],
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn candidate_passes<'a>(
         scope: &QueryScope<'a>,
         bound: &[Option<&'a [u8]>],
+        bound_rowids: &[Option<u64>],
         order: &[usize],
         count: usize,
         on: Option<&Expr<'a>>,
@@ -596,7 +616,15 @@ fn scan_source_mode<'a>(
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<bool, SqlError> {
         if let Some(on) = on {
-            let row = assemble(scope, bound, order, count, decode_buffers, arena)?;
+            let row = assemble(
+                scope,
+                bound,
+                bound_rowids,
+                order,
+                count,
+                decode_buffers,
+                arena,
+            )?;
             let chained_row = Chained { inner: &row, outer };
             match eval_full(on, arena, params, &chained_row, hooks)? {
                 Datum::Bool(true) => {}
@@ -612,7 +640,15 @@ fn scan_source_mode<'a>(
         if pushdown.is_empty() {
             return Ok(true);
         }
-        let row = assemble(scope, bound, order, count, decode_buffers, arena)?;
+        let row = assemble(
+            scope,
+            bound,
+            bound_rowids,
+            order,
+            count,
+            decode_buffers,
+            arena,
+        )?;
         let chained_row = Chained { inner: &row, outer };
         for &conjunct in pushdown {
             if !conjunct_passes(conjunct, arena, params, &chained_row, hooks)? {
@@ -637,6 +673,7 @@ fn scan_source_mode<'a>(
         outer: Option<&dyn ColumnLookup<'a>>,
         depth: usize,
         bound: &mut [Option<&'a [u8]>],
+        bound_rowids: &mut [Option<u64>],
         // For each RIGHT/FULL join level, one flag per scanned row of that
         // level's table, marking those that found a left partner.
         matched: &[Option<&[core::cell::Cell<bool>]>],
@@ -651,7 +688,15 @@ fn scan_source_mode<'a>(
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
-            let row = assemble(scope, bound, order, depth, decode_buffers, arena)?;
+            let row = assemble(
+                scope,
+                bound,
+                bound_rowids,
+                order,
+                depth,
+                decode_buffers,
+                arena,
+            )?;
             if let Some(w) = where_clause {
                 let chained_row = Chained { inner: &row, outer };
                 if !where_passes(w, arena, params, &chained_row, hooks)? {
@@ -679,7 +724,15 @@ fn scan_source_mode<'a>(
             } else {
                 &from.joins[t - 1].table
             };
-            let outer_row = assemble(scope, bound, order, depth, decode_buffers, arena)?;
+            let outer_row = assemble(
+                scope,
+                bound,
+                bound_rowids,
+                order,
+                depth,
+                decode_buffers,
+                arena,
+            )?;
             let chained = Chained {
                 inner: &outer_row,
                 outer,
@@ -689,8 +742,9 @@ fn scan_source_mode<'a>(
                 check_timeout()?;
                 let keep_scanning = recycled(arena, recycle_rows, || {
                     bound[order[depth]] = Some(bytes);
+                    bound_rowids[order[depth]] = None;
                     if !candidate_passes(
-                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
                         decode_buffers, arena, params, hooks, outer,
                     )? {
                         return Ok(true);
@@ -701,7 +755,7 @@ fn scan_source_mode<'a>(
                     }
                     level(
                         storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
                         decode_buffers, recycle_rows, f,
                     )
                 })?;
@@ -727,8 +781,9 @@ fn scan_source_mode<'a>(
                         // statement storage only for the callback's lifetime.
                         let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
                         bound[order[depth]] = Some(owned);
+                        bound_rowids[order[depth]] = None;
                         if !candidate_passes(
-                            scope, bound, order, depth + 1, on, pushdown[depth],
+                            scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
                             decode_buffers, arena, params, hooks, outer,
                         )? {
                             return Ok(true);
@@ -739,7 +794,7 @@ fn scan_source_mode<'a>(
                         }
                         level(
                             storage, scope, from, txid, where_clause, arena, params, hooks,
-                            outer, depth + 1, bound, matched, pushdown, order, indexed,
+                            outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
                             decode_buffers, recycle_rows, f,
                         )
                     })
@@ -756,8 +811,9 @@ fn scan_source_mode<'a>(
                 check_timeout()?;
                 let keep_scanning = recycled(arena, recycle_rows, || {
                     bound[order[depth]] = Some(bytes);
+                    bound_rowids[order[depth]] = None;
                     if !candidate_passes(
-                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
                         decode_buffers, arena, params, hooks, outer,
                     )? {
                         return Ok(true);
@@ -768,7 +824,7 @@ fn scan_source_mode<'a>(
                     }
                     level(
                         storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
                         decode_buffers, recycle_rows, f,
                     )
                 })?;
@@ -832,8 +888,9 @@ fn scan_source_mode<'a>(
                 let keep_scanning = recycled(arena, recycle_rows, || {
                     bound[order[depth]] =
                         Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
+                    bound_rowids[order[depth]] = Some(rowid);
                     if !candidate_passes(
-                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
                         decode_buffers, arena, params, hooks, outer,
                     )? {
                         return Ok(true);
@@ -844,7 +901,7 @@ fn scan_source_mode<'a>(
                     }
                     level(
                         storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
                         decode_buffers, recycle_rows, f,
                     )
                 })?;
@@ -866,8 +923,9 @@ fn scan_source_mode<'a>(
                 index += 1;
                 let keep_scanning = recycled(arena, recycle_rows, || {
                     bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
+                    bound_rowids[order[depth]] = Some(rowid);
                     if !candidate_passes(
-                        scope, bound, order, depth + 1, on, pushdown[depth],
+                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
                         decode_buffers, arena, params, hooks, outer,
                     )? {
                         return Ok(true);
@@ -878,7 +936,7 @@ fn scan_source_mode<'a>(
                     }
                     level(
                         storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, matched, pushdown, order, indexed,
+                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
                         decode_buffers, recycle_rows, f,
                     )
                 })?;
@@ -896,6 +954,7 @@ fn scan_source_mode<'a>(
         // left side preserved, this table nulled).
         if !matched_any && join.is_some_and(|j| matches!(j.kind, JoinKind::Left | JoinKind::Full)) {
             bound[order[depth]] = None;
+            bound_rowids[order[depth]] = None;
             if !level(
                 storage,
                 scope,
@@ -908,6 +967,7 @@ fn scan_source_mode<'a>(
                 outer,
                 depth + 1,
                 bound,
+                bound_rowids,
                 matched,
                 pushdown,
                 order,
@@ -920,6 +980,7 @@ fn scan_source_mode<'a>(
             }
         }
         bound[order[depth]] = None;
+        bound_rowids[order[depth]] = None;
         Ok(true)
     }
 
@@ -1037,6 +1098,9 @@ fn scan_source_mode<'a>(
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
+    let bound_rowids = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
@@ -1052,6 +1116,7 @@ fn scan_source_mode<'a>(
         outer,
         0,
         bound,
+        bound_rowids,
         matched,
         pushdown,
         order,
@@ -1068,13 +1133,24 @@ fn scan_source_mode<'a>(
     for d in 1..scope.n {
         let Some(m) = matched[d] else { continue };
         let mut emit_unmatched = |bytes: &'a [u8],
+                                  rowid: Option<u64>,
                               f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
          -> Result<bool, SqlError> {
             bound.fill(None);
+            bound_rowids.fill(None);
             bound[d] = Some(bytes);
+            bound_rowids[d] = rowid;
             if d + 1 == scope.n {
                 // Last level: the row is complete once the left side nulls.
-                let row = assemble(scope, bound, order, scope.n, decode_buffers, arena)?;
+                let row = assemble(
+                    scope,
+                    bound,
+                    bound_rowids,
+                    order,
+                    scope.n,
+                    decode_buffers,
+                    arena,
+                )?;
                 if let Some(w) = where_clause {
                     let chained_row = Chained { inner: &row, outer };
                     if !where_passes(w, arena, params, &chained_row, hooks)? {
@@ -1095,6 +1171,7 @@ fn scan_source_mode<'a>(
                 outer,
                 d + 1,
                 bound,
+                bound_rowids,
                 matched,
                 pushdown,
                 order,
@@ -1120,7 +1197,7 @@ fn scan_source_mode<'a>(
                             Ok(true)
                         } else {
                             let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                            emit_unmatched(owned, f)
+                            emit_unmatched(owned, None, f)
                         }
                     })
                 }?;
@@ -1134,7 +1211,11 @@ fn scan_source_mode<'a>(
         } else if let Some(rows) = scope.derived[d] {
             for (index, bytes) in rows.iter().enumerate() {
                 let keep_scanning = recycled(arena, recycle_rows, || {
-                    if m[index].get() { Ok(true) } else { emit_unmatched(bytes, f) }
+                    if m[index].get() {
+                        Ok(true)
+                    } else {
+                        emit_unmatched(bytes, None, f)
+                    }
                 })?;
                 if !keep_scanning {
                     return Ok(());
@@ -1156,7 +1237,7 @@ fn scan_source_mode<'a>(
                         Ok(true)
                     } else {
                         let bytes = storage.row_bytes(scope.slots[d], rowid, home, arena)?;
-                        emit_unmatched(bytes, f)
+                        emit_unmatched(bytes, Some(rowid), f)
                     }
                 })?;
                 if !keep_scanning {

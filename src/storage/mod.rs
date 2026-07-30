@@ -1890,6 +1890,26 @@ pub enum ResolvedRelation {
     Catalog,
 }
 
+#[derive(Clone, Copy)]
+struct TableLock {
+    owner: u32,
+    table: u32,
+    /// Acquisition sequence for each table-lock mode. PostgreSQL permits a
+    /// transaction to hold multiple incomparable modes on one relation.
+    modes: [u64; 8],
+}
+
+impl TableLock {
+    fn mask(&self) -> u8 {
+        self.modes
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (index, sequence)| {
+                mask | u8::from(*sequence != 0) << index
+            })
+    }
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -1923,10 +1943,21 @@ pub struct Storage {
     /// Repeatable-read snapshots held by live connections. This registry is
     /// startup-sized to max_connections and drives version/WAL/SST retention.
     active_snapshots: FixedVec<(u32, u64)>,
-    /// ACCESS SHARE table locks held until transaction end. The current
-    /// execution core fails conflicting DDL fast instead of parking it, but
-    /// the lock is real and cross-connection rather than accepted-and-ignored.
-    table_locks: FixedVec<(u32, u32)>,
+    /// PostgreSQL relation locks. Each mode is tracked independently because
+    /// SHARE and SHARE UPDATE EXCLUSIVE are incomparable, and savepoint
+    /// rollback releases only modes acquired by the rolled-back
+    /// subtransaction.
+    table_locks: std::cell::RefCell<FixedVec<TableLock>>,
+    /// PostgreSQL row locks and their wait-for graph. The registry is sized at
+    /// startup from the per-transaction row bound and connection count.
+    row_locks: std::cell::RefCell<crate::sql::lock::LockManager>,
+    /// Shared acquisition clock for table and row locks. It lets a savepoint
+    /// restore both registries to one exact transaction boundary.
+    lock_sequence: Cell<u64>,
+    /// Table generations captured at a SERIALIZABLE transaction's first
+    /// snapshot. Scans mark entries read; a read-write transaction validates
+    /// them before WAL publication to reject phantoms and write skew.
+    serializable_snapshots: std::cell::RefCell<FixedVec<(u32, u32, u64, bool)>>,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
     /// The read path for spilled rows: the tiered block stack shared with the
@@ -2251,7 +2282,16 @@ impl Storage {
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<(u32, u64)>()
-            + config.max_connections as usize * config.max_tables * size_of::<(u32, u32)>()
+            + config.max_connections as usize
+                * config.max_tables
+                * size_of::<TableLock>()
+            + crate::sql::lock::LockManager::budget_bytes(
+                config.max_connections as usize * config.txn_rows,
+                config.max_connections as usize,
+            )
+            + config.max_connections as usize
+                * config.max_tables
+                * size_of::<(u32, u32, u64, bool)>()
             + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
     }
 
@@ -2428,11 +2468,21 @@ impl Storage {
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
         let active_snapshots =
             FixedVec::new(budget, "active_snapshots", config.max_connections as usize)?;
-        let table_locks = FixedVec::new(
+        let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
             "table_locks",
             config.max_connections as usize * config.max_tables,
-        )?;
+        )?);
+        let row_locks = std::cell::RefCell::new(crate::sql::lock::LockManager::new(
+            budget,
+            config.max_connections as usize * config.txn_rows,
+            config.max_connections as usize,
+        )?);
+        let serializable_snapshots = std::cell::RefCell::new(FixedVec::new(
+            budget,
+            "serializable_snapshots",
+            config.max_connections as usize * config.max_tables,
+        )?);
         Ok(Self {
             heap,
             tables,
@@ -2454,6 +2504,9 @@ impl Storage {
             commit_snapshot: u64::MAX,
             active_snapshots,
             table_locks,
+            row_locks,
+            lock_sequence: Cell::new(0),
+            serializable_snapshots,
             next_rowid: 1,
             lsn: 0,
             spill: None,
@@ -2704,13 +2757,18 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if self.schemas.iter().any(|n| {
-            n.name.as_str() == name.as_str() && matches!(n.pending, Some(p) if p.txid != txid)
+        if let Some(owner) = self.schemas.iter().find_map(|schema| {
+            (schema.name.as_str() == name.as_str())
+                .then_some(schema.pending)
+                .flatten()
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
+            self.row_locks.borrow_mut().wait_for(txid, owner)?;
             return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access due to concurrent DDL on schema \"{}\"",
-                name.as_str()
+                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on schema \"{}\"",
+                name.as_str(),
             ));
         }
         self.alloc_schema(
@@ -4323,8 +4381,8 @@ impl Storage {
 
     /// Records an uncommitted change to a row. Returns whether this is the
     /// transaction's first touch of the row (the caller then remembers it
-    /// for commit/rollback). Fails fast when another transaction holds an
-    /// uncommitted change (SQLSTATE 40001).
+    /// for commit/rollback). A conflicting transaction becomes a wait-graph
+    /// edge; the protocol parks and retries after the owner ends.
     pub fn write_pending(
         &mut self,
         table_index: usize,
@@ -4333,25 +4391,30 @@ impl Storage {
         cid: u32,
         loc: Option<RowLoc>,
     ) -> Result<Option<Option<RowLoc>>, SqlError> {
-        if self.tables[table_index]
+        if let Some(owner) = self.tables[table_index]
             .pending_def_txid
-            .is_some_and(|owner| owner != txid)
+            .filter(|owner| *owner != txid)
         {
+            self.row_locks.borrow_mut().wait_for(txid, owner)?;
             return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access due to concurrent table definition change"
+                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for a concurrent table definition change"
             ));
         }
         let oldest_snapshot = self.oldest_snapshot();
+        let conflicting_owner = self.tables[table_index]
+            .rows
+            .get(&rowid)
+            .and_then(|state| state.locked_by_other(txid));
+        if let Some(owner) = conflicting_owner {
+            self.row_locks.borrow_mut().wait_for(txid, owner)?;
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for a concurrent row update"
+            ));
+        }
         let table = &mut self.tables[table_index];
         if let Some(state) = table.rows.get_mut(&rowid) {
-            if let Some(other) = state.locked_by_other(txid) {
-                let _ = other;
-                return Err(sql_err!(
-                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                    "could not serialize access due to concurrent update"
-                ));
-            }
             if let Some(last) = state.pending.last_mut()
                 && last.cid == cid
             {
@@ -5330,10 +5393,10 @@ impl Storage {
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
         if let Some(other) = self.tables[index].ddl_locked_by_other(txid) {
-            let _ = other;
+            self.row_locks.borrow_mut().wait_for(txid, other)?;
             return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access due to concurrent DDL on \"{}\"",
+                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on \"{}\"",
                 self.tables[index].def.name.as_str()
             ));
         }
@@ -5585,7 +5648,7 @@ impl Storage {
 
     /// Transactional create: the table exists only for `txid` until commit.
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
-    /// another transaction's uncommitted DDL is a conflict (40001).
+    /// another transaction's uncommitted DDL joins the shared wait graph.
     pub fn create_table_in(&mut self, def: TableDef, txid: u32) -> Result<usize, SqlError> {
         if self
             .find_visible(def.schema.as_str(), def.name.as_str(), txid)
@@ -5600,10 +5663,10 @@ impl Storage {
         if let Some(other) =
             self.ddl_name_locked_by_other(def.schema.as_str(), def.name.as_str(), txid)
         {
-            let _ = other;
+            self.row_locks.borrow_mut().wait_for(txid, other)?;
             return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access due to concurrent DDL on \"{}\"",
+                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on \"{}\"",
                 def.name.as_str()
             ));
         }
@@ -5787,16 +5850,13 @@ impl Storage {
         populated: bool,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self.matviews.iter().any(|m| {
-            m.schema.as_str() == schema.as_str()
-                && m.name.as_str() == name.as_str()
-                && matches!(m.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.matviews.iter().find_map(|m| {
+            (m.schema.as_str() == schema.as_str() && m.name.as_str() == name.as_str())
+                .then_some(m.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .matviews
@@ -5833,16 +5893,13 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if self.matviews.iter().any(|m| {
-            m.schema.as_str() == schema
-                && m.name.as_str() == name
-                && matches!(m.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.matviews.iter().find_map(|m| {
+            (m.schema.as_str() == schema && m.name.as_str() == name)
+                .then_some(m.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.matviews.iter().position(|m| {
             m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
@@ -5987,16 +6044,13 @@ impl Storage {
         generator_for: Option<SequenceOwner>,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self.sequences.iter().any(|s| {
-            s.schema.as_str() == schema.as_str()
-                && s.name.as_str() == name.as_str()
-                && matches!(s.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.sequences.iter().find_map(|s| {
+            (s.schema.as_str() == schema.as_str() && s.name.as_str() == name.as_str())
+                .then_some(s.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .sequences
@@ -6068,16 +6122,13 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if self.sequences.iter().any(|s| {
-            s.schema.as_str() == schema
-                && s.name.as_str() == name
-                && matches!(s.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.sequences.iter().find_map(|s| {
+            (s.schema.as_str() == schema && s.name.as_str() == name)
+                .then_some(s.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.sequences.iter().position(|s| {
             s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name
@@ -6265,16 +6316,13 @@ impl Storage {
         spec: DomainSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self.domains.iter().any(|d| {
-            d.schema.as_str() == schema.as_str()
-                && d.name.as_str() == name.as_str()
-                && matches!(d.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.domains.iter().find_map(|d| {
+            (d.schema.as_str() == schema.as_str() && d.name.as_str() == name.as_str())
+                .then_some(d.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .domains
@@ -6362,16 +6410,13 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if self.domains.iter().any(|d| {
-            d.schema.as_str() == schema
-                && d.name.as_str() == name
-                && matches!(d.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.domains.iter().find_map(|d| {
+            (d.schema.as_str() == schema && d.name.as_str() == name)
+                .then_some(d.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.domains.iter().position(|d| {
             d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
@@ -6540,16 +6585,13 @@ impl Storage {
         spec: EnumSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self.enums.iter().any(|e| {
-            e.schema.as_str() == schema.as_str()
-                && e.name.as_str() == name.as_str()
-                && matches!(e.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.enums.iter().find_map(|e| {
+            (e.schema.as_str() == schema.as_str() && e.name.as_str() == name.as_str())
+                .then_some(e.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .enums
@@ -6651,16 +6693,13 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if self.enums.iter().any(|e| {
-            e.schema.as_str() == schema
-                && e.name.as_str() == name
-                && matches!(e.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.enums.iter().find_map(|e| {
+            (e.schema.as_str() == schema && e.name.as_str() == name)
+                .then_some(e.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.enums.iter().position(|e| {
             e.visible_to(txid) && e.schema.as_str() == schema && e.name.as_str() == name
@@ -6730,18 +6769,13 @@ impl Storage {
                 name.as_str()
             ));
         }
-        // Another transaction's uncommitted CREATE/DROP holds the name; a
-        // fail-fast conflict replaces PostgreSQL's lock wait.
-        if self.views.iter().any(|v| {
-            v.schema.as_str() == schema.as_str()
-                && v.name.as_str() == name.as_str()
-                && matches!(v.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.views.iter().find_map(|v| {
+            (v.schema.as_str() == schema.as_str() && v.name.as_str() == name.as_str())
+                .then_some(v.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let existing = self.views.iter().position(|v| {
             v.visible_to(txid)
@@ -6795,16 +6829,13 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if self.views.iter().any(|v| {
-            v.schema.as_str() == schema
-                && v.name.as_str() == name
-                && matches!(v.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.views.iter().find_map(|v| {
+            (v.schema.as_str() == schema && v.name.as_str() == name)
+                .then_some(v.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.views.iter().position(|v| {
             v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
@@ -6898,16 +6929,14 @@ impl Storage {
     /// transaction; returns its slot. Errors on a duplicate visible name or
     /// another transaction's uncommitted DDL on the name.
     pub fn create_index(&mut self, def: IndexDef, txid: u32) -> Result<usize, SqlError> {
-        if self.indexes.iter().any(|x| {
-            x.schema.as_str() == def.schema.as_str()
-                && x.name.as_str() == def.name.as_str()
-                && matches!(x.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.indexes.iter().find_map(|index| {
+            (index.schema.as_str() == def.schema.as_str()
+                && index.name.as_str() == def.name.as_str())
+            .then_some(index.pending?)
+            .filter(|pending| pending.txid != txid)
+            .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                def.name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, def.name.as_str()));
         }
         if self.index_exists(def.schema.as_str(), def.name.as_str(), txid) {
             return Err(sql_err!(
@@ -6989,16 +7018,13 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if self.indexes.iter().any(|x| {
-            x.schema.as_str() == schema
-                && x.name.as_str() == name
-                && matches!(x.pending, Some(p) if p.txid != txid)
+        if let Some(blocker) = self.indexes.iter().find_map(|index| {
+            (index.schema.as_str() == schema && index.name.as_str() == name)
+                .then_some(index.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
         }) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize access: uncommitted DDL on \"{}\" by another transaction",
-                name
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.indexes.iter().position(|x| {
             x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name
@@ -7329,28 +7355,275 @@ impl Storage {
         !self.active_snapshots.is_empty()
     }
 
-    pub fn lock_table_access_share(&mut self, txid: u32, table: usize) -> Result<(), SqlError> {
-        if self
-            .table_locks
+    pub fn lock_table(
+        &self,
+        txid: u32,
+        table: usize,
+        mode: crate::sql::ast::TableLockMode,
+        nowait: bool,
+    ) -> Result<(), SqlError> {
+        use crate::sql::ast::TableLockMode;
+
+        fn mode_bit(mode: TableLockMode) -> u8 {
+            1 << mode as u8
+        }
+
+        fn modes_conflict(left: u8, right: u8) -> bool {
+            for left_index in 0..8 {
+                if left & (1 << left_index) == 0 {
+                    continue;
+                }
+                for right_index in 0..8 {
+                    if right & (1 << right_index) != 0
+                        && mode_conflicts(left_index, right_index)
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        fn mode_conflicts(left: u8, right: u8) -> bool {
+            use TableLockMode::*;
+            let left = match left {
+                0 => AccessShare,
+                1 => RowShare,
+                2 => RowExclusive,
+                3 => ShareUpdateExclusive,
+                4 => Share,
+                5 => ShareRowExclusive,
+                6 => Exclusive,
+                _ => AccessExclusive,
+            };
+            let right = match right {
+                0 => AccessShare,
+                1 => RowShare,
+                2 => RowExclusive,
+                3 => ShareUpdateExclusive,
+                4 => Share,
+                5 => ShareRowExclusive,
+                6 => Exclusive,
+                _ => AccessExclusive,
+            };
+            matches!(
+                (left, right),
+                (AccessShare, AccessExclusive)
+                    | (RowShare, Exclusive | AccessExclusive)
+                    | (
+                        RowExclusive,
+                        Share | ShareRowExclusive | Exclusive | AccessExclusive
+                    )
+                    | (
+                        ShareUpdateExclusive,
+                        ShareUpdateExclusive
+                            | Share
+                            | ShareRowExclusive
+                            | Exclusive
+                            | AccessExclusive
+                    )
+                    | (
+                        Share,
+                        RowExclusive
+                            | ShareUpdateExclusive
+                            | ShareRowExclusive
+                            | Exclusive
+                            | AccessExclusive
+                    )
+                    | (
+                        ShareRowExclusive,
+                        RowExclusive
+                            | ShareUpdateExclusive
+                            | Share
+                            | ShareRowExclusive
+                            | Exclusive
+                            | AccessExclusive
+                    )
+                    | (
+                        Exclusive,
+                        RowShare
+                            | RowExclusive
+                            | ShareUpdateExclusive
+                            | Share
+                            | ShareRowExclusive
+                            | Exclusive
+                            | AccessExclusive
+                    )
+                    | (AccessExclusive, _)
+            ) || matches!(right, AccessExclusive)
+        }
+
+        let mut table_locks = self.table_locks.borrow_mut();
+        let requested = mode_bit(mode);
+        let own_index = table_locks
             .iter()
-            .any(|(owner, slot)| *owner == txid && *slot == table as u32)
-        {
+            .position(|lock| lock.owner == txid && lock.table == table as u32);
+        if own_index.is_some_and(|index| table_locks[index].mask() & requested != 0) {
             return Ok(());
         }
-        self.table_locks.push((txid, table as u32)).map_err(|_| {
+        let combined = own_index
+            .map(|index| table_locks[index].mask() | requested)
+            .unwrap_or(requested);
+        if let Some(blocker) = table_locks.iter().find(|lock| {
+            lock.owner != txid
+                && lock.table == table as u32
+                && modes_conflict(combined, lock.mask())
+        }) {
+            if nowait {
+                return Err(sql_err!(
+                    sqlstate::LOCK_NOT_AVAILABLE,
+                    "could not obtain lock on relation"
+                ));
+            }
+            self.row_locks
+                .borrow_mut()
+                .wait_for(txid, blocker.owner)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for a relation lock"
+            ));
+        }
+        let sequence = self.next_lock_sequence();
+        if let Some(index) = own_index {
+            table_locks[index].modes[mode as usize] = sequence;
+            return Ok(());
+        }
+        let mut modes = [0; 8];
+        modes[mode as usize] = sequence;
+        table_locks.push(TableLock {
+            owner: txid,
+            table: table as u32,
+            modes,
+        }).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "table-lock registry is full ({} locks)",
-                self.table_locks.capacity()
+                table_locks.capacity()
             )
         })
     }
 
-    pub fn release_table_locks(&mut self, txid: u32) {
+    fn next_lock_sequence(&self) -> u64 {
+        let next = self.lock_sequence.get().wrapping_add(1).max(1);
+        self.lock_sequence.set(next);
+        next
+    }
+
+    pub(crate) fn lock_mark(&self) -> u64 {
+        self.lock_sequence.get()
+    }
+
+    pub(crate) fn rollback_locks_to(&self, txid: u32, mark: u64) {
+        let mut table_locks = self.table_locks.borrow_mut();
+        let mut table_changed = false;
         let mut index = 0usize;
-        while index < self.table_locks.len() {
-            if self.table_locks[index].0 == txid {
-                self.table_locks.swap_remove(index);
+        while index < table_locks.len() {
+            if table_locks[index].owner != txid {
+                index += 1;
+                continue;
+            }
+            for acquired_at in &mut table_locks[index].modes {
+                if *acquired_at > mark {
+                    *acquired_at = 0;
+                    table_changed = true;
+                }
+            }
+            if table_locks[index].mask() == 0 {
+                table_locks.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        drop(table_locks);
+        let mut row_locks = self.row_locks.borrow_mut();
+        row_locks.rollback_to(txid, mark);
+        if table_changed {
+            row_locks.resource_released(txid);
+        }
+    }
+
+    pub fn release_table_locks(&self, txid: u32) {
+        let mut table_locks = self.table_locks.borrow_mut();
+        let mut index = 0usize;
+        while index < table_locks.len() {
+            if table_locks[index].owner == txid {
+                table_locks.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    pub(crate) fn acquire_row_lock(
+        &self,
+        table: usize,
+        rowid: u64,
+        txid: u32,
+        strength: crate::sql::ast::LockStrength,
+        wait: crate::sql::ast::LockWait,
+    ) -> Result<crate::sql::lock::LockDecision, SqlError> {
+        let sequence = self.next_lock_sequence();
+        self.row_locks
+            .borrow_mut()
+            .acquire(table, rowid, txid, strength, wait, sequence)
+    }
+
+    pub(crate) fn release_row_locks(&self, txid: u32) {
+        self.row_locks.borrow_mut().release(txid);
+    }
+
+    pub(crate) fn lock_generation(&self) -> u64 {
+        self.row_locks.borrow().generation()
+    }
+
+    pub(crate) fn begin_serializable(&self, txid: u32) -> Result<(), SqlError> {
+        let mut snapshots = self.serializable_snapshots.borrow_mut();
+        if snapshots.iter().any(|entry| entry.0 == txid) {
+            return Ok(());
+        }
+        for (table, definition) in self.tables.iter().enumerate() {
+            snapshots
+                .push((txid, table as u32, definition.generation, false))
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "serializable snapshot registry is full ({} table snapshots)",
+                        snapshots.capacity()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_serializable_read(&self, txid: u32, table: usize) {
+        if let Some(entry) = self
+            .serializable_snapshots
+            .borrow_mut()
+            .iter_mut()
+            .find(|entry| entry.0 == txid && entry.1 == table as u32)
+        {
+            entry.3 = true;
+        }
+    }
+
+    pub(crate) fn validate_serializable(&self, txid: u32) -> Result<(), SqlError> {
+        for &(owner, table, generation, read) in self.serializable_snapshots.borrow().iter() {
+            if owner == txid && read && self.tables[table as usize].generation != generation {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "could not serialize access due to read/write dependencies among transactions"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_serializable(&self, txid: u32) {
+        let mut snapshots = self.serializable_snapshots.borrow_mut();
+        let mut index = 0usize;
+        while index < snapshots.len() {
+            if snapshots[index].0 == txid {
+                snapshots.swap_remove(index);
             } else {
                 index += 1;
             }
@@ -7358,7 +7631,35 @@ impl Storage {
     }
 
     pub fn has_access_share_locks(&self) -> bool {
-        !self.table_locks.is_empty()
+        !self.table_locks.borrow().is_empty()
+    }
+
+    pub(crate) fn schema_lock_blocker(&self, txid: u32) -> Option<u32> {
+        let table_locks = self.table_locks.borrow();
+        self.active_snapshots
+            .iter()
+            .map(|(owner, _)| *owner)
+            .chain(table_locks.iter().map(|lock| lock.owner))
+            .find(|owner| *owner != txid)
+    }
+
+    pub(crate) fn wait_for_transaction(
+        &self,
+        waiter: u32,
+        blocker: u32,
+    ) -> Result<(), SqlError> {
+        self.row_locks.borrow_mut().wait_for(waiter, blocker)
+    }
+
+    fn catalog_ddl_wait_error(&self, waiter: u32, blocker: u32, name: &str) -> SqlError {
+        match self.wait_for_transaction(waiter, blocker) {
+            Err(error) => error,
+            Ok(()) => sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on \"{}\"",
+                name
+            ),
+        }
     }
 
     /// Lowers reads to a command snapshot (a data-modifying `WITH` statement) or
@@ -7432,8 +7733,10 @@ mod tests {
     fn test_config() -> Config {
         let mut c = Config::default_dev();
         c.memtable_bytes = 1 << 16;
+        c.max_connections = 2;
         c.max_tables = 4;
         c.table_rows = 128;
+        c.txn_rows = 128;
         c.value_index_rows = 512;
         c.max_value_indexes = 8;
         c

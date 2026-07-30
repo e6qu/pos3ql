@@ -12,8 +12,10 @@ fn test_config(name: &str) -> Config {
     let mut config = Config::default_dev();
     config.data_dir = dir.to_str().unwrap().to_string();
     config.memtable_bytes = 1 << 20;
+    config.max_connections = 8;
     config.max_tables = 8;
     config.table_rows = 1024;
+    config.txn_rows = 2048;
     config.value_index_rows = 2048;
     config.max_value_indexes = 8;
     config.wal_bytes = 1 << 20;
@@ -357,14 +359,16 @@ fn uncommitted_create_is_invisible_to_other_sessions() {
         other.contains("does not exist"),
         "other must not see it: {other}"
     );
-    // Nor can it create the same name concurrently.
+    // Creating the same name waits for the owner, then rechecks the catalog.
     let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE TABLE t (x int)");
     assert!(
-        conflict.contains("40001"),
-        "concurrent create conflicts: {conflict}"
+        conflict.is_empty(),
+        "concurrent create must park without output: {conflict}"
     );
     // After commit it becomes visible to everyone.
     run_txn(&mut e, &mut b, &mut a, "COMMIT");
+    let resumed = run_txn(&mut e, &mut b, &mut s, "CREATE TABLE t (x int)");
+    assert!(resumed.contains("42P07"), "{resumed}");
     let now = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
     assert!(now.contains("SELECT 1"), "visible after commit: {now}");
 }
@@ -379,12 +383,12 @@ fn uncommitted_drop_stays_visible_to_other_sessions() {
     run_txn(&mut e, &mut b, &mut a, "BEGIN");
     let dropped = run_txn(&mut e, &mut b, &mut a, "DROP TABLE t");
     assert!(dropped.contains("DROP TABLE"), "drop succeeds: {dropped}");
-    // Another session still sees the committed table and its rows (the
-    // drop is not visible until it commits).
+    // PostgreSQL keeps the old catalog image transactionally, but DROP's
+    // ACCESS EXCLUSIVE lock makes a concurrent reader wait rather than use it.
     let other = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
     assert!(
-        other.contains("SELECT 1") && other.contains('7'),
-        "other still sees it: {other}"
+        other.is_empty(),
+        "concurrent SELECT waits for DROP TABLE: {other}"
     );
     run_txn(&mut e, &mut b, &mut a, "COMMIT");
     let after = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM t");
@@ -488,22 +492,25 @@ fn transactional_alter_table_versions_shape_and_rows() {
         ["0"]
     );
 
-    let observer_rows = data_rows(&run_with_txn_bytes(
+    let observer_rows = run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT id, value FROM shaped",
+    );
+    assert!(
+        observer_rows.is_empty(),
+        "observer waits for ALTER TABLE's ACCESS EXCLUSIVE lock"
+    );
+
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    let resumed_rows = data_rows(&run_with_txn_bytes(
         &mut engine,
         &mut budget,
         &mut observer,
         "SELECT id, value FROM shaped",
     ));
-    assert_eq!(observer_rows, ["1|old"]);
-    let observer_shape = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut observer,
-        "SELECT generation FROM shaped",
-    );
-    assert!(observer_shape.contains("42703"), "{observer_shape}");
-
-    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    assert_eq!(resumed_rows, ["1|old"]);
     let rolled_back = run_txn(
         &mut engine,
         &mut budget,
@@ -638,15 +645,6 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
             &mut engine,
             &mut budget,
             &mut observer,
-            "SELECT id FROM original",
-        )),
-        ["1"]
-    );
-    assert_eq!(
-        data_rows(&run_with_txn_bytes(
-            &mut engine,
-            &mut budget,
-            &mut observer,
             "SELECT pg_get_constraintdef(c.oid, true)
                FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
               WHERE r.relname = 'child' AND c.contype = 'f'",
@@ -660,8 +658,25 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
         "SELECT * FROM renamed",
     );
     assert!(observer_new.contains("42P01"), "{observer_new}");
+    let observer_old = run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT id FROM original",
+    );
+    assert!(
+        observer_old.is_empty(),
+        "observer waits for ALTER TABLE RENAME's ACCESS EXCLUSIVE lock"
+    );
     let committed = run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
     assert!(committed.contains("COMMIT"), "{committed}");
+    let old_after_commit = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT id FROM original",
+    );
+    assert!(old_after_commit.contains("42P01"), "{old_after_commit}");
     let visible = run_with_txn_bytes(
         &mut engine,
         &mut budget,
@@ -718,11 +733,16 @@ fn uncommitted_create_view_is_invisible_to_other_sessions() {
     // Nor can it create the same name concurrently.
     let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE VIEW v AS SELECT id FROM t");
     assert!(
-        conflict.contains("40001"),
-        "concurrent create conflicts: {conflict}"
+        conflict.is_empty(),
+        "concurrent create waits without wire output: {conflict}"
     );
     // After commit it becomes visible to everyone.
     run_txn(&mut e, &mut b, &mut a, "COMMIT");
+    let duplicate = run_txn(&mut e, &mut b, &mut s, "CREATE VIEW v AS SELECT id FROM t");
+    assert!(
+        duplicate.contains("42P07"),
+        "the resumed create rechecks the committed catalog: {duplicate}"
+    );
     let now = run_txn(&mut e, &mut b, &mut s, "SELECT id FROM v");
     assert!(
         now.contains("SELECT 1") && now.contains('3'),
@@ -800,22 +820,32 @@ fn uncommitted_create_index_is_invisible_to_other_sessions() {
         "creator is bound by its own pending index: {own}"
     );
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
-    // ...but another session must not be bound by an uncommitted index.
+    // ...and CREATE INDEX's SHARE relation lock makes concurrent writers wait
+    // even though they cannot yet see the pending index definition.
     run_txn(&mut e, &mut b, &mut a, "BEGIN");
     run_txn(&mut e, &mut b, &mut a, "CREATE UNIQUE INDEX t_id ON t (id)");
     let other = run_txn(&mut e, &mut b, &mut s, "INSERT INTO t VALUES (1)");
     assert!(
-        other.contains("INSERT 0 1"),
-        "other unbound by pending index: {other}"
-    );
-    // Concurrent creation of the same index name conflicts.
-    let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
-    assert!(
-        conflict.contains("40001"),
-        "concurrent create conflicts: {conflict}"
+        other.is_empty(),
+        "writer waits for pending index transaction: {other}"
     );
     run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
-    // After rollback the name is free.
+    let resumed_insert = run_txn(&mut e, &mut b, &mut s, "INSERT INTO t VALUES (1)");
+    assert!(
+        resumed_insert.contains("INSERT 0 1"),
+        "rollback removes the invisible unique index before recheck: {resumed_insert}"
+    );
+
+    // Same-name catalog operations wait and recheck too.
+    run_txn(&mut e, &mut b, &mut a, "BEGIN");
+    run_txn(&mut e, &mut b, &mut a, "CREATE INDEX t_id ON t (id)");
+    let conflict = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
+    assert!(
+        conflict.is_empty(),
+        "concurrent create waits: {conflict}"
+    );
+    run_txn(&mut e, &mut b, &mut a, "ROLLBACK");
+    // After rollback the resumed statement sees that the name is free.
     let reuse = run_txn(&mut e, &mut b, &mut s, "CREATE INDEX t_id ON t (id)");
     assert!(
         reuse.contains("CREATE INDEX"),
@@ -918,6 +948,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
     // SET then SHOW within one message (GUC state is per session/message).
     assert!(run("SET extra_float_digits = 2; SHOW extra_float_digits").contains('2'));
     assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5000"));
+    assert!(run("SET lock_timeout = '50ms'; SHOW lock_timeout").contains("50ms"));
     assert!(run("SET row_security = off; SHOW row_security").contains("off"));
     assert!(run("SET intervalstyle = postgres; SHOW intervalstyle").contains("postgres"));
     assert!(run("SET synchronize_seqscans = off; SHOW synchronize_seqscans").contains("off"));
@@ -936,6 +967,10 @@ fn session_gucs_honored_or_rejected_faithfully() {
     // statement_timeout is now accepted (enforced at scan boundaries); a
     // malformed value is still rejected loudly.
     assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5000"));
+    assert!(
+        run("SET lock_timeout = 'bogus'").contains("22023"),
+        "bad lock timeout"
+    );
     assert!(
         run("SET statement_timeout = 'bogus'").contains("22023"),
         "bad timeout"
@@ -1005,9 +1040,8 @@ fn set_show_transaction_and_show_all() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
     let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
-    // Transaction-control SET forms that JDBC/tools send (one isolation
-    // level, as BEGIN provides — the clause is acknowledged).
-    assert!(run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").contains("0A000"));
+    // Transaction-control SET forms that JDBC/tools send.
+    assert!(run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").contains("SET"));
     assert!(
         run("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .contains("SET")
@@ -2558,23 +2592,30 @@ fn isolation_and_write_conflicts() {
     ));
     assert_eq!(rows, ["base"], "uncommitted changes must be invisible");
 
-    // Bob's write to Alice's row conflicts immediately.
+    // Bob's writer parks without output until Alice releases the row.
     let out = run_txn(
         &mut e,
         &mut b,
         &mut bob,
         "UPDATE t SET v = 'bob' WHERE id = 1",
     );
-    assert!(out.contains("40001"), "{out}");
+    assert!(out.is_empty(), "a waiting writer emits nothing: {out}");
 
     run_txn(&mut e, &mut b, &mut alice, "COMMIT");
+    let resumed = run_txn(
+        &mut e,
+        &mut b,
+        &mut bob,
+        "UPDATE t SET v = 'bob' WHERE id = 1",
+    );
+    assert!(resumed.contains("UPDATE 1"), "{resumed}");
     let rows = data_rows(&run_with_txn_bytes(
         &mut e,
         &mut b,
         &mut bob,
         "SELECT v FROM t ORDER BY id",
     ));
-    assert_eq!(rows, ["alice", "alice-new"]);
+    assert_eq!(rows, ["bob", "alice-new"]);
 }
 
 #[test]
@@ -6916,6 +6957,517 @@ fn for_update_locking_clause() {
 }
 
 #[test]
+fn row_lock_compatibility_nowait_skip_and_wait_resume() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE row_lock_test (id int primary key, value int)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "INSERT INTO row_lock_test VALUES (1, 10), (2, 20)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    let locked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT id FROM row_lock_test WHERE id = 1 FOR UPDATE",
+    );
+    assert!(locked.contains("SELECT 1"), "{locked}");
+
+    let nowait = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT id FROM row_lock_test FOR UPDATE NOWAIT",
+    );
+    assert!(nowait.contains("55P03"), "{nowait}");
+    let skipped = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT id FROM row_lock_test ORDER BY id FOR UPDATE SKIP LOCKED",
+    );
+    assert!(
+        skipped
+            .as_bytes()
+            .windows(5)
+            .any(|window| window == [0, 0, 0, 1, b'2']),
+        "{skipped}"
+    );
+    assert!(
+        !skipped
+            .as_bytes()
+            .windows(5)
+            .any(|window| window == [0, 0, 0, 1, b'1']),
+        "{skipped}"
+    );
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "lock wait send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "lock wait sql", 1 << 18).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut guc = GucState::new();
+    let mut cursors = test_cursors(&mut budget);
+    let sql = "UPDATE row_lock_test SET value = 11 WHERE id = 1";
+    let status = engine
+        .execute_simple(
+            sql,
+            &arena,
+            &mut waiter,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            2,
+        )
+        .unwrap();
+    assert_eq!(
+        status,
+        ExecutionStatus::Blocked {
+            completed_statements: 0,
+            output_mark: 0,
+        }
+    );
+    assert!(send.is_empty(), "a parked statement emits no wire output");
+
+    let timed_out = engine
+        .execute_simple_from(
+            sql,
+            0,
+            &arena,
+            &mut waiter,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            2,
+            true,
+        )
+        .unwrap();
+    assert_eq!(timed_out, ExecutionStatus::Complete);
+    let timeout_output = String::from_utf8_lossy(send.readable());
+    assert!(timeout_output.contains("55P03"), "{timeout_output}");
+    assert!(
+        timeout_output.contains("canceling statement due to lock timeout"),
+        "{timeout_output}"
+    );
+    send.clear();
+
+    let mut resume_waiter = TxnState::new(&mut budget, 256).unwrap();
+    let parked_again = engine
+        .execute_simple(
+            sql,
+            &arena,
+            &mut resume_waiter,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            3,
+        )
+        .unwrap();
+    assert!(matches!(parked_again, ExecutionStatus::Blocked { .. }));
+
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    let resumed = engine
+        .execute_simple_from(
+            sql,
+            0,
+            &arena,
+            &mut resume_waiter,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            3,
+            false,
+        )
+        .unwrap();
+    assert_eq!(resumed, ExecutionStatus::Complete);
+    assert!(String::from_utf8_lossy(send.readable()).contains("UPDATE 1"));
+}
+
+#[test]
+fn table_lock_modes_nowait_and_wait_match_postgresql_matrix() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE table_lock_test (id int)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "LOCK TABLE table_lock_test IN SHARE MODE",
+        )
+        .contains("LOCK TABLE")
+    );
+    run_txn(&mut engine, &mut budget, &mut waiter, "BEGIN");
+    let conflict = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "LOCK TABLE table_lock_test IN ROW EXCLUSIVE MODE NOWAIT",
+    );
+    assert!(conflict.contains("55P03"), "{conflict}");
+    run_txn(&mut engine, &mut budget, &mut waiter, "ROLLBACK");
+    run_txn(&mut engine, &mut budget, &mut waiter, "BEGIN");
+    let blocked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "LOCK TABLE table_lock_test IN ROW EXCLUSIVE MODE",
+    );
+    assert!(blocked.is_empty(), "parked LOCK emits nothing: {blocked}");
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    let resumed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "LOCK TABLE table_lock_test IN ROW EXCLUSIVE MODE",
+    );
+    assert!(resumed.contains("LOCK TABLE"), "{resumed}");
+    run_txn(&mut engine, &mut budget, &mut waiter, "ROLLBACK");
+
+    // The omitted mode is ACCESS EXCLUSIVE, and every spelling parses.
+    for mode in [
+        "ACCESS SHARE",
+        "ROW SHARE",
+        "ROW EXCLUSIVE",
+        "SHARE UPDATE EXCLUSIVE",
+        "SHARE",
+        "SHARE ROW EXCLUSIVE",
+        "EXCLUSIVE",
+        "ACCESS EXCLUSIVE",
+    ] {
+        run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+        let output = run_txn(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            &format!("LOCK TABLE table_lock_test IN {mode} MODE"),
+        );
+        assert!(output.contains("LOCK TABLE"), "{mode}: {output}");
+        run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    }
+
+    // Ordinary commands participate in the same relation-lock matrix.
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "LOCK TABLE table_lock_test IN ACCESS EXCLUSIVE MODE",
+    );
+    let blocked_select = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT count(*) FROM table_lock_test",
+    );
+    assert!(
+        blocked_select.is_empty(),
+        "ordinary SELECT must wait for ACCESS EXCLUSIVE: {blocked_select}"
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    let resumed_select = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT count(*) FROM table_lock_test",
+    );
+    assert!(resumed_select.contains("SELECT 1"), "{resumed_select}");
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "LOCK TABLE table_lock_test IN SHARE MODE",
+    );
+    let blocked_update = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "UPDATE table_lock_test SET id = id",
+    );
+    assert!(
+        blocked_update.is_empty(),
+        "ordinary UPDATE must wait for SHARE: {blocked_update}"
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    let resumed_update = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "UPDATE table_lock_test SET id = id",
+    );
+    assert!(resumed_update.contains("UPDATE 0"), "{resumed_update}");
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "LOCK TABLE table_lock_test IN ACCESS SHARE MODE",
+    );
+    let compatible_update = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "UPDATE table_lock_test SET id = id",
+    );
+    assert!(
+        compatible_update.contains("UPDATE 0"),
+        "ACCESS SHARE and ROW EXCLUSIVE are compatible: {compatible_update}"
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
+fn rollback_to_savepoint_releases_only_subtransaction_locks() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE savepoint_locks (id int primary key)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "INSERT INTO savepoint_locks VALUES (1)",
+    );
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "LOCK TABLE savepoint_locks IN ACCESS SHARE MODE",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "SAVEPOINT before_share");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "LOCK TABLE savepoint_locks IN SHARE MODE",
+    );
+    run_txn(&mut engine, &mut budget, &mut waiter, "BEGIN");
+    let table_conflict = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "LOCK TABLE savepoint_locks IN ROW EXCLUSIVE MODE NOWAIT",
+    );
+    assert!(table_conflict.contains("55P03"), "{table_conflict}");
+    run_txn(&mut engine, &mut budget, &mut waiter, "ROLLBACK");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ROLLBACK TO SAVEPOINT before_share",
+    );
+    run_txn(&mut engine, &mut budget, &mut waiter, "BEGIN");
+    let table_acquired = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "LOCK TABLE savepoint_locks IN ROW EXCLUSIVE MODE NOWAIT",
+    );
+    assert!(
+        table_acquired.contains("LOCK TABLE"),
+        "the pre-savepoint ACCESS SHARE remains, but SHARE is released: {table_acquired}"
+    );
+    run_txn(&mut engine, &mut budget, &mut waiter, "ROLLBACK");
+
+    run_txn(&mut engine, &mut budget, &mut owner, "SAVEPOINT before_row");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT id FROM savepoint_locks FOR UPDATE",
+    );
+    run_txn(&mut engine, &mut budget, &mut waiter, "BEGIN");
+    let row_conflict = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT id FROM savepoint_locks FOR UPDATE NOWAIT",
+    );
+    assert!(row_conflict.contains("55P03"), "{row_conflict}");
+    run_txn(&mut engine, &mut budget, &mut waiter, "ROLLBACK");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ROLLBACK TO SAVEPOINT before_row",
+    );
+    run_txn(&mut engine, &mut budget, &mut waiter, "BEGIN");
+    let row_acquired = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT id FROM savepoint_locks FOR UPDATE NOWAIT",
+    );
+    assert!(row_acquired.contains("SELECT 1"), "{row_acquired}");
+    run_txn(&mut engine, &mut budget, &mut waiter, "ROLLBACK");
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
+fn row_lock_deadlock_aborts_one_explicit_transaction_and_wakes_the_other() {
+    let (mut engine, mut budget) = test_engine();
+    let mut first = TxnState::new(&mut budget, 256).unwrap();
+    let mut second = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "CREATE TABLE deadlock_rows (id int primary key, value int);
+         INSERT INTO deadlock_rows VALUES (1, 10), (2, 20)",
+    );
+    run_txn(&mut engine, &mut budget, &mut first, "BEGIN");
+    run_txn(&mut engine, &mut budget, &mut second, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "SELECT id FROM deadlock_rows WHERE id = 1 FOR UPDATE",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        "SELECT id FROM deadlock_rows WHERE id = 2 FOR UPDATE",
+    );
+    let parked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "UPDATE deadlock_rows SET value = 21 WHERE id = 2",
+    );
+    assert!(parked.is_empty(), "{parked}");
+    let victim = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        "UPDATE deadlock_rows SET value = 11 WHERE id = 1",
+    );
+    assert!(victim.contains("40P01"), "{victim}");
+    assert_eq!(second.status_byte(), b'E');
+    let resumed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "UPDATE deadlock_rows SET value = 21 WHERE id = 2",
+    );
+    assert!(resumed.contains("UPDATE 1"), "{resumed}");
+    run_txn(&mut engine, &mut budget, &mut first, "COMMIT");
+    run_txn(&mut engine, &mut budget, &mut second, "ROLLBACK");
+}
+
+#[test]
+fn unique_key_writer_waits_then_rechecks_the_committed_outcome() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE unique_wait (id int primary key)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "INSERT INTO unique_wait VALUES (1)",
+    );
+    let blocked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "INSERT INTO unique_wait VALUES (1)",
+    );
+    assert!(blocked.is_empty(), "{blocked}");
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    let duplicate = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "INSERT INTO unique_wait VALUES (1)",
+    );
+    assert!(duplicate.contains("23505"), "{duplicate}");
+}
+
+#[test]
+fn parked_statement_rewinds_partial_rows_before_replay() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE replay_rows (id int primary key)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "INSERT INTO replay_rows VALUES (2)",
+    );
+    let blocked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "INSERT INTO replay_rows VALUES (1), (2)",
+    );
+    assert!(blocked.is_empty(), "{blocked}");
+    assert!(
+        engine
+            .storage
+            .table(engine.storage.find_table("public", "replay_rows").unwrap())
+            .rows
+            .iter()
+            .all(|(_, state)| {
+                state
+                    .pending
+                    .last()
+                    .is_none_or(|pending| pending.txid != waiter.txid)
+            }),
+        "the parked statement must leave no partial pending row"
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    let resumed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "INSERT INTO replay_rows VALUES (1), (2)",
+    );
+    assert!(resumed.contains("INSERT 0 2"), "{resumed}");
+}
+
+#[test]
 fn select_into_creates_table() {
     // SELECT ... INTO table is CREATE TABLE AS spelled the old way.
     let (mut e, mut b) = test_engine();
@@ -8309,6 +8861,84 @@ fn repeatable_read_retains_committed_row_history() {
 }
 
 #[test]
+fn serializable_rejects_write_skew_at_commit() {
+    let (mut engine, mut budget) = test_engine();
+    let mut first = TxnState::new(&mut budget, 256).unwrap();
+    let mut second = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "CREATE TABLE serial_doctors (id int primary key, on_call bool)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "INSERT INTO serial_doctors VALUES (1, true), (2, true)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+    );
+    assert_eq!(
+        first.isolation,
+        IsolationLevel::Serializable,
+        "SERIALIZABLE is a real transaction mode"
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut first,
+            "SELECT count(*) FROM serial_doctors WHERE on_call",
+        )),
+        ["2"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut second,
+            "SELECT count(*) FROM serial_doctors WHERE on_call",
+        )),
+        ["2"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut first,
+        "UPDATE serial_doctors SET on_call = false WHERE id = 1",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        "UPDATE serial_doctors SET on_call = false WHERE id = 2",
+    );
+    let first_commit = run_txn(&mut engine, &mut budget, &mut first, "COMMIT");
+    assert!(first_commit.contains("COMMIT"), "{first_commit}");
+    let second_commit = run_txn(&mut engine, &mut budget, &mut second, "COMMIT");
+    assert!(second_commit.contains("40001"), "{second_commit}");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM serial_doctors WHERE on_call"
+        )),
+        ["1"]
+    );
+}
+
+#[test]
 fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -8692,6 +9322,44 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
             "16"
         ]
     );
+    let union_output = run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM external_rows WHERE id <= 4
+             UNION
+             SELECT id FROM external_rows WHERE id BETWEEN 3 AND 6
+             ORDER BY id DESC",
+        );
+    assert_eq!(
+        data_rows(&union_output),
+        ["6", "5", "4", "3", "2", "1"],
+        "UNION must merge and deduplicate provider-neutral runs: {}",
+        String::from_utf8_lossy(&union_output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM external_rows WHERE id <= 4
+             INTERSECT ALL
+             SELECT id FROM external_rows WHERE id BETWEEN 3 AND 6
+             ORDER BY id",
+        )),
+        ["3", "4"],
+        "INTERSECT ALL must merge external multisets"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM external_rows WHERE id <= 4
+             EXCEPT
+             SELECT id FROM external_rows WHERE id BETWEEN 3 AND 6
+             ORDER BY id",
+        )),
+        ["1", "2"],
+        "EXCEPT must merge external multisets"
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut restarted,
@@ -8736,6 +9404,72 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     assert!(ties.iter().all(|value| value == "0"));
 
     drop(restarted);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn external_set_multisets_use_the_provider_neutral_block_store() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("external-sets-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-external-sets-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE external_set_rows (id int);
+         INSERT INTO external_set_rows VALUES (1),(2),(3),(3),(4),(5),(6)",
+    );
+    let before = engine.storage.block_io_stats();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM external_set_rows WHERE id <= 4
+             UNION
+             SELECT id FROM external_set_rows WHERE id BETWEEN 3 AND 6
+             ORDER BY id DESC",
+        )),
+        ["6", "5", "4", "3", "2", "1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM external_set_rows WHERE id <= 4
+             INTERSECT ALL
+             SELECT id FROM external_set_rows WHERE id BETWEEN 3 AND 6
+             ORDER BY id",
+        )),
+        ["3", "3", "4"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM external_set_rows WHERE id <= 4
+             EXCEPT
+             SELECT id FROM external_set_rows WHERE id BETWEEN 3 AND 6
+             ORDER BY id",
+        )),
+        ["1", "2"]
+    );
+    let traffic = engine.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        traffic.object_puts > 0 && traffic.object_gets > 0,
+        "set multisets must traverse BlockStore: {traffic:?}"
+    );
+    drop(engine);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

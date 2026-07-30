@@ -12,13 +12,14 @@ use crate::pg::wire::WireFull;
 use crate::sql::ast::{Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
 use crate::sql::eval::{compare_datums, sqlstate, SqlError};
 use crate::sql::exec::{self, MAX_PROJ};
+use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::storage::Storage;
 use crate::{sql_err, stack_format};
 
 use super::{
     arena_full, describe_scope_items, expand_set_tree_exec, infer_scope_type, select_into_rows,
-    sql_fail, sql_ok, Outcome, QueryScope,
+    select_into_rows_recycling, sql_fail, sql_ok, Outcome, QueryScope,
 };
 
 const MAX_SET_LEAVES: usize = 32;
@@ -59,6 +60,20 @@ pub fn set_query<'a>(
     let mut target = [ColType::Bool; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         target[c] = exec::coltype_of_oid(col.type_oid).unwrap_or(ColType::Text);
+    }
+
+    if storage.spill_attached() {
+        return external_set_query(
+            storage,
+            txid,
+            body,
+            q,
+            arena,
+            params,
+            &target[..n_cols],
+            &columns[..n_cols],
+            responder,
+        );
     }
 
     // Materialize and combine the tree.
@@ -102,6 +117,479 @@ pub fn set_query<'a>(
             return Err(WireFull);
         }
         emitted += 1;
+    }
+    let tag = stack_format!(48, "SELECT {}", emitted);
+    responder.command_complete(tag.as_str())?;
+    sql_ok()
+}
+
+fn byte_order(left: &[u8], right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
+    Ok(left.cmp(right))
+}
+
+fn insertion_order(_left: &[u8], _right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
+    Ok(core::cmp::Ordering::Equal)
+}
+
+fn resolve_set_order(
+    order_by: &[OrderBy],
+    columns: &[ColDesc],
+    keys: &mut [(usize, bool, bool); MAX_PROJ],
+) -> Result<usize, SqlError> {
+    let mut count = 0usize;
+    for order in order_by {
+        let index = match order.expression {
+            Expr::Int(position) if *position >= 1 && (*position as usize) <= columns.len() => {
+                (*position as usize) - 1
+            }
+            Expr::Column {
+                name,
+                qualifier: None,
+            } => columns.iter().position(|column| column.name == *name).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "ORDER BY column \"{}\" does not exist in the set-operation result",
+                    name
+                )
+            })?,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "ORDER BY on a set operation must name an output column or its position"
+                ));
+            }
+        };
+        keys[count] = (index, order.descending, order.nulls_first);
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn compare_set_order(
+    left: &[u8],
+    right: &[u8],
+    keys: &[(usize, bool, bool)],
+) -> Result<core::cmp::Ordering, SqlError> {
+    for &(index, descending, nulls_first) in keys {
+        let left_value = exec::decode_projected_pub(left, index);
+        let right_value = exec::decode_projected_pub(right, index);
+        let ordering = match (left_value.is_null(), right_value.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) if nulls_first => core::cmp::Ordering::Less,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) if nulls_first => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => {
+                let ordering = compare_datums(&left_value, &right_value)?;
+                if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(core::cmp::Ordering::Equal)
+}
+
+fn push_run(
+    storage: &Storage,
+    reader: &mut crate::sql::external::ExternalRunReader,
+    run: ExternalRun,
+    sorter: &mut crate::sql::external::ExternalSorter,
+    compare: &mut impl FnMut(&[u8], &[u8]) -> Result<core::cmp::Ordering, SqlError>,
+) -> Result<(), SqlError> {
+    storage
+        .with_block_store(|blocks| reader.start(blocks, run))
+        .expect("spill-attached block store")?;
+    while let Some(row) = reader.row() {
+        storage
+            .with_block_store(|blocks| sorter.push_encoded(blocks, row, compare))
+            .expect("spill-attached block store")?;
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("spill-attached block store")?;
+    }
+    Ok(())
+}
+
+fn external_set_leaf<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    target: &[ColType],
+    sorted: bool,
+) -> Result<Option<ExternalRun>, SqlError> {
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = if sorted {
+        byte_order as fn(&[u8], &[u8]) -> Result<_, _>
+    } else {
+        insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
+    };
+    select_into_rows_recycling(storage, txid, select, arena, params, None, None, &mut |values| {
+        if values.len() != target.len() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "each UNION query must have the same number of columns"
+            ));
+        }
+        let mut coerced = [Datum::Null; MAX_PROJ];
+        for column in 0..target.len() {
+            coerced[column] = crate::sql::eval::cast_to(values[column], target[column], arena)?;
+        }
+        storage
+            .with_block_store(|blocks| {
+                sorter.push_projected_by(
+                    blocks,
+                    target.len(),
+                    |column| coerced[column],
+                    &mut compare,
+                )
+            })
+            .expect("spill-attached block store")
+    })?;
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("spill-attached block store")
+}
+
+fn external_set_tree<'a>(
+    tree: &'a SetTree<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    target: &[ColType],
+    sorted: bool,
+) -> Result<Option<ExternalRun>, SqlError> {
+    let SetTree::Op {
+        operator,
+        all,
+        left,
+        right,
+    } = tree
+    else {
+        let SetTree::Select(select) = tree else {
+            unreachable!()
+        };
+        return external_set_leaf(select, storage, txid, arena, params, target, sorted);
+    };
+    let merge_inputs = !(*operator == SetOp::Union && *all);
+    let left_run = external_set_tree(
+        left,
+        storage,
+        txid,
+        arena,
+        params,
+        target,
+        sorted || merge_inputs,
+    )?;
+    let right_run = external_set_tree(
+        right,
+        storage,
+        txid,
+        arena,
+        params,
+        target,
+        sorted || merge_inputs,
+    )?;
+
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut output_compare = if sorted || merge_inputs {
+        byte_order as fn(&[u8], &[u8]) -> Result<_, _>
+    } else {
+        insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
+    };
+    if *operator == SetOp::Union && *all {
+        let mut reader = storage.external_run_reader()?;
+        if let Some(run) = left_run {
+            push_run(storage, &mut reader, run, &mut sorter, &mut output_compare)?;
+        }
+        if let Some(run) = right_run {
+            push_run(storage, &mut reader, run, &mut sorter, &mut output_compare)?;
+        }
+    } else if let Some(left_run) = left_run {
+        let mut left_reader = storage.external_run_reader()?;
+        let mut right_reader = storage.external_run_reader()?;
+        storage
+            .with_block_store(|blocks| left_reader.start(blocks, left_run))
+            .expect("spill-attached block store")?;
+        if let Some(right_run) = right_run {
+            storage
+                .with_block_store(|blocks| right_reader.start(blocks, right_run))
+                .expect("spill-attached block store")?;
+        }
+        while left_reader.row().is_some() {
+            let left_length = left_reader.stage_current().expect("current left row");
+            let mut left_count = 0u64;
+            while left_reader.row() == Some(left_reader.output(left_length)) {
+                left_count += 1;
+                storage
+                    .with_block_store(|blocks| left_reader.advance(blocks))
+                    .expect("spill-attached block store")?;
+            }
+            let left_row = left_reader.output(left_length);
+            while right_reader.row().is_some_and(|row| row < left_row) {
+                let right_length = right_reader.stage_current().expect("current right row");
+                if *operator == SetOp::Union {
+                    storage
+                        .with_block_store(|blocks| {
+                            sorter.push_encoded(
+                                blocks,
+                                right_reader.output(right_length),
+                                &mut output_compare,
+                            )
+                        })
+                        .expect("spill-attached block store")?;
+                }
+                while right_reader.row() == Some(right_reader.output(right_length)) {
+                    storage
+                        .with_block_store(|blocks| right_reader.advance(blocks))
+                        .expect("spill-attached block store")?;
+                }
+            }
+            let mut right_count = 0u64;
+            while right_reader.row() == Some(left_row) {
+                right_count += 1;
+                storage
+                    .with_block_store(|blocks| right_reader.advance(blocks))
+                    .expect("spill-attached block store")?;
+            }
+            let copies = match (*operator, *all) {
+                (SetOp::Union, false) => 1,
+                (SetOp::Intersect, true) => left_count.min(right_count),
+                (SetOp::Intersect, false) => u64::from(right_count > 0),
+                (SetOp::Except, true) => left_count.saturating_sub(right_count),
+                (SetOp::Except, false) => u64::from(right_count == 0),
+                _ => unreachable!(),
+            };
+            for _ in 0..copies {
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_encoded(blocks, left_row, &mut output_compare)
+                    })
+                    .expect("spill-attached block store")?;
+            }
+        }
+        if *operator == SetOp::Union && !*all {
+            while right_reader.row().is_some() {
+                let right_length = right_reader.stage_current().expect("current right row");
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_encoded(
+                            blocks,
+                            right_reader.output(right_length),
+                            &mut output_compare,
+                        )
+                    })
+                    .expect("spill-attached block store")?;
+                while right_reader.row() == Some(right_reader.output(right_length)) {
+                    storage
+                        .with_block_store(|blocks| right_reader.advance(blocks))
+                        .expect("spill-attached block store")?;
+                }
+            }
+        }
+    } else if *operator == SetOp::Union && !*all {
+        let mut reader = storage.external_run_reader()?;
+        if let Some(run) = right_run {
+            storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("spill-attached block store")?;
+            while reader.row().is_some() {
+                let right_length = reader.stage_current().expect("current right row");
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_encoded(
+                            blocks,
+                            reader.output(right_length),
+                            &mut output_compare,
+                        )
+                    })
+                    .expect("spill-attached block store")?;
+                while reader.row() == Some(reader.output(right_length)) {
+                    storage
+                        .with_block_store(|blocks| reader.advance(blocks))
+                        .expect("spill-attached block store")?;
+                }
+            }
+        }
+    }
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut output_compare))
+        .expect("spill-attached block store")
+}
+
+/// Streams a set-operation body from immutable provider-neutral runs. This is
+/// the retention-free row-source seam used by INSERT/CTAS and derived
+/// consumers; decoded values borrow only the reader's current row.
+pub(crate) fn external_set_body_into<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    tree: &'a SetTree<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let column_count = describe_set_body(storage, tree, txid, &mut columns, arena)?;
+    let mut target = [ColType::Bool; MAX_PROJ];
+    for column in 0..column_count {
+        target[column] =
+            exec::coltype_of_oid(columns[column].type_oid).unwrap_or(ColType::Text);
+    }
+    let Some(run) = external_set_tree(
+        tree,
+        storage,
+        txid,
+        arena,
+        params,
+        &target[..column_count],
+        false,
+    )? else {
+        return Ok(());
+    };
+    let mut reader = storage.external_run_reader()?;
+    storage
+        .with_block_store(|blocks| reader.start(blocks, run))
+        .expect("spill-attached block store")?;
+    while let Some(row) = reader.row() {
+        let mut values = [Datum::Null; MAX_PROJ];
+        for (column, value) in values.iter_mut().enumerate().take(column_count) {
+            *value = exec::decode_projected_pub(row, column);
+        }
+        emit(&values[..column_count])?;
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("spill-attached block store")?;
+    }
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments, reason = "set-query execution plumbing")]
+fn external_set_query<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    tree: &'a SetTree<'a>,
+    query: &'a SetQuery<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    target: &[ColType],
+    columns: &[ColDesc<'a>],
+    responder: &mut Responder,
+) -> Outcome {
+    let run = match external_set_tree(tree, storage, txid, arena, params, target, false) {
+        Ok(run) => run,
+        Err(error) => return sql_fail(error),
+    };
+    let limit = match exec::eval_limit_pub(query.limit, arena, params) {
+        Ok(limit) => limit,
+        Err(error) => return sql_fail(error),
+    };
+    let offset = match exec::eval_offset_pub(query.offset, arena, params) {
+        Ok(offset) => offset,
+        Err(error) => return sql_fail(error),
+    };
+    responder.row_description(columns)?;
+    let Some(run) = run else {
+        responder.command_complete("SELECT 0")?;
+        return sql_ok();
+    };
+    // A trailing ORDER BY needs one final provider-neutral sort. Set-operation
+    // output without ORDER BY retains UNION ALL's left-then-right order.
+    let run = if query.order_by.is_empty() {
+        run
+    } else {
+        let mut keys = [(0usize, false, false); MAX_PROJ];
+        let key_count = match resolve_set_order(query.order_by, columns, &mut keys) {
+            Ok(count) => count,
+            Err(error) => return sql_fail(error),
+        };
+        let mut reader = match storage.external_run_reader() {
+            Ok(reader) => reader,
+            Err(error) => return sql_fail(error),
+        };
+        let mut sorter = match storage.external_sorter() {
+            Ok(sorter) => sorter,
+            Err(error) => return sql_fail(error),
+        };
+        sorter.reset();
+        let mut compare =
+            |left: &[u8], right: &[u8]| compare_set_order(left, right, &keys[..key_count]);
+        if let Err(error) = push_run(storage, &mut reader, run, &mut sorter, &mut compare) {
+            return sql_fail(error);
+        }
+        match storage
+            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+            .expect("spill-attached block store")
+        {
+            Ok(Some(run)) => run,
+            Ok(None) => unreachable!("sorting a non-empty run stays non-empty"),
+            Err(error) => return sql_fail(error),
+        }
+    };
+    let mut reader = match storage.external_run_reader() {
+        Ok(reader) => reader,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage
+        .with_block_store(|blocks| reader.start(blocks, run))
+        .expect("spill-attached block store")
+    {
+        return sql_fail(error);
+    }
+    let mut logical = 0u64;
+    let mut emitted = 0u64;
+    let window = offset.saturating_add(limit);
+    let mut boundary_len = 0usize;
+    while reader.row().is_some() {
+        let keep_scanning = {
+            let context = reader.context().expect("current external set row");
+            let tied = query.with_ties
+                && limit > 0
+                && logical >= window
+                && boundary_len > 0
+                && set_rows_tie(
+                    &context.boundary[..boundary_len],
+                    context.row,
+                    query.order_by,
+                    columns,
+                );
+            if logical >= window && !tied {
+                false
+            } else {
+                if logical >= offset {
+                    let mut values = [Datum::Null; MAX_PROJ];
+                    for (column, value) in values.iter_mut().enumerate().take(target.len()) {
+                        *value = exec::decode_projected_pub(context.row, column);
+                    }
+                    responder.data_row(&values[..target.len()])?;
+                    emitted += 1;
+                }
+                if query.with_ties && limit > 0 && logical + 1 == window {
+                    context.boundary[..context.row.len()].copy_from_slice(context.row);
+                    boundary_len = context.row.len();
+                }
+                logical += 1;
+                true
+            }
+        };
+        if !keep_scanning {
+            break;
+        }
+        if let Err(error) = storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("spill-attached block store")
+        {
+            return sql_fail(error);
+        }
     }
     let tag = stack_format!(48, "SELECT {}", emitted);
     responder.command_complete(tag.as_str())?;

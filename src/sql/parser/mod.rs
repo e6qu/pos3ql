@@ -557,20 +557,53 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        if !self.eat_ident("in")? {
-            return Err(self.err_here(
-                "LOCK TABLE without an explicit mode requires ACCESS EXCLUSIVE MODE, which is not supported",
-            ));
-        }
-        self.expect_ident("access")?;
-        self.expect_ident("share")?;
-        self.expect_ident("mode")?;
+        let mode = if self.eat_ident("in")? {
+            use super::ast::TableLockMode;
+            let first = self.any_ident("lock mode")?;
+            let mode = if first.eq_ignore_ascii_case("access") {
+                if self.eat_ident("share")? {
+                    TableLockMode::AccessShare
+                } else {
+                    self.expect_ident("exclusive")?;
+                    TableLockMode::AccessExclusive
+                }
+            } else if first.eq_ignore_ascii_case("row") {
+                if self.eat_ident("share")? {
+                    TableLockMode::RowShare
+                } else {
+                    self.expect_ident("exclusive")?;
+                    TableLockMode::RowExclusive
+                }
+            } else if first.eq_ignore_ascii_case("share") {
+                if self.eat_ident("update")? {
+                    self.expect_ident("exclusive")?;
+                    TableLockMode::ShareUpdateExclusive
+                } else if self.eat_ident("row")? {
+                    self.expect_ident("exclusive")?;
+                    TableLockMode::ShareRowExclusive
+                } else {
+                    TableLockMode::Share
+                }
+            } else if first.eq_ignore_ascii_case("exclusive") {
+                TableLockMode::Exclusive
+            } else {
+                return Err(self.err_here("unrecognized lock mode"));
+            };
+            self.expect_ident("mode")?;
+            mode
+        } else {
+            super::ast::TableLockMode::AccessExclusive
+        };
         let nowait = self.eat_ident("nowait")?;
         let tables = self
             .arena
             .alloc_slice_copy(&names[..count])
             .map_err(|_| self.err_here("statement too large"))?;
-        Ok(Stmt::LockTable { tables, nowait })
+        Ok(Stmt::LockTable {
+            tables,
+            mode,
+            nowait,
+        })
     }
 
     fn explain_bool(&mut self) -> Result<bool, ParseError> {

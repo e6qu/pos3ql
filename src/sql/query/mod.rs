@@ -1084,7 +1084,11 @@ fn window_row<'r, 'a>(
         let nc = scope.defs[t].expect("resolved").n_columns;
         values[t] = Some(&flat[*offset..*offset + nc]);
     }
-    JoinRow { scope, values }
+    JoinRow {
+        scope,
+        values,
+        rowids: &[],
+    }
 }
 
 /// Whether two rows have equal tuples over `keys` (NULLs compare equal, as in
@@ -1570,6 +1574,54 @@ pub fn validate_locking(statement: &Select) -> Result<(), SqlError> {
     Ok(())
 }
 
+/// Acquires every row lock contributed by one result row. Returns `false`
+/// when `SKIP LOCKED` removes the row. A default-wait conflict becomes a
+/// private control-flow error which the engine turns into a parked execution;
+/// it is never serialized to the client.
+pub(crate) fn lock_result_row(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    scope: &QueryScope<'_>,
+    rowids: &[Option<u64>],
+) -> Result<bool, SqlError> {
+    for clause in statement.locking {
+        for (table, rowid) in rowids.iter().copied().enumerate().take(scope.n) {
+            let targeted = if clause.of.is_empty() {
+                scope.derived[table].is_none()
+            } else {
+                clause
+                    .of
+                    .iter()
+                    .any(|name| scope.table_index(name).ok() == Some(table))
+            };
+            if !targeted {
+                continue;
+            }
+            let Some(rowid) = rowid else {
+                continue;
+            };
+            match storage.acquire_row_lock(
+                scope.slots[table],
+                rowid,
+                txid,
+                clause.strength,
+                clause.wait,
+            )? {
+                crate::sql::lock::LockDecision::Acquired => {}
+                crate::sql::lock::LockDecision::Skipped => return Ok(false),
+                crate::sql::lock::LockDecision::Waiting => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_LOCK_WAIT,
+                        "statement is waiting for a row lock"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 pub fn select_query<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -1622,6 +1674,26 @@ pub fn select_query<'a>(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    // Relation locks are part of planning, before RowDescription. The scan
+    // path repeats this idempotently for nested/correlated execution, but a
+    // top-level wait must not leak a partial wire response.
+    let relation_mode = if statement.locking.is_empty() {
+        crate::sql::ast::TableLockMode::AccessShare
+    } else {
+        crate::sql::ast::TableLockMode::RowShare
+    };
+    for table in 0..scope.n {
+        if scope.derived[table].is_none()
+            && let Err(error) = storage.lock_table(
+                txid,
+                scope.slots[table],
+                relation_mode,
+                false,
+            )
+        {
+            return sql_fail(error);
+        }
+    }
     // A GROUP BY position names a select-list column; resolve it before
     // anything reads the grouping keys.
     let statement = match resolve_group_ordinals(statement, Some(&scope), arena) {
@@ -1831,7 +1903,11 @@ pub fn select_query<'a>(
         );
     }
 
-    let needs_materialize = statement.distinct || !statement.order_by.is_empty();
+    // Locking queries make a complete lock-acquisition pass before emitting
+    // any wire output. Materialization gives that pass a rewindable row set,
+    // including for queries that would otherwise stream.
+    let needs_materialize =
+        statement.distinct || !statement.order_by.is_empty() || !statement.locking.is_empty();
     if !needs_materialize {
         // Stream.
         let mut emitted = 0u64;
@@ -1908,6 +1984,9 @@ pub fn select_query<'a>(
                 for k in 1..=count {
                     if emitted >= limit {
                         break;
+                    }
+                    if !lock_result_row(storage, txid, statement, &scope, row.rowids)? {
+                        continue;
                     }
                     if skipped < offset {
                         skipped += 1;
@@ -2431,7 +2510,46 @@ pub fn select_into_rows<'a>(
     seq: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    select_into_rows_mode(
+        storage, txid, statement, arena, params, outer, seq, false, emit,
+    )
+}
+
+/// Streaming row-source form for consumers that copy every emitted datum
+/// before returning. In particular, external-run producers use it so a cold
+/// SST scan recycles fetched row bytes instead of growing the statement arena.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_into_rows_recycling<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    seq: Option<&dyn SequenceAccess>,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    select_into_rows_mode(
+        storage, txid, statement, arena, params, outer, seq, true, emit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_into_rows_mode<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    seq: Option<&dyn SequenceAccess>,
+    recycle_rows: bool,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     if let Some(tree) = statement.set_body {
+        if storage.spill_attached() {
+            return setops::external_set_body_into(storage, txid, tree, arena, params, emit);
+        }
         let (rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params)?;
         let mut vals = [Datum::Null; MAX_PROJ];
         for row in rows.iter() {
@@ -2464,7 +2582,17 @@ pub fn select_into_rows<'a>(
     // rewrite to the two-level form first.
     if (!statement.group_by.is_empty() || n_aggs > 0) && find_srf(statement.items).is_some() {
         let rewritten = rewrite_grouped_windows(statement, storage, txid, arena)?;
-        return select_into_rows(storage, txid, rewritten, arena, params, outer, seq, emit);
+        return select_into_rows_mode(
+            storage,
+            txid,
+            rewritten,
+            arena,
+            params,
+            outer,
+            seq,
+            recycle_rows,
+            emit,
+        );
     }
     if !statement.group_by.is_empty() || n_aggs > 0 {
         let Some(from) = &statement.from else {
@@ -2615,7 +2743,17 @@ pub fn select_into_rows<'a>(
         }
         if n_win > 0 {
             let wrapped = over_one_row(statement, arena)?;
-            return select_into_rows(storage, txid, wrapped, arena, params, outer, seq, emit);
+            return select_into_rows_mode(
+                storage,
+                txid,
+                wrapped,
+                arena,
+                params,
+                outer,
+                seq,
+                recycle_rows,
+                emit,
+            );
         }
         // A FROM-less body may still reference an outer row when it is a LATERAL
         // item (`LATERAL (SELECT t.a * 2)`); resolve against that outer scope.
@@ -2726,7 +2864,17 @@ pub fn select_into_rows<'a>(
         }
         if !statement.group_by.is_empty() || statement.having.is_some() || n_grouped_aggs > 0 {
             let rewritten = rewrite_grouped_windows(statement, storage, txid, arena)?;
-            return select_into_rows(storage, txid, rewritten, arena, params, outer, seq, emit);
+            return select_into_rows_mode(
+                storage,
+                txid,
+                rewritten,
+                arena,
+                params,
+                outer,
+                seq,
+                recycle_rows,
+                emit,
+            );
         }
         let (proj_rows, sort_keys) = project_window_rows(
             storage,
@@ -2805,14 +2953,14 @@ pub fn select_into_rows<'a>(
                 outer,
                 limit,
                 offset,
-                &mut |values| {
+                &mut |values, _rowids| {
                     emit(values)?;
                     Ok(true)
                 },
             )?;
             return Ok(());
         }
-        let (rows, width, deferred) = materialized_rows(
+        let (rows, width, deferred, _identities_at) = materialized_rows(
             storage,
             &scope,
             from,
@@ -2859,17 +3007,7 @@ pub fn select_into_rows<'a>(
     // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
     let srf_call = find_srf(statement.items);
-    scan_source(
-        storage,
-        &scope,
-        from,
-        txid,
-        where_in_scan,
-        arena,
-        params,
-        &hooks,
-        outer,
-        &mut |row| {
+    let mut visit = |row: &JoinRow<'_, 'a, '_>| {
             if n_where_correlated > 0
                 && !correlated_where_passes(
                     &where_correlated[..n_where_correlated],
@@ -2945,8 +3083,34 @@ pub fn select_into_rows<'a>(
                 }
             }
             Ok(true)
-        },
-    )
+        };
+    if recycle_rows {
+        scan_source_recycling(
+            storage,
+            &scope,
+            from,
+            txid,
+            where_in_scan,
+            arena,
+            params,
+            &hooks,
+            outer,
+            &mut visit,
+        )
+    } else {
+        scan_source(
+            storage,
+            &scope,
+            from,
+            txid,
+            where_in_scan,
+            arena,
+            params,
+            &hooks,
+            outer,
+            &mut visit,
+        )
+    }
 }
 
 /// Projects one source row through the select items.

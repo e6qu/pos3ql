@@ -164,6 +164,14 @@ impl ExternalRunReader {
         &self.output[..length]
     }
 
+    /// Copies the current immutable row into reader-owned staging so a merge
+    /// may advance this cursor while retaining the run key.
+    pub(crate) fn stage_current(&mut self) -> Option<usize> {
+        let row = self.reader.row().map(|prefixed| &prefixed[ORDINAL_BYTES..])?;
+        self.output[..row.len()].copy_from_slice(row);
+        Some(row.len())
+    }
+
     pub(crate) fn advance(&mut self, store: &mut dyn BlockStore) -> Result<(), SqlError> {
         if let Some(prefixed) = self.reader.row() {
             let row = &prefixed[ORDINAL_BYTES..];
@@ -234,9 +242,7 @@ impl ExternalSorter {
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<(), SqlError> {
         let projected_len = projected_row_len_by(columns, &mut value_at)?;
-        let total = ORDINAL_BYTES
-            .checked_add(projected_len)
-            .ok_or_else(row_too_large)?;
+        let total = ORDINAL_BYTES.checked_add(projected_len).ok_or_else(row_too_large)?;
         if total > MAX_INLINE_ROW {
             return Err(row_too_large());
         }
@@ -251,6 +257,33 @@ impl ExternalSorter {
             &mut value_at,
             &mut self.chunk[offset + ORDINAL_BYTES..offset + total],
         )?;
+        self.finish_push(offset, total)
+    }
+
+    /// Appends one already-encoded projected row. This is the common spool
+    /// seam for set multisets, recursive work tables, subquery collectors,
+    /// window partitions, and outer-join match identifiers.
+    pub(crate) fn push_encoded(
+        &mut self,
+        store: &mut dyn BlockStore,
+        row: &[u8],
+        compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+    ) -> Result<(), SqlError> {
+        let total = ORDINAL_BYTES.checked_add(row.len()).ok_or_else(row_too_large)?;
+        if total > MAX_INLINE_ROW {
+            return Err(row_too_large());
+        }
+        if self.row_count == self.rows.len() || self.chunk_len + total > self.chunk.len() {
+            self.flush_chunk(store, compare)?;
+        }
+        let offset = self.chunk_len;
+        self.chunk[offset..offset + ORDINAL_BYTES]
+            .copy_from_slice(&self.next_ordinal.to_le_bytes());
+        self.chunk[offset + ORDINAL_BYTES..offset + total].copy_from_slice(row);
+        self.finish_push(offset, total)
+    }
+
+    fn finish_push(&mut self, offset: usize, total: usize) -> Result<(), SqlError> {
         self.rows[self.row_count] = BufferedRow {
             offset: offset as u32,
             length: total as u32,

@@ -33,6 +33,7 @@ mod memory;
 mod object;
 mod sst;
 mod tiered;
+mod value;
 
 pub(crate) mod lz4;
 
@@ -42,6 +43,9 @@ pub(crate) use sst::{SstHandle, SstKey, SstReader};
 pub(crate) use sst::{block_keys_at, data_block_total, locate_data_block, read_data_block};
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};
+pub(crate) use value::{
+    VALUE_INDEX_KEY_MAX, ValueIndexHandle, ValueIndexReader, ValueIndexWriter, walk_value_roster,
+};
 
 use crate::wal::crc32c::crc32c;
 
@@ -87,6 +91,10 @@ pub(crate) enum BlockType {
     SstDataV2Lz4 = 9,
     /// Sparse index over `(rowid, commit_lsn)` keys.
     SstIndexV2 = 10,
+    /// Encoded secondary-index keys with row identity and commit LSN.
+    ValueIndexData = 11,
+    /// Complete immutable-block roster for one secondary-index generation.
+    ValueIndexRoster = 12,
 }
 
 impl BlockType {
@@ -102,6 +110,8 @@ impl BlockType {
             8 => BlockType::SstDataV2,
             9 => BlockType::SstDataV2Lz4,
             10 => BlockType::SstIndexV2,
+            11 => BlockType::ValueIndexData,
+            12 => BlockType::ValueIndexRoster,
             _ => return None,
         })
     }
@@ -298,6 +308,8 @@ mod tests {
             BlockType::SstDataV2,
             BlockType::SstDataV2Lz4,
             BlockType::SstIndexV2,
+            BlockType::ValueIndexData,
+            BlockType::ValueIndexRoster,
         ]
         .into_iter()
         .enumerate()

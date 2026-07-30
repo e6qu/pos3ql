@@ -11,7 +11,7 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::{BinaryOp, Expr, FromClause, JoinKind};
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, cast_to, eval_full, hash_key, sqlstate,
+    ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums, eval_full, hash_key, sqlstate,
 };
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
@@ -37,7 +37,7 @@ impl<'a> ColumnLookup<'a> for NoColumns {
     }
 }
 
-/// A complete equality probe over one base table. The rowids are sorted so
+/// A complete value probe over one base table. The rowids are sorted so
 /// taking the cache path does not make result/error order depend on hash-slot
 /// placement.
 struct IndexedCandidates<'a> {
@@ -60,11 +60,27 @@ fn indexed_candidates<'a>(
     if scope.n != 1
         || scope.derived[0].is_some()
         || scope.lateral[0]
+        // Resident and object generations carry the published base plus the
+        // latest overlay, not every intermediate key image retained for a
+        // repeatable-read snapshot. The ordinary MVCC scan owns that case.
+        || storage.commit_snapshot() != storage.lsn()
         || storage.has_pending_rows(scope.slots[0])
     {
         return Ok(None);
     }
-    fn find<'a>(expression: &'a Expr<'a>, scope: &QueryScope<'_>) -> Option<(usize, &'a Expr<'a>)> {
+    fn reverse(operator: BinaryOp) -> BinaryOp {
+        match operator {
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::LtEq => BinaryOp::GtEq,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::GtEq => BinaryOp::LtEq,
+            other => other,
+        }
+    }
+    fn find<'a>(
+        expression: &'a Expr<'a>,
+        scope: &QueryScope<'_>,
+    ) -> Option<(usize, &'a Expr<'a>, BinaryOp)> {
         match expression {
             Expr::Binary {
                 operator: BinaryOp::And,
@@ -72,13 +88,18 @@ fn indexed_candidates<'a>(
                 right,
             } => find(left, scope).or_else(|| find(right, scope)),
             Expr::Binary {
-                operator: BinaryOp::Eq,
+                operator,
                 left,
                 right,
-            } => {
+            } if matches!(
+                operator,
+                BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+            ) =>
+            {
                 let side = |column: &'a Expr<'a>,
-                            constant: &'a Expr<'a>|
-                 -> Option<(usize, &'a Expr<'a>)> {
+                            constant: &'a Expr<'a>,
+                            operator: BinaryOp|
+                 -> Option<(usize, &'a Expr<'a>, BinaryOp)> {
                     let Expr::Column { qualifier, name } = column else {
                         return None;
                     };
@@ -90,21 +111,24 @@ fn indexed_candidates<'a>(
                         return None;
                     }
                     match scope.find_column(*qualifier, name).ok()? {
-                        ResolvedColumn::Table(0, index) => Some((index, constant)),
+                        ResolvedColumn::Table(0, index) => Some((index, constant, operator)),
                         _ => None,
                     }
                 };
-                side(left, right).or_else(|| side(right, left))
+                side(left, right, *operator).or_else(|| side(right, left, reverse(*operator)))
             }
             _ => None,
         }
     }
-    let Some((column, constant)) = where_clause.and_then(|clause| find(clause, scope)) else {
+    let Some((column, constant, operator)) = where_clause.and_then(|clause| find(clause, scope))
+    else {
         return Ok(None);
     };
     let columns = [column as u16];
     let slot = scope.slots[0];
-    if !storage.value_cache_complete(slot, &columns) {
+    if (operator == BinaryOp::Eq && !storage.value_probe_complete(slot, &columns))
+        || (operator != BinaryOp::Eq && !storage.value_durable_complete(slot, &columns))
+    {
         return Ok(None);
     }
     let target_type = scope.defs[0].expect("physical table has definition").columns()[column].ctype;
@@ -133,22 +157,69 @@ fn indexed_candidates<'a>(
             rowids: &[],
         }));
     }
+    let key_matches = |key: &[u8]| -> Result<bool, SqlError> {
+        let mut decoded = [Datum::Null];
+        rowenc::decode(key, &[target_type], &mut decoded)?;
+        if decoded[0].is_null() {
+            return Ok(false);
+        }
+        let ordering = compare_datums(&decoded[0], &value)?;
+        Ok(match operator {
+            BinaryOp::Eq => ordering.is_eq(),
+            BinaryOp::Lt => ordering.is_lt(),
+            BinaryOp::LtEq => ordering.is_le(),
+            BinaryOp::Gt => ordering.is_gt(),
+            BinaryOp::GtEq => ordering.is_ge(),
+            _ => unreachable!("filtered comparison"),
+        })
+    };
     let hash = hash_key(&[value], &[0]);
     let mut count = 0usize;
-    let complete = storage.probe_value(slot, &columns, hash, |_| count += 1);
-    debug_assert!(complete, "completeness checked before probe");
-    let rowids = arena
-        .alloc_slice_with(count, |_| 0u64)
-        .map_err(|_| arena_full())?;
+    if operator == BinaryOp::Eq {
+        let complete = storage.probe_value(slot, &columns, hash, |_| count += 1)?;
+        debug_assert!(complete, "completeness checked before probe");
+    } else {
+        let complete = storage.walk_value_index(slot, &columns, |_, key| {
+            if key_matches(key)? {
+                count += 1;
+            }
+            Ok(())
+        })?;
+        debug_assert!(complete, "durable completeness checked before scan");
+    }
+    let Ok(rowids) = arena.alloc_slice_with(count, |_| 0u64) else {
+        // Candidate materialization is an optimization. A broad range or a
+        // highly duplicated key may exceed statement scratch even though the
+        // ordinary streaming table walk does not; decline the access path
+        // instead of changing a successful query into a 54000 error.
+        return Ok(None);
+    };
     let mut fill = 0usize;
-    storage.probe_value(slot, &columns, hash, |rowid| {
-        rowids[fill] = rowid;
-        fill += 1;
-    });
+    if operator == BinaryOp::Eq {
+        storage.probe_value(slot, &columns, hash, |rowid| {
+            rowids[fill] = rowid;
+            fill += 1;
+        })?;
+    } else {
+        storage.walk_value_index(slot, &columns, |rowid, key| {
+            if key_matches(key)? {
+                rowids[fill] = rowid;
+                fill += 1;
+            }
+            Ok(())
+        })?;
+    }
     rowids.sort_unstable();
+    let mut unique = 0usize;
+    for read in 0..rowids.len() {
+        if read == 0 || rowids[read] != rowids[read - 1] {
+            rowids[unique] = rowids[read];
+            unique += 1;
+        }
+    }
     Ok(Some(IndexedCandidates {
         table: 0,
-        rowids,
+        rowids: &rowids[..unique],
     }))
 }
 

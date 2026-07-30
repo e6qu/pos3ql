@@ -118,14 +118,8 @@ pub struct Engine {
     /// [`Engine::copy_row_line`] until CopyDone.
     pending_copy: Option<exec::CopySetup>,
     wal_upload: bool,
-    /// When set, a commit blocks until its WAL batch is uploaded (RPO=0 to
-    /// durable object tier). Otherwise upload is drained off the commit path.
-    wal_upload_sync: bool,
-    /// Backpressure threshold: once this many bytes of committed WAL await
-    /// asynchronous upload, the next commit drains synchronously.
-    wal_upload_backpressure: usize,
-    /// Scratch buffer for reading committed WAL batches before upload; sized
-    /// to hold a full asynchronous accumulation.
+    /// Scratch buffer for reading committed WAL batches before the
+    /// provider-neutral object PUT.
     wal_seg_buf: Vec<u8>,
     /// Scratch for materializing scans (ORDER BY, UPDATE, DELETE) and for
     /// sorting SST entries at checkpoint.
@@ -139,6 +133,9 @@ pub struct Engine {
     /// statement. This is the `work_mem` analogue.
     work: Arena,
     next_txid: u32,
+    /// Transactions with uncommitted catalog WAL. A manifest cannot publish
+    /// while any such transaction could still roll that WAL back.
+    checkpoint_blockers: usize,
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
     notify: notify::NotifyState,
@@ -405,18 +402,14 @@ impl Engine {
         // rebuild every table's uniqueness indexes from the recovered committed
         // rows before serving queries.
         storage.rebuild_all_enforcers()?;
-        // The upload buffer must hold at least one full WAL batch, plus room
-        // to accumulate more before backpressure forces a synchronous drain.
+        // The upload buffer must hold at least one full WAL batch.
         let upload_buf = config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes);
-        let backpressure = upload_buf.saturating_sub(config.wal_buffer_bytes).max(1);
         Ok(Self {
             storage,
             wal,
             ckpt,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
-            wal_upload_sync: config.wal_upload_sync,
-            wal_upload_backpressure: backpressure,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             compact_scratch: FixedVec::new(
@@ -429,6 +422,7 @@ impl Engine {
             )?,
             work: Arena::new(budget, "work_arena", config.work_arena_bytes)?,
             next_txid: 0,
+            checkpoint_blockers: 0,
             notify: notify::NotifyState::new(
                 budget,
                 config.max_connections as usize * notify::CHANNELS_PER_CONN,
@@ -453,6 +447,36 @@ impl Engine {
         guc.begin_transaction();
         txn.failed = false;
         txn.wal_mark = self.wal.mark();
+    }
+
+    /// Keeps the engine-wide checkpoint gate aligned with this transaction's
+    /// rollback-capable catalog changes.
+    fn synchronize_checkpoint_blocker(&mut self, txn: &mut TxnState) {
+        let blocks = !txn.ddl().is_empty();
+        match (txn.checkpoint_blocked(), blocks) {
+            (false, true) => {
+                self.checkpoint_blockers = self
+                    .checkpoint_blockers
+                    .checked_add(1)
+                    .expect("checkpoint blocker count overflow");
+                txn.set_checkpoint_blocked(true);
+            }
+            (true, false) => {
+                self.release_checkpoint_blocker(txn);
+            }
+            _ => {}
+        }
+    }
+
+    fn release_checkpoint_blocker(&mut self, txn: &mut TxnState) {
+        if !txn.checkpoint_blocked() {
+            return;
+        }
+        self.checkpoint_blockers = self
+            .checkpoint_blockers
+            .checked_sub(1)
+            .expect("checkpoint blocker count underflow");
+        txn.set_checkpoint_blocked(false);
     }
 
     /// Commits: journals every touched row, fsyncs once, then promotes the
@@ -594,9 +618,7 @@ impl Engine {
         // state a client could watch move backward and then forward.
         self.wal.commit();
         let contributed = self.wal.pending_batch_bytes() > batch_bytes_before;
-        let upload_result = if self.wal_upload_sync
-            || self.wal.pending_batch_bytes() as usize >= self.wal_upload_backpressure
-        {
+        let upload_result = if self.wal_upload {
             match self.upload_wal_batch() {
                 Err(e) if !contributed => {
                     // Retrying a previous commit's batch: everything in it
@@ -742,6 +764,7 @@ impl Engine {
         // failure, the data is committed regardless — never a silent drop.
         let notify_result = self.flush_committed_notifications(txn);
         guc.commit_transaction();
+        self.release_checkpoint_blocker(txn);
         txn.clear();
         notify_result.and(index_result).and(upload_result)
     }
@@ -878,6 +901,7 @@ impl Engine {
         }
         self.wal.truncate_to_mark(txn.wal_mark);
         guc.rollback_transaction();
+        self.release_checkpoint_blocker(txn);
         txn.clear();
     }
 
@@ -946,34 +970,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether committed WAL awaits asynchronous upload. The event loop polls
-    /// this to drain uploads between requests without adding object-store
-    /// latency to any commit.
-    pub fn has_pending_wal_upload(&self) -> bool {
-        self.wal_upload && !self.wal_upload_sync && self.wal.pending_batch_bytes() > 0
-    }
-
-    /// Uploads the committed WAL batch awaiting asynchronous upload, off the
-    /// commit path. Returns whether the drain succeeded (or had nothing to do);
-    /// a failure is logged, not propagated — the data is already durable on
-    /// local disk, so a bucket hiccup must not disturb request processing. The
-    /// caller backs off before retrying so a persistently-down bucket does not
-    /// spin the event loop.
-    pub fn drain_wal_upload(&mut self) -> bool {
-        if !self.has_pending_wal_upload() {
-            return true;
-        }
-        if let Err(e) = self.upload_wal_batch() {
-            eprintln!(
-                "pos3ql: async WAL segment upload failed ({}): {}",
-                e.sqlstate,
-                e.message.as_str()
-            );
-            return false;
-        }
-        true
-    }
-
     /// Snapshots to object storage, then truncates the journal and compacts
     /// the heap. The atomic form — drives the sliced checkpoint's beats to
     /// completion in one call, for the explicit `CHECKPOINT` statement and
@@ -1039,6 +1035,12 @@ impl Engine {
                 message: stack_format!(192, "no object storage configured (object_store = off)"),
             });
         };
+        if self.checkpoint_blockers != 0 {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "checkpoint is blocked by uncommitted schema changes"
+            ));
+        }
         // Everything the snapshot will contain must be journal-durable
         // first, so an interrupted checkpoint never strands acked writes.
         self.wal.commit();
@@ -1170,9 +1172,11 @@ impl Engine {
     }
 
     pub fn checkpoint_work_pending(&self) -> bool {
-        self.ckpt
-            .as_ref()
-            .is_some_and(|c| c.sweep_active() || c.merge_work_pending(&self.storage))
+        self.checkpoint_blockers == 0
+            && self
+                .ckpt
+                .as_ref()
+                .is_some_and(|c| c.sweep_active() || c.merge_work_pending(&self.storage))
     }
 
     /// One checkpoint beat: a trigger (heap or journal filling) starts a
@@ -1184,6 +1188,9 @@ impl Engine {
     /// the return is false on a failed beat so the idle driver can back off
     /// a persistently-down bucket.
     pub fn maybe_checkpoint(&mut self) -> bool {
+        if self.checkpoint_blockers != 0 {
+            return true;
+        }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return true;
         };
@@ -1270,9 +1277,11 @@ impl Engine {
                     }
                     executed_any = true;
                     emit_parse_warnings(&mut parser, responder)?;
-                    if let Err(e) = self.execute_stmt(
+                    let outcome = self.execute_stmt(
                         &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
-                    )? {
+                    );
+                    self.synchronize_checkpoint_blocker(txn);
+                    if let Err(e) = outcome? {
                         if txn.is_explicit() {
                             txn.failed = true;
                         } else {
@@ -1339,9 +1348,11 @@ impl Engine {
         let outcome = match parser.next_stmt() {
             Ok(Some(statement)) => {
                 emit_parse_warnings(&mut parser, responder)?;
-                self.execute_stmt(
+                let outcome = self.execute_stmt(
                     &statement, arena, params, txn, sqlprep, cursors, guc, responder,
-                )?
+                );
+                self.synchronize_checkpoint_blocker(txn);
+                outcome?
             }
             Ok(None) => {
                 responder.empty_query_response()?;
@@ -3812,6 +3823,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             table,
             columns,
+            descending,
+            nulls_first,
             n_cols,
             unique,
         } => {
@@ -3821,6 +3834,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name: crate::storage::SqlName::parse(name)?,
                     table: crate::storage::SqlName::parse(table)?,
                     columns,
+                    descending,
+                    nulls_first,
                     n_cols,
                     unique,
                     live: true,

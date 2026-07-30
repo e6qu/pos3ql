@@ -259,7 +259,7 @@ fn enforce_key_uniqueness(
             Ok(false) => {}
             Err(e) => result = Err(e),
         }
-    });
+    })?;
     result?;
     if !served {
         committed_scan_uniqueness(
@@ -417,6 +417,51 @@ pub fn check_all_unique(
     check_unique_keys(storage, table_index, def, schema, values, self_rowid, txid)
 }
 
+/// Rejects an indexed tuple before its row or CREATE INDEX WAL can commit if
+/// the immutable object generation cannot represent the key. Checkpoint is
+/// never the first observer of this physical limit.
+pub(crate) fn check_index_tuple_size(
+    columns: &[u16],
+    values: &[Datum],
+) -> Result<(), SqlError> {
+    let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    for (at, column) in columns.iter().enumerate() {
+        key[at] = values[*column as usize];
+    }
+    let encoded = rowenc::encoded_len(&key[..columns.len()]);
+    if encoded > crate::store::VALUE_INDEX_KEY_MAX {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "index row size {} exceeds maximum {}",
+            encoded,
+            crate::store::VALUE_INDEX_KEY_MAX
+        ));
+    }
+    Ok(())
+}
+
+/// Validates every persistent tuple shape visible on a table, including
+/// non-unique named indexes (which uniqueness-only enforcement does not walk).
+fn check_index_tuple_sizes(
+    storage: &Storage,
+    def: &TableDef,
+    values: &[Datum],
+    txid: u32,
+) -> Result<(), SqlError> {
+    for (column, metadata) in def.columns().iter().enumerate() {
+        if metadata.unique {
+            check_index_tuple_size(&[column as u16], values)?;
+        }
+    }
+    for unique in def.uniques() {
+        check_index_tuple_size(unique.columns(), values)?;
+    }
+    for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        check_index_tuple_size(&index.columns[..index.n_cols], values)?;
+    }
+    Ok(())
+}
+
 /// Enforces every UNIQUE index on the table: a candidate row conflicts if some
 /// other visible row has an equal, all-non-NULL tuple over the index columns
 /// (23505; a conflicting uncommitted row from another transaction is 40001).
@@ -554,6 +599,7 @@ pub(crate) fn enforce_row_constraints(
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
+    check_index_tuple_sizes(storage, def, values, txid)?;
     check_all_unique(storage, table_index, def, schema, values, self_rowid, txid)?;
     check_row_checks(def, checks, values, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
@@ -578,6 +624,7 @@ pub(crate) fn check_row_content(
     txid: u32,
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
+    check_index_tuple_sizes(storage, def, values, txid)?;
     check_row_checks(def, checks, values, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;
@@ -1012,5 +1059,19 @@ fn datum_changed(old: &Datum, new: &Datum) -> Result<bool, SqlError> {
         (true, true) => Ok(false),
         (true, false) | (false, true) => Ok(true),
         (false, false) => compare_datums(old, new).map(|ordering| !ordering.is_eq()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_tuple_limit_is_checked_before_checkpoint() {
+        assert!(check_index_tuple_size(&[0], &[Datum::Text("small")]).is_ok());
+        let text = "x".repeat(crate::store::VALUE_INDEX_KEY_MAX);
+        let error = check_index_tuple_size(&[0], &[Datum::Text(&text)]).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("index row size"));
     }
 }

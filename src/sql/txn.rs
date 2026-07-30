@@ -84,6 +84,9 @@ pub struct TxnState {
     touched: FixedVec<(u32, u64, PriorPending)>,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
+    /// Whether the engine has counted this transaction as preventing a
+    /// checkpoint from publishing its uncommitted catalog WAL.
+    checkpoint_blocked: bool,
     /// Active savepoints, innermost last.
     savepoints: FixedVec<Savepoint>,
     /// WAL buffer mark taken when the transaction started.
@@ -212,6 +215,7 @@ impl TxnState {
             command_id: 1,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
             ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
+            checkpoint_blocked: false,
             savepoints: FixedVec::new(budget, "txn_savepoints", MAX_SAVEPOINTS)?,
             wal_mark: 0,
             pending_notifies: FixedVec::new(
@@ -488,6 +492,14 @@ impl TxnState {
         &self.ddl
     }
 
+    pub fn checkpoint_blocked(&self) -> bool {
+        self.checkpoint_blocked
+    }
+
+    pub fn set_checkpoint_blocked(&mut self, blocked: bool) {
+        self.checkpoint_blocked = blocked;
+    }
+
     pub fn clear(&mut self) {
         self.mode = TxnMode::Idle;
         self.failed = false;
@@ -498,6 +510,7 @@ impl TxnState {
         self.snapshot_taken = false;
         self.touched.clear();
         self.ddl.clear();
+        self.checkpoint_blocked = false;
         self.savepoints.clear();
         // Commit flushes these before clearing; rollback drops them here.
         self.pending_notifies.clear();

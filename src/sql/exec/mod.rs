@@ -147,8 +147,9 @@ use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build
 mod constraints;
 pub(crate) use constraints::coerce_domain_value;
 use constraints::{
-    MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions, enforce_row_constraints,
-    parse_checks, parse_defaults, parse_generated, referenced_key_changed, table_is_referenced,
+    MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions, check_index_tuple_size,
+    enforce_row_constraints, parse_checks, parse_defaults, parse_generated, referenced_key_changed,
+    table_is_referenced,
 };
 pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
 
@@ -527,6 +528,8 @@ fn remap_columns(
 #[derive(Clone, Copy)]
 struct CopiedIndex {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
+    descending: [bool; crate::storage::MAX_INDEX_COLS],
+    nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
     unique: bool,
 }
@@ -545,6 +548,8 @@ fn copy_like_indexes(
         // Collected up front: creating one needs `storage` mutably.
         let mut copied = [CopiedIndex {
             columns: [0; crate::storage::MAX_INDEX_COLS],
+            descending: [false; crate::storage::MAX_INDEX_COLS],
+            nulls_first: [false; crate::storage::MAX_INDEX_COLS],
             n_cols: 0,
             unique: false,
         }; MAX_LIKE_INDEXES];
@@ -567,6 +572,8 @@ fn copy_like_indexes(
             }
             copied[n_copied] = CopiedIndex {
                 columns: index.columns,
+                descending: index.descending,
+                nulls_first: index.nulls_first,
                 n_cols: index.n_cols,
                 unique: index.unique,
             };
@@ -582,6 +589,8 @@ fn copy_like_indexes(
                     name,
                     table: def.name,
                     columns,
+                    descending: index.descending,
+                    nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
                     unique: index.unique,
                     live: true,
@@ -597,6 +606,8 @@ fn copy_like_indexes(
                     name: name.as_str(),
                     table: def.name.as_str(),
                     columns,
+                    descending: index.descending,
+                    nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
                     unique: index.unique,
                 },
@@ -5730,10 +5741,8 @@ pub fn drop_view(
     sql_ok()
 }
 
-/// CREATE [UNIQUE] INDEX: registers a durable index over a table's columns.
-/// The engine does full scans, so the index never accelerates a query; a
-/// UNIQUE index enforces a uniqueness constraint on its column tuple (checked
-/// here against existing rows, and on every later INSERT/UPDATE).
+/// CREATE [UNIQUE] INDEX: registers a durable btree index over a table's
+/// columns. A UNIQUE index validates the existing image before publication.
 #[allow(clippy::too_many_arguments)]
 pub fn create_index(
     storage: &mut Storage,
@@ -5741,7 +5750,7 @@ pub fn create_index(
     txn: &mut super::txn::TxnState,
     name: &str,
     table: &QualName,
-    column_names: &[&str],
+    index_columns: &[crate::sql::ast::IndexColumn<'_>],
     unique: bool,
     responder: &mut Responder,
 ) -> Outcome {
@@ -5751,7 +5760,7 @@ pub fn create_index(
         Err(e) => return sql_fail(e),
     };
     let tdef = *storage.table_def(table_index, txn.txid);
-    if column_names.is_empty() || column_names.len() > MAX_INDEX_COLS {
+    if index_columns.is_empty() || index_columns.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "an index must have 1..={} columns",
@@ -5759,20 +5768,24 @@ pub fn create_index(
         ));
     }
     let mut columns = [0u16; MAX_INDEX_COLS];
-    for (i, column_name) in column_names.iter().enumerate() {
-        let Some(column_index) = tdef.column_index(column_name) else {
+    let mut descending = [false; MAX_INDEX_COLS];
+    let mut nulls_first = [false; MAX_INDEX_COLS];
+    for (i, index_column) in index_columns.iter().enumerate() {
+        let Some(column_index) = tdef.column_index(index_column.name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
-                column_name
+                index_column.name
             ));
         };
         columns[i] = column_index as u16;
+        descending[i] = index_column.descending;
+        nulls_first[i] = index_column.nulls_first;
     }
     // The written column list's length — not the fixed array's, whose
     // padding would quietly widen the index's tuple (a UNIQUE index on (b)
     // must not enforce uniqueness of (b, first-column) instead).
-    let n_cols = column_names.len();
+    let n_cols = index_columns.len();
     let sqlname = match SqlName::parse(name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
@@ -5782,6 +5795,8 @@ pub fn create_index(
         name: sqlname,
         table: tdef.name,
         columns,
+        descending,
+        nulls_first,
         n_cols,
         unique,
         live: true,
@@ -5793,23 +5808,25 @@ pub fn create_index(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    if unique {
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        tdef.schema(&mut schema);
-        // Every existing row is checked against the others via the just-
-        // registered index (all borrows shared); a conflict is deferred so the
-        // rollback drop_index (a mutable borrow) runs after the scan.
-        let validation = storage.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = state.committed else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            // The whole check runs inside the fetch: the decoded values borrow
-            // the fetched bytes, and the re-scan's own fetches nest into the
-            // spill reader's second scratch.
-            storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    tdef.schema(&mut schema);
+    // Validate every existing tuple against the physical generation limit.
+    // UNIQUE additionally checks authoritative rows for duplicate keys. A
+    // conflict is deferred so rollback can remove the pending catalog entry
+    // after the shared row walk releases its borrows.
+    let validation = storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        let Some(home) = state.committed else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
+            check_index_tuple_size(
+                &columns[..n_cols],
+                &values[..tdef.n_columns],
+            )?;
+            if unique {
                 check_unique_indexes(
                     storage,
                     table_index,
@@ -5820,14 +5837,15 @@ pub fn create_index(
                     // The just-registered index is an uncommitted CREATE owned
                     // by this transaction; validation must see it.
                     txn.txid,
-                )
-            })?;
-            Ok(ControlFlow::Continue(()))
-        });
-        if let Err(error) = validation {
-            storage.rollback_index_create(slot);
-            return sql_fail(error);
-        }
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(ControlFlow::Continue(()))
+    });
+    if let Err(error) = validation {
+        storage.rollback_index_create(slot);
+        return sql_fail(error);
     }
     if let Err(error) = storage.prepare_index_enforcers(table_index, txn.txid) {
         storage.rollback_index_create(slot);
@@ -5844,6 +5862,8 @@ pub fn create_index(
             name,
             table: tdef.name.as_str(),
             columns,
+            descending,
+            nulls_first,
             n_cols,
             unique,
         },

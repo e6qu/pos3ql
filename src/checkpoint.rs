@@ -30,7 +30,7 @@ use crate::stack_format;
 use crate::storage::{ColumnMeta, MAX_COLUMNS, OwnedDatum, RowHome, SqlName, Storage, TableDef};
 use crate::store::{
     BlockId, BlockStore, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter, StackPlan,
-    TieredStore,
+    TieredStore, ValueIndexHandle, ValueIndexWriter,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -60,6 +60,14 @@ enum SlotInstall {
         at: usize,
         handle: Option<SstHandle>,
     },
+}
+
+#[derive(Clone, Copy)]
+struct ValueInstall {
+    slot: usize,
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    n_columns: usize,
+    handle: Option<ValueIndexHandle>,
 }
 
 /// A prior checkpoint's SST reference for one table slot.
@@ -174,6 +182,7 @@ pub(crate) struct Checkpointer {
     /// Spill-list updates computed during a checkpoint, applied to storage
     /// only after the manifest CAS lands.
     pending_installs: Vec<(usize, SlotInstall)>,
+    pending_value_installs: Vec<ValueInstall>,
     /// Pre-reserved physical-version schedule: (key, source-and-kind).
     merge_scratch: Vec<(SstKey, u8)>,
     /// Rosters of the SSTs the current manifest references (GC keep-set
@@ -206,6 +215,7 @@ pub(crate) struct Checkpointer {
     /// state instead of borrowing an arena.
     slice_writer: SstWriter,
     merge_writer: SstWriter,
+    value_writer: ValueIndexWriter,
     merge_job: Option<MergeJob>,
     merge_done: Option<CompletedMerge>,
     /// Fairness toggle: merge beats and sweep beats alternate when both
@@ -275,6 +285,10 @@ impl Checkpointer {
         // this accounts the fixed parts.
         2 * ObjectStore::budget_bytes(config)
             + 2 * SstWriter::budget_bytes()
+            + ValueIndexWriter::budget_bytes()
+            + MAX_CKPT_TABLES
+                * crate::storage::MAX_VALUE_ENFORCERS
+                * core::mem::size_of::<ValueInstall>()
             + MANIFEST_BUF_BYTES
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
@@ -632,6 +646,9 @@ impl Checkpointer {
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
             pending_installs: Vec::with_capacity(MAX_CKPT_TABLES),
+            pending_value_installs: Vec::with_capacity(
+                MAX_CKPT_TABLES * crate::storage::MAX_VALUE_ENFORCERS,
+            ),
             merge_scratch: Vec::with_capacity(MERGE_SCRATCH_ENTRIES),
             roster_scratch: Vec::with_capacity(MAX_KEEP_BLOCKS),
             doomed_blocks: Vec::with_capacity(MAX_SWEEP_KEYS),
@@ -649,6 +666,7 @@ impl Checkpointer {
             sliced_this_sweep: vec![false; MAX_CKPT_TABLES],
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
+            value_writer: ValueIndexWriter::new(),
             merge_job: None,
             merge_done: None,
             merge_turn: false,
@@ -839,6 +857,12 @@ impl Checkpointer {
         let mut ssts: Vec<(String, usize, u64, u64, u32)> = Vec::new();
         // (mindex, list index, count, crc, handle) — the block-grid form.
         let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
+        let mut value_indexes: Vec<(
+            usize,
+            [u16; crate::storage::MAX_INDEX_COLS],
+            usize,
+            ValueIndexHandle,
+        )> = Vec::new();
         let mut saw_end = false;
 
         for line in lines {
@@ -1141,6 +1165,38 @@ impl Checkpointer {
                     };
                     bssts.push((mindex, idx, count, crc, handle));
                 }
+                Some("vix") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let mindex: usize = parse_field(words.next(), "vix table")?;
+                    let n_columns: usize = parse_field(words.next(), "vix columns")?;
+                    if n_columns == 0 || n_columns > crate::storage::MAX_INDEX_COLS {
+                        return Err(CheckpointSetupError::Corrupt("bad vix column count"));
+                    }
+                    let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+                    for column in columns.iter_mut().take(n_columns) {
+                        *column = parse_field(words.next(), "vix column")?;
+                    }
+                    let roster = parse_block_id(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("vix roster"))?,
+                    )?;
+                    let entries = parse_field(words.next(), "vix entries")?;
+                    let published_lsn = parse_field(words.next(), "vix lsn")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing vix fields"));
+                    }
+                    value_indexes.push((
+                        mindex,
+                        columns,
+                        n_columns,
+                        ValueIndexHandle {
+                            roster,
+                            entries,
+                            published_lsn,
+                        },
+                    ));
+                }
                 Some("view") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_legacy_view(storage, line)?;
@@ -1407,6 +1463,23 @@ impl Checkpointer {
                         Some(hex) => decode_hex_name(hex)?,
                         None => "public".to_string(),
                     };
+                    let descending_mask: u16 = match words.next() {
+                        Some(mask) => parse_field(Some(mask), "idx descending mask")?,
+                        None => 0,
+                    };
+                    let nulls_first_mask: u16 = match words.next() {
+                        Some(mask) => parse_field(Some(mask), "idx nulls-first mask")?,
+                        None => 0,
+                    };
+                    if descending_mask >> n_cols != 0 || nulls_first_mask >> n_cols != 0 {
+                        return Err(CheckpointSetupError::Corrupt("bad index ordering mask"));
+                    }
+                    let mut descending = [false; crate::storage::MAX_INDEX_COLS];
+                    let mut nulls_first = [false; crate::storage::MAX_INDEX_COLS];
+                    for i in 0..n_cols {
+                        descending[i] = descending_mask & (1 << i) != 0;
+                        nulls_first[i] = nulls_first_mask & (1 << i) != 0;
+                    }
                     let slot = storage
                         .create_index(
                             crate::storage::IndexDef {
@@ -1414,6 +1487,8 @@ impl Checkpointer {
                                 name: sql_name(&name)?,
                                 table: sql_name(&table)?,
                                 columns,
+                                descending,
+                                nulls_first,
                                 n_cols,
                                 unique: unique != 0,
                                 live: true,
@@ -1518,6 +1593,32 @@ impl Checkpointer {
                     });
                 storage.set_spill_list(slot, &handles[..n]);
             }
+        }
+        // Named indexes are serialized after tables, so establish the final
+        // tuple-binding shape before attaching physical generations.
+        storage.rebuild_all_enforcers().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest value-index bindings rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+        for (mindex, columns, n_columns, handle) in value_indexes {
+            let slot =
+                slot_of
+                    .get(mindex)
+                    .copied()
+                    .flatten()
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "vix references unknown table",
+                    ))?;
+            storage
+                .install_value_binding(slot, &columns[..n_columns], Some(handle))
+                .map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!(
+                        "manifest value index rejected: {}",
+                        error.message.as_str()
+                    ))
+                })?;
         }
 
         storage
@@ -1761,6 +1862,7 @@ impl Checkpointer {
             self.sliced_generation.iter_mut().for_each(|g| *g = 0);
             self.sliced_this_sweep.iter_mut().for_each(|s| *s = false);
             self.pending_installs.clear();
+            self.pending_value_installs.clear();
         }
         for slot in 0..storage.table_count().min(MAX_CKPT_TABLES) {
             if !self.needs_slice(storage, slot) {
@@ -2162,6 +2264,37 @@ impl Checkpointer {
                     format_args!("dsst {slot} 0 0 0 - - -"),
                 )?;
             }
+            for binding in 0..storage.value_binding_count(slot) {
+                let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+                let handle = self
+                    .pending_value_installs
+                    .iter()
+                    .find(|install| {
+                        install.slot == slot
+                            && install.n_columns == n_columns
+                            && install.columns[..n_columns] == columns[..n_columns]
+                    })
+                    .and_then(|install| install.handle)
+                    .or_else(|| storage.value_binding_handle(slot, binding));
+                let Some(handle) = handle else { continue };
+                use core::fmt::Write;
+                let mut column_text = StackStr::<128>::new();
+                for column in &columns[..n_columns] {
+                    let _ = write!(column_text, "{column} ");
+                }
+                let mut roster = [0u8; 64];
+                handle.roster.write_key(&mut roster);
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "vix {slot} {n_columns} {}{} {} {}",
+                        column_text.as_str(),
+                        core::str::from_utf8(&roster).expect("hex"),
+                        handle.entries,
+                        handle.published_lsn,
+                    ),
+                )?;
+            }
         }
         // Views: `vw2 <hex-SELECT> <hex-schema> <hex-creation-path> <hex-name>`
         // (all hex, so every field survives the space-separated format; the
@@ -2332,7 +2465,8 @@ impl Checkpointer {
                 ),
             )?;
         }
-        // Indexes: `index <unique> <ncols> <c0..cN> <hex-name> <hex-table>`.
+        // Indexes: `idx <unique> <ncols> <c0..cN> <hex-name> <hex-table>
+        // <hex-schema> <descending-mask> <nulls-first-mask>`.
         for index in storage.live_indexes() {
             use core::fmt::Write;
             let mut columns = StackStr::<128>::new();
@@ -2351,16 +2485,24 @@ impl Checkpointer {
             for b in index.schema.as_str().as_bytes() {
                 let _ = write!(hschema, "{b:02x}");
             }
+            let mut descending_mask = 0u16;
+            let mut nulls_first_mask = 0u16;
+            for i in 0..index.n_cols {
+                descending_mask |= u16::from(index.descending[i]) << i;
+                nulls_first_mask |= u16::from(index.nulls_first[i]) << i;
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {}{} {} {}",
+                    "idx {} {} {}{} {} {} {} {}",
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
                     hex_name.as_str(),
                     htable.as_str(),
-                    hschema.as_str()
+                    hschema.as_str(),
+                    descending_mask,
+                    nulls_first_mask,
                 ),
             )?;
         }
@@ -2431,6 +2573,14 @@ impl Checkpointer {
             storage.clear_tombstones(slot);
         }
         self.pending_installs.clear();
+        for install in &self.pending_value_installs {
+            storage.install_value_binding(
+                install.slot,
+                &install.columns[..install.n_columns],
+                install.handle,
+            )?;
+        }
+        self.pending_value_installs.clear();
         // The completed merge is consumed with the installs — whether it
         // composed in or a collapse had superseded it, this publish settled
         // its fate either way.
@@ -2456,7 +2606,7 @@ impl Checkpointer {
                 e.message.as_str()
             );
         }
-        if let Err(e) = self.collect_block_garbage() {
+        if let Err(e) = self.collect_block_garbage(storage) {
             eprintln!(
                 "pos3ql: post-checkpoint block sweep failed ({}): {}",
                 e.sqlstate,
@@ -2479,6 +2629,8 @@ impl Checkpointer {
         slot: usize,
     ) -> Result<(), SqlError> {
         self.pending_installs.retain(|(s, _)| *s != slot);
+        self.pending_value_installs
+            .retain(|install| install.slot != slot);
         let mut base_list = self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
         // A completed paced merge is part of this publish's base before a
         // dirty table decides whether its new versions fit as a delta.
@@ -2680,6 +2832,59 @@ impl Checkpointer {
         if slot < self.prev_scratch.len() {
             self.prev_scratch[slot] = new_list;
         }
+        self.build_value_indexes(storage, slot)?;
+        Ok(())
+    }
+
+    /// Rebuilds each distinct constrained/named tuple as a compact key-only
+    /// generation. This is deliberately a full logical rebuild: stale keys
+    /// disappear at every publish, while publication remains atomic with the
+    /// row generation through the same manifest CAS.
+    fn build_value_indexes(&mut self, storage: &Storage, slot: usize) -> Result<(), SqlError> {
+        if storage.value_binding_count(slot) == 0 {
+            return Ok(());
+        }
+        self.sst_arena.reset();
+        let key = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index key scratch"))?;
+        let published_lsn = storage.lsn();
+        for binding in 0..storage.value_binding_count(slot) {
+            if !storage.value_binding_is_committed(slot, binding) {
+                continue;
+            }
+            self.value_writer.reset();
+            storage.for_each_row_state(slot, &mut |rowid, state| {
+                use core::ops::ControlFlow;
+                let Some(home) = state.committed else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                let (key_len, hash) =
+                    storage.encode_value_binding_key(slot, binding, rowid, home, key)?;
+                self.value_writer
+                    .append(
+                        &mut *self.blocks.borrow_mut(),
+                        hash,
+                        rowid,
+                        state.committed_lsn,
+                        &key[..key_len],
+                    )
+                    .map_err(value_index_to_sql)?;
+                Ok(ControlFlow::Continue(()))
+            })?;
+            let handle = self
+                .value_writer
+                .finish(&mut *self.blocks.borrow_mut(), published_lsn)
+                .map_err(value_index_to_sql)?;
+            let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+            self.pending_value_installs.push(ValueInstall {
+                slot,
+                columns,
+                n_columns,
+                handle,
+            });
+        }
         Ok(())
     }
 
@@ -2689,7 +2894,7 @@ impl Checkpointer {
     /// else under the prefix is an orphan from a superseded checkpoint or an
     /// interrupted write, and is deleted. Overflow defers to the next sweep
     /// rather than deleting anything live.
-    fn collect_block_garbage(&mut self) -> Result<(), SqlError> {
+    fn collect_block_garbage(&mut self, storage: &Storage) -> Result<(), SqlError> {
         self.roster_scratch.clear();
         self.sst_arena.reset();
         let scratch = self
@@ -2734,6 +2939,36 @@ impl Checkpointer {
                 let mut id = [0u8; 32];
                 id.copy_from_slice(id_bytes);
                 self.roster_scratch.push(BlockId(id));
+            }
+        }
+        for slot in 0..storage.table_count() {
+            for binding in 0..storage.value_binding_count(slot) {
+                let Some(handle) = storage.value_binding_handle(slot, binding) else {
+                    continue;
+                };
+                let complete = crate::store::walk_value_roster(
+                    &mut *self.blocks.borrow_mut(),
+                    handle.roster,
+                    scratch,
+                    |id| {
+                        if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
+                            return false;
+                        }
+                        self.roster_scratch.push(id);
+                        true
+                    },
+                )
+                .map_err(|error| {
+                    sql_err!(
+                        SQLSTATE_IO,
+                        "corrupt persistent value-index roster: {:?}",
+                        error
+                    )
+                })?;
+                if !complete {
+                    eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
+                    return Ok(());
+                }
             }
         }
         self.doomed_blocks.clear();
@@ -2823,6 +3058,10 @@ fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
 
 fn sst_to_sql(e: crate::store::SstError) -> SqlError {
     sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", e)
+}
+
+fn value_index_to_sql(error: impl core::fmt::Debug) -> SqlError {
+    sql_err!(SQLSTATE_IO, "persistent value-index write: {:?}", error)
 }
 
 fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {

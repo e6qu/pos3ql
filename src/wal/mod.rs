@@ -183,6 +183,8 @@ pub enum WalOp<'a> {
         name: &'a str,
         table: &'a str,
         columns: [u16; MAX_INDEX_COLS],
+        descending: [bool; MAX_INDEX_COLS],
+        nulls_first: [bool; MAX_INDEX_COLS],
         n_cols: usize,
         unique: bool,
     },
@@ -713,7 +715,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateIndex { schema, name, table, n_cols, .. } => {
-            1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2 + 1 + schema.len()
+            1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2 + 1 + schema.len() + 1 + n_cols
         }
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::SequenceSet { schema, table, .. } => {
@@ -923,7 +925,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::DropView { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
-        WalOp::CreateIndex { schema, name, table, columns, n_cols, unique } => {
+        WalOp::CreateIndex {
+            schema,
+            name,
+            table,
+            columns,
+            descending,
+            nulls_first,
+            n_cols,
+            unique,
+        } => {
             let mut ok = name_bytes(buffer, name)
                 && name_bytes(buffer, table)
                 && buffer.append(&[u8::from(*unique), *n_cols as u8]);
@@ -931,6 +942,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&c.to_le_bytes());
             }
             ok &= name_bytes(buffer, schema);
+            ok &= buffer.append(&[0xa1]);
+            for i in 0..*n_cols {
+                ok &= buffer.append(&[u8::from(descending[i]) | (u8::from(nulls_first[i]) << 1)]);
+            }
             ok
         }
         WalOp::DropIndex { schema, name } => {
@@ -1487,11 +1502,30 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 2;
             }
             let schema = if at < payload.len() { take_name(&mut at)? } else { "public" };
+            let mut descending = [false; MAX_INDEX_COLS];
+            let mut nulls_first = [false; MAX_INDEX_COLS];
+            if at < payload.len() {
+                if *payload.get(at)? != 0xa1 {
+                    return None;
+                }
+                at += 1;
+                for i in 0..n_cols {
+                    let flags = *payload.get(at)?;
+                    at += 1;
+                    if flags & !0b11 != 0 {
+                        return None;
+                    }
+                    descending[i] = flags & 1 != 0;
+                    nulls_first[i] = flags & 2 != 0;
+                }
+            }
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 schema,
                 name,
                 table,
                 columns,
+                descending,
+                nulls_first,
                 n_cols,
                 unique,
             })
@@ -2175,6 +2209,33 @@ mod tests {
         // Appending continues after the replayed tail.
         wal.append(10, &WalOp::DropTable { schema: "public", name: "u" }).unwrap();
         wal.commit();
+    }
+
+    #[test]
+    fn legacy_index_payload_defaults_to_ascending_nulls_last() {
+        let payload = [
+            1, b'u', 1, b't', 1, 2, 0, 0, 1, 0, 6, b'p', b'u', b'b', b'l', b'i', b'c',
+        ];
+        let Some(WalOp::CreateIndex {
+            schema,
+            name,
+            table,
+            columns,
+            descending,
+            nulls_first,
+            n_cols,
+            unique,
+        }) = decode_op(KIND_CREATE_INDEX, &payload)
+        else {
+            panic!("legacy CREATE INDEX payload must decode");
+        };
+        assert_eq!(schema, "public");
+        assert_eq!(name, "u");
+        assert_eq!(table, "t");
+        assert_eq!(&columns[..n_cols], [0, 1]);
+        assert!(unique);
+        assert!(!descending[..n_cols].iter().any(|direction| *direction));
+        assert!(!nulls_first[..n_cols].iter().any(|placement| *placement));
     }
 
     #[test]

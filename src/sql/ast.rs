@@ -148,11 +148,11 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
-    /// CREATE [UNIQUE] INDEX name ON table (col, ...).
+    /// CREATE [UNIQUE] INDEX name ON table (col [ASC|DESC] [NULLS ...], ...).
     CreateIndex {
         name: &'a str,
         table: QualName<'a>,
-        columns: &'a [&'a str],
+        columns: &'a [IndexColumn<'a>],
         unique: bool,
     },
     /// DROP INDEX [IF EXISTS] name.
@@ -261,6 +261,15 @@ pub enum Stmt<'a> {
         role: &'a str,
         if_exists: bool,
     },
+}
+
+/// One btree index key. PostgreSQL's defaults depend on direction: ascending
+/// keys put NULLs last, descending keys put them first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexColumn<'a> {
+    pub name: &'a str,
+    pub descending: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

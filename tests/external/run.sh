@@ -31,7 +31,7 @@ FAIL=0
 #   proto      psql golden files, protocol versions, raw wire probes,
 #              the psycopg driver suite and the \copy round trip
 #   dur        durability cycles on the main server: kill -9 recovery,
-#              async WAL rebuild, commit-durable-on-bucket, cold start
+#              durable WAL rebuild, commit-durable-on-bucket, cold start
 #   overlay    row-map pressure: 5000 rows through a 1024-entry map, plus
 #              value-indexed uniqueness enforcement across the spill boundary
 #   ingest     beyond-memtable ingest, paced compaction, cold starts
@@ -110,9 +110,7 @@ s3_prefix = run-$$/
 s3_access_key = minioadmin
 s3_secret_key = minioadmin
 wal_upload = on
-# The asynchronous posture, stated: this suite's async-WAL step tests the
-# drain path, and s3 = on now defaults to synchronous upload.
-wal_upload_sync = off
+wal_upload_sync = on
 sql_arena_bytes = 4MiB
 wal_buffer_bytes = 4MiB
 max_tables = 64
@@ -121,7 +119,7 @@ table_rows = 32768
 # streaming read path is a later stage); size it for the spilled dataset.
 work_arena_bytes = 192MiB
 # Smaller than one committed WAL batch can be (wal_buffer is 4MiB): the
-# async-WAL recovery below proves segments larger than the response buffer
+# object-WAL recovery below proves segments larger than the response buffer
 # stream back in ranged windows.
 s3_response_bytes = 256KiB
 EOF
@@ -224,11 +222,9 @@ step "durability: kill -9, restart, data intact"
   -c "INSERT INTO crashy_enum VALUES (1,'happy',ARRAY['happy','ok']::crashy_mood[]),(2,'sad',ARRAY['sad']::crashy_mood[])" \
   -c "ALTER TYPE crashy_mood RENAME VALUE 'happy' TO 'glad'" \
   -c "ALTER TYPE crashy_mood RENAME TO crashy_feeling"
-# With asynchronous wal_upload, a commit is durable on local disk immediately
-# but its S3 upload drains just after; a trailing query plus a short pause lets
-# that drain reach MinIO before the abrupt kill, so the later disk-wipe steps
-# (which recover from the bucket) are deterministic. Local recovery below does
-# not depend on this — it replays the on-disk journal.
+# WAL upload is synchronous in durable mode. The trailing query still gives
+# the event loop an ordinary turn before this broader crash/restart fixture;
+# local recovery below replays the on-disk journal.
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q -c "SELECT 1" >/dev/null
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
@@ -293,15 +289,12 @@ cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -q \
 [[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive restart" \
   || bad "comments after restart: '$cmt'"
 
-step "async WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WAL"
-# wal_upload = on with the asynchronous drain stated (wal_upload_sync = off —
-# synchronous is the default now). Commit without any
-# CHECKPOINT, then destroy the local disk: recovery must come entirely from the
-# WAL segments the async drain uploaded to MinIO. A trailing SELECT plus a short
-# pause guarantees the event loop has drained the commit's segment to the bucket.
+step "durable WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WAL"
+# Commit without any CHECKPOINT, then destroy the local disk: recovery must
+# come entirely from WAL segments synchronously acknowledged by MinIO.
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -q \
   -c "CREATE TABLE waltest (id int, v text)" \
-  -c "INSERT INTO waltest VALUES (10,'async-a'),(20,'async-b'),(30,'async-c')"
+  -c "INSERT INTO waltest VALUES (10,'durable-a'),(20,'durable-b'),(30,'durable-c')"
 # One commit whose WAL batch (~600 KiB of row images, within the statement
 # arena) exceeds the 256 KiB response buffer: its uploaded segment must
 # still replay, in ranged windows, after the wipe.
@@ -318,7 +311,7 @@ for i in {1..50}; do
   sleep 0.1
 done
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U ext -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
-[[ "$out" == "async-a,async-b,async-c|600" ]] && ok "async WAL upload recovers from MinIO (segments beyond the response buffer)" || bad "async WAL recovery: '$out'"
+[[ "$out" == "durable-a,durable-b,durable-c|600" ]] && ok "durable WAL upload recovers from MinIO (segments beyond the response buffer)" || bad "durable WAL recovery: '$out'"
 
 step "commit-durable-on-bucket by default: ack, kill -9 at once, wipe, cold start"
 # A config that says nothing but `s3 = on` gets the plan-of-record posture:
@@ -733,7 +726,7 @@ s3_prefix = spilldiff-$$/
 s3_access_key = minioadmin
 s3_secret_key = minioadmin
 wal_upload = on
-wal_upload_sync = off
+wal_upload_sync = on
 work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then
     ok "forced-spill differential ($(grep -c '^PASS' "$WORK/spilldiff.out") corpora)"
   else

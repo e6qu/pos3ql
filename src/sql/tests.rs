@@ -2603,11 +2603,23 @@ fn indexes_survive_restart() {
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (a int, b int)");
         run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1),(1,2)");
-        run_with(&mut e, &mut budget, "CREATE UNIQUE INDEX u ON t(a,b)");
+        run_with(
+            &mut e,
+            &mut budget,
+            "CREATE UNIQUE INDEX u ON t(a DESC NULLS LAST,b ASC NULLS FIRST)",
+        );
         e.commit_wal();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'u'"
+        )),
+        ["CREATE UNIQUE INDEX u ON public.t USING btree (a DESC NULLS LAST, b NULLS FIRST)"]
+    );
     // The UNIQUE index survived: a conflicting insert is rejected.
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1)"))
@@ -7206,6 +7218,27 @@ fn create_index_and_unique() {
         )),
         ["1|1|10", "1|2|20", "2|1|30"]
     );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE INDEX ordered ON t(c DESC NULLS LAST, b ASC NULLS FIRST)",
+    );
+    let ordered = e
+        .storage
+        .indexes_for("public", "t", 0)
+        .find(|index| index.name.as_str() == "ordered")
+        .expect("ordered index catalog row");
+    assert_eq!(&ordered.columns[..2], &[2, 1]);
+    assert_eq!(&ordered.descending[..2], &[true, false]);
+    assert_eq!(&ordered.nulls_first[..2], &[false, true]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'ordered'"
+        )),
+        ["CREATE INDEX ordered ON public.t USING btree (c DESC NULLS LAST, b NULLS FIRST)"]
+    );
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT a,b FROM t WHERE c=20")),
         ["1|2"]
@@ -7244,6 +7277,38 @@ fn create_index_and_unique() {
     let out = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,7)"))
         .to_string();
     assert!(!out.contains("23505"), "constraint should be gone: {out}");
+}
+
+#[test]
+fn joins_are_not_capped_at_eight_edges() {
+    let mut config = test_config("wide-join");
+    config.max_tables = 16;
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for table in 0..10 {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("CREATE TABLE j{table} (id int); INSERT INTO j{table} VALUES (1)"),
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "table {table}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let mut sql = String::from("SELECT j0.id FROM j0");
+    for table in 1..10 {
+        use core::fmt::Write;
+        let _ = write!(sql, " JOIN j{table} ON j{table}.id = j0.id");
+    }
+    let output = run_with(&mut engine, &mut budget, &sql);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["1"]);
 }
 
 #[test]
@@ -7661,7 +7726,7 @@ fn repeatable_read_retains_committed_row_history() {
         &mut engine,
         &mut budget,
         &mut writer,
-        "UPDATE snapshot_rows SET value = 'after' WHERE id = 1",
+        "UPDATE snapshot_rows SET id = 2, value = 'after' WHERE id = 1",
     );
     assert_eq!(
         data_rows(&run_with_txn_bytes(
@@ -7687,7 +7752,7 @@ fn repeatable_read_retains_committed_row_history() {
             &mut engine,
             &mut budget,
             &mut writer,
-            "SELECT value FROM snapshot_rows WHERE id = 1",
+            "SELECT value FROM snapshot_rows WHERE id = 2",
         )),
         ["after"]
     );
@@ -7709,6 +7774,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.wal_upload_buffer_bytes = 256 * 1024;
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
+    config.value_index_rows = 1;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 28);
@@ -7725,7 +7791,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         &mut engine,
         &mut budget,
         &mut writer,
-        "INSERT INTO snapshot_rows VALUES (1, 'before'), (2, 'remove-me')",
+        "INSERT INTO snapshot_rows VALUES (1, 'before'), (2, 'remove-me'), (3, 'keep-me')",
     );
     assert!(engine.checkpoint().unwrap());
     run_txn(
@@ -7741,7 +7807,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
             &mut reader,
             "SELECT value FROM snapshot_rows ORDER BY id",
         )),
-        ["before", "remove-me"]
+        ["before", "remove-me", "keep-me"]
     );
     // Cross both the resident history bound and the immutable-SST list bound.
     // Every checkpoint must be free to publish and compact while the old
@@ -7775,7 +7841,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
                 &mut reader,
                 "SELECT value FROM snapshot_rows ORDER BY id",
             )),
-            ["before", "remove-me"],
+            ["before", "remove-me", "keep-me"],
             "version {version} must preserve the object-resident snapshot"
         );
     }
@@ -7786,7 +7852,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
             &mut reader,
             "SELECT value FROM snapshot_rows ORDER BY id",
         )),
-        ["before", "remove-me"],
+        ["before", "remove-me", "keep-me"],
         "compaction must retain both an overwritten row and a deleted row at the pinned snapshot"
     );
     run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
@@ -7797,10 +7863,112 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
             &mut writer,
             "SELECT id, value FROM snapshot_rows ORDER BY id",
         )),
-        ["1|after-24"],
+        ["1|after-24", "3|keep-me"],
         "the current snapshot must honor the tombstone and newest version"
     );
     engine.checkpoint().unwrap();
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let restarted_slot = restarted
+        .storage
+        .find_table("public", "snapshot_rows")
+        .unwrap();
+    assert!(
+        !restarted.storage.value_cache_complete(restarted_slot, &[0])
+            && restarted.storage.value_probe_complete(restarted_slot, &[0]),
+        "cold recovery must attach the durable generation even when the one-row RAM cache is incomplete"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id, value FROM snapshot_rows WHERE id = 1 ORDER BY id",
+        )),
+        ["1|after-24"],
+        "a cold RAM-and-disk cache must recover the authoritative object-store index generation"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM snapshot_rows WHERE id >= 1 ORDER BY id",
+        )),
+        ["1", "3"],
+        "range predicates must consume the recovered key generation"
+    );
+    let duplicate = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO snapshot_rows VALUES (1, 'duplicate')",
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate).contains("23505"),
+        "an incomplete one-entry RAM cache must enforce uniqueness through the durable index"
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn checkpoint_waits_for_transactional_schema_wal_before_publishing() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("object-ddl-gate-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-object-ddl-gate-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.block_cache_bytes = 512 * 1024;
+    config.disk_cache_bytes = 1 << 20;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE indexed_rows (id int, value text)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO indexed_rows VALUES (1, 'one'), (2, 'two')",
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE UNIQUE INDEX indexed_rows_id ON indexed_rows(id DESC NULLS LAST)",
+    );
+    let blocked = engine.checkpoint().unwrap_err();
+    assert_eq!(
+        blocked.sqlstate,
+        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+    );
+    assert!(
+        blocked
+            .message
+            .as_str()
+            .contains("uncommitted schema changes")
+    );
+    assert!(engine.maybe_checkpoint());
+    run_txn(&mut engine, &mut budget, &mut transaction, "COMMIT");
+    assert!(engine.checkpoint().unwrap());
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -7810,11 +7978,16 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT id, value FROM snapshot_rows ORDER BY id",
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'indexed_rows_id'"
         )),
-        ["1|after-24"],
-        "a cold RAM-and-disk cache must recover the authoritative object-store generation"
+        ["CREATE UNIQUE INDEX indexed_rows_id ON public.indexed_rows USING btree (id DESC NULLS LAST)"]
     );
+    let duplicate = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO indexed_rows VALUES (1, 'duplicate')",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
     drop(restarted);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

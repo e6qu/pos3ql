@@ -30,19 +30,29 @@ except ImportError:
     print("psycopg not installed; skipping slt_diff", file=sys.stderr)
     sys.exit(0)
 
-# pos3ql SQLSTATEs that mean "this is outside our implemented subset",
-# not "your query is wrong". A PostgreSQL success against one of these is a
-# documented gap, not a divergence.
-UNSUPPORTED_STATES = {
-    "0A000",  # feature_not_supported
-    "42601",  # syntax_error (grammar we don't parse yet)
-    "42P01",  # undefined_table (cascades from an earlier unsupported CREATE)
-    "42883",  # undefined_function
-    "42704",  # undefined_object (e.g. a type we lack)
-    "42846",  # cannot_coerce
-    "54000",  # program_limit_exceeded (fixed arenas)
-    "22023",  # invalid_parameter_value (some unsupported options)
-}
+def is_unsupported(result):
+    """Classify only errors that explicitly identify an absent feature/bound.
+
+    SQLSTATE alone is too broad: ordinary syntax mistakes, missing tables, bad
+    casts, and invalid values are fidelity divergences when PostgreSQL accepts
+    the statement. Keeping those out of this bucket prevents a real regression
+    from being laundered into the unsupported ratchet.
+    """
+    if result[0] != "err":
+        return False
+    state = result[1]
+    message = result[2].lower() if len(result) > 2 else ""
+    if state == "0A000":
+        return True
+    if state in {"42883", "42704"}:
+        return True
+    if state == "42601":
+        return "not supported" in message or "fixed limit" in message
+    if state == "54000":
+        return any(word in message for word in ("limit", "arena", "full", "exhausted"))
+    if state == "22023":
+        return "not supported" in message
+    return False
 
 
 class Block:
@@ -205,12 +215,13 @@ def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist,
     created = set()
     for b in blocks:
         created.update(table_names(b.sql))
-    for name in created:
-        for cur in (pg, p3):
-            try:
-                cur.execute(f"DROP TABLE IF EXISTS {name}")
-            except psycopg.Error:
-                pass
+
+    def cleanup():
+        for name in created:
+            for cur in (pg, p3):
+                cur.execute(f"DROP TABLE IF EXISTS {name} CASCADE")
+
+    cleanup()
 
     # Query-block sharding, to balance the read-only bulk across parallel CI
     # jobs while every shard runs all the (cheap, state-building) statement
@@ -235,7 +246,7 @@ def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist,
         if pg_res[0] == "err" and p3_res[0] == "err":
             if pg_res[1] == p3_res[1]:
                 stats["match"] += 1
-            elif p3_res[1] in UNSUPPORTED_STATES:
+            elif is_unsupported(p3_res):
                 stats["unsupported"] += 1
                 key = f"{p3_res[1]} {p3_res[2] if len(p3_res) > 2 else ''}"
                 unsupp_hist[key] = unsupp_hist.get(key, 0) + 1
@@ -247,7 +258,7 @@ def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist,
 
         # PG ok, pos3ql errored.
         if pg_res[0] == "ok" and p3_res[0] == "err":
-            if p3_res[1] in UNSUPPORTED_STATES:
+            if is_unsupported(p3_res):
                 stats["unsupported"] += 1
                 key = f"{p3_res[1]} {p3_res[2] if len(p3_res) > 2 else ''}"
                 unsupp_hist[key] = unsupp_hist.get(key, 0) + 1
@@ -269,6 +280,10 @@ def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist,
         else:
             stats["divergence"] += 1
             record(divergences, path, b, pg_res, p3_res, max_print)
+    # A file is a self-contained SQLLogicTest database. Reclaim its catalog
+    # slots as well as its names so the next file cannot inherit capacity or
+    # dependency failures from this one.
+    cleanup()
     return stats
 
 

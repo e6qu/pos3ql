@@ -37,7 +37,7 @@ acknowledged data in durable mode.
 | P6 | Driver compatibility | Extended query protocol incl. binary parameters, named statements/portals; functions & aggregates; psycopg 3 suite passes | **done** (`pg_catalog` tables themselves still absent) |
 | P7 | Object storage is the database | CHECKPOINT + auto-checkpoint snapshot SSTs + CAS'd manifest; cold start from a wiped disk; WAL truncation; heap compaction; object GC | **done** (snapshot model — see "Deviations") |
 | P8 | External conformance suite | psql 18 golden tests (dialect, SQLSTATEs, extended), raw wire probes, psycopg, durability + cold-start scenarios; 12/12 pass | **done** |
-| P9 | Transactions | BEGIN/COMMIT/ROLLBACK, READ COMMITTED and REPEATABLE READ snapshots, READ ONLY enforcement, commit-LSN-keyed row versions in resident staging and object SSTs with fail-fast 40001 conflicts, WAL-batch-at-commit, transactional DDL | **done** |
+| P9 | Transactions | BEGIN/COMMIT/ROLLBACK, READ COMMITTED, REPEATABLE READ, and SERIALIZABLE snapshots, READ ONLY enforcement, commit-LSN-keyed row versions in resident staging and object SSTs, waitable writer/catalog/row/table locks with deadlock detection, WAL-batch-at-commit, transactional DDL | **done** |
 | P10 | VSR multi-replica | Sans-io Replica state machine (normal op + view change), TCP transport (`vsr::cluster`), wire codec; 3-node cluster replicates and fails over | **done** (live psql write-routing into the cluster is the remaining productionization step) |
 | P11 | VOPR hardening | Deterministic whole-cluster simulator (`sim`) with loss/reorder/dup/delay/crash/partition; found and fixed two real consensus bugs (B-009, B-010); reproducible from a seed | **done** |
 | P12 | Compatibility polish | SCRAM-SHA-256 + cleartext auth, GROUP BY/HAVING/joins/subqueries, `pg_catalog` + `information_schema`, binary result format, portal max_rows, NOTICE, more types (date/timestamp/uuid/bytea), differential suite vs real PostgreSQL 18. | **done** (the TLS decision, deferred here, was later resolved in Stage G: isolated rustls to the object store) |
@@ -491,7 +491,9 @@ and release their bounded resident staging histories after the manifest makes th
 versions object-resident. Point probes and merged walks use the same snapshot rule.
 Paced compaction keeps every version newer than the oldest live snapshot plus its
 one visible baseline, and may discard older versions only after that watermark
-advances. A second writer still fails fast (`40001`).
+advances. A second writer parks on the bounded wait graph, then re-evaluates at
+READ COMMITTED after the owner commits or rolls back; a cycle selects a 40P01
+deadlock victim.
 
 **Milestone:** concurrent sessions show identical snapshot semantics whether data
 is in RAM or on the bucket; update churn and snapshot duration consume immutable
@@ -557,10 +559,11 @@ outages by removing old uniqueness-index entries by row identity.
 **Stage F core is complete for the current materialized execution model.**
 Stage I's future suspendable row source must register its longer-lived read in
 this same snapshot registry and unregister it only when the portal is exhausted
-or closed; it must not introduce a second retention mechanism. SERIALIZABLE
-predicate/range conflict tracking and PostgreSQL's block-and-wait writer
-behavior remain separate concurrency-fidelity work, not storage-authority
-exceptions.
+or closed; it must not introduce a second retention mechanism. PostgreSQL
+block-and-wait writer behavior, row/table lock modes, deadlock detection, and a
+bounded relation-predicate SERIALIZABLE validator are now live in the
+concurrency slice below. Finer predicate/range dependency tracking remains
+concurrency-fidelity work, not a storage-authority exception.
 
 ### Stage G — object-store client hardening & multi-provider reach
 
@@ -784,16 +787,58 @@ and view expansions, spool through that interface. The cold-cache regression
 composes a 1.5 MiB child materialization with a parent external sort and a
 retaining CREATE TABLE AS consumer under a 512 KiB work arena.
 
+Set-operation multisets now use the same encoded-run seam. UNION ALL retains
+left-to-right append order when no final ordering is requested; UNION,
+INTERSECT, and EXCEPT merge sorted equal runs with their DISTINCT/ALL
+multiplicities; a trailing ORDER BY/LIMIT/OFFSET/WITH TIES streams a final run.
+INSERT, CTAS, and other row-source consumers receive the run through a
+higher-ranked callback rather than rebuilding it in the statement arena. A
+small object-store simulator regression covers all three combining families
+and observes both GETs and PUTs.
+
 The durable authority remains the provider-neutral object contract: query code
 does not know whether its blocks reach S3, MinIO, Google Cloud Storage, Azure
 Blob Storage, or another adapter. RAM and disk cache those same content-addressed
 blocks and may disappear at any point between statements. The remaining B-006
 work is to give grouped aggregates (including DISTINCT/ordered collectors),
-set operations, windows, scalar/list subquery results, recursive/lateral row
-sources, and outer-join match state bounded run-native representations. Pillar
-2 must then make the cursor suspendable around a fixed in-flight GET pool;
-pillars 3–4 batch expression evaluation and introduce PAX column-range late
-materialization.
+windows, scalar/list subquery results, recursive/lateral row sources, and
+outer-join match state bounded run-native representations. Pillar 2 must then
+make the cursor suspendable around a fixed in-flight GET pool; pillars 3–4
+batch expression evaluation and introduce PAX column-range late materialization.
+
+**Concurrency-fidelity slice (2026-07-30).** Execution now has a first-class
+blocked result instead of converting contention to 40001 or blocking the
+single-threaded reactor. Simple-query messages retain their frontend bytes and
+completed-statement index; extended Execute retains its portal/message state.
+A startup-bounded lock registry and wait-for graph carry stable
+`(table slot, rowid)` identities through joins and hidden columns in both arena
+and object-backed query runs. The four row lock strengths, `OF`, NOWAIT, and
+SKIP LOCKED implement PostgreSQL's compatibility and paging behavior. UPDATE,
+DELETE, pending unique-key writers, DDL/schema waits, and all eight `LOCK TABLE`
+modes use the same graph. Ordinary scans, DML, COPY, TRUNCATE, VACUUM, and
+ANALYZE acquire their PostgreSQL relation modes before observable work.
+Per-mode acquisition stamps preserve incomparable table modes and let
+`ROLLBACK TO SAVEPOINT` release exactly the table and row locks its
+subtransaction acquired. Transaction end advances a generation and retries
+parked peers, while a cycle raises 40P01 and immediately releases the victim.
+Nonzero `lock_timeout` values are active deadlines, not merely observable
+session text: the nearest parked deadline participates in the reactor poll,
+and expiry replays the retained message once before returning PostgreSQL's
+55P03 and rewinding the failed statement's locks and state. This timer lives in
+fixed per-connection protocol state and does not add a thread, heap allocation,
+or storage-provider dependency.
+
+Every execution captures a statement undo mark before it can wait. A wait
+rewinds row images, catalog/statistics undo, WAL staging, notifications, and
+LISTEN changes while retaining transaction locks, so replay cannot duplicate a
+partially executed multi-row statement. Locking SELECT performs its complete
+row-lock pass before serializing rows, and every SELECT preflights relation
+locks before RowDescription, preventing a late wait from leaking a partial
+result. SERIALIZABLE is now a pinned-snapshot mode with a
+startup-bounded relation-predicate validation registry; the write-skew
+regression aborts with 40001 at commit. More granular predicate/range
+dependencies remain part of the final PostgreSQL-fidelity work, not an excuse
+to move durable state outside the common block store.
 
 ### First slice (de-risks the whole plan)
 

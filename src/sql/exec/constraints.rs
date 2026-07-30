@@ -213,7 +213,7 @@ fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> Result<bool,
 
 /// The shared uniqueness enforcement for one key (a single-column flag, a
 /// table-level key, or a unique index). Committed collisions raise 23505; a
-/// collision against another transaction's pending image raises 40001. The
+/// collision against another transaction's pending image waits for it. The
 /// committed side is served by the value index when the table carries an
 /// enforcer for these columns (an O(1) probe), falling back to a full scan
 /// otherwise; the pending side is always a bounded scan of the resident overlay
@@ -325,7 +325,7 @@ fn committed_scan_uniqueness(
 /// committed. All pending rows stay in the overlay map (eviction only drops
 /// committed-spilled, pending-free entries), so this scan is bounded by the
 /// overlay, never the spilled dataset. A pending collision from another
-/// transaction is 40001; from this one, 23505.
+/// transaction parks behind its owner; from this one, it is 23505.
 #[allow(clippy::too_many_arguments)]
 fn pending_scan_uniqueness(
     storage: &Storage,
@@ -355,9 +355,10 @@ fn pending_scan_uniqueness(
         })?;
         if matched {
             if pending.txid != txid {
+                storage.wait_for_transaction(txid, pending.txid)?;
                 return Err(sql_err!(
-                    sqlstate::SERIALIZATION_FAILURE,
-                    "could not serialize access due to concurrent update"
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "statement is waiting for a concurrent unique-key writer"
                 ));
             }
             return Err(unique_violation(def, name));
@@ -464,7 +465,7 @@ fn check_index_tuple_sizes(
 
 /// Enforces every UNIQUE index on the table: a candidate row conflicts if some
 /// other visible row has an equal, all-non-NULL tuple over the index columns
-/// (23505; a conflicting uncommitted row from another transaction is 40001).
+/// (23505; a conflicting uncommitted row from another transaction waits).
 /// Named indexes share the same bounded acceleration cache as table
 /// constraints. CREATE INDEX validates against authoritative rows before its
 /// pending cache binding is prepared, and subsequent writes may use that

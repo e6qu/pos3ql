@@ -155,6 +155,10 @@ pub mod sqlstate {
     pub const GENERATED_ALWAYS: &str = "428C9";
     pub const INVALID_USE_OF_ESCAPE_CHARACTER: &str = "2200C";
     pub const LOCK_NOT_AVAILABLE: &str = "55P03";
+    pub const DEADLOCK_DETECTED: &str = "40P01";
+    /// Private control-flow sentinel. The wire layer must park the connection
+    /// and must never serialize this as an ErrorResponse.
+    pub(crate) const INTERNAL_LOCK_WAIT: &str = "PZ001";
     pub const NAME_TOO_LONG: &str = "42622";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";

@@ -1146,11 +1146,21 @@ pub fn drop_table(
                 ));
             }
             Some(crate::storage::ResolvedRelation::Table(index)) => {
+                if let Err(error) = storage.lock_table(
+                    txn.txid,
+                    index,
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
                 if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
-                    let _ = other;
+                    if let Err(error) = storage.wait_for_transaction(txn.txid, other) {
+                        return sql_fail(error);
+                    }
                     return sql_fail(sql_err!(
-                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                        "could not serialize access due to concurrent DDL on \"{}\"",
+                        crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                        "statement is waiting for concurrent DDL on \"{}\"",
                         name.name
                     ));
                 }
@@ -2271,10 +2281,12 @@ pub fn drop_schema(
             }
             SchemaObject::Table(t) => {
                 if let Some(other) = storage.table(*t).ddl_locked_by_other(txn.txid) {
-                    let _ = other;
+                    if let Err(error) = storage.wait_for_transaction(txn.txid, other) {
+                        return sql_fail(error);
+                    }
                     return sql_fail(sql_err!(
-                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
-                        "could not serialize access due to concurrent DDL on \"{}\"",
+                        crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                        "statement is waiting for concurrent DDL on \"{}\"",
                         storage.table_def(*t, txn.txid).name.as_str()
                     ));
                 }
@@ -5794,6 +5806,14 @@ pub fn create_index(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::Share,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let tdef = *storage.table_def(table_index, txn.txid);
     if index_columns.is_empty() || index_columns.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
@@ -7311,6 +7331,14 @@ pub fn merge(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::RowExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let def = *storage.table_def(table_index, txn.txid);
     let target_alias = statement.target_alias.unwrap_or(statement.target.name);
     let source_alias = statement
@@ -7831,6 +7859,14 @@ pub fn insert(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::RowExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let def = *storage.table_def(table_index, txn.txid);
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
@@ -8479,6 +8515,14 @@ pub fn update(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::RowExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let def = *storage.table_def(table_index, txn.txid);
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
@@ -8564,6 +8608,47 @@ pub fn update(
     };
     if let Err(e) = collect {
         return sql_fail(e);
+    }
+
+    // PostgreSQL obtains a row lock before it computes or publishes any new
+    // image. Collecting all target rowids first makes a default wait
+    // suspendable without partially executing the statement.
+    let changes_key = targets[..statement.assignments.len()].iter().any(|&column| {
+        def.columns()[column].primary
+            || def.columns()[column].unique
+            || def
+                .uniques()
+                .iter()
+                .any(|constraint| constraint.columns().contains(&(column as u16)))
+            || storage
+                .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid)
+                .any(|index| index.columns[..index.n_cols].contains(&(column as u16)))
+    });
+    let lock_strength = if changes_key {
+        crate::sql::ast::LockStrength::Update
+    } else {
+        crate::sql::ast::LockStrength::NoKeyUpdate
+    };
+    for &(rowid, _) in scratch.iter() {
+        match storage.acquire_row_lock(
+            table_index,
+            rowid,
+            txn.txid,
+            lock_strength,
+            crate::sql::ast::LockWait::Wait,
+        ) {
+            Ok(crate::sql::lock::LockDecision::Acquired) => {}
+            Ok(crate::sql::lock::LockDecision::Waiting) => {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "statement is waiting for a row lock"
+                ));
+            }
+            Ok(crate::sql::lock::LockDecision::Skipped) => {
+                unreachable!("data modification does not request SKIP LOCKED")
+            }
+            Err(error) => return sql_fail(error),
+        }
     }
 
     if !statement.returning.is_empty() && !capturing {
@@ -8814,6 +8899,14 @@ pub fn delete(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::RowExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let def = *storage.table_def(table_index, txn.txid);
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -8867,6 +8960,27 @@ pub fn delete(
     };
     if let Err(e) = collect {
         return sql_fail(e);
+    }
+    for &(rowid, _) in scratch.iter() {
+        match storage.acquire_row_lock(
+            table_index,
+            rowid,
+            txn.txid,
+            crate::sql::ast::LockStrength::Update,
+            crate::sql::ast::LockWait::Wait,
+        ) {
+            Ok(crate::sql::lock::LockDecision::Acquired) => {}
+            Ok(crate::sql::lock::LockDecision::Waiting) => {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "statement is waiting for a row lock"
+                ));
+            }
+            Ok(crate::sql::lock::LockDecision::Skipped) => {
+                unreachable!("data modification does not request SKIP LOCKED")
+            }
+            Err(error) => return sql_fail(error),
+        }
     }
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -9038,6 +9152,19 @@ pub fn truncate(
         }
         if !grew {
             break;
+        }
+    }
+    // PostgreSQL acquires ACCESS EXCLUSIVE on the complete CASCADE closure
+    // before changing any row. Acquire the whole set before mutation so a
+    // wait can replay the statement without exposing a partial truncate.
+    for &table_index in &list[..n] {
+        if let Err(error) = storage.lock_table(
+            txn.txid,
+            table_index,
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        ) {
+            return sql_fail(error);
         }
     }
     // Remove every visible row, transactionally.
@@ -9394,9 +9521,19 @@ fn alter_table_inner(
             }
             _ => return sql_fail(undefined_qual(&statement.table)),
         };
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let def = *storage.table_def(table_index, txn.txid);
 
-    // Any in-flight change on this table blocks ALTER (fail fast).
+    // The ACCESS EXCLUSIVE acquisition above waits for ordinary readers and
+    // writers. This verifies the row-version invariant at the rewrite
+    // boundary as a corruption guard.
     if storage
         .table(table_index)
         .rows
@@ -10639,6 +10776,7 @@ fn collect_matches<'a>(
     scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<(), SqlError> {
     scratch.clear();
+    storage.record_serializable_read(txid, table_index);
     let def = storage.table_def(table_index, txid);
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
@@ -10687,6 +10825,7 @@ fn collect_join_matches<'a>(
     scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<(), SqlError> {
     scratch.clear();
+    storage.record_serializable_read(txid, table_index);
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
         let Some(loc) = storage.visible_row_home(table_index, rowid, state, txid)? else {

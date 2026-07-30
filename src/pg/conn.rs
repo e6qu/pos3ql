@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::mem::arena::Arena;
@@ -104,6 +105,15 @@ pub struct Conn {
     /// Negotiated protocol minor version (major is always 3).
     minor: u16,
     id: i32,
+    /// A simple-query message parked on a row lock remains at the front of
+    /// `recv`; completed statements in that message are not replayed.
+    parked: bool,
+    parked_generation: u64,
+    /// Absolute deadline for the current lock acquisition. `None` means
+    /// `lock_timeout = 0`; the reactor uses this to wake an otherwise idle
+    /// server and retry the retained frontend message as a timeout error.
+    parked_deadline: Option<Instant>,
+    resume_statement: usize,
     /// The live TLS session, once the handshake starts. All socket bytes for
     /// `recv`/`send` tunnel through it.
     tls: Option<crate::pg::tls::ServerSession>,
@@ -157,6 +167,10 @@ impl Conn {
             phase: Phase::Startup,
             minor: 0,
             id: 0,
+            parked: false,
+            parked_generation: 0,
+            parked_deadline: None,
+            resume_statement: 0,
             tls: None,
             pending_tls: None,
         })
@@ -188,6 +202,10 @@ impl Conn {
         self.phase = Phase::Startup;
         self.minor = 0;
         self.id = id;
+        self.parked = false;
+        self.parked_generation = 0;
+        self.parked_deadline = None;
+        self.resume_statement = 0;
         self.tls = None;
         self.pending_tls = None;
     }
@@ -245,6 +263,12 @@ impl Conn {
     ) -> After {
         if self.stream.is_none() {
             return After::Close;
+        }
+        if self.parked {
+            return match self.flush() {
+                Ok(()) => After::Continue,
+                Err(()) => After::Close,
+            };
         }
         let space = self.recv.writable();
         if space.is_empty() {
@@ -317,10 +341,59 @@ impl Conn {
             };
             match after {
                 Step::NeedMoreData => return After::Continue,
+                Step::Parked => return After::Continue,
                 Step::Continue => {}
                 Step::Close => return After::Close,
             }
         }
+    }
+
+    pub fn retry_parked(&mut self, engine: &mut Engine, generation: u64) -> After {
+        if !self.parked
+            || (self.parked_generation == generation && !self.lock_timeout_expired())
+        {
+            return After::Continue;
+        }
+        self.parked = false;
+        let after = match self.process_message(engine) {
+            Step::Close => After::Close,
+            Step::Continue | Step::NeedMoreData | Step::Parked => After::Continue,
+        };
+        match self.flush() {
+            Ok(()) => after,
+            Err(()) => After::Close,
+        }
+    }
+
+    pub(crate) fn lock_wait_remaining(&self) -> Option<Duration> {
+        if !self.parked {
+            return None;
+        }
+        self.parked_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn lock_timeout_expired(&self) -> bool {
+        self.parked_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn park_on_lock(&mut self, generation: u64) {
+        self.parked = true;
+        self.parked_generation = generation;
+        if self.parked_deadline.is_none() {
+            let timeout_ms = self.guc.lock_timeout_ms();
+            if timeout_ms != 0 {
+                self.parked_deadline =
+                    Instant::now().checked_add(Duration::from_millis(timeout_ms));
+            }
+        }
+    }
+
+    fn finish_lock_wait(&mut self) {
+        self.parked = false;
+        self.parked_generation = 0;
+        self.parked_deadline = None;
     }
 
     fn process_startup(
@@ -708,7 +781,7 @@ impl Conn {
                 Step::Close
             }
         };
-        if !matches!(step, Step::Close) && msg_type != wire::FMSG_QUERY {
+        if !matches!(step, Step::Close | Step::Parked) && msg_type != wire::FMSG_QUERY {
             self.recv.consume(total);
         }
         step
@@ -1319,6 +1392,7 @@ impl Conn {
 
         if need_run {
             self.arena.reset();
+            let lock_timeout_expired = self.lock_timeout_expired();
             let portal = &mut self.portals[portal_slot];
             let prepared = &self.prepared[portal.statement];
             if !prepared.active {
@@ -1367,6 +1441,7 @@ impl Conn {
             // Paged execution goes through the portal's result buffer so
             // later Execute messages can continue draining it.
             let rfmt = portal.result_formats;
+            let send_mark = self.send.mark();
             let result = if paged {
                 portal.result.clear();
                 let mut responder = Responder::for_execute(&mut portal.result, rfmt);
@@ -1380,6 +1455,7 @@ impl Conn {
                     &mut self.guc,
                     &mut responder,
                     self.id,
+                    lock_timeout_expired,
                 )
             } else {
                 let mut responder = Responder::for_execute(&mut self.send, rfmt);
@@ -1393,14 +1469,18 @@ impl Conn {
                     &mut self.guc,
                     &mut responder,
                     self.id,
+                    lock_timeout_expired,
                 )
             };
             engine.maybe_checkpoint();
             let pending_copy = engine.take_pending_copy();
             self.arena.reset();
             match result {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(crate::sql::ExtendedExecutionStatus::Complete(true)) => {
+                    self.finish_lock_wait();
+                }
+                Ok(crate::sql::ExtendedExecutionStatus::Complete(false)) => {
+                    self.finish_lock_wait();
                     if pending_copy.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
                     }
@@ -1415,6 +1495,15 @@ impl Conn {
                     }
                     self.phase = Phase::SkipToSync;
                     return Step::Continue;
+                }
+                Ok(crate::sql::ExtendedExecutionStatus::Blocked) => {
+                    if paged {
+                        self.portals[portal_slot].result.clear();
+                    } else {
+                        self.send.truncate_to(send_mark);
+                    }
+                    self.park_on_lock(engine.lock_generation());
+                    return Step::Parked;
                 }
                 Err(WireFull) => {
                     if pending_copy.is_some() {
@@ -1545,6 +1634,7 @@ impl Conn {
             let _ = stream.set_nonblocking(false);
         }
         let result = {
+            let lock_timeout_expired = self.lock_timeout_expired();
             let mut responder = Responder::new(&mut self.send);
             // Over TLS the drain must encrypt through the session onto the
             // blocking socket; in the clear it writes the fd directly.
@@ -1553,7 +1643,18 @@ impl Conn {
             } else if let Some(fd) = fd {
                 responder = responder.with_flush(fd);
             }
-            engine.execute_simple(text, &self.arena, &mut self.txn, &mut self.sqlprep, &mut self.cursors, &mut self.guc, &mut responder, self.id)
+            engine.execute_simple_from(
+                text,
+                self.resume_statement,
+                &self.arena,
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &mut self.guc,
+                &mut responder,
+                self.id,
+                lock_timeout_expired,
+            )
         };
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.set_nonblocking(true);
@@ -1564,7 +1665,9 @@ impl Conn {
         engine.maybe_checkpoint();
         let status = self.txn.status_byte();
         let step = match result {
-            Ok(()) => {
+            Ok(crate::sql::ExecutionStatus::Complete) => {
+                self.finish_lock_wait();
+                self.resume_statement = 0;
                 // A COPY FROM STDIN holds its query cycle open: the
                 // connection enters copy-in mode and ReadyForQuery waits
                 // for CopyDone.
@@ -1589,6 +1692,16 @@ impl Conn {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
                 }
+            }
+            Ok(crate::sql::ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+            }) => {
+                self.send.truncate_to(output_mark);
+                self.resume_statement = completed_statements;
+                self.park_on_lock(engine.lock_generation());
+                self.arena.reset();
+                return Step::Parked;
             }
             Err(WireFull) => {
                 if engine.take_pending_copy().is_some() {
@@ -1650,6 +1763,7 @@ impl Conn {
 enum Step {
     Continue,
     NeedMoreData,
+    Parked,
     Close,
 }
 

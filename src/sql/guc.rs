@@ -345,6 +345,10 @@ impl GucState {
         parse_timeout_ms(self.store.borrow().current.statement_timeout.as_str()).unwrap_or(0)
     }
 
+    pub fn lock_timeout_ms(&self) -> u64 {
+        parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str()).unwrap_or(0)
+    }
+
     /// Applies `SET name = raw`. `raw` is the raw source text of the value
     /// (surrounding single quotes and whitespace are stripped here). Returns an
     /// error for an unknown parameter, a read-only parameter, or a value whose
@@ -704,10 +708,17 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return Ok(());
     }
     if name.eq_ignore_ascii_case("lock_timeout") {
-        // A write conflict fails fast (40001) rather than waiting on a
-        // lock, so there is never a lock wait for lock_timeout to bound —
-        // any value is trivially satisfied.
-        return store(&mut values.lock_timeout, if is_default { "0" } else { v });
+        if is_default {
+            return store(&mut values.lock_timeout, "0");
+        }
+        if parse_timeout_ms(v).is_none() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"lock_timeout\": \"{}\"",
+                v
+            ));
+        }
+        return store(&mut values.lock_timeout, v);
     }
     if name.eq_ignore_ascii_case("statement_timeout") {
         // Enforced at scan boundaries during execution.

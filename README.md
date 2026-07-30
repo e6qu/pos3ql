@@ -75,7 +75,7 @@ Working single-node database:
   INSERT/SELECT/UPDATE/DELETE/MERGE with WHERE / ORDER BY (PostgreSQL null
   ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, row-locking clauses
   (`FOR UPDATE`/`SHARE`/`NO KEY UPDATE`/`KEY SHARE` with `OF`/`NOWAIT`/`SKIP
-  LOCKED`), INSERT ... ON CONFLICT
+  LOCKED`), all eight `LOCK TABLE` modes with `NOWAIT`, INSERT ... ON CONFLICT
   (`DO NOTHING` / `DO UPDATE` upsert with column- or `ON CONSTRAINT`-inferred
   arbiters, `excluded.*`, and RETURNING), joins (including
   `LATERAL` subqueries and set-returning functions), GROUP BY and aggregates,
@@ -124,9 +124,11 @@ Working single-node database:
   REPEATABLE READ, READ ONLY snapshot with ACCESS SHARE locks, and the emitted
   schema/data/view/identity dump restores into vanilla PostgreSQL with sequence
   continuation intact.
-- Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED and REPEATABLE READ
-  snapshots, READ ONLY enforcement, transactional DDL, transaction-private
-  fixed WAL staging, and fail-fast (`40001`) write-conflict detection.
+- Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED, REPEATABLE READ,
+  and SERIALIZABLE snapshots, READ ONLY enforcement, transactional DDL,
+  transaction-private fixed WAL staging, waitable row/table locks (including
+  automatic relation modes and savepoint-scoped release), NOWAIT / SKIP
+  LOCKED, and deadlock detection.
 - LISTEN / NOTIFY: `LISTEN`/`UNLISTEN`/`NOTIFY channel[, payload]` with
   PostgreSQL's transactional delivery (fired at commit, dropped on rollback,
   de-duplicated within a transaction) and asynchronous cross-connection
@@ -179,25 +181,31 @@ changing that durable authority.
 Known divergences from PostgreSQL and current constraints (details and IDs in
 [BUGS.md](BUGS.md)):
 
-- **Concurrency is single-threaded, fail-fast.** READ COMMITTED and REPEATABLE
-  READ are implemented; SERIALIZABLE is not yet implemented. Sessions
-  interleave only at message boundaries. A write-write conflict fails
-  immediately with `40001` (serialization failure) — pos3ql does **not**
-  block-and-wait like PostgreSQL READ COMMITTED, so applications must retry
-  (B-004).
-- **Catalog conflicts are fail-fast.** Tables, views, materialized views,
-  indexes, schemas, sequences, domains, and enums all participate in
-  transactional catalog MVCC and savepoint rollback. A concurrent DDL change
-  to the same object reports `40001` rather than blocking on a catalog lock.
+- **Concurrency uses a single-threaded, waitable reactor.** READ COMMITTED
+  writers and row/table locking clauses park their protocol message, let other
+  sessions run, and re-evaluate after wakeup; a bounded wait graph detects
+  deadlocks. `lock_timeout` deadlines wake the same reactor and return 55P03
+  if the retained statement is still blocked. Ordinary SQL commands acquire
+  PostgreSQL's relation modes before wire output, and savepoint rollback
+  releases subtransaction row/table locks.
+  SERIALIZABLE uses pinned snapshots and relation-level predicate validation.
+  PostgreSQL's finer predicate/range dependency tracking remains to reduce
+  conservative serialization failures.
+- **Catalog concurrency is transaction-visible and waitable.** Tables, views,
+  materialized views, indexes, schemas, sequences, domains, and enums all
+  participate in transactional catalog MVCC and savepoint rollback. Same-name
+  CREATE/DROP and table/schema definition conflicts use the shared wait graph
+  and recheck the committed catalog after wakeup.
 - **Materializing operators use a `work_mem` analogue.** In durable mode,
   top-level `ORDER BY`, `DISTINCT`, and `DISTINCT ON` spill into immutable
   runs through the provider-neutral object-store block stack; RAM and local
   disk only cache those blocks. Non-lateral derived tables, CTEs, and views
-  retain their rows in the same external runs. Grouped aggregates, set
-  operations, windows, scalar/list subqueries, recursive/lateral row sources,
-  and outer-join match state still retain their working sets in the fixed
-  shared arena (`work_arena_bytes`, 64 MiB default). Exceeding that remaining
-  bound errors `54000`, never truncates a result (B-006).
+  retain their rows in the same external runs, as do UNION/INTERSECT/EXCEPT
+  multisets and their INSERT/CTAS consumers. Grouped aggregates, windows,
+  scalar/list subqueries, recursive/lateral row sources, and outer-join match
+  state still retain their working sets in the fixed shared arena
+  (`work_arena_bytes`, 64 MiB default). Exceeding that remaining bound errors
+  `54000`, never truncates a result (B-006).
 - **A checkpoint beat blocks for one table's write.** The auto-checkpoint is
   sliced — one table's SSTs per beat, beats interleaved with statements and
   driven on by the idle event loop, publishing only when no table changed

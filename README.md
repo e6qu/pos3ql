@@ -119,8 +119,8 @@ Working single-node database:
   schema/data/view/identity dump restores into vanilla PostgreSQL with sequence
   continuation intact.
 - Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED and REPEATABLE READ
-  snapshots, READ ONLY enforcement, transactional DDL, and fail-fast (`40001`)
-  write-conflict detection.
+  snapshots, READ ONLY enforcement, transactional DDL, transaction-private
+  fixed WAL staging, and fail-fast (`40001`) write-conflict detection.
 - LISTEN / NOTIFY: `LISTEN`/`UNLISTEN`/`NOTIFY channel[, payload]` with
   PostgreSQL's transactional delivery (fired at commit, dropped on rollback,
   de-duplicated within a transaction) and asynchronous cross-connection
@@ -131,8 +131,8 @@ Working single-node database:
 - Durability: CRC-checksummed WAL with F_FULLFSYNC (kill -9 safe); CHECKPOINT
   snapshots every table to the bucket behind a compare-and-swap manifest, a
   node with an empty disk cold-starts entirely from it, and `wal_upload`
-  streams WAL segments to the bucket (synchronously by default with object
-  storage enabled). See
+  streams WAL segments to the bucket (synchronously and obligatorily with
+  object storage enabled). See
   **Durability and write safety** below.
 - `tests/external/run.sh` runs the external conformance suite against real
   MinIO (psql golden files, raw wire probes, psycopg driver suite, kill-9 and
@@ -193,10 +193,12 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   since its slice — so a checkpoint no longer stalls connections for its
   whole duration, but a single very large table's slice still blocks while
   it writes (per-block beats are the roadmap's Stage E). The explicit
-  `CHECKPOINT` statement and the cold-start load remain atomic. Publication
-  waits while a transaction has rollback-capable catalog WAL, preventing a
-  manifest replay floor from passing uncommitted DDL; read-only historical
-  snapshots continue to coexist with checkpoints.
+  `CHECKPOINT` statement and the cold-start load remain atomic. Each active
+  transaction stages catalog and row WAL privately; checkpoint publication
+  contains only committed storage, while commit assigns the stage fresh
+  commit-order LSNs above the published floor. Checkpoints therefore coexist
+  with rollback-capable DDL and read-only historical snapshots without a
+  global publication gate.
 - **The row map is an overlay, not an index.** `table_rows` bounds the
   *working set* — pending changes plus rows not yet shed under pressure —
   not the dataset: rows beyond it live only in the bucket's SSTs and are

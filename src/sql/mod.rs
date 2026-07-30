@@ -133,9 +133,6 @@ pub struct Engine {
     /// statement. This is the `work_mem` analogue.
     work: Arena,
     next_txid: u32,
-    /// Transactions with uncommitted catalog WAL. A manifest cannot publish
-    /// while any such transaction could still roll that WAL back.
-    checkpoint_blockers: usize,
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
     notify: notify::NotifyState,
@@ -344,7 +341,9 @@ impl Engine {
                 * config.table_rows
                 * size_of::<(u32, u64, u8, RowLoc)>()
             + config.work_arena_bytes
+            + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
+            + config.max_connections as usize * config.wal_buffer_bytes
             + if config.object_store_on {
                 // The checkpointer's fixed parts plus the spilled-row reader's
                 // two scratch sets.
@@ -422,7 +421,6 @@ impl Engine {
             )?,
             work: Arena::new(budget, "work_arena", config.work_arena_bytes)?,
             next_txid: 0,
-            checkpoint_blockers: 0,
             notify: notify::NotifyState::new(
                 budget,
                 config.max_connections as usize * notify::CHANNELS_PER_CONN,
@@ -446,37 +444,6 @@ impl Engine {
         datetime::begin_transaction();
         guc.begin_transaction();
         txn.failed = false;
-        txn.wal_mark = self.wal.mark();
-    }
-
-    /// Keeps the engine-wide checkpoint gate aligned with this transaction's
-    /// rollback-capable catalog changes.
-    fn synchronize_checkpoint_blocker(&mut self, txn: &mut TxnState) {
-        let blocks = !txn.ddl().is_empty();
-        match (txn.checkpoint_blocked(), blocks) {
-            (false, true) => {
-                self.checkpoint_blockers = self
-                    .checkpoint_blockers
-                    .checked_add(1)
-                    .expect("checkpoint blocker count overflow");
-                txn.set_checkpoint_blocked(true);
-            }
-            (true, false) => {
-                self.release_checkpoint_blocker(txn);
-            }
-            _ => {}
-        }
-    }
-
-    fn release_checkpoint_blocker(&mut self, txn: &mut TxnState) {
-        if !txn.checkpoint_blocked() {
-            return;
-        }
-        self.checkpoint_blockers = self
-            .checkpoint_blockers
-            .checked_sub(1)
-            .expect("checkpoint blocker count underflow");
-        txn.set_checkpoint_blocked(false);
     }
 
     /// Commits: journals every touched row, fsyncs once, then promotes the
@@ -523,7 +490,8 @@ impl Engine {
             let schema = def.schema;
             let lsn = self.storage.lsn() + 1;
             let appended = match p.loc {
-                Some(loc) => self.wal.append(
+                Some(loc) => self.wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::Upsert {
                         schema: schema.as_str(),
@@ -532,7 +500,8 @@ impl Engine {
                         row: self.storage.heap.get(loc),
                     },
                 ),
-                None => self.wal.append(
+                None => self.wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::Delete {
                         schema: schema.as_str(),
@@ -551,7 +520,9 @@ impl Engine {
         // rolled-back transaction left dirty): absolute positions, so replay
         // is idempotent.
         for i in 0..self.storage.table_count() {
-            if !self.storage.table(i).serial_dirty || !self.storage.table(i).live {
+            if !self.storage.table(i).serial_dirty
+                || !self.storage.table(i).visible_to(txn.txid)
+            {
                 continue;
             }
             let def = *self.storage.table_def(i, txn.txid);
@@ -563,7 +534,8 @@ impl Engine {
                 }
                 let last = self.storage.table(i).serial_last[c];
                 let lsn = self.storage.lsn() + 1;
-                if let Err(e) = self.wal.append(
+                if let Err(e) = self.wal.stage(
+                    txn.txid,
                     lsn,
                     &WalOp::SequenceSet {
                         schema: schema.as_str(),
@@ -577,7 +549,6 @@ impl Engine {
                 }
                 self.storage.set_lsn(lsn);
             }
-            self.storage.table_mut(i).serial_dirty = false;
         }
         // Journal sequence advances (this transaction's or ones a rolled-back
         // transaction left dirty). Absolute positions, like serial advances, and
@@ -585,7 +556,7 @@ impl Engine {
         // transaction still consumes its number, matching PostgreSQL's gaps.
         for i in 0..self.storage.sequence_count() {
             let seq = self.storage.sequence(i);
-            if !seq.live || !seq.dirty.get() {
+            if !seq.visible_to(txn.txid) || !seq.dirty.get() {
                 continue;
             }
             let schema = seq.schema;
@@ -593,7 +564,8 @@ impl Engine {
             let last = seq.last_value.get();
             let is_called = seq.is_called.get();
             let lsn = self.storage.lsn() + 1;
-            if let Err(e) = self.wal.append(
+            if let Err(e) = self.wal.stage(
+                txn.txid,
                 lsn,
                 &WalOp::SequenceAdvance {
                     schema: schema.as_str(),
@@ -606,7 +578,29 @@ impl Engine {
                 return Err(e);
             }
             self.storage.set_lsn(lsn);
-            self.storage.sequence(i).dirty.set(false);
+        }
+        let commit_lsn = match self.wal.commit_stage(txn.txid, self.storage.lsn()) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        };
+        self.storage.set_lsn(commit_lsn);
+        // Publication accepted every staged absolute sequence position.
+        // Clear retry markers only now: a staging or journal-capacity error
+        // rolls the transaction back but PostgreSQL sequence advances remain
+        // nontransactional and must be journaled by a later commit.
+        for i in 0..self.storage.table_count() {
+            if self.storage.table(i).visible_to(txn.txid) {
+                self.storage.table_mut(i).serial_dirty = false;
+            }
+        }
+        for i in 0..self.storage.sequence_count() {
+            let sequence = self.storage.sequence(i);
+            if sequence.visible_to(txn.txid) {
+                sequence.dirty.set(false);
+            }
         }
         // One fsync per transaction, before any promotion: this is the
         // durability point — and the point of no return. A restart replays
@@ -656,7 +650,6 @@ impl Engine {
             altered_tables[altered_count] = (slot, rewrote_rows);
             altered_count += 1;
         }
-        let commit_lsn = self.storage.lsn();
         for &(table, rowid, _) in txn.touched() {
             let table = table as usize;
             if altered_tables[..altered_count]
@@ -764,7 +757,6 @@ impl Engine {
         // failure, the data is committed regardless — never a silent drop.
         let notify_result = self.flush_committed_notifications(txn);
         guc.commit_transaction();
-        self.release_checkpoint_blocker(txn);
         txn.clear();
         notify_result.and(index_result).and(upload_result)
     }
@@ -899,9 +891,8 @@ impl Engine {
         for &undo in txn.ddl().iter().rev() {
             self.rollback_ddl(undo, txn.txid);
         }
-        self.wal.truncate_to_mark(txn.wal_mark);
+        self.wal.discard_stage(txn.txid);
         guc.rollback_transaction();
-        self.release_checkpoint_blocker(txn);
         txn.clear();
     }
 
@@ -923,7 +914,7 @@ impl Engine {
         txn.rewind_ddl(sp.ddl_mark);
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
         txn.rollback_savepoints_after(index);
-        self.wal.truncate_to_mark(sp.wal_mark);
+        self.wal.truncate_stage(txn.txid, sp.wal_mark);
         guc.rollback_to_savepoint(index);
         txn.failed = sp.failed;
     }
@@ -1035,12 +1026,6 @@ impl Engine {
                 message: stack_format!(192, "no object storage configured (object_store = off)"),
             });
         };
-        if self.checkpoint_blockers != 0 {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "checkpoint is blocked by uncommitted schema changes"
-            ));
-        }
         // Everything the snapshot will contain must be journal-durable
         // first, so an interrupted checkpoint never strands acked writes.
         self.wal.commit();
@@ -1172,11 +1157,9 @@ impl Engine {
     }
 
     pub fn checkpoint_work_pending(&self) -> bool {
-        self.checkpoint_blockers == 0
-            && self
-                .ckpt
-                .as_ref()
-                .is_some_and(|c| c.sweep_active() || c.merge_work_pending(&self.storage))
+        self.ckpt
+            .as_ref()
+            .is_some_and(|c| c.sweep_active() || c.merge_work_pending(&self.storage))
     }
 
     /// One checkpoint beat: a trigger (heap or journal filling) starts a
@@ -1188,9 +1171,6 @@ impl Engine {
     /// the return is false on a failed beat so the idle driver can back off
     /// a persistently-down bucket.
     pub fn maybe_checkpoint(&mut self) -> bool {
-        if self.checkpoint_blockers != 0 {
-            return true;
-        }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return true;
         };
@@ -1280,7 +1260,6 @@ impl Engine {
                     let outcome = self.execute_stmt(
                         &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
                     );
-                    self.synchronize_checkpoint_blocker(txn);
                     if let Err(e) = outcome? {
                         if txn.is_explicit() {
                             txn.failed = true;
@@ -1351,7 +1330,6 @@ impl Engine {
                 let outcome = self.execute_stmt(
                     &statement, arena, params, txn, sqlprep, cursors, guc, responder,
                 );
-                self.synchronize_checkpoint_blocker(txn);
                 outcome?
             }
             Ok(None) => {
@@ -2947,7 +2925,7 @@ impl Engine {
                         "SAVEPOINT can only be used in transaction blocks"
                     )));
                 }
-                let mark = self.wal.mark();
+                let mark = self.wal.stage_mark(txn.txid);
                 if let Err(e) = txn.savepoint(name, mark) {
                     return Ok(Err(e));
                 }

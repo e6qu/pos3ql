@@ -378,6 +378,7 @@ def main():
     gen = Gen(rng)
     stats = {"match": 0, "unsupported": 0, "divergence": 0}
     unsupp_hist = {}
+    unsupp_examples = {}
     divergences = []
 
     for i in range(args.count):
@@ -393,7 +394,13 @@ def main():
             stats["match"] += 1
         elif verdict == "unsupported":
             stats["unsupported"] += 1
-            unsupp_hist[p3_res[1]] = unsupp_hist.get(p3_res[1], 0) + 1
+            message = p3_res[2].replace("\n", " ") if len(p3_res) > 2 else ""
+            reason = f"{p3_res[1]} {message}".rstrip()
+            unsupp_hist[reason] = unsupp_hist.get(reason, 0) + 1
+            unsupp_examples.setdefault(
+                reason,
+                f"seed {args.seed}, stmt #{i}, substmt-seed {sub}: {sql}",
+            )
         else:
             stats["divergence"] += 1
             if len(divergences) < args.max_print:
@@ -408,7 +415,10 @@ def main():
         print(d)
     if unsupp_hist:
         top = sorted(unsupp_hist.items(), key=lambda kv: -kv[1])
-        print("unsupported by SQLSTATE: " + ", ".join(f"{k}×{v}" for k, v in top))
+        print("unsupported breakdown:")
+        for reason, count in top:
+            print(f"  {count:4d}  {reason}")
+            print(f"        e.g. {unsupp_examples[reason]}")
     print(f"\nTOTAL: {args.count} statements (seed {args.seed})  "
           f"match={stats['match']}  unsupported={stats['unsupported']}  "
           f"divergence={stats['divergence']}")
@@ -431,7 +441,8 @@ def classify(pg_res, p3_res):
 
 def summarize(res):
     if res[0] == "err":
-        return f"ERROR {res[1]}"
+        message = res[2].replace("\n", " ") if len(res) > 2 else ""
+        return f"ERROR {res[1]} {message[:240]}".rstrip()
     rows = res[1]
     if rows is None:
         return "ok (no rows)"

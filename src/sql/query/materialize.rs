@@ -17,37 +17,45 @@ use crate::sql::eval::{
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::{ColType, Datum};
 use crate::{sql_err, stack_format};
-use crate::storage::{Storage, MAX_COLUMNS};
+use crate::storage::Storage;
 
 use super::{
     arena_full, correlated_in_expression, correlated_where_passes, find_srf, merge_correlated,
     postpone_cost, project_row_skipping, record_star_width, resolve_order_target, scan_source,
     sql_fail, sql_ok, srf_max_count, JoinRow, Outcome, QueryScope, ResolvedColumn,
-    MAX_JOIN_TABLES, MAX_SUBQUERIES,
+    MAX_SUBQUERIES,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
 /// order) resolvable by name, for evaluating postponed projection items after
 /// the sort.
-struct RawRow<'s, 'd, 'a> {
+struct EncodedRawRow<'s, 'd, 'a> {
     scope: &'s QueryScope<'d>,
-    values: &'s [Datum<'a>],
+    bytes: &'a [u8],
+    raw_at: usize,
+    arena: &'a Arena,
 }
 
-impl<'a> ColumnLookup<'a> for RawRow<'_, '_, 'a> {
+impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        // The raw row stores every table's columns concatenated in scope
-        // order (merges hide nothing here).
         let flat_of = |t: usize, c: usize| -> usize {
             (0..t).map(|i| self.scope.defs[i].expect("resolved").n_columns).sum::<usize>() + c
         };
         match self.scope.find_column(qualifier, name)? {
-            ResolvedColumn::Table(t, c) => Ok(self.values[flat_of(t, c)]),
+            ResolvedColumn::Table(t, c) => crate::sql::exec::decode_projected_col_record(
+                self.bytes,
+                self.raw_at + flat_of(t, c),
+                self.arena,
+            ),
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
                 let mc = &self.scope.merged[m];
                 for &(t, c) in &mc.parts[..mc.n_parts] {
-                    let v = self.values[flat_of(t, c)];
+                    let v = crate::sql::exec::decode_projected_col_record(
+                        self.bytes,
+                        self.raw_at + flat_of(t, c),
+                        self.arena,
+                    )?;
                     if !v.is_null() {
                         return Ok(v);
                     }
@@ -207,7 +215,6 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
 pub(crate) struct PostponedProjection {
     postponed: [bool; MAX_PROJ],
     raw_at: usize,
-    n_raw: usize,
 }
 
 /// Fills `out` with an encoded row's visible columns, evaluating any postponed
@@ -230,11 +237,12 @@ pub(crate) fn finalize_projected_row<'a>(
         *slot = crate::sql::exec::decode_projected_col_record(bytes, i, arena)?;
     }
     let Some(d) = deferred else { return Ok(()) };
-    let mut raw = [Datum::Null; MAX_COLUMNS * MAX_JOIN_TABLES];
-    for (k, slot) in raw.iter_mut().enumerate().take(d.n_raw) {
-        *slot = crate::sql::exec::decode_projected_col_record(bytes, d.raw_at + k, arena)?;
-    }
-    let raw_row = RawRow { scope, values: &raw[..d.n_raw] };
+    let raw_row = EncodedRawRow {
+        scope,
+        bytes,
+        raw_at: d.raw_at,
+        arena,
+    };
     // `postponed` is indexed by item; wildcards (never postponed) advance the
     // output slot by their column count.
     let mut slot = 0usize;
@@ -444,24 +452,31 @@ pub(crate) fn materialized_rows<'a>(
                     srf_call.is_some(),
                     &mut |row, projected, keys| {
                     debug_assert_eq!(projected.len(), width);
-                    let mut full =
-                        [Datum::Null; MAX_PROJ + MAX_PROJ + MAX_COLUMNS * MAX_JOIN_TABLES];
-                    full[..width].copy_from_slice(&projected[..width]);
-                    full[width..width + n_keys].copy_from_slice(keys);
-                    // Raw source columns for deferred projection after the sort.
-                    if any_postponed {
-                        let mut flat = width + n_keys;
-                        for t in 0..scope.n {
-                            let def = scope.defs[t].expect("resolved");
-                            let vals = row.values[t].expect("bound");
-                            for c in 0..def.n_columns {
-                                full[flat] = if vals.is_empty() { Datum::Null } else { vals[c] };
-                                flat += 1;
+                    rows[at] = crate::sql::exec::encode_projected_by(
+                        width + n_keys + n_raw,
+                        |index| {
+                            if index < width {
+                                return projected[index];
                             }
-                        }
-                    }
-                    rows[at] = crate::sql::exec::encode_projected_pub(
-                        &full[..width + n_keys + n_raw],
+                            if index < width + n_keys {
+                                return keys[index - width];
+                            }
+                            let mut raw_index = index - width - n_keys;
+                            for table in 0..scope.n {
+                                let column_count =
+                                    scope.defs[table].expect("resolved").n_columns;
+                                if raw_index < column_count {
+                                    let values = row.values[table].expect("bound");
+                                    return if values.is_empty() {
+                                        Datum::Null
+                                    } else {
+                                        values[raw_index]
+                                    };
+                                }
+                                raw_index -= column_count;
+                            }
+                            unreachable!("raw projected column is within scope width")
+                        },
                         arena,
                     )?;
                     at += 1;
@@ -561,7 +576,6 @@ pub(crate) fn materialized_rows<'a>(
     let deferred = any_postponed.then_some(PostponedProjection {
         postponed,
         raw_at: width + n_keys,
-        n_raw,
     });
     Ok((rows, width, deferred))
 }

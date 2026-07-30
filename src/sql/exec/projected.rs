@@ -14,9 +14,43 @@ use crate::sql_err;
 /// Tagged, order-preserving-for-equality encoding of a projected row:
 /// per value, a tag byte plus a fixed or length-prefixed payload.
 pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
-    let mut len = 1usize;
-    for v in values {
-        len += projected_value_len(v);
+    let len = projected_row_len(values)?;
+    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "DISTINCT row exceeds the statement arena"
+        )
+    })?;
+    encode_projected_into(values, out)?;
+    Ok(&*out)
+}
+
+/// Encodes a projected row whose values are available by index.
+///
+/// The accessor is called twice: once to size the exact arena allocation and
+/// once to encode it. It must therefore only retrieve already-evaluated
+/// values; expression evaluation belongs before this encoding boundary.
+pub(crate) fn encode_projected_by<'a>(
+    count: usize,
+    mut value_at: impl FnMut(usize) -> Datum<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let count_u16 = u16::try_from(count).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row has too many columns"
+        )
+    })?;
+    let mut len = size_of_val(&count_u16);
+    for index in 0..count {
+        len = len
+            .checked_add(projected_value_len(&value_at(index)))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "projected row is too large"
+                )
+            })?;
     }
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
         sql_err!(
@@ -24,12 +58,66 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
             "DISTINCT row exceeds the statement arena"
         )
     })?;
-    out[0] = values.len() as u8;
-    let mut at = 1usize;
+    out[..2].copy_from_slice(&count_u16.to_le_bytes());
+    let mut at = 2usize;
+    for index in 0..count {
+        at += write_projected_value(&value_at(index), &mut out[at..]);
+    }
+    debug_assert_eq!(at, len);
+    Ok(&*out)
+}
+
+/// Exact byte length needed by [`encode_projected_into`].
+pub(crate) fn projected_row_len(values: &[Datum]) -> Result<usize, SqlError> {
+    let count = u16::try_from(values.len()).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row has too many columns"
+        )
+    })?;
+    let mut len = size_of_val(&count);
+    for v in values {
+        len = len.checked_add(projected_value_len(v)).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "projected row is too large"
+            )
+        })?;
+    }
+    Ok(len)
+}
+
+/// Encodes one projected row into caller-owned storage.
+///
+/// The arena path and the external-run path share this writer, so the two
+/// representations cannot drift. `out` may be larger than necessary; the
+/// returned length names the initialized prefix.
+pub(crate) fn encode_projected_into(
+    values: &[Datum],
+    out: &mut [u8],
+) -> Result<usize, SqlError> {
+    let len = projected_row_len(values)?;
+    if out.len() < len {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row of {} bytes exceeds external-run block capacity {}",
+            len,
+            out.len()
+        ));
+    }
+    let count = u16::try_from(values.len()).expect("projected_row_len checked the count");
+    out[..2].copy_from_slice(&count.to_le_bytes());
+    let mut at = 2usize;
     for v in values {
         at += write_projected_value(v, &mut out[at..]);
     }
-    Ok(&*out)
+    debug_assert_eq!(at, len);
+    Ok(at)
+}
+
+/// Number of values stored in a projected row.
+pub(crate) fn projected_row_width(bytes: &[u8]) -> usize {
+    u16::from_le_bytes(bytes[..2].try_into().expect("projected row header")) as usize
 }
 
 /// The projected-encoding byte length of one value (tag + payload).
@@ -517,7 +605,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
 
 /// Byte length of an encoded row's first `width` values, tags included.
 pub fn projected_prefix_len(bytes: &[u8], width: usize) -> usize {
-    let mut at = 1usize;
+    let mut at = 2usize;
     for _ in 0..width {
         let tag = bytes[at];
         // The reader takes the offset *past* the tag, as its own caller does.
@@ -529,7 +617,7 @@ pub fn projected_prefix_len(bytes: &[u8], width: usize) -> usize {
 
 /// Reads column `col` back out of an [`encode_projected`] row.
 pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
-    let mut at = 1usize;
+    let mut at = 2usize;
     let mut current = 0usize;
     loop {
         let tag = bytes[at];
@@ -546,7 +634,7 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
 /// column bytes compare directly except bpchar values, which compare by their
 /// stripped text — cross-width padding must not split a DISTINCT group.
 fn cmp_projected_prefix(a: &[u8], b: &[u8], width: usize) -> core::cmp::Ordering {
-    let (mut ia, mut ib) = (1usize, 1usize);
+    let (mut ia, mut ib) = (2usize, 2usize);
     for _ in 0..width {
         let (ta, tb) = (a[ia], b[ib]);
         ia += 1;
@@ -592,7 +680,7 @@ pub fn decode_projected_col_record<'a>(
     col: usize,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut at = 1usize;
+    let mut at = 2usize;
     let mut current = 0usize;
     loop {
         let tag = bytes[at];
@@ -670,4 +758,20 @@ pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
         }
     }
     unique
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::budget::Budget;
+
+    #[test]
+    fn projected_width_is_not_truncated_to_one_byte() {
+        let mut budget = Budget::new(64 * 1024);
+        let arena = Arena::new(&mut budget, "wide projected row", 32 * 1024).unwrap();
+        let values = [Datum::Null; 300];
+        let encoded = encode_projected_pub(&values, &arena).unwrap();
+        assert_eq!(projected_row_width(encoded), values.len());
+        assert!(decode_projected_pub(encoded, values.len() - 1).is_null());
+    }
 }

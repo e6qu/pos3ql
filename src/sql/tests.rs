@@ -2205,6 +2205,44 @@ fn multiway_equijoin_prunes_early() {
 }
 
 #[test]
+fn range_table_covers_wide_conformance_queries() {
+    // The vendored SQLLogicTest select5 workload reaches seventeen relations
+    // in one range table. This used to fail at a second, executor-only limit
+    // even though the configured catalog could hold every relation.
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE TABLE t (id int)");
+    run_with(&mut engine, &mut budget, "INSERT INTO t VALUES (1)");
+    let rows = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) \
+         FROM t a01, t a02, t a03, t a04, t a05, t a06, t a07, t a08, t a09, \
+              t a10, t a11, t a12, t a13, t a14, t a15, t a16, t a17 \
+         WHERE a01.id=a02.id AND a02.id=a03.id AND a03.id=a04.id \
+           AND a04.id=a05.id AND a05.id=a06.id AND a06.id=a07.id \
+           AND a07.id=a08.id AND a08.id=a09.id AND a09.id=a10.id \
+           AND a10.id=a11.id AND a11.id=a12.id AND a12.id=a13.id \
+           AND a13.id=a14.id AND a14.id=a15.id AND a15.id=a16.id \
+           AND a16.id=a17.id",
+    ));
+    assert_eq!(rows, ["1"]);
+
+    // Keep ample headroom above the seventeen-table conformance case while
+    // exercising recursive execution on the test harness's constrained stack.
+    let table_count = 32;
+    let from = (1..=table_count)
+        .map(|index| format!("t a{index:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let qualification = (1..table_count)
+        .map(|index| format!("a{index:02}.id=a{:02}.id", index + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let query = format!("SELECT count(*) FROM {from} WHERE {qualification}");
+    assert_eq!(data_rows(&run_with(&mut engine, &mut budget, &query)), ["1"]);
+}
+
+#[test]
 fn selective_join_component_precedes_independent_cross_filters() {
     // The final cardinality is small, but postponing the t1/t6 equality until
     // after the six independent filters creates more than sixteen million

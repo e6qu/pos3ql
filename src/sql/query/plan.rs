@@ -17,11 +17,14 @@ use crate::storage::Storage;
 
 use super::{MAX_JOIN_TABLES, QueryScope, ResolvedColumn, ScopeCols, arena_full};
 
-pub(super) const MAX_CONJUNCTS: usize = 32;
+/// Top-level qualification terms retained for cost ordering and join
+/// pushdown. A full 64-relation equality chain has 63 terms; leave another
+/// full chain of headroom for independent filters and BETWEEN expansion.
+pub(super) const MAX_CONJUNCTS: usize = 128;
 
 /// The set of table indices (as a bitmask) an expression references. `None` if
 /// it contains a construct not analyzable for pushdown (subquery, aggregate, …).
-pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u16> {
+pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> {
     use Expr::*;
     match expression {
         Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | Param(_) => Some(0),
@@ -33,7 +36,7 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u16> 
                 Some(
                     mc.parts[..mc.n_parts]
                         .iter()
-                        .fold(0u16, |mask, &(t, _)| mask | (1 << t)),
+                        .fold(0u64, |mask, &(t, _)| mask | (1 << t)),
                 )
             }
         },
@@ -92,14 +95,24 @@ pub(crate) fn join_order(
     where_clause: Option<&Expr>,
 ) -> [usize; MAX_JOIN_TABLES] {
     let mut order = core::array::from_fn(|i| i);
+    fill_join_order(storage, scope, where_clause, &mut order[..scope.n]);
+    order
+}
+
+pub(crate) fn fill_join_order(
+    storage: &Storage,
+    scope: &QueryScope,
+    where_clause: Option<&Expr>,
+    order: &mut [usize],
+) {
     let n = scope.n;
     if n < 2 {
-        return order;
+        return;
     }
     // Collect analyzable WHERE conjuncts and their static selectivity.
     // Predicate shape distinguishes one equality from a broad list; analyzed
     // table cardinality then breaks ties between otherwise-equivalent choices.
-    let mut masks = [0u16; MAX_CONJUNCTS];
+    let mut masks = [0u64; MAX_CONJUNCTS];
     let mut strengths = [0u32; MAX_CONJUNCTS];
     let mut n_masks = 0;
     if let Some(w) = where_clause {
@@ -120,7 +133,7 @@ pub(crate) fn join_order(
             }
         }
     }
-    let mut chosen_mask = 0u16;
+    let mut chosen_mask = 0u64;
     for slot in order.iter_mut().take(n) {
         // A table earns the strength of every predicate component it starts or
         // extends, and twice the strength when it completes a multi-table
@@ -173,7 +186,6 @@ pub(crate) fn join_order(
         *slot = best;
         chosen_mask |= 1 << best;
     }
-    order
 }
 
 /// Static selectivity signal used only to order freely-reorderable cross joins.

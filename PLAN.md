@@ -1860,9 +1860,20 @@ the rest. Corpus `74_array_slicing`, with unit-test coverage.
    The SQLLogicTest runner now reclaims every file's catalog objects and only
    classifies errors whose message explicitly identifies an absent feature or
    static bound. `42601`, missing tables, bad casts, and invalid values are no
-   longer broad escape hatches. The former eight-join parser ceiling is gone;
-   the static executor range-table capacity is sixteen, which covers the
-   vendored ten-table workload without introducing post-startup allocation.
+   longer broad escape hatches. The former eight- and sixteen-relation parser /
+   executor ceilings are gone: one shared 64-relation envelope covers the full
+   configured catalog and the vendored `select5` workload. Qualification
+   planning retains 128 top-level terms, so a 64-relation equality chain is
+   pushed down incrementally instead of degenerating into a Cartesian product.
+   The full unsharded PostgreSQL 18.4 replay is now 10,911/10,911 exact,
+   unsupported 0, divergence 0, and CI carries a zero unsupported ratchet.
+   Range-table, decode, predicate, and match scratch are statement-arena slices
+   sized to the actual FROM clause. A merged SST walk releases its block context
+   before invoking the row callback, so recursively nested joins reuse one
+   startup-sized context. A walk-owner token invalidates only residency claims
+   overwritten by nested reuse; increasing the SQL envelope therefore reserves
+   neither recursive stacks nor one nine-block object reader per possible join
+   depth.
 
    *Earlier (same day):* **the choke points went in first** — the first half of the
    two-PR shape this step takes (the query.rs-split playbook: mechanical
@@ -1966,6 +1977,18 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;
    after 2–4 because it optimizes the read path those steps finalize.
+   **Status (2026-07-30): the wide-executor groundwork landed.** Range-table
+   state and scan scratch now scale with the actual plan rather than the static
+   envelope; projected rows have a shared direct writer and a two-byte width,
+   removing the hidden 255-value failure in wide deferred projections; and
+   spill-read contexts remain a startup-bounded pool behind the existing
+   provider-neutral block stack. Remaining Stage I work is still the real
+   batch/vector expression path, a fixed in-flight/hedged GET scheduler, late
+   materialization, and external ORDER BY/DISTINCT/GROUP BY runs. Those runs
+   must use the common block-store interface: object storage is their remote
+   backing in durable mode, while RAM and local disk are disposable cache
+   tiers. No executor code may branch on S3, MinIO, Google Cloud Storage,
+   Azure Blob Storage, or any other provider identity.
 8. **VSR productionization** — live write-routing, quorum ordering, failover,
    and group commit. It never changes the durability root: an acknowledgment
    follows the object-store WAL PUT, while replica journals and disks remain
@@ -1992,14 +2015,14 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
 
 ## Verification
 
-- `cargo test` — 502 unit/property tests plus the integration suites
+- `cargo test` — 507 unit/property tests plus the integration suites
   (memory guard incl. unwind safety and the TLS budget scope, differential
   FixedMap vs std, PCG32/CRC-32C/SHA-256/SHA-512/HMAC/SigV4 official vectors,
   row codec fuzz-by-truncation, WAL corruption/floor/stale-tail, engine
   restart persistence, protocol framing, block/SST/bloom/cache stores, an
   in-process rustls round trip, the sqlstate gate).
-- SQLLogicTest differential against PostgreSQL 18.4: 3,205 vendored blocks,
-  3,205 exact matches, zero unsupported, and zero divergences. The CI shards
+- SQLLogicTest differential against PostgreSQL 18.4: 10,911 vendored blocks,
+  10,911 exact matches, zero unsupported, and zero divergences. The CI shards
   keep a zero unsupported/divergence ratchet.
 - `POS3QL_MINIO_ENDPOINT=... cargo test --test minio_it` — S3 client CAS/range
   /list + engine checkpoint/cold-start integration against real MinIO.

@@ -92,9 +92,9 @@ impl Plan {
     }
 }
 
-fn projected_shape(
-    statement: &Select<'_>,
-    scope: Option<&QueryScope<'_>>,
+fn projected_shape<'a>(
+    statement: &Select<'a>,
+    scope: Option<&QueryScope<'a>>,
     storage: &Storage,
     txid: u32,
 ) -> Result<(u32, StackStr<256>), SqlError> {

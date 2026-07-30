@@ -140,6 +140,9 @@ pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
     encode_projected_pub, projected_prefix_len, projected_value_len, sort_dedup_projected,
 };
+pub(crate) use projected::{
+    encode_projected_by, projected_row_width,
+};
 
 mod ddl;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
@@ -7487,7 +7490,7 @@ pub fn merge(
 
     let mut affected_count = 0u64;
     for sbytes in source_rows.iter() {
-        let n_src_cols = sbytes[0] as usize;
+        let n_src_cols = projected_row_width(sbytes);
         let mut sv = [Datum::Null; MAX_COLUMNS];
         for (c, slot) in sv.iter_mut().enumerate().take(n_src_cols) {
             *slot = decode_projected_pub(sbytes, c);
@@ -7949,7 +7952,7 @@ pub fn insert(
         };
         let mut inserted = 0u64;
         for bytes in rows_bytes.iter() {
-            let n_src = bytes[0] as usize;
+            let n_src = projected_row_width(bytes);
             if n_src != n_targets {
                 let msg = if n_src > n_targets {
                     "INSERT has more expressions than target columns"

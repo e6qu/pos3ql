@@ -1954,20 +1954,22 @@ pub(crate) struct SpillReader {
     /// inside another walk's callback). Each holds a resident data block
     /// per spill-list member plus an index buffer for cursor advances.
     /// Exhaustion is a loud error naming the bound.
-    scan_contexts: [std::cell::RefCell<ScanContext>; SCAN_CONTEXTS],
+    scan_contexts: Box<[std::cell::RefCell<ScanContext>]>,
+    next_walk_id: std::cell::Cell<u64>,
     /// Independent buffers for persistent value probes. A probe may invoke an
     /// authoritative spilled-row recheck, so it must not borrow row scratch.
     value_scratch: [std::cell::RefCell<ValueIndexScratch>; 2],
 }
 
-/// How many row-state walks may be live at once: a full join
-/// ([`crate::sql::query::MAX_JOIN_TABLES`] deep), plus a constraint or
-/// validation scan running inside the innermost callback, with headroom.
-const SCAN_CONTEXTS: usize = crate::sql::query::MAX_JOIN_TABLES + 4;
+/// A row-state walk releases its block context before invoking its callback.
+/// Nested joins therefore share one context; an ownership token invalidates
+/// resident-block markers if the callback's nested walk reused it.
+const SCAN_CONTEXTS: usize = 1;
 
 /// One merged walk's working memory: the current data block per member and
 /// a shared buffer for index-block navigation on block advances.
 struct ScanContext {
+    owner: u64,
     member_blocks: [Box<[u8]>; MAX_SPILL_SSTS],
     index_buf: Box<[u8]>,
 }
@@ -2022,7 +2024,9 @@ impl SpillReader {
             "spill reader",
         )?;
         budget.draw(
-            SCAN_CONTEXTS * (MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD,
+            SCAN_CONTEXTS
+                * ((MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+                    + core::mem::size_of::<std::cell::RefCell<ScanContext>>()),
             "row-state walk contexts",
         )?;
         budget.draw(
@@ -2039,6 +2043,7 @@ impl SpillReader {
         };
         let context = || {
             std::cell::RefCell::new(ScanContext {
+                owner: 0,
                 member_blocks: core::array::from_fn(|_| {
                     vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice()
                 }),
@@ -2051,10 +2056,15 @@ impl SpillReader {
                 data: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             })
         };
+        let mut scan_contexts = Vec::with_capacity(SCAN_CONTEXTS);
+        for _ in 0..SCAN_CONTEXTS {
+            scan_contexts.push(context());
+        }
         Ok(Self {
             blocks,
             scratch: [fresh(), fresh()],
-            scan_contexts: core::array::from_fn(|_| context()),
+            scan_contexts: scan_contexts.into_boxed_slice(),
+            next_walk_id: std::cell::Cell::new(1),
             value_scratch: [value(), value()],
         })
     }
@@ -2062,7 +2072,9 @@ impl SpillReader {
     /// The budget the contexts and scratch draw, for memory-plan estimates.
     pub(crate) fn budget_bytes() -> usize {
         2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
-            + SCAN_CONTEXTS * (MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+            + SCAN_CONTEXTS
+                * ((MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+                    + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
             + 4 * crate::store::MAX_PAYLOAD
     }
 }
@@ -3133,18 +3145,8 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let Some(mut context) = spill
-            .scan_contexts
-            .iter()
-            .find_map(|c| c.try_borrow_mut().ok())
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "row scans nested deeper than {} concurrent walks",
-                SCAN_CONTEXTS
-            ));
-        };
-        let context = &mut *context;
+        let walk_id = spill.next_walk_id.get();
+        spill.next_walk_id.set(walk_id.wrapping_add(1).max(1));
         let mut cursors = [MemberCursor {
             ordinal: 0,
             offset: 0,
@@ -3153,8 +3155,21 @@ impl Storage {
             head: None,
             done: false,
         }; MAX_SPILL_SSTS];
-        for (member, cursor) in cursors[..n].iter_mut().enumerate() {
-            Self::cursor_advance(spill, table, member, cursor, context)?;
+        {
+            let Some(mut context) = spill
+                .scan_contexts
+                .iter()
+                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            else {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "row-state block context is already in use"
+                ));
+            };
+            context.owner = walk_id;
+            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+            }
         }
         loop {
             let mut min: Option<u64> = None;
@@ -3164,6 +3179,26 @@ impl Storage {
                 }
             }
             let Some(rowid) = min else { return Ok(()) };
+            let Some(mut context) = spill
+                .scan_contexts
+                .iter()
+                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            else {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "row-state block context is already in use"
+                ));
+            };
+            if context.owner != walk_id {
+                // A nested walk ran while this walk's row callback was active
+                // and reused the buffers. Parsed heads are owned values and
+                // remain valid; only buffer-residency claims are stale.
+                for cursor in &mut cursors[..n] {
+                    cursor.loaded = None;
+                    cursor.loaded_len = 0;
+                }
+                context.owner = walk_id;
+            }
             // Consume every version of this row from every member. The
             // greatest commit LSN admitted by the statement snapshot wins;
             // equal keys prefer the newer list member.
@@ -3185,9 +3220,10 @@ impl Storage {
                             commit_lsn: key.commit_lsn,
                         });
                     }
-                    Self::cursor_advance(spill, table, member, cursor, context)?;
+                    Self::cursor_advance(spill, table, member, cursor, &mut context)?;
                 }
             }
+            drop(context);
             if let Some(SpillVersion {
                 len: Some(len),
                 member,
@@ -7171,13 +7207,14 @@ impl Storage {
     }
 
     pub fn release_snapshot(&mut self, txid: u32) {
-        if let Some(index) = self
+        let Some(index) = self
             .active_snapshots
             .iter()
             .position(|(owner, _)| *owner == txid)
-        {
-            self.active_snapshots.swap_remove(index);
-        }
+        else {
+            return;
+        };
+        self.active_snapshots.swap_remove(index);
         let oldest = self.oldest_snapshot();
         for table in self.tables.iter_mut() {
             for (_, state) in table.rows.iter_mut() {

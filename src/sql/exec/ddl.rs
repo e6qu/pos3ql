@@ -9,14 +9,14 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{ColumnDef, Expr, FkAction, QualName, TableConstraint};
-use crate::sql::eval::{cast_to, eval_full, sqlstate, EvalHooks, NoColumns, SqlError};
+use crate::sql::eval::{EvalHooks, NoColumns, SqlError, cast_to, eval_full, sqlstate};
 use crate::sql::types::ColType;
-use crate::util::StackStr;
-use crate::storage::{
-    CheckConstraint, ColumnMeta, ForeignKey, OwnedDatum, SqlName, Storage, TableDef, UniqueKey,
-    MAX_COLUMNS, MAX_INDEX_COLS,
-};
 use crate::sql_err;
+use crate::storage::{
+    CheckConstraint, ColumnMeta, ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS, OwnedDatum, SqlName,
+    Storage, TableDef, UniqueKey,
+};
+use crate::util::StackStr;
 
 use super::apply_typmod;
 
@@ -63,7 +63,10 @@ pub(super) fn validate_generated_refs(def: &TableDef, arena: &Arena) -> Result<(
         if !c.is_generated {
             continue;
         }
-        let text = c.default_expr.as_ref().expect("generated column has expr text");
+        let text = c
+            .default_expr
+            .as_ref()
+            .expect("generated column has expr text");
         let expression = crate::sql::parser::parse_expr(text.as_str(), arena)?;
         let mut offending: Option<SqlError> = None;
         expression.for_each_column(&mut |name| {
@@ -190,6 +193,9 @@ pub(super) fn build_column(
                 }
             }
         };
+    if let (Some(type_name), Some(type_schema)) = (domain, user_type_schema) {
+        storage.require_type_usage(type_schema.as_str(), type_name.as_str(), txid)?;
+    }
     // A GENERATED column stores its expression in `default_expr` with the
     // `is_generated` flag; it cannot also carry a DEFAULT.
     let (default_value, default_expr, is_generated) = if let Some(gtext) = c.generated_text {
@@ -202,8 +208,15 @@ pub(super) fn build_column(
         }
         (None, Some(resolve_generated(gtext, arena)?), true)
     } else {
-        let (dv, de) =
-            resolve_default(c.default, c.default_text, ctype, type_mod, storage, txid, arena)?;
+        let (dv, de) = resolve_default(
+            c.default,
+            c.default_text,
+            ctype,
+            type_mod,
+            storage,
+            txid,
+            arena,
+        )?;
         // A domain-typed column with no column-level DEFAULT inherits the
         // domain's DEFAULT (baked in at creation, re-evaluated per insert).
         if dv.is_none() && de.is_none() {
@@ -298,7 +311,13 @@ pub(super) fn resolve_default(
     storage: &Storage,
     txid: u32,
     arena: &Arena,
-) -> Result<(Option<OwnedDatum>, Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>), SqlError> {
+) -> Result<
+    (
+        Option<OwnedDatum>,
+        Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>,
+    ),
+    SqlError,
+> {
     let Some(expression) = default else {
         return Ok((None, None));
     };
@@ -325,8 +344,7 @@ pub(super) fn resolve_default(
         let v = match ctype {
             ColType::Enum(slot) => super::coerce_enum_value(v, slot, storage, arena)?,
             ColType::Array(
-                element
-                @ (crate::sql::types::ArrElem::Enum(_)
+                element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
             ) => super::coerce_user_type_array(v, element, storage, arena)?,
             _ => cast_to(v, ctype, arena)?,
@@ -394,7 +412,10 @@ fn fk_action_of(a: FkAction) -> crate::storage::FkAction {
 }
 
 /// Resolves a constraint's column names to indices in `def` (42703 if absent).
-pub(super) fn resolve_cols(def: &TableDef, names: &[&str]) -> Result<([u16; MAX_INDEX_COLS], usize), SqlError> {
+pub(super) fn resolve_cols(
+    def: &TableDef,
+    names: &[&str],
+) -> Result<([u16; MAX_INDEX_COLS], usize), SqlError> {
     if names.len() > MAX_INDEX_COLS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -436,7 +457,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "whole-row reference to \"{}\" is not supported in CHECK",
                 t
-            ))
+            ));
         }
         Expr::Column { name, .. } => {
             let Some(index) = def.column_index(name) else {
@@ -449,16 +470,15 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
             // MAX_COLUMNS is 64, so a column index always fits the u64 mask.
             *cols |= 1u64 << index;
         }
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => {
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "cannot use subquery in check constraint"
             ));
         }
-        Expr::Unary { operand, .. }
-        | Expr::Cast { operand, .. }
-        | Expr::IsNull { operand, .. } => validate_check_refs(operand, def, cols)?,
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
+            validate_check_refs(operand, def, cols)?
+        }
         Expr::Binary { left, right, .. } => {
             validate_check_refs(left, def, cols)?;
             validate_check_refs(right, def, cols)?;
@@ -474,16 +494,28 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
                 validate_check_refs(a, def, cols)?;
             }
         }
-        Expr::Between { operand, low, high, .. } => {
+        Expr::Between {
+            operand, low, high, ..
+        } => {
             validate_check_refs(operand, def, cols)?;
             validate_check_refs(low, def, cols)?;
             validate_check_refs(high, def, cols)?;
         }
-        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
+        Expr::Like {
+            operand, pattern, ..
+        }
+        | Expr::Match {
+            operand, pattern, ..
+        } => {
             validate_check_refs(operand, def, cols)?;
             validate_check_refs(pattern, def, cols)?;
         }
-        Expr::Case { operand, whens, otherwise, .. } => {
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
             if let Some(o) = operand {
                 validate_check_refs(o, def, cols)?;
             }
@@ -580,7 +612,11 @@ pub(super) fn attach_constraints(
                     add_unique_key(def, *name, "key", &indices, n, false)?;
                 }
             }
-            TableConstraint::Check { name, expression, text } => {
+            TableConstraint::Check {
+                name,
+                expression,
+                text,
+            } => {
                 let mut referenced_cols = 0u64;
                 validate_check_refs(expression, def, &mut referenced_cols)?;
                 if text.len() > crate::storage::CHECK_SQL_MAX {
@@ -601,7 +637,10 @@ pub(super) fn attach_constraints(
                     Some(n) => SqlName::parse(n)?,
                     None => auto_check_name(def, referenced_cols)?,
                 };
-                let mut c = CheckConstraint { name: constraint_name, expression: crate::util::StackStr::new() };
+                let mut c = CheckConstraint {
+                    name: constraint_name,
+                    expression: crate::util::StackStr::new(),
+                };
                 let _ = core::fmt::Write::write_str(&mut c.expression, text);
                 if c.expression.is_truncated() {
                     return Err(sql_err!(
@@ -621,7 +660,15 @@ pub(super) fn attach_constraints(
                 on_update,
             } => {
                 attach_fkey(
-                    storage, def, *name, columns, parent, parent_cols, *on_delete, *on_update, txid,
+                    storage,
+                    def,
+                    *name,
+                    columns,
+                    parent,
+                    parent_cols,
+                    *on_delete,
+                    *on_update,
+                    txid,
                     arena,
                 )?;
             }
@@ -715,9 +762,15 @@ fn disambiguate_constraint_name(def: &TableDef, base: &str) -> Result<SqlName, S
 /// single-column PRIMARY KEY / UNIQUE flags (`<table>_pkey` / `<table>_<col>_key`).
 fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
     use core::fmt::Write as _;
-    if def.checks[..def.n_checks].iter().any(|c| c.name.as_str() == name)
-        || def.uniques[..def.n_uniques].iter().any(|k| k.name.as_str() == name)
-        || def.fkeys[..def.n_fkeys].iter().any(|f| f.name.as_str() == name)
+    if def.checks[..def.n_checks]
+        .iter()
+        .any(|c| c.name.as_str() == name)
+        || def.uniques[..def.n_uniques]
+            .iter()
+            .any(|k| k.name.as_str() == name)
+        || def.fkeys[..def.n_fkeys]
+            .iter()
+            .any(|f| f.name.as_str() == name)
     {
         return true;
     }
@@ -797,11 +850,10 @@ fn attach_fkey(
     // cataloged, so a name landing on the creation target is a self-reference
     // — a bare name only when no earlier search-path schema holds an existing
     // table of that name, a qualified one when it names the table's schema.
-    let resolved: Option<usize> =
-        match storage.resolve_relation(parent.schema, parent.name, txid) {
-            Some(crate::storage::ResolvedRelation::Table(pi)) => Some(pi),
-            _ => None,
-        };
+    let resolved: Option<usize> = match storage.resolve_relation(parent.schema, parent.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(pi)) => Some(pi),
+        _ => None,
+    };
     let self_ref = parent.name == def.name.as_str()
         && match parent.schema {
             Some(schema) => schema == def.schema.as_str(),
@@ -833,6 +885,28 @@ fn attach_fkey(
         };
         *storage.table_def(pi, txid)
     };
+    if !self_ref {
+        let parent_slot = resolved.expect("non-self foreign key resolved above");
+        storage.require_schema_usage(parent_def.schema.as_str(), txid)?;
+        let role = storage.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        if !storage.has_object_privilege(
+            storage.table_access_object(parent_slot, txid),
+            role,
+            crate::storage::PrivilegeSet::REFERENCES,
+            txid,
+        ) {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for table {}",
+                parent_def.name.as_str()
+            ));
+        }
+    }
 
     // Referenced columns default to the parent's primary key.
     let mut pcol_names: [&str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];

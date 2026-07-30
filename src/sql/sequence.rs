@@ -9,10 +9,10 @@
 //!
 //! [`EvalHooks`]: crate::sql::eval::EvalHooks
 
-use crate::sql::eval::{sqlstate, SequenceAccess, SqlError};
+use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::guc::SeqSession;
 use crate::sql_err;
-use crate::storage::Storage;
+use crate::storage::{AccessClass, AccessObject, PrivilegeSet, Storage};
 
 pub struct SeqEval<'a> {
     storage: &'a Storage,
@@ -27,11 +27,21 @@ pub struct SeqEval<'a> {
 
 impl<'a> SeqEval<'a> {
     pub fn new(storage: &'a Storage, session: &'a SeqSession, txid: u32) -> Self {
-        SeqEval { storage, session, txid, dry: false }
+        SeqEval {
+            storage,
+            session,
+            txid,
+            dry: false,
+        }
     }
 
     pub fn dry(storage: &'a Storage, session: &'a SeqSession, txid: u32) -> Self {
-        SeqEval { storage, session, txid, dry: true }
+        SeqEval {
+            storage,
+            session,
+            txid,
+            dry: true,
+        }
     }
 
     /// Resolves a `nextval('name')` argument to a live sequence slot. The name
@@ -43,11 +53,17 @@ impl<'a> SeqEval<'a> {
             None => (None, name),
         };
         if let Some(slot) = self.storage.sequence_on_path(qualifier, base, self.txid) {
+            self.storage
+                .require_schema_usage(self.storage.sequence(slot).schema.as_str(), self.txid)?;
             return Ok(slot);
         }
         // Match PostgreSQL's phrasing: a relation of another kind is a type
         // error; nothing at all is an undefined relation.
-        if self.storage.resolve_relation(qualifier, base, self.txid).is_some() {
+        if self
+            .storage
+            .resolve_relation(qualifier, base, self.txid)
+            .is_some()
+        {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
                 "\"{}\" is not a sequence",
@@ -60,11 +76,45 @@ impl<'a> SeqEval<'a> {
             name
         ))
     }
+
+    fn require_any(
+        &self,
+        slot: usize,
+        first: PrivilegeSet,
+        second: Option<PrivilegeSet>,
+    ) -> Result<(), SqlError> {
+        let role = self.storage.current_role_slot(self.txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let object = AccessObject {
+            class: AccessClass::Sequence,
+            slot: slot as u16,
+        };
+        if self
+            .storage
+            .has_object_privilege(object, role, first, self.txid)
+            || second.is_some_and(|privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            })
+        {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for sequence {}",
+            self.storage.sequence(slot).name.as_str()
+        ))
+    }
 }
 
 impl SequenceAccess for SeqEval<'_> {
     fn nextval(&self, name: &str) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
+        self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::UPDATE))?;
         let seq = self.storage.sequence(slot);
         if self.dry {
             return Ok(seq.last_value.get());
@@ -76,6 +126,7 @@ impl SequenceAccess for SeqEval<'_> {
 
     fn currval(&self, name: &str) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
+        self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
         let seq = self.storage.sequence(slot);
         match self.session.currval(slot, seq.created_at) {
             Some(v) => Ok(v),
@@ -98,6 +149,7 @@ impl SequenceAccess for SeqEval<'_> {
 
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
+        self.require_any(slot, PrivilegeSet::UPDATE, None)?;
         let seq = self.storage.sequence(slot);
         if self.dry {
             // Validate the range (so the error surfaces in the counting pass too)

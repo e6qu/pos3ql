@@ -33,7 +33,7 @@ def connect():
     return s
 
 
-def startup_payload(minor, user=b"probe"):
+def startup_payload(minor, user=b"postgres"):
     body = struct.pack("!i", (3 << 16) | minor)
     body += b"user\x00" + user + b"\x00\x00"
     return struct.pack("!i", len(body) + 4) + body
@@ -152,7 +152,7 @@ def test_unknown_minor_negotiates():
 def test_unknown_protocol_option():
     s = connect()
     body = struct.pack("!i", 3 << 16)
-    body += b"user\x00probe\x00_pq_.made_up_option\x00yes\x00\x00"
+    body += b"user\x00postgres\x00_pq_.made_up_option\x00yes\x00\x00"
     s.sendall(struct.pack("!i", len(body) + 4) + body)
     seen = drain_startup(s)
     check("_pq_ option: NegotiateProtocolVersion sent", b"v" in seen)

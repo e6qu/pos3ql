@@ -215,6 +215,9 @@ impl SeqSession {
 
 #[derive(Clone, Copy)]
 struct GucValues {
+    /// Effective authorization identifier. Kept in the transactional GUC
+    /// snapshot so SET ROLE follows PostgreSQL's rollback/savepoint behavior.
+    current_role: StackStr<64>,
     datestyle: StackStr<48>,
     timezone: StackStr<64>,
     /// Parsed current time zone, so rendering does not re-parse it.
@@ -241,6 +244,7 @@ struct GucValues {
 impl GucValues {
     fn new() -> Self {
         let mut values = Self {
+            current_role: StackStr::from_str("postgres"),
             datestyle: StackStr::new(),
             timezone: StackStr::new(),
             parsed_timezone: super::timezone::Timezone::utc(),
@@ -339,6 +343,30 @@ impl GucState {
     pub fn set_session_user(&mut self, user: &str) {
         self.session_user = StackStr::new();
         let _ = core::fmt::Write::write_str(&mut self.session_user, user);
+        let mut store = self.store.borrow_mut();
+        let role = StackStr::from_str(user);
+        store.current.current_role = role;
+        store.defaults.current_role = role;
+        store.transaction.start.current_role = role;
+        store.transaction.session.current_role = role;
+    }
+
+    pub fn current_role(&self) -> StackStr<64> {
+        self.store.borrow().current.current_role
+    }
+
+    pub fn set_role(&self, role: &str, local: bool) {
+        let mut store = self.store.borrow_mut();
+        let role = StackStr::from_str(role);
+        store.current.current_role = role;
+        if store.transaction.active && !local {
+            store.transaction.session.current_role = role;
+        }
+    }
+
+    pub fn reset_role(&self, local: bool) {
+        let session_user = self.session_user;
+        self.set_role(session_user.as_str(), local);
     }
 
     pub fn statement_timeout_ms(&self) -> u64 {

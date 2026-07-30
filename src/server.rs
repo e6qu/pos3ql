@@ -11,7 +11,7 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::pg::auth::{AuthMode, ScramServer, SCRAM_ITERATIONS};
+use crate::pg::auth::{AuthMode, SCRAM_ITERATIONS, ScramServer};
 use crate::pg::conn::{After, AuthContext, Conn};
 use crate::sql::Engine;
 
@@ -22,8 +22,7 @@ const SHUTDOWN_TOKEN: u64 = u64::MAX - 1;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Write end of the self-pipe, written by the signal handler to wake the
 /// reactor. -1 until installed.
-static SHUTDOWN_PIPE_WRITE: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(-1);
+static SHUTDOWN_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
@@ -102,13 +101,12 @@ impl Server {
             .set_nonblocking(true)
             .map_err(|e| ServerSetupError::Io("set listener nonblocking", e))?;
 
-        let reactor = Reactor::new(budget, max_conns + 1)
-            .map_err(|e| match e {
-                crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
-                crate::io::reactor::ReactorSetupError::Os(io) => {
-                    ServerSetupError::Io("create kqueue", io)
-                }
-            })?;
+        let reactor = Reactor::new(budget, max_conns + 1).map_err(|e| match e {
+            crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
+            crate::io::reactor::ReactorSetupError::Os(io) => {
+                ServerSetupError::Io("create kqueue", io)
+            }
+        })?;
         reactor
             .register_read(listener.as_raw_fd(), LISTENER_TOKEN)
             .map_err(|e| ServerSetupError::Io("register listener", e))?;
@@ -127,9 +125,7 @@ impl Server {
         }
 
         let mut cancel_key = [0u8; 16];
-        let rc = unsafe {
-            libc::getentropy(cancel_key.as_mut_ptr().cast(), cancel_key.len())
-        };
+        let rc = unsafe { libc::getentropy(cancel_key.as_mut_ptr().cast(), cancel_key.len()) };
         if rc != 0 {
             return Err(ServerSetupError::Io(
                 "getentropy for cancel key",
@@ -177,7 +173,7 @@ impl Server {
                         std::io::ErrorKind::InvalidInput,
                         format!("unknown auth mode '{other}'"),
                     ),
-                ))
+                ));
             }
         };
         if mode != AuthMode::Trust && config.password.is_empty() {
@@ -198,7 +194,11 @@ impl Server {
                     std::io::Error::last_os_error(),
                 ));
             }
-            Some(ScramServer::derive(&config.password, salt, SCRAM_ITERATIONS))
+            Some(ScramServer::derive(
+                &config.password,
+                salt,
+                SCRAM_ITERATIONS,
+            ))
         } else {
             None
         };
@@ -239,11 +239,12 @@ impl Server {
         use crate::pg::respond::Responder;
         let mut buffer = crate::mem::buffer::FixedBuf::new(budget, "refusal_scratch", 128)?;
         let mut responder = Responder::new(&mut buffer);
-        responder.error(
-            crate::sql::eval::sqlstate::TOO_MANY_CONNECTIONS,
-            "sorry, too many clients already",
-        )
-        .expect("refusal fits in 128 bytes");
+        responder
+            .error(
+                crate::sql::eval::sqlstate::TOO_MANY_CONNECTIONS,
+                "sorry, too many clients already",
+            )
+            .expect("refusal fits in 128 bytes");
         let mut bytes = [0u8; 128];
         let n = buffer.readable().len();
         bytes[..n].copy_from_slice(buffer.readable());
@@ -311,30 +312,37 @@ impl Server {
     /// close connections, take a final checkpoint. Runs post-freeze, so it
     /// must not allocate — messages go to stderr via raw writes.
     fn shutdown(&mut self) {
-        stderr_line(b"pos3ql: shutdown requested, draining
-");
+        stderr_line(
+            b"pos3ql: shutdown requested, draining
+",
+        );
         let _ = self.reactor.deregister(self.listener.as_raw_fd());
         for i in 0..self.slots.len() {
             if self.slots[i].conn.is_open() {
                 let slot = &mut self.slots[i];
-                self.engine
-                    .rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
+                self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 self.release(i);
             }
         }
         if self.engine.checkpoint_enabled() {
             match self.engine.checkpoint() {
-                Ok(true) => stderr_line(b"pos3ql: final checkpoint written
-"),
+                Ok(true) => stderr_line(
+                    b"pos3ql: final checkpoint written
+",
+                ),
                 Ok(false) => {}
-                Err(_) => stderr_line(b"pos3ql: final checkpoint failed; journal is durable
-"),
+                Err(_) => stderr_line(
+                    b"pos3ql: final checkpoint failed; journal is durable
+",
+                ),
             }
         }
         // Ensure the journal is durable even if no checkpoint ran.
         self.engine.commit_wal();
-        stderr_line(b"pos3ql: shutdown complete
-");
+        stderr_line(
+            b"pos3ql: shutdown complete
+",
+        );
     }
 
     fn accept_pending(&mut self) {
@@ -408,8 +416,7 @@ impl Server {
             After::Close => {
                 // A dropped connection releases its uncommitted work.
                 let slot = &mut self.slots[index];
-                self.engine
-                    .rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
+                self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 self.release(index)
             }
             After::Continue => {
@@ -463,8 +470,7 @@ impl Server {
                     After::Continue => self.sync_write_interest(index),
                     After::Close => {
                         let slot = &mut self.slots[index];
-                        self.engine
-                            .rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
+                        self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                         self.release(index);
                     }
                 }
@@ -489,7 +495,10 @@ impl Server {
                     continue;
                 }
                 let conn_id = self.slots[index].conn.id();
-                if !self.engine.is_listening(conn_id, notification.channel.as_str()) {
+                if !self
+                    .engine
+                    .is_listening(conn_id, notification.channel.as_str())
+                {
                     continue;
                 }
                 let delivered = self.slots[index].conn.queue_notification(
@@ -533,6 +542,9 @@ impl Server {
         // Drop the connection's LISTEN registrations so its channels free up and
         // no stale entry can match a later connection that reuses the id.
         self.engine.drop_connection(self.slots[index].conn.id());
+        if let Some(role) = self.slots[index].conn.authenticated_role() {
+            self.engine.release_role_connection(role);
+        }
         let slot = &mut self.slots[index];
         if let Some(stream) = slot.conn.close() {
             // Closing the fd drops its kqueue registrations; an explicit

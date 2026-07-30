@@ -81,6 +81,9 @@ pub mod sqlstate {
     pub const DUPLICATE_TABLE: &str = "42P07";
     pub const DUPLICATE_SCHEMA: &str = "42P06";
     pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
+    pub const INVALID_GRANT_OPERATION: &str = "0LP01";
+    pub const OBJECT_IN_USE: &str = "55006";
+    pub const WARNING_PRIVILEGE_NOT_GRANTED: &str = "01007";
     pub const RESERVED_NAME: &str = "42939";
     pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
     pub const DUPLICATE_CURSOR: &str = "42P03";
@@ -380,6 +383,55 @@ pub trait CatalogAccess {
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
     /// The OID of the relation named `name`, for `'relname'::regclass`.
     fn reloid(&self, name: &str) -> Option<i32>;
+    /// Resolve a role OID to its catalog name.
+    fn role_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Resolve a namespace OID to its catalog name.
+    fn schema_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// PostgreSQL privilege inquiry functions. `None` represents a missing
+    /// object or role, for which PostgreSQL returns NULL in the OID forms.
+    fn has_table_privilege(
+        &self,
+        _role: Option<&str>,
+        _relation: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_sequence_privilege(
+        &self,
+        _role: Option<&str>,
+        _sequence: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_schema_privilege(
+        &self,
+        _role: Option<&str>,
+        _schema: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_type_privilege(
+        &self,
+        _role: Option<&str>,
+        _type_name: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_database_privilege(
+        &self,
+        _role: Option<&str>,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
     /// The comment text on the object with this OID and column `subid` (0 for
     /// the object itself), or `None`. `catalog_name` selects the owning
     /// catalog (`pg_class`, `pg_namespace`, or `pg_type`). Backs

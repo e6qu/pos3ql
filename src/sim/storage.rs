@@ -36,14 +36,14 @@ use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::Budget;
 use crate::mem::buffer::FixedBuf;
+use crate::object_store::sim::{SimBucket, drop_bucket, open_bucket};
 use crate::pg::respond::Responder;
 use crate::prng::Pcg32;
-use crate::object_store::sim::{drop_bucket, open_bucket, SimBucket};
+use crate::sql::Engine;
 use crate::sql::cursor::CursorPool;
 use crate::sql::guc::GucState;
 use crate::sql::prep::SqlPreparedPool;
 use crate::sql::txn::TxnState;
-use crate::sql::Engine;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -68,7 +68,9 @@ impl Outcome {
 /// One engine incarnation with its per-connection state; dropped whole to
 /// simulate a crash.
 struct Session {
-    engine: Engine,
+    /// Recovery replaces this large value inside nested constrained-stack
+    /// fault frames; its working memory is startup-budgeted internally.
+    engine: Box<Engine>,
     txn: TxnState,
     prepared: SqlPreparedPool,
     cursors: CursorPool,
@@ -93,10 +95,8 @@ struct World {
 
 fn vopr_config(seed: u64) -> Config {
     let mut config = Config::default_dev();
-    let dir = std::env::temp_dir().join(format!(
-        "pos3ql-storage-vopr-{}-{seed}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("pos3ql-storage-vopr-{}-{seed}", std::process::id()));
     config.data_dir = dir.to_str().unwrap().to_string();
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -145,14 +145,20 @@ impl World {
         };
         world.start_engine();
         let created = world.run("CREATE TABLE t (id bigint PRIMARY KEY, v bigint, pad text)");
-        assert!(created.ok(), "seed {seed}: setup failed: {:?}", created.error);
+        assert!(
+            created.ok(),
+            "seed {seed}: setup failed: {:?}",
+            created.error
+        );
         world
     }
 
     fn start_engine(&mut self) {
         let mut budget = Budget::new(1 << 28);
-        let engine = Engine::new(&self.config, &mut budget)
-            .unwrap_or_else(|e| panic!("seed {}: engine start failed: {e}", self.seed));
+        let engine = Box::new(
+            Engine::new(&self.config, &mut budget)
+                .unwrap_or_else(|e| panic!("seed {}: engine start failed: {e}", self.seed)),
+        );
         self.session = Some(Session {
             engine,
             txn: TxnState::new(&mut budget, self.config.txn_rows).unwrap(),
@@ -181,7 +187,11 @@ impl World {
             &mut responder,
             1,
         );
-        assert!(sent.is_ok(), "seed {}: send buffer overflow on: {sql}", self.seed);
+        assert!(
+            sent.is_ok(),
+            "seed {}: send buffer overflow on: {sql}",
+            self.seed
+        );
         // What the connection loop does after every query message: the
         // auto-checkpoint rides here, so it runs under fault fire too (its
         // failures go to stderr and the next message retries).
@@ -269,17 +279,16 @@ impl World {
                     self.next_id += 1;
                     let row = self.fresh_row();
                     (
-                        format!(
-                            "INSERT INTO t VALUES ({id}, {}, '{}')",
-                            row.v, row.pad
-                        ),
+                        format!("INSERT INTO t VALUES ({id}, {}, '{}')", row.v, row.pad),
                         id,
                         None,
                         Some(row),
                     )
                 }
                 1 => {
-                    let Some(id) = self.pick_certain_id() else { continue };
+                    let Some(id) = self.pick_certain_id() else {
+                        continue;
+                    };
                     (
                         format!("DELETE FROM t WHERE id = {id}"),
                         id,
@@ -288,7 +297,9 @@ impl World {
                     )
                 }
                 _ => {
-                    let Some(id) = self.pick_certain_id() else { continue };
+                    let Some(id) = self.pick_certain_id() else {
+                        continue;
+                    };
                     let row = self.fresh_row();
                     (
                         format!(
@@ -303,10 +314,7 @@ impl World {
             };
             // A transactional statement already touched by this burst keeps
             // its original before-image.
-            let before = pending
-                .get(&id)
-                .map(|(b, _)| b.clone())
-                .unwrap_or(before);
+            let before = pending.get(&id).map(|(b, _)| b.clone()).unwrap_or(before);
             let outcome = self.run(&sql);
             if outcome.ok() {
                 // Trust the CommandComplete tag: a statement that touched no
@@ -431,7 +439,9 @@ impl World {
     /// as data.
     fn corrupt_disk_cache(&mut self) {
         let path = std::path::Path::new(&self.config.data_dir).join("block-cache");
-        let Ok(mut bytes) = std::fs::read(&path) else { return };
+        let Ok(mut bytes) = std::fs::read(&path) else {
+            return;
+        };
         if bytes.is_empty() {
             return;
         }
@@ -527,7 +537,11 @@ fn apply(model: &mut BTreeMap<i64, Row>, id: i64, state: Option<Row>) {
 /// Reads a simple-protocol response: DataRows as `(id, Row)` and the first
 /// ErrorResponse's (SQLSTATE, message).
 fn parse_outcome(mut bytes: &[u8]) -> Outcome {
-    let mut outcome = Outcome { rows: Vec::new(), affected: None, error: None };
+    let mut outcome = Outcome {
+        rows: Vec::new(),
+        affected: None,
+        error: None,
+    };
     while bytes.len() >= 5 {
         let kind = bytes[0];
         let len = i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
@@ -560,10 +574,7 @@ fn parse_outcome(mut bytes: &[u8]) -> Outcome {
                 // "INSERT 0 1" / "UPDATE 0" / "DELETE 1": the trailing
                 // number is the row count.
                 let tag = std::str::from_utf8(&body[..body.len().saturating_sub(1)]).unwrap();
-                outcome.affected = tag
-                    .rsplit(' ')
-                    .next()
-                    .and_then(|n| n.parse().ok());
+                outcome.affected = tag.rsplit(' ').next().and_then(|n| n.parse().ok());
             }
             b'E' if outcome.error.is_none() => {
                 let mut code = String::new();
@@ -571,7 +582,8 @@ fn parse_outcome(mut bytes: &[u8]) -> Outcome {
                 let mut at = 0;
                 while at < body.len() && body[at] != 0 {
                     let tag = body[at];
-                    let end = at + 1
+                    let end = at
+                        + 1
                         + body[at + 1..]
                             .iter()
                             .position(|&b| b == 0)
@@ -603,8 +615,12 @@ fn env_or(name: &str, default: u64) -> u64 {
 #[test]
 fn storage_vopr() {
     let result = std::thread::Builder::new()
-        .name("storage-vopr-1.5-mib".to_string())
-        .stack_size(1_572_864)
+        .name("storage-vopr-2-mib".to_string())
+        // The authorization catalog adds bounded parser/executor state to the
+        // same recovery frames exercised here. Keep the stack explicit and
+        // small enough to catch accidental unbounded growth, while matching
+        // the project's ordinary 2 MiB test-thread envelope.
+        .stack_size(2_097_152)
         .spawn(run_storage_vopr)
         .expect("spawn storage VOPR with constrained stack")
         .join();

@@ -4,7 +4,7 @@
 import psycopg
 
 conn = psycopg.connect(
-    host="127.0.0.1", port=5433, user="driver", dbname="postgres",
+    host="127.0.0.1", port=5433, user="postgres", dbname="postgres",
     sslmode="disable", autocommit=True,
 )
 cur = conn.cursor()

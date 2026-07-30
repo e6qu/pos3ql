@@ -477,7 +477,17 @@ pub(crate) fn scan_source<'a>(
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     scan_source_mode(
-        storage, scope, from, txid, where_clause, arena, params, hooks, outer, false, f,
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        false,
+        f,
     )
 }
 
@@ -498,7 +508,17 @@ pub(crate) fn scan_source_recycling<'a>(
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     scan_source_mode(
-        storage, scope, from, txid, where_clause, arena, params, hooks, outer, true, f,
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        true,
+        f,
     )
 }
 
@@ -516,8 +536,35 @@ fn scan_source_mode<'a>(
     recycle_rows: bool,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    let current_role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
     for table in 0..scope.n {
         if scope.derived[table].is_none() {
+            let authorization_role =
+                scope.authorization_roles[table].map_or(current_role, usize::from);
+            let object = storage.table_access_object(scope.slots[table], txid);
+            let definition = storage.table_def(scope.slots[table], txid);
+            storage.require_schema_usage_as(
+                definition.schema.as_str(),
+                authorization_role,
+                txid,
+            )?;
+            if !storage.has_object_privilege(
+                object,
+                authorization_role,
+                crate::storage::PrivilegeSet::SELECT,
+                txid,
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for table {}",
+                    definition.name.as_str()
+                ));
+            }
             storage.lock_table(
                 txid,
                 scope.slots[table],
@@ -744,8 +791,18 @@ fn scan_source_mode<'a>(
                     bound[order[depth]] = Some(bytes);
                     bound_rowids[order[depth]] = None;
                     if !candidate_passes(
-                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
-                        decode_buffers, arena, params, hooks, outer,
+                        scope,
+                        bound,
+                        bound_rowids,
+                        order,
+                        depth + 1,
+                        on,
+                        pushdown[depth],
+                        decode_buffers,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
                     )? {
                         return Ok(true);
                     }
@@ -754,9 +811,25 @@ fn scan_source_mode<'a>(
                         m[index].set(true);
                     }
                     level(
-                        storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
-                        decode_buffers, recycle_rows, f,
+                        storage,
+                        scope,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
+                        depth + 1,
+                        bound,
+                        bound_rowids,
+                        matched,
+                        pushdown,
+                        order,
+                        indexed,
+                        decode_buffers,
+                        recycle_rows,
+                        f,
                     )
                 })?;
                 if !keep_scanning {
@@ -783,8 +856,18 @@ fn scan_source_mode<'a>(
                         bound[order[depth]] = Some(owned);
                         bound_rowids[order[depth]] = None;
                         if !candidate_passes(
-                            scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
-                            decode_buffers, arena, params, hooks, outer,
+                            scope,
+                            bound,
+                            bound_rowids,
+                            order,
+                            depth + 1,
+                            on,
+                            pushdown[depth],
+                            decode_buffers,
+                            arena,
+                            params,
+                            hooks,
+                            outer,
                         )? {
                             return Ok(true);
                         }
@@ -793,9 +876,25 @@ fn scan_source_mode<'a>(
                             matched_rows[this].set(true);
                         }
                         level(
-                            storage, scope, from, txid, where_clause, arena, params, hooks,
-                            outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
-                            decode_buffers, recycle_rows, f,
+                            storage,
+                            scope,
+                            from,
+                            txid,
+                            where_clause,
+                            arena,
+                            params,
+                            hooks,
+                            outer,
+                            depth + 1,
+                            bound,
+                            bound_rowids,
+                            matched,
+                            pushdown,
+                            order,
+                            indexed,
+                            decode_buffers,
+                            recycle_rows,
+                            f,
                         )
                     })
                 }?;
@@ -813,8 +912,18 @@ fn scan_source_mode<'a>(
                     bound[order[depth]] = Some(bytes);
                     bound_rowids[order[depth]] = None;
                     if !candidate_passes(
-                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
-                        decode_buffers, arena, params, hooks, outer,
+                        scope,
+                        bound,
+                        bound_rowids,
+                        order,
+                        depth + 1,
+                        on,
+                        pushdown[depth],
+                        decode_buffers,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
                     )? {
                         return Ok(true);
                     }
@@ -823,9 +932,25 @@ fn scan_source_mode<'a>(
                         m[index].set(true);
                     }
                     level(
-                        storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
-                        decode_buffers, recycle_rows, f,
+                        storage,
+                        scope,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
+                        depth + 1,
+                        bound,
+                        bound_rowids,
+                        matched,
+                        pushdown,
+                        order,
+                        indexed,
+                        decode_buffers,
+                        recycle_rows,
+                        f,
                     )
                 })?;
                 if !keep_scanning {
@@ -890,8 +1015,18 @@ fn scan_source_mode<'a>(
                         Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
                     bound_rowids[order[depth]] = Some(rowid);
                     if !candidate_passes(
-                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
-                        decode_buffers, arena, params, hooks, outer,
+                        scope,
+                        bound,
+                        bound_rowids,
+                        order,
+                        depth + 1,
+                        on,
+                        pushdown[depth],
+                        decode_buffers,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
                     )? {
                         return Ok(true);
                     }
@@ -900,9 +1035,25 @@ fn scan_source_mode<'a>(
                         m[this].set(true);
                     }
                     level(
-                        storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
-                        decode_buffers, recycle_rows, f,
+                        storage,
+                        scope,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
+                        depth + 1,
+                        bound,
+                        bound_rowids,
+                        matched,
+                        pushdown,
+                        order,
+                        indexed,
+                        decode_buffers,
+                        recycle_rows,
+                        f,
                     )
                 })?;
                 if !keep_scanning {
@@ -925,8 +1076,18 @@ fn scan_source_mode<'a>(
                     bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
                     bound_rowids[order[depth]] = Some(rowid);
                     if !candidate_passes(
-                        scope, bound, bound_rowids, order, depth + 1, on, pushdown[depth],
-                        decode_buffers, arena, params, hooks, outer,
+                        scope,
+                        bound,
+                        bound_rowids,
+                        order,
+                        depth + 1,
+                        on,
+                        pushdown[depth],
+                        decode_buffers,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
                     )? {
                         return Ok(true);
                     }
@@ -935,9 +1096,25 @@ fn scan_source_mode<'a>(
                         m[this].set(true);
                     }
                     level(
-                        storage, scope, from, txid, where_clause, arena, params, hooks,
-                        outer, depth + 1, bound, bound_rowids, matched, pushdown, order, indexed,
-                        decode_buffers, recycle_rows, f,
+                        storage,
+                        scope,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
+                        depth + 1,
+                        bound,
+                        bound_rowids,
+                        matched,
+                        pushdown,
+                        order,
+                        indexed,
+                        decode_buffers,
+                        recycle_rows,
+                        f,
                     )
                 })?;
                 if !keep_scanning {
@@ -1132,55 +1309,56 @@ fn scan_source_mode<'a>(
     // levels' flags before those levels' post-passes run).
     for d in 1..scope.n {
         let Some(m) = matched[d] else { continue };
-        let mut emit_unmatched = |bytes: &'a [u8],
-                                  rowid: Option<u64>,
-                              f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
-         -> Result<bool, SqlError> {
-            bound.fill(None);
-            bound_rowids.fill(None);
-            bound[d] = Some(bytes);
-            bound_rowids[d] = rowid;
-            if d + 1 == scope.n {
-                // Last level: the row is complete once the left side nulls.
-                let row = assemble(
+        let mut emit_unmatched =
+            |bytes: &'a [u8],
+             rowid: Option<u64>,
+             f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
+             -> Result<bool, SqlError> {
+                bound.fill(None);
+                bound_rowids.fill(None);
+                bound[d] = Some(bytes);
+                bound_rowids[d] = rowid;
+                if d + 1 == scope.n {
+                    // Last level: the row is complete once the left side nulls.
+                    let row = assemble(
+                        scope,
+                        bound,
+                        bound_rowids,
+                        order,
+                        scope.n,
+                        decode_buffers,
+                        arena,
+                    )?;
+                    if let Some(w) = where_clause {
+                        let chained_row = Chained { inner: &row, outer };
+                        if !where_passes(w, arena, params, &chained_row, hooks)? {
+                            return Ok(true);
+                        }
+                    }
+                    return f(&row);
+                }
+                level(
+                    storage,
                     scope,
+                    from,
+                    txid,
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    d + 1,
                     bound,
                     bound_rowids,
+                    matched,
+                    pushdown,
                     order,
-                    scope.n,
+                    indexed.as_ref(),
                     decode_buffers,
-                    arena,
-                )?;
-                if let Some(w) = where_clause {
-                    let chained_row = Chained { inner: &row, outer };
-                    if !where_passes(w, arena, params, &chained_row, hooks)? {
-                        return Ok(true);
-                    }
-                }
-                return f(&row);
-            }
-            level(
-                storage,
-                scope,
-                from,
-                txid,
-                where_clause,
-                arena,
-                params,
-                hooks,
-                outer,
-                d + 1,
-                bound,
-                bound_rowids,
-                matched,
-                pushdown,
-                order,
-                indexed.as_ref(),
-                decode_buffers,
-                recycle_rows,
-                f,
-            )
-        };
+                    recycle_rows,
+                    f,
+                )
+            };
         if let Some(run) = scope.external_runs[d] {
             let mut reader = storage.external_run_reader()?;
             let mut index = 0usize;

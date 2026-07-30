@@ -1,0 +1,199 @@
+# PostgreSQL 18.4 top-level SQL-command compatibility inventory.
+#
+# Provenance:
+#   PostgreSQL tag: REL_18_4
+#   Commit: f5cc81719e6da4cbdb1f797c48b693e91018153a
+#   Source: doc/src/sgml/ref/allfiles.sgml
+#   URL: https://github.com/postgres/postgres/blob/f5cc81719e6da4cbdb1f797c48b693e91018153a/doc/src/sgml/ref/allfiles.sgml
+#   Source SHA-256: 4240987b5fddaa5ab5ffa2562551cb1325f2e5527b552c3bbe5be7ca6fd42fc7
+#   Retrieved: 2026-07-30
+#
+# State is complete, partial, or missing. "Complete" requires a differential
+# probe of the command's PostgreSQL-visible semantics, not merely accepting its
+# first keyword. This file is a whole-product ratchet: 100% PostgreSQL command
+# fidelity is reached only when every row is complete and
+# tools/check-pg18-surface.sh passes. Individual fat PRs advance the measured
+# states without pretending that the remaining surface is complete.
+ABORT	complete	05_transactions.sql
+ALTER AGGREGATE	missing	-
+ALTER COLLATION	missing	-
+ALTER CONVERSION	missing	-
+ALTER DATABASE	missing	-
+ALTER DEFAULT PRIVILEGES	missing	-
+ALTER DOMAIN	partial	62_domains.sql
+ALTER EVENT TRIGGER	missing	-
+ALTER EXTENSION	missing	-
+ALTER FOREIGN DATA WRAPPER	missing	-
+ALTER FOREIGN TABLE	missing	-
+ALTER FUNCTION	missing	-
+ALTER GROUP	partial	83_roles_acl.sql
+ALTER INDEX	missing	-
+ALTER LANGUAGE	missing	-
+ALTER LARGE OBJECT	missing	-
+ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql
+ALTER OPERATOR	missing	-
+ALTER OPERATOR CLASS	missing	-
+ALTER OPERATOR FAMILY	missing	-
+ALTER POLICY	missing	-
+ALTER PROCEDURE	missing	-
+ALTER PUBLICATION	missing	-
+ALTER ROLE	partial	83_roles_acl.sql
+ALTER ROUTINE	missing	-
+ALTER RULE	missing	-
+ALTER SCHEMA	partial	37_schemas.sql
+ALTER SEQUENCE	partial	54_sequence.sql
+ALTER SERVER	missing	-
+ALTER STATISTICS	missing	-
+ALTER SUBSCRIPTION	missing	-
+ALTER SYSTEM	missing	-
+ALTER TABLE	partial	45_alter_column.sql
+ALTER TABLESPACE	missing	-
+ALTER TEXT SEARCH CONFIGURATION	missing	-
+ALTER TEXT SEARCH DICTIONARY	missing	-
+ALTER TEXT SEARCH PARSER	missing	-
+ALTER TEXT SEARCH TEMPLATE	missing	-
+ALTER TRIGGER	missing	-
+ALTER TYPE	partial	63_enums.sql
+ALTER USER	partial	83_roles_acl.sql
+ALTER USER MAPPING	missing	-
+ALTER VIEW	partial	76_stored_dependencies.sql
+ANALYZE	complete	48_vacuum_analyze.sql
+BEGIN	complete	05_transactions.sql
+CALL	missing	-
+CHECKPOINT	complete	40_copy.sql
+CLOSE	complete	39_cursors.sql
+CLUSTER	missing	-
+COMMENT	partial	59_comment.sql
+COMMIT	complete	05_transactions.sql
+COMMIT PREPARED	missing	-
+COPY	complete	40_copy.sql
+CREATE ACCESS METHOD	missing	-
+CREATE AGGREGATE	missing	-
+CREATE CAST	missing	-
+CREATE COLLATION	missing	-
+CREATE CONVERSION	missing	-
+CREATE DATABASE	missing	-
+CREATE DOMAIN	complete	62_domains.sql
+CREATE EVENT TRIGGER	missing	-
+CREATE EXTENSION	missing	-
+CREATE FOREIGN DATA WRAPPER	missing	-
+CREATE FOREIGN TABLE	missing	-
+CREATE FUNCTION	missing	-
+CREATE GROUP	partial	83_roles_acl.sql
+CREATE INDEX	partial	43_indexes.sql
+CREATE LANGUAGE	missing	-
+CREATE MATERIALIZED VIEW	complete	53_materialized_view.sql
+CREATE OPERATOR	missing	-
+CREATE OPERATOR CLASS	missing	-
+CREATE OPERATOR FAMILY	missing	-
+CREATE POLICY	missing	-
+CREATE PROCEDURE	missing	-
+CREATE PUBLICATION	missing	-
+CREATE ROLE	partial	83_roles_acl.sql
+CREATE RULE	missing	-
+CREATE SCHEMA	partial	37_schemas.sql
+CREATE SEQUENCE	complete	54_sequence.sql
+CREATE SERVER	missing	-
+CREATE STATISTICS	missing	-
+CREATE SUBSCRIPTION	missing	-
+CREATE TABLE	partial	14_surface.sql
+CREATE TABLE AS	complete	52_create_table_as.sql
+CREATE TABLESPACE	missing	-
+CREATE TEXT SEARCH CONFIGURATION	missing	-
+CREATE TEXT SEARCH DICTIONARY	missing	-
+CREATE TEXT SEARCH PARSER	missing	-
+CREATE TEXT SEARCH TEMPLATE	missing	-
+CREATE TRANSFORM	missing	-
+CREATE TRIGGER	missing	-
+CREATE TYPE	partial	63_enums.sql
+CREATE USER	partial	83_roles_acl.sql
+CREATE USER MAPPING	missing	-
+CREATE VIEW	complete	76_stored_dependencies.sql
+DEALLOCATE	complete	14_surface.sql
+DECLARE	partial	39_cursors.sql
+DELETE	complete	02_dml_returning.sql
+DISCARD	missing	-
+DO	missing	-
+DROP ACCESS METHOD	missing	-
+DROP AGGREGATE	missing	-
+DROP CAST	missing	-
+DROP COLLATION	missing	-
+DROP CONVERSION	missing	-
+DROP DATABASE	missing	-
+DROP DOMAIN	complete	62_domains.sql
+DROP EVENT TRIGGER	missing	-
+DROP EXTENSION	missing	-
+DROP FOREIGN DATA WRAPPER	missing	-
+DROP FOREIGN TABLE	missing	-
+DROP FUNCTION	missing	-
+DROP GROUP	partial	83_roles_acl.sql
+DROP INDEX	complete	43_indexes.sql
+DROP LANGUAGE	missing	-
+DROP MATERIALIZED VIEW	complete	53_materialized_view.sql
+DROP OPERATOR	missing	-
+DROP OPERATOR CLASS	missing	-
+DROP OPERATOR FAMILY	missing	-
+DROP OWNED	missing	-
+DROP POLICY	missing	-
+DROP PROCEDURE	missing	-
+DROP PUBLICATION	missing	-
+DROP ROLE	partial	83_roles_acl.sql
+DROP ROUTINE	missing	-
+DROP RULE	missing	-
+DROP SCHEMA	complete	37_schemas.sql
+DROP SEQUENCE	complete	54_sequence.sql
+DROP SERVER	missing	-
+DROP STATISTICS	missing	-
+DROP SUBSCRIPTION	missing	-
+DROP TABLE	complete	14_surface.sql
+DROP TABLESPACE	missing	-
+DROP TEXT SEARCH CONFIGURATION	missing	-
+DROP TEXT SEARCH DICTIONARY	missing	-
+DROP TEXT SEARCH PARSER	missing	-
+DROP TEXT SEARCH TEMPLATE	missing	-
+DROP TRANSFORM	missing	-
+DROP TRIGGER	missing	-
+DROP TYPE	complete	63_enums.sql
+DROP USER	partial	83_roles_acl.sql
+DROP USER MAPPING	missing	-
+DROP VIEW	complete	76_stored_dependencies.sql
+END	complete	05_transactions.sql
+EXECUTE	complete	14_surface.sql
+EXPLAIN	partial	48_vacuum_analyze.sql
+FETCH	complete	39_cursors.sql
+GRANT	partial	83_roles_acl.sql
+IMPORT FOREIGN SCHEMA	missing	-
+INSERT	complete	02_dml_returning.sql
+LISTEN	complete	14_surface.sql
+LOAD	missing	-
+LOCK	complete	67_for_update.sql
+MERGE	partial	58_merge.sql
+MOVE	complete	39_cursors.sql
+NOTIFY	complete	14_surface.sql
+PREPARE	complete	14_surface.sql
+PREPARE TRANSACTION	missing	-
+REASSIGN OWNED	missing	-
+REFRESH MATERIALIZED VIEW	complete	53_materialized_view.sql
+REINDEX	missing	-
+RELEASE SAVEPOINT	complete	05_transactions.sql
+RESET	complete	75_guc_mutation.sql
+REVOKE	partial	83_roles_acl.sql
+ROLLBACK	complete	05_transactions.sql
+ROLLBACK PREPARED	missing	-
+ROLLBACK TO SAVEPOINT	complete	05_transactions.sql
+SAVEPOINT	complete	05_transactions.sql
+SECURITY LABEL	missing	-
+SELECT	complete	14_surface.sql
+SELECT INTO	complete	69_select_into.sql
+SET	partial	75_guc_mutation.sql
+SET CONSTRAINTS	missing	-
+SET ROLE	complete	83_roles_acl.sql
+SET SESSION AUTHORIZATION	missing	-
+SET TRANSACTION	partial	05_transactions.sql
+SHOW	partial	68_current_setting.sql
+START TRANSACTION	complete	05_transactions.sql
+TRUNCATE	complete	35_truncate_sequences.sql
+UNLISTEN	complete	14_surface.sql
+UPDATE	complete	02_dml_returning.sql
+VACUUM	partial	48_vacuum_analyze.sql
+VALUES	complete	14_surface.sql

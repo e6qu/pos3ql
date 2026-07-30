@@ -1012,9 +1012,7 @@ impl Checkpointer {
                     }
                     let average_width: u32 = parse_field(words.next(), "cstat average width")?;
                     if words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "malformed column statistics",
-                        ));
+                        return Err(CheckpointSetupError::Corrupt("malformed column statistics"));
                     }
                     let Some((_, statistics)) = table_statistics
                         .iter_mut()
@@ -1025,9 +1023,7 @@ impl Checkpointer {
                         ));
                     };
                     if statistics.columns[column].valid {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "duplicate column statistics",
-                        ));
+                        return Err(CheckpointSetupError::Corrupt("duplicate column statistics"));
                     }
                     statistics.columns[column] = crate::storage::ColumnStatistics {
                         valid: true,
@@ -1060,6 +1056,190 @@ impl Checkpointer {
                             ))
                         })?;
                     }
+                }
+                Some("rol") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rol name missing"))?,
+                    )?;
+                    let flags: u16 = parse_field(words.next(), "rol flags")?;
+                    let connection_limit: i32 = parse_field(words.next(), "rol connection limit")?;
+                    let salt = parse_hex_array::<16>(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rol salt missing"))?,
+                    )?;
+                    let stored_key = parse_hex_array::<32>(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rol stored key missing"))?,
+                    )?;
+                    let server_key = parse_hex_array::<32>(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rol server key missing"))?,
+                    )?;
+                    let iterations: u32 = parse_field(words.next(), "rol iterations")?;
+                    let valid_until = match words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol valid-until missing"))?
+                    {
+                        "-" => String::new(),
+                        "0" => String::new(),
+                        encoded => decode_hex_name(encoded)?,
+                    };
+                    if words.next().is_some()
+                        || flags & !0x01ff != 0
+                        || valid_until.len() > crate::storage::ROLE_VALID_UNTIL_MAX
+                        || (flags & (1 << 7) != 0 && iterations == 0)
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid rol record"));
+                    }
+                    storage
+                        .install_role(
+                            sql_name(&name)?,
+                            crate::storage::RoleAttributes {
+                                superuser: flags & 1 != 0,
+                                inherit: flags & (1 << 1) != 0,
+                                create_role: flags & (1 << 2) != 0,
+                                create_database: flags & (1 << 3) != 0,
+                                can_login: flags & (1 << 4) != 0,
+                                replication: flags & (1 << 5) != 0,
+                                bypass_row_level_security: flags & (1 << 6) != 0,
+                                connection_limit,
+                                password: crate::storage::RolePassword {
+                                    salt,
+                                    stored_key,
+                                    server_key,
+                                    iterations,
+                                },
+                                has_password: flags & (1 << 7) != 0,
+                                valid_until: crate::util::StackStr::from_str(&valid_until),
+                                has_valid_until: flags & (1 << 8) != 0,
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest role rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("rmem") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let decode = |word: Option<&str>, missing: &'static str| {
+                        word.ok_or(CheckpointSetupError::Corrupt(missing))
+                            .and_then(decode_hex_name)
+                    };
+                    let role = decode(words.next(), "rmem role missing")?;
+                    let member = decode(words.next(), "rmem member missing")?;
+                    let grantor = decode(words.next(), "rmem grantor missing")?;
+                    let flags: u8 = parse_field(words.next(), "rmem flags")?;
+                    if words.next().is_some() || flags & !0x07 != 0 {
+                        return Err(CheckpointSetupError::Corrupt("invalid rmem record"));
+                    }
+                    storage
+                        .install_role_membership(
+                            &role,
+                            &member,
+                            &grantor,
+                            crate::storage::RoleMembershipOptions {
+                                admin: flags & 1 != 0,
+                                inherit: flags & 2 != 0,
+                                set: flags & 4 != 0,
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest role membership rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("own") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let class: u8 = parse_field(words.next(), "own class")?;
+                    let class = crate::storage::AccessClass::from_u8(class)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid own class"))?;
+                    let schema = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("own schema missing"))?,
+                    )?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("own name missing"))?,
+                    )?;
+                    let owner = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("own owner missing"))?,
+                    )?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("malformed own record"));
+                    }
+                    let object = storage
+                        .resolve_access_object(class, &schema, &name, 0)
+                        .ok_or(CheckpointSetupError::Corrupt("own target does not exist"))?;
+                    let owner = storage
+                        .find_role(&owner)
+                        .ok_or(CheckpointSetupError::Corrupt("own role does not exist"))?;
+                    storage.set_object_owner(object, owner, 0);
+                }
+                Some("acl") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let class: u8 = parse_field(words.next(), "acl class")?;
+                    let class = crate::storage::AccessClass::from_u8(class)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid acl class"))?;
+                    let decode = |word: Option<&str>, missing: &'static str| {
+                        word.ok_or(CheckpointSetupError::Corrupt(missing))
+                            .and_then(decode_hex_name)
+                    };
+                    let schema = decode(words.next(), "acl schema missing")?;
+                    let name = decode(words.next(), "acl name missing")?;
+                    let grantee = decode(words.next(), "acl grantee missing")?;
+                    let grantor = decode(words.next(), "acl grantor missing")?;
+                    let privileges: u16 = parse_field(words.next(), "acl privileges")?;
+                    let grant_options: u16 = parse_field(words.next(), "acl grant options")?;
+                    if words.next().is_some()
+                        || privileges & !0x01ff != 0
+                        || grant_options & !privileges != 0
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid acl record"));
+                    }
+                    let object = storage
+                        .resolve_access_object(class, &schema, &name, 0)
+                        .ok_or(CheckpointSetupError::Corrupt("acl target does not exist"))?;
+                    let grantee = if grantee == "PUBLIC" {
+                        crate::storage::PUBLIC_ROLE
+                    } else {
+                        storage
+                            .find_role(&grantee)
+                            .ok_or(CheckpointSetupError::Corrupt("acl grantee does not exist"))?
+                            as u16
+                    };
+                    let grantor = storage
+                        .find_role(&grantor)
+                        .ok_or(CheckpointSetupError::Corrupt("acl grantor does not exist"))?
+                        as u16;
+                    storage
+                        .change_acl(
+                            object,
+                            grantee,
+                            grantor,
+                            crate::storage::PrivilegeSet(privileges),
+                            crate::storage::PrivilegeSet(grant_options),
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest ACL rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
                 }
                 Some("seq") => {
                     let Some((_, _, _, serials)) = pending_def.as_mut() else {
@@ -1564,6 +1744,7 @@ impl Checkpointer {
                                 schema: sql_name(&schema)?,
                                 name: sql_name(&name)?,
                                 table: sql_name(&table)?,
+                                ownership: crate::storage::Ownership::BOOTSTRAP,
                                 columns,
                                 descending,
                                 nulls_first,
@@ -2006,6 +2187,107 @@ impl Checkpointer {
             &mut self.manifest_buf,
             format_args!("writer {:016x}", self.writer_id),
         )?;
+
+        // Roles are durable catalog authority. Only SCRAM verifier material
+        // crosses this object-backed manifest; plaintext passwords never do.
+        for (_, role) in storage.live_roles() {
+            use core::fmt::Write;
+            let attributes = role.attributes;
+            let mut name = StackStr::<130>::new();
+            for byte in role.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            let mut salt = StackStr::<32>::new();
+            let mut stored_key = StackStr::<64>::new();
+            let mut server_key = StackStr::<64>::new();
+            for byte in attributes.password.salt {
+                let _ = write!(salt, "{byte:02x}");
+            }
+            for byte in attributes.password.stored_key {
+                let _ = write!(stored_key, "{byte:02x}");
+            }
+            for byte in attributes.password.server_key {
+                let _ = write!(server_key, "{byte:02x}");
+            }
+            let mut valid_until = StackStr::<{ 2 * crate::storage::ROLE_VALID_UNTIL_MAX }>::new();
+            if attributes.has_valid_until {
+                if attributes.valid_until.as_str().is_empty() {
+                    let _ = write!(valid_until, "0");
+                } else {
+                    for byte in attributes.valid_until.as_str().as_bytes() {
+                        let _ = write!(valid_until, "{byte:02x}");
+                    }
+                }
+            } else {
+                let _ = write!(valid_until, "-");
+            }
+            let flags = u16::from(attributes.superuser)
+                | (u16::from(attributes.inherit) << 1)
+                | (u16::from(attributes.create_role) << 2)
+                | (u16::from(attributes.create_database) << 3)
+                | (u16::from(attributes.can_login) << 4)
+                | (u16::from(attributes.replication) << 5)
+                | (u16::from(attributes.bypass_row_level_security) << 6)
+                | (u16::from(attributes.has_password) << 7)
+                | (u16::from(attributes.has_valid_until) << 8);
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "rol {} {} {} {} {} {} {} {}",
+                    name.as_str(),
+                    flags,
+                    attributes.connection_limit,
+                    salt.as_str(),
+                    stored_key.as_str(),
+                    server_key.as_str(),
+                    attributes.password.iterations,
+                    valid_until.as_str()
+                ),
+            )?;
+        }
+        for (_, membership) in storage.live_role_memberships() {
+            use core::fmt::Write;
+            let mut role = StackStr::<130>::new();
+            let mut member = StackStr::<130>::new();
+            let mut grantor = StackStr::<130>::new();
+            for byte in storage
+                .role(membership.role as usize)
+                .name
+                .as_str()
+                .as_bytes()
+            {
+                let _ = write!(role, "{byte:02x}");
+            }
+            for byte in storage
+                .role(membership.member as usize)
+                .name
+                .as_str()
+                .as_bytes()
+            {
+                let _ = write!(member, "{byte:02x}");
+            }
+            for byte in storage
+                .role(membership.grantor as usize)
+                .name
+                .as_str()
+                .as_bytes()
+            {
+                let _ = write!(grantor, "{byte:02x}");
+            }
+            let flags = u8::from(membership.options.admin)
+                | (u8::from(membership.options.inherit) << 1)
+                | (u8::from(membership.options.set) << 2);
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "rmem {} {} {} {}",
+                    role.as_str(),
+                    member.as_str(),
+                    grantor.as_str(),
+                    flags
+                ),
+            )?;
+        }
 
         // Schemas: `nsp <hex-name>` (public is implicit and never written).
         for (_, schema) in storage.live_schemas() {
@@ -2634,6 +2916,127 @@ impl Checkpointer {
                 ),
             )?;
         }
+        // Ownership and ACL authority follows every object definition so a
+        // cold manifest load can resolve stable runtime slots from names.
+        let mut write_owner = |object: crate::storage::AccessObject| -> Result<(), SqlError> {
+            use core::fmt::Write;
+            let (schema, name) = storage.access_object_name(object);
+            let owner = storage.role(storage.object_owner(object, 0)).name;
+            let mut schema_hex = StackStr::<130>::new();
+            let mut name_hex = StackStr::<130>::new();
+            let mut owner_hex = StackStr::<130>::new();
+            for byte in schema.as_str().as_bytes() {
+                let _ = write!(schema_hex, "{byte:02x}");
+            }
+            for byte in name.as_str().as_bytes() {
+                let _ = write!(name_hex, "{byte:02x}");
+            }
+            for byte in owner.as_str().as_bytes() {
+                let _ = write!(owner_hex, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "own {} {} {} {}",
+                    object.class as u8,
+                    schema_hex.as_str(),
+                    name_hex.as_str(),
+                    owner_hex.as_str()
+                ),
+            )
+        };
+        for slot in 0..storage.table_count() {
+            if storage.table(slot).live {
+                write_owner(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Table,
+                    slot: slot as u16,
+                })?;
+            }
+        }
+        for (slot, _) in storage.views_with_slots() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.matviews_with_slots() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::MaterializedView,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.sequences_with_slots() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Sequence,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.live_schemas() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Schema,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.live_domains() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Domain,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.live_enums() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Enum,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.live_indexes_with_slots() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Index,
+                slot: slot as u16,
+            })?;
+        }
+        for (_, acl) in storage.live_acls() {
+            if !storage.access_object_is_live(acl.object) {
+                continue;
+            }
+            use core::fmt::Write;
+            let (schema, name) = storage.access_object_name(acl.object);
+            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
+                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
+            } else {
+                storage.role(acl.grantee as usize).name
+            };
+            let grantor = storage.role(acl.grantor as usize).name;
+            let mut schema_hex = StackStr::<130>::new();
+            let mut name_hex = StackStr::<130>::new();
+            let mut grantee_hex = StackStr::<130>::new();
+            let mut grantor_hex = StackStr::<130>::new();
+            for byte in schema.as_str().as_bytes() {
+                let _ = write!(schema_hex, "{byte:02x}");
+            }
+            for byte in name.as_str().as_bytes() {
+                let _ = write!(name_hex, "{byte:02x}");
+            }
+            for byte in grantee.as_str().as_bytes() {
+                let _ = write!(grantee_hex, "{byte:02x}");
+            }
+            for byte in grantor.as_str().as_bytes() {
+                let _ = write!(grantor_hex, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "acl {} {} {} {} {} {} {}",
+                    acl.object.class as u8,
+                    schema_hex.as_str(),
+                    name_hex.as_str(),
+                    grantee_hex.as_str(),
+                    grantor_hex.as_str(),
+                    acl.privileges.0,
+                    acl.grant_options.0
+                ),
+            )?;
+        }
         write_manifest(&mut self.manifest_buf, "end")?;
 
         // Publish via CAS.
@@ -3161,11 +3564,11 @@ impl Checkpointer {
     }
 }
 
-fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
+fn parse_hex_array<const N: usize>(hex: &str) -> Result<[u8; N], CheckpointSetupError> {
     let bytes = hex.as_bytes();
-    if bytes.len() != 64 {
+    if bytes.len() != 2 * N {
         return Err(CheckpointSetupError::Corrupt(
-            "block id is not 64 hex chars",
+            "fixed byte field has the wrong hex length",
         ));
     }
     let nibble = |b: u8| -> Result<u8, CheckpointSetupError> {
@@ -3177,11 +3580,15 @@ fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
             )),
         }
     };
-    let mut id = [0u8; 32];
+    let mut output = [0u8; N];
     for (i, pair) in bytes.chunks(2).enumerate() {
-        id[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        output[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
-    Ok(BlockId(id))
+    Ok(output)
+}
+
+fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
+    Ok(BlockId(parse_hex_array(hex)?))
 }
 
 fn sst_to_sql(e: crate::store::SstError) -> SqlError {

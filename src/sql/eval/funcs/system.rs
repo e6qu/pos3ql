@@ -3,7 +3,7 @@
 //! Covers server identity/state (`version`, `pg_is_in_recovery`), session identity
 //! (`current_database`/`current_catalog`,
 //! `current_schema`/`current_schemas`, `current_user`/`session_user`/`user`,
-//! `pg_get_userbyid`), the always-true visibility/privilege predicates, the
+//! `pg_get_userbyid`), visibility and privilege predicates, the
 //! catalog-definition reconstructors (`pg_get_indexdef`/`pg_get_constraintdef`
 //! and the not-reconstructed `pg_get_expr`/`pg_get_viewdef`/… → NULL),
 //! partitioning identity (`pg_partition_ancestors`/`_root`/`_tree`),
@@ -18,10 +18,71 @@ use crate::stack_format;
 
 use super::super::{ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate};
 
+fn privilege_role_name<'a>(
+    value: Datum<'a>,
+    catalog: &dyn super::super::CatalogAccess,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    match value {
+        Datum::Text(role) => Ok(Some(role)),
+        Datum::Int4(oid) => catalog.role_name(oid, arena),
+        Datum::Int8(oid) => catalog.role_name(oid as i32, arena),
+        Datum::Null => Ok(None),
+        _ => Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "role must be specified by name or oid"
+        )),
+    }
+}
+
+fn privilege_object_name<'a>(
+    value: Datum<'a>,
+    function: &str,
+    catalog: &dyn super::super::CatalogAccess,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    match value {
+        Datum::Text(object) => Ok(Some(object)),
+        Datum::Int4(oid) => {
+            if function == "has_type_privilege" {
+                catalog.type_name(oid, arena)
+            } else if function == "has_schema_privilege" {
+                catalog.schema_name(oid, arena)
+            } else if function == "has_database_privilege" {
+                Ok(Some("pos3ql"))
+            } else {
+                catalog.relname(oid, arena)
+            }
+        }
+        Datum::Int8(oid) => {
+            if function == "has_type_privilege" {
+                catalog.type_name(oid as i32, arena)
+            } else if function == "has_schema_privilege" {
+                catalog.schema_name(oid as i32, arena)
+            } else if function == "has_database_privilege" {
+                Ok(Some("pos3ql"))
+            } else {
+                catalog.relname(oid as i32, arena)
+            }
+        }
+        Datum::Null => Ok(None),
+        _ => Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "object must be specified by name or oid"
+        )),
+    }
+}
+
 std::thread_local! {
     /// The session's startup user, published per statement (like the session
     /// time zone) so `current_user` and friends reflect the connection.
     static SESSION_USER: core::cell::RefCell<crate::util::StackStr<64>> =
+        core::cell::RefCell::new({
+            let mut s = crate::util::StackStr::new();
+            let _ = core::fmt::Write::write_str(&mut s, "postgres");
+            s
+        });
+    static CURRENT_USER: core::cell::RefCell<crate::util::StackStr<64>> =
         core::cell::RefCell::new({
             let mut s = crate::util::StackStr::new();
             let _ = core::fmt::Write::write_str(&mut s, "postgres");
@@ -139,14 +200,33 @@ pub fn set_session_user(user: &str) {
         *u = crate::util::StackStr::new();
         let _ = core::fmt::Write::write_str(&mut *u, user);
     });
+    CURRENT_USER.with(|current| {
+        let mut current = current.borrow_mut();
+        *current = crate::util::StackStr::from_str(user);
+    });
+}
+
+pub fn set_current_user(user: &str) {
+    CURRENT_USER.with(|current| {
+        *current.borrow_mut() = crate::util::StackStr::from_str(user);
+    });
 }
 
 pub fn session_user_owned() -> crate::util::StackStr<64> {
     SESSION_USER.with(|u| *u.borrow())
 }
 
+pub fn current_user_owned() -> crate::util::StackStr<64> {
+    CURRENT_USER.with(|user| *user.borrow())
+}
+
 fn session_user_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> {
     let user = session_user_owned();
+    arena.alloc_str(user.as_str()).map_err(|_| arena_full())
+}
+
+fn current_user_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> {
+    let user = current_user_owned();
     arena.alloc_str(user.as_str()).map_err(|_| arena_full())
 }
 
@@ -171,6 +251,7 @@ pub(crate) fn dispatch<'a>(
             | "current_schema"
             | "current_schemas"
             | "current_user"
+            | "current_role"
             | "session_user"
             | "user"
             | "pg_get_userbyid"
@@ -183,7 +264,9 @@ pub(crate) fn dispatch<'a>(
             | "pg_collation_is_visible"
             | "has_table_privilege"
             | "has_column_privilege"
+            | "has_sequence_privilege"
             | "has_schema_privilege"
+            | "has_type_privilege"
             | "has_database_privilege"
             | "pg_relation_is_publishable"
             | "pg_get_indexdef"
@@ -381,15 +464,36 @@ pub(crate) fn dispatch<'a>(
                     raw: array::build(&elems[..n], arena)?,
                 })
             }
-            "current_user" | "session_user" | "user" => {
+            "session_user" => {
                 arity(0)?;
                 Ok(Datum::Text(session_user_str(arena)?))
+            }
+            "current_user" | "current_role" | "user" => {
+                arity(0)?;
+                Ok(Datum::Text(current_user_str(arena)?))
             }
             // Catalog helpers for psql introspection. Every user object lives in the
             // single visible schema owned by the connection role.
             "pg_get_userbyid" => {
                 arity(1)?;
-                Ok(Datum::Text("pos3ql"))
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => value as i32,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "pg_get_userbyid() requires an oid"
+                        ));
+                    }
+                };
+                Ok(cat
+                    .role_name(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             // A non-partitioned table is its own only ancestor/root; we have no
             // partitioning, so these return the argument unchanged.
@@ -397,14 +501,83 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 eval_full(args[0], arena, params, row, hooks)
             }
+            "has_table_privilege"
+            | "has_column_privilege"
+            | "has_sequence_privilege"
+            | "has_schema_privilege"
+            | "has_type_privilege"
+            | "has_database_privilege" => {
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let column = name == "has_column_privilege";
+                let minimum = if column { 3 } else { 2 };
+                let maximum = minimum + 1;
+                if !(minimum..=maximum).contains(&args.len()) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}(...) with {} arguments does not exist",
+                        name,
+                        args.len()
+                    ));
+                }
+                let explicit_role = args.len() == maximum;
+                let mut at = 0usize;
+                let role = if explicit_role {
+                    let value = eval_full(args[at], arena, params, row, hooks)?;
+                    at += 1;
+                    match privilege_role_name(value, cat, arena)? {
+                        Some(role) => Some(role),
+                        None => return Ok(Datum::Null),
+                    }
+                } else {
+                    None
+                };
+                let object = eval_full(args[at], arena, params, row, hooks)?;
+                at += 1;
+                let object = match privilege_object_name(object, name, cat, arena)? {
+                    Some(object) => object,
+                    None => return Ok(Datum::Null),
+                };
+                if column {
+                    // Table-level privileges imply the corresponding column
+                    // privilege. Column-specific ACL entries are checked by
+                    // the same catalog hook when present.
+                    let column = eval_full(args[at], arena, params, row, hooks)?;
+                    at += 1;
+                    if matches!(column, Datum::Null) {
+                        return Ok(Datum::Null);
+                    }
+                }
+                let privilege = match eval_full(args[at], arena, params, row, hooks)? {
+                    Datum::Text(privilege) => privilege,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "{}() requires a text privilege name",
+                            name
+                        ));
+                    }
+                };
+                let answer = match name {
+                    "has_table_privilege" | "has_column_privilege" => {
+                        cat.has_table_privilege(role, object, privilege)?
+                    }
+                    "has_sequence_privilege" => {
+                        cat.has_sequence_privilege(role, object, privilege)?
+                    }
+                    "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
+                    "has_type_privilege" => cat.has_type_privilege(role, object, privilege)?,
+                    "has_database_privilege" => cat.has_database_privilege(role, privilege)?,
+                    _ => unreachable!(),
+                };
+                Ok(answer.map(Datum::Bool).unwrap_or(Datum::Null))
+            }
             "pg_table_is_visible"
             | "pg_type_is_visible"
             | "pg_function_is_visible"
             | "pg_collation_is_visible"
-            | "has_table_privilege"
-            | "has_column_privilege"
-            | "has_schema_privilege"
-            | "has_database_privilege"
             | "pg_relation_is_publishable" => Ok(Datum::Bool(true)),
             "pg_get_indexdef" => {
                 // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole

@@ -13,7 +13,7 @@ use crate::sql::ast::{
     WindowFrame,
 };
 use crate::sql::eval::{
-    compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError, SubqueryValues,
+    ColumnLookup, EvalHooks, SqlError, SubqueryValues, compare_datums, eval_full, sqlstate,
 };
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::Datum;
@@ -22,10 +22,10 @@ use crate::{sql_err, stack_format};
 
 use super::group::row_passes_correlated_where;
 use super::{
-    arena_full, collect_grouped_aggs, keys_equal, merge_correlated, project_row,
-    resolve_order_target, rewrite_grouped_expr, scan_source, sql_fail,
-    sql_ok, window_row, AggState, GroupedRewrite, Outcome, QueryScope, MAX_AGGS, MAX_JOIN_TABLES,
-    MAX_SUBQUERIES, MAX_WINDOWS, MAX_WIN_KEYS,
+    AggState, GroupedRewrite, MAX_AGGS, MAX_JOIN_TABLES, MAX_SUBQUERIES, MAX_WIN_KEYS, MAX_WINDOWS,
+    Outcome, QueryScope, arena_full, collect_grouped_aggs, keys_equal, merge_correlated,
+    project_row, resolve_order_target, rewrite_grouped_expr, scan_source, sql_fail, sql_ok,
+    window_row,
 };
 
 /// Windows over a grouped query: PostgreSQL evaluates window functions after
@@ -62,14 +62,20 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             .alloc_str(stack_format!(16, "?g{}", i).as_str())
             .map_err(|_| arena_full())?;
         group_names[i] = name;
-        inner_items[i] = SelectItem::Expr { expression: g, alias: Some(name) };
+        inner_items[i] = SelectItem::Expr {
+            expression: g,
+            alias: Some(name),
+        };
     }
     for i in 0..n_aggs {
         let name = arena
             .alloc_str(stack_format!(16, "?a{}", i).as_str())
             .map_err(|_| arena_full())?;
         agg_names[i] = name;
-        inner_items[n_keys + i] = SelectItem::Expr { expression: agg_nodes[i].1, alias: Some(name) };
+        inner_items[n_keys + i] = SelectItem::Expr {
+            expression: agg_nodes[i].1,
+            alias: Some(name),
+        };
     }
     let inner = Select {
         items: arena
@@ -92,12 +98,15 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     };
     let inner = arena.alloc(inner).map_err(|_| arena_full())?;
 
-    let group_names: &[&str] =
-        arena.alloc_slice_copy(&group_names[..n_keys]).map_err(|_| arena_full())?;
-    let agg_names: &[&str] =
-        arena.alloc_slice_copy(&agg_names[..n_aggs]).map_err(|_| arena_full())?;
-    let agg_nodes: &[(*const Expr, &Expr)] =
-        arena.alloc_slice_copy(&agg_nodes[..n_aggs]).map_err(|_| arena_full())?;
+    let group_names: &[&str] = arena
+        .alloc_slice_copy(&group_names[..n_keys])
+        .map_err(|_| arena_full())?;
+    let agg_names: &[&str] = arena
+        .alloc_slice_copy(&agg_names[..n_aggs])
+        .map_err(|_| arena_full())?;
+    let agg_nodes: &[(*const Expr, &Expr)] = arena
+        .alloc_slice_copy(&agg_nodes[..n_aggs])
+        .map_err(|_| arena_full())?;
     let scope = statement
         .from
         .as_ref()
@@ -121,8 +130,11 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             other => *other,
         };
     }
-    let mut outer_order = [OrderBy { expression: &Expr::Null, descending: false, nulls_first: false };
-        MAX_PROJ];
+    let mut outer_order = [OrderBy {
+        expression: &Expr::Null,
+        descending: false,
+        nulls_first: false,
+    }; MAX_PROJ];
     for (i, ob) in statement.order_by.iter().enumerate() {
         // Ordinals resolve against the (unchanged) select list; expressions
         // rewrite like the items.
@@ -144,6 +156,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             cte: None,
             with_ordinality: false,
             lateral: false,
+            authorization_role: None,
         },
         joins: &[],
     };
@@ -193,7 +206,7 @@ fn frame_offset_count<'a>(
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "frame offset must be an integer"
-            ))
+            ));
         }
     };
     if n < 0 {
@@ -240,17 +253,19 @@ fn frame_range<'a>(
     // Peers under the window ORDER BY (every row is a peer with no ORDER BY).
     let is_peer = |a: usize, b: usize| -> Result<bool, SqlError> {
         ord.iter().try_fold(true, |acc, o| {
-            Ok::<bool, SqlError>(acc && {
-                let ra = window_row(scope, rows[p[a]], offs);
-                let va = eval_full(o.expression, arena, params, &ra, hooks)?;
-                let rb = window_row(scope, rows[p[b]], offs);
-                let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-                match (va.is_null(), vb.is_null()) {
-                    (true, true) => true,
-                    (true, false) | (false, true) => false,
-                    (false, false) => compare_datums(&va, &vb)?.is_eq(),
-                }
-            })
+            Ok::<bool, SqlError>(
+                acc && {
+                    let ra = window_row(scope, rows[p[a]], offs);
+                    let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                    let rb = window_row(scope, rows[p[b]], offs);
+                    let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                    match (va.is_null(), vb.is_null()) {
+                        (true, true) => true,
+                        (true, false) | (false, true) => false,
+                        (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                    }
+                },
+            )
         })
     };
     let peer_start = |from: usize| -> Result<usize, SqlError> {
@@ -274,7 +289,11 @@ fn frame_range<'a>(
             FrameBound::UnboundedPreceding => return Ok(0),
             FrameBound::UnboundedFollowing => return Ok(m as isize - 1),
             FrameBound::CurrentRow => {
-                return Ok(if starting { peer_start(j)? as isize } else { peer_end(j)? as isize })
+                return Ok(if starting {
+                    peer_start(j)? as isize
+                } else {
+                    peer_end(j)? as isize
+                });
             }
             FrameBound::Preceding(e) => (*e, true),
             FrameBound::Following(e) => (*e, false),
@@ -301,11 +320,19 @@ fn frame_range<'a>(
         let key_j = key_of(j)?;
         // A NULL current key frames its peer group (nulls are peers).
         if key_j.is_null() {
-            return Ok(if starting { peer_start(j)? as isize } else { peer_end(j)? as isize });
+            return Ok(if starting {
+                peer_start(j)? as isize
+            } else {
+                peer_end(j)? as isize
+            });
         }
         // The frame edge value: preceding moves against the sort direction.
         let towards_smaller = preceding != o.descending;
-        let op = if towards_smaller { BinaryOp::Sub } else { BinaryOp::Add };
+        let op = if towards_smaller {
+            BinaryOp::Sub
+        } else {
+            BinaryOp::Add
+        };
         let edge = crate::sql::eval::arithmetic(op, key_j, off, false, false, arena)?;
         // In-frame: key between edge and key_j (inclusive), in sort order.
         let in_frame = |i: usize| -> Result<bool, SqlError> {
@@ -314,7 +341,11 @@ fn frame_range<'a>(
                 return Ok(false);
             }
             let c = compare_datums(&k, &edge)?;
-            Ok(if towards_smaller { c.is_ge() } else { c.is_le() })
+            Ok(if towards_smaller {
+                c.is_ge()
+            } else {
+                c.is_le()
+            })
         };
         if starting {
             // First row (scanning forward) inside the frame edge.
@@ -324,7 +355,9 @@ fn frame_range<'a>(
                     continue;
                 }
                 let c = compare_datums(&k, &edge)?;
-                let inside = if preceding { in_frame(i)? } else {
+                let inside = if preceding {
+                    in_frame(i)?
+                } else {
                     // Starting FOLLOWING: first row at/after the edge in sort
                     // direction.
                     if o.descending { c.is_le() } else { c.is_ge() }
@@ -364,14 +397,16 @@ fn frame_range<'a>(
                 FrameBound::UnboundedPreceding => 0,
                 FrameBound::Preceding(e) => {
                     j as isize
-                        - frame_offset_count(e, scope, rows, offs, p[j], true, arena, params, hooks)?
-                            as isize
+                        - frame_offset_count(
+                            e, scope, rows, offs, p[j], true, arena, params, hooks,
+                        )? as isize
                 }
                 FrameBound::CurrentRow => j as isize,
                 FrameBound::Following(e) => {
                     j as isize
-                        + frame_offset_count(e, scope, rows, offs, p[j], true, arena, params, hooks)?
-                            as isize
+                        + frame_offset_count(
+                            e, scope, rows, offs, p[j], true, arena, params, hooks,
+                        )? as isize
                 }
                 FrameBound::UnboundedFollowing => unreachable!("rejected at parse"),
             };
@@ -379,14 +414,16 @@ fn frame_range<'a>(
                 FrameBound::UnboundedPreceding => unreachable!("rejected at parse"),
                 FrameBound::Preceding(e) => {
                     j as isize
-                        - frame_offset_count(e, scope, rows, offs, p[j], false, arena, params, hooks)?
-                            as isize
+                        - frame_offset_count(
+                            e, scope, rows, offs, p[j], false, arena, params, hooks,
+                        )? as isize
                 }
                 FrameBound::CurrentRow => j as isize,
                 FrameBound::Following(e) => {
                     j as isize
-                        + frame_offset_count(e, scope, rows, offs, p[j], false, arena, params, hooks)?
-                            as isize
+                        + frame_offset_count(
+                            e, scope, rows, offs, p[j], false, arena, params, hooks,
+                        )? as isize
                 }
                 FrameBound::UnboundedFollowing => m as isize - 1,
             };
@@ -394,7 +431,10 @@ fn frame_range<'a>(
         }
         FrameUnits::Groups => {
             if ord.is_empty() {
-                return Err(sql_err!(sqlstate::WINDOWING_ERROR, "GROUPS mode requires an ORDER BY clause"));
+                return Err(sql_err!(
+                    sqlstate::WINDOWING_ERROR,
+                    "GROUPS mode requires an ORDER BY clause"
+                ));
             }
             // This row's peer-group index (groups counted from the front).
             let gj = {
@@ -439,12 +479,14 @@ fn frame_range<'a>(
             let s: isize = match &frame.start {
                 FrameBound::UnboundedPreceding => 0,
                 FrameBound::Preceding(e) => {
-                    let k = frame_offset_count(e, scope, rows, offs, p[j], true, arena, params, hooks)?;
+                    let k =
+                        frame_offset_count(e, scope, rows, offs, p[j], true, arena, params, hooks)?;
                     group_start(gj as isize - k as isize)?.map_or(0, |x| x) as isize
                 }
                 FrameBound::CurrentRow => peer_start(j)? as isize,
                 FrameBound::Following(e) => {
-                    let k = frame_offset_count(e, scope, rows, offs, p[j], true, arena, params, hooks)?;
+                    let k =
+                        frame_offset_count(e, scope, rows, offs, p[j], true, arena, params, hooks)?;
                     match group_start(gj as isize + k as isize)? {
                         Some(x) => x as isize,
                         None => m as isize, // past the last group: empty
@@ -455,7 +497,9 @@ fn frame_range<'a>(
             let e: isize = match &frame.end {
                 FrameBound::UnboundedPreceding => unreachable!("rejected at parse"),
                 FrameBound::Preceding(e) => {
-                    let k = frame_offset_count(e, scope, rows, offs, p[j], false, arena, params, hooks)?;
+                    let k = frame_offset_count(
+                        e, scope, rows, offs, p[j], false, arena, params, hooks,
+                    )?;
                     match group_end(gj as isize - k as isize)? {
                         Some(x) => x as isize,
                         None => -1, // before the first group: empty
@@ -463,7 +507,9 @@ fn frame_range<'a>(
                 }
                 FrameBound::CurrentRow => peer_end(j)? as isize,
                 FrameBound::Following(e) => {
-                    let k = frame_offset_count(e, scope, rows, offs, p[j], false, arena, params, hooks)?;
+                    let k = frame_offset_count(
+                        e, scope, rows, offs, p[j], false, arena, params, hooks,
+                    )?;
                     group_end(gj as isize + k as isize)?.map_or(m as isize - 1, |x| x as isize)
                 }
                 FrameBound::UnboundedFollowing => m as isize - 1,
@@ -482,7 +528,10 @@ fn frame_range<'a>(
                     "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"
                 ));
             }
-            (range_edge(&frame.start, true)?, range_edge(&frame.end, false)?)
+            (
+                range_edge(&frame.start, true)?,
+                range_edge(&frame.end, false)?,
+            )
         }
     };
     let start = start.max(0);
@@ -513,17 +562,19 @@ fn peer_bounds<'a>(
     }
     let is_peer = |a: usize, b: usize| -> Result<bool, SqlError> {
         ord.iter().try_fold(true, |acc, o| {
-            Ok::<bool, SqlError>(acc && {
-                let ra = window_row(scope, rows[p[a]], offs);
-                let va = eval_full(o.expression, arena, params, &ra, hooks)?;
-                let rb = window_row(scope, rows[p[b]], offs);
-                let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-                match (va.is_null(), vb.is_null()) {
-                    (true, true) => true,
-                    (true, false) | (false, true) => false,
-                    (false, false) => compare_datums(&va, &vb)?.is_eq(),
-                }
-            })
+            Ok::<bool, SqlError>(
+                acc && {
+                    let ra = window_row(scope, rows[p[a]], offs);
+                    let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                    let rb = window_row(scope, rows[p[b]], offs);
+                    let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                    match (va.is_null(), vb.is_null()) {
+                        (true, true) => true,
+                        (true, false) | (false, true) => false,
+                        (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                    }
+                },
+            )
         })
     };
     let mut s = j;
@@ -566,20 +617,42 @@ fn compute_window<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
-    let Expr::Call { name, args, over: Some(spec), .. } = node else {
+    let Expr::Call {
+        name,
+        args,
+        over: Some(spec),
+        ..
+    } = node
+    else {
         return Err(sql_err!(sqlstate::INTERNAL_ERROR, "not a window function"));
     };
     let n = rows.len();
-    let out = arena.alloc_slice_with(n, |_| Datum::Null).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(n, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
 
     // Assign each row a partition id by comparing PARTITION BY keys.
-    let group_of = arena.alloc_slice_with(n, |_| 0usize).map_err(|_| arena_full())?;
-    let reps = arena.alloc_slice_with(n, |_| 0usize).map_err(|_| arena_full())?;
+    let group_of = arena
+        .alloc_slice_with(n, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let reps = arena
+        .alloc_slice_with(n, |_| 0usize)
+        .map_err(|_| arena_full())?;
     let mut n_groups = 0usize;
     for i in 0..n {
         let mut gid = None;
         for g in 0..n_groups {
-            if keys_equal(spec.partition_by, scope, rows, offs, i, reps[g], arena, params, hooks)? {
+            if keys_equal(
+                spec.partition_by,
+                scope,
+                rows,
+                offs,
+                i,
+                reps[g],
+                arena,
+                params,
+                hooks,
+            )? {
                 gid = Some(g);
                 break;
             }
@@ -600,7 +673,9 @@ fn compute_window<'a>(
     );
     let is_offset = matches!(*name, "lag" | "lead");
 
-    let part = arena.alloc_slice_with(n, |_| 0usize).map_err(|_| arena_full())?;
+    let part = arena
+        .alloc_slice_with(n, |_| 0usize)
+        .map_err(|_| arena_full())?;
     for g in 0..n_groups {
         // Collect this partition's row indices, then sort by ORDER BY.
         let mut m = 0usize;
@@ -617,7 +692,17 @@ fn compute_window<'a>(
             for x in 1..m {
                 let mut y = x;
                 while y > 0 {
-                    let c = cmp_order(ord, scope, rows, offs, part[y - 1], part[y], arena, params, hooks)?;
+                    let c = cmp_order(
+                        ord,
+                        scope,
+                        rows,
+                        offs,
+                        part[y - 1],
+                        part[y],
+                        arena,
+                        params,
+                        hooks,
+                    )?;
                     if c == core::cmp::Ordering::Greater {
                         part.swap(y - 1, y);
                         y -= 1;
@@ -634,20 +719,24 @@ fn compute_window<'a>(
             // ties `p[j-1]` on the ORDER BY keys (with no ORDER BY the whole
             // partition is one peer group). `rank`/`percent_rank`/`cume_dist`
             // all read from these boundaries.
-            let same = arena.alloc_slice_with(m, |_| false).map_err(|_| arena_full())?;
+            let same = arena
+                .alloc_slice_with(m, |_| false)
+                .map_err(|_| arena_full())?;
             for j in 1..m {
                 same[j] = spec.order_by.iter().try_fold(true, |acc, o| {
-                    Ok::<bool, SqlError>(acc && {
-                        let ra = window_row(scope, rows[p[j - 1]], offs);
-                        let va = eval_full(o.expression, arena, params, &ra, hooks)?;
-                        let rb = window_row(scope, rows[p[j]], offs);
-                        let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-                        match (va.is_null(), vb.is_null()) {
-                            (true, true) => true,
-                            (true, false) | (false, true) => false,
-                            (false, false) => compare_datums(&va, &vb)?.is_eq(),
-                        }
-                    })
+                    Ok::<bool, SqlError>(
+                        acc && {
+                            let ra = window_row(scope, rows[p[j - 1]], offs);
+                            let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                            let rb = window_row(scope, rows[p[j]], offs);
+                            let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                            match (va.is_null(), vb.is_null()) {
+                                (true, true) => true,
+                                (true, false) | (false, true) => false,
+                                (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                            }
+                        },
+                    )
                 })?;
             }
             let mut rank = 1i64;
@@ -710,7 +799,16 @@ fn compute_window<'a>(
             // too-short frame).
             for j in 0..m {
                 let range = frame_range(
-                    frame, spec.order_by, scope, rows, offs, p, j, arena, params, hooks,
+                    frame,
+                    spec.order_by,
+                    scope,
+                    rows,
+                    offs,
+                    p,
+                    j,
+                    arena,
+                    params,
+                    hooks,
                 )?;
                 let peers = if frame.exclusion == crate::sql::ast::FrameExclusion::NoOthers {
                     (j, j)
@@ -720,15 +818,13 @@ fn compute_window<'a>(
                 let excluded = |i: usize| frame_excludes(frame.exclusion, j, peers, i);
                 out[p[j]] = match (range, *name) {
                     (None, _) => Datum::Null,
-                    (Some((fs, fe)), "first_value") => {
-                        match (fs..=fe).find(|&i| !excluded(i)) {
-                            Some(i) => {
-                                let r = window_row(scope, rows[p[i]], offs);
-                                eval_full(args[0], arena, params, &r, hooks)?
-                            }
-                            None => Datum::Null,
+                    (Some((fs, fe)), "first_value") => match (fs..=fe).find(|&i| !excluded(i)) {
+                        Some(i) => {
+                            let r = window_row(scope, rows[p[i]], offs);
+                            eval_full(args[0], arena, params, &r, hooks)?
                         }
-                    }
+                        None => Datum::Null,
+                    },
                     (Some((fs, fe)), "last_value") => {
                         match (fs..=fe).rev().find(|&i| !excluded(i)) {
                             Some(i) => {
@@ -773,17 +869,19 @@ fn compute_window<'a>(
                 let mut e = from;
                 while e + 1 < m {
                     let same = spec.order_by.iter().try_fold(true, |acc, o| {
-                        Ok::<bool, SqlError>(acc && {
-                            let ra = window_row(scope, rows[p[e]], offs);
-                            let va = eval_full(o.expression, arena, params, &ra, hooks)?;
-                            let rb = window_row(scope, rows[p[e + 1]], offs);
-                            let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-                            match (va.is_null(), vb.is_null()) {
-                                (true, true) => true,
-                                (true, false) | (false, true) => false,
-                                (false, false) => compare_datums(&va, &vb)?.is_eq(),
-                            }
-                        })
+                        Ok::<bool, SqlError>(
+                            acc && {
+                                let ra = window_row(scope, rows[p[e]], offs);
+                                let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                                let rb = window_row(scope, rows[p[e + 1]], offs);
+                                let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                                match (va.is_null(), vb.is_null()) {
+                                    (true, true) => true,
+                                    (true, false) | (false, true) => false,
+                                    (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                                }
+                            },
+                        )
                     })?;
                     if same {
                         e += 1;
@@ -874,7 +972,16 @@ fn compute_window<'a>(
             // frame aggregates zero rows — count 0, sum NULL).
             for j in 0..m {
                 let range = frame_range(
-                    frame, spec.order_by, scope, rows, offs, p, j, arena, params, hooks,
+                    frame,
+                    spec.order_by,
+                    scope,
+                    rows,
+                    offs,
+                    p,
+                    j,
+                    arena,
+                    params,
+                    hooks,
                 )?;
                 let peers = if frame.exclusion == crate::sql::ast::FrameExclusion::NoOthers {
                     (j, j)
@@ -919,17 +1026,19 @@ fn compute_window<'a>(
                     let mut e = j;
                     while e + 1 < m {
                         let same = spec.order_by.iter().try_fold(true, |acc, o| {
-                            Ok::<bool, SqlError>(acc && {
-                                let ra = window_row(scope, rows[p[e]], offs);
-                                let va = eval_full(o.expression, arena, params, &ra, hooks)?;
-                                let rb = window_row(scope, rows[p[e + 1]], offs);
-                                let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-                                match (va.is_null(), vb.is_null()) {
-                                    (true, true) => true,
-                                    (true, false) | (false, true) => false,
-                                    (false, false) => compare_datums(&va, &vb)?.is_eq(),
-                                }
-                            })
+                            Ok::<bool, SqlError>(
+                                acc && {
+                                    let ra = window_row(scope, rows[p[e]], offs);
+                                    let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                                    let rb = window_row(scope, rows[p[e + 1]], offs);
+                                    let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                                    match (va.is_null(), vb.is_null()) {
+                                        (true, true) => true,
+                                        (true, false) | (false, true) => false,
+                                        (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                                    }
+                                },
+                            )
                         })?;
                         if same {
                             e += 1;
@@ -978,10 +1087,18 @@ fn cmp_order<'a>(
         let base = match (va.is_null(), vb.is_null()) {
             (true, true) => Ordering::Equal,
             (true, false) => {
-                if o.nulls_first { Ordering::Less } else { Ordering::Greater }
+                if o.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
             }
             (false, true) => {
-                if o.nulls_first { Ordering::Greater } else { Ordering::Less }
+                if o.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
             }
             (false, false) => compare_datums(&va, &vb)?,
         };
@@ -1001,7 +1118,11 @@ fn cmp_order<'a>(
 /// projects every row with the window values in scope. Returns the (unsorted)
 /// projected rows and their ORDER BY sort keys. Shared by the streaming
 /// `window_select` and the derived-table / INSERT-source materializer.
-#[allow(clippy::type_complexity, clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::needless_range_loop
+)]
 pub(crate) fn project_window_rows<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -1019,7 +1140,11 @@ pub(crate) fn project_window_rows<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
     // WHERE with correlated subqueries is applied per row in the callbacks.
-    let scan_where = if correlated.is_empty() { statement.where_clause } else { None };
+    let scan_where = if correlated.is_empty() {
+        statement.where_clause
+    } else {
+        None
+    };
     // Flat-row column offsets per table.
     let mut offs = [0usize; MAX_JOIN_TABLES];
     let mut total = 0usize;
@@ -1031,10 +1156,25 @@ pub(crate) fn project_window_rows<'a>(
     // Pass 1: count source rows.
     let mut count = 0usize;
     scan_source(
-        storage, scope, from, txid, scan_where, arena, params, hooks, outer,
+        storage,
+        scope,
+        from,
+        txid,
+        scan_where,
+        arena,
+        params,
+        hooks,
+        outer,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
+                correlated,
+                statement.where_clause,
+                storage,
+                txid,
+                arena,
+                params,
+                hooks,
+                row,
             )? {
                 return Ok(true);
             }
@@ -1044,13 +1184,30 @@ pub(crate) fn project_window_rows<'a>(
     )?;
     // Pass 2: materialize each row's columns flat in the arena.
     let empty: &[Datum] = &[];
-    let rows: &mut [&[Datum]] = arena.alloc_slice_with(count, |_| empty).map_err(|_| arena_full())?;
+    let rows: &mut [&[Datum]] = arena
+        .alloc_slice_with(count, |_| empty)
+        .map_err(|_| arena_full())?;
     let mut at = 0usize;
     scan_source(
-        storage, scope, from, txid, scan_where, arena, params, hooks, outer,
+        storage,
+        scope,
+        from,
+        txid,
+        scan_where,
+        arena,
+        params,
+        hooks,
+        outer,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
+                correlated,
+                statement.where_clause,
+                storage,
+                txid,
+                arena,
+                params,
+                hooks,
+                row,
             )? {
                 return Ok(true);
             }
@@ -1061,7 +1218,11 @@ pub(crate) fn project_window_rows<'a>(
                 let def = scope.defs[t].expect("resolved");
                 let vals = row.values[t].expect("bound");
                 for c in 0..def.n_columns {
-                    flat[offset + c] = if vals.is_empty() { Datum::Null } else { vals[c] };
+                    flat[offset + c] = if vals.is_empty() {
+                        Datum::Null
+                    } else {
+                        vals[c]
+                    };
                 }
             }
             rows[at] = &flat[..total];
@@ -1084,17 +1245,27 @@ pub(crate) fn project_window_rows<'a>(
     let n_order = statement.order_by.len();
     let mut order_exprs: [Option<&Expr>; MAX_WIN_KEYS] = [None; MAX_WIN_KEYS];
     if n_order > MAX_WIN_KEYS {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "ORDER BY list too long"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "ORDER BY list too long"
+        ));
     }
     for (k, ob) in statement.order_by.iter().enumerate() {
-        order_exprs[k] = Some(resolve_order_target(ob.expression, statement.items, scope, arena)?);
+        order_exprs[k] = Some(resolve_order_target(
+            ob.expression,
+            statement.items,
+            scope,
+            arena,
+        )?);
     }
 
     // Project each row (with the window hook) and compute its sort keys.
-    let proj_rows: &mut [&[Datum]] =
-        arena.alloc_slice_with(count, |_| empty).map_err(|_| arena_full())?;
-    let sort_keys: &mut [&[Datum]] =
-        arena.alloc_slice_with(count, |_| empty).map_err(|_| arena_full())?;
+    let proj_rows: &mut [&[Datum]] = arena
+        .alloc_slice_with(count, |_| empty)
+        .map_err(|_| arena_full())?;
+    let sort_keys: &mut [&[Datum]] = arena
+        .alloc_slice_with(count, |_| empty)
+        .map_err(|_| arena_full())?;
     for i in 0..count {
         let mut wv = [Datum::Null; MAX_WINDOWS];
         for (w, wval) in win_vals.iter().enumerate().take(win_nodes.len()) {
@@ -1112,15 +1283,7 @@ pub(crate) fn project_window_rows<'a>(
             hooks.subs
         } else {
             row_subs = merge_correlated(
-                correlated,
-                base,
-                &jr,
-                storage,
-                txid,
-                arena,
-                params,
-                &mut sc,
-                &mut ls,
+                correlated, base, &jr, storage, txid, arena, params, &mut sc, &mut ls,
             )?;
             Some(&row_subs)
         };
@@ -1129,18 +1292,37 @@ pub(crate) fn project_window_rows<'a>(
             aggs: None,
             subs,
             windows: Some((win_ptrs, &wv[..win_nodes.len()])),
-            catalog: hooks.catalog, srf_index: hooks.srf_index,
+            catalog: hooks.catalog,
+            srf_index: hooks.srf_index,
             sequences: hooks.sequences,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
-        let np =
-            project_row(statement.items, scope, &jr, arena, params, &win_hooks, &mut projected, outer)?;
-        proj_rows[i] = &*arena.alloc_slice_copy(&projected[..np]).map_err(|_| arena_full())?;
+        let np = project_row(
+            statement.items,
+            scope,
+            &jr,
+            arena,
+            params,
+            &win_hooks,
+            &mut projected,
+            outer,
+        )?;
+        proj_rows[i] = &*arena
+            .alloc_slice_copy(&projected[..np])
+            .map_err(|_| arena_full())?;
         let mut keys = [Datum::Null; MAX_WIN_KEYS];
         for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
-            keys[k] = eval_full(oe.expect("set"), arena, params, &super::Chained { inner: &jr, outer }, &win_hooks)?;
+            keys[k] = eval_full(
+                oe.expect("set"),
+                arena,
+                params,
+                &super::Chained { inner: &jr, outer },
+                &win_hooks,
+            )?;
         }
-        sort_keys[i] = &*arena.alloc_slice_copy(&keys[..n_order]).map_err(|_| arena_full())?;
+        sort_keys[i] = &*arena
+            .alloc_slice_copy(&keys[..n_order])
+            .map_err(|_| arena_full())?;
     }
     Ok((proj_rows, sort_keys))
 }
@@ -1217,7 +1399,11 @@ pub(crate) fn window_select<'a>(
         for x in 1..count {
             let mut y = x;
             while y > 0 {
-                let c = cmp_key_rows(sort_keys[order[y - 1]], sort_keys[order[y]], statement.order_by);
+                let c = cmp_key_rows(
+                    sort_keys[order[y - 1]],
+                    sort_keys[order[y]],
+                    statement.order_by,
+                );
                 if c == core::cmp::Ordering::Greater {
                     order.swap(y - 1, y);
                     y -= 1;
@@ -1259,7 +1445,9 @@ pub(crate) fn dedup_window_rows<'a>(
     let n = proj_rows.len();
     let index = arena.alloc_slice_with(n, |i| i).map_err(|_| arena_full())?;
     let empty: &[u8] = &[];
-    let encoded = arena.alloc_slice_with(n, |_| empty).map_err(|_| arena_full())?;
+    let encoded = arena
+        .alloc_slice_with(n, |_| empty)
+        .map_err(|_| arena_full())?;
     for i in 0..n {
         if proj_rows[i].iter().any(|d| matches!(d, Datum::Bpchar(_))) {
             let key = arena
@@ -1282,10 +1470,12 @@ pub(crate) fn dedup_window_rows<'a>(
         }
     }
     let empty_row: &[Datum] = &[];
-    let out_rows =
-        arena.alloc_slice_with(unique, |_| empty_row).map_err(|_| arena_full())?;
-    let out_keys =
-        arena.alloc_slice_with(unique, |_| empty_row).map_err(|_| arena_full())?;
+    let out_rows = arena
+        .alloc_slice_with(unique, |_| empty_row)
+        .map_err(|_| arena_full())?;
+    let out_keys = arena
+        .alloc_slice_with(unique, |_| empty_row)
+        .map_err(|_| arena_full())?;
     for k in 0..unique {
         out_rows[k] = proj_rows[index[k]];
         out_keys[k] = sort_keys[index[k]];
@@ -1300,11 +1490,27 @@ pub(crate) fn cmp_key_rows(a: &[Datum], b: &[Datum], ord: &[OrderBy]) -> core::c
         let (va, vb) = (&a[k], &b[k]);
         let base = match (va.is_null(), vb.is_null()) {
             (true, true) => Ordering::Equal,
-            (true, false) => if o.nulls_first { Ordering::Less } else { Ordering::Greater },
-            (false, true) => if o.nulls_first { Ordering::Greater } else { Ordering::Less },
+            (true, false) => {
+                if o.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if o.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
             (false, false) => compare_datums(va, vb).unwrap_or(Ordering::Equal),
         };
-        let c = if o.descending && !va.is_null() && !vb.is_null() { base.reverse() } else { base };
+        let c = if o.descending && !va.is_null() && !vb.is_null() {
+            base.reverse()
+        } else {
+            base
+        };
         if c != Ordering::Equal {
             return c;
         }

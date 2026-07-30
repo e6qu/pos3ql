@@ -143,6 +143,19 @@ pub struct Engine {
     /// `execute_simple`/`execute_extended` entry so LISTEN/UNLISTEN/NOTIFY can
     /// stamp their buffered ops without threading the id through every arm.
     current_conn_id: i32,
+    /// Authenticated sessions per fixed role slot, used to enforce
+    /// `CONNECTION LIMIT` without allocating in the server loop.
+    role_connections: [u16; crate::storage::MAX_ROLES],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RoleLogin {
+    pub slot: u16,
+    pub can_login: bool,
+    pub valid: bool,
+    pub superuser: bool,
+    pub connection_limit: i32,
+    pub password: Option<crate::storage::RolePassword>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +264,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Set { .. }
         | Stmt::Reset(_)
         | Stmt::SetTransaction(_)
+        | Stmt::SetRole { .. }
         | Stmt::Show(_)
         | Stmt::ShowAll
         | Stmt::Prepare { .. }
@@ -297,7 +311,15 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Vacuum { .. }
         | Stmt::Notify { .. }
         | Stmt::Comment { .. }
-        | Stmt::AlterOwner { .. } => true,
+        | Stmt::AlterOwner { .. }
+        | Stmt::CreateRole { .. }
+        | Stmt::AlterRole { .. }
+        | Stmt::AlterRoleRename { .. }
+        | Stmt::DropRole { .. } => true,
+        Stmt::GrantRole { .. }
+        | Stmt::RevokeRole { .. }
+        | Stmt::GrantPrivileges { .. }
+        | Stmt::RevokePrivileges { .. } => true,
     }
 }
 
@@ -341,6 +363,48 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
 }
 
 impl Engine {
+    pub(crate) fn role_login(&self, name: &str) -> Option<RoleLogin> {
+        let slot = self.storage.find_role(name)?;
+        let attributes = self.storage.role(slot).attributes;
+        let valid = !attributes.has_valid_until
+            || attributes
+                .valid_until
+                .as_str()
+                .eq_ignore_ascii_case("infinity")
+            || crate::sql::datetime::parse_timestamp(attributes.valid_until.as_str(), true)
+                .is_ok_and(|deadline| deadline >= crate::sql::datetime::now_micros());
+        Some(RoleLogin {
+            slot: slot as u16,
+            can_login: attributes.can_login,
+            valid,
+            superuser: attributes.superuser,
+            connection_limit: attributes.connection_limit,
+            password: attributes.has_password.then_some(attributes.password),
+        })
+    }
+
+    pub(crate) fn reserve_role_connection(&mut self, login: RoleLogin) -> bool {
+        let count = &mut self.role_connections[login.slot as usize];
+        if !login.superuser
+            && login.connection_limit >= 0
+            && usize::from(*count) >= login.connection_limit as usize
+        {
+            return false;
+        }
+        let Some(next) = count.checked_add(1) else {
+            return false;
+        };
+        *count = next;
+        true
+    }
+
+    pub(crate) fn release_role_connection(&mut self, slot: u16) {
+        let count = &mut self.role_connections[slot as usize];
+        *count = count
+            .checked_sub(1)
+            .expect("an authenticated role connection is released once");
+    }
+
     /// Whether one extended-protocol statement is COPY. Execute's `max_rows`
     /// applies only to row-returning portals; COPY has its own streaming
     /// protocol and must never be staged in the bounded portal buffer.
@@ -397,7 +461,6 @@ impl Engine {
         wal.replay(floor, |lsn, operator| {
             apply_wal_op(&mut storage, lsn, operator)
         })?;
-        storage.reconcile_serials();
         // RPO=0: replay any WAL segments in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
         if let Some(c) = ckpt.as_mut() {
@@ -417,6 +480,8 @@ impl Engine {
                 storage.set_lsn(applied_to);
             }
         }
+        storage.ensure_no_pending_replay_table_rewrite()?;
+        storage.reconcile_serials();
         // Replay's row installs bypass the per-row value-index maintenance, so
         // rebuild every table's uniqueness indexes from the recovered committed
         // rows before serving queries.
@@ -447,6 +512,7 @@ impl Engine {
                 notify::OUTBOX,
             )?,
             current_conn_id: 0,
+            role_connections: [0; crate::storage::MAX_ROLES],
         })
     }
 
@@ -637,6 +703,117 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        // Ownership and ACLs are absolute catalog images. They are staged at
+        // commit from the transaction-visible overlays, so repeated GRANT,
+        // REVOKE, ALTER OWNER, and savepoint rollback publish exactly one
+        // final record per object/ACL slot.
+        for (position, undo) in txn.ddl().iter().enumerate() {
+            let object = match *undo {
+                DdlUndo::Created(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Table,
+                    slot: slot as u16,
+                }),
+                DdlUndo::ViewCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::View,
+                    slot: slot as u16,
+                }),
+                DdlUndo::MatviewCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::MaterializedView,
+                    slot: slot as u16,
+                }),
+                DdlUndo::SequenceCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Sequence,
+                    slot: slot as u16,
+                }),
+                DdlUndo::DomainCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Domain,
+                    slot: slot as u16,
+                }),
+                DdlUndo::EnumCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Enum,
+                    slot: slot as u16,
+                }),
+                DdlUndo::IndexCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Index,
+                    slot: slot as u16,
+                }),
+                DdlUndo::SchemaCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Schema,
+                    slot: slot as u16,
+                }),
+                DdlUndo::ObjectOwnerChanged { object, .. } => Some(object),
+                _ => None,
+            };
+            let Some(object) = object else {
+                continue;
+            };
+            if txn.ddl()[position + 1..].iter().any(|later| {
+                matches!(
+                    later,
+                    DdlUndo::ObjectOwnerChanged {
+                        object: later_object,
+                        ..
+                    } if *later_object == object
+                )
+            }) {
+                continue;
+            }
+            let (schema, name) = self.storage.access_object_name_to(object, txn.txid);
+            let owner = self.storage.object_owner(object, txn.txid);
+            let owner_name = self.storage.role_name(owner, txn.txid);
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetObjectOwner {
+                    class: object.class as u8,
+                    schema: schema.as_str(),
+                    name: name.as_str(),
+                    owner: owner_name.as_str(),
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
+        for (position, undo) in txn.ddl().iter().enumerate() {
+            let DdlUndo::ObjectAclChanged { slot, .. } = *undo else {
+                continue;
+            };
+            if txn.ddl()[position + 1..].iter().any(
+                |later| matches!(later, DdlUndo::ObjectAclChanged { slot: later, .. } if *later == slot),
+            ) {
+                continue;
+            }
+            let entry = self.storage.acl_entry(slot as usize);
+            let object = entry.object;
+            let grantee = entry.grantee;
+            let grantor = entry.grantor;
+            let (privileges, grant_options) = self.storage.acl_state(slot as usize, txn.txid);
+            let (schema, name) = self.storage.access_object_name_to(object, txn.txid);
+            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
+                .then(|| self.storage.role_name(grantee as usize, txn.txid));
+            let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetObjectAcl {
+                    class: object.class as u8,
+                    schema: schema.as_str(),
+                    name: name.as_str(),
+                    grantee: grantee_name.as_ref().map_or("PUBLIC", |role| role.as_str()),
+                    grantor: grantor_name.as_str(),
+                    privileges,
+                    grant_options,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         let commit_lsn = match self.wal.commit_stage(txn.txid, self.storage.lsn()) {
             Ok(lsn) => lsn,
             Err(error) => {
@@ -735,7 +912,16 @@ impl Engine {
             match undo {
                 // Promote the transaction's uncommitted DDL into the committed
                 // catalog now that the journal is durable.
-                DdlUndo::Created(slot) => self.storage.commit_create(*slot as usize),
+                DdlUndo::Created(slot) => {
+                    self.storage.commit_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Table,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::Dropped(slot) => {
                     let name = self.storage.table(*slot as usize).def.name;
                     let schema = self.storage.table(*slot as usize).def.schema;
@@ -745,21 +931,64 @@ impl Engine {
                         .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
                 DdlUndo::TableAltered(_) => {}
-                DdlUndo::ViewCreated(slot) => self.storage.commit_view_create(*slot as usize),
+                DdlUndo::ViewCreated(slot) => {
+                    self.storage.commit_view_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::View,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
-                DdlUndo::MatviewCreated(slot) => self.storage.commit_matview_create(*slot as usize),
+                DdlUndo::MatviewCreated(slot) => {
+                    self.storage.commit_matview_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::MaterializedView,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::MatviewDropped(slot) => self.storage.commit_matview_drop(*slot as usize),
                 DdlUndo::SequenceCreated(slot) => {
-                    self.storage.commit_sequence_create(*slot as usize)
+                    self.storage.commit_sequence_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Sequence,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
                 }
                 DdlUndo::SequenceDropped(slot) => self.storage.commit_sequence_drop(*slot as usize),
-                DdlUndo::DomainCreated(slot) => self.storage.commit_domain_create(*slot as usize),
+                DdlUndo::DomainCreated(slot) => {
+                    self.storage.commit_domain_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Domain,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::DomainDropped(slot) => self.storage.commit_domain_drop(*slot as usize),
                 DdlUndo::DomainNullabilityAltered { .. }
                 | DdlUndo::DomainDefaultAltered { .. }
                 | DdlUndo::DomainCheckAdded { .. }
                 | DdlUndo::DomainCheckDropped { .. } => {}
-                DdlUndo::EnumCreated(slot) => self.storage.commit_enum_create(*slot as usize),
+                DdlUndo::EnumCreated(slot) => {
+                    self.storage.commit_enum_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Enum,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::EnumDropped(slot) => self.storage.commit_enum_drop(*slot as usize),
                 DdlUndo::EnumValueAdded { .. }
                 | DdlUndo::EnumValueRenamed { .. }
@@ -767,6 +996,13 @@ impl Engine {
                 DdlUndo::IndexCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_index_create(slot);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Index,
+                            slot: slot as u16,
+                        },
+                        txn.txid,
+                    );
                     if let Some(table) = self.storage.index_table_slot(slot)
                         && !index_tables[..index_table_count].contains(&table)
                     {
@@ -786,8 +1022,29 @@ impl Engine {
                 }
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
-                DdlUndo::SchemaCreated(slot) => self.storage.commit_schema_create(*slot as usize),
+                DdlUndo::SchemaCreated(slot) => {
+                    self.storage.commit_schema_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Schema,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
+                DdlUndo::RoleChanged { slot, .. } => {
+                    self.storage.commit_role_change(*slot as usize);
+                }
+                DdlUndo::RoleMembershipChanged { slot, .. } => {
+                    self.storage.commit_role_membership_change(*slot as usize);
+                }
+                DdlUndo::ObjectOwnerChanged { object, .. } => {
+                    self.storage.commit_object_owner(*object, txn.txid);
+                }
+                DdlUndo::ObjectAclChanged { slot, .. } => {
+                    self.storage.commit_acl(*slot as usize, txn.txid);
+                }
                 // Promote the uncommitted comment overlay to committed; its WAL
                 // record was journaled at exec time (like other DDL).
                 DdlUndo::CommentSet { slot, .. } => {
@@ -941,6 +1198,19 @@ impl Engine {
             }
             DdlUndo::SchemaCreated(slot) => self.storage.rollback_schema_create(slot as usize),
             DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize),
+            DdlUndo::RoleChanged { slot, prior } => {
+                self.storage.rollback_role_change(slot as usize, prior);
+            }
+            DdlUndo::RoleMembershipChanged { slot, prior } => {
+                self.storage
+                    .rollback_role_membership_change(slot as usize, prior);
+            }
+            DdlUndo::ObjectOwnerChanged { object, prior } => {
+                self.storage.restore_object_owner(object, prior);
+            }
+            DdlUndo::ObjectAclChanged { slot, prior } => {
+                self.storage.restore_acl_pending(slot as usize, prior);
+            }
             DdlUndo::CommentSet { slot, prior } => {
                 self.storage.restore_comment_pending(slot as usize, prior);
             }
@@ -952,6 +1222,11 @@ impl Engine {
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
+        if txn.txid == 0 {
+            guc.rollback_transaction();
+            txn.clear();
+            return;
+        }
         self.storage.release_snapshot(txn.txid);
         self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
@@ -988,11 +1263,7 @@ impl Engine {
     /// Restores transaction-owned state a partially executed statement built
     /// before discovering a lock wait. Transaction-level locks remain held
     /// while the protocol message is parked.
-    fn rollback_waiting_statement(
-        &mut self,
-        txn: &mut TxnState,
-        mark: txn::StatementMark,
-    ) {
+    fn rollback_waiting_statement(&mut self, txn: &mut TxnState, mark: txn::StatementMark) {
         for index in (mark.touched..txn.touched().len()).rev() {
             let (table, rowid, prior) = txn.touched()[index];
             self.storage
@@ -1002,10 +1273,8 @@ impl Engine {
             self.rollback_ddl(txn.ddl()[index], txn.txid);
         }
         for index in (mark.statistics..txn.statistics_undo().len()).rev() {
-            self.storage.rollback_table_statistics(
-                txn.statistics_undo()[index].table as usize,
-                txn.txid,
-            );
+            self.storage
+                .rollback_table_statistics(txn.statistics_undo()[index].table as usize, txn.txid);
         }
         txn.rewind_touched(mark.touched);
         txn.rewind_ddl(mark.ddl);
@@ -1144,12 +1413,8 @@ impl Engine {
         }
         for target in targets {
             let slot = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
-            self.storage.lock_table(
-                txid,
-                slot,
-                ast::TableLockMode::ShareUpdateExclusive,
-                false,
-            )?;
+            self.storage
+                .lock_table(txid, slot, ast::TableLockMode::ShareUpdateExclusive, false)?;
         }
         Ok(())
     }
@@ -1459,10 +1724,8 @@ impl Engine {
                     }
                     executed_any = true;
                     let output_mark = responder.buffer.mark();
-                    let statement_mark = txn.statement_mark(
-                        self.wal.stage_mark(txn.txid),
-                        self.storage.lock_mark(),
-                    );
+                    let statement_mark =
+                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
                     emit_parse_warnings(&mut parser, responder)?;
                     let outcome = self.execute_stmt(
                         &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
@@ -1476,7 +1739,8 @@ impl Engine {
                                     output_mark,
                                 });
                             }
-                            self.storage.rollback_locks_to(txn.txid, statement_mark.lock);
+                            self.storage
+                                .rollback_locks_to(txn.txid, statement_mark.lock);
                             e = sql_err!(
                                 sqlstate::LOCK_NOT_AVAILABLE,
                                 "canceling statement due to lock timeout"
@@ -1597,7 +1861,8 @@ impl Engine {
                     if !lock_timeout_expired {
                         return Ok(ExtendedExecutionStatus::Blocked);
                     }
-                    self.storage.rollback_locks_to(txn.txid, statement_mark.lock);
+                    self.storage
+                        .rollback_locks_to(txn.txid, statement_mark.lock);
                     e = sql_err!(
                         sqlstate::LOCK_NOT_AVAILABLE,
                         "canceling statement due to lock timeout"
@@ -2476,19 +2741,17 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         match statement {
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                Self::execute_data_modification(
-                    &mut self.storage,
-                    &mut self.scratch,
-                    &self.work,
-                    statement,
-                    txn,
-                    params,
-                    guc,
-                    responder,
-                    None,
-                )
-            }
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
+                &mut self.storage,
+                &mut self.scratch,
+                &self.work,
+                statement,
+                txn,
+                params,
+                guc,
+                responder,
+                None,
+            ),
             Stmt::Merge(merge) => exec::merge(
                 &mut self.storage,
                 txn,
@@ -2578,10 +2841,12 @@ impl Engine {
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
         eval::funcs::system::set_session_user(guc.session_user());
+        let current_role = guc.current_role();
+        eval::funcs::system::set_current_user(current_role.as_str());
         let raw_path = guc.search_path();
         let path = self
             .storage
-            .compute_path(raw_path.as_str(), guc.session_user(), txn.txid);
+            .compute_path(raw_path.as_str(), current_role.as_str(), txn.txid);
         self.storage.swap_path(path);
         // Publish the path's schema names for current_schema/current_schemas.
         {
@@ -2727,8 +2992,7 @@ impl Engine {
             if matches!(
                 txn.isolation,
                 IsolationLevel::RepeatableRead | IsolationLevel::Serializable
-            )
-                && let Err(error) = self.storage.register_snapshot(txn.txid, snapshot)
+            ) && let Err(error) = self.storage.register_snapshot(txn.txid, snapshot)
             {
                 return Ok(Err(error));
             }
@@ -3081,6 +3345,7 @@ impl Engine {
             ),
             Stmt::CreateSchema {
                 name,
+                authorization,
                 if_not_exists,
                 elements,
             } => {
@@ -3089,6 +3354,7 @@ impl Engine {
                     &mut self.wal,
                     txn,
                     name,
+                    *authorization,
                     *if_not_exists,
                     responder,
                 )?;
@@ -3139,7 +3405,111 @@ impl Engine {
                 name,
                 role,
                 if_exists,
-            } => exec::alter_owner(&self.storage, txn, *kind, name, role, *if_exists, responder),
+            } => exec::alter_owner(
+                &mut self.storage,
+                txn,
+                *kind,
+                name,
+                role,
+                *if_exists,
+                responder,
+            ),
+            Stmt::CreateRole {
+                name,
+                options,
+                memberships,
+            } => exec::create_role(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                options,
+                memberships,
+                responder,
+            ),
+            Stmt::AlterRole { name, options } => exec::alter_role(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                options,
+                responder,
+            ),
+            Stmt::AlterRoleRename { name, new_name } => exec::rename_role(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                new_name,
+                responder,
+            ),
+            Stmt::DropRole { names, if_exists } => exec::drop_role(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                responder,
+            ),
+            Stmt::SetRole { role, local, reset } => {
+                exec::set_role(&self.storage, txn, guc, *role, *local, *reset, responder)
+            }
+            Stmt::GrantRole {
+                roles,
+                members,
+                options,
+            } => exec::grant_role(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                roles,
+                members,
+                *options,
+                responder,
+            ),
+            Stmt::RevokeRole {
+                roles,
+                members,
+                admin_option_only,
+            } => exec::revoke_role(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                roles,
+                members,
+                *admin_option_only,
+                responder,
+            ),
+            Stmt::GrantPrivileges {
+                privileges,
+                target,
+                grantees,
+                grant_option,
+            } => exec::grant_privileges(
+                &mut self.storage,
+                txn,
+                privileges,
+                *target,
+                grantees,
+                *grant_option,
+                responder,
+            ),
+            Stmt::RevokePrivileges {
+                grant_option_only,
+                privileges,
+                target,
+                grantees,
+                cascade,
+            } => exec::revoke_privileges(
+                &mut self.storage,
+                txn,
+                *grant_option_only,
+                privileges,
+                *target,
+                grantees,
+                *cascade,
+                responder,
+            ),
             Stmt::DeclareCursor {
                 name,
                 scroll,
@@ -4004,7 +4374,16 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // A journal written before its schema existed cannot occur going
             // forward (CreateSchema precedes in LSN order), but a pre-schema
             // journal names only public, which always exists.
-            storage.create_table(def)?;
+            if !storage.complete_replay_table_rewrite(def)? {
+                storage.create_table(def)?;
+            }
+        }
+        WalOp::BeginTableRewrite {
+            previous_schema,
+            previous_name,
+            column_mapping,
+        } => {
+            storage.begin_replay_table_rewrite(previous_schema, previous_name, column_mapping)?;
         }
         WalOp::SequenceSet {
             schema,
@@ -4312,6 +4691,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     schema: crate::storage::SqlName::parse(schema)?,
                     name: crate::storage::SqlName::parse(name)?,
                     table: crate::storage::SqlName::parse(table)?,
+                    ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
                     descending,
                     nulls_first,
@@ -4366,6 +4746,97 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 });
             };
             let _ = storage.drop_fk(index, fk_name);
+        }
+        WalOp::UpsertRole { name, attributes } => {
+            storage.install_role(crate::storage::SqlName::parse(name)?, attributes)?;
+        }
+        WalOp::DropRole { name } => storage.remove_role(name),
+        WalOp::UpsertRoleMembership {
+            role,
+            member,
+            grantor,
+            options,
+        } => {
+            storage.install_role_membership(role, member, grantor, options)?;
+        }
+        WalOp::DropRoleMembership { role, member } => {
+            storage.remove_role_membership(role, member);
+        }
+        WalOp::SetObjectOwner {
+            class,
+            schema,
+            name,
+            owner,
+        } => {
+            let class = crate::storage::AccessClass::from_u8(class).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt WAL object class {}",
+                    class
+                )
+            })?;
+            let object = storage
+                .resolve_access_object(class, schema, name, 0)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "WAL ownership target \"{}\" does not exist",
+                        name
+                    )
+                })?;
+            let owner = storage.find_role(owner).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "WAL owner role \"{}\" does not exist",
+                    owner
+                )
+            })?;
+            storage.set_object_owner(object, owner, 0);
+        }
+        WalOp::SetObjectAcl {
+            class,
+            schema,
+            name,
+            grantee,
+            grantor,
+            privileges,
+            grant_options,
+        } => {
+            let class = crate::storage::AccessClass::from_u8(class).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt WAL object class {}",
+                    class
+                )
+            })?;
+            let object = storage
+                .resolve_access_object(class, schema, name, 0)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "WAL privilege target \"{}\" does not exist",
+                        name
+                    )
+                })?;
+            let grantee = if grantee == "PUBLIC" {
+                crate::storage::PUBLIC_ROLE
+            } else {
+                storage.find_role(grantee).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "WAL grantee role \"{}\" does not exist",
+                        grantee
+                    )
+                })? as u16
+            };
+            let grantor = storage.find_role(grantor).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "WAL grantor role \"{}\" does not exist",
+                    grantor
+                )
+            })? as u16;
+            storage.change_acl(object, grantee, grantor, privileges, grant_options, 0)?;
         }
     }
     storage.set_lsn(lsn);

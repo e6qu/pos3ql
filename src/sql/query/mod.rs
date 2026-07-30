@@ -188,6 +188,219 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         super::catalog::reloid_of_name(self.storage, self.txid, name)
     }
 
+    fn role_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        let Some(slot) = self.storage.role_slot_by_oid(oid, self.txid) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            arena
+                .alloc_str(self.storage.role_name(slot, self.txid).as_str())
+                .map_err(|_| arena_full())?,
+        ))
+    }
+
+    fn schema_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        let Some(name) = super::catalog::schema_name_by_oid(self.storage, oid) else {
+            return Ok(None);
+        };
+        Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))
+    }
+
+    fn has_table_privilege(
+        &self,
+        role: Option<&str>,
+        relation: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let (schema, name) = split_catalog_name(relation);
+        let object = match self.storage.resolve_relation(schema, name, self.txid) {
+            Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                self.storage.table_access_object(slot, self.txid)
+            }
+            Some(crate::storage::ResolvedRelation::View(slot)) => crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: slot as u16,
+            },
+            Some(crate::storage::ResolvedRelation::Catalog) => {
+                return privilege_query(
+                    privileges,
+                    crate::storage::PrivilegeSet::SELECT,
+                    crate::storage::PrivilegeSet::TABLE_ALL,
+                    |_| false,
+                    |_| false,
+                )
+                .map(Some);
+            }
+            None => return Ok(None),
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::TABLE_ALL,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn has_sequence_privilege(
+        &self,
+        role: Option<&str>,
+        sequence: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let (schema, name) = split_catalog_name(sequence);
+        let Some(slot) = self.storage.sequence_on_path(schema, name, self.txid) else {
+            return Ok(None);
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Sequence,
+            slot: slot as u16,
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::SEQUENCE_ALL,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn has_schema_privilege(
+        &self,
+        role: Option<&str>,
+        schema: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let Some(slot) = self.storage.find_schema_visible(schema, self.txid) else {
+            return Ok(None);
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Schema,
+            slot: slot as u16,
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::SCHEMA_ALL,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn has_type_privilege(
+        &self,
+        role: Option<&str>,
+        type_name: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let (written_schema, name) = split_catalog_name(type_name);
+        let domain = match written_schema {
+            Some(schema) => self.storage.domain_slot(schema, name, self.txid),
+            None => self.storage.resolve_domain_slot(name, self.txid),
+        };
+        let enumeration = match written_schema {
+            Some(schema) => self.storage.enum_slot(schema, name, self.txid),
+            None => self.storage.resolve_enum_slot(name, self.txid),
+        };
+        let object = domain
+            .map(|slot| crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Domain,
+                slot: slot as u16,
+            })
+            .or_else(|| {
+                enumeration.map(|slot| crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Enum,
+                    slot: slot as u16,
+                })
+            });
+        let Some(object) = object else {
+            return Ok(None);
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::TYPE_ALL,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn has_database_privilege(
+        &self,
+        role: Option<&str>,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let attributes = self.storage.role(role).attributes_to(self.txid);
+        let mut result = true;
+        for written in privileges.split(',') {
+            let privilege = written.trim();
+            let allowed = if privilege.eq_ignore_ascii_case("connect")
+                || privilege.eq_ignore_ascii_case("temporary")
+                || privilege.eq_ignore_ascii_case("temp")
+            {
+                true
+            } else if privilege.eq_ignore_ascii_case("create") {
+                attributes.superuser || attributes.create_database
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized privilege type: \"{}\"",
+                    privilege
+                ));
+            };
+            result &= allowed;
+        }
+        Ok(Some(result))
+    }
+
     fn comment<'a>(
         &self,
         catalog_name: &str,
@@ -337,6 +550,74 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
                 .map_err(|_| arena_full())?,
         ))
     }
+}
+
+fn split_catalog_name(name: &str) -> (Option<&str>, &str) {
+    name.rsplit_once('.')
+        .map_or((None, name), |(schema, object)| (Some(schema), object))
+}
+
+fn privilege_role(storage: &Storage, role: Option<&str>, txid: u32) -> Option<usize> {
+    match role {
+        Some(role) => storage.find_role_visible(role, txid),
+        None => storage.current_role_slot(txid),
+    }
+}
+
+fn privilege_query(
+    written: &str,
+    catalog_default: crate::storage::PrivilegeSet,
+    all: crate::storage::PrivilegeSet,
+    has_privilege: impl Fn(crate::storage::PrivilegeSet) -> bool,
+    has_grant_option: impl Fn(crate::storage::PrivilegeSet) -> bool,
+) -> Result<bool, SqlError> {
+    let mut answer = true;
+    for item in written.split(',') {
+        let item = item.trim();
+        const GRANT_OPTION: &str = " WITH GRANT OPTION";
+        let (name, grant_option) = if item.len() >= GRANT_OPTION.len()
+            && item[item.len() - GRANT_OPTION.len()..].eq_ignore_ascii_case(GRANT_OPTION)
+        {
+            (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
+        } else {
+            (item, false)
+        };
+        let privilege =
+            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("all privileges") {
+                all
+            } else if name.eq_ignore_ascii_case("select") {
+                crate::storage::PrivilegeSet::SELECT
+            } else if name.eq_ignore_ascii_case("insert") {
+                crate::storage::PrivilegeSet::INSERT
+            } else if name.eq_ignore_ascii_case("update") {
+                crate::storage::PrivilegeSet::UPDATE
+            } else if name.eq_ignore_ascii_case("delete") {
+                crate::storage::PrivilegeSet::DELETE
+            } else if name.eq_ignore_ascii_case("truncate") {
+                crate::storage::PrivilegeSet::TRUNCATE
+            } else if name.eq_ignore_ascii_case("references") {
+                crate::storage::PrivilegeSet::REFERENCES
+            } else if name.eq_ignore_ascii_case("trigger") {
+                crate::storage::PrivilegeSet::TRIGGER
+            } else if name.eq_ignore_ascii_case("usage") {
+                crate::storage::PrivilegeSet::USAGE
+            } else if name.eq_ignore_ascii_case("create") {
+                crate::storage::PrivilegeSet::CREATE
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized privilege type: \"{}\"",
+                    name
+                ));
+            };
+        let allowed = if grant_option {
+            has_grant_option(privilege)
+        } else {
+            catalog_default.contains(privilege) || has_privilege(privilege)
+        };
+        answer &= allowed;
+    }
+    Ok(answer)
 }
 
 fn sql_ok() -> Outcome {
@@ -1684,12 +1965,7 @@ pub fn select_query<'a>(
     };
     for table in 0..scope.n {
         if scope.derived[table].is_none()
-            && let Err(error) = storage.lock_table(
-                txid,
-                scope.slots[table],
-                relation_mode,
-                false,
-            )
+            && let Err(error) = storage.lock_table(txid, scope.slots[table], relation_mode, false)
         {
             return sql_fail(error);
         }
@@ -2100,6 +2376,7 @@ fn over_one_row<'a>(
             cte: None,
             with_ordinality: false,
             lateral: false,
+            authorization_role: None,
         },
         joins: &[],
     };
@@ -3008,82 +3285,82 @@ fn select_into_rows_mode<'a>(
     // source row into one output row per array element.
     let srf_call = find_srf(statement.items);
     let mut visit = |row: &JoinRow<'_, 'a, '_>| {
-            if n_where_correlated > 0
-                && !correlated_where_passes(
-                    &where_correlated[..n_where_correlated],
-                    &outer_subs.base,
-                    statement.where_clause,
-                    row,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    &hooks,
-                )?
-            {
-                return Ok(true);
-            }
-            let mut scalar_scratch: CorrelatedScalarScratch =
-                [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-            let mut list_scratch: CorrelatedListScratch =
-                [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
-            let row_subqueries = correlated_row_subqueries(
-                correlated,
+        if n_where_correlated > 0
+            && !correlated_where_passes(
+                &where_correlated[..n_where_correlated],
                 &outer_subs.base,
+                statement.where_clause,
                 row,
                 storage,
                 txid,
                 arena,
                 params,
-                &mut scalar_scratch,
-                &mut list_scratch,
-            )?;
-            let row_hooks_owned;
-            let row_hooks: &EvalHooks = match row_subqueries.as_ref() {
-                Some(subqueries) => {
-                    row_hooks_owned = correlated_row_hooks(&hooks, subqueries);
-                    &row_hooks_owned
-                }
-                None => &hooks,
-            };
-            let mut projected = [Datum::Null; MAX_PROJ];
-            match srf_call {
-                None => {
+                &hooks,
+            )?
+        {
+            return Ok(true);
+        }
+        let mut scalar_scratch: CorrelatedScalarScratch =
+            [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+        let mut list_scratch: CorrelatedListScratch =
+            [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+        let row_subqueries = correlated_row_subqueries(
+            correlated,
+            &outer_subs.base,
+            row,
+            storage,
+            txid,
+            arena,
+            params,
+            &mut scalar_scratch,
+            &mut list_scratch,
+        )?;
+        let row_hooks_owned;
+        let row_hooks: &EvalHooks = match row_subqueries.as_ref() {
+            Some(subqueries) => {
+                row_hooks_owned = correlated_row_hooks(&hooks, subqueries);
+                &row_hooks_owned
+            }
+            None => &hooks,
+        };
+        let mut projected = [Datum::Null; MAX_PROJ];
+        match srf_call {
+            None => {
+                let n = project_row(
+                    statement.items,
+                    &scope,
+                    row,
+                    arena,
+                    params,
+                    row_hooks,
+                    &mut projected,
+                    None,
+                )?;
+                emit(&projected[..n])?;
+            }
+            Some(c) => {
+                let count = srf_count(c, arena, params, row, row_hooks)?;
+                for k in 1..=count {
+                    let srf_hooks = EvalHooks {
+                        srf_index: Some(k),
+                        ..*row_hooks
+                    };
                     let n = project_row(
                         statement.items,
                         &scope,
                         row,
                         arena,
                         params,
-                        row_hooks,
+                        &srf_hooks,
                         &mut projected,
                         None,
                     )?;
                     emit(&projected[..n])?;
                 }
-                Some(c) => {
-                    let count = srf_count(c, arena, params, row, row_hooks)?;
-                    for k in 1..=count {
-                        let srf_hooks = EvalHooks {
-                            srf_index: Some(k),
-                            ..*row_hooks
-                        };
-                        let n = project_row(
-                            statement.items,
-                            &scope,
-                            row,
-                            arena,
-                            params,
-                            &srf_hooks,
-                            &mut projected,
-                            None,
-                        )?;
-                        emit(&projected[..n])?;
-                    }
-                }
             }
-            Ok(true)
-        };
+        }
+        Ok(true)
+    };
     if recycle_rows {
         scan_source_recycling(
             storage,

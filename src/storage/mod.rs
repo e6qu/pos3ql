@@ -837,6 +837,7 @@ impl RowHeap {
 
 pub struct Table {
     pub def: TableDef,
+    pub ownership: Ownership,
     /// Transaction-owned table-definition versions. Other transactions keep
     /// resolving and decoding against `def`; the owner resolves against the
     /// latest pending definition. RowState's command versions carry the
@@ -1231,6 +1232,7 @@ pub struct ViewDef {
     /// view body by OID at creation; this engine re-resolves the stored text,
     /// so it must re-resolve under the creator's path, not the reader's.
     pub creation_path: StackStr<128>,
+    pub ownership: Ownership,
     pub live: bool,
     /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
     /// mirroring `Table::pending_ddl`): other transactions see `live`; the
@@ -1258,6 +1260,7 @@ pub struct MatviewDef {
     pub name: SqlName,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
+    pub ownership: Ownership,
     /// False after `WITH NO DATA` until the first REFRESH.
     pub populated: bool,
     pub live: bool,
@@ -1295,6 +1298,7 @@ pub struct DomainDef {
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
+    pub ownership: Ownership,
     /// Immediate parent when this domain was declared over another domain.
     /// The value representation is flattened to `base`, but the parent chain
     /// remains explicit so every inherited NOT NULL/CHECK is enforced.
@@ -1317,6 +1321,7 @@ impl DomainDef {
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
+        ownership: Ownership::BOOTSTRAP,
         base_domain: None,
         base_domain_schema: None,
         base: ColType::Bool,
@@ -1387,6 +1392,7 @@ pub struct EnumDef {
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
+    pub ownership: Ownership,
     pub members: [EnumMember; MAX_ENUM_LABELS],
     pub n_members: usize,
     pub live: bool,
@@ -1398,6 +1404,7 @@ impl EnumDef {
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
+        ownership: Ownership::BOOTSTRAP,
         members: [EnumMember::EMPTY; MAX_ENUM_LABELS],
         n_members: 0,
         live: false,
@@ -1497,6 +1504,7 @@ pub struct SequenceDef {
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
+    pub ownership: Ownership,
     pub data_type: SeqType,
     pub increment: i64,
     pub min_value: i64,
@@ -1659,6 +1667,7 @@ pub struct IndexDef {
     pub schema: SqlName,
     pub name: SqlName,
     pub table: SqlName,
+    pub ownership: Ownership,
     pub columns: [u16; MAX_INDEX_COLS],
     pub descending: [bool; MAX_INDEX_COLS],
     pub nulls_first: [bool; MAX_INDEX_COLS],
@@ -1689,6 +1698,7 @@ pub(crate) const MAX_SCHEMAS: usize = 32;
 #[derive(Clone, Copy)]
 pub struct SchemaDef {
     pub name: SqlName,
+    pub ownership: Ownership,
     pub live: bool,
     pub pending: Option<PendingDdl>,
 }
@@ -1699,6 +1709,294 @@ impl SchemaDef {
         match self.pending {
             Some(p) if p.txid == txid => p.creating,
             _ => self.live,
+        }
+    }
+}
+
+/// Transactional owner metadata shared by every user-created catalog object.
+/// Role slots, rather than names, make ownership survive role renames; object
+/// slots make it survive object renames. WAL and manifests resolve the slots
+/// from durable names at replay boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ownership {
+    pub owner: u16,
+    pub pending: Option<PendingOwnership>,
+}
+
+impl Ownership {
+    pub const BOOTSTRAP: Self = Self {
+        owner: 0,
+        pending: None,
+    };
+
+    pub fn owner_to(self, txid: u32) -> u16 {
+        match self.pending {
+            Some(pending) if pending.txid == txid => pending.owner,
+            _ => self.owner,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingOwnership {
+    pub txid: u32,
+    pub owner: u16,
+}
+
+/// Stable object classes used by ownership and ACL state. Relation covers
+/// tables, plain views, and materialized views; their slots are disambiguated
+/// by the dedicated view classes because each registry has its own slot space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum AccessClass {
+    Table = 0,
+    View = 1,
+    MaterializedView = 2,
+    Sequence = 3,
+    Schema = 4,
+    Domain = 5,
+    Enum = 6,
+    Index = 7,
+}
+
+impl AccessClass {
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::Table,
+            1 => Self::View,
+            2 => Self::MaterializedView,
+            3 => Self::Sequence,
+            4 => Self::Schema,
+            5 => Self::Domain,
+            6 => Self::Enum,
+            7 => Self::Index,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccessObject {
+    pub class: AccessClass,
+    pub slot: u16,
+}
+
+/// PostgreSQL object privileges represented as a compact set. Unsupported
+/// object/privilege combinations are rejected before they reach storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrivilegeSet(pub u16);
+
+impl PrivilegeSet {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const SELECT: Self = Self(1 << 0);
+    pub(crate) const INSERT: Self = Self(1 << 1);
+    pub(crate) const UPDATE: Self = Self(1 << 2);
+    pub(crate) const DELETE: Self = Self(1 << 3);
+    pub(crate) const TRUNCATE: Self = Self(1 << 4);
+    pub(crate) const REFERENCES: Self = Self(1 << 5);
+    pub(crate) const TRIGGER: Self = Self(1 << 6);
+    pub(crate) const USAGE: Self = Self(1 << 7);
+    pub(crate) const CREATE: Self = Self(1 << 8);
+
+    pub(crate) const TABLE_ALL: Self = Self(
+        Self::SELECT.0
+            | Self::INSERT.0
+            | Self::UPDATE.0
+            | Self::DELETE.0
+            | Self::TRUNCATE.0
+            | Self::REFERENCES.0
+            | Self::TRIGGER.0,
+    );
+    pub(crate) const SEQUENCE_ALL: Self = Self(Self::USAGE.0 | Self::SELECT.0 | Self::UPDATE.0);
+    pub(crate) const SCHEMA_ALL: Self = Self(Self::USAGE.0 | Self::CREATE.0);
+    pub(crate) const TYPE_ALL: Self = Self::USAGE;
+
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub(crate) const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+pub(crate) const PUBLIC_ROLE: u16 = u16::MAX;
+pub(crate) const MAX_ACL_ENTRIES: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingAcl {
+    pub txid: u32,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AclEntry {
+    pub object: AccessObject,
+    pub grantee: u16,
+    pub grantor: u16,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+    pub live: bool,
+    pub pending: Option<PendingAcl>,
+}
+
+/// Startup-bounded PostgreSQL role catalog. Role metadata is catalog state and
+/// therefore follows the same transaction/WAL/manifest lifecycle as schemas;
+/// it never lives in a process-global authentication side table.
+pub(crate) const MAX_ROLES: usize = 64;
+pub(crate) const MAX_ROLE_MEMBERSHIPS: usize = 256;
+pub(crate) const ROLE_PASSWORD_MAX: usize = 128;
+pub(crate) const ROLE_VALID_UNTIL_MAX: usize = 64;
+
+#[derive(Clone, Copy, Debug)]
+pub struct RolePassword {
+    pub salt: [u8; 16],
+    pub stored_key: [u8; 32],
+    pub server_key: [u8; 32],
+    pub iterations: u32,
+}
+
+impl RolePassword {
+    pub const EMPTY: Self = Self {
+        salt: [0; 16],
+        stored_key: [0; 32],
+        server_key: [0; 32],
+        iterations: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RoleAttributes {
+    pub superuser: bool,
+    pub inherit: bool,
+    pub create_role: bool,
+    pub create_database: bool,
+    pub can_login: bool,
+    pub replication: bool,
+    pub bypass_row_level_security: bool,
+    pub connection_limit: i32,
+    pub password: RolePassword,
+    pub has_password: bool,
+    pub valid_until: StackStr<ROLE_VALID_UNTIL_MAX>,
+    pub has_valid_until: bool,
+}
+
+impl RoleAttributes {
+    pub const ORDINARY: Self = Self {
+        superuser: false,
+        inherit: true,
+        create_role: false,
+        create_database: false,
+        can_login: false,
+        replication: false,
+        bypass_row_level_security: false,
+        connection_limit: -1,
+        password: RolePassword::EMPTY,
+        has_password: false,
+        valid_until: StackStr::new(),
+        has_valid_until: false,
+    };
+
+    pub const BOOTSTRAP: Self = Self {
+        superuser: true,
+        inherit: true,
+        create_role: true,
+        create_database: true,
+        can_login: true,
+        replication: true,
+        bypass_row_level_security: true,
+        ..Self::ORDINARY
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PendingRole {
+    pub txid: u32,
+    pub exists: bool,
+    pub name: SqlName,
+    pub attributes: RoleAttributes,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RoleDef {
+    pub name: SqlName,
+    pub attributes: RoleAttributes,
+    pub live: bool,
+    pub pending: Option<PendingRole>,
+}
+
+impl RoleDef {
+    pub fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(pending) if pending.txid == txid => pending.exists,
+            _ => self.live,
+        }
+    }
+
+    pub fn attributes_to(&self, txid: u32) -> RoleAttributes {
+        match self.pending {
+            Some(pending) if pending.txid == txid && pending.exists => pending.attributes,
+            _ => self.attributes,
+        }
+    }
+
+    pub fn name_to(&self, txid: u32) -> SqlName {
+        match self.pending {
+            Some(pending) if pending.txid == txid && pending.exists => pending.name,
+            _ => self.name,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RoleMembershipOptions {
+    pub admin: bool,
+    pub inherit: bool,
+    pub set: bool,
+}
+
+impl RoleMembershipOptions {
+    pub const DEFAULT: Self = Self {
+        admin: false,
+        inherit: true,
+        set: true,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PendingRoleMembership {
+    pub txid: u32,
+    pub exists: bool,
+    pub options: RoleMembershipOptions,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RoleMembership {
+    pub role: u16,
+    pub member: u16,
+    pub grantor: u16,
+    pub options: RoleMembershipOptions,
+    pub live: bool,
+    pub pending: Option<PendingRoleMembership>,
+}
+
+impl RoleMembership {
+    pub fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(pending) if pending.txid == txid => pending.exists,
+            _ => self.live,
+        }
+    }
+
+    pub fn options_to(&self, txid: u32) -> RoleMembershipOptions {
+        match self.pending {
+            Some(pending) if pending.txid == txid && pending.exists => pending.options,
+            _ => self.options,
         }
     }
 }
@@ -1910,6 +2208,12 @@ impl TableLock {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReplayTableRewrite {
+    table: usize,
+    column_mapping: [u16; MAX_COLUMNS],
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -1924,6 +2228,9 @@ pub struct Storage {
     enums: FixedVec<EnumDef>,
     indexes: FixedVec<IndexDef>,
     schemas: FixedVec<SchemaDef>,
+    roles: FixedVec<RoleDef>,
+    role_memberships: FixedVec<RoleMembership>,
+    acl_entries: FixedVec<AclEntry>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
     comments: FixedVec<CommentEntry>,
@@ -1960,6 +2267,9 @@ pub struct Storage {
     serializable_snapshots: std::cell::RefCell<FixedVec<(u32, u32, u64, bool)>>,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
+    /// ALTER TABLE replay is encoded as a compact identity/mapping marker
+    /// followed immediately by the ordinary final table definition.
+    replay_table_rewrite: Option<ReplayTableRewrite>,
     /// The read path for spilled rows: the tiered block stack shared with the
     /// checkpointer, plus owned reader scratch. `None` without object storage
     /// — then rows never spill and the heap-full error stands.
@@ -1993,8 +2303,7 @@ pub(crate) struct SpillReader {
     /// Nested materializers lease independent external-run producers. Their
     /// buffers and merge fan-in are fixed at startup; run blocks travel
     /// through `blocks`, never a provider-specific path.
-    external_sorters:
-        Box<[std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>]>,
+    external_sorters: Box<[std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>]>,
     /// Immutable-run cursors leased by nested materialized row sources.
     /// Their scratch is independent from the sorter, so consuming a completed
     /// run never prevents a deeper operator from producing another.
@@ -2076,9 +2385,7 @@ impl SpillReader {
         )?;
         budget.draw_array(
             EXTERNAL_RUN_CONTEXTS,
-            core::mem::size_of::<
-                std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
-            >(),
+            core::mem::size_of::<std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>>(),
             "external query run producer slots",
         )?;
         let mut external_sorters = Vec::with_capacity(EXTERNAL_RUN_CONTEXTS);
@@ -2142,9 +2449,8 @@ impl SpillReader {
             + 4 * crate::store::MAX_PAYLOAD
             + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
             + EXTERNAL_RUN_CONTEXTS
-                * core::mem::size_of::<
-                    std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
-                >()
+                * core::mem::size_of::<std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>>(
+                )
             + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes()
     }
 }
@@ -2277,14 +2583,15 @@ impl Storage {
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableStatisticsSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
+            + MAX_ROLES * size_of::<RoleDef>()
+            + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
+            + MAX_ACL_ENTRIES * size_of::<AclEntry>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<(u32, u64)>()
-            + config.max_connections as usize
-                * config.max_tables
-                * size_of::<TableLock>()
+            + config.max_connections as usize * config.max_tables * size_of::<TableLock>()
             + crate::sql::lock::LockManager::budget_bytes(
                 config.max_connections as usize * config.txn_rows,
                 config.max_connections as usize,
@@ -2333,6 +2640,7 @@ impl Storage {
                         n_columns: 0,
                         ..TableDef::empty()
                     },
+                    ownership: Ownership::BOOTSTRAP,
                     pending_def_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
                     n_pending_defs: 0,
                     pending_def_txid: None,
@@ -2369,6 +2677,7 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
+                    ownership: Ownership::BOOTSTRAP,
                     live: false,
                     pending: None,
                 })
@@ -2385,6 +2694,7 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
+                    ownership: Ownership::BOOTSTRAP,
                     populated: false,
                     live: false,
                     pending: None,
@@ -2400,6 +2710,7 @@ impl Storage {
                     created_at: 0,
                     schema: SqlName::EMPTY,
                     name: SqlName::EMPTY,
+                    ownership: Ownership::BOOTSTRAP,
                     data_type: SeqType::Bigint,
                     increment: 1,
                     min_value: 1,
@@ -2436,6 +2747,7 @@ impl Storage {
                     } else {
                         SqlName::EMPTY
                     },
+                    ownership: Ownership::BOOTSTRAP,
                     live: i == 0,
                     pending: None,
                 })
@@ -2447,6 +2759,53 @@ impl Storage {
                 .push(CommentEntry::empty())
                 .expect("sized to MAX_COMMENTS");
         }
+        let mut roles = FixedVec::new(budget, "roles", MAX_ROLES)?;
+        for slot in 0..MAX_ROLES {
+            roles
+                .push(RoleDef {
+                    name: if slot == 0 {
+                        SqlName::parse("postgres").expect("bootstrap role name fits")
+                    } else {
+                        SqlName::EMPTY
+                    },
+                    attributes: if slot == 0 {
+                        RoleAttributes::BOOTSTRAP
+                    } else {
+                        RoleAttributes::ORDINARY
+                    },
+                    live: slot == 0,
+                    pending: None,
+                })
+                .expect("sized to MAX_ROLES");
+        }
+        let mut role_memberships = FixedVec::new(budget, "role_memberships", MAX_ROLE_MEMBERSHIPS)?;
+        for _ in 0..MAX_ROLE_MEMBERSHIPS {
+            role_memberships
+                .push(RoleMembership {
+                    role: 0,
+                    member: 0,
+                    grantor: 0,
+                    options: RoleMembershipOptions::DEFAULT,
+                    live: false,
+                    pending: None,
+                })
+                .expect("sized to MAX_ROLE_MEMBERSHIPS");
+        }
+        let mut acl_entries = FixedVec::new(budget, "acl_entries", MAX_ACL_ENTRIES)?;
+        acl_entries
+            .push(AclEntry {
+                object: AccessObject {
+                    class: AccessClass::Schema,
+                    slot: 0,
+                },
+                grantee: PUBLIC_ROLE,
+                grantor: 0,
+                privileges: PrivilegeSet::USAGE,
+                grant_options: PrivilegeSet::NONE,
+                live: true,
+                pending: None,
+            })
+            .expect("ACL pool has room for the public schema default");
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
         for _ in 0..config.max_tables {
             indexes
@@ -2454,6 +2813,7 @@ impl Storage {
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
                     table: SqlName::parse("").expect("empty name fits"),
+                    ownership: Ownership::BOOTSTRAP,
                     columns: [0; MAX_INDEX_COLS],
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
@@ -2497,6 +2857,9 @@ impl Storage {
             enums,
             indexes,
             schemas,
+            roles,
+            role_memberships,
+            acl_entries,
             comments,
             path: PathContext::public_only(),
             catalog_seq: 0,
@@ -2509,6 +2872,7 @@ impl Storage {
             serializable_snapshots,
             next_rowid: 1,
             lsn: 0,
+            replay_table_rewrite: None,
             spill: None,
             value_indexes: Some(value_indexes),
         })
@@ -2532,6 +2896,1173 @@ impl Storage {
 
     pub fn schema_def(&self, slot: usize) -> &SchemaDef {
         &self.schemas[slot]
+    }
+
+    pub fn role_count(&self) -> usize {
+        self.roles.len()
+    }
+
+    pub fn role(&self, slot: usize) -> &RoleDef {
+        &self.roles[slot]
+    }
+
+    pub fn role_name(&self, slot: usize, txid: u32) -> SqlName {
+        self.roles[slot].name_to(txid)
+    }
+
+    pub fn live_roles(&self) -> impl Iterator<Item = (usize, &RoleDef)> {
+        self.roles.iter().enumerate().filter(|(_, role)| role.live)
+    }
+
+    pub fn find_role(&self, name: &str) -> Option<usize> {
+        self.roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == name)
+    }
+
+    pub fn find_role_visible(&self, name: &str, txid: u32) -> Option<usize> {
+        self.roles
+            .iter()
+            .position(|role| role.visible_to(txid) && role.name_to(txid).as_str() == name)
+    }
+
+    /// PostgreSQL preassigns OIDs to built-in roles. The bootstrap role keeps
+    /// OID 10 for compatibility with the existing catalog; user roles occupy
+    /// a deterministic catalog range.
+    pub fn role_oid(slot: usize) -> i32 {
+        if slot == 0 { 10 } else { 16_384 + slot as i32 }
+    }
+
+    pub(crate) fn role_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.roles.iter().enumerate().find_map(|(slot, role)| {
+            (role.visible_to(txid) && Self::role_oid(slot) == oid).then_some(slot)
+        })
+    }
+
+    fn ownership(&self, object: AccessObject) -> &Ownership {
+        let slot = object.slot as usize;
+        match object.class {
+            AccessClass::Table => &self.tables[slot].ownership,
+            AccessClass::View => &self.views[slot].ownership,
+            AccessClass::MaterializedView => &self.matviews[slot].ownership,
+            AccessClass::Sequence => &self.sequences[slot].ownership,
+            AccessClass::Schema => &self.schemas[slot].ownership,
+            AccessClass::Domain => &self.domains[slot].ownership,
+            AccessClass::Enum => &self.enums[slot].ownership,
+            AccessClass::Index => &self.indexes[slot].ownership,
+        }
+    }
+
+    fn ownership_mut(&mut self, object: AccessObject) -> &mut Ownership {
+        let slot = object.slot as usize;
+        match object.class {
+            AccessClass::Table => &mut self.tables[slot].ownership,
+            AccessClass::View => &mut self.views[slot].ownership,
+            AccessClass::MaterializedView => &mut self.matviews[slot].ownership,
+            AccessClass::Sequence => &mut self.sequences[slot].ownership,
+            AccessClass::Schema => &mut self.schemas[slot].ownership,
+            AccessClass::Domain => &mut self.domains[slot].ownership,
+            AccessClass::Enum => &mut self.enums[slot].ownership,
+            AccessClass::Index => &mut self.indexes[slot].ownership,
+        }
+    }
+
+    fn initial_ownership(&self, txid: u32) -> Ownership {
+        if txid == 0 {
+            return Ownership::BOOTSTRAP;
+        }
+        let role_name = crate::sql::eval::funcs::system::current_user_owned();
+        let owner = self
+            .find_role_visible(role_name.as_str(), txid)
+            .unwrap_or(0) as u16;
+        Ownership {
+            owner: 0,
+            pending: Some(PendingOwnership { txid, owner }),
+        }
+    }
+
+    pub(crate) fn object_owner(&self, object: AccessObject, txid: u32) -> usize {
+        self.ownership(object).owner_to(txid) as usize
+    }
+
+    pub(crate) fn current_role_slot(&self, txid: u32) -> Option<usize> {
+        let role = crate::sql::eval::funcs::system::current_user_owned();
+        self.find_role_visible(role.as_str(), txid)
+    }
+
+    pub(crate) fn table_access_object(&self, slot: usize, txid: u32) -> AccessObject {
+        let definition = self.table_def(slot, txid);
+        self.matview_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+            .map_or(
+                AccessObject {
+                    class: AccessClass::Table,
+                    slot: slot as u16,
+                },
+                |matview| AccessObject {
+                    class: AccessClass::MaterializedView,
+                    slot: matview as u16,
+                },
+            )
+    }
+
+    pub(crate) fn resolve_access_object(
+        &self,
+        class: AccessClass,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<AccessObject> {
+        let slot = match class {
+            AccessClass::Table => self.find_visible(schema, name, txid),
+            AccessClass::View => self.views.iter().position(|view| {
+                view.visible_to(txid)
+                    && view.schema.as_str() == schema
+                    && view.name.as_str() == name
+            }),
+            AccessClass::MaterializedView => self.matview_slot(schema, name, txid),
+            AccessClass::Sequence => self.sequence_slot(schema, name, txid),
+            AccessClass::Schema => self.find_schema_visible(name, txid),
+            AccessClass::Domain => self.domain_slot(schema, name, txid),
+            AccessClass::Enum => self.enum_slot(schema, name, txid),
+            AccessClass::Index => self.indexes.iter().position(|index| {
+                index.visible_to(txid)
+                    && index.schema.as_str() == schema
+                    && index.name.as_str() == name
+            }),
+        }?;
+        u16::try_from(slot)
+            .ok()
+            .map(|slot| AccessObject { class, slot })
+    }
+
+    pub(crate) fn access_object_name(&self, object: AccessObject) -> (SqlName, SqlName) {
+        self.access_object_name_to(object, 0)
+    }
+
+    pub(crate) fn access_object_name_to(
+        &self,
+        object: AccessObject,
+        txid: u32,
+    ) -> (SqlName, SqlName) {
+        let slot = object.slot as usize;
+        match object.class {
+            AccessClass::Table => {
+                let definition = self.table_def(slot, txid);
+                (definition.schema, definition.name)
+            }
+            AccessClass::View => {
+                let definition = &self.views[slot];
+                (definition.schema, definition.name)
+            }
+            AccessClass::MaterializedView => {
+                let definition = &self.matviews[slot];
+                (definition.schema, definition.name)
+            }
+            AccessClass::Sequence => {
+                let definition = &self.sequences[slot];
+                (definition.schema, definition.name)
+            }
+            AccessClass::Schema => (SqlName::EMPTY, self.schemas[slot].name),
+            AccessClass::Domain => {
+                let definition = &self.domains[slot];
+                (definition.schema, definition.name)
+            }
+            AccessClass::Enum => {
+                let definition = &self.enums[slot];
+                (definition.schema, definition.name)
+            }
+            AccessClass::Index => {
+                let definition = &self.indexes[slot];
+                (definition.schema, definition.name)
+            }
+        }
+    }
+
+    pub(crate) fn access_object_is_live(&self, object: AccessObject) -> bool {
+        let slot = object.slot as usize;
+        match object.class {
+            AccessClass::Table => self.tables[slot].live,
+            AccessClass::View => self.views[slot].live,
+            AccessClass::MaterializedView => self.matviews[slot].live,
+            AccessClass::Sequence => self.sequences[slot].live,
+            AccessClass::Schema => self.schemas[slot].live,
+            AccessClass::Domain => self.domains[slot].live,
+            AccessClass::Enum => self.enums[slot].live,
+            AccessClass::Index => self.indexes[slot].live,
+        }
+    }
+
+    fn access_object_visible_to(&self, object: AccessObject, txid: u32) -> bool {
+        let slot = object.slot as usize;
+        match object.class {
+            AccessClass::Table => self.tables[slot].visible_to(txid),
+            AccessClass::View => self.views[slot].visible_to(txid),
+            AccessClass::MaterializedView => self.matviews[slot].visible_to(txid),
+            AccessClass::Sequence => self.sequences[slot].visible_to(txid),
+            AccessClass::Schema => self.schemas[slot].visible_to(txid),
+            AccessClass::Domain => self.domains[slot].visible_to(txid),
+            AccessClass::Enum => self.enums[slot].visible_to(txid),
+            AccessClass::Index => self.indexes[slot].visible_to(txid),
+        }
+    }
+
+    /// Removes privilege rows belonging to a catalog slot before that slot is
+    /// reused. ACL identity includes the fixed registry slot, so retaining a
+    /// dropped object's rows would otherwise grant privileges on an unrelated
+    /// object later allocated into the same slot.
+    fn clear_object_acl_entries(&mut self, object: AccessObject) {
+        for entry in self.acl_entries.iter_mut() {
+            if entry.object == object {
+                entry.live = false;
+                entry.privileges = PrivilegeSet::NONE;
+                entry.grant_options = PrivilegeSet::NONE;
+                entry.pending = None;
+                entry.object.slot = u16::MAX;
+            }
+        }
+    }
+
+    pub(crate) fn role_has_object_dependents(&self, role: usize, txid: u32) -> bool {
+        let owned = [
+            (AccessClass::Table, self.tables.len()),
+            (AccessClass::View, self.views.len()),
+            (AccessClass::MaterializedView, self.matviews.len()),
+            (AccessClass::Sequence, self.sequences.len()),
+            (AccessClass::Schema, self.schemas.len()),
+            (AccessClass::Domain, self.domains.len()),
+            (AccessClass::Enum, self.enums.len()),
+            (AccessClass::Index, self.indexes.len()),
+        ]
+        .into_iter()
+        .any(|(class, count)| {
+            (0..count).any(|slot| {
+                let object = AccessObject {
+                    class,
+                    slot: slot as u16,
+                };
+                self.access_object_visible_to(object, txid)
+                    && self.object_owner(object, txid) == role
+            })
+        });
+        owned
+            || self.acl_entries.iter().any(|entry| {
+                let (visible, _, _) = Self::acl_visible(entry, txid);
+                visible
+                    && self.access_object_visible_to(entry.object, txid)
+                    && (entry.grantee == role as u16 || entry.grantor == role as u16)
+            })
+    }
+
+    pub(crate) fn set_object_owner(
+        &mut self,
+        object: AccessObject,
+        owner: usize,
+        txid: u32,
+    ) -> Option<PendingOwnership> {
+        let ownership = self.ownership_mut(object);
+        let prior = ownership.pending;
+        if txid == 0 {
+            ownership.owner = owner as u16;
+            ownership.pending = None;
+        } else {
+            ownership.pending = Some(PendingOwnership {
+                txid,
+                owner: owner as u16,
+            });
+        }
+        prior
+    }
+
+    pub(crate) fn commit_object_owner(&mut self, object: AccessObject, txid: u32) {
+        let ownership = self.ownership_mut(object);
+        if let Some(pending) = ownership.pending
+            && pending.txid == txid
+        {
+            ownership.owner = pending.owner;
+            ownership.pending = None;
+        }
+    }
+
+    pub(crate) fn restore_object_owner(
+        &mut self,
+        object: AccessObject,
+        prior: Option<PendingOwnership>,
+    ) {
+        self.ownership_mut(object).pending = prior;
+    }
+
+    fn acl_visible(entry: &AclEntry, txid: u32) -> (bool, PrivilegeSet, PrivilegeSet) {
+        match entry.pending {
+            Some(pending) if pending.txid == txid => (
+                pending.privileges.0 != 0,
+                pending.privileges,
+                pending.grant_options,
+            ),
+            _ => (entry.live, entry.privileges, entry.grant_options),
+        }
+    }
+
+    pub(crate) fn change_acl(
+        &mut self,
+        object: AccessObject,
+        grantee: u16,
+        grantor: u16,
+        privileges: PrivilegeSet,
+        grant_options: PrivilegeSet,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingAcl>), SqlError> {
+        let slot = self
+            .acl_entries
+            .iter()
+            .position(|entry| {
+                entry.object == object
+                    && entry.grantee == grantee
+                    && entry.grantor == grantor
+                    && (entry.live || entry.pending.is_some())
+            })
+            .or_else(|| {
+                self.acl_entries.iter().position(|entry| {
+                    entry.object.slot == u16::MAX && !entry.live && entry.pending.is_none()
+                })
+            })
+            .unwrap_or(self.acl_entries.len());
+        if slot == self.acl_entries.len() {
+            self.acl_entries
+                .push(AclEntry {
+                    object,
+                    grantee,
+                    grantor,
+                    privileges: PrivilegeSet::NONE,
+                    grant_options: PrivilegeSet::NONE,
+                    live: false,
+                    pending: None,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many object privilege entries (limit {})",
+                        MAX_ACL_ENTRIES
+                    )
+                })?;
+        } else if self.acl_entries[slot].object.slot == u16::MAX {
+            self.acl_entries[slot].object = object;
+            self.acl_entries[slot].grantee = grantee;
+            self.acl_entries[slot].grantor = grantor;
+        }
+        let entry = &mut self.acl_entries[slot];
+        let prior = entry.pending;
+        entry.grantor = grantor;
+        if txid == 0 {
+            entry.privileges = privileges;
+            entry.grant_options = grant_options;
+            entry.live = privileges.0 != 0;
+            entry.pending = None;
+        } else {
+            entry.pending = Some(PendingAcl {
+                txid,
+                privileges,
+                grant_options,
+            });
+        }
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn acl_to(
+        &self,
+        object: AccessObject,
+        grantee: u16,
+        txid: u32,
+    ) -> (PrivilegeSet, PrivilegeSet) {
+        self.acl_entries
+            .iter()
+            .filter(|entry| entry.object == object && entry.grantee == grantee)
+            .fold(
+                (PrivilegeSet::NONE, PrivilegeSet::NONE),
+                |(privileges, grant_options), entry| {
+                    let (visible, entry_privileges, entry_grant_options) =
+                        Self::acl_visible(entry, txid);
+                    if visible {
+                        (
+                            privileges.union(entry_privileges),
+                            grant_options.union(entry_grant_options),
+                        )
+                    } else {
+                        (privileges, grant_options)
+                    }
+                },
+            )
+    }
+
+    pub(crate) fn acl_from(
+        &self,
+        object: AccessObject,
+        grantee: u16,
+        grantor: u16,
+        txid: u32,
+    ) -> (PrivilegeSet, PrivilegeSet) {
+        self.acl_entries
+            .iter()
+            .find(|entry| {
+                entry.object == object
+                    && entry.grantee == grantee
+                    && entry.grantor == grantor
+                    && (entry.live || entry.pending.is_some())
+            })
+            .map(|entry| {
+                let (visible, privileges, grant_options) = Self::acl_visible(entry, txid);
+                if visible {
+                    (privileges, grant_options)
+                } else {
+                    (PrivilegeSet::NONE, PrivilegeSet::NONE)
+                }
+            })
+            .unwrap_or((PrivilegeSet::NONE, PrivilegeSet::NONE))
+    }
+
+    pub(crate) fn acl_state(&self, slot: usize, txid: u32) -> (PrivilegeSet, PrivilegeSet) {
+        let (visible, privileges, grant_options) = Self::acl_visible(&self.acl_entries[slot], txid);
+        if visible {
+            (privileges, grant_options)
+        } else {
+            (PrivilegeSet::NONE, PrivilegeSet::NONE)
+        }
+    }
+
+    pub(crate) fn commit_acl(&mut self, slot: usize, txid: u32) {
+        let entry = &mut self.acl_entries[slot];
+        if let Some(pending) = entry.pending
+            && pending.txid == txid
+        {
+            entry.privileges = pending.privileges;
+            entry.grant_options = pending.grant_options;
+            entry.live = pending.privileges.0 != 0;
+            entry.pending = None;
+        }
+    }
+
+    pub(crate) fn restore_acl_pending(&mut self, slot: usize, prior: Option<PendingAcl>) {
+        self.acl_entries[slot].pending = prior;
+    }
+
+    pub(crate) fn live_acls(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
+        self.acl_entries.iter().enumerate().filter(|(_, entry)| {
+            entry.live
+                || (entry.object
+                    == (AccessObject {
+                        class: AccessClass::Schema,
+                        slot: 0,
+                    })
+                    && entry.grantee == PUBLIC_ROLE
+                    && entry.grantor == 0)
+                || (matches!(entry.object.class, AccessClass::Domain | AccessClass::Enum)
+                    && entry.object.slot != u16::MAX
+                    && entry.grantee == PUBLIC_ROLE)
+        })
+    }
+
+    pub(crate) fn acl_entry(&self, slot: usize) -> &AclEntry {
+        &self.acl_entries[slot]
+    }
+
+    pub(crate) fn acl_entries(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
+        self.acl_entries.iter().enumerate()
+    }
+
+    pub(crate) fn dependent_acl_slots(
+        &self,
+        object: AccessObject,
+        grantor: u16,
+        privileges: PrivilegeSet,
+        txid: u32,
+        output: &mut [usize; MAX_ACL_ENTRIES],
+    ) -> usize {
+        let mut count = 0usize;
+        for (slot, entry) in self.acl_entries.iter().enumerate() {
+            let (visible, entry_privileges, _) = Self::acl_visible(entry, txid);
+            if visible
+                && entry.object == object
+                && entry.grantor == grantor
+                && entry_privileges.0 & privileges.0 != 0
+            {
+                output[count] = slot;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn inherited_roles(&self, member: usize, txid: u32, out: &mut [bool; MAX_ROLES]) {
+        if out[member] {
+            return;
+        }
+        out[member] = true;
+        if !self.role(member).attributes_to(txid).inherit {
+            return;
+        }
+        for membership in self.role_memberships.iter() {
+            if membership.visible_to(txid)
+                && membership.member as usize == member
+                && membership.options_to(txid).inherit
+            {
+                self.inherited_roles(membership.role as usize, txid, out);
+            }
+        }
+    }
+
+    pub(crate) fn has_object_privilege(
+        &self,
+        object: AccessObject,
+        role: usize,
+        privilege: PrivilegeSet,
+        txid: u32,
+    ) -> bool {
+        if self.role(role).attributes_to(txid).superuser || self.object_owner(object, txid) == role
+        {
+            return true;
+        }
+        let mut roles = [false; MAX_ROLES];
+        self.inherited_roles(role, txid, &mut roles);
+        let public_acl_defined = self.acl_entries.iter().any(|entry| {
+            entry.object == object && entry.grantee == PUBLIC_ROLE && entry.object.slot != u16::MAX
+        });
+        let mut effective = if matches!(object.class, AccessClass::Domain | AccessClass::Enum)
+            && !public_acl_defined
+        {
+            // PostgreSQL's acldefault() grants USAGE on newly created types to
+            // PUBLIC. Absence means that default; an explicit zero ACL entry
+            // is the durable tombstone created by REVOKE.
+            PrivilegeSet::USAGE
+        } else {
+            self.acl_to(object, PUBLIC_ROLE, txid).0
+        };
+        for (slot, inherited) in roles.into_iter().enumerate() {
+            if inherited {
+                effective = effective.union(self.acl_to(object, slot as u16, txid).0);
+            }
+        }
+        effective.contains(privilege)
+    }
+
+    pub(crate) fn require_schema_create(&self, schema: &str, txid: u32) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        self.require_schema_create_as(schema, role, txid)
+    }
+
+    pub(crate) fn require_schema_create_as(
+        &self,
+        schema: &str,
+        role: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let schema_slot = self.find_schema_visible(schema, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                schema
+            )
+        })?;
+        let object = AccessObject {
+            class: AccessClass::Schema,
+            slot: schema_slot as u16,
+        };
+        if self.has_object_privilege(object, role, PrivilegeSet::CREATE, txid) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for schema {}",
+                schema
+            ))
+        }
+    }
+
+    pub(crate) fn require_schema_usage(&self, schema: &str, txid: u32) -> Result<(), SqlError> {
+        if txid == 0 || schema == "pg_catalog" {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        self.require_schema_usage_as(schema, role, txid)
+    }
+
+    pub(crate) fn require_schema_usage_as(
+        &self,
+        schema: &str,
+        role: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if txid == 0 || schema == "pg_catalog" {
+            return Ok(());
+        }
+        let schema_slot = self.find_schema_visible(schema, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                schema
+            )
+        })?;
+        let object = AccessObject {
+            class: AccessClass::Schema,
+            slot: schema_slot as u16,
+        };
+        if self.has_object_privilege(object, role, PrivilegeSet::USAGE, txid) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for schema {}",
+                schema
+            ))
+        }
+    }
+
+    pub(crate) fn require_type_usage(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        self.require_schema_usage(schema, txid)?;
+        let object = self
+            .domain_slot(schema, name, txid)
+            .map(|slot| AccessObject {
+                class: AccessClass::Domain,
+                slot: slot as u16,
+            })
+            .or_else(|| {
+                self.enum_slot(schema, name, txid).map(|slot| AccessObject {
+                    class: AccessClass::Enum,
+                    slot: slot as u16,
+                })
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}.{}\" does not exist",
+                    schema,
+                    name
+                )
+            })?;
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        if self.has_object_privilege(object, role, PrivilegeSet::USAGE, txid) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for type {}",
+                name
+            ))
+        }
+    }
+
+    pub(crate) fn require_owner(
+        &self,
+        object: AccessObject,
+        txid: u32,
+        object_type: &str,
+    ) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        if self.role(role).attributes_to(txid).superuser || self.object_owner(object, txid) == role
+        {
+            return Ok(());
+        }
+        let (_, name) = self.access_object_name(object);
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of {} {}",
+            object_type,
+            name.as_str()
+        ))
+    }
+
+    pub(crate) fn has_object_grant_option(
+        &self,
+        object: AccessObject,
+        role: usize,
+        privilege: PrivilegeSet,
+        txid: u32,
+    ) -> bool {
+        if self.role(role).attributes_to(txid).superuser || self.object_owner(object, txid) == role
+        {
+            return true;
+        }
+        let mut roles = [false; MAX_ROLES];
+        self.inherited_roles(role, txid, &mut roles);
+        let mut effective = self.acl_to(object, PUBLIC_ROLE, txid).1;
+        for (slot, inherited) in roles.into_iter().enumerate() {
+            if inherited {
+                effective = effective.union(self.acl_to(object, slot as u16, txid).1);
+            }
+        }
+        effective.contains(privilege)
+    }
+
+    pub fn create_role(
+        &mut self,
+        name: SqlName,
+        attributes: RoleAttributes,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingRole>), SqlError> {
+        if self.find_role_visible(name.as_str(), txid).is_some() {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "role \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if let Some(owner) = self.roles.iter().find_map(|role| {
+            (role.name == name)
+                .then_some(role.pending)
+                .flatten()
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            self.row_locks.borrow_mut().wait_for(txid, owner)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on role \"{}\"",
+                name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .roles
+            .iter()
+            .position(|role| !role.live && role.pending.is_none())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many roles (limit {})",
+                self.roles.len()
+            ));
+        };
+        let prior = self.roles[slot].pending;
+        self.roles[slot] = RoleDef {
+            name,
+            attributes: RoleAttributes::ORDINARY,
+            live: false,
+            pending: Some(PendingRole {
+                txid,
+                exists: true,
+                name,
+                attributes,
+            }),
+        };
+        Ok((slot, prior))
+    }
+
+    pub fn alter_role(
+        &mut self,
+        slot: usize,
+        attributes: RoleAttributes,
+        txid: u32,
+    ) -> Result<Option<PendingRole>, SqlError> {
+        if let Some(pending) = self.roles[slot].pending
+            && pending.txid != txid
+        {
+            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on role \"{}\"",
+                self.roles[slot].name.as_str()
+            ));
+        }
+        let prior = self.roles[slot].pending;
+        let name = self.roles[slot].name_to(txid);
+        self.roles[slot].pending = Some(PendingRole {
+            txid,
+            exists: true,
+            name,
+            attributes,
+        });
+        Ok(prior)
+    }
+
+    pub fn rename_role(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingRole>, SqlError> {
+        if self
+            .find_role_visible(name.as_str(), txid)
+            .is_some_and(|existing| existing != slot)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "role \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if let Some(pending) = self.roles[slot].pending
+            && pending.txid != txid
+        {
+            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on role \"{}\"",
+                self.roles[slot].name.as_str()
+            ));
+        }
+        let prior = self.roles[slot].pending;
+        let attributes = self.roles[slot].attributes_to(txid);
+        self.roles[slot].pending = Some(PendingRole {
+            txid,
+            exists: true,
+            name,
+            attributes,
+        });
+        Ok(prior)
+    }
+
+    pub fn drop_role_in(
+        &mut self,
+        slot: usize,
+        txid: u32,
+    ) -> Result<Option<PendingRole>, SqlError> {
+        if let Some(pending) = self.roles[slot].pending
+            && pending.txid != txid
+        {
+            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent DDL on role \"{}\"",
+                self.roles[slot].name.as_str()
+            ));
+        }
+        let prior = self.roles[slot].pending;
+        let name = self.roles[slot].name_to(txid);
+        let attributes = self.roles[slot].attributes_to(txid);
+        self.roles[slot].pending = Some(PendingRole {
+            txid,
+            exists: false,
+            name,
+            attributes,
+        });
+        Ok(prior)
+    }
+
+    pub fn commit_role_change(&mut self, slot: usize) {
+        let Some(pending) = self.roles[slot].pending.take() else {
+            return;
+        };
+        self.roles[slot].live = pending.exists;
+        self.roles[slot].name = pending.name;
+        self.roles[slot].attributes = pending.attributes;
+        if !pending.exists {
+            self.roles[slot].name = SqlName::EMPTY;
+        }
+    }
+
+    pub fn rollback_role_change(&mut self, slot: usize, prior: Option<PendingRole>) {
+        self.roles[slot].pending = prior;
+        if !self.roles[slot].live && prior.is_none() {
+            self.roles[slot].name = SqlName::EMPTY;
+            self.roles[slot].attributes = RoleAttributes::ORDINARY;
+        }
+    }
+
+    /// Committed role install used by WAL and manifest recovery.
+    pub fn install_role(
+        &mut self,
+        name: SqlName,
+        attributes: RoleAttributes,
+    ) -> Result<usize, SqlError> {
+        if let Some(slot) = self.find_role(name.as_str()) {
+            self.roles[slot].attributes = attributes;
+            return Ok(slot);
+        }
+        let Some(slot) = self
+            .roles
+            .iter()
+            .position(|role| !role.live && role.pending.is_none())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many roles (limit {})",
+                self.roles.len()
+            ));
+        };
+        self.roles[slot] = RoleDef {
+            name,
+            attributes,
+            live: true,
+            pending: None,
+        };
+        Ok(slot)
+    }
+
+    pub fn remove_role(&mut self, name: &str) {
+        if let Some(slot) = self.find_role(name) {
+            self.roles[slot] = RoleDef {
+                name: SqlName::EMPTY,
+                attributes: RoleAttributes::ORDINARY,
+                live: false,
+                pending: None,
+            };
+        }
+    }
+
+    pub fn role_membership_count(&self) -> usize {
+        self.role_memberships.len()
+    }
+
+    pub fn role_membership(&self, slot: usize) -> &RoleMembership {
+        &self.role_memberships[slot]
+    }
+
+    pub fn live_role_memberships(&self) -> impl Iterator<Item = (usize, &RoleMembership)> {
+        self.role_memberships
+            .iter()
+            .enumerate()
+            .filter(|(_, membership)| membership.live)
+    }
+
+    pub fn find_role_membership_visible(
+        &self,
+        role: usize,
+        member: usize,
+        txid: u32,
+    ) -> Option<usize> {
+        self.role_memberships.iter().position(|membership| {
+            membership.visible_to(txid)
+                && membership.role as usize == role
+                && membership.member as usize == member
+        })
+    }
+
+    pub fn change_role_membership(
+        &mut self,
+        role: usize,
+        member: usize,
+        grantor: usize,
+        options: RoleMembershipOptions,
+        exists: bool,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingRoleMembership>), SqlError> {
+        let existing = self.role_memberships.iter().position(|membership| {
+            (membership.live || membership.pending.is_some())
+                && membership.role as usize == role
+                && membership.member as usize == member
+        });
+        let slot = match existing {
+            Some(slot) => slot,
+            None if !exists => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role membership does not exist"
+                ));
+            }
+            None => self
+                .role_memberships
+                .iter()
+                .position(|membership| !membership.live && membership.pending.is_none())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many role memberships (limit {})",
+                        self.role_memberships.len()
+                    )
+                })?,
+        };
+        if let Some(pending) = self.role_memberships[slot].pending
+            && pending.txid != txid
+        {
+            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent role membership DDL"
+            ));
+        }
+        let prior = self.role_memberships[slot].pending;
+        if existing.is_none() {
+            self.role_memberships[slot].role = role as u16;
+            self.role_memberships[slot].member = member as u16;
+            self.role_memberships[slot].grantor = grantor as u16;
+        }
+        self.role_memberships[slot].pending = Some(PendingRoleMembership {
+            txid,
+            exists,
+            options,
+        });
+        Ok((slot, prior))
+    }
+
+    pub fn commit_role_membership_change(&mut self, slot: usize) {
+        let Some(pending) = self.role_memberships[slot].pending.take() else {
+            return;
+        };
+        self.role_memberships[slot].live = pending.exists;
+        self.role_memberships[slot].options = pending.options;
+        if !pending.exists {
+            self.role_memberships[slot].role = 0;
+            self.role_memberships[slot].member = 0;
+            self.role_memberships[slot].grantor = 0;
+        }
+    }
+
+    pub fn rollback_role_membership_change(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingRoleMembership>,
+    ) {
+        self.role_memberships[slot].pending = prior;
+        if !self.role_memberships[slot].live && prior.is_none() {
+            self.role_memberships[slot].role = 0;
+            self.role_memberships[slot].member = 0;
+            self.role_memberships[slot].grantor = 0;
+        }
+    }
+
+    pub fn install_role_membership(
+        &mut self,
+        role_name: &str,
+        member_name: &str,
+        grantor_name: &str,
+        options: RoleMembershipOptions,
+    ) -> Result<usize, SqlError> {
+        let role = self.find_role(role_name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "membership role \"{}\" does not exist",
+                role_name
+            )
+        })?;
+        let member = self.find_role(member_name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "membership member \"{}\" does not exist",
+                member_name
+            )
+        })?;
+        let grantor = self.find_role(grantor_name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "membership grantor \"{}\" does not exist",
+                grantor_name
+            )
+        })?;
+        if let Some(slot) = self.find_role_membership_visible(role, member, 0) {
+            self.role_memberships[slot].options = options;
+            return Ok(slot);
+        }
+        let slot = self
+            .role_memberships
+            .iter()
+            .position(|membership| !membership.live && membership.pending.is_none())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many role memberships (limit {})",
+                    self.role_memberships.len()
+                )
+            })?;
+        self.role_memberships[slot] = RoleMembership {
+            role: role as u16,
+            member: member as u16,
+            grantor: grantor as u16,
+            options,
+            live: true,
+            pending: None,
+        };
+        Ok(slot)
+    }
+
+    pub fn remove_role_membership(&mut self, role_name: &str, member_name: &str) {
+        let (Some(role), Some(member)) = (self.find_role(role_name), self.find_role(member_name))
+        else {
+            return;
+        };
+        if let Some(slot) = self.find_role_membership_visible(role, member, 0) {
+            self.role_memberships[slot].live = false;
+        }
+    }
+
+    /// Whether `member` may SET ROLE to `target`, following membership edges
+    /// whose SET option is true. Fixed catalog size gives the traversal a
+    /// fixed stack and visited bitmap.
+    pub fn role_can_set(&self, member: usize, target: usize, txid: u32) -> bool {
+        self.role_reaches(member, target, txid, true)
+    }
+
+    pub fn role_is_member_of(&self, member: usize, target: usize, txid: u32) -> bool {
+        self.role_reaches(member, target, txid, false)
+    }
+
+    fn role_reaches(&self, member: usize, target: usize, txid: u32, require_set: bool) -> bool {
+        if member == target {
+            return true;
+        }
+        let mut visited = [false; MAX_ROLES];
+        let mut stack = [0u16; MAX_ROLES];
+        let mut count = 1usize;
+        stack[0] = member as u16;
+        visited[member] = true;
+        while count > 0 {
+            count -= 1;
+            let current = stack[count] as usize;
+            for membership in self.role_memberships.iter() {
+                if !membership.visible_to(txid)
+                    || membership.member as usize != current
+                    || (require_set && !membership.options_to(txid).set)
+                {
+                    continue;
+                }
+                let next = membership.role as usize;
+                if next == target {
+                    return true;
+                }
+                if !visited[next] {
+                    visited[next] = true;
+                    stack[count] = next as u16;
+                    count += 1;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn role_can_admin(&self, member: usize, target: usize, txid: u32) -> bool {
+        self.role_memberships.iter().any(|membership| {
+            membership.visible_to(txid)
+                && membership.role as usize == target
+                && membership.options_to(txid).admin
+                && self.role_is_member_of(member, membership.member as usize, txid)
+        })
+    }
+
+    pub fn role_has_membership_dependents(&self, role: usize, txid: u32) -> bool {
+        self.role_memberships.iter().any(|membership| {
+            membership.visible_to(txid)
+                && (membership.role as usize == role || membership.member as usize == role)
+        })
     }
 
     /// Committed schemas with their slot indices, for checkpoint and catalog
@@ -2750,6 +4281,19 @@ impl Storage {
 
     /// Transactional create: the schema exists only for `txid` until commit.
     pub fn create_schema_in(&mut self, name: SqlName, txid: u32) -> Result<usize, SqlError> {
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let attributes = self.role(role).attributes_to(txid);
+        if !attributes.superuser && !attributes.create_database {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for database pos3ql"
+            ));
+        }
         if self.find_schema_visible(name.as_str(), txid).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_SCHEMA,
@@ -2796,8 +4340,14 @@ impl Storage {
                 self.schemas.len()
             ));
         };
+        let ownership = self.initial_ownership(pending.map_or(0, |pending| pending.txid));
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Schema,
+            slot: slot as u16,
+        });
         self.schemas[slot] = SchemaDef {
             name,
+            ownership,
             live: pending.is_none(),
             pending,
         };
@@ -5526,10 +7076,16 @@ impl Storage {
         self.release_enforcers(slot);
         self.clear_pending_table_defs(slot);
         self.clear_pending_table_statistics(slot);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Table,
+            slot: slot as u16,
+        });
+        let ownership = self.initial_ownership(pending.map_or(0, |pending| pending.txid));
         self.catalog_seq += 1;
         let stamp = self.catalog_seq;
         let table = &mut self.tables[slot];
         table.def = def;
+        table.ownership = ownership;
         table.created_at = stamp;
         table.rows.clear();
         table.live = pending.is_none();
@@ -5646,10 +7202,78 @@ impl Storage {
         Ok(slot)
     }
 
+    /// Starts replaying ALTER TABLE's two-record in-place rewrite.
+    pub fn begin_replay_table_rewrite(
+        &mut self,
+        previous_schema: &str,
+        previous_name: &str,
+        column_mapping: [u16; MAX_COLUMNS],
+    ) -> Result<(), SqlError> {
+        if self.replay_table_rewrite.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "corrupt journal contains nested table rewrite markers"
+            ));
+        }
+        let Some(index) = self.find_table(previous_schema, previous_name) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "journal rewrites unknown table \"{}\"",
+                previous_name
+            ));
+        };
+        self.replay_table_rewrite = Some(ReplayTableRewrite {
+            table: index,
+            column_mapping,
+        });
+        Ok(())
+    }
+
+    /// Completes a pending ALTER TABLE replay when its final definition arrives.
+    /// Returns false when the definition is an ordinary CREATE TABLE.
+    pub fn complete_replay_table_rewrite(&mut self, mut def: TableDef) -> Result<bool, SqlError> {
+        let Some(rewrite) = self.replay_table_rewrite.take() else {
+            return Ok(false);
+        };
+        self.bind_user_type_columns(&mut def)?;
+        let mut column_mapping = [None; MAX_COLUMNS];
+        for (old_column, &target_column) in rewrite.column_mapping.iter().enumerate() {
+            if target_column == u16::MAX {
+                continue;
+            }
+            let Some(target) = def.columns().get(target_column as usize) else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt journal maps table column {} past the rewritten definition",
+                    target_column
+                ));
+            };
+            column_mapping[old_column] = Some(target.name);
+        }
+        let index = rewrite.table;
+        self.set_table_def(index, def, &column_mapping);
+        self.tables[index].rows.clear();
+        self.tables[index].statistics = TableStatistics::EMPTY;
+        self.tables[index].statistics_wal_dirty = false;
+        self.set_spill_list(index, &[]);
+        Ok(true)
+    }
+
+    pub fn ensure_no_pending_replay_table_rewrite(&self) -> Result<(), SqlError> {
+        if self.replay_table_rewrite.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "corrupt journal ends during a table rewrite"
+            ));
+        }
+        Ok(())
+    }
+
     /// Transactional create: the table exists only for `txid` until commit.
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
     pub fn create_table_in(&mut self, def: TableDef, txid: u32) -> Result<usize, SqlError> {
+        self.require_schema_create(def.schema.as_str(), txid)?;
         if self
             .find_visible(def.schema.as_str(), def.name.as_str(), txid)
             .is_some()
@@ -5850,6 +7474,7 @@ impl Storage {
         populated: bool,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
             (m.schema.as_str() == schema.as_str() && m.name.as_str() == name.as_str())
                 .then_some(m.pending?)
@@ -5869,6 +7494,11 @@ impl Storage {
                 self.matviews.len()
             ));
         };
+        let ownership = self.initial_ownership(txid);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::MaterializedView,
+            slot: new as u16,
+        });
         self.catalog_seq += 1;
         self.matviews[new] = MatviewDef {
             created_at: self.catalog_seq,
@@ -5876,6 +7506,7 @@ impl Storage {
             name,
             sql: query.sql,
             creation_path: query.creation_path,
+            ownership,
             populated,
             live: false,
             pending: Some(PendingDdl {
@@ -6044,6 +7675,7 @@ impl Storage {
         generator_for: Option<SequenceOwner>,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
             (s.schema.as_str() == schema.as_str() && s.name.as_str() == name.as_str())
                 .then_some(s.pending?)
@@ -6063,11 +7695,17 @@ impl Storage {
                 self.sequences.len()
             ));
         };
+        let ownership = self.initial_ownership(txid);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Sequence,
+            slot: new as u16,
+        });
         self.catalog_seq += 1;
         self.sequences[new] = SequenceDef {
             created_at: self.catalog_seq,
             schema,
             name,
+            ownership,
             data_type: spec.data_type,
             increment: spec.increment,
             min_value: spec.min_value,
@@ -6316,6 +7954,7 @@ impl Storage {
         spec: DomainSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|d| {
             (d.schema.as_str() == schema.as_str() && d.name.as_str() == name.as_str())
                 .then_some(d.pending?)
@@ -6340,10 +7979,16 @@ impl Storage {
             txid,
             creating: true,
         });
+        let ownership = self.initial_ownership(txid);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Domain,
+            slot: new as u16,
+        });
         self.domains[new] = DomainDef {
             created_at: self.catalog_seq,
             schema,
             name,
+            ownership,
             base_domain: spec.base_domain,
             base_domain_schema: spec.base_domain_schema,
             base: spec.base,
@@ -6585,6 +8230,7 @@ impl Storage {
         spec: EnumSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.enums.iter().find_map(|e| {
             (e.schema.as_str() == schema.as_str() && e.name.as_str() == name.as_str())
                 .then_some(e.pending?)
@@ -6609,10 +8255,16 @@ impl Storage {
             txid,
             creating: true,
         });
+        let ownership = self.initial_ownership(txid);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Enum,
+            slot: new as u16,
+        });
         self.enums[new] = EnumDef {
             created_at: self.catalog_seq,
             schema,
             name,
+            ownership,
             members: spec.members,
             n_members: spec.n_members,
             live: txid == 0,
@@ -6762,6 +8414,7 @@ impl Storage {
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<usize>), SqlError> {
+        self.require_schema_create(schema.as_str(), txid)?;
         if self.find_table(schema.as_str(), name.as_str()).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
@@ -6803,6 +8456,11 @@ impl Storage {
         if let Some(old) = existing {
             self.pending_drop_view(old, txid);
         }
+        let ownership = self.initial_ownership(txid);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::View,
+            slot: new as u16,
+        });
         self.catalog_seq += 1;
         self.views[new] = ViewDef {
             created_at: self.catalog_seq,
@@ -6810,6 +8468,7 @@ impl Storage {
             name,
             sql: query.sql,
             creation_path: query.creation_path,
+            ownership,
             live: false,
             pending: Some(PendingDdl {
                 txid,
@@ -6929,6 +8588,7 @@ impl Storage {
     /// transaction; returns its slot. Errors on a duplicate visible name or
     /// another transaction's uncommitted DDL on the name.
     pub fn create_index(&mut self, def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+        self.require_schema_create(def.schema.as_str(), txid)?;
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
             (index.schema.as_str() == def.schema.as_str()
                 && index.name.as_str() == def.name.as_str())
@@ -6956,7 +8616,13 @@ impl Storage {
                 self.indexes.len()
             ));
         };
+        let ownership = self.initial_ownership(txid);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Index,
+            slot: i as u16,
+        });
         self.indexes[i] = IndexDef {
+            ownership,
             live: false,
             pending: Some(PendingDdl {
                 txid,
@@ -7134,6 +8800,13 @@ impl Storage {
         self.indexes.iter().filter(|x| x.live)
     }
 
+    pub(crate) fn live_indexes_with_slots(&self) -> impl Iterator<Item = (usize, &IndexDef)> {
+        self.indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| index.live)
+    }
+
     /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
     /// and its indexes change schema, and every inbound foreign key follows —
     /// deterministically, so WAL replay reproduces it from the names alone.
@@ -7273,6 +8946,24 @@ impl Storage {
                 true,
             );
         }
+        for index_def in self.indexes.iter_mut() {
+            if !index_def.live || index_def.schema != old.schema || index_def.table != old.name {
+                continue;
+            }
+            for column in &mut index_def.columns[..index_def.n_cols] {
+                let Some(target_name) = column_mapping
+                    .get(*column as usize)
+                    .and_then(|target| *target)
+                else {
+                    continue;
+                };
+                if let Some(target_column) = def.column_index(target_name.as_str()) {
+                    *column = target_column as u16;
+                }
+            }
+            index_def.schema = def.schema;
+            index_def.table = def.name;
+        }
         self.tables[index].def = def;
         self.tables[index].mark_dirty();
     }
@@ -7374,9 +9065,7 @@ impl Storage {
                     continue;
                 }
                 for right_index in 0..8 {
-                    if right & (1 << right_index) != 0
-                        && mode_conflicts(left_index, right_index)
-                    {
+                    if right & (1 << right_index) != 0 && mode_conflicts(left_index, right_index) {
                         return true;
                     }
                 }
@@ -7475,9 +9164,7 @@ impl Storage {
                     "could not obtain lock on relation"
                 ));
             }
-            self.row_locks
-                .borrow_mut()
-                .wait_for(txid, blocker.owner)?;
+            self.row_locks.borrow_mut().wait_for(txid, blocker.owner)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for a relation lock"
@@ -7490,17 +9177,19 @@ impl Storage {
         }
         let mut modes = [0; 8];
         modes[mode as usize] = sequence;
-        table_locks.push(TableLock {
-            owner: txid,
-            table: table as u32,
-            modes,
-        }).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table-lock registry is full ({} locks)",
-                table_locks.capacity()
-            )
-        })
+        table_locks
+            .push(TableLock {
+                owner: txid,
+                table: table as u32,
+                modes,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table-lock registry is full ({} locks)",
+                    table_locks.capacity()
+                )
+            })
     }
 
     fn next_lock_sequence(&self) -> u64 {
@@ -7643,11 +9332,7 @@ impl Storage {
             .find(|owner| *owner != txid)
     }
 
-    pub(crate) fn wait_for_transaction(
-        &self,
-        waiter: u32,
-        blocker: u32,
-    ) -> Result<(), SqlError> {
+    pub(crate) fn wait_for_transaction(&self, waiter: u32, blocker: u32) -> Result<(), SqlError> {
         self.row_locks.borrow_mut().wait_for(waiter, blocker)
     }
 
@@ -7818,6 +9503,42 @@ mod tests {
             .create_table(make_def("overflow", &[("a", ColType::Bool, false)]))
             .unwrap_err();
         assert_eq!(err.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    }
+
+    #[test]
+    fn replay_table_rewrite_marker_must_be_paired_exactly_once() {
+        let config = test_config();
+        let mut budget = Budget::new(1 << 22);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage
+            .create_table(make_def("t", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let mut column_mapping = [u16::MAX; MAX_COLUMNS];
+        column_mapping[0] = 0;
+
+        storage
+            .begin_replay_table_rewrite("public", "t", column_mapping)
+            .unwrap();
+        assert_eq!(
+            storage
+                .begin_replay_table_rewrite("public", "t", column_mapping)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_ERROR
+        );
+        assert_eq!(
+            storage
+                .ensure_no_pending_replay_table_rewrite()
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_ERROR
+        );
+        assert!(
+            storage
+                .complete_replay_table_rewrite(make_def("t", &[("id", ColType::Int4, true)]))
+                .unwrap()
+        );
+        storage.ensure_no_pending_replay_table_rewrite().unwrap();
     }
 
     #[test]

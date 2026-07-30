@@ -24,7 +24,6 @@ use super::{
 /// Upper bound on distinct USING/NATURAL-merged columns across a join tree
 /// (chained merges of the same name allocate a fresh entry per join).
 pub const MAX_MERGED_COLUMNS: usize = 32;
-const MAX_OUTPUT_COLUMNS: usize = MAX_JOIN_TABLES * MAX_COLUMNS;
 
 /// A `USING`/NATURAL join output column: the merged sides in join order. Its
 /// value is the first non-null contributor (PostgreSQL's join output
@@ -51,38 +50,38 @@ pub enum ResolvedColumn {
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
-    pub names: [&'d str; MAX_JOIN_TABLES],
-    pub defs: [Option<&'d TableDef>; MAX_JOIN_TABLES],
-    pub slots: [usize; MAX_JOIN_TABLES],
+    pub names: &'d mut [&'d str],
+    pub defs: &'d mut [Option<&'d TableDef>],
+    pub slots: &'d mut [usize],
     /// Derived tables (`FROM (SELECT ...) alias`): the materialized rows,
     /// self-describing-encoded. `None` marks a physical table (scanned from
     /// storage by `slots`).
-    pub derived: [Option<&'d [&'d [u8]]>; MAX_JOIN_TABLES],
+    pub derived: &'d mut [Option<&'d [&'d [u8]]>],
     /// A `LATERAL` FROM item: its rows depend on the outer row, so they are
     /// **not** pre-materialized (`derived` holds an empty placeholder). The
     /// scan re-runs the item's body per outer row, resolving its outer column
     /// references against the tables to its left.
-    pub lateral: [bool; MAX_JOIN_TABLES],
+    pub lateral: &'d mut [bool],
     /// Marks a set-returning-function scan (`FROM func(args)`), whose output row
     /// type is its single scalar column — so a whole-row reference to the table
     /// alias yields that scalar, not a one-field record (which is how a
     /// subquery- or storage-derived table's whole-row reference behaves).
-    pub func_scalar: [bool; MAX_JOIN_TABLES],
+    pub func_scalar: &'d mut [bool],
     pub n: usize,
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
-    pub merged: [MergedColumn<'d>; MAX_MERGED_COLUMNS],
+    pub merged: &'d mut [MergedColumn<'d>],
     pub n_merged: usize,
     /// The join tree's output columns in PostgreSQL's order — each
     /// USING/NATURAL join hoists its merged columns to the front and hides
     /// the per-side copies. `n_output == 0` means no merges anywhere: the
     /// output is every table's columns in scope order (the common case, kept
     /// implicit).
-    output: [ResolvedColumn; MAX_OUTPUT_COLUMNS],
+    output: &'d mut [ResolvedColumn],
     n_output: usize,
     /// Synthesized USING/NATURAL equality predicates, indexed like
     /// `FromClause::joins` (whose `on` is None for such joins). Filled only
     /// on the executor path (predicate synthesis needs an arena).
-    pub join_on: [Option<&'d Expr<'d>>; MAX_JOIN_TABLES - 1],
+    pub join_on: &'d mut [Option<&'d Expr<'d>>],
 }
 
 /// Type-only lookup over FROM items already registered in a scope. Table
@@ -118,26 +117,74 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 }
 
 impl<'d> QueryScope<'d> {
-    fn empty() -> Self {
-        QueryScope {
-            names: [""; MAX_JOIN_TABLES],
-            defs: [None; MAX_JOIN_TABLES],
-            slots: [0; MAX_JOIN_TABLES],
-            derived: [None; MAX_JOIN_TABLES],
-            lateral: [false; MAX_JOIN_TABLES],
-            func_scalar: [false; MAX_JOIN_TABLES],
-            n: 0,
-            merged: [MergedColumn {
+    fn empty(arena: &'d Arena, from: &FromClause<'d>) -> Result<Self, SqlError> {
+        let table_count = from.joins.len() + 1;
+        let merged_capacity = from
+            .joins
+            .iter()
+            .map(|join| {
+                if join.natural {
+                    MAX_USING_COLUMNS
+                } else {
+                    join.using_columns.map_or(0, <[&str]>::len)
+                }
+            })
+            .sum::<usize>()
+            .min(MAX_MERGED_COLUMNS);
+        let has_merges = merged_capacity != 0;
+        let names = arena
+            .alloc_slice_with(table_count, |_| "")
+            .map_err(|_| arena_full())?;
+        let defs = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
+        let slots = arena
+            .alloc_slice_with(table_count, |_| 0)
+            .map_err(|_| arena_full())?;
+        let derived = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
+        let lateral = arena
+            .alloc_slice_with(table_count, |_| false)
+            .map_err(|_| arena_full())?;
+        let func_scalar = arena
+            .alloc_slice_with(table_count, |_| false)
+            .map_err(|_| arena_full())?;
+        let merged = arena
+            .alloc_slice_with(merged_capacity.max(1), |_| MergedColumn {
                 name: "",
                 parts: [(0, 0); MAX_JOIN_TABLES],
                 n_parts: 0,
                 ctype: ColType::Bool,
-            }; MAX_MERGED_COLUMNS],
+            })
+            .map_err(|_| arena_full())?;
+        let output = arena
+            .alloc_slice_with(
+                if has_merges {
+                    table_count * MAX_COLUMNS
+                } else {
+                    1
+                },
+                |_| ResolvedColumn::Table(0, 0),
+            )
+            .map_err(|_| arena_full())?;
+        let join_on = arena
+            .alloc_slice_with(from.joins.len().max(1), |_| None)
+            .map_err(|_| arena_full())?;
+        Ok(QueryScope {
+            names,
+            defs,
+            slots,
+            derived,
+            lateral,
+            func_scalar,
+            n: 0,
+            merged,
             n_merged: 0,
-            output: [ResolvedColumn::Table(0, 0); MAX_OUTPUT_COLUMNS],
+            output,
             n_output: 0,
-            join_on: [None; MAX_JOIN_TABLES - 1],
-        }
+            join_on,
+        })
     }
 
     /// Like `resolve`, but materializes any derived table (`FROM (SELECT ...)`)
@@ -164,12 +211,12 @@ impl<'d> QueryScope<'d> {
         params: &[Datum<'a>],
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
-        let mut scope = QueryScope::empty();
+        let mut scope = QueryScope::empty(arena, from)?;
         scope.add_exec(storage, &from.base, txid, arena, params, outer)?;
         for j in from.joins {
             scope.add_exec(storage, &j.table, txid, arena, params, outer)?;
         }
-        scope.build_merges(from, Some(arena))?;
+        scope.build_merges(from, arena, Some(arena))?;
         Ok(scope)
     }
 
@@ -344,12 +391,12 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
     ) -> Result<QueryScope<'a>, SqlError> {
-        let mut scope = QueryScope::empty();
+        let mut scope = QueryScope::empty(arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena)?;
         for j in from.joins {
             scope.add_schema(storage, &j.table, txid, arena)?;
         }
-        scope.build_merges(from, None)?;
+        scope.build_merges(from, arena, None)?;
         Ok(scope)
     }
 
@@ -586,7 +633,8 @@ impl<'d> QueryScope<'d> {
     fn build_merges(
         &mut self,
         from: &FromClause<'d>,
-        arena: Option<&'d Arena>,
+        scratch_arena: &'d Arena,
+        expression_arena: Option<&'d Arena>,
     ) -> Result<(), SqlError> {
         if !from
             .joins
@@ -596,7 +644,9 @@ impl<'d> QueryScope<'d> {
             return Ok(());
         }
         // The left join tree's output columns, updated join by join.
-        let mut out = [ResolvedColumn::Table(0, 0); MAX_OUTPUT_COLUMNS];
+        let out = scratch_arena
+            .alloc_slice_with(self.output.len(), |_| ResolvedColumn::Table(0, 0))
+            .map_err(|_| arena_full())?;
         let mut n_out = 0usize;
         for c in 0..self.defs[0].expect("resolved").n_columns {
             out[n_out] = ResolvedColumn::Table(0, c);
@@ -711,7 +761,7 @@ impl<'d> QueryScope<'d> {
                 // prepended to the output below, after all names resolve.
                 out.copy_within(left_k + 1..n_out, left_k);
                 n_out -= 1;
-                if let Some(arena) = arena {
+                if let Some(arena) = expression_arena {
                     let left_ref = self.output_expression(left, arena)?;
                     let right_ref = arena
                         .alloc(Expr::Column {

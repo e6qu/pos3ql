@@ -18,11 +18,12 @@ use crate::sql_err;
 use crate::storage::{MAX_COLUMNS, Storage, rowenc};
 
 use super::plan::{
-    MAX_CONJUNCTS, conjunct_passes, expr_tables, flatten_and, fold_null, is_error_safe,
+    MAX_CONJUNCTS, conjunct_passes, expr_tables, fill_join_order, flatten_and, fold_null,
+    is_error_safe,
 };
 use super::{
-    MAX_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, join_order,
-    reorder_qual, simplify_qual, where_passes,
+    MAX_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, reorder_qual,
+    simplify_qual, where_passes,
 };
 
 struct NoColumns;
@@ -491,10 +492,10 @@ pub(crate) fn scan_source<'a>(
     // are heap-encoded (fixed schema); derived rows are self-describing.
     fn assemble<'s, 'v, 'd>(
         scope: &'s QueryScope<'d>,
-        bound: &[Option<&'v [u8]>; MAX_JOIN_TABLES],
-        order: &[usize; MAX_JOIN_TABLES],
+        bound: &[Option<&'v [u8]>],
+        order: &[usize],
         count: usize,
-        buffers: &'s mut [[Datum<'v>; MAX_COLUMNS]; MAX_JOIN_TABLES],
+        buffers: &'s mut [[Datum<'v>; MAX_COLUMNS]],
         arena: &'v Arena,
     ) -> Result<JoinRow<'s, 'v, 'd>, SqlError> {
         let mut values: [Option<&[Datum]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
@@ -528,7 +529,49 @@ pub(crate) fn scan_source<'a>(
         Ok(JoinRow { scope, values })
     }
 
-    // Per-level decode buffers live on this stack frame.
+    #[allow(clippy::too_many_arguments)]
+    fn candidate_passes<'a>(
+        scope: &QueryScope<'a>,
+        bound: &[Option<&'a [u8]>],
+        order: &[usize],
+        count: usize,
+        on: Option<&Expr<'a>>,
+        pushdown: &[&Expr<'a>],
+        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        hooks: &EvalHooks<'_, 'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+    ) -> Result<bool, SqlError> {
+        if let Some(on) = on {
+            let row = assemble(scope, bound, order, count, decode_buffers, arena)?;
+            let chained_row = Chained { inner: &row, outer };
+            match eval_full(on, arena, params, &chained_row, hooks)? {
+                Datum::Bool(true) => {}
+                Datum::Bool(false) | Datum::Null => return Ok(false),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "argument of JOIN/ON must be type boolean"
+                    ));
+                }
+            }
+        }
+        if pushdown.is_empty() {
+            return Ok(true);
+        }
+        let row = assemble(scope, bound, order, count, decode_buffers, arena)?;
+        let chained_row = Chained { inner: &row, outer };
+        for &conjunct in pushdown {
+            if !conjunct_passes(conjunct, arena, params, &chained_row, hooks)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    // Recursive join state is small; product-sized decode scratch is owned by
+    // the statement arena and passed through each level.
     #[allow(clippy::too_many_arguments)]
     fn level<'a>(
         storage: &'a Storage,
@@ -541,21 +584,21 @@ pub(crate) fn scan_source<'a>(
         hooks: &EvalHooks<'_, 'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
         depth: usize,
-        bound: &mut [Option<&'a [u8]>; MAX_JOIN_TABLES],
+        bound: &mut [Option<&'a [u8]>],
         // For each RIGHT/FULL join level, one flag per scanned row of that
         // level's table, marking those that found a left partner.
-        matched: &[Option<&[core::cell::Cell<bool>]>; MAX_JOIN_TABLES],
+        matched: &[Option<&[core::cell::Cell<bool>]>],
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
         pushdown: &[&[&'a Expr<'a>]],
         // Execution order: `order[depth]` is the scope-table joined at this depth
         // (identity unless a cross join was cost-reordered).
-        order: &[usize; MAX_JOIN_TABLES],
+        order: &[usize],
         indexed: Option<&IndexedCandidates<'a>>,
+        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
-            let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-            let row = assemble(scope, bound, order, depth, &mut buffers, arena)?;
+            let row = assemble(scope, bound, order, depth, decode_buffers, arena)?;
             if let Some(w) = where_clause {
                 let chained_row = Chained { inner: &row, outer };
                 if !where_passes(w, arena, params, &chained_row, hooks)? {
@@ -570,49 +613,9 @@ pub(crate) fn scan_source<'a>(
         } else {
             Some(&from.joins[depth - 1])
         };
+        // USING/NATURAL predicates are synthesized at plan time.
+        let on = join.and_then(|join| join.on.or(scope.join_on[depth - 1]));
         let mut matched_any = false;
-        // Bind one candidate row for this level, run the ON condition, then
-        // recurse. `on_matches` returns false to skip the row.
-        let on_matches =
-            |bound: &mut [Option<&'a [u8]>; MAX_JOIN_TABLES]| -> Result<bool, SqlError> {
-                if let Some(join) = join
-                // USING/NATURAL predicates are synthesized at plan time.
-                && let Some(on) = join.on.or(scope.join_on[depth - 1])
-                {
-                    let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-                    let row = assemble(scope, bound, order, depth + 1, &mut buffers, arena)?;
-                    let chained_row = Chained { inner: &row, outer };
-                    return match eval_full(on, arena, params, &chained_row, hooks)? {
-                        Datum::Bool(true) => Ok(true),
-                        Datum::Bool(false) | Datum::Null => Ok(false),
-                        _ => Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "argument of JOIN/ON must be type boolean"
-                        )),
-                    };
-                }
-                Ok(true)
-            };
-        // Predicate pushdown: skip a partial row that already fails an error-safe
-        // WHERE conjunct fully bound at this depth.
-        let passes_pushdown =
-            |bound: &[Option<&'a [u8]>; MAX_JOIN_TABLES]| -> Result<bool, SqlError> {
-                if pushdown[depth].is_empty() {
-                    return Ok(true);
-                }
-                let mut pbuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-                let prow = assemble(scope, bound, order, depth + 1, &mut pbuf, arena)?;
-                let pcr = Chained {
-                    inner: &prow,
-                    outer,
-                };
-                for &c in pushdown[depth] {
-                    if !conjunct_passes(c, arena, params, &pcr, hooks)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            };
         // A LATERAL FROM item is re-run per outer row: assemble the row bound by
         // the tables to its left, resolve the item's body against it, and iterate
         // the resulting rows like a derived table's.
@@ -623,8 +626,7 @@ pub(crate) fn scan_source<'a>(
             } else {
                 &from.joins[t - 1].table
             };
-            let mut obuf = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-            let outer_row = assemble(scope, bound, order, depth, &mut obuf, arena)?;
+            let outer_row = assemble(scope, bound, order, depth, decode_buffers, arena)?;
             let chained = Chained {
                 inner: &outer_row,
                 outer,
@@ -633,7 +635,19 @@ pub(crate) fn scan_source<'a>(
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
                 bound[order[depth]] = Some(bytes);
-                if !on_matches(bound)? || !passes_pushdown(bound)? {
+                if !candidate_passes(
+                    scope,
+                    bound,
+                    order,
+                    depth + 1,
+                    on,
+                    pushdown[depth],
+                    decode_buffers,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                )? {
                     continue;
                 }
                 matched_any = true;
@@ -656,6 +670,7 @@ pub(crate) fn scan_source<'a>(
                     pushdown,
                     order,
                     indexed,
+                    decode_buffers,
                     f,
                 )? {
                     return Ok(false);
@@ -665,7 +680,19 @@ pub(crate) fn scan_source<'a>(
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
                 bound[order[depth]] = Some(bytes);
-                if !on_matches(bound)? || !passes_pushdown(bound)? {
+                if !candidate_passes(
+                    scope,
+                    bound,
+                    order,
+                    depth + 1,
+                    on,
+                    pushdown[depth],
+                    decode_buffers,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                )? {
                     continue;
                 }
                 matched_any = true;
@@ -688,6 +715,7 @@ pub(crate) fn scan_source<'a>(
                     pushdown,
                     order,
                     indexed,
+                    decode_buffers,
                     f,
                 )? {
                     return Ok(false);
@@ -748,7 +776,19 @@ pub(crate) fn scan_source<'a>(
                 check_timeout()?;
                 bound[order[depth]] =
                     Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
-                if !on_matches(bound)? || !passes_pushdown(bound)? {
+                if !candidate_passes(
+                    scope,
+                    bound,
+                    order,
+                    depth + 1,
+                    on,
+                    pushdown[depth],
+                    decode_buffers,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                )? {
                     continue;
                 }
                 matched_any = true;
@@ -771,6 +811,7 @@ pub(crate) fn scan_source<'a>(
                     pushdown,
                     order,
                     indexed,
+                    decode_buffers,
                     f,
                 )? {
                     return Ok(false);
@@ -789,7 +830,19 @@ pub(crate) fn scan_source<'a>(
                 bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
                 let this = index;
                 index += 1;
-                if !on_matches(bound)? || !passes_pushdown(bound)? {
+                if !candidate_passes(
+                    scope,
+                    bound,
+                    order,
+                    depth + 1,
+                    on,
+                    pushdown[depth],
+                    decode_buffers,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                )? {
                     return Ok(ControlFlow::Continue(()));
                 }
                 matched_any = true;
@@ -812,6 +865,7 @@ pub(crate) fn scan_source<'a>(
                     pushdown,
                     order,
                     indexed,
+                    decode_buffers,
                     f,
                 )? {
                     aborted = true;
@@ -843,6 +897,7 @@ pub(crate) fn scan_source<'a>(
                 pushdown,
                 order,
                 indexed,
+                decode_buffers,
                 f,
             )? {
                 return Ok(false);
@@ -857,7 +912,9 @@ pub(crate) fn scan_source<'a>(
     // row null-pads the tables to its left and still joins the tables to its
     // right (post-passes below, shallowest level first — so a deeper level's
     // flags also accumulate matches found during a shallower post-pass).
-    let mut matched: [Option<&[core::cell::Cell<bool>]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
+    let matched = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
     for (i, j) in from.joins.iter().enumerate() {
         if !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             continue;
@@ -904,18 +961,24 @@ pub(crate) fn scan_source<'a>(
         }
     }
     let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
-    let order: [usize; MAX_JOIN_TABLES] = if all_cross && !any_lateral {
-        join_order(storage, scope, where_clause)
-    } else {
-        core::array::from_fn(|i| i)
-    };
-    let mut inv_order = [0usize; MAX_JOIN_TABLES];
+    let order = arena
+        .alloc_slice_with(scope.n, |index| index)
+        .map_err(|_| arena_full())?;
+    if all_cross && !any_lateral {
+        fill_join_order(storage, scope, where_clause, order);
+    }
+    let inv_order = arena
+        .alloc_slice_with(scope.n, |_| 0usize)
+        .map_err(|_| arena_full())?;
     for (pos, &t) in order.iter().enumerate() {
         inv_order[t] = pos;
     }
-    let mut pushdown_buffers: [[&Expr; MAX_CONJUNCTS]; MAX_JOIN_TABLES] =
-        [[&Expr::Null; MAX_CONJUNCTS]; MAX_JOIN_TABLES];
-    let mut pd_n = [0usize; MAX_JOIN_TABLES];
+    let pushdown_buffers = arena
+        .alloc_slice_with(scope.n, |_| [&Expr::Null; MAX_CONJUNCTS])
+        .map_err(|_| arena_full())?;
+    let pushdown_counts = arena
+        .alloc_slice_with(scope.n, |_| 0usize)
+        .map_err(|_| arena_full())?;
     if all_inner
         && scope.n >= 2
         && let Some(w) = where_clause
@@ -939,18 +1002,26 @@ pub(crate) fn scan_source<'a>(
                     .map(|t| inv_order[t])
                     .max()
                     .unwrap_or(0);
-                if d < scope.n && pd_n[d] < MAX_CONJUNCTS {
-                    pushdown_buffers[d][pd_n[d]] = c;
-                    pd_n[d] += 1;
+                if d < scope.n && pushdown_counts[d] < MAX_CONJUNCTS {
+                    pushdown_buffers[d][pushdown_counts[d]] = c;
+                    pushdown_counts[d] += 1;
                 }
             }
         }
     }
-    let pushdown: [&[&Expr]; MAX_JOIN_TABLES] =
-        core::array::from_fn(|d| &pushdown_buffers[d][..pd_n[d]]);
+    let pushdown = arena
+        .alloc_slice_with(scope.n, |depth| {
+            &pushdown_buffers[depth][..pushdown_counts[depth]]
+        })
+        .map_err(|_| arena_full())?;
 
     let indexed = indexed_candidates(storage, scope, where_clause, arena, params, hooks)?;
-    let mut bound = [None; MAX_JOIN_TABLES];
+    let bound = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
+    let decode_buffers = arena
+        .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
+        .map_err(|_| arena_full())?;
     level(
         storage,
         scope,
@@ -962,11 +1033,12 @@ pub(crate) fn scan_source<'a>(
         hooks,
         outer,
         0,
-        &mut bound,
-        &matched,
-        &pushdown,
-        &order,
+        bound,
+        matched,
+        pushdown,
+        order,
         indexed.as_ref(),
+        decode_buffers,
         f,
     )?;
 
@@ -976,15 +1048,14 @@ pub(crate) fn scan_source<'a>(
     // levels' flags before those levels' post-passes run).
     for d in 1..scope.n {
         let Some(m) = matched[d] else { continue };
-        let emit_unmatched = |bytes: &'a [u8],
+        let mut emit_unmatched = |bytes: &'a [u8],
                               f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
          -> Result<bool, SqlError> {
-            let mut b = [None; MAX_JOIN_TABLES];
-            b[d] = Some(bytes);
+            bound.fill(None);
+            bound[d] = Some(bytes);
             if d + 1 == scope.n {
                 // Last level: the row is complete once the left side nulls.
-                let mut buffers = [[Datum::Null; MAX_COLUMNS]; MAX_JOIN_TABLES];
-                let row = assemble(scope, &b, &order, scope.n, &mut buffers, arena)?;
+                let row = assemble(scope, bound, order, scope.n, decode_buffers, arena)?;
                 if let Some(w) = where_clause {
                     let chained_row = Chained { inner: &row, outer };
                     if !where_passes(w, arena, params, &chained_row, hooks)? {
@@ -1004,11 +1075,12 @@ pub(crate) fn scan_source<'a>(
                 hooks,
                 outer,
                 d + 1,
-                &mut b,
-                &matched,
-                &pushdown,
-                &order,
+                bound,
+                matched,
+                pushdown,
+                order,
                 indexed.as_ref(),
+                decode_buffers,
                 f,
             )
         };

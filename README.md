@@ -226,7 +226,9 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   generation-size ceiling; historical snapshots use the full MVCC row walk.
 - **Fixed capacities.** Connections, tables, columns, prepared statements,
   transaction footprint, and every buffer are sized from config at startup;
-  exceeding any is a loud error, never silent growth.
+  exceeding any is a loud error, never silent growth. A query range table may
+  use the full 64-relation catalog envelope; its scratch is sized to the actual
+  FROM clause, so ordinary queries do not reserve that maximum.
 - **TLS is opt-in.** Object-store HTTPS is controlled by `object_store_tls`; PostgreSQL
   wire TLS is enabled with `tls_on`, `tls_cert_file`, and `tls_key_file`.
   Cleartext clients remain accepted when server TLS is configured.

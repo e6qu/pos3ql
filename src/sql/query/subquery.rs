@@ -518,7 +518,7 @@ fn subquery_node_correlated<'a>(
 /// within `chain` (which already includes this select's own scope).
 fn select_has_outer_ref<'a>(
     select: &'a Select<'a>,
-    chain: &ScopeChain,
+    chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
     arena: &'a Arena,
 ) -> bool {
@@ -566,7 +566,7 @@ fn select_has_outer_ref<'a>(
 /// subquery does.
 fn table_ref_has_outer_ref<'a>(
     table: &'a crate::sql::ast::TableRef<'a>,
-    chain: &ScopeChain,
+    chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
     arena: &'a Arena,
 ) -> bool {
@@ -596,7 +596,7 @@ fn table_ref_has_outer_ref<'a>(
 /// column they provide themselves does not count as an outer reference.
 fn expr_has_outer_ref<'a>(
     expression: &'a Expr<'a>,
-    chain: &ScopeChain,
+    chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
     arena: &'a Arena,
 ) -> bool {

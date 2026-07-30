@@ -27,6 +27,7 @@ pub struct Savepoint {
     pub name: StackStr<63>,
     pub touched_mark: usize,
     pub ddl_mark: usize,
+    pub statistics_mark: usize,
     pub wal_mark: usize,
     /// Pending-notification and pending-listen-op lengths (and the notification
     /// payload-buffer offset) at savepoint time, so ROLLBACK TO discards the
@@ -84,6 +85,10 @@ pub struct TxnState {
     touched: FixedVec<(u32, u64, PriorPending)>,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
+    /// Transaction-private ANALYZE versions, kept outside `DdlUndo`. The
+    /// images themselves live in Storage's startup-sized slab; undo needs only
+    /// the table whose latest version is popped.
+    statistics_undo: FixedVec<StatisticsUndo>,
     /// Active savepoints, innermost last.
     savepoints: FixedVec<Savepoint>,
     /// NOTIFY raised in this transaction, delivered at commit (discarded on
@@ -195,6 +200,12 @@ pub enum DdlUndo {
 /// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and
 /// transaction-versioned inbound foreign key takes one undo entry.
 pub const MAX_TXN_DDL: usize = 64;
+pub const MAX_TXN_ANALYZE: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StatisticsUndo {
+    pub(crate) table: u32,
+}
 
 impl TxnState {
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -210,6 +221,7 @@ impl TxnState {
             command_id: 1,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
             ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
+            statistics_undo: FixedVec::new(budget, "txn_statistics_undo", MAX_TXN_ANALYZE)?,
             savepoints: FixedVec::new(budget, "txn_savepoints", MAX_SAVEPOINTS)?,
             pending_notifies: FixedVec::new(
                 budget,
@@ -414,6 +426,7 @@ impl TxnState {
             },
             touched_mark: self.touched.len(),
             ddl_mark: self.ddl.len(),
+            statistics_mark: self.statistics_undo.len(),
             wal_mark,
             notify_mark: self.pending_notifies.len(),
             notify_payload_mark: self.notify_payloads.mark(),
@@ -471,6 +484,28 @@ impl TxnState {
         }
     }
 
+    pub(crate) fn record_statistics(&mut self, table: u32) -> Result<(), SqlError> {
+        self.statistics_undo
+            .push(StatisticsUndo { table })
+            .map_err(|_| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "more than {} ANALYZE targets in one transaction",
+                    MAX_TXN_ANALYZE
+                )
+            })
+    }
+
+    pub(crate) fn statistics_undo(&self) -> &[StatisticsUndo] {
+        &self.statistics_undo
+    }
+
+    pub(crate) fn rewind_statistics(&mut self, mark: usize) {
+        while self.statistics_undo.len() > mark {
+            self.statistics_undo.pop();
+        }
+    }
+
     pub fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
         self.ddl.push(undo).map_err(|_| {
             sql_err!(
@@ -495,6 +530,7 @@ impl TxnState {
         self.snapshot_taken = false;
         self.touched.clear();
         self.ddl.clear();
+        self.statistics_undo.clear();
         self.savepoints.clear();
         // Commit flushes these before clearing; rollback drops them here.
         self.pending_notifies.clear();

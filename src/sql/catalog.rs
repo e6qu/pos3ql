@@ -80,6 +80,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_trigger"
                 | "pg_event_trigger"
                 | "pg_inherits"
+                | "pg_stats"
                 | "pg_statistic_ext"
                 | "pg_publication"
                 | "pg_publication_rel"
@@ -198,6 +199,7 @@ pub fn synthesize<'a>(
         ),
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
         (false, "pg_index") => pg_index(storage, txid, arena),
+        (false, "pg_stats") => pg_stats(storage, txid, arena),
         (false, "pg_policy") => finish(
             def_of(
                 "pg_policy",
@@ -2079,6 +2081,99 @@ fn describe_view<'a>(
     super::query::describe_query_under(view.sql.as_str(), storage, 0, path, arena, out)
 }
 
+fn pg_stats<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_stats",
+        &[
+            ("schemaname", ColType::Text),
+            ("tablename", ColType::Text),
+            ("attname", ColType::Text),
+            ("inherited", ColType::Bool),
+            ("null_frac", ColType::Float4),
+            ("avg_width", ColType::Int4),
+            ("n_distinct", ColType::Float4),
+            ("most_common_vals", ColType::Text),
+            (
+                "most_common_freqs",
+                ColType::Array(super::types::ArrElem::Float4),
+            ),
+            ("histogram_bounds", ColType::Text),
+            ("correlation", ColType::Float4),
+            ("most_common_elems", ColType::Text),
+            (
+                "most_common_elem_freqs",
+                ColType::Array(super::types::ArrElem::Float4),
+            ),
+            (
+                "elem_count_histogram",
+                ColType::Array(super::types::ArrElem::Float4),
+            ),
+            ("range_length_histogram", ColType::Text),
+            ("range_empty_frac", ColType::Float4),
+            ("range_bounds_histogram", ColType::Text),
+        ],
+    );
+    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let mut count = 0usize;
+    for slot in 0..storage.table_count() {
+        let table = storage.table(slot);
+        if !table.visible_to(txid) {
+            continue;
+        }
+        let statistics = storage.table_statistics(slot, txid);
+        if !statistics.valid {
+            continue;
+        }
+        let table_definition = storage.table_def(slot, txid);
+        for (column, metadata) in table_definition.columns().iter().enumerate() {
+            let column_statistics = statistics.columns[column];
+            if !column_statistics.valid {
+                continue;
+            }
+            if count == rows.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pg_stats exceeds {} rows",
+                    rows.len()
+                ));
+            }
+            let distinct = if column_statistics.distinct_fraction_ppm != 0 {
+                -(column_statistics.distinct_fraction_ppm as f32 / 1_000_000.0)
+            } else {
+                column_statistics.distinct_values as f32
+            };
+            rows[count] = row(
+                &[
+                    text(table_definition.schema.as_str(), arena)?,
+                    text(table_definition.name.as_str(), arena)?,
+                    text(metadata.name.as_str(), arena)?,
+                    Datum::Bool(false),
+                    Datum::Float4(column_statistics.null_fraction_ppm as f32 / 1_000_000.0),
+                    Datum::Int4(column_statistics.average_width.min(i32::MAX as u32) as i32),
+                    Datum::Float4(distinct),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(def, &rows[..count], arena)
+}
+
 fn pg_class<'a>(
     storage: &Storage,
     txid: u32,
@@ -2145,6 +2240,21 @@ fn pg_class<'a>(
                 .flatten()
                 .any(|foreign_key| foreign_key.confrelid == toid);
         let n_checks = table_def.n_checks as i32;
+        let statistics = storage.table_statistics(slot, txid);
+        let reltuples = if statistics.valid {
+            statistics.rows as f64
+        } else {
+            -1.0
+        };
+        let relpages = if statistics.valid {
+            statistics
+                .rows
+                .saturating_mul(u64::from(statistics.average_row_width))
+                .div_ceil(8_192)
+                .min(i32::MAX as u64) as i32
+        } else {
+            0
+        };
         // A table that has a matching matview catalog entry is a materialized
         // view (relkind 'm'), not an ordinary table ('r').
         let relkind = if storage
@@ -2162,8 +2272,8 @@ fn pg_class<'a>(
                 Datum::Int4(namespace_oid(storage, table_def.schema.as_str())),
                 text(relkind, arena)?, // relkind: ordinary table 'r' / matview 'm'
                 Datum::Int4(table_def.n_columns as i32),
-                Datum::Float8(table.rows.len() as f64),
-                Datum::Int4(0),        // relpages
+                Datum::Float8(reltuples),
+                Datum::Int4(relpages),
                 Datum::Int4(0),        // relam
                 Datum::Int4(10),       // relowner (a role oid)
                 Datum::Int4(n_checks), // relchecks

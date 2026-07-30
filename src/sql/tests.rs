@@ -2897,11 +2897,7 @@ fn sequence_advance_in_creating_transaction_survives_restart() {
     let mut budget = Budget::new(1 << 25);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT nextval('s')"
-        )),
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT nextval('s')")),
         ["15"]
     );
     run_with(
@@ -2927,10 +2923,7 @@ fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
-    let slot = engine
-        .storage
-        .sequence_slot("public", "s", 0)
-        .unwrap();
+    let slot = engine.storage.sequence_slot("public", "s", 0).unwrap();
     assert!(!engine.storage.sequence(slot).dirty.get());
 
     let failed = run_with(&mut engine, &mut budget, "SELECT nextval('s')");
@@ -4154,7 +4147,7 @@ fn alter_table_multi_action() {
 #[test]
 fn vacuum_and_analyze() {
     let config = test_config("vacuum");
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE vt (a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO vt VALUES (1, 'x'), (2, 'y')");
@@ -4195,6 +4188,431 @@ fn vacuum_and_analyze() {
     let text =
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "BEGIN; ANALYZE vt; COMMIT")).to_string();
     assert!(!text.contains("25001") && !text.contains("ERROR"), "{text}");
+
+    let slot = e.storage.find_table("public", "vt").expect("table exists");
+    let statistics = e.storage.table_statistics(slot, 0);
+    assert!(statistics.valid);
+    assert_eq!(statistics.rows, 2);
+    assert_eq!(statistics.columns[0].distinct_values, 2);
+    assert_eq!(statistics.columns[1].distinct_values, 2);
+    assert_eq!(statistics.columns[0].null_fraction_ppm, 0);
+    assert!(statistics.average_row_width > 0);
+    let catalog = run_with(
+        &mut e,
+        &mut b,
+        "SELECT reltuples FROM pg_class WHERE relname = 'vt'; \
+         SELECT attname, null_frac, avg_width, n_distinct FROM pg_stats \
+         WHERE tablename = 'vt' ORDER BY attname",
+    );
+    let rows = data_rows(&catalog);
+    assert_eq!(rows[0], "2");
+    assert!(rows[1].starts_with("a|0|"), "{rows:?}");
+    assert!(rows[1].ends_with("|-1"), "{rows:?}");
+    assert!(rows[2].starts_with("b|0|"), "{rows:?}");
+    assert!(rows[2].ends_with("|-1"), "{rows:?}");
+
+    // PostgreSQL deliberately splits ANALYZE's transaction behavior:
+    // pg_class relation estimates are updated in place, while pg_statistic
+    // column rows roll back. Savepoints obey the same split.
+    let transaction_statistics = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "BEGIN; \
+         INSERT INTO vt VALUES (NULL, 'rolled back'); \
+         ANALYZE vt; \
+         SELECT c.reltuples, s.null_frac FROM pg_class c JOIN pg_stats s \
+           ON s.tablename = c.relname AND s.attname = 'a' WHERE c.relname = 'vt'; \
+         ROLLBACK; \
+         SELECT c.reltuples, s.null_frac FROM pg_class c JOIN pg_stats s \
+           ON s.tablename = c.relname AND s.attname = 'a' WHERE c.relname = 'vt'",
+    ));
+    assert_eq!(
+        transaction_statistics.len(),
+        2,
+        "{transaction_statistics:?}"
+    );
+    assert!(
+        transaction_statistics[0].starts_with("3|0.333333"),
+        "{transaction_statistics:?}"
+    );
+    assert_eq!(transaction_statistics[1], "3|0");
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT count(*) FROM vt")),
+        ["2"]
+    );
+
+    let mut statistics_owner = TxnState::new(&mut b, 256).unwrap();
+    let mut statistics_observer = TxnState::new(&mut b, 256).unwrap();
+    run_txn(&mut e, &mut b, &mut statistics_owner, "BEGIN");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut statistics_owner,
+        "INSERT INTO vt VALUES (NULL, 'private'); ANALYZE vt",
+    );
+    assert!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut statistics_owner,
+            "SELECT null_frac FROM pg_stats WHERE tablename = 'vt' AND attname = 'a'"
+        ))[0]
+            .starts_with("0.333333")
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut statistics_observer,
+            "SELECT c.reltuples, s.null_frac FROM pg_class c JOIN pg_stats s \
+             ON s.tablename = c.relname AND s.attname = 'a' WHERE c.relname = 'vt'"
+        )),
+        ["3|0"],
+        "relation estimates are global in-place state, column statistics remain private"
+    );
+    run_txn(&mut e, &mut b, &mut statistics_owner, "ROLLBACK");
+
+    let savepoint_statistics = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "BEGIN; \
+         INSERT INTO vt VALUES (NULL, 'rolled back'); \
+         SAVEPOINT before_analyze; \
+         ANALYZE vt; \
+         SELECT null_frac FROM pg_stats WHERE tablename = 'vt' AND attname = 'a'; \
+         ROLLBACK TO before_analyze; \
+         SELECT null_frac FROM pg_stats WHERE tablename = 'vt' AND attname = 'a'; \
+         ROLLBACK",
+    ));
+    assert_eq!(savepoint_statistics.len(), 2, "{savepoint_statistics:?}");
+    assert!(
+        savepoint_statistics[0].starts_with("0.333333"),
+        "{savepoint_statistics:?}"
+    );
+    assert_eq!(savepoint_statistics[1], "0");
+
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE targeted_stats (a int, b text); \
+         INSERT INTO targeted_stats VALUES (1, 'one'); \
+         ANALYZE targeted_stats(a)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attname FROM pg_stats WHERE tablename = 'targeted_stats'"
+        )),
+        ["a"]
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "TRUNCATE targeted_stats; ANALYZE targeted_stats(a)",
+    );
+    assert!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attname FROM pg_stats WHERE tablename = 'targeted_stats'"
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics() {
+    let config = test_config("analyze-wal-recovery");
+    {
+        let mut budget = Budget::new(1 << 26);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_statistics (a int); \
+             INSERT INTO durable_statistics VALUES (1), (2); \
+             ANALYZE durable_statistics",
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             INSERT INTO durable_statistics VALUES (NULL); \
+             ANALYZE durable_statistics; \
+             ROLLBACK",
+        );
+        // A following commit carries the rollback-surviving in-place relation
+        // estimate into WAL without resurrecting the rolled-back column row.
+        run_with(&mut engine, &mut budget, "SELECT 1");
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE targeted_stale_statistics (a int, b int); \
+             INSERT INTO targeted_stale_statistics VALUES (1, 10), (2, 20); \
+             ANALYZE targeted_stale_statistics; \
+             DELETE FROM targeted_stale_statistics WHERE a = 2; \
+             ANALYZE targeted_stale_statistics(a)",
+        );
+    }
+
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT c.reltuples, s.null_frac, (SELECT count(*) FROM durable_statistics) \
+             FROM pg_class c JOIN pg_stats s \
+               ON s.tablename = c.relname AND s.attname = 'a' \
+             WHERE c.relname = 'durable_statistics'"
+        )),
+        ["3|0|2"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT c.reltuples, s.n_distinct \
+             FROM pg_class c JOIN pg_stats s \
+               ON s.tablename = c.relname AND s.attname = 'b' \
+             WHERE c.relname = 'targeted_stale_statistics'"
+        )),
+        ["1|-1"],
+        "targeted ANALYZE preserves an untouched estimate even when it exceeds the new row estimate"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ep (id int PRIMARY KEY, payload text)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO ep VALUES (1, 'a'), (2, 'b'), (3, 'c'); ANALYZE ep",
+    );
+
+    let explained = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT payload FROM ep WHERE id > 1 ORDER BY payload",
+    );
+    let rows = data_rows(&explained);
+    assert!(
+        rows.iter().any(|row| row.starts_with("Sort  (cost=")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Seq Scan on ep")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.starts_with("Planning Time: ")),
+        "{rows:?}"
+    );
+
+    let analyzed = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT payload FROM ep WHERE id = 2",
+    );
+    let rows = data_rows(&analyzed);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("(actual rows=1.00 loops=1)")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  Buffers: shared hit=")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.starts_with("Execution Time: ")),
+        "{rows:?}"
+    );
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (BUFFERS) SELECT * FROM ep",
+    );
+    assert!(String::from_utf8_lossy(&invalid).contains("22023"));
+    let invalid_timing = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (TIMING ON) SELECT * FROM ep",
+    );
+    assert!(String::from_utf8_lossy(&invalid_timing).contains("22023"));
+    let invalid_serialize = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (SERIALIZE TEXT) SELECT * FROM ep",
+    );
+    assert!(String::from_utf8_lossy(&invalid_serialize).contains("22023"));
+    let invalid_generic = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (GENERIC_PLAN, ANALYZE) SELECT * FROM ep",
+    );
+    assert!(String::from_utf8_lossy(&invalid_generic).contains("22023"));
+
+    let detailed = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, VERBOSE, MEMORY, SERIALIZE, TIMING OFF) \
+         SELECT payload FROM ep WHERE id = 2",
+    ));
+    assert!(detailed.iter().any(|row| row.contains("Output: payload")));
+    assert!(detailed.iter().any(|row| row == "Planning:"));
+    assert!(
+        detailed
+            .iter()
+            .any(|row| row.starts_with("Serialization: time=")),
+        "{detailed:?}"
+    );
+    assert!(
+        detailed
+            .iter()
+            .any(|row| row.contains("Index Scan using ep_pkey"))
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ep_large (id int); CREATE TABLE ep_small (id int); \
+         INSERT INTO ep_large SELECT g FROM generate_series(1, 20) g; \
+         INSERT INTO ep_small VALUES (1); ANALYZE ep_large; ANALYZE ep_small",
+    );
+    let join_plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT count(*) FROM ep_large, ep_small",
+    ));
+    let small = join_plan
+        .iter()
+        .position(|row| row.contains("Seq Scan on ep_small"))
+        .expect("small scan is planned");
+    let large = join_plan
+        .iter()
+        .position(|row| row.contains("Seq Scan on ep_large"))
+        .expect("large scan is planned");
+    assert!(
+        small < large,
+        "EXPLAIN must expose the cardinality-based executor order: {join_plan:?}"
+    );
+
+    let set_plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT 1 UNION ALL SELECT 2",
+    ));
+    assert!(
+        set_plan.iter().any(|row| row.contains("Append")),
+        "{set_plan:?}"
+    );
+
+    let insert_plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN INSERT INTO ep VALUES (4, 'd')",
+    ));
+    assert!(
+        insert_plan
+            .iter()
+            .any(|row| row.starts_with("Insert on ep")),
+        "{insert_plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM ep"
+        )),
+        ["3"]
+    );
+    let analyzed_insert = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, TIMING OFF) INSERT INTO ep VALUES (4, 'd')",
+    ));
+    assert!(
+        analyzed_insert
+            .iter()
+            .any(|row| row.starts_with("Insert on ep") && row.contains("actual rows=0.00")),
+        "{analyzed_insert:?}"
+    );
+    let returning_insert = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, TIMING OFF) INSERT INTO ep VALUES (5, 'e') RETURNING id",
+    ));
+    assert!(
+        returning_insert
+            .iter()
+            .any(|row| row.starts_with("Insert on ep") && row.contains("actual rows=0.00")),
+        "{returning_insert:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM ep"
+        )),
+        ["5"]
+    );
+    let wal_update = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, WAL, TIMING OFF) \
+         UPDATE ep SET payload = 'updated' WHERE id = 4",
+    ));
+    assert!(
+        wal_update
+            .iter()
+            .any(|row| row.starts_with("  WAL: records=") && !row.contains("records=0")),
+        "{wal_update:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT payload FROM ep WHERE id = 4"
+        )),
+        ["updated"]
+    );
+
+    let json = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (FORMAT JSON) SELECT 1",
+    ));
+    assert_eq!(json.len(), 1);
+    assert!(json[0].starts_with("[{\"Plan\":{"), "{json:?}");
+    assert!(json[0].contains("\"Node Type\":\"Result\""), "{json:?}");
+
+    let xml = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT 1",
+    ));
+    assert!(xml[0].starts_with("<explain "), "{xml:?}");
+    assert!(xml[0].contains("<Node-Type>Result</Node-Type>"), "{xml:?}");
+
+    let yaml = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (FORMAT YAML) SELECT 1",
+    ));
+    assert!(yaml[0].starts_with("- Plan:\n"), "{yaml:?}");
+    assert!(yaml[0].contains("Node Type: \"Result\""), "{yaml:?}");
 }
 
 #[test]
@@ -7937,6 +8355,13 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         ["1|after-24", "3|keep-me"],
         "the current snapshot must honor the tombstone and newest version"
     );
+    let analyzed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "ANALYZE snapshot_rows",
+    );
+    assert!(analyzed.contains("ANALYZE"), "{analyzed}");
     engine.checkpoint().unwrap();
     drop(engine);
 
@@ -7947,6 +8372,10 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         .storage
         .find_table("public", "snapshot_rows")
         .unwrap();
+    let restarted_statistics = restarted.storage.table_statistics(restarted_slot, 0);
+    assert!(restarted_statistics.valid);
+    assert_eq!(restarted_statistics.rows, 2);
+    assert_eq!(restarted_statistics.columns[0].distinct_values, 2);
     assert!(
         !restarted.storage.value_cache_complete(restarted_slot, &[0])
             && restarted.storage.value_probe_complete(restarted_slot, &[0]),
@@ -7985,6 +8414,123 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
 }
 
 #[test]
+fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_planning() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("object-pruning-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-object-pruning-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 1 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    config.value_index_rows = 1;
+    config.work_arena_bytes = 16 << 20;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE pruning_rows (id int PRIMARY KEY, payload text)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for start in (1..=600).step_by(100) {
+        let end = start + 99;
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO pruning_rows \
+                 SELECT i, repeat('x', 512) FROM generate_series({start}, {end}) AS g(i)"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "rows {start}..={end}: {}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    let analyzed = run_with(&mut engine, &mut budget, "ANALYZE pruning_rows");
+    assert!(!String::from_utf8_lossy(&analyzed).contains("ERROR"));
+    let _ = engine.checkpoint().unwrap();
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut full_budget = Budget::new(1 << 28);
+    let mut full = Engine::new(&config, &mut full_budget).unwrap();
+    let before_full = full.storage.block_io_stats();
+    let full_result = run_with(
+        &mut full,
+        &mut full_budget,
+        "SELECT count(*) FROM pruning_rows",
+    );
+    assert_eq!(
+        data_rows(&full_result),
+        ["600"],
+        "{}",
+        String::from_utf8_lossy(&full_result)
+    );
+    let full_gets = full
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_full)
+        .object_gets;
+    assert!(full_gets > 1, "fixture must occupy several durable blocks");
+    drop(full);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut selective_budget = Budget::new(1 << 28);
+    let mut selective = Engine::new(&config, &mut selective_budget).unwrap();
+    let before_plan = selective.storage.block_io_stats();
+    let plan = data_rows(&run_with(
+        &mut selective,
+        &mut selective_budget,
+        "EXPLAIN SELECT payload FROM pruning_rows WHERE id = 573",
+    ));
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("Index Scan using pruning_rows_pkey")),
+        "{plan:?}"
+    );
+    assert_eq!(
+        selective.storage.block_io_stats(),
+        before_plan,
+        "planning must consult only resident metadata"
+    );
+    let before_selective = selective.storage.block_io_stats();
+    let result = data_rows(&run_with(
+        &mut selective,
+        &mut selective_budget,
+        "SELECT length(payload) FROM pruning_rows WHERE id = 573",
+    ));
+    assert_eq!(result, ["512"]);
+    let selective_gets = selective
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_selective)
+        .object_gets;
+    assert!(
+        selective_gets < full_gets,
+        "durable index pruning must fetch fewer objects: selective={selective_gets}, full={full_gets}"
+    );
+    drop(selective);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7993,7 +8539,10 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery() {
     let mut config = test_config(&format!("object-transaction-wal-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-object-transaction-wal-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!(
+        "sql-object-transaction-wal-{}-{sequence}",
+        std::process::id()
+    );
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
@@ -8120,27 +8669,48 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery() {
             &mut restarted,
             &mut restarted_budget,
             "SELECT indexdef FROM pg_indexes WHERE indexname = 'rolled_back_index'"
-        )).is_empty(),
+        ))
+        .is_empty(),
         "a rolled-back index must never reach durable recovery"
     );
     assert_eq!(
-        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM checkpoint_base")),
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM checkpoint_base"
+        )),
         ["1"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM committed_while_a_open")),
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM committed_while_a_open"
+        )),
         ["2"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM late_commit")),
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM late_commit"
+        )),
         ["3"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM after_savepoint")),
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM after_savepoint"
+        )),
         ["4"]
     );
     assert_eq!(
-        data_rows(&run_with(&mut restarted, &mut restarted_budget, "SELECT id FROM middle_commit")),
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM middle_commit"
+        )),
         ["5"]
     );
     assert_eq!(

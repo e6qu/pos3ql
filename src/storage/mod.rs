@@ -18,6 +18,7 @@ use crate::mem::value_index::ValueIndexPool;
 use crate::sql::eval::{SqlError, hash_key, sqlstate};
 use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
+use crate::store::BlockStore;
 use crate::util::StackStr;
 
 pub(crate) use rowenc::MAX_COLUMNS;
@@ -863,6 +864,21 @@ pub struct Table {
     /// publishes — the bug class this kills is a snapshot quietly missing
     /// writes that landed between beats.
     pub generation: u64,
+    /// Planner statistics produced by ANALYZE. They are derived metadata:
+    /// query correctness never depends on them, and the authoritative rows
+    /// remain in immutable object-store generations.
+    pub(crate) statistics: TableStatistics,
+    pub(crate) statistics_dirty: bool,
+    /// The in-place relation-statistics half of ANALYZE has not yet been
+    /// included in a durable WAL commit. Unlike pg_statistic column rows,
+    /// PostgreSQL's pg_class reltuples/relpages update survives rollback.
+    statistics_wal_dirty: bool,
+    /// Transaction-private pg_statistic versions. The large images live in a
+    /// startup-sized storage slab; the table retains only slot handles so SQL
+    /// transaction/savepoint undo records stay compact.
+    pending_statistics_slots: [u32; MAX_PENDING_TABLE_DEFS],
+    n_pending_statistics: u8,
+    pending_statistics_txid: Option<u32>,
     /// Per-column sequence state for serial/identity columns: the last value
     /// a *default* assignment handed out. PostgreSQL's sequence, not a max
     /// scan — explicit inserts do not advance it, deletes and TRUNCATE
@@ -890,6 +906,62 @@ pub struct Table {
     /// definition/index set changes and maintained per committed row otherwise.
     pub(crate) enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
     pub(crate) n_enforcers: usize,
+}
+
+/// Statistics for one stored column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnStatistics {
+    /// Whether this column was included in the latest applicable ANALYZE.
+    /// Table-level statistics can be valid while a targeted ANALYZE leaves
+    /// other columns without a pg_statistic row.
+    pub(crate) valid: bool,
+    /// Fraction of rows that are NULL, in millionths.
+    pub(crate) null_fraction_ppm: u32,
+    /// HyperLogLog estimate over non-NULL values.
+    pub(crate) distinct_values: u64,
+    /// PostgreSQL's negative `n_distinct` ratio, in millionths, when the
+    /// estimate exceeded its ratio threshold at collection time. Keeping the
+    /// sampled ratio prevents targeted ANALYZE from recomputing nonsense
+    /// against a newer table row estimate.
+    pub(crate) distinct_fraction_ppm: u32,
+    /// Average encoded bytes for a non-NULL value.
+    pub(crate) average_width: u32,
+}
+
+impl ColumnStatistics {
+    pub(crate) const EMPTY: Self = Self {
+        valid: false,
+        null_fraction_ppm: 0,
+        distinct_values: 0,
+        distinct_fraction_ppm: 0,
+        average_width: 0,
+    };
+}
+
+/// Table cardinality and width statistics used by the storage-aware planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableStatistics {
+    pub(crate) valid: bool,
+    pub(crate) rows: u64,
+    pub(crate) average_row_width: u32,
+    pub(crate) analyzed_generation: u64,
+    pub(crate) columns: [ColumnStatistics; MAX_COLUMNS],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingTableStatisticsSlot {
+    used: bool,
+    statistics: TableStatistics,
+}
+
+impl TableStatistics {
+    pub(crate) const EMPTY: Self = Self {
+        valid: false,
+        rows: 0,
+        average_row_width: 0,
+        analyzed_generation: 0,
+        columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
+    };
 }
 
 /// The most delta SSTs a table accumulates before a checkpoint merges them
@@ -1822,6 +1894,7 @@ pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
     pending_table_defs: FixedVec<PendingTableDefSlot>,
+    pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
     view_dependencies: FixedVec<StoredQueryDependencies>,
     matviews: FixedVec<MatviewDef>,
@@ -2120,6 +2193,7 @@ impl Storage {
                 + size_of::<StoredQueryDependencies>()
                 + size_of::<IndexDef>())
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
+            + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableStatisticsSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
@@ -2139,6 +2213,11 @@ impl Storage {
         let pending_table_defs = FixedVec::new(
             budget,
             "pending_table_defs",
+            config.max_tables * MAX_PENDING_TABLE_DEFS,
+        )?;
+        let pending_table_statistics = FixedVec::new(
+            budget,
+            "pending_table_statistics",
             config.max_tables * MAX_PENDING_TABLE_DEFS,
         )?;
         for _ in 0..config.max_tables {
@@ -2175,6 +2254,12 @@ impl Storage {
                     pending_ddl: None,
                     dirty: false,
                     generation: 1,
+                    statistics: TableStatistics::EMPTY,
+                    statistics_dirty: false,
+                    statistics_wal_dirty: false,
+                    pending_statistics_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
+                    n_pending_statistics: 0,
+                    pending_statistics_txid: None,
                     serial_last: [0; MAX_COLUMNS],
                     serial_dirty: false,
                     spill_ssts: [None; MAX_SPILL_SSTS],
@@ -2307,6 +2392,7 @@ impl Storage {
             heap,
             tables,
             pending_table_defs,
+            pending_table_statistics,
             views,
             view_dependencies,
             matviews,
@@ -3004,6 +3090,23 @@ impl Storage {
         self.spill.is_some()
     }
 
+    /// Cumulative traffic through the provider-neutral block stack.
+    ///
+    /// A database without object storage has no spill stack and therefore
+    /// reports zeros. Callers compare snapshots around an operation; the
+    /// counters themselves are deliberately process-local observability.
+    pub(crate) fn block_io_stats(&self) -> crate::store::BlockIoStats {
+        self.spill
+            .as_ref()
+            .map(|reader| reader.blocks.borrow().io_stats())
+            .unwrap_or_default()
+    }
+
+    /// Number of immutable row generations currently backing a table.
+    pub(crate) fn spill_generation_count(&self, table_slot: usize) -> usize {
+        self.tables[table_slot].n_spill_ssts
+    }
+
     /// The bytes of a visible row, wherever they live: a heap row borrows the
     /// heap directly; a spilled row is fetched through the cache tiers into
     /// `arena`. The two lifetimes unify, so call sites keep their shapes.
@@ -3335,6 +3438,317 @@ impl Storage {
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         Ok(count)
+    }
+
+    /// Rebuilds planner statistics from the same MVCC-visible row seam every
+    /// query uses. An empty `selected_columns` means every column; otherwise
+    /// only the named column statistics are replaced while table cardinality
+    /// and row width are always refreshed.
+    pub(crate) fn analyze_table(
+        &mut self,
+        table_slot: usize,
+        txid: u32,
+        selected_columns: &[usize],
+    ) -> Result<TableStatistics, SqlError> {
+        const REGISTERS: usize = 64;
+
+        fn add_distinct(registers: &mut [u8; REGISTERS], hash: u64) {
+            let index = (hash as usize) & (REGISTERS - 1);
+            let tail = hash >> REGISTERS.trailing_zeros();
+            let rank = tail.leading_zeros().saturating_add(1).min(63) as u8;
+            registers[index] = registers[index].max(rank);
+        }
+
+        fn distinct_estimate(registers: &[u8; REGISTERS]) -> u64 {
+            let mut inverse_sum = 0.0f64;
+            let mut zeros = 0usize;
+            for &register in registers {
+                inverse_sum += 2.0f64.powi(-i32::from(register));
+                zeros += usize::from(register == 0);
+            }
+            let count = REGISTERS as f64;
+            let raw = 0.709 * count * count / inverse_sum;
+            let corrected = if raw <= 2.5 * count && zeros > 0 {
+                count * (count / zeros as f64).ln()
+            } else {
+                raw
+            };
+            corrected.round().max(0.0) as u64
+        }
+
+        let definition = *self.table_def(table_slot, txid);
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = definition.schema(&mut schema);
+        let mut selected = [false; MAX_COLUMNS];
+        if selected_columns.is_empty() {
+            selected[..n_columns].fill(true);
+        } else {
+            for &column in selected_columns {
+                selected[column] = true;
+            }
+        }
+
+        let mut rows = 0u64;
+        let mut row_bytes = 0u64;
+        let mut nulls = [0u64; MAX_COLUMNS];
+        let mut widths = [0u64; MAX_COLUMNS];
+        let mut non_nulls = [0u64; MAX_COLUMNS];
+        let mut registers = [[0u8; REGISTERS]; MAX_COLUMNS];
+        self.for_each_row_state(table_slot, &mut |rowid, state| {
+            let Some(home) = self.visible_row_home(table_slot, rowid, state, txid)? else {
+                return Ok(core::ops::ControlFlow::Continue(()));
+            };
+            self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
+                for column in 0..n_columns {
+                    if !selected[column] {
+                        continue;
+                    }
+                    let value = values[column];
+                    if value.is_null() {
+                        nulls[column] = nulls[column].saturating_add(1);
+                        continue;
+                    }
+                    non_nulls[column] = non_nulls[column].saturating_add(1);
+                    // A one-column row encoding contributes a two-byte count
+                    // and one bitmap byte; remove that framing to retain the
+                    // value's actual stored width.
+                    let width =
+                        rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3);
+                    widths[column] = widths[column].saturating_add(width as u64);
+                    let index = [column as u16];
+                    add_distinct(&mut registers[column], hash_key(&values, &index));
+                }
+                Ok(())
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+
+        let mut statistics = self.table_statistics(table_slot, txid);
+        statistics.valid = true;
+        statistics.rows = rows;
+        statistics.average_row_width = row_bytes
+            .checked_div(rows)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        statistics.analyzed_generation = self.tables[table_slot].generation;
+        for column in 0..n_columns {
+            if !selected[column] {
+                continue;
+            }
+            let distinct_values =
+                distinct_estimate(&registers[column]).min(non_nulls[column]);
+            statistics.columns[column] = ColumnStatistics {
+                valid: rows != 0,
+                null_fraction_ppm: nulls[column]
+                    .saturating_mul(1_000_000)
+                    .checked_div(rows)
+                    .unwrap_or(0)
+                    .min(u64::from(u32::MAX)) as u32,
+                distinct_values,
+                distinct_fraction_ppm: if rows != 0
+                    && distinct_values.saturating_mul(10) > rows
+                {
+                    distinct_values
+                        .saturating_mul(1_000_000)
+                        .checked_div(rows)
+                        .unwrap_or(0)
+                        .min(1_000_000) as u32
+                } else {
+                    0
+                },
+                average_width: widths[column]
+                    .checked_div(non_nulls[column])
+                    .unwrap_or(0)
+                    .min(u64::from(u32::MAX)) as u32,
+            };
+        }
+        self.write_table_statistics(table_slot, txid, statistics)?;
+        // PostgreSQL updates pg_class's relation statistics in place:
+        // reltuples/relpages remain changed even if the surrounding
+        // transaction rolls back. Column pg_statistic rows stay in the
+        // transaction-private version written above.
+        let committed = &mut self.tables[table_slot].statistics;
+        committed.valid = statistics.valid;
+        committed.rows = statistics.rows;
+        committed.average_row_width = statistics.average_row_width;
+        committed.analyzed_generation = statistics.analyzed_generation;
+        self.tables[table_slot].statistics_dirty = true;
+        self.tables[table_slot].statistics_wal_dirty = true;
+        Ok(statistics)
+    }
+
+    pub(crate) fn table_statistics(&self, table_slot: usize, txid: u32) -> TableStatistics {
+        if self.tables[table_slot].pending_statistics_txid == Some(txid)
+            && let Some(position) = self.tables[table_slot].n_pending_statistics.checked_sub(1)
+        {
+            let slot = self.tables[table_slot].pending_statistics_slots[position as usize] as usize;
+            return self.pending_table_statistics[slot].statistics;
+        }
+        self.tables[table_slot].statistics
+    }
+
+    pub(crate) fn pending_table_statistics(
+        &self,
+        table_slot: usize,
+        txid: u32,
+    ) -> Option<TableStatistics> {
+        (self.tables[table_slot].pending_statistics_txid == Some(txid))
+            .then(|| self.tables[table_slot].n_pending_statistics.checked_sub(1))
+            .flatten()
+            .map(|position| {
+                let slot =
+                    self.tables[table_slot].pending_statistics_slots[position as usize] as usize;
+                self.pending_table_statistics[slot].statistics
+            })
+    }
+
+    fn write_table_statistics(
+        &mut self,
+        table_slot: usize,
+        txid: u32,
+        statistics: TableStatistics,
+    ) -> Result<(), SqlError> {
+        if let Some(owner) = self.tables[table_slot].pending_statistics_txid
+            && owner != txid
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize ANALYZE of relation \"{}\"",
+                self.tables[table_slot].def.name.as_str()
+            ));
+        }
+        if self.tables[table_slot].n_pending_statistics as usize == MAX_PENDING_TABLE_DEFS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "one transaction analyzes relation \"{}\" more than {} times",
+                self.tables[table_slot].def.name.as_str(),
+                MAX_PENDING_TABLE_DEFS
+            ));
+        }
+        let slot = match self
+            .pending_table_statistics
+            .iter()
+            .position(|entry| !entry.used)
+        {
+            Some(slot) => {
+                self.pending_table_statistics[slot] = PendingTableStatisticsSlot {
+                    used: true,
+                    statistics,
+                };
+                slot
+            }
+            None => {
+                let slot = self.pending_table_statistics.len();
+                self.pending_table_statistics
+                    .push(PendingTableStatisticsSlot {
+                        used: true,
+                        statistics,
+                    })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "pending table-statistics pool is exhausted"
+                        )
+                    })?;
+                slot
+            }
+        };
+        let position = self.tables[table_slot].n_pending_statistics as usize;
+        self.tables[table_slot].pending_statistics_slots[position] = slot as u32;
+        self.tables[table_slot].n_pending_statistics += 1;
+        self.tables[table_slot].pending_statistics_txid = Some(txid);
+        Ok(())
+    }
+
+    pub(crate) fn rollback_table_statistics(&mut self, table_slot: usize, txid: u32) {
+        if self.tables[table_slot].pending_statistics_txid != Some(txid) {
+            return;
+        }
+        let Some(position) = self.tables[table_slot].n_pending_statistics.checked_sub(1) else {
+            return;
+        };
+        let slot = self.tables[table_slot].pending_statistics_slots[position as usize] as usize;
+        self.pending_table_statistics[slot].used = false;
+        self.tables[table_slot].pending_statistics_slots[position as usize] = u32::MAX;
+        self.tables[table_slot].n_pending_statistics = position;
+        if position == 0 {
+            self.tables[table_slot].pending_statistics_txid = None;
+        }
+    }
+
+    fn clear_pending_table_statistics(&mut self, table_slot: usize) {
+        let count = self.tables[table_slot].n_pending_statistics as usize;
+        for position in 0..count {
+            let slot = self.tables[table_slot].pending_statistics_slots[position] as usize;
+            self.pending_table_statistics[slot].used = false;
+            self.tables[table_slot].pending_statistics_slots[position] = u32::MAX;
+        }
+        self.tables[table_slot].n_pending_statistics = 0;
+        self.tables[table_slot].pending_statistics_txid = None;
+    }
+
+    pub(crate) fn commit_table_statistics(&mut self, table_slot: usize, txid: u32) {
+        let Some(statistics) = self.pending_table_statistics(table_slot, txid) else {
+            return;
+        };
+        self.tables[table_slot].statistics = statistics;
+        self.tables[table_slot].statistics_dirty = true;
+        self.clear_pending_table_statistics(table_slot);
+    }
+
+    /// Cardinality estimate that never performs object I/O. ANALYZE wins; an
+    /// unspilled table can otherwise use its complete resident map exactly,
+    /// while a spilled table uses a conservative floor until statistics are
+    /// collected.
+    pub(crate) fn planning_row_estimate(&self, table_slot: usize) -> u64 {
+        let table = &self.tables[table_slot];
+        if table.statistics.valid {
+            table.statistics.rows
+        } else if table.n_spill_ssts == 0 {
+            table.rows.len() as u64
+        } else {
+            (table.rows.len() as u64).max(1_000)
+        }
+    }
+
+    pub(crate) fn statistics_dirty(&self) -> bool {
+        self.tables
+            .iter()
+            .any(|table| table.live && table.statistics_dirty)
+    }
+
+    pub(crate) fn statistics_wal_dirty(&self, table_slot: usize) -> bool {
+        self.tables[table_slot].statistics_wal_dirty
+    }
+
+    pub(crate) fn clear_statistics_wal_dirty(&mut self, table_slot: usize) {
+        self.tables[table_slot].statistics_wal_dirty = false;
+    }
+
+    pub(crate) fn install_table_statistics(
+        &mut self,
+        table_slot: usize,
+        statistics: TableStatistics,
+    ) {
+        self.tables[table_slot].statistics = statistics;
+        self.tables[table_slot].statistics_dirty = false;
+        self.tables[table_slot].statistics_wal_dirty = false;
+        self.clear_pending_table_statistics(table_slot);
+    }
+
+    pub(crate) fn replay_table_statistics(
+        &mut self,
+        table_slot: usize,
+        statistics: TableStatistics,
+    ) {
+        self.tables[table_slot].statistics = statistics;
+        self.tables[table_slot].statistics_dirty = true;
+        self.tables[table_slot].statistics_wal_dirty = false;
+        self.clear_pending_table_statistics(table_slot);
     }
 
     pub fn row_bytes<'a>(
@@ -3677,6 +4091,8 @@ impl Storage {
     pub fn clear_dirty(&mut self) {
         for t in self.tables.iter_mut() {
             t.dirty = false;
+            t.statistics_dirty = false;
+            t.statistics_wal_dirty = false;
         }
     }
 
@@ -4915,6 +5331,7 @@ impl Storage {
         // A reused slot must not keep the dropped table's value indexes.
         self.release_enforcers(slot);
         self.clear_pending_table_defs(slot);
+        self.clear_pending_table_statistics(slot);
         self.catalog_seq += 1;
         let stamp = self.catalog_seq;
         let table = &mut self.tables[slot];
@@ -4924,6 +5341,9 @@ impl Storage {
         table.live = pending.is_none();
         table.pending_ddl = pending;
         table.mark_dirty();
+        table.statistics = TableStatistics::EMPTY;
+        table.statistics_dirty = false;
+        table.statistics_wal_dirty = false;
         // A reused slot must not inherit the dropped table's sequences or
         // spilled rows.
         table.serial_last = [0; MAX_COLUMNS];
@@ -5091,6 +5511,7 @@ impl Storage {
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
+        self.clear_pending_table_statistics(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].mark_dirty();
@@ -5120,18 +5541,22 @@ impl Storage {
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
+        self.clear_pending_table_statistics(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].rows.clear();
+        self.tables[index].statistics_wal_dirty = false;
     }
 
     /// Rolls back an uncommitted CREATE, freeing the slot.
     pub fn rollback_create(&mut self, index: usize) {
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
+        self.clear_pending_table_statistics(index);
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].rows.clear();
+        self.tables[index].statistics_wal_dirty = false;
     }
 
     /// Rolls back an uncommitted DROP: the table returns to the committed

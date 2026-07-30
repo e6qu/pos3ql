@@ -3,6 +3,7 @@
 
 use crate::mem::buffer::FixedBuf;
 use crate::sql::types::{ColDesc, Datum};
+use crate::sql::ast::ExplainSerialize;
 use crate::stack_format;
 
 use super::wire::{self, MsgOut, WireFull};
@@ -69,6 +70,131 @@ pub struct Responder<'b> {
     flush: FlushSink<'b>,
     /// Session value-rendering settings (DateStyle, time zone).
     render: crate::sql::guc::RenderContext,
+    /// EXPLAIN ANALYZE executes through the ordinary executor but suppresses
+    /// its row description, rows, and command tag. Errors still propagate.
+    discard_query_output: bool,
+    discarded_rows: u64,
+    discard_serialize: ExplainSerialize,
+    serialized_bytes: u64,
+    serialization_micros: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DiscardedOutput {
+    pub(crate) rows: u64,
+    pub(crate) serialized_bytes: u64,
+    pub(crate) serialization_micros: u64,
+}
+
+fn display_len(value: impl core::fmt::Display) -> usize {
+    struct Counter(usize);
+    impl core::fmt::Write for Counter {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            self.0 = self.0.saturating_add(text.len());
+            Ok(())
+        }
+    }
+    use core::fmt::Write as _;
+    let mut counter = Counter(0);
+    let _ = write!(counter, "{value}");
+    counter.0
+}
+
+fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usize {
+    match value {
+        Datum::Null => 0,
+        Datum::Text(text) | Datum::Bpchar(text) => text.len(),
+        Datum::Bytea(bytes) if render.bytea_escape => bytes
+            .iter()
+            .map(|byte| match byte {
+                b'\\' => 2,
+                0x20..=0x7e => 1,
+                _ => 4,
+            })
+            .sum(),
+        Datum::Bytea(bytes) => 2usize.saturating_add(bytes.len().saturating_mul(2)),
+        Datum::Numeric(number) => display_len(number),
+        Datum::Date(date) => {
+            crate::sql::datetime::format_date_styled(*date, render.datestyle)
+                .as_str()
+                .len()
+        }
+        Datum::Timestamp(timestamp) | Datum::Timestamptz(timestamp) => {
+            crate::sql::datetime::format_timestamp_styled(
+                *timestamp,
+                matches!(value, Datum::Timestamptz(_)),
+                render.datestyle,
+                render.parsed_timezone,
+            )
+            .as_str()
+            .len()
+        }
+        other => display_len(other),
+    }
+}
+
+fn binary_value_len(value: &Datum) -> usize {
+    match value {
+        Datum::Null => 0,
+        Datum::Bool(_) => 1,
+        Datum::Int2(_) => 2,
+        Datum::Int4(_) | Datum::Date(_) | Datum::Float4(_) => 4,
+        Datum::Int8(_)
+        | Datum::Timestamp(_)
+        | Datum::Timestamptz(_)
+        | Datum::Time(_)
+        | Datum::Float8(_)
+        | Datum::Macaddr8(_) => 8,
+        Datum::Macaddr(_) => 6,
+        Datum::Timetz(..) => 12,
+        Datum::Interval(_) | Datum::Uuid(_) => 16,
+        Datum::Text(text) | Datum::Bpchar(text) => text.len(),
+        Datum::Bytea(bytes) => bytes.len(),
+        Datum::Json { text, jsonb } => text.len().saturating_add(usize::from(*jsonb)),
+        Datum::Range { text, .. } | Datum::Multirange { text, .. } => text.len(),
+        Datum::Bit { bits, .. } => 4usize.saturating_add(bits.len().div_ceil(8)),
+        Datum::Inet(network) | Datum::Cidr(network) => {
+            4usize.saturating_add(network.addr_len())
+        }
+        Datum::Enum { label, .. } => label.len(),
+        Datum::Numeric(number) => 8usize.saturating_add(number.ndigits().saturating_mul(2)),
+        Datum::Record(_) => display_len(value),
+        Datum::Int2Vector(raw) => {
+            let count = raw.len() / 2;
+            12usize
+                .saturating_add(usize::from(count != 0).saturating_mul(8))
+                .saturating_add(count.saturating_mul(6))
+        }
+        Datum::Array { element, raw } => {
+            let count = crate::sql::array::len(raw);
+            let mut bytes =
+                12usize.saturating_add(usize::from(count != 0).saturating_mul(8));
+            for index in 0..count {
+                let item =
+                    crate::sql::array::get(raw, *element, index).unwrap_or(Datum::Null);
+                bytes = bytes
+                    .saturating_add(4)
+                    .saturating_add(binary_value_len(&item));
+            }
+            bytes
+        }
+    }
+}
+
+fn serialized_row_len(
+    values: &[Datum],
+    binary: bool,
+    render: crate::sql::guc::RenderContext,
+) -> usize {
+    values.iter().fold(2usize, |bytes, value| {
+        bytes
+            .saturating_add(4)
+            .saturating_add(if binary {
+                binary_value_len(value)
+            } else {
+                text_value_len(value, render)
+            })
+    })
 }
 
 impl<'b> Responder<'b> {
@@ -79,6 +205,11 @@ impl<'b> Responder<'b> {
             formats: ResultFmt::ALL_TEXT,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
+            discard_query_output: false,
+            discarded_rows: 0,
+            discard_serialize: ExplainSerialize::None,
+            serialized_bytes: 0,
+            serialization_micros: 0,
         }
     }
 
@@ -89,6 +220,11 @@ impl<'b> Responder<'b> {
             formats,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
+            discard_query_output: false,
+            discarded_rows: 0,
+            discard_serialize: ExplainSerialize::None,
+            serialized_bytes: 0,
+            serialization_micros: 0,
         }
     }
 
@@ -101,6 +237,11 @@ impl<'b> Responder<'b> {
             formats,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
+            discard_query_output: false,
+            discarded_rows: 0,
+            discard_serialize: ExplainSerialize::None,
+            serialized_bytes: 0,
+            serialization_micros: 0,
         }
     }
 
@@ -131,6 +272,25 @@ impl<'b> Responder<'b> {
 
     pub fn set_render(&mut self, render: crate::sql::guc::RenderContext) {
         self.render = render;
+    }
+
+    pub(crate) fn begin_discard_query_output(&mut self, serialize: ExplainSerialize) {
+        debug_assert!(!self.discard_query_output);
+        self.discard_query_output = true;
+        self.discarded_rows = 0;
+        self.discard_serialize = serialize;
+        self.serialized_bytes = 0;
+        self.serialization_micros = 0;
+    }
+
+    pub(crate) fn finish_discard_query_output(&mut self) -> DiscardedOutput {
+        debug_assert!(self.discard_query_output);
+        self.discard_query_output = false;
+        DiscardedOutput {
+            rows: self.discarded_rows,
+            serialized_bytes: self.serialized_bytes,
+            serialization_micros: self.serialization_micros,
+        }
     }
 
     /// Drains the whole send buffer to the flush sink, blocking. Returns
@@ -289,7 +449,7 @@ impl<'b> Responder<'b> {
     }
 
     pub fn row_description(&mut self, columns: &[ColDesc]) -> Result<(), WireFull> {
-        if self.suppress_row_description {
+        if self.suppress_row_description || self.discard_query_output {
             return Ok(());
         }
         let formats = self.formats;
@@ -389,6 +549,19 @@ impl<'b> Responder<'b> {
     }
 
     pub fn data_row(&mut self, values: &[Datum]) -> Result<(), WireFull> {
+        if self.discard_query_output {
+            self.discarded_rows = self.discarded_rows.saturating_add(1);
+            if self.discard_serialize != ExplainSerialize::None {
+                let started = std::time::Instant::now();
+                let binary = self.discard_serialize == ExplainSerialize::Binary;
+                let bytes = serialized_row_len(values, binary, self.render_context());
+                self.serialized_bytes = self.serialized_bytes.saturating_add(bytes as u64);
+                self.serialization_micros = self.serialization_micros.saturating_add(
+                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                );
+            }
+            return Ok(());
+        }
         let formats = self.formats;
         let render = self.render_context();
         self.with_retry(|buffer| Self::build_data_row(buffer, values, formats, render))
@@ -825,6 +998,9 @@ impl<'b> Responder<'b> {
     }
 
     pub fn command_complete(&mut self, tag: &str) -> Result<(), WireFull> {
+        if self.discard_query_output {
+            return Ok(());
+        }
         let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
         m.cstr(tag);
         m.finish()

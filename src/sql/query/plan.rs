@@ -10,11 +10,12 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
-use crate::sql::eval::{eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
+use crate::storage::Storage;
 
-use super::{arena_full, QueryScope, ResolvedColumn, ScopeCols, MAX_JOIN_TABLES};
+use super::{MAX_JOIN_TABLES, QueryScope, ResolvedColumn, ScopeCols, arena_full};
 
 pub(super) const MAX_CONJUNCTS: usize = 32;
 
@@ -29,19 +30,28 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u16> 
             // Merged USING/NATURAL column: reads every contributing table.
             ResolvedColumn::Merged(m) => {
                 let mc = &scope.merged[m];
-                Some(mc.parts[..mc.n_parts].iter().fold(0u16, |mask, &(t, _)| mask | (1 << t)))
+                Some(
+                    mc.parts[..mc.n_parts]
+                        .iter()
+                        .fold(0u16, |mask, &(t, _)| mask | (1 << t)),
+                )
             }
         },
         Unary { operand, .. } | IsNull { operand, .. } | Cast { operand, .. } => {
             expr_tables(operand, scope)
         }
         Binary { left, right, .. } => Some(expr_tables(left, scope)? | expr_tables(right, scope)?),
-        Between { operand, low, high, .. } => {
-            Some(expr_tables(operand, scope)? | expr_tables(low, scope)? | expr_tables(high, scope)?)
+        Between {
+            operand, low, high, ..
+        } => Some(
+            expr_tables(operand, scope)? | expr_tables(low, scope)? | expr_tables(high, scope)?,
+        ),
+        Like {
+            operand, pattern, ..
         }
-        Like { operand, pattern, .. } | Match { operand, pattern, .. } => {
-            Some(expr_tables(operand, scope)? | expr_tables(pattern, scope)?)
-        }
+        | Match {
+            operand, pattern, ..
+        } => Some(expr_tables(operand, scope)? | expr_tables(pattern, scope)?),
         InList { operand, list, .. } => {
             let mut m = expr_tables(operand, scope)?;
             for e in *list {
@@ -49,7 +59,9 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u16> 
             }
             Some(m)
         }
-        Call { args, over: None, .. } if !expression.is_aggregate() => {
+        Call {
+            args, over: None, ..
+        } if !expression.is_aggregate() => {
             let mut m = 0;
             for a in *args {
                 m |= expr_tables(a, scope)?;
@@ -74,24 +86,30 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u16> 
 /// plan stable across equivalent FROM permutations without stored statistics,
 /// and pushes unconstrained tables last. Results do not change because join
 /// order is free for inner/cross joins.
-pub(super) fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [usize; MAX_JOIN_TABLES] {
+pub(crate) fn join_order(
+    storage: &Storage,
+    scope: &QueryScope,
+    where_clause: Option<&Expr>,
+) -> [usize; MAX_JOIN_TABLES] {
     let mut order = core::array::from_fn(|i| i);
     let n = scope.n;
-    if n < 3 {
+    if n < 2 {
         return order;
     }
-    // Collect analyzable WHERE conjuncts and their static selectivity. The
-    // estimate is deliberately cardinality-free: live table statistics do not
-    // exist yet, but the predicate shape still distinguishes one equality from
-    // a broad list.
+    // Collect analyzable WHERE conjuncts and their static selectivity.
+    // Predicate shape distinguishes one equality from a broad list; analyzed
+    // table cardinality then breaks ties between otherwise-equivalent choices.
     let mut masks = [0u16; MAX_CONJUNCTS];
     let mut strengths = [0u32; MAX_CONJUNCTS];
     let mut n_masks = 0;
     if let Some(w) = where_clause {
         let mut conjunct: [&Expr; MAX_CONJUNCTS] = [w; MAX_CONJUNCTS];
         let mut nc = 0;
-        let conjuncts: &[&Expr] =
-            if flatten_and(w, &mut conjunct, &mut nc) { &conjunct[..nc] } else { core::slice::from_ref(&w) };
+        let conjuncts: &[&Expr] = if flatten_and(w, &mut conjunct, &mut nc) {
+            &conjunct[..nc]
+        } else {
+            core::slice::from_ref(&w)
+        };
         for &c in conjuncts {
             if let Some(m) = expr_tables(c, scope)
                 && n_masks < MAX_CONJUNCTS
@@ -111,15 +129,14 @@ pub(super) fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [us
         // filters have multiplied the outer loop.
         let mut best = usize::MAX;
         let mut best_score = 0u32;
+        let mut best_rows = u64::MAX;
         for t in 0..n {
             if chosen_mask & (1 << t) != 0 {
                 continue;
             }
             let after = chosen_mask | (1 << t);
             let mut score = 0u32;
-            for (&mask, &strength) in
-                masks[..n_masks].iter().zip(&strengths[..n_masks])
-            {
+            for (&mask, &strength) in masks[..n_masks].iter().zip(&strengths[..n_masks]) {
                 if mask & (1 << t) == 0 {
                     continue;
                 }
@@ -128,8 +145,28 @@ pub(super) fn join_order(scope: &QueryScope, where_clause: Option<&Expr>) -> [us
                     score = score.saturating_add(strength);
                 }
             }
-            if best == usize::MAX || score > best_score {
+            let base_rows = scope.derived[t].map_or_else(
+                || storage.planning_row_estimate(scope.slots[t]),
+                |rows| rows.len() as u64,
+            );
+            let local_strength = masks[..n_masks]
+                .iter()
+                .zip(&strengths[..n_masks])
+                .filter(|(mask, _)| **mask == 1 << t)
+                .fold(0u32, |sum, (_, strength)| sum.saturating_add(*strength));
+            let divisor = match local_strength {
+                1024.. => 100,
+                256..=1023 => 4,
+                32..=255 => 3,
+                _ => 1,
+            };
+            let estimated_rows = base_rows.div_ceil(divisor);
+            if best == usize::MAX
+                || score > best_score
+                || (score == best_score && estimated_rows < best_rows)
+            {
                 best_score = score;
+                best_rows = estimated_rows;
                 best = t;
             }
         }
@@ -148,14 +185,16 @@ fn predicate_strength(expression: &Expr) -> u32 {
 
     fn equality_alternatives(expression: &Expr) -> Option<u32> {
         match expression {
-            Expr::Binary { operator: BinaryOp::Or, left, right } => {
-                equality_alternatives(left)?.checked_add(equality_alternatives(right)?)
-            }
-            Expr::Binary { operator: BinaryOp::Eq, left, right }
-                if left.is_constant() != right.is_constant() =>
-            {
-                Some(1)
-            }
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                left,
+                right,
+            } => equality_alternatives(left)?.checked_add(equality_alternatives(right)?),
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+            } if left.is_constant() != right.is_constant() => Some(1),
             _ => None,
         }
     }
@@ -164,12 +203,15 @@ fn predicate_strength(expression: &Expr) -> u32 {
         return EXACT / alternatives.max(1);
     }
     match expression {
-        Expr::Binary { operator: BinaryOp::Eq, .. } => EXACT,
-        Expr::InList { list, negated: false, .. }
-            if list.iter().all(|item| item.is_constant()) =>
-        {
-            EXACT / (list.len() as u32).max(1)
-        }
+        Expr::Binary {
+            operator: BinaryOp::Eq,
+            ..
+        } => EXACT,
+        Expr::InList {
+            list,
+            negated: false,
+            ..
+        } if list.iter().all(|item| item.is_constant()) => EXACT / (list.len() as u32).max(1),
         Expr::IsNull { .. } => EXACT / 4,
         Expr::Between { .. } => EXACT / 8,
         Expr::Binary {
@@ -202,8 +244,17 @@ pub(super) fn conjunct_passes<'a>(
 
 /// Flattens a top-level `AND` chain into `out`, returning the count, or `None`
 /// if it would overflow (caller then evaluates the predicate whole).
-pub(super) fn flatten_and<'e, 'a>(e: &'e Expr<'a>, out: &mut [&'e Expr<'a>], n: &mut usize) -> bool {
-    if let Expr::Binary { operator: crate::sql::ast::BinaryOp::And, left, right } = e {
+pub(super) fn flatten_and<'e, 'a>(
+    e: &'e Expr<'a>,
+    out: &mut [&'e Expr<'a>],
+    n: &mut usize,
+) -> bool {
+    if let Expr::Binary {
+        operator: crate::sql::ast::BinaryOp::And,
+        left,
+        right,
+    } = e
+    {
         return flatten_and(left, out, n) && flatten_and(right, out, n);
     }
     if *n == out.len() {
@@ -229,21 +280,39 @@ pub(super) fn is_error_safe(e: &Expr) -> bool {
         return true;
     }
     match e {
-        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-        | Expr::Str(_) | Expr::Column { .. } | Expr::Param(_) | Expr::DefaultMarker => true,
-        Expr::Binary { operator, left, right } => match operator {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::Column { .. }
+        | Expr::Param(_)
+        | Expr::DefaultMarker => true,
+        Expr::Binary {
+            operator,
+            left,
+            right,
+        } => match operator {
             Add | Sub | Mul | Div | Mod => false,
             _ => is_error_safe(left) && is_error_safe(right),
         },
-        Expr::Unary { operator, operand } => matches!(operator, UnaryOp::Not) && is_error_safe(operand),
+        Expr::Unary { operator, operand } => {
+            matches!(operator, UnaryOp::Not) && is_error_safe(operand)
+        }
         Expr::IsNull { operand, .. } => is_error_safe(operand),
         Expr::InList { operand, list, .. } => {
             is_error_safe(operand) && list.iter().all(|e| is_error_safe(e))
         }
-        Expr::Between { operand, low, high, .. } => {
-            is_error_safe(operand) && is_error_safe(low) && is_error_safe(high)
+        Expr::Between {
+            operand, low, high, ..
+        } => is_error_safe(operand) && is_error_safe(low) && is_error_safe(high),
+        Expr::Like {
+            operand, pattern, ..
         }
-        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => is_error_safe(operand) && is_error_safe(pattern),
+        | Expr::Match {
+            operand, pattern, ..
+        } => is_error_safe(operand) && is_error_safe(pattern),
         _ => false,
     }
 }
@@ -297,14 +366,15 @@ pub(super) fn fold_null<'a>(
         // Some(negated) when `e` is a NullTest on a provably NOT NULL plain
         // column. A merged USING/NATURAL column can be null even over
         // NOT NULL parts (outer-join null rows) — never a candidate.
-        if let Expr::IsNull { operand: Expr::Column { qualifier, name }, negated } = e
+        if let Expr::IsNull {
+            operand: Expr::Column { qualifier, name },
+            negated,
+        } = e
             && scope
                 .find_column(*qualifier, name)
                 .ok()
                 .and_then(|entry| match entry {
-                    ResolvedColumn::Table(t, c) => {
-                        scope.defs[t].map(|d| d.columns()[c].not_null)
-                    }
+                    ResolvedColumn::Table(t, c) => scope.defs[t].map(|d| d.columns()[c].not_null),
                     ResolvedColumn::Merged(_) => None,
                 })
                 .unwrap_or(false)
@@ -316,9 +386,11 @@ pub(super) fn fold_null<'a>(
 
     fn or_spine_has_true<'a>(e: &Expr<'a>, scope: &QueryScope<'a>) -> bool {
         match e {
-            Expr::Binary { operator: BinaryOp::Or, left, right } => {
-                or_spine_has_true(left, scope) || or_spine_has_true(right, scope)
-            }
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                left,
+                right,
+            } => or_spine_has_true(left, scope) || or_spine_has_true(right, scope),
             other => not_null_test(other, scope) == Some(true),
         }
     }
@@ -327,8 +399,13 @@ pub(super) fn fold_null<'a>(
         if let Some(negated) = not_null_test(e, scope) {
             return Some(negated); // IS NOT NULL → TRUE, IS NULL → FALSE
         }
-        if matches!(e, Expr::Binary { operator: BinaryOp::Or, .. })
-            && or_spine_has_true(e, scope)
+        if matches!(
+            e,
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                ..
+            }
+        ) && or_spine_has_true(e, scope)
         {
             return Some(true);
         }
@@ -366,7 +443,11 @@ pub(super) fn fold_null<'a>(
     let mut acc = kept[0];
     for &c in &kept[1..n_kept] {
         acc = arena
-            .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: c })
+            .alloc(Expr::Binary {
+                operator: BinaryOp::And,
+                left: acc,
+                right: c,
+            })
             .map_err(|_| arena_full())?;
     }
     Ok(acc)
@@ -393,15 +474,29 @@ pub(super) fn reorder_qual<'a>(
     let mut expanded: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
     let mut m = 0usize;
     for &c in &conjunct[..n] {
-        if let Expr::Between { operand, low, high, negated: false } = c {
+        if let Expr::Between {
+            operand,
+            low,
+            high,
+            negated: false,
+        } = c
+        {
             if m + 2 > MAX_CONJUNCTS {
                 return Ok(pred);
             }
             expanded[m] = arena
-                .alloc(Expr::Binary { operator: crate::sql::ast::BinaryOp::GtEq, left: operand, right: low })
+                .alloc(Expr::Binary {
+                    operator: crate::sql::ast::BinaryOp::GtEq,
+                    left: operand,
+                    right: low,
+                })
                 .map_err(|_| arena_full())?;
             expanded[m + 1] = arena
-                .alloc(Expr::Binary { operator: crate::sql::ast::BinaryOp::LtEq, left: operand, right: high })
+                .alloc(Expr::Binary {
+                    operator: crate::sql::ast::BinaryOp::LtEq,
+                    left: operand,
+                    right: high,
+                })
                 .map_err(|_| arena_full())?;
             m += 2;
         } else {
@@ -425,8 +520,13 @@ pub(super) fn reorder_qual<'a>(
     // first on an exact cost tie, while `0 <> (…) AND (…OR…)` keeps written
     // order). The same calibrated cost model drives projection postponement.
     let is_equality = |c: &Expr| -> bool {
-        matches!(c, Expr::Binary { operator: crate::sql::ast::BinaryOp::Eq, .. })
-            || matches!(c, Expr::InList { list, negated: false, .. } if list.len() == 1)
+        matches!(
+            c,
+            Expr::Binary {
+                operator: crate::sql::ast::BinaryOp::Eq,
+                ..
+            }
+        ) || matches!(c, Expr::InList { list, negated: false, .. } if list.len() == 1)
     };
     let mut order = [0usize; MAX_CONJUNCTS];
     let mut at = 0usize;
@@ -457,13 +557,15 @@ pub(super) fn reorder_qual<'a>(
     let mut acc = conjunct[order[0]];
     for &i in &order[1..n] {
         acc = arena
-            .alloc(Expr::Binary { operator: crate::sql::ast::BinaryOp::And, left: acc, right: conjunct[i] })
+            .alloc(Expr::Binary {
+                operator: crate::sql::ast::BinaryOp::And,
+                left: acc,
+                right: conjunct[i],
+            })
             .map_err(|_| arena_full())?;
     }
     Ok(acc)
 }
-
-
 
 /// PostgreSQL's `find_duplicate_ors` canonicalization: AND terms common to
 /// every arm of an OR are factored out in front — `(A AND B) OR (A AND C)`
@@ -477,7 +579,12 @@ pub(super) fn factor_common_or_terms<'a>(
     use crate::sql::ast::BinaryOp;
     const MAX_PARTS: usize = 16;
     fn flatten_or<'a>(x: &'a Expr<'a>, out: &mut [&'a Expr<'a>; MAX_PARTS], n: &mut usize) -> bool {
-        if let Expr::Binary { operator: BinaryOp::Or, left, right } = x {
+        if let Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+        } = x
+        {
             return flatten_or(left, out, n) && flatten_or(right, out, n);
         }
         if *n == MAX_PARTS {
@@ -488,7 +595,12 @@ pub(super) fn factor_common_or_terms<'a>(
         true
     }
     fn and_terms<'a>(x: &'a Expr<'a>, out: &mut [&'a Expr<'a>; MAX_PARTS], n: &mut usize) -> bool {
-        if let Expr::Binary { operator: BinaryOp::And, left, right } = x {
+        if let Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+        } = x
+        {
             return and_terms(left, out, n) && and_terms(right, out, n);
         }
         if *n == MAX_PARTS {
@@ -544,7 +656,11 @@ pub(super) fn factor_common_or_terms<'a>(
             residue = Some(match residue {
                 None => t,
                 Some(acc) => arena
-                    .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: t })
+                    .alloc(Expr::Binary {
+                        operator: BinaryOp::And,
+                        left: acc,
+                        right: t,
+                    })
                     .map_err(|_| arena_full())?,
             });
         }
@@ -554,7 +670,11 @@ pub(super) fn factor_common_or_terms<'a>(
                 let mut acc = common[0];
                 for &c in &common[1..kept] {
                     acc = arena
-                        .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: c })
+                        .alloc(Expr::Binary {
+                            operator: BinaryOp::And,
+                            left: acc,
+                            right: c,
+                        })
                         .map_err(|_| arena_full())?;
                 }
                 return Ok(acc);
@@ -569,17 +689,29 @@ pub(super) fn factor_common_or_terms<'a>(
     let mut or_acc = residues[0];
     for &x in &residues[1..n_res] {
         or_acc = arena
-            .alloc(Expr::Binary { operator: BinaryOp::Or, left: or_acc, right: x })
+            .alloc(Expr::Binary {
+                operator: BinaryOp::Or,
+                left: or_acc,
+                right: x,
+            })
             .map_err(|_| arena_full())?;
     }
     let mut acc = common[0];
     for &c in &common[1..kept] {
         acc = arena
-            .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: c })
+            .alloc(Expr::Binary {
+                operator: BinaryOp::And,
+                left: acc,
+                right: c,
+            })
             .map_err(|_| arena_full())?;
     }
     Ok(&*arena
-        .alloc(Expr::Binary { operator: BinaryOp::And, left: acc, right: or_acc })
+        .alloc(Expr::Binary {
+            operator: BinaryOp::And,
+            left: acc,
+            right: or_acc,
+        })
         .map_err(|_| arena_full())?)
 }
 
@@ -589,13 +721,22 @@ pub(super) fn factor_common_or_terms<'a>(
 pub(super) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
     use crate::sql::ast::BinaryOp;
     if e.is_constant() {
-        return match crate::sql::eval::eval(e, arena, crate::sql::eval::NO_PARAMS, &crate::sql::eval::NoColumns) {
+        return match crate::sql::eval::eval(
+            e,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            &crate::sql::eval::NoColumns,
+        ) {
             Ok(Datum::Bool(b)) => Some(b),
             _ => None,
         };
     }
     match e {
-        Expr::Binary { operator: BinaryOp::And, left, right } => {
+        Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+        } => {
             if plan_time_bool(left, arena) == Some(false)
                 || plan_time_bool(right, arena) == Some(false)
             {
@@ -604,7 +745,11 @@ pub(super) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
                 None
             }
         }
-        Expr::Binary { operator: BinaryOp::Or, left, right } => {
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+        } => {
             if plan_time_bool(left, arena) == Some(true)
                 || plan_time_bool(right, arena) == Some(true)
             {
@@ -613,9 +758,10 @@ pub(super) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
                 None
             }
         }
-        Expr::Unary { operator: crate::sql::ast::UnaryOp::Not, operand } => {
-            plan_time_bool(operand, arena).map(|b| !b)
-        }
+        Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Not,
+            operand,
+        } => plan_time_bool(operand, arena).map(|b| !b),
         _ => None,
     }
 }
@@ -625,13 +771,24 @@ pub(super) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
 /// connective collapses to its constant. This exposes a nested AND to the
 /// top-level conjunct ordering — `(a AND b) OR const-false` orders `a`/`b` by
 /// cost just as PostgreSQL does after simplifying the OR away.
-pub(super) fn simplify_qual<'a>(e: &'a Expr<'a>, arena: &'a Arena) -> Result<&'a Expr<'a>, SqlError> {
+pub(super) fn simplify_qual<'a>(
+    e: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
     use crate::sql::ast::BinaryOp;
     if let Some(b) = plan_time_bool(e, arena) {
-        return Ok(if b { &Expr::Bool(true) } else { &Expr::Bool(false) });
+        return Ok(if b {
+            &Expr::Bool(true)
+        } else {
+            &Expr::Bool(false)
+        });
     }
     match e {
-        Expr::Binary { operator: operator @ (BinaryOp::And | BinaryOp::Or), left, right } => {
+        Expr::Binary {
+            operator: operator @ (BinaryOp::And | BinaryOp::Or),
+            left,
+            right,
+        } => {
             let keep_true = matches!(operator, BinaryOp::And);
             let l = simplify_qual(left, arena)?;
             let r = simplify_qual(right, arena)?;
@@ -647,7 +804,11 @@ pub(super) fn simplify_qual<'a>(e: &'a Expr<'a>, arena: &'a Arena) -> Result<&'a
                 e
             } else {
                 arena
-                    .alloc(Expr::Binary { operator: *operator, left: l, right: r })
+                    .alloc(Expr::Binary {
+                        operator: *operator,
+                        left: l,
+                        right: r,
+                    })
                     .map_err(|_| arena_full())?
             };
             if matches!(operator, BinaryOp::Or) {
@@ -659,33 +820,73 @@ pub(super) fn simplify_qual<'a>(e: &'a Expr<'a>, arena: &'a Arena) -> Result<&'a
         // to top-level conjunct ordering exactly as PostgreSQL's
         // `canonicalize_qual` does: `NOT (x OR y IS NOT NULL)` becomes
         // `NOT x AND y IS NULL`, so the cheap null test can filter first.
-        Expr::Unary { operator: crate::sql::ast::UnaryOp::Not, operand } => {
+        Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Not,
+            operand,
+        } => {
             let negated: &Expr = match *operand {
-                Expr::Binary { operator: BinaryOp::Or, left, right } => {
+                Expr::Binary {
+                    operator: BinaryOp::Or,
+                    left,
+                    right,
+                } => {
                     let nl = arena
-                        .alloc(Expr::Unary { operator: crate::sql::ast::UnaryOp::Not, operand: left })
+                        .alloc(Expr::Unary {
+                            operator: crate::sql::ast::UnaryOp::Not,
+                            operand: left,
+                        })
                         .map_err(|_| arena_full())?;
                     let nr = arena
-                        .alloc(Expr::Unary { operator: crate::sql::ast::UnaryOp::Not, operand: right })
+                        .alloc(Expr::Unary {
+                            operator: crate::sql::ast::UnaryOp::Not,
+                            operand: right,
+                        })
                         .map_err(|_| arena_full())?;
                     arena
-                        .alloc(Expr::Binary { operator: BinaryOp::And, left: nl, right: nr })
+                        .alloc(Expr::Binary {
+                            operator: BinaryOp::And,
+                            left: nl,
+                            right: nr,
+                        })
                         .map_err(|_| arena_full())?
                 }
-                Expr::Binary { operator: BinaryOp::And, left, right } => {
+                Expr::Binary {
+                    operator: BinaryOp::And,
+                    left,
+                    right,
+                } => {
                     let nl = arena
-                        .alloc(Expr::Unary { operator: crate::sql::ast::UnaryOp::Not, operand: left })
+                        .alloc(Expr::Unary {
+                            operator: crate::sql::ast::UnaryOp::Not,
+                            operand: left,
+                        })
                         .map_err(|_| arena_full())?;
                     let nr = arena
-                        .alloc(Expr::Unary { operator: crate::sql::ast::UnaryOp::Not, operand: right })
+                        .alloc(Expr::Unary {
+                            operator: crate::sql::ast::UnaryOp::Not,
+                            operand: right,
+                        })
                         .map_err(|_| arena_full())?;
                     arena
-                        .alloc(Expr::Binary { operator: BinaryOp::Or, left: nl, right: nr })
+                        .alloc(Expr::Binary {
+                            operator: BinaryOp::Or,
+                            left: nl,
+                            right: nr,
+                        })
                         .map_err(|_| arena_full())?
                 }
-                Expr::Unary { operator: crate::sql::ast::UnaryOp::Not, operand: inner } => inner,
-                Expr::IsNull { operand: inner, negated } => arena
-                    .alloc(Expr::IsNull { operand: inner, negated: !negated })
+                Expr::Unary {
+                    operator: crate::sql::ast::UnaryOp::Not,
+                    operand: inner,
+                } => inner,
+                Expr::IsNull {
+                    operand: inner,
+                    negated,
+                } => arena
+                    .alloc(Expr::IsNull {
+                        operand: inner,
+                        negated: !negated,
+                    })
                     .map_err(|_| arena_full())?,
                 // A comparison flips to its negator, as PostgreSQL's
                 // `negate_clause` does (exact under three-valued logic:
@@ -715,7 +916,11 @@ pub(super) fn simplify_qual<'a>(e: &'a Expr<'a>, arena: &'a Arena) -> Result<&'a
                         _ => unreachable!("matched comparisons only"),
                     };
                     arena
-                        .alloc(Expr::Binary { operator: negator, left, right })
+                        .alloc(Expr::Binary {
+                            operator: negator,
+                            left,
+                            right,
+                        })
                         .map_err(|_| arena_full())?
                 }
                 _ => return Ok(e),
@@ -741,7 +946,9 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         return 0;
     }
     let oid_of = |x: &Expr| -> Option<i32> {
-        crate::sql::exec::infer_type_res(x, &ScopeCols(scope)).ok().map(|t| t.0)
+        crate::sql::exec::infer_type_res(x, &ScopeCols(scope))
+            .ok()
+            .map(|t| t.0)
     };
     // Numeric-family promotion rank: the lower-ranked operand is the one
     // PostgreSQL casts (int → numeric → float8).
@@ -770,19 +977,39 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         }
     };
     match e {
-        Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | BitLit(_) | Param(_)
-        | DefaultMarker | Column { .. } | WholeRow(_) | SchemaColumn { .. } => 0,
-        Unary { operator: crate::sql::ast::UnaryOp::Not, operand } => postpone_cost(operand, scope, arena),
+        Null
+        | Bool(_)
+        | Int(_)
+        | Float(_)
+        | NumericLit(_)
+        | Str(_)
+        | BitLit(_)
+        | Param(_)
+        | DefaultMarker
+        | Column { .. }
+        | WholeRow(_)
+        | SchemaColumn { .. } => 0,
+        Unary {
+            operator: crate::sql::ast::UnaryOp::Not,
+            operand,
+        } => postpone_cost(operand, scope, arena),
         Unary { operand, .. } => postpone_cost(operand, scope, arena) + 2,
         IsNull { operand, .. } => postpone_cost(operand, scope, arena),
         Cast { operand, .. } => postpone_cost(operand, scope, arena) + 2,
-        Binary { operator: crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or, left, right } => {
-            postpone_cost(left, scope, arena) + postpone_cost(right, scope, arena)
-        }
+        Binary {
+            operator: crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or,
+            left,
+            right,
+        } => postpone_cost(left, scope, arena) + postpone_cost(right, scope, arena),
         Binary { left, right, .. } => {
-            postpone_cost(left, scope, arena) + postpone_cost(right, scope, arena) + 2 + coercion(left, right)
+            postpone_cost(left, scope, arena)
+                + postpone_cost(right, scope, arena)
+                + 2
+                + coercion(left, right)
         }
-        Between { operand, low, high, .. } => {
+        Between {
+            operand, low, high, ..
+        } => {
             postpone_cost(operand, scope, arena)
                 + postpone_cost(low, scope, arena)
                 + postpone_cost(high, scope, arena)
@@ -793,14 +1020,24 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         InList { operand, list, .. } => {
             // PostgreSQL rewrites a one-element IN to plain `=` (one operator);
             // longer lists cost half an operator per element (= ANY(array)).
-            let applications = if list.len() <= 1 { 2 } else { list.len() as u32 };
+            let applications = if list.len() <= 1 {
+                2
+            } else {
+                list.len() as u32
+            };
             postpone_cost(operand, scope, arena)
-                + list.iter().map(|x| postpone_cost(x, scope, arena)).sum::<u32>()
+                + list
+                    .iter()
+                    .map(|x| postpone_cost(x, scope, arena))
+                    .sum::<u32>()
                 + applications
         }
-        Like { operand, pattern, .. } | Match { operand, pattern, .. } => {
-            postpone_cost(operand, scope, arena) + postpone_cost(pattern, scope, arena) + 2
+        Like {
+            operand, pattern, ..
         }
+        | Match {
+            operand, pattern, ..
+        } => postpone_cost(operand, scope, arena) + postpone_cost(pattern, scope, arena) + 2,
         Call { name, args, .. } => {
             // GREATEST/LEAST/COALESCE unify their arguments' types, and
             // PostgreSQL charges one operator for each argument it has to cast
@@ -811,8 +1048,16 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             let unifying = name.eq_ignore_ascii_case("greatest")
                 || name.eq_ignore_ascii_case("least")
                 || name.eq_ignore_ascii_case("coalesce");
-            let node = if name.eq_ignore_ascii_case("coalesce") { 0 } else { 2 };
-            let mut c = args.iter().map(|a| postpone_cost(a, scope, arena)).sum::<u32>() + node;
+            let node = if name.eq_ignore_ascii_case("coalesce") {
+                0
+            } else {
+                2
+            };
+            let mut c = args
+                .iter()
+                .map(|a| postpone_cost(a, scope, arena))
+                .sum::<u32>()
+                + node;
             if unifying {
                 let unified = oid_of(e).and_then(rank);
                 for a in *args {
@@ -827,7 +1072,12 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             }
             c
         }
-        Case { operand, whens, otherwise, .. } => {
+        Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
             let mut c = operand.map_or(0, |o| postpone_cost(o, scope, arena));
             // Non-constant branch results whose type differs from the CASE's
             // unified result type carry an implicit cast, which PostgreSQL
@@ -867,7 +1117,9 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             c
         }
         Array(items) => items.iter().map(|x| postpone_cost(x, scope, arena)).sum(),
-        Subscript { base, index } => postpone_cost(base, scope, arena) + postpone_cost(index, scope, arena),
+        Subscript { base, index } => {
+            postpone_cost(base, scope, arena) + postpone_cost(index, scope, arena)
+        }
         Slice { base, lower, upper } => {
             postpone_cost(base, scope, arena)
                 + lower.map_or(0, |e| postpone_cost(e, scope, arena))
@@ -875,7 +1127,11 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         }
         Field { base, .. } => postpone_cost(base, scope, arena),
         AnyAll { operand, array, .. } => {
-            let elements = if let Array(items) = array { items.len() as u32 } else { 20 };
+            let elements = if let Array(items) = array {
+                items.len() as u32
+            } else {
+                20
+            };
             postpone_cost(operand, scope, arena) + postpone_cost(array, scope, arena) + elements
         }
         // Subqueries carry a subplan's cost in PostgreSQL and are postponed.

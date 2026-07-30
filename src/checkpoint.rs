@@ -863,6 +863,7 @@ impl Checkpointer {
             usize,
             ValueIndexHandle,
         )> = Vec::new();
+        let mut table_statistics: Vec<(usize, crate::storage::TableStatistics)> = Vec::new();
         let mut saw_end = false;
 
         for line in lines {
@@ -958,6 +959,83 @@ impl Checkpointer {
                         user_type_schema,
                     };
                     *seen += 1;
+                }
+                Some("stats") => {
+                    let table_index: usize = parse_field(words.next(), "stats table index")?;
+                    let rows: u64 = parse_field(words.next(), "stats rows")?;
+                    let average_row_width: u32 =
+                        parse_field(words.next(), "stats average row width")?;
+                    let analyzed_generation: u64 =
+                        parse_field(words.next(), "stats analyzed generation")?;
+                    if words.next().is_some()
+                        || table_statistics
+                            .iter()
+                            .any(|(existing, _)| *existing == table_index)
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate or malformed table statistics",
+                        ));
+                    }
+                    table_statistics.push((
+                        table_index,
+                        crate::storage::TableStatistics {
+                            valid: true,
+                            rows,
+                            average_row_width,
+                            analyzed_generation,
+                            columns: [crate::storage::ColumnStatistics::EMPTY;
+                                crate::storage::MAX_COLUMNS],
+                        },
+                    ));
+                }
+                Some("cstat") => {
+                    let table_index: usize = parse_field(words.next(), "cstat table index")?;
+                    let column: usize = parse_field(words.next(), "cstat column")?;
+                    if column >= crate::storage::MAX_COLUMNS {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "statistics column out of range",
+                        ));
+                    }
+                    let null_fraction_ppm: u32 = parse_field(words.next(), "cstat null fraction")?;
+                    if null_fraction_ppm > 1_000_000 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "statistics null fraction out of range",
+                        ));
+                    }
+                    let distinct_values: u64 = parse_field(words.next(), "cstat distinct values")?;
+                    let distinct_fraction_ppm: u32 =
+                        parse_field(words.next(), "cstat distinct fraction")?;
+                    if distinct_fraction_ppm > 1_000_000 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "statistics distinct fraction out of range",
+                        ));
+                    }
+                    let average_width: u32 = parse_field(words.next(), "cstat average width")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "malformed column statistics",
+                        ));
+                    }
+                    let Some((_, statistics)) = table_statistics
+                        .iter_mut()
+                        .find(|(existing, _)| *existing == table_index)
+                    else {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "column statistics precede table statistics",
+                        ));
+                    };
+                    if statistics.columns[column].valid {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate column statistics",
+                        ));
+                    }
+                    statistics.columns[column] = crate::storage::ColumnStatistics {
+                        valid: true,
+                        null_fraction_ppm,
+                        distinct_values,
+                        distinct_fraction_ppm,
+                        average_width,
+                    };
                 }
                 Some("tsch") => {
                     let Some((_, def, _, _)) = pending_def.as_mut() else {
@@ -1620,6 +1698,26 @@ impl Checkpointer {
                     ))
                 })?;
         }
+        for (manifest_index, statistics) in table_statistics {
+            let slot = slot_of.get(manifest_index).copied().flatten().ok_or(
+                CheckpointSetupError::Corrupt("statistics reference unknown table"),
+            )?;
+            if statistics.rows > usize::MAX as u64 {
+                return Err(CheckpointSetupError::Corrupt(
+                    "statistics row count exceeds addressable memory",
+                ));
+            }
+            let n_columns = storage.table(slot).def.n_columns;
+            if statistics.columns[n_columns..]
+                .iter()
+                .any(|column| column.valid)
+            {
+                return Err(CheckpointSetupError::Corrupt(
+                    "statistics reference a nonexistent column",
+                ));
+            }
+            storage.install_table_statistics(slot, statistics);
+        }
 
         storage
             .rebind_all_stored_query_dependencies()
@@ -1847,7 +1945,8 @@ impl Checkpointer {
         let sweep_due = self.sweeping
             || storage.lsn() != self.manifest_lsn
             || self.manifest_etag.is_none()
-            || self.merge_done.is_some();
+            || self.merge_done.is_some()
+            || storage.statistics_dirty();
         if merge_due && (self.merge_turn || !sweep_due) {
             self.merge_turn = false;
             self.merge_beat(storage)?;
@@ -2097,6 +2196,35 @@ impl Checkpointer {
                         c.name.as_str()
                     ),
                 )?;
+            }
+            if table.statistics.valid {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "stats {slot} {} {} {}",
+                        table.statistics.rows,
+                        table.statistics.average_row_width,
+                        table.statistics.analyzed_generation
+                    ),
+                )?;
+                for (column, statistics) in table.statistics.columns[..table.def.n_columns]
+                    .iter()
+                    .enumerate()
+                {
+                    if !statistics.valid {
+                        continue;
+                    }
+                    write_manifest(
+                        &mut self.manifest_buf,
+                        format_args!(
+                            "cstat {slot} {column} {} {} {} {}",
+                            statistics.null_fraction_ppm,
+                            statistics.distinct_values,
+                            statistics.distinct_fraction_ppm,
+                            statistics.average_width
+                        ),
+                    )?;
+                }
             }
             for (ci, c) in table.def.columns().iter().enumerate() {
                 if c.auto_increment {

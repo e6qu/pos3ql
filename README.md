@@ -99,6 +99,12 @@ Working single-node database:
   `SHOW` / `SET` / `SET LOCAL` / `RESET` /
   `RESET ALL` and `current_setting(...)` / `set_config(...)` for session
   settings (including savepoint rollback),
+  persistent `ANALYZE` table/column statistics exposed through `pg_class` and
+  `pg_stats` (including PostgreSQL's transactional column-statistics versus
+  in-place relation-estimate split), and storage-aware `EXPLAIN` /
+  `EXPLAIN ANALYZE` in text, JSON,
+  XML, and YAML (including cache/object `BUFFERS`, WAL, bounded planning
+  memory, and result-serialization measurements),
   PostgreSQL lexical rules, and SQLSTATE-correct errors.
 - COPY FROM STDIN / TO STDOUT (including `COPY (query) TO STDOUT`) over both
   the simple and extended query protocols, in

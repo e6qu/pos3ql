@@ -258,6 +258,47 @@ pub(crate) trait BlockStore {
 
     /// Whether the block is present without reading it.
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError>;
+
+    /// Cumulative provider-neutral I/O counters for this store stack.
+    ///
+    /// Every cache layer adds its own counters to the slower layers it wraps,
+    /// so callers can distinguish a RAM hit from a disk hit and a durable-tier
+    /// request without knowing which provider implements that durable tier.
+    /// Stores with no observable tier (the in-memory test store, for example)
+    /// keep the all-zero default.
+    fn io_stats(&self) -> BlockIoStats {
+        BlockIoStats::default()
+    }
+}
+
+/// Cumulative traffic through the tiered block stack.
+///
+/// These are execution telemetry, not durable database state. Losing them on
+/// restart changes only `EXPLAIN (ANALYZE, BUFFERS)` output and planner
+/// calibration, never query results or durability.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct BlockIoStats {
+    pub(crate) ram_hits: u64,
+    pub(crate) ram_misses: u64,
+    pub(crate) disk_hits: u64,
+    pub(crate) disk_misses: u64,
+    pub(crate) object_gets: u64,
+    pub(crate) object_puts: u64,
+    pub(crate) object_contains: u64,
+}
+
+impl BlockIoStats {
+    pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            ram_hits: self.ram_hits.saturating_sub(earlier.ram_hits),
+            ram_misses: self.ram_misses.saturating_sub(earlier.ram_misses),
+            disk_hits: self.disk_hits.saturating_sub(earlier.disk_hits),
+            disk_misses: self.disk_misses.saturating_sub(earlier.disk_misses),
+            object_gets: self.object_gets.saturating_sub(earlier.object_gets),
+            object_puts: self.object_puts.saturating_sub(earlier.object_puts),
+            object_contains: self.object_contains.saturating_sub(earlier.object_contains),
+        }
+    }
 }
 
 /// A block store's failures, kept separate from [`BlockError`] so a caller can

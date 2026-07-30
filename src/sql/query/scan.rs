@@ -131,12 +131,14 @@ fn indexed_candidates<'a>(
     {
         return Ok(None);
     }
-    let target_type = scope.defs[0].expect("physical table has definition").columns()[column].ctype;
+    let target_type = scope.defs[0]
+        .expect("physical table has definition")
+        .columns()[column]
+        .ctype;
     let raw = eval_full(constant, arena, params, &NoColumns, hooks)?;
     let raw_type = ColType::from_oid(raw.type_oid());
-    let integer = |column_type: ColType| {
-        matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8)
-    };
+    let integer =
+        |column_type: ColType| matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8);
     let integer_compatible = raw_type.is_some_and(integer) && integer(target_type);
     // An untyped string literal is coerced to the indexed column by the
     // equality operator. Already-typed constants are safe only when their
@@ -144,10 +146,7 @@ fn indexed_candidates<'a>(
     // one canonical hash). Declining other cross-type operators avoids, for
     // example, turning `integer_column = 1.1::numeric` into an index probe for
     // a rounded integer.
-    if !matches!(constant, Expr::Str(_))
-        && raw_type != Some(target_type)
-        && !integer_compatible
-    {
+    if !matches!(constant, Expr::Str(_)) && raw_type != Some(target_type) && !integer_compatible {
         return Ok(None);
     }
     let value = cast_to(raw, target_type, arena)?;
@@ -703,8 +702,9 @@ pub(crate) fn scan_source<'a>(
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
             let slot = scope.slots[order[depth]];
-            let candidates =
-                indexed.filter(|access| access.table == order[depth]).map(|access| access.rowids);
+            let candidates = indexed
+                .filter(|access| access.table == order[depth])
+                .map(|access| access.rowids);
             let count = candidates
                 .map(<[u64]>::len)
                 .unwrap_or(storage.visible_row_count(slot, txid)?);
@@ -905,7 +905,7 @@ pub(crate) fn scan_source<'a>(
     }
     let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
     let order: [usize; MAX_JOIN_TABLES] = if all_cross && !any_lateral {
-        join_order(scope, where_clause)
+        join_order(storage, scope, where_clause)
     } else {
         core::array::from_fn(|i| i)
     };

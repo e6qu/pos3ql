@@ -10,6 +10,7 @@ pub mod datetime;
 pub mod encoding;
 pub mod eval;
 pub mod exec;
+mod explain;
 pub mod guc;
 pub mod json;
 pub mod lexer;
@@ -41,7 +42,7 @@ use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{RowHome, RowLoc, Storage};
-use crate::wal::{Wal, WalOp, WalSetupError};
+use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 use crate::pg::conn::MAX_BIND_PARAMS;
 use ast::{Delete, Expr, Insert, Stmt, Update};
@@ -211,6 +212,9 @@ fn transaction_characteristics(text: &str) -> Result<TransactionCharacteristics,
 
 fn statement_writes(statement: &Stmt<'_>) -> bool {
     match statement {
+        Stmt::Explain { options, statement } => {
+            options.analyze && statement_writes(statement)
+        }
         Stmt::Select(_)
         | Stmt::SetQuery(_)
         | Stmt::Begin(_)
@@ -273,6 +277,16 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
     }
 }
 
+fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u64 {
+    match statement {
+        // PostgreSQL's ModifyTable node reports zero output rows even when its
+        // RETURNING projection sends rows to the client.
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => 0,
+        Stmt::With { statement, .. } => explained_root_rows(statement, emitted_rows),
+        _ => emitted_rows,
+    }
+}
+
 fn statement_changes_schema(statement: &Stmt<'_>) -> bool {
     matches!(
         statement,
@@ -305,6 +319,7 @@ fn statement_changes_schema(statement: &Stmt<'_>) -> bool {
 
 fn statement_tag(statement: &Stmt<'_>) -> &'static str {
     match statement {
+        Stmt::Explain { statement, .. } => statement_tag(statement),
         Stmt::With { statement, .. } => statement_tag(statement),
         Stmt::LockTable { .. } => "LOCK TABLE",
         Stmt::Insert(_) => "INSERT",
@@ -520,9 +535,7 @@ impl Engine {
         // rolled-back transaction left dirty): absolute positions, so replay
         // is idempotent.
         for i in 0..self.storage.table_count() {
-            if !self.storage.table(i).serial_dirty
-                || !self.storage.table(i).visible_to(txn.txid)
-            {
+            if !self.storage.table(i).serial_dirty || !self.storage.table(i).visible_to(txn.txid) {
                 continue;
             }
             let def = *self.storage.table_def(i, txn.txid);
@@ -579,6 +592,37 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        // pg_statistic column rows are transactional, but PostgreSQL updates
+        // pg_class reltuples/relpages in place. A later commit therefore also
+        // journals relation statistics left dirty by a rolled-back ANALYZE.
+        // In either case the final image crosses the same provider-neutral
+        // WAL/object-store durability boundary as every other catalog change.
+        for slot in 0..self.storage.table_count() {
+            if !self.storage.table(slot).visible_to(txn.txid) {
+                continue;
+            }
+            let pending = self.storage.pending_table_statistics(slot, txn.txid);
+            if pending.is_none() && !self.storage.statistics_wal_dirty(slot) {
+                continue;
+            }
+            let statistics =
+                pending.unwrap_or_else(|| self.storage.table_statistics(slot, txn.txid));
+            let definition = *self.storage.table_def(slot, txn.txid);
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::Analyze {
+                    schema: definition.schema.as_str(),
+                    table: definition.name.as_str(),
+                    statistics: crate::wal::WalTableStatistics::Captured(&statistics),
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         let commit_lsn = match self.wal.commit_stage(txn.txid, self.storage.lsn()) {
             Ok(lsn) => lsn,
             Err(error) => {
@@ -600,6 +644,17 @@ impl Engine {
             let sequence = self.storage.sequence(i);
             if sequence.visible_to(txn.txid) {
                 sequence.dirty.set(false);
+            }
+        }
+        for slot in 0..self.storage.table_count() {
+            if self.storage.table(slot).visible_to(txn.txid)
+                && (self
+                    .storage
+                    .pending_table_statistics(slot, txn.txid)
+                    .is_some()
+                    || self.storage.statistics_wal_dirty(slot))
+            {
+                self.storage.clear_statistics_wal_dirty(slot);
             }
         }
         // One fsync per transaction, before any promotion: this is the
@@ -750,6 +805,9 @@ impl Engine {
                 }
             }
         }
+        for slot in 0..self.storage.table_count() {
+            self.storage.commit_table_statistics(slot, txn.txid);
+        }
         // Past the durability point, so these fire iff the transaction really
         // committed: apply its LISTEN/UNLISTEN to the shared registry and move
         // its notifications into the delivery outbox. A pool-exhaustion here is
@@ -891,6 +949,10 @@ impl Engine {
         for &undo in txn.ddl().iter().rev() {
             self.rollback_ddl(undo, txn.txid);
         }
+        for undo in txn.statistics_undo().iter().rev() {
+            self.storage
+                .rollback_table_statistics(undo.table as usize, txn.txid);
+        }
         self.wal.discard_stage(txn.txid);
         guc.rollback_transaction();
         txn.clear();
@@ -910,8 +972,14 @@ impl Engine {
         for i in (sp.ddl_mark..txn.ddl().len()).rev() {
             self.rollback_ddl(txn.ddl()[i], txn.txid);
         }
+        for i in (sp.statistics_mark..txn.statistics_undo().len()).rev() {
+            let undo = txn.statistics_undo()[i];
+            self.storage
+                .rollback_table_statistics(undo.table as usize, txn.txid);
+        }
         txn.rewind_touched(sp.touched_mark);
         txn.rewind_ddl(sp.ddl_mark);
+        txn.rewind_statistics(sp.statistics_mark);
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
         txn.rollback_savepoints_after(index);
         self.wal.truncate_stage(txn.txid, sp.wal_mark);
@@ -969,27 +1037,11 @@ impl Engine {
         self.ckpt.is_some()
     }
 
-    fn analyze_targets(
+    fn validate_maintenance_targets(
         &self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
-    ) -> Result<usize, SqlError> {
-        let mut total_rows = 0usize;
-        if targets.is_empty() {
-            for slot in 0..self.storage.table_count() {
-                if self.storage.table(slot).visible_to(txid) {
-                    total_rows = total_rows
-                        .checked_add(self.storage.visible_row_count(slot, txid)?)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "ANALYZE row count exceeds addressable memory"
-                            )
-                        })?;
-                }
-            }
-            return Ok(total_rows);
-        }
+    ) -> Result<(), SqlError> {
         for target in targets {
             let slot = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
             let definition = self.storage.table_def(slot, txid);
@@ -1007,14 +1059,46 @@ impl Engine {
                     ));
                 }
             }
-            total_rows = total_rows
-                .checked_add(self.storage.visible_row_count(slot, txid)?)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "ANALYZE row count exceeds addressable memory"
-                    )
-                })?;
+        }
+        Ok(())
+    }
+
+    fn analyze_targets(
+        &mut self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txn: &mut TxnState,
+    ) -> Result<u64, SqlError> {
+        self.validate_maintenance_targets(targets, txn.txid)?;
+        let mut total_rows = 0u64;
+        if targets.is_empty() {
+            for slot in 0..self.storage.table_count() {
+                if self.storage.table(slot).visible_to(txn.txid) {
+                    txn.record_statistics(slot as u32)?;
+                    total_rows = total_rows
+                        .saturating_add(self.storage.analyze_table(slot, txn.txid, &[])?.rows);
+                }
+            }
+            return Ok(total_rows);
+        }
+        for target in targets {
+            let slot = exec::resolve_dml_table(&self.storage, &target.table, txn.txid)?;
+            let definition = self.storage.table_def(slot, txn.txid);
+            let mut selected = [0usize; crate::storage::MAX_COLUMNS];
+            let mut selected_count = 0usize;
+            for column in target.columns {
+                selected[selected_count] = definition
+                    .columns()
+                    .iter()
+                    .position(|metadata| metadata.name.as_str() == *column)
+                    .expect("maintenance targets were validated");
+                selected_count += 1;
+            }
+            txn.record_statistics(slot as u32)?;
+            total_rows = total_rows.saturating_add(
+                self.storage
+                    .analyze_table(slot, txn.txid, &selected[..selected_count])?
+                    .rows,
+            );
         }
         Ok(total_rows)
     }
@@ -1423,6 +1507,9 @@ impl Engine {
             }
         };
         match statement {
+            Stmt::Explain { statement, .. } => {
+                self.infer_stmt_params(statement, txid, oids);
+            }
             Stmt::With { ctes, statement } => {
                 for cte in *ctes {
                     match cte.dml {
@@ -1669,6 +1756,10 @@ impl Engine {
             }
         };
         match &statement {
+            Stmt::Explain { .. } => {
+                responder.row_description(&[ColDesc::new("QUERY PLAN", types::oid::TEXT, -1)])?;
+                Ok(true)
+            }
             Stmt::With { statement, .. } => {
                 self.describe_data_modification(statement, arena, txn, responder)
             }
@@ -2090,6 +2181,217 @@ impl Engine {
         }
     }
 
+    fn execute_select(
+        &mut self,
+        statement: &ast::Select<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let dml_mats = match self.run_dml_ctes(statement.with, txn, arena, params, guc, responder) {
+            Ok(materialized) => materialized.unwrap_or(&[]),
+            Err(error) => return Ok(Err(error)),
+        };
+        let statement = match query::expand_ctes_exec(
+            statement,
+            &self.storage,
+            txn.txid,
+            &self.work,
+            params,
+            dml_mats,
+        ) {
+            Ok(expanded) => expanded,
+            Err(error) => return Ok(Err(error)),
+        };
+        if let Err(error) = query::validate_locking(statement) {
+            return Ok(Err(error));
+        }
+        let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+        if statement.from.is_none() {
+            query::constant_select(
+                &self.storage,
+                txn.txid,
+                statement,
+                &self.work,
+                params,
+                Some(&sequence),
+                responder,
+            )
+        } else {
+            query::select_query(
+                &self.storage,
+                txn.txid,
+                statement,
+                &self.work,
+                params,
+                Some(&sequence),
+                responder,
+            )
+        }
+    }
+
+    fn execute_explained_statement(
+        &mut self,
+        statement: &Stmt<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        match statement {
+            Stmt::Select(select) => self.execute_select(select, arena, params, txn, guc, responder),
+            Stmt::SetQuery(query) => query::set_query(
+                &self.storage,
+                txn.txid,
+                query,
+                &self.work,
+                params,
+                responder,
+            ),
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
+                &mut self.storage,
+                &mut self.scratch,
+                &self.work,
+                statement,
+                txn,
+                params,
+                guc,
+                responder,
+                None,
+            ),
+            Stmt::Merge(merge) => exec::merge(
+                &mut self.storage,
+                txn,
+                &mut self.scratch,
+                merge,
+                &self.work,
+                params,
+                guc.seq_session(),
+                responder,
+            ),
+            Stmt::With { ctes, statement } => self.execute_with_data_modification(
+                ctes, statement, arena, params, txn, guc, responder,
+            ),
+            _ => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN does not support this statement type"
+            ))),
+        }
+    }
+
+    /// Expands and executes the data-modifying main statement of a WITH.
+    /// EXPLAIN ANALYZE and ordinary execution share this choke point so CTE
+    /// materialization, snapshot visibility, and DML dispatch cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_data_modification<'a>(
+        &mut self,
+        ctes: &'a [ast::Cte<'a>],
+        statement: &'a Stmt<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        txn: &mut TxnState,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let dml_mats = match self.run_dml_ctes(ctes, txn, arena, params, guc, responder) {
+            Ok(materialized) => materialized.unwrap_or(&[]),
+            Err(error) => return Ok(Err(error)),
+        };
+        let statement = match query::expand_dml_ctes(
+            statement,
+            ctes,
+            &self.storage,
+            txn.txid,
+            &self.work,
+            params,
+            dml_mats,
+        ) {
+            Ok(expanded) => expanded,
+            Err(error) => return Ok(Err(error)),
+        };
+        match statement {
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                Self::execute_data_modification(
+                    &mut self.storage,
+                    &mut self.scratch,
+                    &self.work,
+                    statement,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    None,
+                )
+            }
+            Stmt::Merge(merge) => exec::merge(
+                &mut self.storage,
+                txn,
+                &mut self.scratch,
+                merge,
+                &self.work,
+                params,
+                guc.seq_session(),
+                responder,
+            ),
+            _ => Ok(Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "WITH expanded to a non-data-modifying statement"
+            ))),
+        }
+    }
+
+    /// Counts the row-journal records produced by writes since `touched_mark`.
+    ///
+    /// Row DML is retained as transaction-private heap state and encoded into
+    /// WAL at commit, unlike DDL records that enter the private WAL stage
+    /// immediately. Measuring the final row images through the production WAL
+    /// codec reports those real pending bytes without changing publication or
+    /// object-store durability semantics.
+    fn explained_row_wal_stats(
+        &self,
+        txn: &TxnState,
+        touched_mark: usize,
+    ) -> Result<(u64, u64), SqlError> {
+        let touched = txn.touched();
+        let mut records = 0u64;
+        let mut bytes = 0u64;
+        for index in touched_mark..touched.len() {
+            let (table, rowid, _) = touched[index];
+            if touched[touched_mark..index]
+                .iter()
+                .any(|&(prior_table, prior_rowid, _)| prior_table == table && prior_rowid == rowid)
+            {
+                continue;
+            }
+            let Some(state) = self.storage.row_state(table as usize, rowid)? else {
+                continue;
+            };
+            let Some(pending) = state.pending.last() else {
+                continue;
+            };
+            let table_definition = self.storage.table_def(table as usize, txn.txid);
+            let operation = match pending.loc {
+                Some(location) => WalOp::Upsert {
+                    schema: table_definition.schema.as_str(),
+                    table: table_definition.name.as_str(),
+                    rowid,
+                    row: self.storage.heap.get(location),
+                },
+                None => WalOp::Delete {
+                    schema: table_definition.schema.as_str(),
+                    table: table_definition.name.as_str(),
+                    rowid,
+                },
+            };
+            records = records.saturating_add(1);
+            bytes = bytes.saturating_add(encoded_record_len(&operation) as u64);
+        }
+        Ok((records, bytes))
+    }
+
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
@@ -2267,106 +2569,96 @@ impl Engine {
         };
         self.storage.set_commit_snapshot(commit_snapshot);
         match statement {
-            Stmt::With { ctes, statement } => {
-                let dml_mats = match self.run_dml_ctes(ctes, txn, arena, params, guc, responder) {
-                    Ok(materialized) => materialized.unwrap_or(&[]),
-                    Err(error) => return Ok(Err(error)),
-                };
-                let statement = match query::expand_dml_ctes(
-                    statement,
-                    ctes,
-                    &self.storage,
-                    txn.txid,
-                    &self.work,
-                    params,
-                    dml_mats,
-                ) {
-                    Ok(expanded) => expanded,
-                    Err(error) => return Ok(Err(error)),
-                };
-                match statement {
-                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                        Self::execute_data_modification(
-                            &mut self.storage,
-                            &mut self.scratch,
-                            &self.work,
-                            statement,
-                            txn,
-                            params,
-                            guc,
-                            responder,
-                            None,
-                        )
+            Stmt::Explain { options, statement } => {
+                let plan = match statement {
+                    Stmt::Select(select) => {
+                        let planned_select = if select.with.is_empty() {
+                            select
+                        } else {
+                            match query::expand_ctes(select, &self.storage, txn.txid, arena) {
+                                Ok(expanded) => expanded,
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        };
+                        explain::plan_select(&self.storage, txn.txid, planned_select, arena)
                     }
-                    Stmt::Merge(merge) => exec::merge(
-                        &mut self.storage,
-                        txn,
-                        &mut self.scratch,
-                        merge,
-                        &self.work,
-                        params,
-                        guc.seq_session(),
-                        responder,
-                    ),
-                    _ => Ok(Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "WITH expanded to a non-data-modifying statement"
-                    ))),
-                }
-            }
-            Stmt::Select(s) => {
-                // Data-modifying CTEs run once here (capturing RETURNING) under
-                // this statement's command snapshot, before the main query.
-                let dml_mats = match self.run_dml_ctes(s.with, txn, arena, params, guc, responder) {
-                    Ok(m) => m.unwrap_or(&[]),
-                    Err(e) => return Ok(Err(e)),
+                    Stmt::SetQuery(set_query) => {
+                        let body = match query::expand_set_tree(
+                            set_query.with,
+                            set_query.body,
+                            &self.storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(body) => body,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let planned = ast::SetQuery {
+                            with: &[],
+                            body,
+                            ..*set_query
+                        };
+                        explain::plan_set_query(&self.storage, txn.txid, &planned, arena)
+                    }
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+                        explain::plan_modification(&self.storage, txn.txid, statement, arena)
+                    }
+                    Stmt::With { statement, .. } => {
+                        explain::plan_modification(&self.storage, txn.txid, statement, arena)
+                    }
+                    _ => Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN does not support this statement type"
+                    )),
                 };
-                // WITH CTEs expand into derived tables before execution; a
-                // recursive CTE is materialized to its fixpoint in the work
-                // arena (reset per statement, sized for row data).
-                let s = match query::expand_ctes_exec(
-                    s,
-                    &self.storage,
-                    txn.txid,
-                    &self.work,
-                    params,
-                    dml_mats,
-                ) {
-                    Ok(x) => x,
-                    Err(e) => return Ok(Err(e)),
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => return Ok(Err(error)),
                 };
-                // FOR UPDATE / FOR SHARE row-locking clauses: enforce their
-                // analysis-time restrictions (0A000 / 42P01) before executing.
-                if let Err(e) = query::validate_locking(s) {
-                    return Ok(Err(e));
-                }
-                // Execution (row materialization) uses the shared work arena;
-                // the parsed AST (`s`, `params`) lives in the per-connection
-                // arena, which outlives it — so the work arena can be reset
-                // per statement while the AST persists across the message.
-                let seq = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                if s.from.is_none() {
-                    query::constant_select(
-                        &self.storage,
-                        txn.txid,
-                        s,
-                        &self.work,
-                        params,
-                        Some(&seq),
-                        responder,
-                    )
+                let actual = if options.analyze {
+                    let before = self.storage.block_io_stats();
+                    let (before_wal_records, before_wal_bytes) = self.wal.stage_stats(txn.txid);
+                    let touched_mark = txn.touched().len();
+                    let started = std::time::Instant::now();
+                    responder.begin_discard_query_output(options.serialize);
+                    let execution = self
+                        .execute_explained_statement(statement, arena, params, txn, guc, responder);
+                    let output = responder.finish_discard_query_output();
+                    match execution {
+                        Err(wire) => return Err(wire),
+                        Ok(Err(error)) => return Ok(Err(error)),
+                        Ok(Ok(())) => {}
+                    }
+                    let elapsed_micros =
+                        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    let (after_wal_records, after_wal_bytes) = self.wal.stage_stats(txn.txid);
+                    let (row_wal_records, row_wal_bytes) =
+                        match self.explained_row_wal_stats(txn, touched_mark) {
+                            Ok(stats) => stats,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    Some(explain::ExplainActual {
+                        rows: explained_root_rows(statement, output.rows),
+                        elapsed_micros,
+                        io: self.storage.block_io_stats().saturating_sub(before),
+                        serialized_bytes: output.serialized_bytes,
+                        serialization_micros: output.serialization_micros,
+                        wal_records: after_wal_records
+                            .saturating_sub(before_wal_records)
+                            .saturating_add(row_wal_records),
+                        wal_bytes: after_wal_bytes
+                            .saturating_sub(before_wal_bytes)
+                            .saturating_add(row_wal_bytes),
+                    })
                 } else {
-                    query::select_query(
-                        &self.storage,
-                        txn.txid,
-                        s,
-                        &self.work,
-                        params,
-                        Some(&seq),
-                        responder,
-                    )
-                }
+                    None
+                };
+                explain::emit_plan(&plan, *options, actual, responder)
             }
+            Stmt::With { ctes, statement } => self.execute_with_data_modification(
+                ctes, statement, arena, params, txn, guc, responder,
+            ),
+            Stmt::Select(s) => self.execute_select(s, arena, params, txn, guc, responder),
             Stmt::SetQuery(q) => {
                 query::set_query(&self.storage, txn.txid, q, &self.work, params, responder)
             }
@@ -3101,11 +3393,13 @@ impl Engine {
             // the whole store, which subsumes any named table. Without object
             // storage there is nothing to compact to, and — as VACUUM on a
             // table with nothing to reclaim does in PostgreSQL — it succeeds.
-            Stmt::Vacuum {
-                targets,
-                analyze: _,
-            } => {
-                if let Err(error) = self.analyze_targets(targets, txn.txid) {
+            Stmt::Vacuum { targets, analyze } => {
+                let validation = if *analyze {
+                    self.analyze_targets(targets, txn).map(|_| ())
+                } else {
+                    self.validate_maintenance_targets(targets, txn.txid)
+                };
+                if let Err(error) = validation {
                     return Ok(Err(error));
                 }
                 if self.ckpt.is_some()
@@ -3116,13 +3410,11 @@ impl Engine {
                 responder.command_complete("VACUUM")?;
                 Ok(Ok(()))
             }
-            // Cardinalities are exact live state rather than sampled,
-            // periodically stale statistics. ANALYZE still resolves every
-            // requested relation/column and walks its visible row state, so it
-            // detects inaccessible/corrupt backing data instead of silently
-            // accepting and ignoring the command.
+            // ANALYZE resolves every requested relation/column and walks its
+            // MVCC-visible row state. Cardinality and widths are exact for that
+            // snapshot; distinct counts use the fixed-size estimator.
             Stmt::Analyze(targets) => {
-                if let Err(error) = self.analyze_targets(targets, txn.txid) {
+                if let Err(error) = self.analyze_targets(targets, txn) {
                     return Ok(Err(error));
                 }
                 responder.command_complete("ANALYZE")?;
@@ -3539,6 +3831,20 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             if (column as usize) < crate::storage::MAX_COLUMNS {
                 t.serial_last[column as usize] = last;
             }
+        }
+        WalOp::Analyze {
+            schema,
+            table,
+            statistics,
+        } => {
+            let Some(index) = storage.find_table(schema, table) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal analyzes unknown table \"{}\"",
+                    table
+                ));
+            };
+            storage.replay_table_statistics(index, statistics.materialize()?);
         }
         WalOp::DropTable { schema, name } => {
             let Some(index) = storage.find_table(schema, name) else {

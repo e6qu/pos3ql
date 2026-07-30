@@ -87,14 +87,33 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            // `expression COLLATE collation`: we implement a single (default)
-            // collation, so the clause is accepted and has no effect.
+            // The engine's fixed UTF-8 C locale has bytewise ordering. Accept
+            // only PostgreSQL names with the same semantics; locale-aware
+            // collations need first-class collation keys.
             if self.peeked == Tok::Ident("collate") {
                 self.advance()?;
-                // Skip an optional schema-qualified collation name.
-                let _ = self.any_ident("collation name")?;
+                let first = self.any_ident("collation name")?;
+                let mut schema = None;
+                let mut name = first;
                 if self.eat_op(".")? {
-                    let _ = self.any_ident("collation name")?;
+                    schema = Some(first);
+                    name = self.any_ident("collation name")?;
+                }
+                let catalog = schema.is_none_or(|value| value.eq_ignore_ascii_case("pg_catalog"));
+                let bytewise = name.eq_ignore_ascii_case("c")
+                    || name.eq_ignore_ascii_case("posix")
+                    || name.eq_ignore_ascii_case("default")
+                    || name.eq_ignore_ascii_case("ucs_basic");
+                if !catalog || !bytewise {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: crate::stack_format!(
+                            96,
+                            "collation \"{}\" is not supported by the C-locale executor",
+                            name
+                        ),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
                 }
                 continue;
             }

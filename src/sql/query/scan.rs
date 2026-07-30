@@ -709,6 +709,48 @@ fn scan_source_mode<'a>(
                     return Ok(false);
                 }
             }
+        } else if let Some(run) = scope.external_runs[order[depth]] {
+            let mut reader = storage.external_run_reader()?;
+            let mut index = 0usize;
+            storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("external run has a block store")?;
+            loop {
+                let keep_scanning = {
+                    let Some(bytes) = reader.row() else { break };
+                    check_timeout()?;
+                    let this = index;
+                    index += 1;
+                    recycled(arena, recycle_rows, || {
+                        // The cursor replaces its row buffer on advance, so
+                        // deeper join levels retain this row in recycling
+                        // statement storage only for the callback's lifetime.
+                        let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                        bound[order[depth]] = Some(owned);
+                        if !candidate_passes(
+                            scope, bound, order, depth + 1, on, pushdown[depth],
+                            decode_buffers, arena, params, hooks, outer,
+                        )? {
+                            return Ok(true);
+                        }
+                        matched_any = true;
+                        if let Some(matched_rows) = matched[depth] {
+                            matched_rows[this].set(true);
+                        }
+                        level(
+                            storage, scope, from, txid, where_clause, arena, params, hooks,
+                            outer, depth + 1, bound, matched, pushdown, order, indexed,
+                            decode_buffers, recycle_rows, f,
+                        )
+                    })
+                }?;
+                if !keep_scanning {
+                    return Ok(false);
+                }
+                storage
+                    .with_block_store(|blocks| reader.advance(blocks))
+                    .expect("external run has a block store")?;
+            }
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
@@ -894,7 +936,9 @@ fn scan_source_mode<'a>(
             continue;
         }
         let t = i + 1;
-        let n_rows = if let Some(rows) = scope.derived[t] {
+        let n_rows = if let Some(run) = scope.external_runs[t] {
+            usize::try_from(run.rows()).map_err(|_| arena_full())?
+        } else if let Some(rows) = scope.derived[t] {
             rows.len()
         } else {
             storage.visible_row_count(scope.slots[t], txid)?
@@ -1060,7 +1104,34 @@ fn scan_source_mode<'a>(
                 f,
             )
         };
-        if let Some(rows) = scope.derived[d] {
+        if let Some(run) = scope.external_runs[d] {
+            let mut reader = storage.external_run_reader()?;
+            let mut index = 0usize;
+            storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("external run has a block store")?;
+            loop {
+                let keep_scanning = {
+                    let Some(bytes) = reader.row() else { break };
+                    let this = index;
+                    index += 1;
+                    recycled(arena, recycle_rows, || {
+                        if m[this].get() {
+                            Ok(true)
+                        } else {
+                            let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                            emit_unmatched(owned, f)
+                        }
+                    })
+                }?;
+                if !keep_scanning {
+                    return Ok(());
+                }
+                storage
+                    .with_block_store(|blocks| reader.advance(blocks))
+                    .expect("external run has a block store")?;
+            }
+        } else if let Some(rows) = scope.derived[d] {
             for (index, bytes) in rows.iter().enumerate() {
                 let keep_scanning = recycled(arena, recycle_rows, || {
                     if m[index].get() { Ok(true) } else { emit_unmatched(bytes, f) }

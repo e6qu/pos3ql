@@ -189,10 +189,15 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   indexes, schemas, sequences, domains, and enums all participate in
   transactional catalog MVCC and savepoint rollback. A concurrent DDL change
   to the same object reports `40001` rather than blocking on a catalog lock.
-- **Sorts are bounded by a `work_mem` analogue.** `ORDER BY` / `DISTINCT` /
-  `GROUP BY` materialize in a fixed shared arena (`work_arena_bytes`, 64 MiB
-  default — larger than PostgreSQL's 4 MiB default `work_mem`). A result that
-  exceeds it errors `54000` rather than spilling to temporary files (B-006).
+- **Materializing operators use a `work_mem` analogue.** In durable mode,
+  top-level `ORDER BY`, `DISTINCT`, and `DISTINCT ON` spill into immutable
+  runs through the provider-neutral object-store block stack; RAM and local
+  disk only cache those blocks. Non-lateral derived tables, CTEs, and views
+  retain their rows in the same external runs. Grouped aggregates, set
+  operations, windows, scalar/list subqueries, recursive/lateral row sources,
+  and outer-join match state still retain their working sets in the fixed
+  shared arena (`work_arena_bytes`, 64 MiB default). Exceeding that remaining
+  bound errors `54000`, never truncates a result (B-006).
 - **A checkpoint beat blocks for one table's write.** The auto-checkpoint is
   sliced — one table's SSTs per beat, beats interleaved with statements and
   driven on by the idle event loop, publishing only when no table changed

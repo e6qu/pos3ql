@@ -138,6 +138,7 @@ pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeri
 mod projected;
 pub(crate) use projected::{
     compare_projected_prefix, encode_projected_by, encode_projected_by_into,
+    encode_projected_into,
     projected_row_len_by, projected_row_width,
 };
 pub use projected::{

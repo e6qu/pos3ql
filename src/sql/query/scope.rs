@@ -57,6 +57,10 @@ pub struct QueryScope<'d> {
     /// self-describing-encoded. `None` marks a physical table (scanned from
     /// storage by `slots`).
     pub derived: &'d mut [Option<&'d [&'d [u8]]>],
+    /// Object-backed derived rows. `derived` remains `Some` for these entries
+    /// so decoding and relation-kind checks take the derived-table path; the
+    /// empty arena slice is only a marker, not the row authority.
+    pub(crate) external_runs: &'d mut [Option<crate::sql::external::ExternalRun>],
     /// A `LATERAL` FROM item: its rows depend on the outer row, so they are
     /// **not** pre-materialized (`derived` holds an empty placeholder). The
     /// scan re-runs the item's body per outer row, resolving its outer column
@@ -144,6 +148,9 @@ impl<'d> QueryScope<'d> {
         let derived = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
+        let external_runs = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let lateral = arena
             .alloc_slice_with(table_count, |_| false)
             .map_err(|_| arena_full())?;
@@ -176,6 +183,7 @@ impl<'d> QueryScope<'d> {
             defs,
             slots,
             derived,
+            external_runs,
             lateral,
             func_scalar,
             n: 0,
@@ -344,38 +352,84 @@ impl<'d> QueryScope<'d> {
             return Ok(());
         }
         let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
-        // Materialize the subquery rows, self-describing-encoded, into a
-        // doubling arena vector.
-        const EMPTY: &[u8] = &[];
-        let mut store: *mut &[u8] = core::ptr::null_mut();
-        let mut len = 0usize;
-        let mut cap = 0usize;
-        select_into_rows(storage, txid, sub, arena, params, None, None, &mut |vals| {
-            let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
-            if len == cap {
-                let new_cap = if cap == 0 { 8 } else { cap * 2 };
-                let fresh: &mut [&[u8]] = arena
-                    .alloc_slice_with(new_cap, |_| EMPTY)
-                    .map_err(|_| arena_full())?;
-                if len > 0 {
-                    let old = unsafe { core::slice::from_raw_parts(store, len) };
-                    fresh[..len].copy_from_slice(old);
-                }
-                store = fresh.as_mut_ptr();
-                cap = new_cap;
-            }
-            unsafe { store.add(len).write(enc) };
-            len += 1;
-            Ok(())
-        })?;
-        let rows: &'a [&'a [u8]] = if len == 0 {
-            &[]
+        let rows: &'a [&'a [u8]];
+        let external_run;
+        if storage.spill_attached() {
+            // A stable all-equal sort is an insertion-order spool. Resetting
+            // one leased producer cannot disturb a nested child's producer.
+            let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
+            let mut sorter = storage.external_sorter()?;
+            sorter.reset();
+            select_into_rows(
+                storage,
+                txid,
+                sub,
+                arena,
+                params,
+                None,
+                None,
+                &mut |values| {
+                    storage
+                        .with_block_store(|blocks| {
+                            sorter.push_projected_by(
+                                blocks,
+                                values.len(),
+                                |column| values[column],
+                                &mut compare,
+                            )
+                        })
+                        .expect("spill-attached block store")
+                },
+            )?;
+            external_run = storage
+                .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+                .expect("spill-attached block store")?;
+            rows = &[];
         } else {
-            unsafe { core::slice::from_raw_parts(store, len) }
-        };
+            // Local-only mode has no authoritative external tier: retain the
+            // existing arena representation and fail loudly at its bound.
+            const EMPTY: &[u8] = &[];
+            let mut store: *mut &[u8] = core::ptr::null_mut();
+            let mut len = 0usize;
+            let mut cap = 0usize;
+            select_into_rows(
+                storage,
+                txid,
+                sub,
+                arena,
+                params,
+                None,
+                None,
+                &mut |values| {
+                    let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
+                    if len == cap {
+                        let new_cap = if cap == 0 { 8 } else { cap * 2 };
+                        let fresh: &mut [&[u8]] = arena
+                            .alloc_slice_with(new_cap, |_| EMPTY)
+                            .map_err(|_| arena_full())?;
+                        if len > 0 {
+                            let old = unsafe { core::slice::from_raw_parts(store, len) };
+                            fresh[..len].copy_from_slice(old);
+                        }
+                        store = fresh.as_mut_ptr();
+                        cap = new_cap;
+                    }
+                    unsafe { store.add(len).write(encoded) };
+                    len += 1;
+                    Ok(())
+                },
+            )?;
+            rows = if len == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(store, len) }
+            };
+            external_run = None;
+        }
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
+        self.external_runs[self.n] = external_run;
         self.slots[self.n] = usize::MAX;
         self.n += 1;
         Ok(())

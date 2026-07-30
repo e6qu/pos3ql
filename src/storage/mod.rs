@@ -809,7 +809,7 @@ impl RowHeap {
         if self.buffer.len() - self.used < len {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "memtable is full ({} bytes); with object storage on, rows spill at the next checkpoint — retry, raise memtable_bytes, or enable s3",
+                "memtable is full ({} bytes); with object storage on, rows spill at the next checkpoint — retry, raise memtable_bytes, or enable object storage",
                 self.buffer.len()
             ));
         }
@@ -1959,16 +1959,22 @@ pub(crate) struct SpillReader {
     /// Independent buffers for persistent value probes. A probe may invoke an
     /// authoritative spilled-row recheck, so it must not borrow row scratch.
     value_scratch: [std::cell::RefCell<ValueIndexScratch>; 2],
-    /// One statement at a time may build immutable external execution runs.
-    /// Its buffers and merge fan-in are fixed at startup; run blocks travel
+    /// Nested materializers lease independent external-run producers. Their
+    /// buffers and merge fan-in are fixed at startup; run blocks travel
     /// through `blocks`, never a provider-specific path.
-    external: std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
+    external_sorters:
+        Box<[std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>]>,
+    /// Immutable-run cursors leased by nested materialized row sources.
+    /// Their scratch is independent from the sorter, so consuming a completed
+    /// run never prevents a deeper operator from producing another.
+    external_readers: Box<[std::cell::RefCell<crate::sql::external::ExternalRunReader>]>,
 }
 
 /// A row-state walk releases its block context before invoking its callback.
 /// Nested joins therefore share one context; an ownership token invalidates
 /// resident-block markers if the callback's nested walk reused it.
 const SCAN_CONTEXTS: usize = 1;
+const EXTERNAL_RUN_CONTEXTS: usize = 8;
 
 /// One merged walk's working memory: the current data block per member and
 /// a shared buffer for index-block navigation on block advances.
@@ -2037,7 +2043,27 @@ impl SpillReader {
             4 * crate::store::MAX_PAYLOAD,
             "persistent value-index readers",
         )?;
-        let external = Box::new(crate::sql::external::ExternalSorter::new(budget)?);
+        budget.draw_array(
+            EXTERNAL_RUN_CONTEXTS,
+            core::mem::size_of::<
+                std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
+            >(),
+            "external query run producer slots",
+        )?;
+        let mut external_sorters = Vec::with_capacity(EXTERNAL_RUN_CONTEXTS);
+        for _ in 0..EXTERNAL_RUN_CONTEXTS {
+            external_sorters.push(std::cell::RefCell::new(Box::new(
+                crate::sql::external::ExternalSorter::new(budget)?,
+            )));
+        }
+        budget.draw(
+            EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes(),
+            "external query run readers",
+        )?;
+        let external_readers = (0..EXTERNAL_RUN_CONTEXTS)
+            .map(|_| std::cell::RefCell::new(crate::sql::external::ExternalRunReader::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let fresh = || {
             std::cell::RefCell::new(SpillScratch {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -2071,7 +2097,8 @@ impl SpillReader {
             scan_contexts: scan_contexts.into_boxed_slice(),
             next_walk_id: std::cell::Cell::new(1),
             value_scratch: [value(), value()],
-            external: std::cell::RefCell::new(external),
+            external_sorters: external_sorters.into_boxed_slice(),
+            external_readers,
         })
     }
 
@@ -2082,7 +2109,12 @@ impl SpillReader {
                 * ((MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
             + 4 * crate::store::MAX_PAYLOAD
-            + crate::sql::external::ExternalSorter::budget_bytes()
+            + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
+            + EXTERNAL_RUN_CONTEXTS
+                * core::mem::size_of::<
+                    std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
+                >()
+            + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes()
     }
 }
 
@@ -2220,10 +2252,7 @@ impl Storage {
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<(u32, u64)>()
             + config.max_connections as usize * config.max_tables * size_of::<(u32, u32)>()
-            + ValueIndexPool::budget_bytes(
-                config.max_value_indexes,
-                config.value_index_rows,
-            )
+            + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -2395,11 +2424,8 @@ impl Storage {
                 })
                 .expect("sized to max_tables");
         }
-        let value_indexes = ValueIndexPool::new(
-            budget,
-            config.max_value_indexes,
-            config.value_index_rows,
-        )?;
+        let value_indexes =
+            ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
         let active_snapshots =
             FixedVec::new(budget, "active_snapshots", config.max_connections as usize)?;
         let table_locks = FixedVec::new(
@@ -3121,13 +3147,56 @@ impl Storage {
             .unwrap_or_default()
     }
 
-    /// Borrows the startup-sized external-run workspace.
+    /// Leases one startup-sized external-run producer. A nested materializer
+    /// gets a distinct producer instead of resetting an outer run in progress.
     pub(crate) fn external_sorter(
         &self,
-    ) -> Option<std::cell::RefMut<'_, Box<crate::sql::external::ExternalSorter>>> {
-        self.spill
-            .as_ref()
-            .map(|reader| reader.external.borrow_mut())
+    ) -> Result<
+        std::cell::RefMut<'_, Box<crate::sql::external::ExternalSorter>>,
+        crate::sql::eval::SqlError,
+    > {
+        let Some(spill) = self.spill.as_ref() else {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "external query runs require durable object storage"
+            ));
+        };
+        for sorter in spill.external_sorters.iter() {
+            if let Ok(lease) = sorter.try_borrow_mut() {
+                return Ok(lease);
+            }
+        }
+        Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "external query run producer pool exhausted (maximum nesting {})",
+            EXTERNAL_RUN_CONTEXTS
+        ))
+    }
+
+    /// Leases one independent immutable-run cursor. Exhaustion is loud instead
+    /// of aliasing scratch across nested materializers.
+    pub(crate) fn external_run_reader(
+        &self,
+    ) -> Result<
+        std::cell::RefMut<'_, crate::sql::external::ExternalRunReader>,
+        crate::sql::eval::SqlError,
+    > {
+        let Some(spill) = self.spill.as_ref() else {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "external query runs require durable object storage"
+            ));
+        };
+        for reader in spill.external_readers.iter() {
+            if let Ok(lease) = reader.try_borrow_mut() {
+                return Ok(lease);
+            }
+        }
+        Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "external query run reader pool exhausted (maximum nesting {})",
+            EXTERNAL_RUN_CONTEXTS
+        ))
     }
 
     /// Runs one short operation against the provider-neutral tiered block
@@ -3604,8 +3673,7 @@ impl Storage {
             if !selected[column] {
                 continue;
             }
-            let distinct_values =
-                distinct_estimate(&registers[column]).min(non_nulls[column]);
+            let distinct_values = distinct_estimate(&registers[column]).min(non_nulls[column]);
             statistics.columns[column] = ColumnStatistics {
                 valid: rows != 0,
                 null_fraction_ppm: nulls[column]
@@ -3614,9 +3682,7 @@ impl Storage {
                     .unwrap_or(0)
                     .min(u64::from(u32::MAX)) as u32,
                 distinct_values,
-                distinct_fraction_ppm: if rows != 0
-                    && distinct_values.saturating_mul(10) > rows
-                {
+                distinct_fraction_ppm: if rows != 0 && distinct_values.saturating_mul(10) > rows {
                     distinct_values
                         .saturating_mul(1_000_000)
                         .checked_div(rows)

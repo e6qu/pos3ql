@@ -158,9 +158,14 @@ pub(crate) fn fill_join_order(
                     score = score.saturating_add(strength);
                 }
             }
-            let base_rows = scope.derived[t].map_or_else(
-                || storage.planning_row_estimate(scope.slots[t]),
-                |rows| rows.len() as u64,
+            let base_rows = scope.external_runs[t].map_or_else(
+                || {
+                    scope.derived[t].map_or_else(
+                        || storage.planning_row_estimate(scope.slots[t]),
+                        |rows| rows.len() as u64,
+                    )
+                },
+                crate::sql::external::ExternalRun::rows,
             );
             let local_strength = masks[..n_masks]
                 .iter()

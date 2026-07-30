@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 # Phrases that mark a silent semantic no-op. Precise on purpose: these are the
 # ways "we pretend to handle X but don't" get written, not the word "no-op"
 # (which legitimately describes idempotency).
-BANNED='accepted and ignored|for client compatibility|parsed and discarded|value is skipped|accepted as a no-?op|silently (ignore|ignored|skip|skipped|default|drop|dropped)'
+BANNED='accepted and ignored|accepted and has no effect|accepted.*no effect|for client compatibility|parsed and discarded|value is skipped|accepted as a no-?op|silently (ignore|ignored|skip|skipped|default|drop|dropped)'
 
 # The tagged-debt ceiling. Lower it as items are implemented; never raise it.
 DEBT_BUDGET=0

@@ -1021,7 +1021,11 @@ fn run_subquery<'a>(
                         "subquery must return only one column"
                     ));
                 }
-                out[at] = vals[0];
+                // Row-source values may borrow a recycling external-run
+                // reader. Re-encode the scalar into the statement arena
+                // before retaining it in the subquery result.
+                let encoded = crate::sql::exec::encode_projected_pub(vals, arena)?;
+                out[at] = crate::sql::exec::decode_projected_pub(encoded, 0);
                 any_null |= vals[0].is_null();
                 at += 1;
                 Ok(())

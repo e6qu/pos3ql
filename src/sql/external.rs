@@ -39,6 +39,13 @@ const EMPTY_BUFFERED_ROW: BufferedRow = BufferedRow {
 #[derive(Clone, Copy)]
 pub(crate) struct ExternalRun {
     handle: SstHandle,
+    rows: u64,
+}
+
+impl ExternalRun {
+    pub(crate) fn rows(self) -> u64 {
+        self.rows
+    }
 }
 
 struct MergeReader {
@@ -86,6 +93,87 @@ impl MergeReader {
     }
 }
 
+/// A leased, startup-allocated cursor over one immutable external run.
+///
+/// Readers live independently from [`ExternalSorter`], so a consumer may
+/// stream one completed run while a nested producer reuses the sorter to build
+/// another. Only encoded bytes cross that lifetime boundary; statement-arena
+/// references never do.
+pub(crate) struct ExternalRunReader {
+    reader: MergeReader,
+    previous: Box<[u8]>,
+    previous_len: usize,
+    boundary: Box<[u8]>,
+    output: Box<[u8]>,
+}
+
+pub(crate) struct ExternalRunContext<'a> {
+    pub(crate) row: &'a [u8],
+    pub(crate) previous: Option<&'a [u8]>,
+    pub(crate) boundary: &'a mut [u8],
+    pub(crate) output: &'a mut [u8],
+}
+
+impl ExternalRunReader {
+    pub(crate) fn budget_bytes() -> usize {
+        core::mem::size_of::<std::cell::RefCell<Self>>() + 7 * MAX_PAYLOAD
+    }
+
+    pub(crate) fn new() -> Self {
+        Self {
+            reader: MergeReader::new(),
+            previous: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+            previous_len: 0,
+            boundary: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+            output: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn start(
+        &mut self,
+        store: &mut dyn BlockStore,
+        run: ExternalRun,
+    ) -> Result<(), SqlError> {
+        self.previous_len = 0;
+        self.reader.start(run, store).map_err(run_error)
+    }
+
+    pub(crate) fn row(&self) -> Option<&[u8]> {
+        self.reader.row().map(|prefixed| &prefixed[ORDINAL_BYTES..])
+    }
+
+    pub(crate) fn context(&mut self) -> Option<ExternalRunContext<'_>> {
+        let Self {
+            reader,
+            previous,
+            previous_len,
+            boundary,
+            output,
+        } = self;
+        let row = reader.row().map(|prefixed| &prefixed[ORDINAL_BYTES..])?;
+        let prior = (*previous_len > 0).then_some(&previous[..*previous_len]);
+        Some(ExternalRunContext {
+            row,
+            previous: prior,
+            boundary,
+            output,
+        })
+    }
+
+    pub(crate) fn output(&self, length: usize) -> &[u8] {
+        &self.output[..length]
+    }
+
+    pub(crate) fn advance(&mut self, store: &mut dyn BlockStore) -> Result<(), SqlError> {
+        if let Some(prefixed) = self.reader.row() {
+            let row = &prefixed[ORDINAL_BYTES..];
+            self.previous[..row.len()].copy_from_slice(row);
+            self.previous_len = row.len();
+        }
+        self.reader.advance(store).map_err(run_error)
+    }
+}
+
 pub(crate) struct ExternalSorter {
     chunk: Box<[u8]>,
     chunk_len: usize,
@@ -95,8 +183,6 @@ pub(crate) struct ExternalSorter {
     levels: [[Option<ExternalRun>; MERGE_FAN_IN]; MERGE_LEVELS],
     level_counts: [usize; MERGE_LEVELS],
     readers: [MergeReader; MERGE_FAN_IN],
-    previous: Box<[u8]>,
-    boundary: Box<[u8]>,
     next_ordinal: u64,
 }
 
@@ -107,7 +193,6 @@ impl ExternalSorter {
             + ROWS_PER_CHUNK * core::mem::size_of::<BufferedRow>()
             + SstWriter::budget_bytes()
             + MERGE_FAN_IN * 4 * MAX_PAYLOAD
-            + 2 * MAX_PAYLOAD
     }
 
     /// Allocates every run/merge buffer at startup.
@@ -122,8 +207,6 @@ impl ExternalSorter {
             levels: [[None; MERGE_FAN_IN]; MERGE_LEVELS],
             level_counts: [0; MERGE_LEVELS],
             readers: core::array::from_fn(|_| MergeReader::new()),
-            previous: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
-            boundary: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             next_ordinal: 0,
         })
     }
@@ -216,30 +299,6 @@ impl ExternalSorter {
         Ok(carry)
     }
 
-    /// Streams a finished run in order. `previous` is the immediately
-    /// preceding projected row, useful for DISTINCT and WITH TIES without
-    /// retaining output in the statement arena.
-    pub(crate) fn consume(
-        &mut self,
-        store: &mut dyn BlockStore,
-        run: ExternalRun,
-        mut consume: impl FnMut(&[u8], Option<&[u8]>, &mut [u8]) -> Result<bool, SqlError>,
-    ) -> Result<(), SqlError> {
-        self.readers[0].start(run, store).map_err(run_error)?;
-        let mut previous_len = 0usize;
-        while let Some(prefixed) = self.readers[0].row() {
-            let row = &prefixed[ORDINAL_BYTES..];
-            let previous = (previous_len > 0).then_some(&self.previous[..previous_len]);
-            if !consume(row, previous, &mut self.boundary)? {
-                break;
-            }
-            self.previous[..row.len()].copy_from_slice(row);
-            previous_len = row.len();
-            self.readers[0].advance(store).map_err(run_error)?;
-        }
-        Ok(())
-    }
-
     fn flush_chunk(
         &mut self,
         store: &mut dyn BlockStore,
@@ -271,6 +330,7 @@ impl ExternalSorter {
             return Err(error);
         }
         self.writer.reset();
+        let rows = self.row_count as u64;
         for (position, entry) in self.rows[..self.row_count].iter().enumerate() {
             let start = entry.offset as usize;
             let end = start + entry.length as usize;
@@ -285,7 +345,7 @@ impl ExternalSorter {
             .expect("non-empty run");
         self.chunk_len = 0;
         self.row_count = 0;
-        self.add_run(store, ExternalRun { handle }, 0, compare)
+        self.add_run(store, ExternalRun { handle, rows }, 0, compare)
     }
 
     fn add_run(
@@ -318,6 +378,16 @@ impl ExternalSorter {
         runs: &[Option<ExternalRun>],
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<ExternalRun, SqlError> {
+        let rows = runs
+            .iter()
+            .map(|run| run.expect("merge run").rows)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "external query row count exhausted"
+                )
+            })?;
         for (reader, run) in self.readers.iter_mut().zip(runs) {
             reader
                 .start(run.expect("merge run"), store)
@@ -335,11 +405,9 @@ impl ExternalSorter {
                     None => Some(index),
                     Some(current) => {
                         let current_row = self.readers[current].row().expect("live");
-                        let order = compare(
-                            &candidate[ORDINAL_BYTES..],
-                            &current_row[ORDINAL_BYTES..],
-                        )?
-                        .then_with(|| {
+                        let order =
+                            compare(&candidate[ORDINAL_BYTES..], &current_row[ORDINAL_BYTES..])?
+                                .then_with(|| {
                                     let candidate_ordinal =
                                         u64::from_le_bytes(candidate[..8].try_into().unwrap());
                                     let current_ordinal =
@@ -365,7 +433,7 @@ impl ExternalSorter {
             .finish(store)
             .map_err(run_error)?
             .expect("merged run is non-empty");
-        Ok(ExternalRun { handle })
+        Ok(ExternalRun { handle, rows })
     }
 }
 
@@ -401,9 +469,7 @@ mod tests {
         // Force 65 independent runs: run 64 carries through two complete
         // base-eight levels and run 65 leaves a lower-level remainder for
         // `finish` to combine with it.
-        let input: Vec<(i64, i64)> = (0..65i64)
-            .map(|ordinal| (ordinal % 3, ordinal))
-            .collect();
+        let input: Vec<(i64, i64)> = (0..65i64).map(|ordinal| (ordinal % 3, ordinal)).collect();
         for &(key, ordinal) in &input {
             sorter
                 .push_projected_by(
@@ -426,17 +492,17 @@ mod tests {
             .unwrap()
             .expect("rows produce a run");
         let mut seen = Vec::new();
-        sorter
-            .consume(&mut store, run, |row, _, _| {
-                let key = crate::sql::exec::decode_projected_pub(row, 0);
-                let ordinal = crate::sql::exec::decode_projected_pub(row, 1);
-                let (Datum::Int8(key), Datum::Int8(ordinal)) = (key, ordinal) else {
-                    panic!("integer test row")
-                };
-                seen.push((key, ordinal));
-                Ok(true)
-            })
-            .unwrap();
+        let mut reader = ExternalRunReader::new();
+        reader.start(&mut store, run).unwrap();
+        while let Some(row) = reader.row() {
+            let key = crate::sql::exec::decode_projected_pub(row, 0);
+            let ordinal = crate::sql::exec::decode_projected_pub(row, 1);
+            let (Datum::Int8(key), Datum::Int8(ordinal)) = (key, ordinal) else {
+                panic!("integer test row")
+            };
+            seen.push((key, ordinal));
+            reader.advance(&mut store).unwrap();
+        }
         let mut expected = input;
         expected.sort_by_key(|&(key, _)| key);
         assert_eq!(seen, expected);
@@ -445,12 +511,7 @@ mod tests {
         let oversized = "x".repeat(MAX_INLINE_ROW);
         assert!(
             sorter
-                .push_projected_by(
-                    &mut store,
-                    1,
-                    |_| Datum::Text(&oversized),
-                    &mut compare,
-                )
+                .push_projected_by(&mut store, 1, |_| Datum::Text(&oversized), &mut compare,)
                 .is_err(),
             "a run row that would require an SST overflow chain must fail loudly"
         );

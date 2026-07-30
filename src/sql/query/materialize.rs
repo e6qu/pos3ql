@@ -770,7 +770,7 @@ fn distinct_on_keys_equal(
 }
 
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
-fn external_materialized_select<'a>(
+pub(crate) fn external_materialized_into<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
@@ -781,15 +781,13 @@ fn external_materialized_select<'a>(
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     limit: u64,
     offset: u64,
-    responder: &mut Responder,
-) -> Outcome {
-    let plan = match prepare_materialization(statement, scope, correlated, arena) {
-        Ok(plan) => plan,
-        Err(error) => return sql_fail(error),
-    };
-    let mut sorter = storage.external_sorter().expect("spill-attached storage");
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
+) -> Result<u64, SqlError> {
+    let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
         compare_materialized_rows(statement, plan.width, plan.n_order, plan.n_on, left, right)
@@ -803,7 +801,7 @@ fn external_materialized_select<'a>(
         arena,
         params,
         hooks,
-        None,
+        outer,
         &mut |row| {
             let mark = arena.mark();
             let result = for_each_materialized_projection(
@@ -868,20 +866,15 @@ fn external_materialized_select<'a>(
             Ok(true)
         },
     );
-    if let Err(error) = scan {
-        return sql_fail(error);
-    }
-    let run = match storage
+    scan?;
+    let run = storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
-        .expect("spill-attached block store")
-    {
-        Ok(run) => run,
-        Err(error) => return sql_fail(error),
-    };
+        .expect("spill-attached block store")?;
     let Some(run) = run else {
-        responder.command_complete("SELECT 0")?;
-        return sql_ok();
+        return Ok(0);
     };
+    drop(sorter);
+    let mut reader = storage.external_run_reader()?;
 
     let deferred = plan.any_postponed.then_some(PostponedProjection {
         postponed: plan.postponed,
@@ -891,81 +884,157 @@ fn external_materialized_select<'a>(
     let mut logical_index = 0u64;
     let mut emitted = 0u64;
     let mut boundary_len = 0usize;
-    let mut wire_full = false;
-    let consumed = storage
-        .with_block_store(|blocks| {
-            sorter.consume(blocks, run, |row, previous, boundary| {
-                let duplicate = if let Some(prior) = previous {
-                    if statement.distinct && plan.n_on == 0 {
-                        crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
-                    } else if plan.n_on > 0 {
-                        distinct_on_keys_equal(
-                            row, prior, plan.width, plan.n_order, plan.n_on,
-                        )?
-                    } else {
-                        false
-                    }
+    storage
+        .with_block_store(|blocks| reader.start(blocks, run))
+        .expect("spill-attached block store")?;
+    loop {
+        let mut staged_len = 0usize;
+        let keep_scanning = {
+            let Some(context) = reader.context() else {
+                break;
+            };
+            let crate::sql::external::ExternalRunContext {
+                row,
+                previous,
+                boundary,
+                output: staged,
+            } = context;
+            let duplicate = if let Some(prior) = previous {
+                if statement.distinct && plan.n_on == 0 {
+                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
+                } else if plan.n_on > 0 {
+                    distinct_on_keys_equal(row, prior, plan.width, plan.n_order, plan.n_on)?
                 } else {
                     false
-                };
-                if duplicate {
-                    return Ok(true);
                 }
+            } else {
+                false
+            };
+            if duplicate {
+                true
+            } else {
                 let in_ties = if statement.with_ties
                     && limit > 0
                     && logical_index >= window
                     && boundary_len > 0
                 {
-                    order_keys_equal(&boundary[..boundary_len], row, plan.width, plan.n_order)?
+                    order_keys_equal(
+                        &boundary[..boundary_len],
+                        row,
+                        plan.width,
+                        plan.n_order,
+                    )?
                 } else {
                     false
                 };
                 if logical_index >= window && !in_ties {
-                    return Ok(false);
-                }
-                let mark = arena.mark();
-                let mut output = [Datum::Null; MAX_PROJ];
-                let finalized = finalize_projected_row(
-                    row,
-                    plan.width,
-                    deferred.as_ref(),
-                    statement,
-                    scope,
-                    arena,
-                    params,
-                    hooks,
-                    &mut output,
-                );
-                if let Err(error) = finalized {
-                    // SAFETY: failed per-row decode/evaluation cannot
-                    // publish a reference beyond this callback.
-                    unsafe { arena.rewind_to(mark) };
-                    return Err(error);
-                }
-                if logical_index >= offset {
-                    if responder.data_row(&output[..plan.width]).is_err() {
-                        wire_full = true;
-                        // SAFETY: the failed responder did not retain the
-                        // per-row values.
+                    false
+                } else {
+                    let mark = arena.mark();
+                    let mut output = [Datum::Null; MAX_PROJ];
+                    let finalized = finalize_projected_row(
+                        row,
+                        plan.width,
+                        deferred.as_ref(),
+                        statement,
+                        scope,
+                        arena,
+                        params,
+                        hooks,
+                        &mut output,
+                    );
+                    if let Err(error) = finalized {
+                        // SAFETY: failed per-row decode/evaluation cannot
+                        // publish a reference beyond this row.
                         unsafe { arena.rewind_to(mark) };
-                        return Ok(false);
+                        return Err(error);
                     }
-                    emitted += 1;
+                    let encoded = if logical_index >= offset {
+                        crate::sql::exec::encode_projected_into(
+                            &output[..plan.width],
+                            staged,
+                        )
+                    } else {
+                        Ok(0)
+                    };
+                    if statement.with_ties && limit > 0 && logical_index + 1 == window {
+                        boundary[..row.len()].copy_from_slice(row);
+                        boundary_len = row.len();
+                    }
+                    logical_index += 1;
+                    // SAFETY: every finalized value was copied into reader-
+                    // owned staging. The consumer runs only after this rewind,
+                    // so any arena allocation it retains is not discarded.
+                    unsafe { arena.rewind_to(mark) };
+                    staged_len = encoded?;
+                    true
                 }
-                if statement.with_ties && limit > 0 && logical_index + 1 == window {
-                    boundary[..row.len()].copy_from_slice(row);
-                    boundary_len = row.len();
-                }
-                logical_index += 1;
-                // SAFETY: the responder encoded the row synchronously.
-                unsafe { arena.rewind_to(mark) };
-                Ok(true)
-            })
-        })
-        .expect("spill-attached block store");
-    if let Err(error) = consumed {
-        return sql_fail(error);
+            }
+        };
+        if !keep_scanning {
+            break;
+        }
+        if staged_len > 0 {
+            let encoded = reader.output(staged_len);
+            let mut output = [Datum::Null; MAX_PROJ];
+            for (column, value) in output.iter_mut().enumerate().take(plan.width) {
+                *value = crate::sql::exec::decode_projected_pub(encoded, column);
+            }
+            if !emit(&output[..plan.width])? {
+                return Ok(emitted);
+            }
+            emitted += 1;
+        }
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("spill-attached block store")?;
     }
+    Ok(emitted)
+}
+
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+fn external_materialized_select<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
+    limit: u64,
+    offset: u64,
+    responder: &mut Responder,
+) -> Outcome {
+    let mut wire_full = false;
+    let emitted = match external_materialized_into(
+        storage,
+        scope,
+        from,
+        txid,
+        statement,
+        arena,
+        params,
+        hooks,
+        correlated,
+        base,
+        None,
+        limit,
+        offset,
+        &mut |values| {
+            if responder.data_row(values).is_err() {
+                wire_full = true;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        },
+    ) {
+        Ok(emitted) => emitted,
+        Err(error) => return sql_fail(error),
+    };
     if wire_full {
         return Err(crate::pg::wire::WireFull);
     }

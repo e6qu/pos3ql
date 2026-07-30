@@ -36,8 +36,17 @@ fn test_engine() -> (Engine, Budget) {
 }
 
 fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
+    run_with_arena_bytes(engine, budget, sql_text, 1 << 18)
+}
+
+fn run_with_arena_bytes(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    sql_text: &str,
+    arena_bytes: usize,
+) -> Vec<u8> {
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", arena_bytes).unwrap();
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
     let mut guc = GucState::new();
@@ -1950,6 +1959,17 @@ fn regex_match_operators_and_operator_syntax() {
             "SELECT s FROM t WHERE s OPERATOR(pg_catalog.~) '^(foo|public)$' COLLATE \"C\" ORDER BY s"
         )),
         ["foo", "public"]
+    );
+    let unsupported = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT 'a' COLLATE pg_catalog.pg_unicode_fast",
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported)
     );
 }
 
@@ -8596,7 +8616,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     config.work_arena_bytes = 512 << 10;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -8627,7 +8647,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     // Both cache tiers disappear. The table and the execution runs must use
     // the provider-neutral object tier; local files cannot be authoritative.
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted_budget = Budget::new((1 << 28) + (96 << 20));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let before = restarted.storage.block_io_stats();
     let ordered = run_with(
@@ -8668,9 +8688,43 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
             "SELECT DISTINCT id % 17 FROM external_rows",
         )),
         [
-            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
-            "14", "15", "16"
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+            "16"
         ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM \
+             (SELECT id, payload FROM external_rows ORDER BY payload DESC) AS materialized \
+             ORDER BY id LIMIT 10",
+        )),
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+        "a nested consumer must stream its immutable child run while building its own"
+    );
+    let created = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "CREATE TABLE external_copy AS \
+         SELECT id, payload FROM \
+         (SELECT id, payload FROM external_rows ORDER BY payload DESC) AS materialized \
+         ORDER BY id LIMIT 10",
+        1 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM external_copy ORDER BY id",
+        )),
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+        "a retaining consumer must outlive recycled evaluator scratch"
     );
     let ties = data_rows(&run_with(
         &mut restarted,

@@ -32,7 +32,10 @@ use setops::materialize_set_body;
 pub use setops::set_query;
 
 mod materialize;
-use materialize::{ScopeSchema, finalize_projected_row, materialized_rows, materialized_select};
+use materialize::{
+    ScopeSchema, external_materialized_into, finalize_projected_row, materialized_rows,
+    materialized_select,
+};
 
 mod scan;
 pub use scan::JoinRow;
@@ -490,8 +493,7 @@ fn patch_subquery_column_types<'a>(
     }
 }
 
-type CorrelatedScalarScratch<'a> =
-    [(*const Expr<'a>, Datum<'a>, Datum<'a>); MAX_SUBQUERIES];
+type CorrelatedScalarScratch<'a> = [(*const Expr<'a>, Datum<'a>, Datum<'a>); MAX_SUBQUERIES];
 type CorrelatedListScratch<'a> =
     [(*const Expr<'a>, &'a [Datum<'a>], bool, Datum<'a>); MAX_SUBQUERIES];
 
@@ -1657,9 +1659,9 @@ pub fn select_query<'a>(
     let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
     let n_where_correlated =
         match correlated_in_expression(statement.where_clause, correlated, &mut where_correlated) {
-        Ok(count) => count,
-        Err(error) => return sql_fail(error),
-    };
+            Ok(count) => count,
+            Err(error) => return sql_fail(error),
+        };
     let catalog = StorageCatalog { storage, txid };
     let hooks = EvalHooks {
         group: None,
@@ -1798,14 +1800,14 @@ pub fn select_query<'a>(
         if let SelectItem::Expr { expression, .. } = item
             && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs)
         {
-                return sql_fail(e);
-            }
+            return sql_fail(e);
+        }
     }
     if let Some(h) = statement.having
         && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs)
     {
-            return sql_fail(e);
-        }
+        return sql_fail(e);
+    }
     for ob in statement.order_by {
         if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs) {
             return sql_fail(e);
@@ -2128,8 +2130,8 @@ pub fn constant_select<'a>(
         if let SelectItem::Expr { expression, .. } = item
             && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs)
         {
-                return sql_fail(e);
-            }
+            return sql_fail(e);
+        }
     }
     if let Some(h) = statement.having
         && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs)
@@ -2161,9 +2163,9 @@ pub fn constant_select<'a>(
             &super::eval::NoColumns,
             &hooks,
         ) {
-                Ok(d) => d,
-                Err(e) => return sql_fail(e),
-            };
+            Ok(d) => d,
+            Err(e) => return sql_fail(e),
+        };
         let mut rows = 0u64;
         if let Some((ptrs, values)) = hook_data {
             let agg_hooks = EvalHooks {
@@ -2250,7 +2252,7 @@ pub fn constant_select<'a>(
             .items
             .iter()
             .position(|item| {
-            matches!(item, SelectItem::Expr { expression, alias }
+                matches!(item, SelectItem::Expr { expression, alias }
                 if **expression == *ob.expression
                     || matches!(ob.expression, Expr::Column { qualifier: None, name }
                         if *name == alias.unwrap_or(super::exec::derived_name(expression))))
@@ -2427,7 +2429,7 @@ pub fn select_into_rows<'a>(
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     seq: Option<&dyn SequenceAccess>,
-    emit: &mut dyn FnMut(&[Datum<'a>]) -> Result<(), SqlError>,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if let Some(tree) = statement.set_body {
         let (rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params)?;
@@ -2536,8 +2538,8 @@ pub fn select_into_rows<'a>(
                     }
                     _ => {
                         return Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "SELECT * with no tables specified is not valid"
+                            sqlstate::SYNTAX_ERROR,
+                            "SELECT * with no tables specified is not valid"
                         ));
                     }
                 }
@@ -2786,6 +2788,30 @@ pub fn select_into_rows<'a>(
         || statement.limit.is_some()
         || statement.offset.is_some()
     {
+        if storage.spill_attached() {
+            let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+            let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
+            external_materialized_into(
+                storage,
+                &scope,
+                from,
+                txid,
+                statement,
+                arena,
+                params,
+                &hooks,
+                correlated,
+                &outer_subs.base,
+                outer,
+                limit,
+                offset,
+                &mut |values| {
+                    emit(values)?;
+                    Ok(true)
+                },
+            )?;
+            return Ok(());
+        }
         let (rows, width, deferred) = materialized_rows(
             storage,
             &scope,
@@ -3119,10 +3145,10 @@ pub fn describe_scope_items<'q>(
                 // is -1 — the rule PostgreSQL follows.
                 let type_mod = match expression {
                     Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                            Ok(ResolvedColumn::Table(t, c)) => {
-                                scope.defs[t].expect("resolved").columns()[c].type_mod
-                            }
-                            _ => -1,
+                        Ok(ResolvedColumn::Table(t, c)) => {
+                            scope.defs[t].expect("resolved").columns()[c].type_mod
+                        }
+                        _ => -1,
                     },
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,

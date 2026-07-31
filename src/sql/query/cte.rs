@@ -768,7 +768,8 @@ fn external_recursive_tree(
             core::cmp::Ordering::Equal
         })
     };
-    external_set_body_into(storage, txid, tree, arena, params, &mut |values| {
+    external_set_body_into(
+        storage, txid, tree, &[], None, None, false, arena, params, &mut |values| {
         storage
             .with_block_store(|blocks| {
                 sorter.push_projected_by(

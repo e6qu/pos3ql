@@ -12536,6 +12536,42 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
         )),
         ["1"]
     );
+    // ARRAY(subquery) and set-subquery ORDER BY/LIMIT spool through the
+    // provider-neutral run stack under spill.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ARRAY(SELECT a FROM row_witness ORDER BY a DESC)"
+        )),
+        ["{4,1,1}"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ARRAY(SELECT a FROM row_witness UNION SELECT 9)"
+        )),
+        ["{1,4,9}"]
+    );
+    // Grouped aggregate group-key sort runs through an external sort.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE grp_src (g int, v int);
+         INSERT INTO grp_src SELECT i % 10, i FROM generate_series(1, 100) t(i)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT g, count(*), sum(v) FROM grp_src GROUP BY g ORDER BY g"
+        )),
+        [
+            "0|10|550", "1|10|460", "2|10|470", "3|10|480", "4|10|490",
+            "5|10|500", "6|10|510", "7|10|520", "8|10|530", "9|10|540"
+        ]
+    );
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

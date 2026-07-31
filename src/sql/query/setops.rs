@@ -430,10 +430,15 @@ fn external_set_tree<'a>(
 /// Streams a set-operation body from immutable provider-neutral runs. This is
 /// the retention-free row-source seam used by INSERT/CTAS and derived
 /// consumers; decoded values borrow only the reader's current row.
+#[expect(clippy::too_many_arguments, reason = "set-operation execution plumbing")]
 pub(crate) fn external_set_body_into<'a>(
     storage: &'a Storage,
     txid: u32,
     tree: &'a SetTree<'a>,
+    order_by: &'a [OrderBy<'a>],
+    limit: Option<&'a Expr<'a>>,
+    offset: Option<&'a Expr<'a>>,
+    with_ties: bool,
     arena: &'a Arena,
     params: &[Datum<'a>],
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
@@ -456,16 +461,59 @@ pub(crate) fn external_set_body_into<'a>(
     )? else {
         return Ok(());
     };
+    let limit = exec::eval_limit_pub(limit, arena, params)?;
+    let offset = exec::eval_offset_pub(offset, arena, params)?;
+    // A trailing ORDER BY needs one final provider-neutral sort. Set-operation
+    // output without ORDER BY retains the multiset merge order.
+    let run = if order_by.is_empty() {
+        run
+    } else {
+        let mut keys = [(0usize, false, false); MAX_PROJ];
+        let key_count = resolve_set_order(order_by, &columns[..column_count], &mut keys)?;
+        let mut reader = storage.external_run_reader()?;
+        let mut sorter = storage.external_sorter()?;
+        sorter.reset();
+        let mut compare =
+            |left: &[u8], right: &[u8]| compare_set_order(left, right, &keys[..key_count]);
+        push_run(storage, &mut reader, run, &mut sorter, &mut compare)?;
+        storage
+            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+            .expect("spill-attached block store")?
+            .unwrap_or(run)
+    };
     let mut reader = storage.external_run_reader()?;
     storage
         .with_block_store(|blocks| reader.start(blocks, run))
         .expect("spill-attached block store")?;
-    while let Some(row) = reader.row() {
-        let mut values = [Datum::Null; MAX_PROJ];
-        for (column, value) in values.iter_mut().enumerate().take(column_count) {
-            *value = exec::decode_projected_pub(row, column);
+    let window = offset.saturating_add(limit);
+    let mut logical = 0u64;
+    let mut boundary_len = 0usize;
+    while let Some(context) = reader.context() {
+        let tied = with_ties
+            && limit > 0
+            && logical >= window
+            && boundary_len > 0
+            && set_rows_tie(
+                &context.boundary[..boundary_len],
+                context.row,
+                order_by,
+                &columns[..column_count],
+            );
+        if logical >= window && !tied {
+            break;
         }
-        emit(&values[..column_count])?;
+        if logical >= offset {
+            let mut values = [Datum::Null; MAX_PROJ];
+            for (column, value) in values.iter_mut().enumerate().take(column_count) {
+                *value = exec::decode_projected_pub(context.row, column);
+            }
+            emit(&values[..column_count])?;
+        }
+        if with_ties && limit > 0 && logical + 1 == window {
+            context.boundary[..context.row.len()].copy_from_slice(context.row);
+            boundary_len = context.row.len();
+        }
+        logical += 1;
         storage
             .with_block_store(|blocks| reader.advance(blocks))
             .expect("spill-attached block store")?;
@@ -948,7 +996,12 @@ fn combine_sets<'a>(
 /// Whether two set-operation output rows tie on every ORDER BY column (the
 /// `WITH TIES` peer test). The ORDER BY has already been validated by
 /// [`sort_set_rows`], so an unresolvable key conservatively counts as no tie.
-fn set_rows_tie(a: &[u8], b: &[u8], order_by: &[OrderBy], columns: &[ColDesc]) -> bool {
+pub(crate) fn set_rows_tie(
+    a: &[u8],
+    b: &[u8],
+    order_by: &[OrderBy],
+    columns: &[ColDesc],
+) -> bool {
     for ob in order_by {
         let index = match ob.expression {
             Expr::Int(n) if *n >= 1 && (*n as usize) <= columns.len() => (*n as usize) - 1,
@@ -974,7 +1027,7 @@ fn set_rows_tie(a: &[u8], b: &[u8], order_by: &[OrderBy], columns: &[ColDesc]) -
     true
 }
 
-fn sort_set_rows(
+pub(crate) fn sort_set_rows(
     arena: &Arena,
     rows: &mut [&[u8]],
     order_by: &[OrderBy],

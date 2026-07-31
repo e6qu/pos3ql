@@ -817,12 +817,16 @@ traffic.
 The durable authority remains the provider-neutral object contract: query code
 does not know whether its blocks reach S3, MinIO, Google Cloud Storage, Azure
 Blob Storage, or another adapter. RAM and disk cache those same content-addressed
-blocks and may disappear at any point between statements. The remaining B-006
-work is grouped aggregates (including DISTINCT/ordered collectors), windows,
-ARRAY subqueries, and set-subquery forms with their own final ORDER/LIMIT.
-Pillar 2 must then make the cursor suspendable around a fixed in-flight GET
-pool; pillars 3–4 batch expression evaluation and introduce PAX column-range
-late materialization.
+blocks and may disappear at any point between statements. The second
+externalization wave added `ARRAY(subquery)` results, set-subquery forms
+carrying their own final ORDER BY/LIMIT/OFFSET (including set-operation
+bodies), and the grouped-aggregate group-key sort through the same run stack.
+The remaining B-006 work is windows, which need a partition-at-a-time or
+run-random-access representation because `compute_window` requires random
+access within partitions and frames that the forward-only reader cannot
+provide. Pillar 2 must then make the cursor suspendable around a fixed
+in-flight GET pool; pillars 3–4 batch expression evaluation and introduce PAX
+column-range late materialization.
 
 **Concurrency-fidelity slice (2026-07-30).** Execution now has a first-class
 blocked result instead of converting contention to 40001 or blocking the

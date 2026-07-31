@@ -116,15 +116,22 @@ pub(super) fn groups_for_mask<'a>(
     // WHERE with correlated subqueries is applied per row in the callbacks.
     let scan_where = if correlated.is_empty() { statement.where_clause } else { None };
 
-    // Pass 2: encode group keys per row (columns outside this set → NULL).
+    // Pass 2: encode group keys per row (columns outside this set → NULL),
+    // sort them, and compute group assignments. When durable object storage
+    // is attached, the sort runs through the provider-neutral run stack so
+    // the per-row key encodings never touch the work arena.
     let empty: &[u8] = &[];
-    let key_rows = if n_keys == 0 { 0 } else { row_count };
-    let keys: &mut [(&[u8], u32)] = arena
-        .alloc_slice_with(key_rows, |_| (empty, 0u32))
+    let group_of: &mut [u32] = arena
+        .alloc_slice_with(row_count, |_| 0u32)
         .map_err(|_| arena_full())?;
-    if n_keys > 0 {
-        let mut at = 0usize;
-        scan_source(
+    let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
+        let mut sorter = storage.external_sorter()?;
+        sorter.reset();
+        let mut compare = |a: &[u8], b: &[u8]| {
+            Ok(crate::sql::exec::compare_projected_prefix(a, b, n_keys))
+        };
+        let mut at = 0u32;
+        scan_source_recycling(
             storage, scope, from, txid, scan_where, arena, params, hooks,
             outer,
             &mut |row| {
@@ -133,8 +140,6 @@ pub(super) fn groups_for_mask<'a>(
                 )? {
                     return Ok(true);
                 }
-                // Correlated subqueries inside the grouping keys re-evaluate
-                // against each input row.
                 let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
                     [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
                 let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
@@ -147,12 +152,7 @@ pub(super) fn groups_for_mask<'a>(
                         correlated,
                         hooks.subs.expect("outer subqueries prepared"),
                         row,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        &mut sc,
-                        &mut ls,
+                        storage, txid, arena, params, &mut sc, &mut ls,
                     )?;
                     row_hooks_store = EvalHooks { subs: Some(&row_subs), ..*hooks };
                     &row_hooks_store
@@ -164,47 +164,136 @@ pub(super) fn groups_for_mask<'a>(
                     }
                 }
                 for v in key_vals[..n_keys].iter_mut() {
-                    // bpchar keys group by their stripped text.
                     *v = crate::sql::eval::text_view(*v);
                 }
-                keys[at].0 = crate::sql::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
-                keys[at].1 = at as u32;
+                let row_idx = at;
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_projected_by(blocks, n_keys + 1, |i| {
+                            if i < n_keys { key_vals[i] } else { Datum::Int4(row_idx as i32) }
+                        }, &mut compare)
+                    })
+                    .expect("spill-attached block store")?;
                 at += 1;
                 Ok(true)
             },
         )?;
-    }
-    keys.sort_unstable();
-
-    let n_groups = {
-        let mut g = 0usize;
-        for i in 0..keys.len() {
-            if i == 0 || keys[i].0 != keys[i - 1].0 {
-                g += 1;
+        let run = storage
+            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+            .expect("spill-attached block store")?;
+        drop(sorter);
+        let rep_keys_buf = arena
+            .alloc_slice_with(row_count, |_| empty)
+            .map_err(|_| arena_full())?;
+        let mut ng = 0usize;
+        if let Some(run) = run {
+            let mut reader = storage.external_run_reader()?;
+            storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("spill-attached block store")?;
+            while let Some(context) = reader.context() {
+                let row_index = match crate::sql::exec::decode_projected_pub(
+                    context.row, n_keys,
+                ) {
+                    Datum::Int4(i) => i as u32 as usize,
+                    _ => 0,
+                };
+                let is_new = match context.previous {
+                    None => true,
+                    Some(prev) => {
+                        !crate::sql::exec::compare_projected_prefix(prev, context.row, n_keys)
+                            .is_eq()
+                    }
+                };
+                if is_new {
+                    let key_len =
+                        crate::sql::exec::projected_prefix_len(context.row, n_keys);
+                    rep_keys_buf[ng] = arena
+                        .alloc_slice_copy(&context.row[..2 + key_len])
+                        .map_err(|_| arena_full())?;
+                    ng += 1;
+                }
+                group_of[row_index] = (ng - 1) as u32;
+                storage
+                    .with_block_store(|blocks| reader.advance(blocks))
+                    .expect("spill-attached block store")?;
             }
         }
-        if keys.is_empty() && mask == 0 {
-            1 // grand total (no active grouping columns): one row even over zero input rows
-        } else {
-            g
+        (ng, &rep_keys_buf[..ng])
+    } else {
+        let key_rows = if n_keys == 0 { 0 } else { row_count };
+        let keys: &mut [(&[u8], u32)] = arena
+            .alloc_slice_with(key_rows, |_| (empty, 0u32))
+            .map_err(|_| arena_full())?;
+        if n_keys > 0 {
+            let mut at = 0usize;
+            scan_source(
+                storage, scope, from, txid, scan_where, arena, params, hooks,
+                outer,
+                &mut |row| {
+                    if !row_passes_correlated_where(
+                        correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
+                    )? {
+                        return Ok(true);
+                    }
+                    let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
+                        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+                    let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
+                    let row_subs;
+                    let row_hooks_store;
+                    let row_hooks: &EvalHooks = if correlated.is_empty() {
+                        hooks
+                    } else {
+                        row_subs = merge_correlated(
+                            correlated,
+                            hooks.subs.expect("outer subqueries prepared"),
+                            row,
+                            storage, txid, arena, params, &mut sc, &mut ls,
+                        )?;
+                        row_hooks_store = EvalHooks { subs: Some(&row_subs), ..*hooks };
+                        &row_hooks_store
+                    };
+                    let mut key_vals = [Datum::Null; MAX_PROJ];
+                    for (k, g) in statement.group_by.iter().enumerate() {
+                        if mask & (1u64 << k) != 0 {
+                            key_vals[k] = eval_full(g, arena, params, row, row_hooks)?;
+                        }
+                    }
+                    for v in key_vals[..n_keys].iter_mut() {
+                        *v = crate::sql::eval::text_view(*v);
+                    }
+                    keys[at].0 = crate::sql::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
+                    keys[at].1 = at as u32;
+                    at += 1;
+                    Ok(true)
+                },
+            )?;
         }
+        keys.sort_unstable();
+        let ng = {
+            let mut g = 0usize;
+            for i in 0..keys.len() {
+                if i == 0 || keys[i].0 != keys[i - 1].0 {
+                    g += 1;
+                }
+            }
+            if keys.is_empty() && mask == 0 { 1 } else { g }
+        };
+        let rep_keys_buf = arena
+            .alloc_slice_with(ng, |_| empty)
+            .map_err(|_| arena_full())?;
+        {
+            let mut g = 0usize;
+            for i in 0..keys.len() {
+                if i > 0 && keys[i].0 != keys[i - 1].0 {
+                    g += 1;
+                }
+                group_of[keys[i].1 as usize] = g as u32;
+                rep_keys_buf[g] = keys[i].0;
+            }
+        }
+        (ng, &rep_keys_buf[..ng])
     };
-    let group_of: &mut [u32] = arena
-        .alloc_slice_with(row_count, |_| 0u32)
-        .map_err(|_| arena_full())?;
-    let rep_of: &mut [u32] = arena
-        .alloc_slice_with(n_groups, |_| 0u32)
-        .map_err(|_| arena_full())?;
-    {
-        let mut g = 0usize;
-        for i in 0..keys.len() {
-            if i > 0 && keys[i].0 != keys[i - 1].0 {
-                g += 1;
-            }
-            group_of[keys[i].1 as usize] = g as u32;
-            rep_of[g] = keys[i].1;
-        }
-    }
 
     // Correlated subquery nodes appearing in the select list, HAVING, or the
     // ORDER BY keys re-evaluate per group (their outer references resolve to
@@ -298,14 +387,8 @@ pub(super) fn groups_for_mask<'a>(
     let mut survivors = 0usize;
     for g in 0..n_groups {
         let mut key_vals = [Datum::Null; MAX_PROJ];
-        if !keys.is_empty() {
-            let rep = keys
-                .iter()
-                .find(|(_, index)| group_of[*index as usize] as usize == g)
-                .expect("group non-empty");
-            for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
-                *slot = crate::sql::exec::decode_projected_pub(rep.0, k);
-            }
+        for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
+            *slot = crate::sql::exec::decode_projected_pub(rep_keys[g], k);
         }
         let mut agg_vals = [Datum::Null; MAX_AGGS];
         for i in 0..n_aggs {

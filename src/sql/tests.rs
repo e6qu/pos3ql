@@ -10463,6 +10463,84 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
 }
 
 #[test]
+fn cold_start_then_commit_then_crash_recovers_every_record() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("cold-then-crash-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-cold-then-crash-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+
+    // Generation 1: write rows WITHOUT a checkpoint, so they live only as
+    // uploaded WAL segments past a manifest floor of zero — never folded into
+    // an SST checkpoint image.
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(&mut engine, &mut budget, "CREATE TABLE cc (id int, v text)");
+    for i in 1..=5 {
+        run_with(
+            &mut engine,
+            &mut budget,
+            &format!("INSERT INTO cc VALUES ({i}, 'gen1-{i}')"),
+        );
+    }
+    drop(engine);
+
+    // Generation 2: wipe the local disk and recover from the bucket alone —
+    // the journal is recreated empty, the manifest floor stays at zero, and
+    // the segments hold gen1.
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM cc ORDER BY id"
+        )),
+        ["1", "2", "3", "4", "5"],
+        "cold start recovered gen1"
+    );
+
+    // Commit new rows in this incarnation: the fresh journal holds only these,
+    // while gen1 lives only as segments (the manifest floor is still zero).
+    for i in 6..=10 {
+        run_with(
+            &mut engine,
+            &mut budget,
+            &format!("INSERT INTO cc VALUES ({i}, 'gen2-{i}')"),
+        );
+    }
+    // Crash without a checkpoint: the journal now reaches back only to gen2.
+    drop(engine);
+
+    // Generation 3: recover. The journal covers only gen2, so a segment floor
+    // sized by the journal tip would skip the gen1 segments and silently lose
+    // gen1. Both generations must survive.
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM cc ORDER BY id"
+        )),
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+        "both generations survive the post-cold-start crash"
+    );
+    drop(engine);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn external_set_multisets_use_the_provider_neutral_block_store() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

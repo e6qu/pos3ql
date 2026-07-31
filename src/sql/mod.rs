@@ -463,27 +463,38 @@ impl Engine {
             None => 0,
         };
         let mut wal = Wal::open(config, budget)?;
-        wal.replay(floor, |lsn, operator| {
-            apply_wal_op(&mut storage, lsn, operator)
+        // Recovery merges two partial sources by LSN and applies the merge in
+        // order. Neither source alone spans the committed history past the
+        // manifest floor: the journal may restart mid-history (a disk wipe
+        // recreates it holding only the newest commits) or end early (a torn
+        // write), while the segments lack whatever a failed upload left
+        // journaled-only. Applying the journal first and the segments second
+        // would let an older segment image clobber a newer journaled one, so
+        // both are collected and applied exactly once in LSN order — the two
+        // copies of one record are the same bytes, so either wins.
+        let mut recovered: std::collections::BTreeMap<u64, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        wal.replay(floor, |lsn, record| {
+            recovered.insert(lsn, record.to_vec());
+            Ok(())
         })?;
-        // RPO=0: replay any WAL segments in the bucket newer than what the
+        // RPO=0: merge any WAL segments in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
         if let Some(c) = ckpt.as_mut() {
-            let seg_floor = storage.lsn().max(floor);
-            let applied_to = c
-                .replay_wal_segments(seg_floor, |lsn, record| {
-                    match crate::wal::decode_record(record) {
-                        Some(operator) => apply_wal_op(&mut storage, lsn, operator),
-                        None => Err(SqlError {
-                            sqlstate: sqlstate::INTERNAL_ERROR,
-                            message: stack_format!(192, "corrupt uploaded WAL record"),
-                        }),
-                    }
-                })
-                .map_err(EngineSetupError::Checkpoint)?;
-            if applied_to > storage.lsn() {
-                storage.set_lsn(applied_to);
-            }
+            c.replay_wal_segments(floor, |lsn, record| {
+                recovered.entry(lsn).or_insert_with(|| record.to_vec());
+                Ok(())
+            })
+            .map_err(EngineSetupError::Checkpoint)?;
+        }
+        for (lsn, record) in &recovered {
+            let operator = crate::wal::decode_record(record).ok_or(EngineSetupError::Storage(
+                SqlError {
+                    sqlstate: sqlstate::INTERNAL_ERROR,
+                    message: stack_format!(192, "corrupt uploaded WAL record"),
+                },
+            ))?;
+            apply_wal_op(&mut storage, *lsn, operator)?;
         }
         storage.ensure_no_pending_replay_table_rewrite()?;
         storage.reconcile_serials();

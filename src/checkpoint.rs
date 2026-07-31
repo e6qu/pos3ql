@@ -697,20 +697,23 @@ impl Checkpointer {
         Ok(())
     }
 
-    /// Downloads and replays WAL segments with a first-LSN strictly greater
-    /// than `floor`, in ascending order, feeding each record to `apply`.
+    /// Downloads and replays WAL segments with records past `floor`, in
+    /// ascending order, feeding each record to `apply`. The caller merges
+    /// these with the local journal's records by LSN before applying:
+    /// neither source alone spans the committed history (the journal may
+    /// restart mid-history after a disk wipe or end early at a torn write,
+    /// and the segments lack whatever a failed upload left journaled-only).
     /// Startup only (allocates while listing/parsing).
     pub(crate) fn replay_wal_segments(
         &mut self,
         floor: u64,
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
-    ) -> Result<u64, CheckpointSetupError> {
+    ) -> Result<(), CheckpointSetupError> {
         let mut keys: Vec<String> = Vec::new();
         self.client
             .list("wal/", |k| keys.push(k.to_string()))
             .map_err(|e| CheckpointSetupError::ObjectStore(format!("list wal: {e}")))?;
         keys.sort();
-        let mut last_lsn = floor;
         for key in &keys {
             // Key is wal/<20-digit first lsn>.seg
             let Some(digits) = key
@@ -746,11 +749,8 @@ impl Checkpointer {
                     break;
                 }
                 // Records are the same framed format as the local journal.
-                let (n, consumed) = replay_segment_bytes(body, floor, &mut apply)
+                let consumed = replay_segment_bytes(body, floor, &mut apply)
                     .map_err(CheckpointSetupError::Replay)?;
-                if n > last_lsn {
-                    last_lsn = n;
-                }
                 if consumed == 0 {
                     if body.len() < self.client.response_capacity() {
                         // A trailing partial record (torn upload tail): the
@@ -768,7 +768,7 @@ impl Checkpointer {
                 }
             }
         }
-        Ok(last_lsn)
+        Ok(())
     }
 
     /// Deletes uploaded WAL segments whose records are entirely covered by
@@ -3723,10 +3723,9 @@ fn replay_segment_bytes(
     bytes: &[u8],
     floor: u64,
     apply: &mut impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
-) -> Result<(u64, usize), SqlError> {
+) -> Result<usize, SqlError> {
     const HEADER_LEN: usize = 24;
     let mut at = 0usize;
-    let mut last = floor;
     while at + HEADER_LEN <= bytes.len() {
         let stored_crc = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         let payload_len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
@@ -3742,13 +3741,10 @@ fn replay_segment_bytes(
             // Hand over from the kind byte (offset 16) to end of record;
             // decode_record skips the kind + 7 pad bytes.
             apply(lsn, &bytes[at + 16..at + total])?;
-            if lsn > last {
-                last = lsn;
-            }
         }
         at += total;
     }
-    Ok((last, at))
+    Ok(at)
 }
 
 #[derive(Debug)]

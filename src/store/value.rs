@@ -99,7 +99,7 @@ impl ValueIndexWriter {
             return Ok(());
         }
         if self.block_count == self.blocks.len() {
-            self.flush_roster(store, 0)?;
+            self.flush_roster(store)?;
         }
         self.blocks[self.block_count] = store.put(
             &self.pending[..self.pending_len],
@@ -117,7 +117,6 @@ impl ValueIndexWriter {
     fn flush_roster(
         &mut self,
         store: &mut dyn BlockStore,
-        published_lsn: u64,
     ) -> Result<(), ValueIndexError> {
         let count = u32::try_from(self.block_count).map_err(|_| ValueIndexError::Corrupt)?;
         self.pending[..4].copy_from_slice(&(count | ROSTER_CHAINED).to_le_bytes());
@@ -130,10 +129,16 @@ impl ValueIndexWriter {
             self.pending[at..at + 32].copy_from_slice(&id.0);
         }
         let bytes = ROSTER_HEADER + self.block_count * 32;
+        // The roster root is written with a stable lsn (0): a content-addressed
+        // block must re-PUT the same bytes for the same payload, but the header
+        // lsn is the checkpoint's and varies across incarnations — so it would
+        // break write-idempotency for an identical rebuilt index. The lsn is
+        // vestigial in the block (never read back); `published_lsn` rides the
+        // handle into the manifest instead.
         self.roster_tail = Some(store.put(
             &self.pending[..bytes],
             BlockType::ValueIndexRoster,
-            published_lsn,
+            0,
         )?);
         self.block_count = 0;
         Ok(())
@@ -145,7 +150,7 @@ impl ValueIndexWriter {
         published_lsn: u64,
     ) -> Result<Option<ValueIndexHandle>, ValueIndexError> {
         self.flush(store)?;
-        self.flush_roster(store, published_lsn)?;
+        self.flush_roster(store)?;
         let roster = self.roster_tail.expect("finish writes a roster root");
         Ok(Some(ValueIndexHandle {
             roster,

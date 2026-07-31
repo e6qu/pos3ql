@@ -296,6 +296,7 @@ impl<'d> QueryScope<'d> {
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(&*def_reference);
         self.derived[self.n] = Some(if materialize { m.rows } else { &[] });
+        self.external_runs[self.n] = if materialize { m.external_run } else { None };
         self.slots[self.n] = usize::MAX;
         self.n += 1;
         Ok(())

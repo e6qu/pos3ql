@@ -108,6 +108,7 @@ static EMPTY_DML_CTE: ast::MaterializedCte<'static> = ast::MaterializedCte {
     column_names: &[],
     column_types: &[],
     rows: &[],
+    external_run: None,
 };
 
 /// The query engine: catalog, memtable storage, WAL, object-storage
@@ -2505,6 +2506,7 @@ impl Engine {
                     column_names,
                     column_types,
                     rows,
+                    external_run: None,
                 })
                 .map_err(|_| query::arena_full_pub())?;
             if n == parser::MAX_CTES {

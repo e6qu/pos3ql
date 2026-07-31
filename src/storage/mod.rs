@@ -2392,7 +2392,56 @@ pub(crate) struct SpillReader {
     /// Immutable-run cursors leased by nested materialized row sources.
     /// Their scratch is independent from the sorter, so consuming a completed
     /// run never prevents a deeper operator from producing another.
-    external_readers: Box<[std::cell::RefCell<crate::sql::external::ExternalRunReader>]>,
+    external_readers:
+        std::rc::Rc<[std::cell::RefCell<crate::sql::external::ExternalRunReader>]>,
+}
+
+/// Copyable access to immutable external runs.
+///
+/// The pointed-to allocations are owned by `Rc`s in [`SpillReader`] and never
+/// move or detach after engine startup. The handle deliberately does not
+/// borrow [`Storage`], so an immutable run can remain readable while a DML
+/// executor mutates catalog or row state. It is crate-private and may only be
+/// retained by an executor that also retains the engine. All cursor buffers
+/// were reserved during startup.
+#[derive(Clone, Copy)]
+pub(crate) struct ExternalRunAccess {
+    blocks:
+        *const std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+    readers: *const [std::cell::RefCell<crate::sql::external::ExternalRunReader>],
+}
+
+impl ExternalRunAccess {
+    pub(crate) fn reader(
+        &self,
+    ) -> Result<
+        std::cell::RefMut<'_, crate::sql::external::ExternalRunReader>,
+        crate::sql::eval::SqlError,
+    > {
+        // SAFETY: both allocations are pinned by `SpillReader`'s `Rc`s for
+        // the engine lifetime; the crate-private handle is only installed in
+        // executor state that cannot outlive that engine.
+        let readers = unsafe { &*self.readers };
+        for reader in readers.iter() {
+            if let Ok(lease) = reader.try_borrow_mut() {
+                return Ok(lease);
+            }
+        }
+        Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "external query run reader pool exhausted (maximum nesting {})",
+            EXTERNAL_RUN_CONTEXTS
+        ))
+    }
+
+    pub(crate) fn with_blocks<R>(
+        &self,
+        operation: impl FnOnce(&mut dyn crate::store::BlockStore) -> R,
+    ) -> R {
+        // SAFETY: see `reader`; access is serialized by the `RefCell`.
+        let mut blocks = unsafe { &*self.blocks }.borrow_mut();
+        operation(&mut *blocks)
+    }
 }
 
 /// A row-state walk releases its block context before invoking its callback.
@@ -2486,7 +2535,8 @@ impl SpillReader {
         let external_readers = (0..EXTERNAL_RUN_CONTEXTS)
             .map(|_| std::cell::RefCell::new(crate::sql::external::ExternalRunReader::new()))
             .collect::<Vec<_>>()
-            .into_boxed_slice();
+            .into_boxed_slice()
+            .into();
         let fresh = || {
             std::cell::RefCell::new(SpillScratch {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -5230,6 +5280,21 @@ impl Storage {
             "external query run reader pool exhausted (maximum nesting {})",
             EXTERNAL_RUN_CONTEXTS
         ))
+    }
+
+    /// Returns an owned capability for consuming immutable external runs
+    /// without retaining an immutable borrow of the mutable database state.
+    pub(crate) fn external_run_access(&self) -> Result<ExternalRunAccess, crate::sql::eval::SqlError> {
+        let Some(spill) = self.spill.as_ref() else {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "external query runs require durable object storage"
+            ));
+        };
+        Ok(ExternalRunAccess {
+            blocks: std::rc::Rc::as_ptr(&spill.blocks),
+            readers: std::rc::Rc::as_ptr(&spill.external_readers),
+        })
     }
 
     /// Runs one short operation against the provider-neutral tiered block

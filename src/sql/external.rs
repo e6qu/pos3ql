@@ -36,7 +36,7 @@ const EMPTY_BUFFERED_ROW: BufferedRow = BufferedRow {
     ordinal: 0,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalRun {
     handle: SstHandle,
     rows: u64,

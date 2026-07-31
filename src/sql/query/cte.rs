@@ -18,7 +18,7 @@ use crate::sql::types::{ColDesc, Datum};
 use crate::sql_err;
 use crate::storage::Storage;
 
-use super::setops::{describe_set_body, materialize_set_body};
+use super::setops::{describe_set_body, external_set_body_into, materialize_set_body};
 use super::{MAX_JOIN_TABLES, arena_full, check_timeout};
 
 /// Expands a statement's `WITH` list (and any view reference) for the
@@ -501,6 +501,7 @@ static EMPTY_CTE: MaterializedCte<'static> = MaterializedCte {
     column_names: &[],
     column_types: &[],
     rows: &[],
+    external_run: None,
 };
 
 static EMPTY_SELECT: Select<'static> = Select {
@@ -750,6 +751,153 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
 
+fn external_recursive_tree(
+    tree: &SetTree<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    params: &[Datum<'_>],
+    sorted: bool,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |left: &[u8], right: &[u8]| {
+        Ok(if sorted {
+            left.cmp(right)
+        } else {
+            core::cmp::Ordering::Equal
+        })
+    };
+    external_set_body_into(storage, txid, tree, arena, params, &mut |values| {
+        storage
+            .with_block_store(|blocks| {
+                sorter.push_projected_by(
+                    blocks,
+                    values.len(),
+                    |column| values[column],
+                    &mut compare,
+                )
+            })
+            .expect("recursive work table has a block store")
+    })?;
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("recursive work table has a block store")
+}
+
+fn external_unique_run(
+    storage: &Storage,
+    run: Option<crate::sql::external::ExternalRun>,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    let mut reader = storage.external_run_reader()?;
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |left: &[u8], right: &[u8]| Ok(left.cmp(right));
+    storage
+        .with_block_store(|blocks| reader.start(blocks, run))
+        .expect("recursive work table has a block store")?;
+    while reader.row().is_some() {
+        let keep = {
+            let context = reader.context().expect("checked");
+            context.previous != Some(context.row)
+        };
+        if keep {
+            let row = reader.row().expect("checked");
+            storage
+                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .expect("recursive work table has a block store")?;
+        }
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("recursive work table has a block store")?;
+    }
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("recursive work table has a block store")
+}
+
+fn external_recursive_difference(
+    storage: &Storage,
+    candidates: Option<crate::sql::external::ExternalRun>,
+    seen: Option<crate::sql::external::ExternalRun>,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let Some(candidates) = candidates else {
+        return Ok(None);
+    };
+    let Some(seen) = seen else {
+        return Ok(Some(candidates));
+    };
+    let mut candidate_reader = storage.external_run_reader()?;
+    let mut seen_reader = storage.external_run_reader()?;
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |left: &[u8], right: &[u8]| Ok(left.cmp(right));
+    storage
+        .with_block_store(|blocks| candidate_reader.start(blocks, candidates))
+        .expect("recursive work table has a block store")?;
+    storage
+        .with_block_store(|blocks| seen_reader.start(blocks, seen))
+        .expect("recursive work table has a block store")?;
+    while let Some(candidate) = candidate_reader.row() {
+        while seen_reader
+            .row()
+            .is_some_and(|seen_row| seen_row < candidate)
+        {
+            storage
+                .with_block_store(|blocks| seen_reader.advance(blocks))
+                .expect("recursive work table has a block store")?;
+        }
+        if seen_reader.row() != Some(candidate) {
+            storage
+                .with_block_store(|blocks| sorter.push_encoded(blocks, candidate, &mut compare))
+                .expect("recursive work table has a block store")?;
+        }
+        storage
+            .with_block_store(|blocks| candidate_reader.advance(blocks))
+            .expect("recursive work table has a block store")?;
+    }
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("recursive work table has a block store")
+}
+
+fn external_recursive_union(
+    storage: &Storage,
+    left: Option<crate::sql::external::ExternalRun>,
+    right: Option<crate::sql::external::ExternalRun>,
+    sorted: bool,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |left: &[u8], right: &[u8]| {
+        Ok(if sorted {
+            left.cmp(right)
+        } else {
+            core::cmp::Ordering::Equal
+        })
+    };
+    let mut reader = storage.external_run_reader()?;
+    for run in [left, right].into_iter().flatten() {
+        storage
+            .with_block_store(|blocks| reader.start(blocks, run))
+            .expect("recursive work table has a block store")?;
+        while let Some(row) = reader.row() {
+            storage
+                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .expect("recursive work table has a block store")?;
+            storage
+                .with_block_store(|blocks| reader.advance(blocks))
+                .expect("recursive work table has a block store")?;
+        }
+    }
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("recursive work table has a block store")
+}
+
 /// Materializes a self-referencing recursive CTE to its fixpoint: the
 /// non-recursive term's rows first, then the recursive term evaluated
 /// repeatedly with the CTE name bound to the previous iteration's rows,
@@ -822,6 +970,99 @@ fn materialize_recursive<'a>(
             .map_err(|_| arena_full())?
     };
 
+    if storage.spill_attached() {
+        let base = external_recursive_tree(
+            base_tree,
+            storage,
+            txid,
+            arena,
+            params,
+            !union_all,
+        )?;
+        let mut all = if union_all {
+            base
+        } else {
+            external_unique_run(storage, base)?
+        };
+        let mut working = all;
+        while working.is_some_and(|run| run.rows() > 0) {
+            check_timeout()?;
+            let mark = arena.mark();
+            let working_cte = arena
+                .alloc(MaterializedCte {
+                    column_names,
+                    column_types,
+                    rows: &[],
+                    external_run: working,
+                })
+                .map_err(|_| arena_full())?;
+            let binding = [(cte.name, &*working_cte)];
+            let context = Subst {
+                ctes: &[],
+                materialized: &binding,
+                storage,
+                txid: outer.txid,
+                depth: 0,
+                path: None,
+                dependencies: None,
+                authorization_role: None,
+                qualifier: None,
+            };
+            let step_tree = subst_set_tree(recursive_tree, context, arena)?;
+            let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
+            if stepn != ncols {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "each UNION query must have the same number of columns"
+                ));
+            }
+            for column in 0..ncols {
+                if step_desc[column].type_oid != column_types[column].0 {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
+                        cte.name,
+                        column + 1,
+                        column_types[column].0,
+                        step_desc[column].type_oid
+                    ));
+                }
+            }
+            let candidates = external_recursive_tree(
+                step_tree,
+                storage,
+                txid,
+                arena,
+                params,
+                !union_all,
+            )?;
+            let fresh = if union_all {
+                candidates
+            } else {
+                let unique = external_unique_run(storage, candidates)?;
+                external_recursive_difference(storage, unique, all)?
+            };
+            // SAFETY: the substituted iteration tree and its materialized-CTE
+            // binding are dead. Completed immutable runs own only block
+            // identities and never borrow statement-arena bytes.
+            unsafe { arena.rewind_to(mark) };
+            if fresh.is_none_or(|run| run.rows() == 0) {
+                break;
+            }
+            all = external_recursive_union(storage, all, fresh, !union_all)?;
+            working = fresh;
+        }
+        return Ok(&*arena
+            .alloc(MaterializedCte {
+                column_names,
+                column_types,
+                rows: &[],
+                external_run: all,
+            })
+            .map_err(|_| arena_full())?);
+    }
+
     // Base rows; UNION (without ALL) deduplicates them among themselves.
     // Projected-row encoding is order-preserving-for-equality, so byte equality
     // is row equality.
@@ -853,6 +1094,7 @@ fn materialize_recursive<'a>(
                 column_names,
                 column_types,
                 rows: working,
+                external_run: None,
             })
             .map_err(|_| arena_full())?;
         let binding = [(cte.name, &*working_cte)];
@@ -925,6 +1167,7 @@ fn materialize_recursive<'a>(
             column_names,
             column_types,
             rows: all_rows,
+            external_run: None,
         })
         .map_err(|_| arena_full())?)
 }

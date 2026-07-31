@@ -29,7 +29,8 @@ pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring}
 
 pub(crate) use operators::arithmetic;
 pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
-use operators::{binary, coerce_unknown, logic, membership_eq, range_mismatch, unary};
+pub(crate) use operators::membership_eq;
+use operators::{binary, coerce_unknown, logic, range_mismatch, unary};
 pub use operators::{compare_datums, hash_key};
 
 /// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
@@ -507,6 +508,33 @@ pub trait CatalogAccess {
     }
 }
 
+/// A bounded membership source for an `IN (subquery)` result.
+///
+/// Small/local results use the inline `values` slice on [`SubqueryList`].
+/// Durable execution may instead keep the encoded result in an immutable
+/// object-backed run and implement this probe by streaming that run. Keeping
+/// the seam here prevents the expression evaluator from knowing about block
+/// stores, cache tiers, or provider adapters.
+pub trait SubqueryListProbe: 'static {
+    fn is_empty(&self) -> bool;
+
+    /// Returns `(matched, saw_unknown)`. `value` has already been coerced to
+    /// the subquery column's type.
+    fn probe<'a>(&self, value: Datum<'a>, arena: &'a Arena) -> Result<(bool, bool), SqlError>;
+}
+
+/// One pre-evaluated `IN (subquery)` result.
+#[derive(Clone, Copy)]
+pub struct SubqueryList<'a> {
+    pub node: *const (),
+    pub values: &'a [Datum<'a>],
+    /// Statement-arena pointer to a probe whose concrete type is `'static`.
+    /// The pointed allocation is valid for the same lifetime as `values`.
+    pub probe: Option<core::ptr::NonNull<dyn SubqueryListProbe>>,
+    pub saw_null: bool,
+    pub witness: Datum<'a>,
+}
+
 /// Pre-evaluated (uncorrelated) subquery results.
 pub struct SubqueryValues<'h, 'a> {
     /// Scalar subqueries: (node address, value, type-witness datum — the
@@ -517,7 +545,7 @@ pub struct SubqueryValues<'h, 'a> {
     /// the operand be coerced to the column type even when the set is empty or
     /// all-NULL, matching PostgreSQL (which type-checks `x IN (...)` regardless
     /// of contents).
-    pub lists: &'h [(*const Expr<'h>, &'a [Datum<'a>], bool, Datum<'a>)],
+    pub lists: &'h [SubqueryList<'a>],
 }
 
 pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
@@ -1273,19 +1301,20 @@ pub fn eval_full<'a>(
                     "subqueries are not allowed in this context"
                 ));
             };
-            let mut found: Option<(&[Datum], bool, Datum)> = None;
-            for (node, list, saw_null, witness) in subs.lists {
-                if core::ptr::eq(*node, expression as *const _) {
-                    found = Some((list, *saw_null, *witness));
+            let mut found: Option<SubqueryList<'_>> = None;
+            for list in subs.lists {
+                if core::ptr::eq(list.node, (expression as *const Expr).cast()) {
+                    found = Some(*list);
                     break;
                 }
             }
-            let Some((list, mut saw_null, witness)) = found else {
+            let Some(list) = found else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "subqueries are not allowed in this context (or are correlated)"
                 ));
             };
+            let witness = list.witness;
             // Coerce the operand to the subquery's column type first: PostgreSQL
             // type-checks `x IN (...)` regardless of the set's contents, so a
             // string literal that cannot become the column type errors even
@@ -1306,13 +1335,21 @@ pub fn eval_full<'a>(
             // `x IN (subquery)` is `x = ANY (subquery)`. Over an empty set the
             // result is a constant FALSE (TRUE for NOT IN) regardless of x —
             // even a NULL x — so the empty case precedes the null short-circuit.
-            if list.is_empty() {
+            if list.values.is_empty()
+                && list.probe.is_none_or(|probe| {
+                    // SAFETY: probe contexts are statement-arena allocations
+                    // and the hook containing this pointer cannot outlive that
+                    // arena.
+                    unsafe { probe.as_ref() }.is_empty()
+                })
+            {
                 return Ok(Datum::Bool(negated));
             }
             if v.is_null() {
                 return Ok(Datum::Null);
             }
-            for member in list {
+            let mut saw_null = list.saw_null;
+            for member in list.values {
                 if member.is_null() {
                     continue;
                 }
@@ -1323,6 +1360,14 @@ pub fn eval_full<'a>(
                     Some(false) => {}
                     None => saw_null = true,
                 }
+            }
+            if let Some(probe) = list.probe {
+                // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
+                let (matched, unknown) = unsafe { probe.as_ref() }.probe(v, arena)?;
+                if matched {
+                    return Ok(Datum::Bool(!negated));
+                }
+                saw_null |= unknown;
             }
             Ok(if saw_null {
                 Datum::Null

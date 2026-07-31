@@ -13,9 +13,62 @@ use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::Storage;
-use core::fmt::Write as _;
 
-use super::{Chained, MAX_AGGS, QueryScope, arena_full, scan_source};
+use super::{Chained, MAX_AGGS, QueryScope, arena_full, scan_source, scan_source_recycling};
+
+struct JsonAggregateDisplay<'a> {
+    values: &'a [Datum<'a>],
+    jsonb: bool,
+}
+
+impl core::fmt::Display for JsonAggregateDisplay<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write;
+        let colon = if self.jsonb { ": " } else { " : " };
+        formatter.write_char('[')?;
+        for (index, value) in self.values.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            crate::sql::json::write_datum_json_styled(
+                value,
+                colon,
+                ", ",
+                formatter,
+            )?;
+        }
+        formatter.write_char(']')
+    }
+}
+
+struct JsonObjectAggregateDisplay<'a> {
+    rows: &'a [&'a [u8]],
+    jsonb: bool,
+}
+
+impl core::fmt::Display for JsonObjectAggregateDisplay<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let colon = if self.jsonb { ": " } else { " : " };
+        let (open, close) = if self.jsonb { ("{", "}") } else { ("{ ", " }") };
+        formatter.write_str(open)?;
+        for (index, encoded) in self.rows.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            let key = crate::sql::exec::decode_projected_pub(encoded, 0);
+            let value = crate::sql::exec::decode_projected_pub(encoded, 1);
+            crate::sql::json::write_json_display_string(&key, formatter)?;
+            formatter.write_str(colon)?;
+            crate::sql::json::write_datum_json_styled(
+                &value,
+                colon,
+                ", ",
+                formatter,
+            )?;
+        }
+        formatter.write_str(close)
+    }
+}
 
 /// Streams the source once, folding every aggregate node's state.
 /// Returns per-node result datums in the arena.
@@ -36,17 +89,10 @@ pub(crate) fn fold_aggregates<'a>(
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
         states[i].init(node)?;
     }
-    scan_source(
-        storage,
-        scope,
-        from,
-        txid,
-        where_clause,
-        arena,
-        params,
-        hooks,
-        outer_arg,
-        &mut |row| {
+    let recycling_safe = states[..agg_nodes.len()]
+        .iter()
+        .all(AggState::recycling_safe);
+    let mut visit = |row: &super::JoinRow<'_, 'a, '_>| {
             let chained_row = Chained {
                 inner: row,
                 outer: outer_arg,
@@ -55,8 +101,34 @@ pub(crate) fn fold_aggregates<'a>(
                 states[i].update(node, arena, params, &chained_row, hooks)?;
             }
             Ok(true)
-        },
-    )?;
+        };
+    if recycling_safe {
+        scan_source_recycling(
+            storage,
+            scope,
+            from,
+            txid,
+            where_clause,
+            arena,
+            params,
+            hooks,
+            outer_arg,
+            &mut visit,
+        )?;
+    } else {
+        scan_source(
+            storage,
+            scope,
+            from,
+            txid,
+            where_clause,
+            arena,
+            params,
+            hooks,
+            outer_arg,
+            &mut visit,
+        )?;
+    }
     let out = arena
         .alloc_slice_with(agg_nodes.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
@@ -315,6 +387,10 @@ fn agg_f64(d: &Datum) -> Option<f64> {
 }
 
 impl<'a> AggState<'a> {
+    pub(crate) fn recycling_safe(&self) -> bool {
+        matches!(self.kind, AggKind::Count)
+    }
+
     pub(crate) fn init(&mut self, node: &'a Expr<'a>) -> Result<(), SqlError> {
         let Expr::Call {
             name,
@@ -1253,17 +1329,9 @@ impl<'a> AggState<'a> {
         if values.is_empty() {
             return Ok(Datum::Null);
         }
-        let colon = if jsonb { ": " } else { " : " };
-        let mut buf = crate::util::StackStr::<65536>::default();
-        let _ = buf.write_char('[');
-        for (i, v) in values.iter().enumerate() {
-            if i > 0 {
-                let _ = buf.write_str(", ");
-            }
-            let _ = crate::sql::json::write_datum_json_styled(v, colon, ", ", &mut buf);
-        }
-        let _ = buf.write_char(']');
-        let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+        let text = arena
+            .alloc_str_display(JsonAggregateDisplay { values, jsonb })
+            .map_err(|_| arena_full())?;
         Ok(Datum::Json { text, jsonb })
     }
 
@@ -1279,24 +1347,9 @@ impl<'a> AggState<'a> {
             return Ok(Datum::Null);
         }
         let rows = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
-        let colon = if jsonb { ": " } else { " : " };
-        let (open, close) = if jsonb { ("{", "}") } else { ("{ ", " }") };
-        let mut buf = crate::util::StackStr::<65536>::default();
-        let _ = buf.write_str(open);
-        for (i, &enc) in rows.iter().enumerate() {
-            if i > 0 {
-                let _ = buf.write_str(", ");
-            }
-            let key = crate::sql::exec::decode_projected_pub(enc, 0);
-            let value = crate::sql::exec::decode_projected_pub(enc, 1);
-            let mut key_text = crate::util::StackStr::<4096>::default();
-            let _ = write!(key_text, "{key}");
-            let _ = crate::sql::json::write_json_raw_string(key_text.as_str(), &mut buf);
-            let _ = buf.write_str(colon);
-            let _ = crate::sql::json::write_datum_json_styled(&value, colon, ", ", &mut buf);
-        }
-        let _ = buf.write_str(close);
-        let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+        let text = arena
+            .alloc_str_display(JsonObjectAggregateDisplay { rows, jsonb })
+            .map_err(|_| arena_full())?;
         Ok(Datum::Json { text, jsonb })
     }
 

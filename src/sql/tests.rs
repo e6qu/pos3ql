@@ -10231,6 +10231,151 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
             "16"
         ]
     );
+    let before_membership = restarted.storage.block_io_stats();
+    let membership = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT 1 WHERE lpad('1', 512, '0') IN \
+         (SELECT payload FROM external_rows)",
+        256 << 10,
+    );
+    assert_eq!(
+        data_rows(&membership),
+        ["1"],
+        "a subquery list larger than the arena must remain probeable: {}",
+        String::from_utf8_lossy(&membership)
+    );
+    let membership_traffic = restarted
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_membership);
+    assert!(
+        membership_traffic.object_puts > 0 && membership_traffic.object_gets > 0,
+        "subquery membership must spool and probe the provider-neutral run: {membership_traffic:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT 1
+             WHERE ROW(1, lpad('1', 512, '0')) IN
+                   (SELECT id, payload FROM external_rows WHERE id <= 2)",
+            256 << 10,
+        )),
+        ["1"],
+        "a rewritten row-valued subquery must remain a single record in its external run"
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT 1 WHERE 3001 IN (
+                 SELECT id FROM external_rows
+                 UNION ALL
+                 VALUES (3001)
+             )",
+            256 << 10,
+        )),
+        ["1"],
+        "set-operation membership must probe the external run"
+    );
+    let scalar = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT length((SELECT payload FROM external_rows WHERE id > 0 LIMIT 1))",
+        256 << 10,
+    );
+    assert_eq!(
+        data_rows(&scalar),
+        ["512"],
+        "LIMIT must stop an externally spooled scalar subquery before its cardinality check"
+    );
+    let updated = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "UPDATE external_rows SET payload = payload \
+         WHERE id = 1 AND id IN (SELECT id FROM external_rows)",
+        256 << 10,
+    );
+    assert!(
+        !String::from_utf8_lossy(&updated).contains("ERROR"),
+        "DML must keep its object-run probe after releasing the immutable Storage borrow: {}",
+        String::from_utf8_lossy(&updated)
+    );
+    let before_recursive = restarted.storage.block_io_stats();
+    let recursive = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "WITH RECURSIVE r(id, payload) AS (
+             SELECT id, payload FROM external_rows
+             UNION ALL
+             SELECT id, payload FROM r WHERE false
+         )
+         SELECT count(*) FROM r",
+        256 << 10,
+    );
+    assert_eq!(
+        data_rows(&recursive),
+        ["3000"],
+        "the recursive all/work tables must outgrow the arena: {}",
+        String::from_utf8_lossy(&recursive)
+    );
+    assert!(
+        restarted
+            .storage
+            .block_io_stats()
+            .saturating_sub(before_recursive)
+            .object_puts
+            > 0,
+        "recursive work tables must be immutable object-backed runs"
+    );
+    let lateral = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT 1
+         FROM (VALUES (1)) AS seed(n)
+         CROSS JOIN LATERAL (
+             SELECT payload FROM external_rows
+         ) AS expanded
+         WHERE expanded.payload IS NULL",
+        256 << 10,
+    );
+    assert!(
+        data_rows(&lateral).is_empty(),
+        "lateral spooling changed the empty result: {}",
+        String::from_utf8_lossy(&lateral)
+    );
+    let lateral_function = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT generated.n
+         FROM (VALUES (5000)) AS seed(stop)
+         CROSS JOIN LATERAL generate_series(1, seed.stop) AS generated(n)
+         WHERE generated.n < 0",
+        256 << 10,
+    );
+    assert!(
+        data_rows(&lateral_function).is_empty(),
+        "lateral SRF spooling changed the empty result: {}",
+        String::from_utf8_lossy(&lateral_function)
+    );
+    let outer_join = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT right_side.id
+         FROM (
+             SELECT id FROM external_rows WHERE id = 1
+         ) AS left_side
+         RIGHT JOIN external_rows AS right_side
+           ON left_side.id = right_side.id
+         WHERE left_side.id IS NULL AND right_side.id < 0",
+        256 << 10,
+    );
+    assert!(
+        data_rows(&outer_join).is_empty(),
+        "the external RIGHT JOIN match map lost matches: {}",
+        String::from_utf8_lossy(&outer_join)
+    );
     let union_output = run_with(
         &mut restarted,
         &mut restarted_budget,
@@ -10701,6 +10846,16 @@ fn distinct_aggregates() {
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT length(distinct 'x')"))
             .contains("42883")
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT length(json_agg(repeat('x', 1000))::text) \
+             FROM generate_series(1, 70)"
+        )),
+        ["70280"],
+        "JSON aggregate rendering must not truncate at a fixed stack buffer"
     );
 }
 

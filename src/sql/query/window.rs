@@ -1276,8 +1276,7 @@ pub(crate) fn project_window_rows<'a>(
         // output row (their outer references resolve to this window row).
         let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
             [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-        let mut ls: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
-            [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+        let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
         let row_subs;
         let subs = if correlated.is_empty() {
             hooks.subs

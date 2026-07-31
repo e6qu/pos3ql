@@ -113,8 +113,7 @@ fn for_each_materialized_projection<'a>(
     }
     let mut scalars: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
         [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-    let mut lists: [(*const Expr, &[Datum], bool, Datum); MAX_SUBQUERIES] =
-        [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+    let mut lists = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
     let row_subqueries;
     let owned_hooks;
     let row_hooks: &EvalHooks = if correlated.is_empty() {

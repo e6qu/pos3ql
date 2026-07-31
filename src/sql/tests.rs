@@ -12508,6 +12508,34 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
         )),
         ["record"]
     );
+    // A correlated probe resolves outer columns in the subquery's select list
+    // and ORDER BY keys, not only in its WHERE clause.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE corr_outer (x int);
+         INSERT INTO corr_outer VALUES (1),(5),(9)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT x FROM corr_outer
+             WHERE x = ANY (SELECT a + corr_outer.x - corr_outer.x FROM row_witness)
+             ORDER BY x"
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT x FROM corr_outer
+             WHERE x IN (SELECT a FROM row_witness ORDER BY a + 0 * corr_outer.x LIMIT 2)
+             ORDER BY x"
+        )),
+        ["1"]
+    );
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

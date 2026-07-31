@@ -3361,7 +3361,7 @@ fn select_into_rows_mode<'a>(
                     params,
                     row_hooks,
                     &mut projected,
-                    None,
+                    outer,
                 )?;
                 if produced >= offset {
                     emit(&projected[..n])?;
@@ -3383,7 +3383,7 @@ fn select_into_rows_mode<'a>(
                         params,
                         &srf_hooks,
                         &mut projected,
-                        None,
+                        outer,
                     )?;
                     if produced >= offset {
                         emit(&projected[..n])?;

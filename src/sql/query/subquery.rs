@@ -863,6 +863,13 @@ fn select_has_outer_ref<'a>(
     {
         return true;
     }
+    if select
+        .order_by
+        .iter()
+        .any(|o| expr_has_outer_ref(o.expression, chain, storage, arena))
+    {
+        return true;
+    }
     select.items.iter().any(|it| match it {
         SelectItem::Expr { expression, .. } => {
             expr_has_outer_ref(expression, chain, storage, arena)

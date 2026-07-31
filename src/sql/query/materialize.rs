@@ -20,7 +20,7 @@ use crate::storage::Storage;
 use crate::{sql_err, stack_format};
 
 use super::{
-    JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
+    Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
     correlated_in_expression, correlated_where_passes, find_srf, merge_correlated, postpone_cost,
     project_row_skipping, record_star_width, resolve_order_target, scan_source,
     scan_source_recycling, sql_fail, sql_ok, srf_max_count,
@@ -94,6 +94,7 @@ fn for_each_materialized_projection<'a>(
     n_keys: usize,
     postponed: Option<&[bool; MAX_PROJ]>,
     has_srf: bool,
+    outer: Option<&dyn ColumnLookup<'a>>,
     consume: &mut impl FnMut(&JoinRow<'_, 'a, '_>, &[Datum<'a>], &[Datum<'a>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if !where_correlated.is_empty()
@@ -163,11 +164,18 @@ fn for_each_materialized_projection<'a>(
             params,
             use_hooks,
             &mut projected,
-            None,
+            outer,
         )?;
         let mut keys = [Datum::Null; MAX_PROJ];
+        let chained_row = Chained { inner: row, outer };
         for (key, expression) in order_exprs.iter().take(n_keys).enumerate() {
-            keys[key] = eval_full(expression.expect("resolved"), arena, params, row, use_hooks)?;
+            keys[key] = eval_full(
+                expression.expect("resolved"),
+                arena,
+                params,
+                &chained_row,
+                use_hooks,
+            )?;
         }
         consume(row, &projected[..width], &keys[..n_keys])?;
     }
@@ -501,6 +509,7 @@ pub(crate) fn materialized_rows<'a>(
                     None
                 },
                 has_srf,
+                outer,
                 &mut |_, _, _| {
                     count += 1;
                     Ok(())
@@ -547,6 +556,7 @@ pub(crate) fn materialized_rows<'a>(
                         None
                     },
                     has_srf,
+                    outer,
                     &mut |row, projected, keys| {
                         debug_assert_eq!(projected.len(), width);
                         rows[at] = crate::sql::exec::encode_projected_by(
@@ -967,6 +977,7 @@ pub(crate) fn external_materialized_into<'a>(
                     None
                 },
                 plan.has_srf,
+                outer,
                 &mut |row, projected, keys| {
                     storage
                         .with_block_store(|blocks| {

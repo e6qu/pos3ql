@@ -88,7 +88,8 @@ pub use subquery::{prepare_subqueries, subquery_hooks};
 
 mod window;
 use window::{
-    cmp_key_rows, dedup_window_rows, project_window_rows, rewrite_grouped_windows, window_select,
+    cmp_key_rows, dedup_window_rows, external_window_into, project_window_rows,
+    rewrite_grouped_windows, window_select,
 };
 
 /// Static executor envelope for one range table.
@@ -1336,7 +1337,28 @@ pub(super) fn collect_windows<'a>(
     out: &mut [&'a Expr<'a>; MAX_WINDOWS],
     n: &mut usize,
 ) -> Result<(), SqlError> {
-    if let Expr::Call { over: Some(_), .. } = expression {
+    if let Expr::Call { over: Some(_), distinct, order_by, filter, .. } = expression {
+        // PostgreSQL rejects these call decorations on window functions in
+        // parse analysis; accepting them would silently compute a different
+        // query.
+        if *distinct {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "DISTINCT is not implemented for window functions"
+            ));
+        }
+        if !order_by.is_empty() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "aggregate ORDER BY is not implemented for window functions"
+            ));
+        }
+        if filter.is_some() && !expression.is_aggregate() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "FILTER is not implemented for non-aggregate window functions"
+            ));
+        }
         if out[..*n].iter().any(|e| core::ptr::eq(*e, expression)) {
             return Ok(());
         }
@@ -3209,6 +3231,31 @@ fn select_into_rows_mode<'a>(
                 recycle_rows,
                 emit,
             );
+        }
+        if storage.spill_attached() {
+            let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+            let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
+            external_window_into(
+                storage,
+                txid,
+                statement,
+                from,
+                &scope,
+                &win_nodes[..n_win],
+                &hooks,
+                correlated,
+                &outer_subs.base,
+                arena,
+                params,
+                outer,
+                limit,
+                offset,
+                &mut |values| {
+                    emit(values)?;
+                    Ok(true)
+                },
+            )?;
+            return Ok(());
         }
         let (proj_rows, sort_keys) = project_window_rows(
             storage,

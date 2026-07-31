@@ -208,9 +208,13 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   state is an external sorted map, `ARRAY(subquery)` results and
   set-subquery forms carrying their own final ORDER BY/LIMIT spool through
   the same run stack, and the grouped-aggregate group-key sort runs through
-  a provider-neutral external sort. Windows still retain working sets in
-  the fixed shared arena (`work_arena_bytes`, 64 MiB default). Exceeding
-  that remaining bound errors `54000`, never truncates a result (B-006).
+  a provider-neutral external sort. Windows externalize partition-at-a-time:
+  the source rows external-sort by (PARTITION BY, ORDER BY, position),
+  partitions stream back one at a time through the shared arena, and each
+  row's window values ride one ordinal-stable win run that the projection
+  re-scan joins back by position before the final output sort. Only a single
+  window partition larger than the arena (`work_arena_bytes`, 64 MiB default)
+  still errors `54000`, never truncating a result.
 - **A checkpoint beat blocks for one table's write.** The auto-checkpoint is
   sliced — one table's SSTs per beat, beats interleaved with statements and
   driven on by the idle event loop, publishing only when no table changed

@@ -10529,6 +10529,183 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
 }
 
 #[test]
+fn external_windows_spill_through_the_provider_neutral_block_store() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("external-windows-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-external-windows-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 1 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 16 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    config.table_rows = 24576;
+    config.memtable_bytes = 4 << 20;
+    // The 20000-row fixture is ~160 KiB of rows, so the memtable holds it;
+    // window spill pressure comes from the external sorter, not the memtable.
+    // The window working set (all 20000 rows across every spec) is over twice
+    // this arena, so only the spilled path can evaluate the queries below;
+    // per-partition compute_window stays O(partition).
+    config.work_arena_bytes = 2 << 20;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE external_window_rows (grp int, id int); \
+         CREATE TABLE small_window_rows (grp int, id int)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    for start in (1..=20000).step_by(500) {
+        let end = start + 499;
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO external_window_rows \
+                 SELECT i % 7, i \
+                 FROM generate_series({start}, {end}) AS g(i)"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "rows {start}..={end}: {}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    for start in (1..=2000).step_by(500) {
+        let end = start + 499;
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO small_window_rows \
+                 SELECT i % 5, i \
+                 FROM generate_series({start}, {end}) AS g(i)"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "small fixture rows {start}..={end}: {}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+
+    let before = engine.storage.block_io_stats();
+    let partitioned = |engine: &mut Engine,
+                       budget: &mut Budget,
+                       text: &str,
+                       expected: &[&str]| {
+        assert_eq!(
+            data_rows(&run_with(engine, budget, text)),
+            expected,
+            "{}",
+            String::from_utf8_lossy(&run_with(engine, budget, text))
+        );
+    };
+    // A range-function source with two specs (the second a whole-input
+    // partition) proves the multi-spec restitch by position.
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT x, first_value(x) OVER (ORDER BY x), last_value(x) OVER () \
+         FROM generate_series(1, 100) AS x \
+         ORDER BY x LIMIT 3",
+        &["1|1|100", "2|1|100", "3|1|100"],
+    );
+    // Three specs over a 2857-row single partition, reading each window
+    // function's value for its own row out of the shared window run.
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT grp, id,
+                sum(id) OVER (PARTITION BY grp ORDER BY id),
+                first_value(id) OVER (PARTITION BY grp ORDER BY id),
+                last_value(id) OVER (PARTITION BY grp ORDER BY id
+                                     ROWS BETWEEN UNBOUNDED PRECEDING
+                                     AND UNBOUNDED FOLLOWING)
+         FROM external_window_rows
+         WHERE grp = 0
+         ORDER BY id LIMIT 4",
+        &[
+            "0|7|7|7|19999",
+            "0|14|21|7|19999",
+            "0|21|42|7|19999",
+            "0|28|70|7|19999"
+        ],
+    );
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT grp, id, row_number() OVER (PARTITION BY grp ORDER BY id DESC)
+         FROM external_window_rows
+         WHERE grp = 1 AND id >= 29 AND id <= 50
+         ORDER BY id",
+        &["1|29|4", "1|36|3", "1|43|2", "1|50|1"],
+    );
+    // The whole 20000-row input as one spec run (over ROWS_PER_CHUNK, so it
+    // spills mid-input), streaming back one 2857-row partition at a time.
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT DISTINCT grp, count(*) OVER (PARTITION BY grp) AS cnt
+         FROM external_window_rows
+         ORDER BY grp",
+        &[
+            "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857"
+        ],
+    );
+    let traffic = engine.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        traffic.object_puts > 0 && traffic.object_gets > 0,
+        "window runs must traverse BlockStore: {traffic:?}"
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    // Both cache tiers disappear. The window query must read its input and
+    // rebuild its runs from the provider-neutral object tier alone. The
+    // cold-read of the 2000-row table is fast enough for a test, unlike the
+    // 20000-row fixture (three block fetches per row through a one-block
+    // cache, which the warm queries already covered).
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut restarted_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let before_cold = restarted.storage.block_io_stats();
+    partitioned(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT grp, id,
+                sum(id) OVER (PARTITION BY grp ORDER BY id),
+                first_value(id) OVER (PARTITION BY grp ORDER BY id)
+         FROM small_window_rows
+         WHERE grp = 1
+         ORDER BY id LIMIT 4",
+        &["1|1|1|1", "1|6|7|1", "1|11|18|1", "1|16|34|1"],
+    );
+    let cold_traffic = restarted
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_cold);
+    assert!(
+        cold_traffic.object_puts > 0 && cold_traffic.object_gets > 0,
+        "cold window evaluation must cross the durable block boundary: {cold_traffic:?}"
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

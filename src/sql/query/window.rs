@@ -24,8 +24,8 @@ use super::group::row_passes_correlated_where;
 use super::{
     AggState, GroupedRewrite, MAX_AGGS, MAX_JOIN_TABLES, MAX_SUBQUERIES, MAX_WIN_KEYS, MAX_WINDOWS,
     Outcome, QueryScope, arena_full, collect_grouped_aggs, keys_equal, merge_correlated,
-    project_row, resolve_order_target, rewrite_grouped_expr, scan_source, sql_fail, sql_ok,
-    window_row,
+    project_row, record_star_width, resolve_order_target, rewrite_grouped_expr, scan_source,
+    scan_source_recycling, sql_fail, sql_ok, window_row,
 };
 
 /// Windows over a grouped query: PostgreSQL evaluates window functions after
@@ -1065,6 +1065,38 @@ fn compute_window<'a>(
     Ok(&*out)
 }
 
+/// Resolves one ORDER BY key's direction given both decoded values.
+fn order_by_key<'a>(
+    va: &Datum<'a>,
+    vb: &Datum<'a>,
+    o: &OrderBy<'a>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    use core::cmp::Ordering;
+    let base = match (va.is_null(), vb.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if o.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if o.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => compare_datums(va, vb)?,
+    };
+    Ok(if o.descending && !va.is_null() && !vb.is_null() {
+        base.reverse()
+    } else {
+        base
+    })
+}
+
 /// Compares two rows by a window ORDER BY spec (ASC/DESC, NULLS FIRST/LAST).
 #[allow(clippy::too_many_arguments)]
 fn cmp_order<'a>(
@@ -1084,29 +1116,7 @@ fn cmp_order<'a>(
         let va = eval_full(o.expression, arena, params, &ra, hooks)?;
         let rb = window_row(scope, rows[b], offs);
         let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-        let base = match (va.is_null(), vb.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if o.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if o.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => compare_datums(&va, &vb)?,
-        };
-        let c = if o.descending && !va.is_null() && !vb.is_null() {
-            base.reverse()
-        } else {
-            base
-        };
+        let c = order_by_key(&va, &vb, o)?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -1326,6 +1336,573 @@ pub(crate) fn project_window_rows<'a>(
     Ok((proj_rows, sort_keys))
 }
 
+/// Compares two encoded rows' first `n` columns under SQL equality and order,
+/// NULLs first — the same semantics `keys_equal` uses to partition rows.
+fn compare_encoded_keys(a: &[u8], b: &[u8], at: usize, n: usize) -> Result<core::cmp::Ordering, SqlError> {
+    use core::cmp::Ordering;
+    for k in 0..n {
+        let va = crate::sql::exec::decode_projected_pub(a, at + k);
+        let vb = crate::sql::exec::decode_projected_pub(b, at + k);
+        let c = match (va.is_null(), vb.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => compare_datums(&va, &vb)?,
+        };
+        if c != Ordering::Equal {
+            return Ok(c);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Compares two encoded rows' ORDER BY keys (decoded, honoring each key's
+/// ASC/DESC + NULLS placement), mirroring `cmp_order` for the external runs.
+fn compare_encoded_order<'a>(
+    a: &[u8],
+    b: &[u8],
+    at: usize,
+    ord: &[OrderBy<'a>],
+) -> Result<core::cmp::Ordering, SqlError> {
+    use core::cmp::Ordering;
+    for (k, o) in ord.iter().enumerate() {
+        let va = crate::sql::exec::decode_projected_pub(a, at + k);
+        let vb = crate::sql::exec::decode_projected_pub(b, at + k);
+        let c = order_by_key(&va, &vb, o)?;
+        if c != Ordering::Equal {
+            return Ok(c);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// The projected column count for a statement's select list: wildcards expand
+/// by the scope, expressions occupy one slot.
+fn projected_width<'a>(items: &[SelectItem<'a>], scope: &QueryScope<'a>) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::TableWildcard(qualifier) => {
+                scope.defs[scope.table_index(qualifier).expect("resolved table")]
+                    .expect("resolved table")
+                    .n_columns
+            }
+            SelectItem::RecordStar(base) => record_star_width(base, scope),
+            SelectItem::Expr { .. } => 1,
+        })
+        .sum()
+}
+
+/// Doubles an arena-backed scratch array, copying the live prefix. Growth is
+/// geometric so per-row appends stay amortized linear in the final length.
+fn grow_slots<'a, T: Copy>(
+    arena: &'a Arena,
+    slots: &'a mut [T],
+    fill: T,
+) -> Result<&'a mut [T], SqlError> {
+    let new_len = slots.len().saturating_mul(2).max(2);
+    let bigger = arena.alloc_slice_with(new_len, |_| fill).map_err(|_| arena_full())?;
+    bigger[..slots.len()].copy_from_slice(slots);
+    Ok(bigger)
+}
+
+/// Spill-mode window execution: sorts the source by (PARTITION BY, ORDER BY)
+/// per window call, computes each partition's values against a resident
+/// decoded copy, then re-scans the source to project every row with its
+/// window values and stream the ordered, deduped, paged result. Every
+/// intermediate set lives in the external run stack, so the statement arena
+/// holds at most one window partition at a time.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn external_window_into<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    from: &'a FromClause<'a>,
+    scope: &QueryScope<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    limit: u64,
+    offset: u64,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
+) -> Result<u64, SqlError> {
+    // WHERE with correlated subqueries is applied per row in the callbacks.
+    let scan_where = if correlated.is_empty() {
+        statement.where_clause
+    } else {
+        None
+    };
+    // Flat-row column offsets per table.
+    let mut offs = [0usize; MAX_JOIN_TABLES];
+    let mut total = 0usize;
+    for (t, offset) in offs.iter_mut().enumerate().take(scope.n) {
+        *offset = total;
+        total += scope.defs[t].expect("resolved").n_columns;
+    }
+    // Resolve ORDER BY (ordinals → select items).
+    let n_order = statement.order_by.len();
+    if n_order > MAX_WIN_KEYS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "ORDER BY list too long"
+        ));
+    }
+    let mut order_exprs: [Option<&Expr>; MAX_WIN_KEYS] = [None; MAX_WIN_KEYS];
+    for (k, ob) in statement.order_by.iter().enumerate() {
+        order_exprs[k] = Some(resolve_order_target(
+            ob.expression,
+            statement.items,
+            scope,
+            arena,
+        )?);
+    }
+    let win_ptrs: &[*const Expr] = arena
+        .alloc_slice_with(win_nodes.len(), |i| win_nodes[i] as *const Expr)
+        .map_err(|_| arena_full())?;
+
+    // Every window function's value for every source row lands in one run,
+    // keyed by (row position, window index), so the projection pass re-reads
+    // them in lockstep with a fresh source scan.
+    let mut win_sorter = storage.external_sorter()?;
+    win_sorter.reset();
+    let mut win_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
+        let pa = crate::sql::exec::decode_projected_pub(left, 0);
+        let pb = crate::sql::exec::decode_projected_pub(right, 0);
+        compare_datums(&pa, &pb)
+    };
+    for (wi, &node) in win_nodes.iter().enumerate() {
+        let Expr::Call {
+            name: _,
+            args: _,
+            over: Some(spec),
+            ..
+        } = node
+        else {
+            return Err(sql_err!(sqlstate::INTERNAL_ERROR, "not a window function"));
+        };
+        let n_partition = spec.partition_by.len();
+        let n_keys = n_partition + spec.order_by.len();
+        // Sort the source rows by (PARTITION BY keys, ORDER BY keys) so every
+        // partition streams back as one contiguous run segment.
+        let mut spec_sorter = storage.external_sorter()?;
+        spec_sorter.reset();
+        let mut spec_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
+            let by_partition = compare_encoded_keys(left, right, 0, n_partition)?;
+            if !by_partition.is_eq() {
+                return Ok(by_partition);
+            }
+            compare_encoded_order(left, right, n_partition, spec.order_by)
+        };
+        let mut position = 0i64;
+        scan_source_recycling(
+            storage,
+            scope,
+            from,
+            txid,
+            scan_where,
+            arena,
+            params,
+            hooks,
+            outer,
+            &mut |row| {
+                if !row_passes_correlated_where(
+                    correlated,
+                    statement.where_clause,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    hooks,
+                    row,
+                )? {
+                    return Ok(true);
+                }
+                // The full flat source row rides along so `compute_window`
+                // evaluates every window argument and key against the original
+                // row without rescanning.
+                let key_vals = arena
+                    .alloc_slice_with(n_keys.max(1), |_| Datum::Null)
+                    .map_err(|_| arena_full())?;
+                for (k, pk) in spec.partition_by.iter().enumerate() {
+                    key_vals[k] = eval_full(pk, arena, params, row, hooks)?;
+                }
+                for (k, ob) in spec.order_by.iter().enumerate() {
+                    key_vals[n_partition + k] =
+                        eval_full(ob.expression, arena, params, row, hooks)?;
+                }
+                let row_position = position;
+                storage
+                    .with_block_store(|blocks| {
+                        spec_sorter.push_projected_by(
+                            blocks,
+                            n_keys + total + 1,
+                            |index| {
+                                if index < n_keys {
+                                    key_vals[index]
+                                } else if index < n_keys + total {
+                                    let flat = index - n_keys;
+                                    for (t, offset) in offs.iter().enumerate().take(scope.n) {
+                                        let nc = scope.defs[t].expect("resolved").n_columns;
+                                        if flat < offset + nc {
+                                            let vals = row.values[t].expect("bound");
+                                            return if vals.is_empty() {
+                                                Datum::Null
+                                            } else {
+                                                vals[flat - offset]
+                                            };
+                                        }
+                                    }
+                                    unreachable!("flat window column is in scope")
+                                } else {
+                                    Datum::Int8(row_position)
+                                }
+                            },
+                            &mut spec_compare,
+                        )
+                    })
+                    .expect("spill-attached block store")?;
+                position += 1;
+                Ok(true)
+            },
+        )?;
+        let spec_run = storage
+            .with_block_store(|blocks| spec_sorter.finish(blocks, &mut spec_compare))
+            .expect("spill-attached block store")?;
+        drop(spec_sorter);
+        // Stream the sorted run back partition by partition, computing each
+        // partition's window values against a resident decoded copy (one
+        // partition is the largest working set the arena ever holds here).
+        if let Some(run) = spec_run {
+            let mut spec_reader = storage.external_run_reader()?;
+            storage
+                .with_block_store(|blocks| spec_reader.start(blocks, run))
+                .expect("spill-attached block store")?;
+            let mark = arena.mark();
+            let empty_row: &[Datum] = &[];
+            let mut rows: &mut [&[Datum]] = arena
+                .alloc_slice_with(16, |_| empty_row)
+                .map_err(|_| arena_full())?;
+            let mut pos_of: &mut [i64] = arena
+                .alloc_slice_with(16, |_| 0)
+                .map_err(|_| arena_full())?;
+            let mut count = 0usize;
+            let mut finish_partition =
+                |rows: &[&'a [Datum<'a>]], pos_of: &[i64]| -> Result<(), SqlError> {
+                    let out = compute_window(node, rows, scope, &offs, arena, params, hooks)?;
+                    for (r, &pos) in pos_of.iter().enumerate() {
+                        storage
+                            .with_block_store(|blocks| {
+                                win_sorter.push_projected_by(
+                                    blocks,
+                                    3,
+                                    |index| match index {
+                                        0 => Datum::Int8(pos),
+                                        1 => Datum::Int4(wi as i32),
+                                        _ => out[r],
+                                    },
+                                    &mut win_compare,
+                                )
+                            })
+                            .expect("spill-attached block store")?;
+                    }
+                    Ok(())
+                };
+            loop {
+                let keep_scanning = {
+                    let Some(context) = spec_reader.context() else {
+                        break;
+                    };
+                    let crate::sql::external::ExternalRunContext {
+                        row,
+                        previous,
+                        boundary: _,
+                        output: _,
+                    } = context;
+                    let is_new = match previous {
+                        None => true,
+                        Some(prior) => !compare_encoded_keys(prior, row, 0, n_partition)?.is_eq(),
+                    };
+                    if is_new && count > 0 {
+                        finish_partition(&rows[..count], &pos_of[..count])?;
+                        // SAFETY: every value allocated since `mark` was
+                        // encoded into the window run; none escapes.
+                        unsafe { arena.rewind_to(mark) };
+                        count = 0;
+                        rows = arena
+                            .alloc_slice_with(16, |_| empty_row)
+                            .map_err(|_| arena_full())?;
+                        pos_of = arena
+                            .alloc_slice_with(16, |_| 0)
+                            .map_err(|_| arena_full())?;
+                    }
+                    if count == rows.len() {
+                        rows = grow_slots(arena, rows, empty_row)?;
+                        pos_of = grow_slots(arena, pos_of, 0)?;
+                    }
+                    // Copy the encoded row into the arena so its decoded
+                    // columns survive the reader's next advance.
+                    let copied = arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
+                    let flat = arena
+                        .alloc_slice_with(total.max(1), |_| Datum::Null)
+                        .map_err(|_| arena_full())?;
+                    for (f, slot) in flat.iter_mut().enumerate() {
+                        *slot = crate::sql::exec::decode_projected_col_record(
+                            copied,
+                            n_keys + f,
+                            arena,
+                        )?;
+                    }
+                    rows[count] = &flat[..total];
+                    pos_of[count] = match crate::sql::exec::decode_projected_pub(
+                        copied,
+                        n_keys + total,
+                    ) {
+                        Datum::Int8(v) => v,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "window partition position is corrupt"
+                            ));
+                        }
+                    };
+                    count += 1;
+                    true
+                };
+                if !keep_scanning {
+                    break;
+                }
+                storage
+                    .with_block_store(|blocks| spec_reader.advance(blocks))
+                    .expect("spill-attached block store")?;
+            }
+            if count > 0 {
+                finish_partition(&rows[..count], &pos_of[..count])?;
+                // SAFETY: the partition's decoded values were consumed into
+                // the window run before this rewind.
+                unsafe { arena.rewind_to(mark) };
+            }
+        }
+    }
+    let win_run = storage
+        .with_block_store(|blocks| win_sorter.finish(blocks, &mut win_compare))
+        .expect("spill-attached block store")?;
+    drop(win_sorter);
+
+    // Re-scan the source, projecting each row with its window values read
+    // back from the completed run, and sort the projected rows by ORDER BY.
+    let width = projected_width(statement.items, scope);
+    let mut out_sorter = storage.external_sorter()?;
+    out_sorter.reset();
+    let mut out_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
+        let by_order = compare_encoded_order(left, right, width, statement.order_by)?;
+        if statement.distinct && by_order.is_eq() {
+            Ok(crate::sql::exec::compare_projected_prefix(left, right, width))
+        } else {
+            Ok(by_order)
+        }
+    };
+    let mut win_reader = match win_run {
+        Some(run) => {
+            let mut reader = storage.external_run_reader()?;
+            storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("spill-attached block store")?;
+            Some(reader)
+        }
+        None => None,
+    };
+    let win_count = win_nodes.len();
+    let mut position = 0i64;
+    scan_source_recycling(
+        storage,
+        scope,
+        from,
+        txid,
+        scan_where,
+        arena,
+        params,
+        hooks,
+        outer,
+        &mut |row| {
+            if !row_passes_correlated_where(
+                correlated,
+                statement.where_clause,
+                storage,
+                txid,
+                arena,
+                params,
+                hooks,
+                row,
+            )? {
+                return Ok(true);
+            }
+            // Each window value is detached into the arena so the reader can
+            // advance past it before the row is projected.
+            let mut wv = [Datum::Null; MAX_WINDOWS];
+            for w in 0..win_count {
+                let reader = win_reader.as_mut().ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "window run is missing rows")
+                })?;
+                let entry = reader.row().ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "window run ended early")
+                })?;
+                debug_assert_eq!(
+                    crate::sql::exec::decode_projected_pub(entry, 0),
+                    Datum::Int8(position)
+                );
+                let index = match crate::sql::exec::decode_projected_pub(entry, 1) {
+                    Datum::Int4(i) => i as usize,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "window index is corrupt"
+                        ));
+                    }
+                };
+                debug_assert_eq!(index, w);
+                let value = crate::sql::exec::decode_projected_col_record(entry, 2, arena)?;
+                let owned = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                wv[index] = crate::sql::exec::decode_projected_col_record(owned, 0, arena)?;
+                storage
+                    .with_block_store(|blocks| reader.advance(blocks))
+                    .expect("spill-attached block store")?;
+            }
+            let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
+                [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+            let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
+            let row_subs;
+            let subs = if correlated.is_empty() {
+                hooks.subs
+            } else {
+                row_subs = merge_correlated(
+                    correlated,
+                    base,
+                    row,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    &mut sc,
+                    &mut ls,
+                )?;
+                Some(&row_subs)
+            };
+            let win_hooks = EvalHooks {
+                group: None,
+                aggs: None,
+                subs,
+                windows: Some((win_ptrs, &wv[..win_count])),
+                catalog: hooks.catalog,
+                srf_index: hooks.srf_index,
+                sequences: hooks.sequences,
+            };
+            let mut projected = [Datum::Null; MAX_PROJ];
+            let np = project_row(
+                statement.items,
+                scope,
+                row,
+                arena,
+                params,
+                &win_hooks,
+                &mut projected,
+                outer,
+            )?;
+            debug_assert_eq!(np, width);
+            let mut keys = [Datum::Null; MAX_WIN_KEYS];
+            for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
+                keys[k] = eval_full(
+                    oe.expect("set"),
+                    arena,
+                    params,
+                    &super::Chained { inner: row, outer },
+                    &win_hooks,
+                )?;
+            }
+            storage
+                .with_block_store(|blocks| {
+                    out_sorter.push_projected_by(
+                        blocks,
+                        width + n_order,
+                        |index| {
+                            if index < width {
+                                projected[index]
+                            } else {
+                                keys[index - width]
+                            }
+                        },
+                        &mut out_compare,
+                    )
+                })
+                .expect("spill-attached block store")?;
+            position += 1;
+            Ok(true)
+        },
+    )?;
+    let out_run = storage
+        .with_block_store(|blocks| out_sorter.finish(blocks, &mut out_compare))
+        .expect("spill-attached block store")?;
+    drop(out_sorter);
+
+    // Stream the ordered run under DISTINCT / OFFSET / LIMIT.
+    let Some(run) = out_run else {
+        return Ok(0);
+    };
+    let mut out_reader = storage.external_run_reader()?;
+    storage
+        .with_block_store(|blocks| out_reader.start(blocks, run))
+        .expect("spill-attached block store")?;
+    let mut emitted = 0u64;
+    let mut skipped = 0u64;
+    loop {
+        let keep_scanning = {
+            let Some(context) = out_reader.context() else {
+                break;
+            };
+            let crate::sql::external::ExternalRunContext {
+                row,
+                previous,
+                boundary: _,
+                output: _,
+            } = context;
+            let duplicate = statement.distinct
+                && previous.is_some_and(|prior| {
+                    crate::sql::exec::compare_projected_prefix(row, prior, width).is_eq()
+                });
+            if duplicate {
+                true
+            } else if skipped < offset {
+                skipped += 1;
+                true
+            } else if emitted >= limit {
+                false
+            } else {
+                let mut output = [Datum::Null; MAX_PROJ];
+                for (column, value) in output.iter_mut().enumerate().take(width) {
+                    *value = crate::sql::exec::decode_projected_col_record(row, column, arena)?;
+                }
+                if !emit(&output[..width])? {
+                    false
+                } else {
+                    emitted += 1;
+                    true
+                }
+            }
+        };
+        if !keep_scanning {
+            break;
+        }
+        storage
+            .with_block_store(|blocks| out_reader.advance(blocks))
+            .expect("spill-attached block store")?;
+    }
+    Ok(emitted)
+}
+
 /// Window-function execution to the wire: projects each row with its window
 /// values computed over the materialized source, applies DISTINCT and ORDER
 /// BY, then pages with LIMIT/OFFSET and emits.
@@ -1368,6 +1945,42 @@ pub(crate) fn window_select<'a>(
                 ));
             }
         }
+    }
+    if storage.spill_attached() {
+        let mut wire_full = false;
+        let emitted = match external_window_into(
+            storage,
+            txid,
+            statement,
+            from,
+            scope,
+            win_nodes,
+            hooks,
+            correlated,
+            base,
+            arena,
+            params,
+            None,
+            limit,
+            offset,
+            &mut |values| {
+                if responder.data_row(values).is_err() {
+                    wire_full = true;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            },
+        ) {
+            Ok(emitted) => emitted,
+            Err(error) => return sql_fail(error),
+        };
+        if wire_full {
+            return Err(crate::pg::wire::WireFull);
+        }
+        let tag = stack_format!(48, "SELECT {}", emitted);
+        responder.command_complete(tag.as_str())?;
+        return sql_ok();
     }
     let (proj_rows, sort_keys) = match project_window_rows(
         // The top-level query has no enclosing row to resolve against.

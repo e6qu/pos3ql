@@ -218,10 +218,15 @@ block — that distinction between a store and a cache is what tells a caller
 whether it still owes the bucket an upload, and reclaiming belongs to Stage B in
 front of this.
 
-Remaining for Stage A: the free set / ref-map for the local grid, and
-re-expressing the current SST writer/reader in terms of blocks — the half that
-touches working durability code, with the cold-start and durability scenarios in
-`tests/external/run.sh` as the guardrail.
+Stage A closed out since: the SST writer/reader is expressed in blocks
+(`store/sst.rs` — data, chain, filter, sparse index, and roster blocks named
+by identity through `BlockStore`), and the free set / ref-map turned out to be
+the wrong tool for this design rather than a missing piece. Blocks are
+immutable and content-addressed, so nothing needs per-block refcounting: the
+published manifest is the single root, and mark-and-sweep GC reclaims whatever
+it cannot reach (`collect_garbage`), while the local RAM and disk tiers are
+pure caches that reclaim by CLOCK eviction — a lost local block costs a
+re-fetch, never data.
 
 ### Stage B — the tiered read cache (RAM block cache + local disk cache)
 
@@ -397,8 +402,8 @@ manifest CAS lands, so a lost publish leaves memory consistent with the
 still-current manifest and the orphaned blocks sweep as garbage. DML WHERE
 scans consume spilled rows in place (the two-slot spill scratch), so a DELETE
 over thousands of spilled rows no longer stages every candidate in the
-statement arena. **Remaining for Stage E:** paced background compaction (the
-merge currently rides a checkpoint) and flush-rate-driven manifest logging.
+statement arena. (Paced background compaction has since landed — see Stage E:
+the merge is a background job crossing beats, not a checkpoint rider.)
 **Crux invariant** (kept): an SST is referenced by the published manifest
 before the WAL resets — the checkpoint orders it so.
 
@@ -676,10 +681,16 @@ a commit whose synchronous WAL upload failed was left unpromoted — locally
 durable but invisible until a restart resurrected it (client-observable
 time-travel) — and a failed upload *retry* poisoned whatever innocent
 statement (even ROLLBACK) happened to trigger it. What remains of Stage H:
-the virtual *grid disk* (torn-write/bit-rot injection under the WAL and the
-disk cache — today the harness scribbles the cache file between
-incarnations), and folding the mid-flush/mid-compaction crash invariants
-into longer standing runs.
+folding the mid-flush/mid-compaction crash invariants into longer standing
+runs, and re-enabling WAL-journal scribbling once B-283 closes — extending
+the harness to scribble the journal between incarnations (alongside the
+cache file) found two further real bugs (a segment-recovery floor that lost
+records after a disk-wipe restart, and value-index roster write-idempotency,
+both fixed), but it also exposed that an errored commit's records are
+promoted and observable while they live only in the journal (B-156's
+contract), so destroying those journal bytes before any successful retry
+loses observed data — the sound fix re-gates promotion on upload success and
+is held for its own design.
 
 ### Stage I — object-storage-adaptive execution (the four pillars)
 

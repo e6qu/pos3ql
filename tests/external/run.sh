@@ -55,6 +55,32 @@ step() { step_close; STEP_TITLE=$1; STEP_STARTED=$SECONDS; print -- "\n=== $1 ==
 ok()   { PASS=$((PASS+1)); print -- "PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
 
+# Start a pos3ql server and wait for it to answer. A listener already on the
+# port is never ours — a server leaked by an earlier interrupted run would
+# silently serve the whole suite while the fresh binary exits on its bind
+# failure (under coverage that reads as the external layer contributing no
+# profile — B-161). Refuse instead. And the probe succeeding only proves *a*
+# server answered, so the started process must still be alive afterwards.
+START_PID=0
+start_pos3ql() { # <config> <log> <port>
+  local conf=$1 log=$2 port=$3
+  if nc -z 127.0.0.1 $port 2>/dev/null; then
+    bad "port $port is already in use (stale pos3ql from an earlier run?) — kill it first"
+    exit 1
+  fi
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$conf" >> "$log" 2>&1 &
+  START_PID=$!
+  for _ in {1..50}; do
+    "$PSQL" -h 127.0.0.1 -p $port -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  if ! kill -0 "$START_PID" 2>/dev/null; then
+    bad "pos3ql under test exited at startup (see $log)"
+    tail -10 "$log"
+    exit 1
+  fi
+}
+
 cleanup() {
   # Stop the base-port server gracefully and wait for it to exit before
   # returning. Under coverage the server flushes its profile on a clean
@@ -123,13 +149,8 @@ work_arena_bytes = 192MiB
 # stream back in ranged windows.
 s3_response_bytes = 256KiB
 EOF
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" > "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null || { bad "server did not come up"; cat "$WORK/server.log"; exit 1; }
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+SERVER_PID=$START_PID
 ok "server up (pid $SERVER_PID)"
 
 psql_run() { # <name>
@@ -228,12 +249,8 @@ step "durability: kill -9, restart, data intact"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+SERVER_PID=$START_PID
 # A column's type is stored as a one-byte code; two families once shared codes,
 # so an int4[]/bool[] column came back as a multirange with its values gone.
 types=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
@@ -304,12 +321,8 @@ step "durable WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO 
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+SERVER_PID=$START_PID
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
 [[ "$out" == "durable-a,durable-b,durable-c|600" ]] && ok "durable WAL upload recovers from MinIO (segments beyond the response buffer)" || bad "durable WAL recovery: '$out'"
 
@@ -327,23 +340,15 @@ s3_prefix = rpo0-$$/
 s3_access_key = minioadmin
 s3_secret_key = minioadmin
 EOF
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/rpo0.conf" > "$WORK/rpo0.log" 2>&1 &
-RPO0_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/rpo0.conf" "$WORK/rpo0.log" $((PG_PORT + 2))
+RPO0_PID=$START_PID
 "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U postgres -X -q \
   -c "CREATE TABLE rpo0 (id int, v text)" \
   -c "INSERT INTO rpo0 VALUES (1,'acked-then-killed'),(2,'still-here')"
 kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
 rm -rf "$WORK/rpo0-data"
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/rpo0.conf" >> "$WORK/rpo0.log" 2>&1 &
-RPO0_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/rpo0.conf" "$WORK/rpo0.log" $((PG_PORT + 2))
+RPO0_PID=$START_PID
 out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 2)) -U postgres -X -t -A \
   -c "SELECT string_agg(v, ',' ORDER BY id) FROM rpo0" 2>&1)
 kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
@@ -355,12 +360,8 @@ step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+SERVER_PID=$START_PID
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -c "SELECT v FROM crashy ORDER BY id LIMIT 1" 2>&1)
 [[ "$out" == "pre-crash" ]] && ok "cold start from bucket" || bad "cold start from bucket: '$out'"
 # Schemas and their contents rebuild from the manifest alone (wiped disk).
@@ -407,12 +408,8 @@ s3_access_key = minioadmin
 s3_secret_key = minioadmin
 work_arena_bytes = 96MiB
 EOF
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/overlay.conf" > "$WORK/overlay.log" 2>&1 &
-OVERLAY_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/overlay.conf" "$WORK/overlay.log" $((PG_PORT + 3))
+OVERLAY_PID=$START_PID
 # The scale table carries a PRIMARY KEY: the value index (B-169) makes a
 # uniqueness probe a hash seek against the committed rows rather than a scan of
 # the whole spilled SST forest, so a constrained table spills and grows past its
@@ -460,12 +457,8 @@ uniq_count=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A \
 
 kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
 rm -rf "$WORK/overlay-data"
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/overlay.conf" >> "$WORK/overlay.log" 2>&1 &
-OVERLAY_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/overlay.conf" "$WORK/overlay.log" $((PG_PORT + 3))
+OVERLAY_PID=$START_PID
 out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
   -c "SELECT count(*), (SELECT v FROM big WHERE id = 4321) FROM big" 2>&1 | head -1)
 kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
@@ -500,12 +493,8 @@ spill_point=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -c "SELECT l
   -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+SERVER_PID=$START_PID
 after=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
   -c "SELECT count(*), count(*) FILTER (WHERE id BETWEEN 100 AND 599), max(CASE WHEN id = 700 THEN pad END) FROM spilly" 2>&1)
 [[ "$after" == "23500|0|updated" ]] && ok "delta SSTs + tombstones survive a cold start" \
@@ -529,12 +518,8 @@ merged=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
   || bad "paced compaction (got: $merged)"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+SERVER_PID=$START_PID
 merged_cold=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
   -c "SELECT count(*), (SELECT pad FROM spilly WHERE id = 650) FROM spilly" 2>&1)
 [[ "$merged_cold" == "24550|cycle-7" ]] && ok "merged SST lists survive a cold start" \
@@ -571,12 +556,8 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBI
   # The torture script may have restarted the server under its own pid.
   lsof -ti tcp:$PG_PORT -sTCP:LISTEN | xargs kill -9 2>/dev/null || true
   sleep 0.3
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server.conf" >> "$WORK/server.log" 2>&1 &
-  SERVER_PID=$!
-  for i in {1..50}; do
-    "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  SERVER_PID=$START_PID
 else
   print -- "SKIP: torture needs POS3QL_VENV and a reference PostgreSQL"
 fi
@@ -626,24 +607,16 @@ s3_access_key = minioadmin
 s3_secret_key = minioadmin
 wal_upload = on
 EOF
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/tls-server.conf" > "$WORK/tls-server.log" 2>&1 &
-  TLS_SERVER_PID=$!
-  for i in {1..50}; do
-    "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
+  start_pos3ql "$WORK/tls-server.conf" "$WORK/tls-server.log" $((PG_PORT + 1))
+  TLS_SERVER_PID=$START_PID
   "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U postgres -X -q \
     -c "CREATE TABLE tlst (id int, v text)" \
     -c "INSERT INTO tlst VALUES (1, 'over-tls')" \
     -c "CHECKPOINT" >/dev/null 2>&1
   kill -9 $TLS_SERVER_PID 2>/dev/null; wait $TLS_SERVER_PID 2>/dev/null
   rm -rf "$WORK/tls-data"
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/tls-server.conf" >> "$WORK/tls-server.log" 2>&1 &
-  TLS_SERVER_PID=$!
-  for i in {1..50}; do
-    "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-    sleep 0.1
-  done
+  start_pos3ql "$WORK/tls-server.conf" "$WORK/tls-server.log" $((PG_PORT + 1))
+  TLS_SERVER_PID=$START_PID
   tls_out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U postgres -X -t -A -c "SELECT v FROM tlst" 2>&1)
   [[ "$tls_out" == "over-tls" ]] && ok "TLS cold start from the bucket" \
     || { bad "TLS cold start (got: $tls_out)"; tail -5 "$WORK/tls-server.log"; }
@@ -670,12 +643,8 @@ tls_on = on
 tls_cert_file = ${WORK}/server-tls/cert.pem
 tls_key_file = ${WORK}/server-tls/key.pem
 EOF
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/server-tls.conf" > "$WORK/server-tls.log" 2>&1 &
-STLS_PID=$!
-for i in {1..50}; do
-  "$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=require" -X -q -c "SELECT 1" >/dev/null 2>&1 && break
-  sleep 0.1
-done
+start_pos3ql "$WORK/server-tls.conf" "$WORK/server-tls.log" ${STLS_PORT}
+STLS_PID=$START_PID
 # A query under sslmode=require only completes if the server negotiated TLS
 # (psql aborts if the SSLRequest is declined), so this both runs SQL over the
 # encrypted link and proves it is encrypted.

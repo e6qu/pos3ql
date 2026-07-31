@@ -584,13 +584,17 @@ impl Wal {
     /// Replays every valid record from the start of the journal, stopping
     /// at the first invalid or non-monotonic one (the tail). Positions the
     /// write cursor there. Records with `lsn <= floor` are scanned but not
-    /// applied — they are already covered by the checkpoint the caller
+    /// yielded — they are already covered by the checkpoint the caller
     /// loaded (a crash between manifest publication and journal reset
-    /// leaves such records behind). Startup only.
+    /// leaves such records behind). Each yielded record is the raw bytes
+    /// from the kind byte onward, as [`decode_record`] accepts; the caller
+    /// merges them with uploaded-segment records by LSN before applying, so
+    /// a journal that restarts mid-history (disk wipe) or ends early (torn
+    /// write) cannot reorder or lose committed records. Startup only.
     pub(crate) fn replay(
         &mut self,
         floor: u64,
-        mut apply: impl for<'a> FnMut(u64, WalOp<'a>) -> Result<(), SqlError>,
+        mut apply: impl for<'a> FnMut(u64, &'a [u8]) -> Result<(), SqlError>,
     ) -> Result<(), WalSetupError> {
         self.buffer.clear();
         let mut file_offset = 0u64; // next byte to read from the file
@@ -637,13 +641,14 @@ impl Wal {
                 if crc32c(&data[4..total]) != stored_crc {
                     break 'outer;
                 }
-                let payload = &data[HEADER_LEN..total];
-                let operation = match decode_op(kind, payload) {
-                    Some(operation) => operation,
-                    None => break 'outer,
-                };
+                // Validate the framing while the record is contiguous in the
+                // buffer, then hand the caller the raw bytes from the kind
+                // byte onward (as `decode_record` accepts).
+                if decode_op(kind, &data[HEADER_LEN..total]).is_none() {
+                    break 'outer;
+                }
                 if lsn > floor {
-                    apply(lsn, operation).map_err(WalSetupError::Replay)?;
+                    apply(lsn, &data[16..total]).map_err(WalSetupError::Replay)?;
                 }
                 self.last_lsn = lsn;
                 self.write_offset += total as u64;
@@ -2951,8 +2956,8 @@ mod tests {
 
     fn collect_replay_from(wal: &mut Wal, floor: u64) -> Vec<String> {
         let mut seen = Vec::new();
-        wal.replay(floor, |lsn, operation| {
-            seen.push(format!("{lsn}:{operation:?}"));
+        wal.replay(floor, |lsn, record| {
+            seen.push(format!("{lsn}:{:?}", decode_record(record).unwrap()));
             Ok(())
         })
         .unwrap();
@@ -3141,12 +3146,12 @@ mod tests {
         let mut replay_budget = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
         let mut seen = false;
-        wal.replay(0, |lsn, operation| {
+        wal.replay(0, |lsn, record| {
             let WalOp::BeginTableRewrite {
                 previous_schema,
                 previous_name,
                 column_mapping,
-            } = operation
+            } = decode_record(record).unwrap()
             else {
                 panic!("expected table rewrite");
             };

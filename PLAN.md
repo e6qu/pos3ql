@@ -680,17 +680,17 @@ Its first session caught two real engine bugs (B-156, B-157, both fixed):
 a commit whose synchronous WAL upload failed was left unpromoted — locally
 durable but invisible until a restart resurrected it (client-observable
 time-travel) — and a failed upload *retry* poisoned whatever innocent
-statement (even ROLLBACK) happened to trigger it. What remains of Stage H:
-folding the mid-flush/mid-compaction crash invariants into longer standing
-runs, and re-enabling WAL-journal scribbling once B-283 closes — extending
-the harness to scribble the journal between incarnations (alongside the
-cache file) found two further real bugs (a segment-recovery floor that lost
-records after a disk-wipe restart, and value-index roster write-idempotency,
-both fixed), but it also exposed that an errored commit's records are
-promoted and observable while they live only in the journal (B-156's
-contract), so destroying those journal bytes before any successful retry
-loses observed data — the sound fix re-gates promotion on upload success and
-is held for its own design.
+statement (even ROLLBACK) happened to trigger it. The harness now scribbles
+the WAL journal between incarnations alongside the cache file
+(`corrupt_local_files`) — an extension that found three real bugs in one
+session: a segment-recovery floor that lost records after a disk-wipe
+restart, value-index roster write-idempotency, and B-283 (an errored commit's
+records observable while durable only in the journal, so a torn journal could
+take them after a read). All three are fixed — recovery merges journal and
+segments by LSN, the roster writes a stable lsn, and an errored commit now
+becomes bucket-durable eagerly (statement-start retry) and at startup
+(reconciliation of the journaled tail). What remains of Stage H: folding the
+mid-flush/mid-compaction crash invariants into longer standing runs.
 
 ### Stage I — object-storage-adaptive execution (the four pillars)
 

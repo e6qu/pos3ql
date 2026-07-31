@@ -428,28 +428,35 @@ impl World {
         // A crash never commits: whatever a transaction had pending is gone.
         // (Uncertain entries stay uncertain — recovery resolves them.)
         if self.rng.next_bounded(2) == 0 {
-            self.corrupt_disk_cache();
+            self.corrupt_local_files();
         }
         self.start_engine();
         self.verify(context);
     }
 
-    /// Scribbles over the disk-cache file while the engine is down. The
-    /// cache is pure cache: every scribbled slot must read as a miss, never
-    /// as data.
-    fn corrupt_disk_cache(&mut self) {
-        let path = std::path::Path::new(&self.config.data_dir).join("block-cache");
-        let Ok(mut bytes) = std::fs::read(&path) else {
-            return;
-        };
-        if bytes.is_empty() {
-            return;
+    /// Scribbles over the local files a crash leaves behind — the disk cache
+    /// and the WAL journal — while the engine is down. The cache is pure
+    /// cache: every scribbled slot must read as a miss, never as data. The
+    /// journal is CRC-framed: replay must stop at the first damaged record,
+    /// and recovery merges it with the uploaded segments by LSN — so a torn
+    /// write or a rotted sector mid-journal changes no recovered bit.
+    fn corrupt_local_files(&mut self) {
+        for name in ["block-cache", "journal.wal"] {
+            let path = std::path::Path::new(&self.config.data_dir).join(name);
+            let Ok(mut bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            // Both files are preallocated: a flip past the last non-zero
+            // byte lands in reserved space no reader ever reaches.
+            let Some(last) = bytes.iter().rposition(|&b| b != 0) else {
+                continue;
+            };
+            for _ in 0..64 {
+                let at = self.rng.next_bounded(last as u32 + 1) as usize;
+                bytes[at] ^= 0xA5;
+            }
+            std::fs::write(&path, &bytes).expect("rewrite corrupted file");
         }
-        for _ in 0..64 {
-            let at = self.rng.next_bounded(bytes.len() as u32) as usize;
-            bytes[at] ^= 0xA5;
-        }
-        std::fs::write(&path, &bytes).expect("rewrite cache file");
     }
 
     /// The strongest recovery: checkpoint cleanly, wipe the local disk, and

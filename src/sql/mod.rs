@@ -474,14 +474,18 @@ impl Engine {
         // copies of one record are the same bytes, so either wins.
         let mut recovered: std::collections::BTreeMap<u64, Vec<u8>> =
             std::collections::BTreeMap::new();
+        let mut journal_tip = floor;
         wal.replay(floor, |lsn, record| {
+            journal_tip = journal_tip.max(lsn);
             recovered.insert(lsn, record.to_vec());
             Ok(())
         })?;
         // RPO=0: merge any WAL segments in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
+        let mut segment_tip = floor;
         if let Some(c) = ckpt.as_mut() {
             c.replay_wal_segments(floor, |lsn, record| {
+                segment_tip = segment_tip.max(lsn);
                 recovered.entry(lsn).or_insert_with(|| record.to_vec());
                 Ok(())
             })
@@ -495,6 +499,41 @@ impl Engine {
                 },
             ))?;
             apply_wal_op(&mut storage, *lsn, operator)?;
+        }
+        // Startup reconciliation: the newest committed records are
+        // journaled-only whenever their upload failed before the crash (the
+        // batch marker is in-memory and does not survive a restart), so an
+        // errored commit is durable only in the local journal. Re-upload that
+        // tail — every committed record with an LSN past the newest segment —
+        // so a later journal loss cannot take records a client already
+        // observed. Best-effort: the records stay journal-durable either way.
+        if config.wal_upload
+            && config.object_store_on
+            && journal_tip > segment_tip
+            && let Some(c) = ckpt.as_mut()
+        {
+            let mut segment: Vec<u8> = Vec::new();
+            let mut first = 0u64;
+            for (lsn, record) in recovered.range((segment_tip + 1)..=journal_tip) {
+                if first == 0 {
+                    first = *lsn;
+                }
+                let payload_len = (record.len() - 8) as u32;
+                let mut body = Vec::with_capacity(8 + record.len());
+                body.extend_from_slice(&payload_len.to_le_bytes());
+                body.extend_from_slice(&lsn.to_le_bytes());
+                body.extend_from_slice(record);
+                let crc = crate::wal::crc32c::crc32c(&body);
+                segment.extend_from_slice(&crc.to_le_bytes());
+                segment.extend_from_slice(&body);
+            }
+            if let Err(e) = c.upload_wal_segment(first, &segment) {
+                eprintln!(
+                    "pos3ql: startup WAL reconciliation upload failed ({}): {}",
+                    e.sqlstate,
+                    e.message.as_str()
+                );
+            }
         }
         storage.ensure_no_pending_replay_table_rewrite()?;
         storage.reconcile_serials();
@@ -1453,6 +1492,25 @@ impl Engine {
         Ok(())
     }
 
+    /// Best-effort retry of a pending (previously failed) WAL batch upload at
+    /// the start of a statement. An errored commit's records are promoted and
+    /// observable, but durable only in the local journal until a retry lands;
+    /// retrying before the statement's reads narrows the window in which a
+    /// journal loss could take them after they were observed. No-op when no
+    /// batch is pending.
+    fn retry_pending_wal_upload(&mut self) {
+        if !self.wal_upload || self.wal.pending_batch_bytes() == 0 {
+            return;
+        }
+        if let Err(e) = self.upload_wal_batch() {
+            eprintln!(
+                "pos3ql: WAL segment upload retry failed ({}): {}",
+                e.sqlstate,
+                e.message.as_str()
+            );
+        }
+    }
+
     /// Snapshots to object storage, then truncates the journal and compacts
     /// the heap. The atomic form — drives the sliced checkpoint's beats to
     /// completion in one call, for the explicit `CHECKPOINT` statement and
@@ -1780,6 +1838,9 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
+        // Make any commit whose upload previously failed durable before this
+        // statement's reads can observe it (see retry_pending_wal_upload).
+        self.retry_pending_wal_upload();
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {

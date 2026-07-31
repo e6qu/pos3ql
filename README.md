@@ -204,12 +204,13 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   multisets and their INSERT/CTAS consumers. Scalar subqueries use a
   cardinality-checking spool, `IN (subquery)` streams a run-backed membership
   probe (including after a DML read phase), recursive CTE all/work tables and
-  lateral subqueries/functions are immutable runs, and RIGHT/FULL join match
-  state is an external sorted map. Grouped aggregates and windows, plus ARRAY
-  subqueries and set-subquery forms carrying their own final ORDER/LIMIT,
-  still retain working sets in the fixed shared arena (`work_arena_bytes`,
-  64 MiB default). Exceeding that remaining bound errors `54000`, never
-  truncates a result (B-006).
+  lateral subqueries/functions are immutable runs, RIGHT/FULL join match
+  state is an external sorted map, `ARRAY(subquery)` results and
+  set-subquery forms carrying their own final ORDER BY/LIMIT spool through
+  the same run stack, and the grouped-aggregate group-key sort runs through
+  a provider-neutral external sort. Windows still retain working sets in
+  the fixed shared arena (`work_arena_bytes`, 64 MiB default). Exceeding
+  that remaining bound errors `54000`, never truncates a result (B-006).
 - **A checkpoint beat blocks for one table's write.** The auto-checkpoint is
   sliced — one table's SSTs per beat, beats interleaved with statements and
   driven on by the idle event loop, publishing only when no table changed

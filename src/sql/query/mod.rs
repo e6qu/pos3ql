@@ -2828,11 +2828,48 @@ fn select_into_rows_mode<'a>(
 ) -> Result<(), SqlError> {
     if let Some(tree) = statement.set_body {
         if storage.spill_attached() {
-            return setops::external_set_body_into(storage, txid, tree, arena, params, emit);
+            return setops::external_set_body_into(
+                storage, txid, tree,
+                statement.order_by, statement.limit, statement.offset, statement.with_ties,
+                arena, params, emit,
+            );
         }
-        let (rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params)?;
+        let (mut rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params)?;
+        let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+        let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
+        // A trailing ORDER BY needs one final sort over the combined multiset.
+        let columns_owned: Option<[crate::sql::types::ColDesc; MAX_PROJ]> =
+            (!statement.order_by.is_empty()).then(|| {
+                let mut cols = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+                setops::describe_set_body(storage, tree, txid, &mut cols, arena).ok();
+                cols
+            });
+        if let Some(ref cols) = columns_owned {
+            let rows_mut = arena
+                .alloc_slice_with(rows.len(), |i| rows[i])
+                .map_err(|_| arena_full())?;
+            setops::sort_set_rows(arena, rows_mut, statement.order_by, &cols[..n])?;
+            rows = rows_mut;
+        }
+        let start = (offset as usize).min(rows.len());
+        let mut end = offset
+            .saturating_add(limit)
+            .min(rows.len() as u64) as usize;
+        if let Some(ref cols) = columns_owned
+            && statement.with_ties
+            && limit > 0
+            && end < rows.len()
+            && end > start
+        {
+            let boundary = rows[end - 1];
+            while end < rows.len()
+                && setops::set_rows_tie(boundary, rows[end], statement.order_by, &cols[..n])
+            {
+                end += 1;
+            }
+        }
         let mut vals = [Datum::Null; MAX_PROJ];
-        for row in rows.iter() {
+        for row in &rows[start..end] {
             for (c, slot) in vals[..n].iter_mut().enumerate() {
                 *slot = super::exec::decode_projected_pub(row, c);
             }

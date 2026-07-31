@@ -114,6 +114,9 @@ case "$SHARD" in
     cargo test --lib --release 2>&1 | grep -E '^test result' | tail -1
     ;;
 esac
+# The in-process tests' profiles are the baseline; the external suites must
+# add server profiles on top.
+LIB_PROFILES=$(find target -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
 
 echo "=== building the instrumented server ==="
 # Cargo does not always re-fingerprint on RUSTC_WRAPPER alone, so an existing
@@ -158,6 +161,21 @@ case "$SHARD" in
             echo "NOTE: tests/external/run.sh did not pass in full; its FAIL lines:"
             grep '^FAIL' "$TMP/run.log" || echo "      (none — it exited before any check, likely docker/MinIO)"
             tail -2 "$TMP/run.log"
+        fi
+        # The external suites drive the *server binary* as a subprocess; if
+        # they produced no profile beyond the in-process tests', the external
+        # layer contributed nothing and the combined figure would read as a
+        # plausible-looking but far too low number (B-161). Fail loudly rather
+        # than report a figure that claims to cover both layers but does not.
+        ALL_PROFILES=$(find target -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$ALL_PROFILES" -le "$LIB_PROFILES" ]; then
+            echo "FAIL: the external suites wrote no server profile" \
+                 "($ALL_PROFILES profraw file(s), the in-process tests left $LIB_PROFILES);"
+            echo "      the external layer would contribute nothing. Suspect a stale" \
+                 "uninstrumented binary, kill -9'd servers flushing nothing, or a"
+            echo "      profile-signature mismatch. llvm-cov/profdata detail:"
+            cargo llvm-cov report --release --summary-only 2>&1 | grep -iE "warning|error|fail|no .*prof" || true
+            exit 1
         fi
     else
         # Skipping is not a lower number, it is a different measurement:

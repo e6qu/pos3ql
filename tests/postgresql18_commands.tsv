@@ -19,7 +19,7 @@ ALTER AGGREGATE	missing	-
 ALTER COLLATION	missing	-
 ALTER CONVERSION	missing	-
 ALTER DATABASE	missing	-
-ALTER DEFAULT PRIVILEGES	missing	-
+ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
 ALTER DOMAIN	partial	62_domains.sql
 ALTER EVENT TRIGGER	missing	-
 ALTER EXTENSION	missing	-
@@ -133,7 +133,7 @@ DROP MATERIALIZED VIEW	complete	53_materialized_view.sql
 DROP OPERATOR	missing	-
 DROP OPERATOR CLASS	missing	-
 DROP OPERATOR FAMILY	missing	-
-DROP OWNED	missing	-
+DROP OWNED	complete	83_roles_acl.sql
 DROP POLICY	missing	-
 DROP PROCEDURE	missing	-
 DROP PUBLICATION	missing	-
@@ -172,7 +172,7 @@ MOVE	complete	39_cursors.sql
 NOTIFY	complete	14_surface.sql
 PREPARE	complete	14_surface.sql
 PREPARE TRANSACTION	missing	-
-REASSIGN OWNED	missing	-
+REASSIGN OWNED	complete	83_roles_acl.sql
 REFRESH MATERIALIZED VIEW	complete	53_materialized_view.sql
 REINDEX	missing	-
 RELEASE SAVEPOINT	complete	05_transactions.sql
@@ -188,7 +188,7 @@ SELECT INTO	complete	69_select_into.sql
 SET	partial	75_guc_mutation.sql
 SET CONSTRAINTS	missing	-
 SET ROLE	complete	83_roles_acl.sql
-SET SESSION AUTHORIZATION	missing	-
+SET SESSION AUTHORIZATION	complete	83_roles_acl.sql
 SET TRANSACTION	partial	05_transactions.sql
 SHOW	partial	68_current_setting.sql
 START TRANSACTION	complete	05_transactions.sql

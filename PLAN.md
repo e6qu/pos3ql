@@ -2068,6 +2068,23 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
    vanilla PostgreSQL with data, a dependent view, identity metadata, and
    sequence continuation. Remaining tooling work is breadth across additional
    object kinds, not a consistency shortcut.
+
+   **Administrative ownership/default-privilege batch (2026-07-31):**
+   `ALTER DEFAULT PRIVILEGES`, `SET SESSION AUTHORIZATION`, `REASSIGN OWNED`,
+   and `DROP OWNED` are complete and differential-tested against PostgreSQL
+   18.4. Default ACLs are transactional fixed-capacity catalog state, visible
+   through `pg_default_acl`, applied to tables/views/materialized views,
+   sequences, schemas, domains, and enums, and durable through both WAL and the
+   manifest. Ownership transitions rewrite ACL grantee/grantor identity
+   atomically and merge collisions; DROP OWNED follows stored-query dependency
+   closure under RESTRICT/CASCADE. The cold-start regression creates an object
+   from a recovered default template after deleting both local cache tiers.
+   The authoritative copy therefore remains behind the provider-neutral object
+   store contract; RAM and local disk remain bounded, disposable caches, and
+   none of these SQL/catalog paths knows whether the implementation is S3,
+   MinIO, Google Cloud Storage, Azure Blob Storage, or another provider.
+   `tests/postgresql18_commands.tsv` records all four commands as complete.
+
 6. **Logical replication** — publisher first, subscriber second.
 7. **Stage I — object-storage-adaptive execution** — cost model,
    batched/hedged I/O scheduler, vectorized scan path, late materialization;
@@ -2115,7 +2132,7 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
 
 ## Verification
 
-- `cargo test` — 534 unit/property tests plus the integration suites
+- `cargo test` — 540 unit/property tests plus the integration suites
   (memory guard incl. unwind safety and the TLS budget scope, differential
   FixedMap vs std, PCG32/CRC-32C/SHA-256/SHA-512/HMAC/SigV4 official vectors,
   row codec fuzz-by-truncation, WAL corruption/floor/stale-tail, engine
@@ -2135,7 +2152,7 @@ strings** (int32 bit length then MSB-first packed bytes) — encoded on the
   spill beyond `memtable_bytes`, crash torture vs real PostgreSQL, the TLS
   durability cycle, and the forced-spill differential (the whole suite over a
   256 KiB memtable on MinIO). All green as of 2026-07-24.
-- `tests/external/differential.sh` — 79 curated corpora + 3 exact-error
+- `tests/external/differential.sh` — 80 curated corpora + 3 exact-error
   corpora + binary COPY + the vendored sqllogictest replay against real
   PostgreSQL 18, plus the generative fuzzer. SQLLogicTest files reclaim their
   objects between files,

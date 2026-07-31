@@ -38,7 +38,8 @@ fn test_engine() -> (Engine, Budget) {
 }
 
 fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
-    run_with_arena_bytes(engine, budget, sql_text, 1 << 18)
+    let mut guc = GucState::new();
+    run_with_guc(engine, budget, sql_text, 1 << 18, &mut guc)
 }
 
 fn run_with_arena_bytes(
@@ -47,11 +48,21 @@ fn run_with_arena_bytes(
     sql_text: &str,
     arena_bytes: usize,
 ) -> Vec<u8> {
+    let mut guc = GucState::new();
+    run_with_guc(engine, budget, sql_text, arena_bytes, &mut guc)
+}
+
+fn run_with_guc(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    sql_text: &str,
+    arena_bytes: usize,
+    guc: &mut GucState,
+) -> Vec<u8> {
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", arena_bytes).unwrap();
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
-    let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple(
@@ -60,7 +71,7 @@ fn run_with_arena_bytes(
             &mut txn,
             &mut pool,
             &mut test_cursors(budget),
-            &mut guc,
+            guc,
             &mut responder,
             1,
         )
@@ -512,6 +523,8 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
          REVOKE USAGE ON SCHEMA public FROM PUBLIC;
          GRANT USAGE, CREATE ON SCHEMA public TO durable_owner;
          GRANT USAGE ON SCHEMA public TO durable_reader;
+         ALTER DEFAULT PRIVILEGES FOR ROLE durable_owner
+           GRANT SELECT ON TABLES TO durable_reader;
          SET ROLE durable_owner;
          CREATE TABLE durable_private (id int, value text);
          INSERT INTO durable_private VALUES (1, 'object-authority');
@@ -537,8 +550,13 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "SET ROLE durable_reader;
+        "SET ROLE durable_owner;
+         CREATE TABLE durable_default_after_restart (value text);
+         INSERT INTO durable_default_after_restart VALUES ('default-authority');
+         RESET ROLE;
+         SET ROLE durable_reader;
          SELECT value FROM durable_exposed;
+         SELECT value FROM durable_default_after_restart;
          SELECT nextval('durable_sequence');
          RESET ROLE;
          SELECT has_schema_privilege('unprivileged', 'public', 'USAGE'),
@@ -550,7 +568,12 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     );
     assert_eq!(
         data_rows(&output),
-        ["object-authority", "1", "f|t|f|durable_owner",],
+        [
+            "object-authority",
+            "default-authority",
+            "1",
+            "f|t|f|durable_owner",
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -732,6 +755,245 @@ fn reset_role_uses_postgresql_reset_command_tag() {
         command_tags(&output),
         ["CREATE ROLE", "SET", "RESET", "SET"]
     );
+}
+
+#[test]
+fn session_authorization_is_transactional_and_resets_to_authenticated_role() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE session_owner;
+         SET SESSION AUTHORIZATION session_owner;
+         SELECT session_user, current_user, current_role;
+         RESET ROLE;
+         SELECT session_user, current_user, current_role;
+         RESET SESSION AUTHORIZATION;
+         SELECT session_user, current_user, current_role;
+         BEGIN;
+         SET LOCAL SESSION AUTHORIZATION session_owner;
+         SELECT session_user, current_user;
+         COMMIT;
+         SELECT session_user, current_user;
+         BEGIN;
+         SET SESSION AUTHORIZATION session_owner;
+         ROLLBACK;
+         SELECT session_user, current_user;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "session_owner|session_owner|session_owner",
+            "session_owner|session_owner|session_owner",
+            "postgres|postgres|postgres",
+            "session_owner|session_owner",
+            "postgres|postgres",
+            "postgres|postgres",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn reset_session_authorization_survives_a_dropped_authenticated_role() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE authenticated_super SUPERUSER;
+         CREATE ROLE authorization_alias SUPERUSER;",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+
+    let mut guc = GucState::new();
+    guc.set_session_user("authenticated_super");
+    let output = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SET SESSION AUTHORIZATION authorization_alias;
+         DROP ROLE authenticated_super;
+         RESET SESSION AUTHORIZATION;",
+        1 << 18,
+        &mut guc,
+    );
+    assert_eq!(
+        command_tags(&output),
+        ["SET", "DROP ROLE", "RESET"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn default_privileges_apply_additively_and_replay_from_wal() {
+    let config = test_config("default-acl-wal-replay");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE default_owner;
+         CREATE ROLE default_reader;
+         GRANT CREATE ON SCHEMA public TO default_owner;
+         ALTER DEFAULT PRIVILEGES FOR ROLE default_owner
+           GRANT SELECT ON TABLES TO default_reader WITH GRANT OPTION;
+         ALTER DEFAULT PRIVILEGES FOR ROLE default_owner IN SCHEMA public
+           GRANT INSERT ON TABLES TO default_reader;
+         ALTER DEFAULT PRIVILEGES FOR ROLE default_owner
+           REVOKE USAGE ON TYPES FROM PUBLIC;
+         SET ROLE default_owner;
+         CREATE TABLE default_table (id int);
+         CREATE TYPE default_type AS ENUM ('ready');
+         INSERT INTO default_table VALUES (1);
+         RESET ROLE;
+         SELECT defaclobjtype, defaclnamespace = 0, cardinality(defaclacl)
+           FROM pg_default_acl ORDER BY defaclobjtype, defaclnamespace;
+         SET ROLE default_reader;
+         INSERT INTO default_table VALUES (2);
+         SELECT id FROM default_table ORDER BY id;
+         RESET ROLE;
+         SELECT has_type_privilege('default_reader', 'default_type', 'USAGE');",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["T|t|2", "r|t|2", "r|f|1", "1", "2", "f"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SET ROLE default_owner;
+         CREATE TABLE replay_default_table (id int);
+         CREATE TYPE replay_default_type AS ENUM ('ready');
+         RESET ROLE;
+         SET ROLE default_reader;
+         INSERT INTO replay_default_table VALUES (7);
+         SELECT id FROM replay_default_table;
+         RESET ROLE;
+         SELECT has_type_privilege('default_reader', 'replay_default_type', 'USAGE');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["7", "f"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
+    let config = test_config("reassign-drop-owned-wal");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE owned_source;
+         CREATE ROLE owned_target;
+         GRANT CREATE ON SCHEMA public TO owned_source;
+         ALTER DEFAULT PRIVILEGES FOR ROLE owned_source
+           GRANT SELECT ON TABLES TO owned_target;
+         CREATE SCHEMA owned_space AUTHORIZATION owned_source;
+         SET ROLE owned_source;
+         CREATE TABLE public.owned_table (id int);
+         CREATE TYPE public.owned_type AS ENUM ('ready');
+         REVOKE USAGE ON TYPE public.owned_type FROM PUBLIC;
+         RESET ROLE;",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "REASSIGN OWNED BY owned_source TO owned_target;
+         SELECT tableowner FROM pg_tables WHERE tablename = 'owned_table';
+         SELECT nspname, pg_get_userbyid(nspowner)
+           FROM pg_namespace WHERE nspname = 'owned_space';
+         SELECT relacl::text FROM pg_class WHERE relname = 'owned_table';
+         SELECT typacl::text FROM pg_type WHERE typname = 'owned_type';
+         DROP OWNED BY owned_source;
+         DROP ROLE owned_source;
+         SELECT count(*) FROM pg_default_acl;
+         DROP OWNED BY owned_target CASCADE;
+         DROP ROLE owned_target;
+         SELECT count(*) FROM pg_tables WHERE tablename = 'owned_table';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "owned_target",
+            "owned_space|owned_target",
+            "{owned_target=arwdDxtm/owned_target}",
+            "{owned_target=U/owned_target}",
+            "0",
+            "0",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(engine);
+    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT count(*) FROM pg_roles
+          WHERE rolname IN ('owned_source', 'owned_target');
+         SELECT count(*) FROM pg_default_acl;",
+    );
+    assert_eq!(data_rows(&output), ["0", "0"]);
+}
+
+#[test]
+fn drop_owned_restrict_refuses_cross_owner_stored_query_dependents() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE dependency_owner;
+         CREATE ROLE dependency_viewer;
+         GRANT CREATE ON SCHEMA public TO dependency_owner, dependency_viewer;
+         SET ROLE dependency_owner;
+         CREATE TABLE dependency_table (id int);
+         RESET ROLE;
+         GRANT SELECT ON dependency_table TO dependency_viewer;
+         SET ROLE dependency_viewer;
+         CREATE VIEW dependency_view AS SELECT id FROM dependency_table;
+         RESET ROLE;",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP OWNED BY dependency_owner RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("other objects depend"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP OWNED BY dependency_owner CASCADE;
+         SELECT count(*) FROM pg_views WHERE viewname = 'dependency_view';",
+    );
+    assert_eq!(data_rows(&cascaded), ["0"]);
 }
 
 #[test]
@@ -6273,6 +6535,56 @@ fn relation_drop_cascades_through_stored_query_dependency_closure() {
         ))
         .contains("42P01")
     );
+}
+
+#[test]
+fn drop_table_restricts_or_cascades_inbound_foreign_keys() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE drop_parent (id integer PRIMARY KEY);
+         CREATE TABLE drop_child (
+             id integer PRIMARY KEY,
+             parent_id integer REFERENCES drop_parent(id)
+         );
+         INSERT INTO drop_parent VALUES (1);
+         INSERT INTO drop_child VALUES (1, 1);",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    let restricted = run_with(&mut engine, &mut budget, "DROP TABLE drop_parent");
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM drop_child"
+        )),
+        ["1"]
+    );
+
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE drop_parent CASCADE;
+         INSERT INTO drop_child VALUES (2, 999);
+         SELECT count(*) FROM drop_child;",
+    );
+    assert!(
+        !message_types(&cascaded).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&cascaded)
+    );
+    assert_eq!(data_rows(&cascaded), ["2"]);
 }
 
 #[test]

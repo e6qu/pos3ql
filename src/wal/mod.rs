@@ -67,7 +67,8 @@ const KIND_DROP_ROLE_MEMBERSHIP: u8 = 30;
 const KIND_SET_OBJECT_OWNER: u8 = 31;
 const KIND_SET_OBJECT_ACL: u8 = 32;
 const KIND_REWRITE_TABLE: u8 = 33;
-const LAST_KIND: u8 = KIND_REWRITE_TABLE;
+const KIND_SET_DEFAULT_ACL: u8 = 34;
+const LAST_KIND: u8 = KIND_SET_DEFAULT_ACL;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -421,6 +422,16 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         grantee: &'a str,
         grantor: &'a str,
+        privileges: crate::storage::PrivilegeSet,
+        grant_options: crate::storage::PrivilegeSet,
+    },
+    SetDefaultAcl {
+        owner: &'a str,
+        /// Empty denotes the global default; otherwise a schema name.
+        schema: &'a str,
+        class: u8,
+        grantee: &'a str,
+        defined: bool,
         privileges: crate::storage::PrivilegeSet,
         grant_options: crate::storage::PrivilegeSet,
     },
@@ -986,6 +997,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetObjectOwner { .. } => KIND_SET_OBJECT_OWNER,
         WalOp::SetObjectAcl { .. } => KIND_SET_OBJECT_ACL,
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
+        WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
     }
 }
 
@@ -1210,6 +1222,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             grantor,
             ..
         } => 1 + 1 + schema.len() + 1 + name.len() + 1 + grantee.len() + 1 + grantor.len() + 4,
+        WalOp::SetDefaultAcl {
+            owner,
+            schema,
+            grantee,
+            ..
+        } => 1 + owner.len() + 1 + schema.len() + 1 + 1 + grantee.len() + 1 + 4,
     }
 }
 
@@ -1605,6 +1623,23 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, name)
                 && name_bytes(buffer, grantee)
                 && name_bytes(buffer, grantor)
+                && buffer.append(&privileges.0.to_le_bytes())
+                && buffer.append(&grant_options.0.to_le_bytes())
+        }
+        WalOp::SetDefaultAcl {
+            owner,
+            schema,
+            class,
+            grantee,
+            defined,
+            privileges,
+            grant_options,
+        } => {
+            name_bytes(buffer, owner)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[*class])
+                && name_bytes(buffer, grantee)
+                && buffer.append(&[u8::from(*defined)])
                 && buffer.append(&privileges.0.to_le_bytes())
                 && buffer.append(&grant_options.0.to_le_bytes())
         }
@@ -2535,6 +2570,33 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 grantee,
                 grantor,
+                privileges: crate::storage::PrivilegeSet(privileges),
+                grant_options: crate::storage::PrivilegeSet(grant_options),
+            })
+        }
+        KIND_SET_DEFAULT_ACL => {
+            let owner = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let class = *payload.get(at)?;
+            at += 1;
+            crate::storage::DefaultPrivilegeClass::from_u8(class)?;
+            let grantee = take_name(&mut at)?;
+            let defined = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            let privileges = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::SetDefaultAcl {
+                owner,
+                schema,
+                class,
+                grantee,
+                defined,
                 privileges: crate::storage::PrivilegeSet(privileges),
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })

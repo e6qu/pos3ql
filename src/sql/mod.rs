@@ -265,6 +265,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Reset(_)
         | Stmt::SetTransaction(_)
         | Stmt::SetRole { .. }
+        | Stmt::SetSessionAuthorization { .. }
         | Stmt::Show(_)
         | Stmt::ShowAll
         | Stmt::Prepare { .. }
@@ -319,7 +320,10 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         Stmt::GrantRole { .. }
         | Stmt::RevokeRole { .. }
         | Stmt::GrantPrivileges { .. }
-        | Stmt::RevokePrivileges { .. } => true,
+        | Stmt::RevokePrivileges { .. }
+        | Stmt::AlterDefaultPrivileges { .. }
+        | Stmt::ReassignOwned { .. }
+        | Stmt::DropOwned { .. } => true,
     }
 }
 
@@ -747,6 +751,9 @@ impl Engine {
             let Some(object) = object else {
                 continue;
             };
+            if !self.storage.access_object_visible_to(object, txn.txid) {
+                continue;
+            }
             if txn.ddl()[position + 1..].iter().any(|later| {
                 matches!(
                     later,
@@ -781,16 +788,40 @@ impl Engine {
             let DdlUndo::ObjectAclChanged { slot, .. } = *undo else {
                 continue;
             };
-            if txn.ddl()[position + 1..].iter().any(
-                |later| matches!(later, DdlUndo::ObjectAclChanged { slot: later, .. } if *later == slot),
-            ) {
+            if txn.ddl()[position + 1..].iter().any(|later| {
+                matches!(later, DdlUndo::ObjectAclChanged { slot: later, .. } if *later == slot)
+            }) {
                 continue;
             }
             let entry = self.storage.acl_entry(slot as usize);
             let object = entry.object;
-            let grantee = entry.grantee;
-            let grantor = entry.grantor;
-            let (privileges, grant_options) = self.storage.acl_state(slot as usize, txn.txid);
+            if !self.storage.access_object_visible_to(object, txn.txid) {
+                continue;
+            }
+            let (grantee, grantor) = self.storage.acl_identity(slot as usize, txn.txid);
+            if txn.ddl()[..position].iter().any(|earlier| {
+                let DdlUndo::ObjectAclChanged {
+                    slot: earlier_slot,
+                    ..
+                } = *earlier
+                else {
+                    return false;
+                };
+                if earlier_slot == slot {
+                    return false;
+                }
+                let earlier_entry = self.storage.acl_entry(earlier_slot as usize);
+                earlier_entry.object == object
+                    && self
+                        .storage
+                        .acl_identity(earlier_slot as usize, txn.txid)
+                        == (grantee, grantor)
+            }) {
+                continue;
+            }
+            let (privileges, grant_options) =
+                self.storage
+                    .acl_from(object, grantee, grantor, txn.txid);
             let (schema, name) = self.storage.access_object_name_to(object, txn.txid);
             let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(grantee as usize, txn.txid));
@@ -805,6 +836,50 @@ impl Engine {
                     name: name.as_str(),
                     grantee: grantee_name.as_ref().map_or("PUBLIC", |role| role.as_str()),
                     grantor: grantor_name.as_str(),
+                    privileges,
+                    grant_options,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
+        for (position, undo) in txn.ddl().iter().enumerate() {
+            let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
+                continue;
+            };
+            if txn.ddl()[position + 1..].iter().any(
+                |later| matches!(later, DdlUndo::DefaultAclChanged { slot: later, .. } if *later == slot),
+            ) {
+                continue;
+            }
+            let entry = *self.storage.default_acl_entry(slot as usize);
+            let (defined, privileges, grant_options) = self.storage.default_acl_state(
+                entry.owner,
+                entry.schema,
+                entry.class,
+                entry.grantee,
+                txn.txid,
+            );
+            let owner = self.storage.role_name(entry.owner as usize, txn.txid);
+            let schema = if entry.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
+                crate::storage::SqlName::EMPTY
+            } else {
+                self.storage.schema_def(entry.schema as usize).name
+            };
+            let grantee = (entry.grantee != crate::storage::PUBLIC_ROLE)
+                .then(|| self.storage.role_name(entry.grantee as usize, txn.txid));
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetDefaultAcl {
+                    owner: owner.as_str(),
+                    schema: schema.as_str(),
+                    class: entry.class as u8,
+                    grantee: grantee.as_ref().map_or("PUBLIC", |role| role.as_str()),
+                    defined,
                     privileges,
                     grant_options,
                 },
@@ -1045,6 +1120,9 @@ impl Engine {
                 DdlUndo::ObjectAclChanged { slot, .. } => {
                     self.storage.commit_acl(*slot as usize, txn.txid);
                 }
+                DdlUndo::DefaultAclChanged { slot, .. } => {
+                    self.storage.commit_default_acl(*slot as usize, txn.txid);
+                }
                 // Promote the uncommitted comment overlay to committed; its WAL
                 // record was journaled at exec time (like other DDL).
                 DdlUndo::CommentSet { slot, .. } => {
@@ -1210,6 +1288,10 @@ impl Engine {
             }
             DdlUndo::ObjectAclChanged { slot, prior } => {
                 self.storage.restore_acl_pending(slot as usize, prior);
+            }
+            DdlUndo::DefaultAclChanged { slot, prior } => {
+                self.storage
+                    .restore_default_acl_pending(slot as usize, prior);
             }
             DdlUndo::CommentSet { slot, prior } => {
                 self.storage.restore_comment_pending(slot as usize, prior);
@@ -2840,7 +2922,8 @@ impl Engine {
         // every name resolution below reads it from storage.
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
-        eval::funcs::system::set_session_user(guc.session_user());
+        let session_user = guc.session_user();
+        eval::funcs::system::set_session_user(session_user.as_str());
         let current_role = guc.current_role();
         eval::funcs::system::set_current_user(current_role.as_str());
         let raw_path = guc.search_path();
@@ -3454,6 +3537,19 @@ impl Engine {
             Stmt::SetRole { role, local, reset } => {
                 exec::set_role(&self.storage, txn, guc, *role, *local, *reset, responder)
             }
+            Stmt::SetSessionAuthorization {
+                role,
+                local,
+                reset,
+            } => exec::set_session_authorization(
+                &self.storage,
+                txn,
+                guc,
+                *role,
+                *local,
+                *reset,
+                responder,
+            ),
             Stmt::GrantRole {
                 roles,
                 members,
@@ -3508,6 +3604,32 @@ impl Engine {
                 *target,
                 grantees,
                 *cascade,
+                responder,
+            ),
+            Stmt::AlterDefaultPrivileges {
+                roles,
+                schemas,
+                action,
+            } => exec::alter_default_privileges(
+                &mut self.storage,
+                txn,
+                roles,
+                schemas,
+                *action,
+                responder,
+            ),
+            Stmt::ReassignOwned { roles, new_owner } => {
+                exec::reassign_owned(&mut self.storage, txn, roles, new_owner, responder)
+            }
+            Stmt::DropOwned { roles, cascade } => exec::drop_owned(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                &mut self.scratch,
+                roles,
+                *cascade,
+                arena,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::DeclareCursor {
@@ -4791,6 +4913,31 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     owner
                 )
             })?;
+            let old_owner = storage.object_owner(object, 0) as u16;
+            let acl_count = storage.acl_entries().count();
+            for slot in 0..acl_count {
+                let entry = *storage.acl_entry(slot);
+                if entry.object != object || entry.object.slot == u16::MAX {
+                    continue;
+                }
+                let (grantee, grantor) = storage.acl_identity(slot, 0);
+                if grantee == old_owner || grantor == old_owner {
+                    storage.change_acl_identity(
+                        slot,
+                        if grantee == old_owner {
+                            owner as u16
+                        } else {
+                            grantee
+                        },
+                        if grantor == old_owner {
+                            owner as u16
+                        } else {
+                            grantor
+                        },
+                        0,
+                    );
+                }
+            }
             storage.set_object_owner(object, owner, 0);
         }
         WalOp::SetObjectAcl {
@@ -4809,34 +4956,120 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     class
                 )
             })?;
-            let object = storage
-                .resolve_access_object(class, schema, name, 0)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "WAL privilege target \"{}\" does not exist",
-                        name
-                    )
-                })?;
+            let Some(object) = storage.resolve_access_object(class, schema, name, 0) else {
+                if privileges.0 == 0 {
+                    storage.set_lsn(lsn);
+                    return Ok(());
+                }
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "WAL privilege target \"{}\" does not exist",
+                    name
+                ));
+            };
             let grantee = if grantee == "PUBLIC" {
                 crate::storage::PUBLIC_ROLE
             } else {
-                storage.find_role(grantee).ok_or_else(|| {
-                    sql_err!(
+                let Some(grantee_slot) = storage.find_role(grantee) else {
+                    if privileges.0 == 0 {
+                        storage.set_lsn(lsn);
+                        return Ok(());
+                    }
+                    return Err(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
                         "WAL grantee role \"{}\" does not exist",
                         grantee
-                    )
-                })? as u16
+                    ));
+                };
+                grantee_slot as u16
             };
-            let grantor = storage.find_role(grantor).ok_or_else(|| {
-                sql_err!(
+            let Some(grantor_slot) = storage.find_role(grantor) else {
+                if privileges.0 == 0 {
+                    storage.set_lsn(lsn);
+                    return Ok(());
+                }
+                return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "WAL grantor role \"{}\" does not exist",
                     grantor
-                )
-            })? as u16;
+                ));
+            };
+            let grantor = grantor_slot as u16;
             storage.change_acl(object, grantee, grantor, privileges, grant_options, 0)?;
+        }
+        WalOp::SetDefaultAcl {
+            owner,
+            schema,
+            class,
+            grantee,
+            defined,
+            privileges,
+            grant_options,
+        } => {
+            let class =
+                crate::storage::DefaultPrivilegeClass::from_u8(class).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "corrupt WAL default privilege class {}",
+                        class
+                    )
+                })?;
+            let Some(owner_slot) = storage.find_role(owner) else {
+                if !defined {
+                    storage.set_lsn(lsn);
+                    return Ok(());
+                }
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "WAL default privilege owner \"{}\" does not exist",
+                    owner
+                ));
+            };
+            let owner = owner_slot as u16;
+            let schema = if schema.is_empty() {
+                crate::storage::DEFAULT_ACL_ALL_SCHEMAS
+            } else {
+                let Some(schema_slot) = storage.find_schema(schema) else {
+                    if !defined {
+                        storage.set_lsn(lsn);
+                        return Ok(());
+                    }
+                    return Err(sql_err!(
+                        sqlstate::INVALID_SCHEMA_NAME,
+                        "WAL default privilege schema \"{}\" does not exist",
+                        schema
+                    ));
+                };
+                schema_slot as u16
+            };
+            let grantee = if grantee == "PUBLIC" {
+                crate::storage::PUBLIC_ROLE
+            } else {
+                let Some(grantee_slot) = storage.find_role(grantee) else {
+                    if !defined {
+                        storage.set_lsn(lsn);
+                        return Ok(());
+                    }
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "WAL default privilege grantee \"{}\" does not exist",
+                        grantee
+                    ));
+                };
+                grantee_slot as u16
+            };
+            storage.change_default_acl(
+                crate::storage::DefaultAclKey {
+                    owner,
+                    schema,
+                    class,
+                    grantee,
+                },
+                defined,
+                privileges,
+                grant_options,
+                0,
+            )?;
         }
     }
     storage.set_lsn(lsn);

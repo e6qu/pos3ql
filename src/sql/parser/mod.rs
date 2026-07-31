@@ -829,11 +829,33 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident("set") => {
                 self.advance()?;
-                let local = if self.eat_ident("session")? {
+                let session_modifier = self.eat_ident("session")?;
+                let local = if session_modifier {
                     false
                 } else {
                     self.eat_ident("local")?
                 };
+                // SESSION is both the optional scope modifier and the first
+                // word of SESSION AUTHORIZATION. Thus PostgreSQL accepts all
+                // of SET SESSION AUTHORIZATION, SET LOCAL SESSION
+                // AUTHORIZATION, and SET SESSION SESSION AUTHORIZATION.
+                if (session_modifier && self.eat_ident("authorization")?)
+                    || (self.eat_ident("session")? && {
+                        self.expect_ident("authorization")?;
+                        true
+                    })
+                {
+                    let role = if self.eat_ident("default")? {
+                        None
+                    } else {
+                        Some(self.any_ident("role name")?)
+                    };
+                    return Ok(Stmt::SetSessionAuthorization {
+                        role,
+                        local,
+                        reset: false,
+                    });
+                }
                 if self.eat_ident("role")? {
                     let role = if self.eat_ident("none")? {
                         None
@@ -899,6 +921,13 @@ impl<'a> Parser<'a> {
                         local: false,
                         reset: true,
                     })
+                } else if self.eat_ident("session")? {
+                    self.expect_ident("authorization")?;
+                    Ok(Stmt::SetSessionAuthorization {
+                        role: None,
+                        local: false,
+                        reset: true,
+                    })
                 } else if self.eat_ident("all")? {
                     Ok(Stmt::Reset(None))
                 } else {
@@ -942,6 +971,15 @@ impl<'a> Parser<'a> {
             Tok::Ident("alter") => self.alter_table(),
             Tok::Ident("grant") => self.grant_statement(),
             Tok::Ident("revoke") => self.revoke_statement(),
+            Tok::Ident("reassign") => {
+                self.advance()?;
+                self.expect_ident("owned")?;
+                self.expect_ident("by")?;
+                let roles = self.role_name_list("role name")?;
+                self.expect_ident("to")?;
+                let new_owner = self.any_ident("new owner")?;
+                Ok(Stmt::ReassignOwned { roles, new_owner })
+            }
             Tok::Ident("copy") => self.copy_statement(),
             Tok::Ident("prepare") => self.prepare(),
             Tok::Ident("execute") => self.execute_prepared(),
@@ -2495,6 +2533,8 @@ impl<'a> Parser<'a> {
                     | "trigger"
                     | "usage"
                     | "create"
+                    | "execute"
+                    | "maintain"
             )
         )
     }
@@ -2553,7 +2593,7 @@ impl<'a> Parser<'a> {
 
     fn privilege_list(&mut self) -> Result<&'a [crate::sql::ast::Privilege], ParseError> {
         use crate::sql::ast::Privilege;
-        let mut privileges = [Privilege::All; 10];
+        let mut privileges = [Privilege::All; 12];
         let mut count = 0usize;
         loop {
             if count == privileges.len() {
@@ -2580,6 +2620,10 @@ impl<'a> Parser<'a> {
                 Privilege::Usage
             } else if self.eat_ident("create")? {
                 Privilege::Create
+            } else if self.eat_ident("execute")? {
+                Privilege::Execute
+            } else if self.eat_ident("maintain")? {
+                Privilege::Maintain
             } else {
                 return Err(self.unexpected("expected an object privilege"));
             };
@@ -2709,6 +2753,10 @@ impl<'a> Parser<'a> {
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         use crate::sql::ast::AlterOwnerKind;
+        if self.eat_ident("default")? {
+            self.expect_ident("privileges")?;
+            return self.alter_default_privileges();
+        }
         if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
             return self.alter_role();
         }
@@ -2823,6 +2871,106 @@ impl<'a> Parser<'a> {
             if_exists,
             actions: self.arena_slice(&buffer[..count])?,
         }))
+    }
+
+    fn alter_default_privileges(&mut self) -> Result<Stmt<'a>, ParseError> {
+        use crate::sql::ast::{DefaultPrivilegeAction, DefaultPrivilegeObjectKind};
+
+        let roles = if self.eat_ident("for")? {
+            if !self.eat_ident("role")? {
+                self.expect_ident("user")?;
+            }
+            self.role_name_list("role name")?
+        } else {
+            &[]
+        };
+        let schemas = if self.eat_ident("in")? {
+            self.expect_ident("schema")?;
+            self.role_name_list("schema name")?
+        } else {
+            &[]
+        };
+
+        let grant = if self.eat_ident("grant")? {
+            true
+        } else {
+            self.expect_ident("revoke")?;
+            false
+        };
+        let grant_option_only = if !grant && self.eat_ident("grant")? {
+            self.expect_ident("option")?;
+            self.expect_ident("for")?;
+            true
+        } else {
+            false
+        };
+        let privileges = self.privilege_list()?;
+        self.expect_ident("on")?;
+        let kind = if self.eat_ident("tables")? {
+            DefaultPrivilegeObjectKind::Tables
+        } else if self.eat_ident("sequences")? {
+            DefaultPrivilegeObjectKind::Sequences
+        } else if self.eat_ident("functions")? || self.eat_ident("routines")? {
+            DefaultPrivilegeObjectKind::Functions
+        } else if self.eat_ident("types")? {
+            DefaultPrivilegeObjectKind::Types
+        } else if self.eat_ident("schemas")? {
+            DefaultPrivilegeObjectKind::Schemas
+        } else {
+            return Err(self.unexpected(
+                "expected TABLES, SEQUENCES, FUNCTIONS, ROUTINES, TYPES, or SCHEMAS",
+            ));
+        };
+        if !schemas.is_empty() && kind == DefaultPrivilegeObjectKind::Schemas {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: crate::util::StackStr::from_str(
+                    "cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS",
+                ),
+                sqlstate: sqlstate::INVALID_GRANT_OPERATION,
+            });
+        }
+        if grant {
+            self.expect_ident("to")?;
+            let grantees = self.role_name_list("grantee")?;
+            let grant_option = if self.eat_ident("with")? {
+                self.expect_ident("grant")?;
+                self.expect_ident("option")?;
+                true
+            } else {
+                false
+            };
+            Ok(Stmt::AlterDefaultPrivileges {
+                roles,
+                schemas,
+                action: DefaultPrivilegeAction::Grant {
+                    privileges,
+                    kind,
+                    grantees,
+                    grant_option,
+                },
+            })
+        } else {
+            self.expect_ident("from")?;
+            let grantees = self.role_name_list("grantee")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            Ok(Stmt::AlterDefaultPrivileges {
+                roles,
+                schemas,
+                action: DefaultPrivilegeAction::Revoke {
+                    grant_option_only,
+                    privileges,
+                    kind,
+                    grantees,
+                    cascade,
+                },
+            })
+        }
     }
 
     pub(super) fn alter_owner(

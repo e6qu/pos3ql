@@ -1205,7 +1205,7 @@ impl Checkpointer {
                     let privileges: u16 = parse_field(words.next(), "acl privileges")?;
                     let grant_options: u16 = parse_field(words.next(), "acl grant options")?;
                     if words.next().is_some()
-                        || privileges & !0x01ff != 0
+                        || privileges & !0x07ff != 0
                         || grant_options & !privileges != 0
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid acl record"));
@@ -1237,6 +1237,68 @@ impl Checkpointer {
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest ACL rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("dacl") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let decode = |word: Option<&str>, missing: &'static str| {
+                        word.ok_or(CheckpointSetupError::Corrupt(missing))
+                            .and_then(decode_hex_name)
+                    };
+                    let owner = decode(words.next(), "dacl owner missing")?;
+                    let schema = decode(words.next(), "dacl schema missing")?;
+                    let class: u8 = parse_field(words.next(), "dacl class")?;
+                    let class = crate::storage::DefaultPrivilegeClass::from_u8(class)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid dacl class"))?;
+                    let grantee = decode(words.next(), "dacl grantee missing")?;
+                    let privileges: u16 = parse_field(words.next(), "dacl privileges")?;
+                    let grant_options: u16 = parse_field(words.next(), "dacl grant options")?;
+                    if words.next().is_some()
+                        || privileges & !0x07ff != 0
+                        || grant_options & !privileges != 0
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid dacl record"));
+                    }
+                    let owner = storage
+                        .find_role(&owner)
+                        .ok_or(CheckpointSetupError::Corrupt("dacl owner does not exist"))?
+                        as u16;
+                    let schema = if schema.is_empty() {
+                        crate::storage::DEFAULT_ACL_ALL_SCHEMAS
+                    } else {
+                        storage
+                            .find_schema(&schema)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "dacl schema does not exist",
+                            ))? as u16
+                    };
+                    let grantee = if grantee == "PUBLIC" {
+                        crate::storage::PUBLIC_ROLE
+                    } else {
+                        storage
+                            .find_role(&grantee)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "dacl grantee does not exist",
+                            ))? as u16
+                    };
+                    storage
+                        .change_default_acl(
+                            crate::storage::DefaultAclKey {
+                                owner,
+                                schema,
+                                class,
+                                grantee,
+                            },
+                            true,
+                            crate::storage::PrivilegeSet(privileges),
+                            crate::storage::PrivilegeSet(grant_options),
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest default ACL rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -3032,6 +3094,44 @@ impl Checkpointer {
                     name_hex.as_str(),
                     grantee_hex.as_str(),
                     grantor_hex.as_str(),
+                    acl.privileges.0,
+                    acl.grant_options.0
+                ),
+            )?;
+        }
+        for (_, acl) in storage.live_default_acls() {
+            use core::fmt::Write;
+            let owner = storage.role(acl.owner as usize).name;
+            let schema = if acl.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
+                crate::storage::SqlName::EMPTY
+            } else {
+                storage.schema_def(acl.schema as usize).name
+            };
+            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
+                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
+            } else {
+                storage.role(acl.grantee as usize).name
+            };
+            let mut owner_hex = StackStr::<130>::new();
+            let mut schema_hex = StackStr::<130>::new();
+            let mut grantee_hex = StackStr::<130>::new();
+            for byte in owner.as_str().as_bytes() {
+                let _ = write!(owner_hex, "{byte:02x}");
+            }
+            for byte in schema.as_str().as_bytes() {
+                let _ = write!(schema_hex, "{byte:02x}");
+            }
+            for byte in grantee.as_str().as_bytes() {
+                let _ = write!(grantee_hex, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "dacl {} {} {} {} {} {}",
+                    owner_hex.as_str(),
+                    schema_hex.as_str(),
+                    acl.class as u8,
+                    grantee_hex.as_str(),
                     acl.privileges.0,
                     acl.grant_options.0
                 ),

@@ -1759,6 +1759,50 @@ pub(crate) enum AccessClass {
     Index = 7,
 }
 
+/// Object classes addressable by ALTER DEFAULT PRIVILEGES. Functions are
+/// retained even before user-defined function DDL exists: PostgreSQL stores
+/// their default ACL independently of any current function object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum DefaultPrivilegeClass {
+    Table = 0,
+    Sequence = 1,
+    Function = 2,
+    Type = 3,
+    Schema = 4,
+}
+
+impl DefaultPrivilegeClass {
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::Table,
+            1 => Self::Sequence,
+            2 => Self::Function,
+            3 => Self::Type,
+            4 => Self::Schema,
+            _ => return None,
+        })
+    }
+
+    pub(crate) const fn all_privileges(self) -> PrivilegeSet {
+        match self {
+            Self::Table => PrivilegeSet::TABLE_ALL,
+            Self::Sequence => PrivilegeSet::SEQUENCE_ALL,
+            Self::Function => PrivilegeSet::FUNCTION_ALL,
+            Self::Type => PrivilegeSet::TYPE_ALL,
+            Self::Schema => PrivilegeSet::SCHEMA_ALL,
+        }
+    }
+
+    pub(crate) const fn default_public_privileges(self) -> PrivilegeSet {
+        match self {
+            Self::Function => PrivilegeSet::EXECUTE,
+            Self::Type => PrivilegeSet::USAGE,
+            Self::Table | Self::Sequence | Self::Schema => PrivilegeSet::NONE,
+        }
+    }
+}
+
 impl AccessClass {
     pub(crate) fn from_u8(value: u8) -> Option<Self> {
         Some(match value {
@@ -1797,6 +1841,8 @@ impl PrivilegeSet {
     pub(crate) const TRIGGER: Self = Self(1 << 6);
     pub(crate) const USAGE: Self = Self(1 << 7);
     pub(crate) const CREATE: Self = Self(1 << 8);
+    pub(crate) const EXECUTE: Self = Self(1 << 9);
+    pub(crate) const MAINTAIN: Self = Self(1 << 10);
 
     pub(crate) const TABLE_ALL: Self = Self(
         Self::SELECT.0
@@ -1805,11 +1851,13 @@ impl PrivilegeSet {
             | Self::DELETE.0
             | Self::TRUNCATE.0
             | Self::REFERENCES.0
-            | Self::TRIGGER.0,
+            | Self::TRIGGER.0
+            | Self::MAINTAIN.0,
     );
     pub(crate) const SEQUENCE_ALL: Self = Self(Self::USAGE.0 | Self::SELECT.0 | Self::UPDATE.0);
     pub(crate) const SCHEMA_ALL: Self = Self(Self::USAGE.0 | Self::CREATE.0);
     pub(crate) const TYPE_ALL: Self = Self::USAGE;
+    pub(crate) const FUNCTION_ALL: Self = Self::EXECUTE;
 
     pub(crate) const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -1826,10 +1874,14 @@ impl PrivilegeSet {
 
 pub(crate) const PUBLIC_ROLE: u16 = u16::MAX;
 pub(crate) const MAX_ACL_ENTRIES: usize = 512;
+pub(crate) const MAX_DEFAULT_ACL_ENTRIES: usize = 256;
+pub(crate) const DEFAULT_ACL_ALL_SCHEMAS: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingAcl {
     pub txid: u32,
+    pub grantee: u16,
+    pub grantor: u16,
     pub privileges: PrivilegeSet,
     pub grant_options: PrivilegeSet,
 }
@@ -1843,6 +1895,38 @@ pub(crate) struct AclEntry {
     pub grant_options: PrivilegeSet,
     pub live: bool,
     pub pending: Option<PendingAcl>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingDefaultAcl {
+    pub txid: u32,
+    /// A zero-valued entry can be meaningful: it is the tombstone produced by
+    /// revoking a built-in PUBLIC default from types or functions.
+    pub defined: bool,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DefaultAclKey {
+    pub owner: u16,
+    pub schema: u16,
+    pub class: DefaultPrivilegeClass,
+    pub grantee: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DefaultAclEntry {
+    pub owner: u16,
+    /// DEFAULT_ACL_ALL_SCHEMAS denotes the global default; otherwise this is a
+    /// stable schema slot.
+    pub schema: u16,
+    pub class: DefaultPrivilegeClass,
+    pub grantee: u16,
+    pub defined: bool,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+    pub pending: Option<PendingDefaultAcl>,
 }
 
 /// Startup-bounded PostgreSQL role catalog. Role metadata is catalog state and
@@ -2231,6 +2315,7 @@ pub struct Storage {
     roles: FixedVec<RoleDef>,
     role_memberships: FixedVec<RoleMembership>,
     acl_entries: FixedVec<AclEntry>,
+    default_acl_entries: FixedVec<DefaultAclEntry>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
     comments: FixedVec<CommentEntry>,
@@ -2586,6 +2671,7 @@ impl Storage {
             + MAX_ROLES * size_of::<RoleDef>()
             + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
             + MAX_ACL_ENTRIES * size_of::<AclEntry>()
+            + MAX_DEFAULT_ACL_ENTRIES * size_of::<DefaultAclEntry>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
@@ -2806,6 +2892,8 @@ impl Storage {
                 pending: None,
             })
             .expect("ACL pool has room for the public schema default");
+        let default_acl_entries =
+            FixedVec::new(budget, "default_acl_entries", MAX_DEFAULT_ACL_ENTRIES)?;
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
         for _ in 0..config.max_tables {
             indexes
@@ -2860,6 +2948,7 @@ impl Storage {
             roles,
             role_memberships,
             acl_entries,
+            default_acl_entries,
             comments,
             path: PathContext::public_only(),
             catalog_seq: 0,
@@ -3092,7 +3181,7 @@ impl Storage {
         }
     }
 
-    fn access_object_visible_to(&self, object: AccessObject, txid: u32) -> bool {
+    pub(crate) fn access_object_visible_to(&self, object: AccessObject, txid: u32) -> bool {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].visible_to(txid),
@@ -3103,6 +3192,19 @@ impl Storage {
             AccessClass::Domain => self.domains[slot].visible_to(txid),
             AccessClass::Enum => self.enums[slot].visible_to(txid),
             AccessClass::Index => self.indexes[slot].visible_to(txid),
+        }
+    }
+
+    pub(crate) fn access_class_slots(&self, class: AccessClass) -> usize {
+        match class {
+            AccessClass::Table => self.tables.len(),
+            AccessClass::View => self.views.len(),
+            AccessClass::MaterializedView => self.matviews.len(),
+            AccessClass::Sequence => self.sequences.len(),
+            AccessClass::Schema => self.schemas.len(),
+            AccessClass::Domain => self.domains.len(),
+            AccessClass::Enum => self.enums.len(),
+            AccessClass::Index => self.indexes.len(),
         }
     }
 
@@ -3146,10 +3248,14 @@ impl Storage {
         });
         owned
             || self.acl_entries.iter().any(|entry| {
-                let (visible, _, _) = Self::acl_visible(entry, txid);
+                let (visible, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
                 visible
                     && self.access_object_visible_to(entry.object, txid)
-                    && (entry.grantee == role as u16 || entry.grantor == role as u16)
+                    && (grantee == role as u16 || grantor == role as u16)
+            })
+            || self.default_acl_entries.iter().any(|entry| {
+                let (defined, _, _) = Self::default_acl_visible(entry, txid);
+                defined && (entry.owner == role as u16 || entry.grantee == role as u16)
             })
     }
 
@@ -3191,14 +3297,25 @@ impl Storage {
         self.ownership_mut(object).pending = prior;
     }
 
-    fn acl_visible(entry: &AclEntry, txid: u32) -> (bool, PrivilegeSet, PrivilegeSet) {
+    fn acl_visible(
+        entry: &AclEntry,
+        txid: u32,
+    ) -> (bool, u16, u16, PrivilegeSet, PrivilegeSet) {
         match entry.pending {
             Some(pending) if pending.txid == txid => (
                 pending.privileges.0 != 0,
+                pending.grantee,
+                pending.grantor,
                 pending.privileges,
                 pending.grant_options,
             ),
-            _ => (entry.live, entry.privileges, entry.grant_options),
+            _ => (
+                entry.live,
+                entry.grantee,
+                entry.grantor,
+                entry.privileges,
+                entry.grant_options,
+            ),
         }
     }
 
@@ -3215,9 +3332,11 @@ impl Storage {
             .acl_entries
             .iter()
             .position(|entry| {
+                let (_, visible_grantee, visible_grantor, _, _) =
+                    Self::acl_visible(entry, txid);
                 entry.object == object
-                    && entry.grantee == grantee
-                    && entry.grantor == grantor
+                    && visible_grantee == grantee
+                    && visible_grantor == grantor
                     && (entry.live || entry.pending.is_some())
             })
             .or_else(|| {
@@ -3251,8 +3370,9 @@ impl Storage {
         }
         let entry = &mut self.acl_entries[slot];
         let prior = entry.pending;
-        entry.grantor = grantor;
         if txid == 0 {
+            entry.grantee = grantee;
+            entry.grantor = grantor;
             entry.privileges = privileges;
             entry.grant_options = grant_options;
             entry.live = privileges.0 != 0;
@@ -3260,6 +3380,8 @@ impl Storage {
         } else {
             entry.pending = Some(PendingAcl {
                 txid,
+                grantee,
+                grantor,
                 privileges,
                 grant_options,
             });
@@ -3275,11 +3397,14 @@ impl Storage {
     ) -> (PrivilegeSet, PrivilegeSet) {
         self.acl_entries
             .iter()
-            .filter(|entry| entry.object == object && entry.grantee == grantee)
+            .filter(|entry| {
+                let (_, visible_grantee, _, _, _) = Self::acl_visible(entry, txid);
+                entry.object == object && visible_grantee == grantee
+            })
             .fold(
                 (PrivilegeSet::NONE, PrivilegeSet::NONE),
                 |(privileges, grant_options), entry| {
-                    let (visible, entry_privileges, entry_grant_options) =
+                    let (visible, _, _, entry_privileges, entry_grant_options) =
                         Self::acl_visible(entry, txid);
                     if visible {
                         (
@@ -3302,25 +3427,34 @@ impl Storage {
     ) -> (PrivilegeSet, PrivilegeSet) {
         self.acl_entries
             .iter()
-            .find(|entry| {
+            .filter(|entry| {
+                let (_, visible_grantee, visible_grantor, _, _) =
+                    Self::acl_visible(entry, txid);
                 entry.object == object
-                    && entry.grantee == grantee
-                    && entry.grantor == grantor
+                    && visible_grantee == grantee
+                    && visible_grantor == grantor
                     && (entry.live || entry.pending.is_some())
             })
-            .map(|entry| {
-                let (visible, privileges, grant_options) = Self::acl_visible(entry, txid);
-                if visible {
-                    (privileges, grant_options)
-                } else {
-                    (PrivilegeSet::NONE, PrivilegeSet::NONE)
-                }
-            })
-            .unwrap_or((PrivilegeSet::NONE, PrivilegeSet::NONE))
+            .fold(
+                (PrivilegeSet::NONE, PrivilegeSet::NONE),
+                |(privileges, grant_options), entry| {
+                    let (visible, _, _, entry_privileges, entry_grant_options) =
+                        Self::acl_visible(entry, txid);
+                    if visible {
+                        (
+                            privileges.union(entry_privileges),
+                            grant_options.union(entry_grant_options),
+                        )
+                    } else {
+                        (privileges, grant_options)
+                    }
+                },
+            )
     }
 
     pub(crate) fn acl_state(&self, slot: usize, txid: u32) -> (PrivilegeSet, PrivilegeSet) {
-        let (visible, privileges, grant_options) = Self::acl_visible(&self.acl_entries[slot], txid);
+        let (visible, _, _, privileges, grant_options) =
+            Self::acl_visible(&self.acl_entries[slot], txid);
         if visible {
             (privileges, grant_options)
         } else {
@@ -3329,19 +3463,287 @@ impl Storage {
     }
 
     pub(crate) fn commit_acl(&mut self, slot: usize, txid: u32) {
-        let entry = &mut self.acl_entries[slot];
-        if let Some(pending) = entry.pending
-            && pending.txid == txid
+        let Some(pending) = self.acl_entries[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+        else {
+            return;
+        };
         {
+            let entry = &mut self.acl_entries[slot];
+            entry.grantee = pending.grantee;
+            entry.grantor = pending.grantor;
             entry.privileges = pending.privileges;
             entry.grant_options = pending.grant_options;
             entry.live = pending.privileges.0 != 0;
             entry.pending = None;
         }
+        self.deduplicate_acl(slot);
+    }
+
+    fn deduplicate_acl(&mut self, slot: usize) {
+        let object = self.acl_entries[slot].object;
+        let grantee = self.acl_entries[slot].grantee;
+        let grantor = self.acl_entries[slot].grantor;
+        let Some(canonical) = self.acl_entries.iter().enumerate().find_map(|(candidate, entry)| {
+            (candidate != slot
+                && entry.object == object
+                && entry.grantee == grantee
+                && entry.grantor == grantor
+                && entry.object.slot != u16::MAX
+                && entry.pending.is_none())
+            .then_some(candidate)
+        }) else {
+            return;
+        };
+        let privileges = self.acl_entries[slot].privileges;
+        let grant_options = self.acl_entries[slot].grant_options;
+        self.acl_entries[canonical].privileges =
+            self.acl_entries[canonical].privileges.union(privileges);
+        self.acl_entries[canonical].grant_options =
+            self.acl_entries[canonical].grant_options.union(grant_options);
+        self.acl_entries[canonical].live = self.acl_entries[canonical].privileges.0 != 0;
+        self.acl_entries[slot].object.slot = u16::MAX;
+        self.acl_entries[slot].privileges = PrivilegeSet::NONE;
+        self.acl_entries[slot].grant_options = PrivilegeSet::NONE;
+        self.acl_entries[slot].live = false;
     }
 
     pub(crate) fn restore_acl_pending(&mut self, slot: usize, prior: Option<PendingAcl>) {
         self.acl_entries[slot].pending = prior;
+    }
+
+    pub(crate) fn acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
+        let (_, grantee, grantor, _, _) = Self::acl_visible(&self.acl_entries[slot], txid);
+        (grantee, grantor)
+    }
+
+    pub(crate) fn change_acl_identity(
+        &mut self,
+        slot: usize,
+        grantee: u16,
+        grantor: u16,
+        txid: u32,
+    ) -> Option<PendingAcl> {
+        let entry = &mut self.acl_entries[slot];
+        let prior = entry.pending;
+        let (_, _, _, privileges, grant_options) = Self::acl_visible(entry, txid);
+        if txid == 0 {
+            entry.grantee = grantee;
+            entry.grantor = grantor;
+            entry.pending = None;
+        } else {
+            entry.pending = Some(PendingAcl {
+                txid,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+            });
+        }
+        if txid == 0 {
+            self.deduplicate_acl(slot);
+        }
+        prior
+    }
+
+    fn default_acl_visible(
+        entry: &DefaultAclEntry,
+        txid: u32,
+    ) -> (bool, PrivilegeSet, PrivilegeSet) {
+        match entry.pending {
+            Some(pending) if pending.txid == txid => (
+                pending.defined,
+                pending.privileges,
+                pending.grant_options,
+            ),
+            _ => (entry.defined, entry.privileges, entry.grant_options),
+        }
+    }
+
+    pub(crate) const fn default_acl_baseline(
+        owner: u16,
+        schema: u16,
+        class: DefaultPrivilegeClass,
+        grantee: u16,
+    ) -> (PrivilegeSet, PrivilegeSet) {
+        if schema != DEFAULT_ACL_ALL_SCHEMAS {
+            return (PrivilegeSet::NONE, PrivilegeSet::NONE);
+        }
+        if grantee == owner {
+            let all = class.all_privileges();
+            return (all, PrivilegeSet::NONE);
+        }
+        if grantee == PUBLIC_ROLE {
+            return (class.default_public_privileges(), PrivilegeSet::NONE);
+        }
+        (PrivilegeSet::NONE, PrivilegeSet::NONE)
+    }
+
+    pub(crate) fn default_acl_state(
+        &self,
+        owner: u16,
+        schema: u16,
+        class: DefaultPrivilegeClass,
+        grantee: u16,
+        txid: u32,
+    ) -> (bool, PrivilegeSet, PrivilegeSet) {
+        self.default_acl_entries
+            .iter()
+            .find(|entry| {
+                entry.owner == owner
+                    && entry.schema == schema
+                    && entry.class == class
+                    && entry.grantee == grantee
+            })
+            .map(|entry| Self::default_acl_visible(entry, txid))
+            .unwrap_or((
+                false,
+                PrivilegeSet::NONE,
+                PrivilegeSet::NONE,
+            ))
+    }
+
+    pub(crate) fn default_acl_effective(
+        &self,
+        owner: u16,
+        schema: u16,
+        class: DefaultPrivilegeClass,
+        grantee: u16,
+        txid: u32,
+    ) -> (PrivilegeSet, PrivilegeSet) {
+        let (defined, privileges, grant_options) =
+            self.default_acl_state(owner, schema, class, grantee, txid);
+        if defined {
+            (privileges, grant_options)
+        } else {
+            Self::default_acl_baseline(owner, schema, class, grantee)
+        }
+    }
+
+    pub(crate) fn change_default_acl(
+        &mut self,
+        key: DefaultAclKey,
+        defined: bool,
+        privileges: PrivilegeSet,
+        grant_options: PrivilegeSet,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingDefaultAcl>), SqlError> {
+        let DefaultAclKey {
+            owner,
+            schema,
+            class,
+            grantee,
+        } = key;
+        let slot = self
+            .default_acl_entries
+            .iter()
+            .position(|entry| {
+                entry.owner == owner
+                    && entry.schema == schema
+                    && entry.class == class
+                    && entry.grantee == grantee
+            })
+            .or_else(|| {
+                self.default_acl_entries
+                    .iter()
+                    .position(|entry| entry.owner == PUBLIC_ROLE && entry.pending.is_none())
+            })
+            .unwrap_or(self.default_acl_entries.len());
+        if slot == self.default_acl_entries.len() {
+            self.default_acl_entries
+                .push(DefaultAclEntry {
+                    owner,
+                    schema,
+                    class,
+                    grantee,
+                    defined: false,
+                    privileges: PrivilegeSet::NONE,
+                    grant_options: PrivilegeSet::NONE,
+                    pending: None,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many default privilege entries (limit {})",
+                        MAX_DEFAULT_ACL_ENTRIES
+                    )
+                })?;
+        } else if self.default_acl_entries[slot].owner == PUBLIC_ROLE {
+            let entry = &mut self.default_acl_entries[slot];
+            entry.owner = owner;
+            entry.schema = schema;
+            entry.class = class;
+            entry.grantee = grantee;
+            entry.defined = false;
+            entry.privileges = PrivilegeSet::NONE;
+            entry.grant_options = PrivilegeSet::NONE;
+        }
+        let entry = &mut self.default_acl_entries[slot];
+        let prior = entry.pending;
+        if txid == 0 {
+            entry.defined = defined;
+            entry.privileges = privileges;
+            entry.grant_options = grant_options;
+            entry.pending = None;
+            if !defined {
+                entry.owner = PUBLIC_ROLE;
+            }
+        } else {
+            entry.pending = Some(PendingDefaultAcl {
+                txid,
+                defined,
+                privileges,
+                grant_options,
+            });
+        }
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn default_acl_entry(&self, slot: usize) -> &DefaultAclEntry {
+        &self.default_acl_entries[slot]
+    }
+
+    pub(crate) fn default_acl_entries(
+        &self,
+    ) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
+        self.default_acl_entries.iter().enumerate()
+    }
+
+    pub(crate) fn commit_default_acl(&mut self, slot: usize, txid: u32) {
+        let entry = &mut self.default_acl_entries[slot];
+        if let Some(pending) = entry.pending
+            && pending.txid == txid
+        {
+            entry.defined = pending.defined;
+            entry.privileges = pending.privileges;
+            entry.grant_options = pending.grant_options;
+            entry.pending = None;
+            if !entry.defined {
+                entry.owner = PUBLIC_ROLE;
+            }
+        }
+    }
+
+    pub(crate) fn restore_default_acl_pending(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingDefaultAcl>,
+    ) {
+        let entry = &mut self.default_acl_entries[slot];
+        entry.pending = prior;
+        if prior.is_none() && !entry.defined {
+            entry.owner = PUBLIC_ROLE;
+        }
+    }
+
+    pub(crate) fn live_default_acls(
+        &self,
+    ) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
+        self.default_acl_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.defined)
     }
 
     pub(crate) fn live_acls(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
@@ -3378,10 +3780,11 @@ impl Storage {
     ) -> usize {
         let mut count = 0usize;
         for (slot, entry) in self.acl_entries.iter().enumerate() {
-            let (visible, entry_privileges, _) = Self::acl_visible(entry, txid);
+            let (visible, _, entry_grantor, entry_privileges, _) =
+                Self::acl_visible(entry, txid);
             if visible
                 && entry.object == object
-                && entry.grantor == grantor
+                && entry_grantor == grantor
                 && entry_privileges.0 & privileges.0 != 0
             {
                 output[count] = slot;
@@ -3423,7 +3826,8 @@ impl Storage {
         let mut roles = [false; MAX_ROLES];
         self.inherited_roles(role, txid, &mut roles);
         let public_acl_defined = self.acl_entries.iter().any(|entry| {
-            entry.object == object && entry.grantee == PUBLIC_ROLE && entry.object.slot != u16::MAX
+            let (_, grantee, _, _, _) = Self::acl_visible(entry, txid);
+            entry.object == object && grantee == PUBLIC_ROLE && entry.object.slot != u16::MAX
         });
         let mut effective = if matches!(object.class, AccessClass::Domain | AccessClass::Enum)
             && !public_acl_defined
@@ -3590,7 +3994,10 @@ impl Storage {
                 "current role is not present in the role catalog"
             )
         })?;
-        if self.role(role).attributes_to(txid).superuser || self.object_owner(object, txid) == role
+        let owner = self.object_owner(object, txid);
+        if self.role(role).attributes_to(txid).superuser
+            || owner == role
+            || self.role_can_set(role, owner, txid)
         {
             return Ok(());
         }
@@ -3821,6 +4228,24 @@ impl Storage {
 
     pub fn remove_role(&mut self, name: &str) {
         if let Some(slot) = self.find_role(name) {
+            for entry in self.acl_entries.iter_mut() {
+                if entry.grantee == slot as u16 || entry.grantor == slot as u16 {
+                    entry.object.slot = u16::MAX;
+                    entry.live = false;
+                    entry.privileges = PrivilegeSet::NONE;
+                    entry.grant_options = PrivilegeSet::NONE;
+                    entry.pending = None;
+                }
+            }
+            for entry in self.default_acl_entries.iter_mut() {
+                if entry.owner == slot as u16 || entry.grantee == slot as u16 {
+                    entry.owner = PUBLIC_ROLE;
+                    entry.defined = false;
+                    entry.privileges = PrivilegeSet::NONE;
+                    entry.grant_options = PrivilegeSet::NONE;
+                    entry.pending = None;
+                }
+            }
             self.roles[slot] = RoleDef {
                 name: SqlName::EMPTY,
                 attributes: RoleAttributes::ORDINARY,

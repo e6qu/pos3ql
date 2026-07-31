@@ -234,6 +234,15 @@ pub enum Stmt<'a> {
         local: bool,
         reset: bool,
     },
+    /// SET [LOCAL] SESSION AUTHORIZATION role | DEFAULT and
+    /// RESET SESSION AUTHORIZATION. Unlike SET ROLE, this changes both
+    /// session_user and current_user while the authenticated identity remains
+    /// the authority used to permit the change.
+    SetSessionAuthorization {
+        role: Option<&'a str>,
+        local: bool,
+        reset: bool,
+    },
     Show(&'a str),
     /// SHOW ALL: every readable setting as (name, setting, description).
     ShowAll,
@@ -369,6 +378,19 @@ pub enum Stmt<'a> {
         grantees: &'a [&'a str],
         cascade: bool,
     },
+    AlterDefaultPrivileges {
+        roles: &'a [&'a str],
+        schemas: &'a [&'a str],
+        action: DefaultPrivilegeAction<'a>,
+    },
+    ReassignOwned {
+        roles: &'a [&'a str],
+        new_owner: &'a str,
+    },
+    DropOwned {
+        roles: &'a [&'a str],
+        cascade: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +405,34 @@ pub enum Privilege {
     Trigger,
     Usage,
     Create,
+    Execute,
+    Maintain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultPrivilegeObjectKind {
+    Tables,
+    Sequences,
+    Functions,
+    Types,
+    Schemas,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultPrivilegeAction<'a> {
+    Grant {
+        privileges: &'a [Privilege],
+        kind: DefaultPrivilegeObjectKind,
+        grantees: &'a [&'a str],
+        grant_option: bool,
+    },
+    Revoke {
+        grant_option_only: bool,
+        privileges: &'a [Privilege],
+        kind: DefaultPrivilegeObjectKind,
+        grantees: &'a [&'a str],
+        cascade: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

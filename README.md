@@ -201,11 +201,15 @@ Known divergences from PostgreSQL and current constraints (details and IDs in
   runs through the provider-neutral object-store block stack; RAM and local
   disk only cache those blocks. Non-lateral derived tables, CTEs, and views
   retain their rows in the same external runs, as do UNION/INTERSECT/EXCEPT
-  multisets and their INSERT/CTAS consumers. Grouped aggregates, windows,
-  scalar/list subqueries, recursive/lateral row sources, and outer-join match
-  state still retain their working sets in the fixed shared arena
-  (`work_arena_bytes`, 64 MiB default). Exceeding that remaining bound errors
-  `54000`, never truncates a result (B-006).
+  multisets and their INSERT/CTAS consumers. Scalar subqueries use a
+  cardinality-checking spool, `IN (subquery)` streams a run-backed membership
+  probe (including after a DML read phase), recursive CTE all/work tables and
+  lateral subqueries/functions are immutable runs, and RIGHT/FULL join match
+  state is an external sorted map. Grouped aggregates and windows, plus ARRAY
+  subqueries and set-subquery forms carrying their own final ORDER/LIMIT,
+  still retain working sets in the fixed shared arena (`work_arena_bytes`,
+  64 MiB default). Exceeding that remaining bound errors `54000`, never
+  truncates a result (B-006).
 - **A checkpoint beat blocks for one table's write.** The auto-checkpoint is
   sliced — one table's SSTs per beat, beats interleaved with statements and
   driven on by the idle event loop, publishing only when no table changed

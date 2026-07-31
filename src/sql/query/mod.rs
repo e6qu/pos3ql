@@ -779,8 +779,7 @@ fn patch_subquery_column_types<'a>(
 }
 
 type CorrelatedScalarScratch<'a> = [(*const Expr<'a>, Datum<'a>, Datum<'a>); MAX_SUBQUERIES];
-type CorrelatedListScratch<'a> =
-    [(*const Expr<'a>, &'a [Datum<'a>], bool, Datum<'a>); MAX_SUBQUERIES];
+type CorrelatedListScratch<'a> = [super::eval::SubqueryList<'a>; MAX_SUBQUERIES];
 
 /// Materializes only the correlated subqueries needed for one source row.
 /// Streaming and row-emitting SELECT share this stack-backed seam, keeping
@@ -2205,7 +2204,7 @@ pub fn select_query<'a>(
         // A set-returning `_pg_expandarray(array)` expands each row into one output
         // row per array element.
         let srf_call = find_srf(statement.items);
-        let scan = scan_source(
+        let scan = scan_source_recycling(
             storage,
             &scope,
             from,
@@ -2237,8 +2236,8 @@ pub fn select_query<'a>(
                 // Per-row hooks for correlated subqueries; then WHERE.
                 let mut scalar_scratch: CorrelatedScalarScratch =
                     [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-                let mut list_scratch: CorrelatedListScratch =
-                    [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+                let mut list_scratch: CorrelatedListScratch<'_> =
+                    [subquery::empty_subquery_list(); MAX_SUBQUERIES];
                 let row_subqueries = correlated_row_subqueries(
                     correlated,
                     &outer_subs.base,
@@ -2919,6 +2918,11 @@ fn select_into_rows_mode<'a>(
                 aggs: Some((ptrs, values)),
                 ..hooks
             };
+            let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+            let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
+            if limit == 0 || offset > 0 {
+                return Ok(());
+            }
             let mut vals = [Datum::Null; MAX_PROJ];
             let mut n = 0;
             for item in statement.items {
@@ -3036,6 +3040,11 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
+        let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+        let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
+        if limit == 0 {
+            return Ok(());
+        }
         // A FROM-less body may still reference an outer row when it is a LATERAL
         // item (`LATERAL (SELECT t.a * 2)`); resolve against that outer scope.
         let cols: &dyn ColumnLookup = outer.unwrap_or(&super::eval::NoColumns);
@@ -3061,6 +3070,7 @@ fn select_into_rows_mode<'a>(
         };
         let srf_call = find_srf(statement.items);
         let count = srf_max_count(statement.items, arena, params, &cols, &hooks)?;
+        let mut produced = 0u64;
         for k in 1..=count {
             let khooks = if srf_call.is_some() {
                 EvalHooks {
@@ -3099,7 +3109,13 @@ fn select_into_rows_mode<'a>(
                     }
                 }
             }
-            emit(&vals[..n])?;
+            if produced >= offset {
+                emit(&vals[..n])?;
+            }
+            produced = produced.saturating_add(1);
+            if produced >= offset.saturating_add(limit) {
+                break;
+            }
         }
         return Ok(());
     };
@@ -3284,6 +3300,13 @@ fn select_into_rows_mode<'a>(
     } else {
         None
     };
+    let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+    let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
+    let stop_after = offset.saturating_add(limit);
+    if stop_after == 0 {
+        return Ok(());
+    }
+    let mut produced = 0u64;
 
     // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
@@ -3306,8 +3329,8 @@ fn select_into_rows_mode<'a>(
         }
         let mut scalar_scratch: CorrelatedScalarScratch =
             [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-        let mut list_scratch: CorrelatedListScratch =
-            [(core::ptr::null(), &[], false, Datum::Null); MAX_SUBQUERIES];
+        let mut list_scratch: CorrelatedListScratch<'_> =
+            [subquery::empty_subquery_list(); MAX_SUBQUERIES];
         let row_subqueries = correlated_row_subqueries(
             correlated,
             &outer_subs.base,
@@ -3338,9 +3361,12 @@ fn select_into_rows_mode<'a>(
                     params,
                     row_hooks,
                     &mut projected,
-                    None,
+                    outer,
                 )?;
-                emit(&projected[..n])?;
+                if produced >= offset {
+                    emit(&projected[..n])?;
+                }
+                produced = produced.saturating_add(1);
             }
             Some(c) => {
                 let count = srf_count(c, arena, params, row, row_hooks)?;
@@ -3357,13 +3383,19 @@ fn select_into_rows_mode<'a>(
                         params,
                         &srf_hooks,
                         &mut projected,
-                        None,
+                        outer,
                     )?;
-                    emit(&projected[..n])?;
+                    if produced >= offset {
+                        emit(&projected[..n])?;
+                    }
+                    produced = produced.saturating_add(1);
+                    if produced >= stop_after {
+                        break;
+                    }
                 }
             }
         }
-        Ok(true)
+        Ok(produced < stop_after)
     };
     if recycle_rows {
         scan_source_recycling(

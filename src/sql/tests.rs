@@ -10231,6 +10231,151 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
             "16"
         ]
     );
+    let before_membership = restarted.storage.block_io_stats();
+    let membership = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT 1 WHERE lpad('1', 512, '0') IN \
+         (SELECT payload FROM external_rows)",
+        256 << 10,
+    );
+    assert_eq!(
+        data_rows(&membership),
+        ["1"],
+        "a subquery list larger than the arena must remain probeable: {}",
+        String::from_utf8_lossy(&membership)
+    );
+    let membership_traffic = restarted
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_membership);
+    assert!(
+        membership_traffic.object_puts > 0 && membership_traffic.object_gets > 0,
+        "subquery membership must spool and probe the provider-neutral run: {membership_traffic:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT 1
+             WHERE ROW(1, lpad('1', 512, '0')) IN
+                   (SELECT id, payload FROM external_rows WHERE id <= 2)",
+            256 << 10,
+        )),
+        ["1"],
+        "a rewritten row-valued subquery must remain a single record in its external run"
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT 1 WHERE 3001 IN (
+                 SELECT id FROM external_rows
+                 UNION ALL
+                 VALUES (3001)
+             )",
+            256 << 10,
+        )),
+        ["1"],
+        "set-operation membership must probe the external run"
+    );
+    let scalar = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT length((SELECT payload FROM external_rows WHERE id > 0 LIMIT 1))",
+        256 << 10,
+    );
+    assert_eq!(
+        data_rows(&scalar),
+        ["512"],
+        "LIMIT must stop an externally spooled scalar subquery before its cardinality check"
+    );
+    let updated = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "UPDATE external_rows SET payload = payload \
+         WHERE id = 1 AND id IN (SELECT id FROM external_rows)",
+        256 << 10,
+    );
+    assert!(
+        !String::from_utf8_lossy(&updated).contains("ERROR"),
+        "DML must keep its object-run probe after releasing the immutable Storage borrow: {}",
+        String::from_utf8_lossy(&updated)
+    );
+    let before_recursive = restarted.storage.block_io_stats();
+    let recursive = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "WITH RECURSIVE r(id, payload) AS (
+             SELECT id, payload FROM external_rows
+             UNION ALL
+             SELECT id, payload FROM r WHERE false
+         )
+         SELECT count(*) FROM r",
+        256 << 10,
+    );
+    assert_eq!(
+        data_rows(&recursive),
+        ["3000"],
+        "the recursive all/work tables must outgrow the arena: {}",
+        String::from_utf8_lossy(&recursive)
+    );
+    assert!(
+        restarted
+            .storage
+            .block_io_stats()
+            .saturating_sub(before_recursive)
+            .object_puts
+            > 0,
+        "recursive work tables must be immutable object-backed runs"
+    );
+    let lateral = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT 1
+         FROM (VALUES (1)) AS seed(n)
+         CROSS JOIN LATERAL (
+             SELECT payload FROM external_rows
+         ) AS expanded
+         WHERE expanded.payload IS NULL",
+        256 << 10,
+    );
+    assert!(
+        data_rows(&lateral).is_empty(),
+        "lateral spooling changed the empty result: {}",
+        String::from_utf8_lossy(&lateral)
+    );
+    let lateral_function = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT generated.n
+         FROM (VALUES (5000)) AS seed(stop)
+         CROSS JOIN LATERAL generate_series(1, seed.stop) AS generated(n)
+         WHERE generated.n < 0",
+        256 << 10,
+    );
+    assert!(
+        data_rows(&lateral_function).is_empty(),
+        "lateral SRF spooling changed the empty result: {}",
+        String::from_utf8_lossy(&lateral_function)
+    );
+    let outer_join = run_with_arena_bytes(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT right_side.id
+         FROM (
+             SELECT id FROM external_rows WHERE id = 1
+         ) AS left_side
+         RIGHT JOIN external_rows AS right_side
+           ON left_side.id = right_side.id
+         WHERE left_side.id IS NULL AND right_side.id < 0",
+        256 << 10,
+    );
+    assert!(
+        data_rows(&outer_join).is_empty(),
+        "the external RIGHT JOIN match map lost matches: {}",
+        String::from_utf8_lossy(&outer_join)
+    );
     let union_output = run_with(
         &mut restarted,
         &mut restarted_budget,
@@ -10701,6 +10846,16 @@ fn distinct_aggregates() {
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT length(distinct 'x')"))
             .contains("42883")
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT length(json_agg(repeat('x', 1000))::text) \
+             FROM generate_series(1, 70)"
+        )),
+        ["70280"],
+        "JSON aggregate rendering must not truncate at a fixed stack buffer"
     );
 }
 
@@ -12219,4 +12374,168 @@ fn create_table_as_builds_and_populates() {
         )),
         ["ctas_mood|ctas_mood[]"]
     );
+}
+
+#[test]
+fn count_distinct_over_extended_types() {
+    // count(DISTINCT x) buffers its argument values, so it must never ride the
+    // row-recycling scan: a recycled row would reclaim the buffered datums.
+    // Values validated against PostgreSQL 18.4.
+    let (mut engine, mut budget) = test_engine();
+    let r = |e: &mut Engine, b: &mut Budget, sql: &str| data_rows(&run_with(e, b, sql));
+    // Interval equality is canonical: '1 hour' = '60 min'.
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT x) FROM (VALUES (INTERVAL '1 hour'),(INTERVAL '60 min'),(INTERVAL '2 hours')) t(x)"
+        ),
+        ["2"]
+    );
+    // now() is stable within a statement.
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT now()) FROM generate_series(1, 200) g"
+        ),
+        ["1"]
+    );
+    // bpchar compares blank-stripped, so char(2) 'a' = char(3) 'a '.
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT c) FROM (VALUES ('a'::char(2)), ('a'::char(3))) t(c)"
+        ),
+        ["1"]
+    );
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT r) FROM (VALUES (int4range(1,2)),(int4range(2,3))) t(r)"
+        ),
+        ["2"]
+    );
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT a) FROM (VALUES ('1.2.3.4'::inet),('1.2.3.4'::inet)) t(a)"
+        ),
+        ["1"]
+    );
+}
+
+#[test]
+fn external_in_subquery_preserves_wildcard_column_coercion() {
+    // PostgreSQL type-checks the IN operand against the subquery's column type
+    // even over an empty set, so 'hello' against an integer column is 22P02.
+    // The externally spooled run must carry that witness just as the inline
+    // value list does.
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("external-in-witness-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-external-in-witness-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE in_witness (x INTEGER)",
+    );
+    for statement in [
+        "SELECT 'hello' IN (SELECT * FROM in_witness)",
+        "SELECT 'hello' NOT IN (SELECT * FROM in_witness)",
+    ] {
+        let out = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&out).contains("22P02"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    // A conforming operand still probes the empty set as FALSE/TRUE.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 1 IN (SELECT * FROM in_witness), 1 NOT IN (SELECT * FROM in_witness)"
+        )),
+        ["f|t"]
+    );
+    run_with(&mut engine, &mut budget, "INSERT INTO in_witness VALUES (1)");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 1 IN (SELECT * FROM in_witness)"
+        )),
+        ["t"]
+    );
+    // A row-valued probe keeps its records structural through the external
+    // sort that ORDER BY / LIMIT forces: rendered text would not compare.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE row_witness (a int, c int);
+         INSERT INTO row_witness VALUES (1, 10), (1, 20), (4, 40)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT (1,1) IN (SELECT a,a FROM row_witness ORDER BY a LIMIT 1),
+                    (4,4) IN (SELECT a,a FROM row_witness ORDER BY a DESC LIMIT 1),
+                    (2,2) IN (SELECT a,a FROM row_witness ORDER BY a LIMIT 1)"
+        )),
+        ["t|t|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(row(a,a)) FROM row_witness ORDER BY a LIMIT 1"
+        )),
+        ["record"]
+    );
+    // A correlated probe resolves outer columns in the subquery's select list
+    // and ORDER BY keys, not only in its WHERE clause.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE corr_outer (x int);
+         INSERT INTO corr_outer VALUES (1),(5),(9)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT x FROM corr_outer
+             WHERE x = ANY (SELECT a + corr_outer.x - corr_outer.x FROM row_witness)
+             ORDER BY x"
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT x FROM corr_outer
+             WHERE x IN (SELECT a FROM row_witness ORDER BY a + 0 * corr_outer.x LIMIT 2)
+             ORDER BY x"
+        )),
+        ["1"]
+    );
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

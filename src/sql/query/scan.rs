@@ -461,6 +461,287 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
     ))
 }
 
+fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
+    storage: &'a Storage,
+    txid: u32,
+    tref: &'a crate::sql::ast::TableRef<'a>,
+    width: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: &C,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let call = arena
+        .alloc(Expr::Call {
+            name: tref.table,
+            args: tref.func_args.expect("table function"),
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+        .map_err(|_| arena_full())?;
+    let catalog = super::storage_catalog(storage, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let count = super::srf::srf_count(&*call, arena, params, outer, &hooks)?;
+    let base_width = width - usize::from(tref.with_ordinality);
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
+    for index in 1..=count {
+        let mark = arena.mark();
+        let row_hooks = EvalHooks {
+            srf_index: Some(index),
+            ..hooks
+        };
+        let value = eval_full(&*call, arena, params, outer, &row_hooks)?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        match (base_width, value) {
+            (1, value) => values[0] = value,
+            (_, Datum::Record(fields)) if fields.len() == base_width => {
+                for (column, field) in fields.iter().enumerate() {
+                    values[column] = field.value;
+                }
+            }
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "set-returning function row width does not match its definition"
+                ));
+            }
+        }
+        if tref.with_ordinality {
+            values[base_width] = Datum::Int8(index as i64);
+        }
+        storage
+            .with_block_store(|blocks| {
+                sorter.push_projected_by(blocks, width, |column| values[column], &mut compare)
+            })
+            .expect("lateral function run has a block store")?;
+        // SAFETY: the evaluated SRF row was encoded into the immutable run;
+        // no datum allocated after this mark is retained.
+        unsafe { arena.rewind_to(mark) };
+    }
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("lateral function run has a block store")
+}
+
+enum LateralRows<'a> {
+    External(Option<crate::sql::external::ExternalRun>),
+    Local(&'a [&'a [u8]]),
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
+    storage: &'a Storage,
+    txid: u32,
+    tref: &'a crate::sql::ast::TableRef<'a>,
+    width: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: &C,
+) -> Result<LateralRows<'a>, SqlError> {
+    let external_function = tref.func_args.is_some()
+        && !tref.table.eq_ignore_ascii_case("pg_options_to_table")
+        && !tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
+    if !storage.spill_attached() || (tref.subquery.is_none() && !external_function) {
+        return Ok(LateralRows::Local(materialize_lateral(
+            storage, txid, tref, arena, params, outer,
+        )?));
+    }
+    if tref.subquery.is_none() {
+        return Ok(LateralRows::External(external_lateral_function_run(
+            storage, txid, tref, width, arena, params, outer,
+        )?));
+    }
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
+    super::select_into_rows_recycling(
+        storage,
+        txid,
+        tref.subquery.expect("checked"),
+        arena,
+        params,
+        Some(outer),
+        None,
+        &mut |values| {
+            storage
+                .with_block_store(|blocks| {
+                    sorter.push_projected_by(
+                        blocks,
+                        values.len(),
+                        |column| values[column],
+                        &mut compare,
+                    )
+                })
+                .expect("spill-attached block store")
+        },
+    )?;
+    let run = storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("spill-attached block store")?;
+    Ok(LateralRows::External(run))
+}
+
+fn consume_external_lateral_run<'a>(
+    storage: &'a Storage,
+    run: crate::sql::external::ExternalRun,
+    arena: &'a Arena,
+    recycle_rows: bool,
+    visit: &mut impl FnMut(usize, &'a [u8]) -> Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    let mut reader = storage.external_run_reader()?;
+    storage
+        .with_block_store(|blocks| reader.start(blocks, run))
+        .expect("spill-attached block store")?;
+    let mut index = 0usize;
+    while let Some(bytes) = reader.row() {
+        check_timeout()?;
+        let mark = recycle_rows.then(|| arena.mark());
+        let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+        let keep_scanning = visit(index, owned)?;
+        index += 1;
+        if let Some(mark) = mark {
+            // SAFETY: the candidate and every evaluator result derived from it
+            // were consumed synchronously by `visit`.
+            unsafe { arena.rewind_to(mark) };
+        }
+        if !keep_scanning {
+            return Ok(false);
+        }
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("spill-attached block store")?;
+    }
+    Ok(true)
+}
+
+fn record_external_match(
+    storage: &Storage,
+    writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
+    depth: usize,
+    index: usize,
+) -> Result<(), SqlError> {
+    let Some(mut writer) = writer else {
+        return Ok(());
+    };
+    // SAFETY: the pointer is created from a live sorter immediately around a
+    // synchronous scan and is never retained by a row or immutable run.
+    let writer = unsafe { writer.as_mut() };
+    let mut compare = compare_external_matches;
+    storage
+        .with_block_store(|blocks| {
+            writer.push_projected_by(
+                blocks,
+                2,
+                |column| {
+                    if column == 0 {
+                        Datum::Int4(depth as i32)
+                    } else {
+                        Datum::Int8(index as i64)
+                    }
+                },
+                &mut compare,
+            )
+        })
+        .expect("external match map has a block store")
+}
+
+fn external_match_contains(
+    storage: &Storage,
+    reader: &mut crate::sql::external::ExternalRunReader,
+    depth: usize,
+    index: usize,
+) -> Result<bool, SqlError> {
+    while let Some(row) = reader.row() {
+        let row_depth = match crate::sql::exec::decode_projected_pub(row, 0) {
+            Datum::Int4(value) => value as usize,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "external join match depth is corrupt"
+                ));
+            }
+        };
+        let row_index = match crate::sql::exec::decode_projected_pub(row, 1) {
+            Datum::Int8(value) => value as usize,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "external join match index is corrupt"
+                ));
+            }
+        };
+        match (row_depth, row_index).cmp(&(depth, index)) {
+            core::cmp::Ordering::Less => {}
+            core::cmp::Ordering::Equal => return Ok(true),
+            core::cmp::Ordering::Greater => return Ok(false),
+        }
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("external match map has a block store")?;
+    }
+    Ok(false)
+}
+
+fn compare_external_matches(left: &[u8], right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
+    let key = |row: &[u8]| -> Result<(i32, i64), SqlError> {
+        let depth = match crate::sql::exec::decode_projected_pub(row, 0) {
+            Datum::Int4(value) => value,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "external join match depth is corrupt"
+                ));
+            }
+        };
+        let index = match crate::sql::exec::decode_projected_pub(row, 1) {
+            Datum::Int8(value) => value,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "external join match index is corrupt"
+                ));
+            }
+        };
+        Ok((depth, index))
+    };
+    Ok(key(left)?.cmp(&key(right)?))
+}
+
+fn combine_external_match_runs(
+    storage: &Storage,
+    left: Option<crate::sql::external::ExternalRun>,
+    right: Option<crate::sql::external::ExternalRun>,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = compare_external_matches;
+    let mut reader = storage.external_run_reader()?;
+    for run in [left, right].into_iter().flatten() {
+        storage
+            .with_block_store(|blocks| reader.start(blocks, run))
+            .expect("external match map has a block store")?;
+        while let Some(row) = reader.row() {
+            storage
+                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .expect("external match map has a block store")?;
+            storage
+                .with_block_store(|blocks| reader.advance(blocks))
+                .expect("external match map has a block store")?;
+        }
+    }
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("external match map has a block store")
+}
+
 /// Enumerates source rows (visibility-filtered, ON conditions applied,
 /// WHERE applied), calling `f` per row. `f` returns false to stop early.
 #[allow(clippy::too_many_arguments)]
@@ -705,6 +986,56 @@ fn scan_source_mode<'a>(
         Ok(true)
     }
 
+    /// Binds and checks one row before the recursive descent. Keeping this
+    /// non-recursive half out of `level` bounds each recursive frame even
+    /// though every source representation shares the same semantics.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn candidate_matches<'a>(
+        storage: &'a Storage,
+        scope: &QueryScope<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        hooks: &EvalHooks<'_, 'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+        depth: usize,
+        index: usize,
+        bytes: &'a [u8],
+        rowid: Option<u64>,
+        bound: &mut [Option<&'a [u8]>],
+        bound_rowids: &mut [Option<u64>],
+        matched: &[Option<&[core::cell::Cell<bool>]>],
+        external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
+        pushdown: &[&[&'a Expr<'a>]],
+        order: &[usize],
+        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        on: Option<&'a Expr<'a>>,
+    ) -> Result<bool, SqlError> {
+        bound[order[depth]] = Some(bytes);
+        bound_rowids[order[depth]] = rowid;
+        if !candidate_passes(
+            scope,
+            bound,
+            bound_rowids,
+            order,
+            depth + 1,
+            on,
+            pushdown[depth],
+            decode_buffers,
+            arena,
+            params,
+            hooks,
+            outer,
+        )? {
+            return Ok(false);
+        }
+        if let Some(matched_rows) = matched[depth] {
+            matched_rows[index].set(true);
+        }
+        record_external_match(storage, external_match_writer, depth, index)?;
+        Ok(true)
+    }
+
     // Recursive join state is small; product-sized decode scratch is owned by
     // the statement arena and passed through each level.
     #[allow(clippy::too_many_arguments)]
@@ -724,6 +1055,7 @@ fn scan_source_mode<'a>(
         // For each RIGHT/FULL join level, one flag per scanned row of that
         // level's table, marking those that found a left partner.
         matched: &[Option<&[core::cell::Cell<bool>]>],
+        external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
         pushdown: &[&[&'a Expr<'a>]],
         // Execution order: `order[depth]` is the scope-table joined at this depth
@@ -761,6 +1093,59 @@ fn scan_source_mode<'a>(
         // USING/NATURAL predicates are synthesized at plan time.
         let on = join.and_then(|join| join.on.or(scope.join_on[depth - 1]));
         let mut matched_any = false;
+        // Every source representation expands the recursive call at this site;
+        // `candidate_matches` returns before that descent, keeping the
+        // wide-range-table recursion to one live frame per join edge.
+        macro_rules! visit_candidate {
+            ($index:expr, $bytes:expr, $rowid:expr) => {{
+                if !candidate_matches(
+                    storage,
+                    scope,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    depth,
+                    $index,
+                    $bytes,
+                    $rowid,
+                    bound,
+                    bound_rowids,
+                    matched,
+                    external_match_writer,
+                    pushdown,
+                    order,
+                    decode_buffers,
+                    on,
+                )? {
+                    Ok(true)
+                } else {
+                    matched_any = true;
+                    level(
+                        storage,
+                        scope,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
+                        depth + 1,
+                        bound,
+                        bound_rowids,
+                        matched,
+                        external_match_writer,
+                        pushdown,
+                        order,
+                        indexed,
+                        decode_buffers,
+                        recycle_rows,
+                        f,
+                    )
+                }
+            }};
+        }
         // A LATERAL FROM item is re-run per outer row: assemble the row bound by
         // the tables to its left, resolve the item's body against it, and iterate
         // the resulting rows like a derived table's.
@@ -784,56 +1169,37 @@ fn scan_source_mode<'a>(
                 inner: &outer_row,
                 outer,
             };
-            let rows = materialize_lateral(storage, txid, tref, arena, params, &chained)?;
-            for (index, bytes) in rows.iter().enumerate() {
-                check_timeout()?;
-                let keep_scanning = recycled(arena, recycle_rows, || {
-                    bound[order[depth]] = Some(bytes);
-                    bound_rowids[order[depth]] = None;
-                    if !candidate_passes(
-                        scope,
-                        bound,
-                        bound_rowids,
-                        order,
-                        depth + 1,
-                        on,
-                        pushdown[depth],
-                        decode_buffers,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                    )? {
-                        return Ok(true);
+            match materialize_lateral_source(
+                storage,
+                txid,
+                tref,
+                scope.defs[t].expect("resolved").n_columns,
+                arena,
+                params,
+                &chained,
+            )? {
+                LateralRows::External(run) => {
+                    if let Some(run) = run
+                        && !consume_external_lateral_run(
+                            storage,
+                            run,
+                            arena,
+                            recycle_rows,
+                            &mut |index, bytes| visit_candidate!(index, bytes, None),
+                        )?
+                    {
+                        return Ok(false);
                     }
-                    matched_any = true;
-                    if let Some(m) = matched[depth] {
-                        m[index].set(true);
+                }
+                LateralRows::Local(rows) => {
+                    for (index, bytes) in rows.iter().enumerate() {
+                        check_timeout()?;
+                        let keep_scanning =
+                            recycled(arena, recycle_rows, || visit_candidate!(index, bytes, None))?;
+                        if !keep_scanning {
+                            return Ok(false);
+                        }
                     }
-                    level(
-                        storage,
-                        scope,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                        depth + 1,
-                        bound,
-                        bound_rowids,
-                        matched,
-                        pushdown,
-                        order,
-                        indexed,
-                        decode_buffers,
-                        recycle_rows,
-                        f,
-                    )
-                })?;
-                if !keep_scanning {
-                    return Ok(false);
                 }
             }
         } else if let Some(run) = scope.external_runs[order[depth]] {
@@ -853,49 +1219,7 @@ fn scan_source_mode<'a>(
                         // deeper join levels retain this row in recycling
                         // statement storage only for the callback's lifetime.
                         let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                        bound[order[depth]] = Some(owned);
-                        bound_rowids[order[depth]] = None;
-                        if !candidate_passes(
-                            scope,
-                            bound,
-                            bound_rowids,
-                            order,
-                            depth + 1,
-                            on,
-                            pushdown[depth],
-                            decode_buffers,
-                            arena,
-                            params,
-                            hooks,
-                            outer,
-                        )? {
-                            return Ok(true);
-                        }
-                        matched_any = true;
-                        if let Some(matched_rows) = matched[depth] {
-                            matched_rows[this].set(true);
-                        }
-                        level(
-                            storage,
-                            scope,
-                            from,
-                            txid,
-                            where_clause,
-                            arena,
-                            params,
-                            hooks,
-                            outer,
-                            depth + 1,
-                            bound,
-                            bound_rowids,
-                            matched,
-                            pushdown,
-                            order,
-                            indexed,
-                            decode_buffers,
-                            recycle_rows,
-                            f,
-                        )
+                        visit_candidate!(this, owned, None)
                     })
                 }?;
                 if !keep_scanning {
@@ -908,51 +1232,8 @@ fn scan_source_mode<'a>(
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
-                let keep_scanning = recycled(arena, recycle_rows, || {
-                    bound[order[depth]] = Some(bytes);
-                    bound_rowids[order[depth]] = None;
-                    if !candidate_passes(
-                        scope,
-                        bound,
-                        bound_rowids,
-                        order,
-                        depth + 1,
-                        on,
-                        pushdown[depth],
-                        decode_buffers,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                    )? {
-                        return Ok(true);
-                    }
-                    matched_any = true;
-                    if let Some(m) = matched[depth] {
-                        m[index].set(true);
-                    }
-                    level(
-                        storage,
-                        scope,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                        depth + 1,
-                        bound,
-                        bound_rowids,
-                        matched,
-                        pushdown,
-                        order,
-                        indexed,
-                        decode_buffers,
-                        recycle_rows,
-                        f,
-                    )
-                })?;
+                let keep_scanning =
+                    recycled(arena, recycle_rows, || visit_candidate!(index, bytes, None))?;
                 if !keep_scanning {
                     return Ok(false);
                 }
@@ -1011,50 +1292,8 @@ fn scan_source_mode<'a>(
             for (this, &(rowid, home)) in ordered[..fill].iter().enumerate() {
                 check_timeout()?;
                 let keep_scanning = recycled(arena, recycle_rows, || {
-                    bound[order[depth]] =
-                        Some(storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?);
-                    bound_rowids[order[depth]] = Some(rowid);
-                    if !candidate_passes(
-                        scope,
-                        bound,
-                        bound_rowids,
-                        order,
-                        depth + 1,
-                        on,
-                        pushdown[depth],
-                        decode_buffers,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                    )? {
-                        return Ok(true);
-                    }
-                    matched_any = true;
-                    if let Some(m) = matched[depth] {
-                        m[this].set(true);
-                    }
-                    level(
-                        storage,
-                        scope,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                        depth + 1,
-                        bound,
-                        bound_rowids,
-                        matched,
-                        pushdown,
-                        order,
-                        indexed,
-                        decode_buffers,
-                        recycle_rows,
-                        f,
-                    )
+                    let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
+                    visit_candidate!(this, bytes, Some(rowid))
                 })?;
                 if !keep_scanning {
                     return Ok(false);
@@ -1073,49 +1312,8 @@ fn scan_source_mode<'a>(
                 let this = index;
                 index += 1;
                 let keep_scanning = recycled(arena, recycle_rows, || {
-                    bound[order[depth]] = Some(storage.row_bytes(slot, rowid, home, arena)?);
-                    bound_rowids[order[depth]] = Some(rowid);
-                    if !candidate_passes(
-                        scope,
-                        bound,
-                        bound_rowids,
-                        order,
-                        depth + 1,
-                        on,
-                        pushdown[depth],
-                        decode_buffers,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                    )? {
-                        return Ok(true);
-                    }
-                    matched_any = true;
-                    if let Some(m) = matched[depth] {
-                        m[this].set(true);
-                    }
-                    level(
-                        storage,
-                        scope,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                        depth + 1,
-                        bound,
-                        bound_rowids,
-                        matched,
-                        pushdown,
-                        order,
-                        indexed,
-                        decode_buffers,
-                        recycle_rows,
-                        f,
-                    )
+                    let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+                    visit_candidate!(this, bytes, Some(rowid))
                 })?;
                 if !keep_scanning {
                     aborted = true;
@@ -1146,6 +1344,7 @@ fn scan_source_mode<'a>(
                 bound,
                 bound_rowids,
                 matched,
+                external_match_writer,
                 pushdown,
                 order,
                 indexed,
@@ -1169,8 +1368,16 @@ fn scan_source_mode<'a>(
     let matched = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
+    let external_match_map = storage.spill_attached()
+        && from
+            .joins
+            .iter()
+            .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full));
     for (i, j) in from.joins.iter().enumerate() {
         if !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
+            continue;
+        }
+        if external_match_map {
             continue;
         }
         let t = i + 1;
@@ -1281,152 +1488,233 @@ fn scan_source_mode<'a>(
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
-    level(
-        storage,
-        scope,
-        from,
-        txid,
-        where_clause,
-        arena,
-        params,
-        hooks,
-        outer,
-        0,
-        bound,
-        bound_rowids,
-        matched,
-        pushdown,
-        order,
-        indexed.as_ref(),
-        decode_buffers,
-        recycle_rows,
-        f,
-    )?;
+    let mut match_run = None;
+    let mut initial_match_sorter = if external_match_map {
+        let mut sorter = storage.external_sorter()?;
+        sorter.reset();
+        Some(sorter)
+    } else {
+        None
+    };
+    {
+        let external_match_writer = initial_match_sorter
+            .as_deref_mut()
+            .map(|sorter| core::ptr::NonNull::from(&mut **sorter));
+        level(
+            storage,
+            scope,
+            from,
+            txid,
+            where_clause,
+            arena,
+            params,
+            hooks,
+            outer,
+            0,
+            bound,
+            bound_rowids,
+            matched,
+            external_match_writer,
+            pushdown,
+            order,
+            indexed.as_ref(),
+            decode_buffers,
+            recycle_rows,
+            f,
+        )?;
+    }
+    if let Some(mut sorter) = initial_match_sorter {
+        let mut compare = compare_external_matches;
+        match_run = storage
+            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+            .expect("external match map has a block store")?;
+    }
 
     // RIGHT/FULL post-passes, shallowest level first: each unmatched row of
     // that level's table binds with every table to its left nulled and then
     // joins the deeper tables normally (so its own matches mark deeper
     // levels' flags before those levels' post-passes run).
     for d in 1..scope.n {
-        let Some(m) = matched[d] else { continue };
-        let mut emit_unmatched =
-            |bytes: &'a [u8],
-             rowid: Option<u64>,
-             f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
-             -> Result<bool, SqlError> {
-                bound.fill(None);
-                bound_rowids.fill(None);
-                bound[d] = Some(bytes);
-                bound_rowids[d] = rowid;
-                if d + 1 == scope.n {
-                    // Last level: the row is complete once the left side nulls.
-                    let row = assemble(
+        if !matches!(from.joins[d - 1].kind, JoinKind::Right | JoinKind::Full) {
+            continue;
+        }
+        let local_matches = matched[d];
+        let mut phase_match_sorter = if external_match_map {
+            let mut sorter = storage.external_sorter()?;
+            sorter.reset();
+            Some(sorter)
+        } else {
+            None
+        };
+        {
+            let external_match_writer = phase_match_sorter
+                .as_deref_mut()
+                .map(|sorter| core::ptr::NonNull::from(&mut **sorter));
+            let mut external_match_reader = if external_match_map && match_run.is_some() {
+                let mut reader = storage.external_run_reader()?;
+                storage
+                    .with_block_store(|blocks| reader.start(blocks, match_run.expect("checked")))
+                    .expect("external match map has a block store")?;
+                Some(reader)
+            } else {
+                None
+            };
+            let mut emit_unmatched =
+                |bytes: &'a [u8],
+                 rowid: Option<u64>,
+                 f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
+                 -> Result<bool, SqlError> {
+                    bound.fill(None);
+                    bound_rowids.fill(None);
+                    bound[d] = Some(bytes);
+                    bound_rowids[d] = rowid;
+                    if d + 1 == scope.n {
+                        // Last level: the row is complete once the left side nulls.
+                        let row = assemble(
+                            scope,
+                            bound,
+                            bound_rowids,
+                            order,
+                            scope.n,
+                            decode_buffers,
+                            arena,
+                        )?;
+                        if let Some(w) = where_clause {
+                            let chained_row = Chained { inner: &row, outer };
+                            if !where_passes(w, arena, params, &chained_row, hooks)? {
+                                return Ok(true);
+                            }
+                        }
+                        return f(&row);
+                    }
+                    level(
+                        storage,
                         scope,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        outer,
+                        d + 1,
                         bound,
                         bound_rowids,
+                        matched,
+                        external_match_writer,
+                        pushdown,
                         order,
-                        scope.n,
+                        indexed.as_ref(),
                         decode_buffers,
-                        arena,
-                    )?;
-                    if let Some(w) = where_clause {
-                        let chained_row = Chained { inner: &row, outer };
-                        if !where_passes(w, arena, params, &chained_row, hooks)? {
-                            return Ok(true);
-                        }
+                        recycle_rows,
+                        f,
+                    )
+                };
+            if let Some(run) = scope.external_runs[d] {
+                let mut reader = storage.external_run_reader()?;
+                let mut index = 0usize;
+                storage
+                    .with_block_store(|blocks| reader.start(blocks, run))
+                    .expect("external run has a block store")?;
+                loop {
+                    let keep_scanning = {
+                        let Some(bytes) = reader.row() else { break };
+                        let this = index;
+                        index += 1;
+                        recycled(arena, recycle_rows, || {
+                            let already_matched = if external_match_map {
+                                match external_match_reader.as_deref_mut() {
+                                    Some(reader) => {
+                                        external_match_contains(storage, reader, d, this)?
+                                    }
+                                    None => false,
+                                }
+                            } else {
+                                local_matches.expect("local match map")[this].get()
+                            };
+                            if already_matched {
+                                Ok(true)
+                            } else {
+                                let owned =
+                                    arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                                emit_unmatched(owned, None, f)
+                            }
+                        })
+                    }?;
+                    if !keep_scanning {
+                        return Ok(());
                     }
-                    return f(&row);
+                    storage
+                        .with_block_store(|blocks| reader.advance(blocks))
+                        .expect("external run has a block store")?;
                 }
-                level(
-                    storage,
-                    scope,
-                    from,
-                    txid,
-                    where_clause,
-                    arena,
-                    params,
-                    hooks,
-                    outer,
-                    d + 1,
-                    bound,
-                    bound_rowids,
-                    matched,
-                    pushdown,
-                    order,
-                    indexed.as_ref(),
-                    decode_buffers,
-                    recycle_rows,
-                    f,
-                )
-            };
-        if let Some(run) = scope.external_runs[d] {
-            let mut reader = storage.external_run_reader()?;
-            let mut index = 0usize;
-            storage
-                .with_block_store(|blocks| reader.start(blocks, run))
-                .expect("external run has a block store")?;
-            loop {
-                let keep_scanning = {
-                    let Some(bytes) = reader.row() else { break };
-                    let this = index;
-                    index += 1;
-                    recycled(arena, recycle_rows, || {
-                        if m[this].get() {
+            } else if let Some(rows) = scope.derived[d] {
+                for (index, bytes) in rows.iter().enumerate() {
+                    let keep_scanning = recycled(arena, recycle_rows, || {
+                        let already_matched = if external_match_map {
+                            match external_match_reader.as_deref_mut() {
+                                Some(reader) => external_match_contains(storage, reader, d, index)?,
+                                None => false,
+                            }
+                        } else {
+                            local_matches.expect("local match map")[index].get()
+                        };
+                        if already_matched {
                             Ok(true)
                         } else {
-                            let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                            emit_unmatched(owned, None, f)
+                            emit_unmatched(bytes, None, f)
                         }
-                    })
-                }?;
-                if !keep_scanning {
+                    })?;
+                    if !keep_scanning {
+                        return Ok(());
+                    }
+                }
+            } else {
+                let mut index = 0usize;
+                let mut done = false;
+                storage.for_each_row_state(scope.slots[d], &mut |rowid, state| {
+                    use core::ops::ControlFlow;
+                    let Some(home) =
+                        storage.visible_row_home(scope.slots[d], rowid, state, txid)?
+                    else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    let this = index;
+                    index += 1;
+                    let keep_scanning = recycled(arena, recycle_rows, || {
+                        let already_matched = if external_match_map {
+                            match external_match_reader.as_deref_mut() {
+                                Some(reader) => external_match_contains(storage, reader, d, this)?,
+                                None => false,
+                            }
+                        } else {
+                            local_matches.expect("local match map")[this].get()
+                        };
+                        if already_matched {
+                            Ok(true)
+                        } else {
+                            let bytes = storage.row_bytes(scope.slots[d], rowid, home, arena)?;
+                            emit_unmatched(bytes, Some(rowid), f)
+                        }
+                    })?;
+                    if !keep_scanning {
+                        done = true;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    Ok(ControlFlow::Continue(()))
+                })?;
+                if done {
                     return Ok(());
                 }
-                storage
-                    .with_block_store(|blocks| reader.advance(blocks))
-                    .expect("external run has a block store")?;
             }
-        } else if let Some(rows) = scope.derived[d] {
-            for (index, bytes) in rows.iter().enumerate() {
-                let keep_scanning = recycled(arena, recycle_rows, || {
-                    if m[index].get() {
-                        Ok(true)
-                    } else {
-                        emit_unmatched(bytes, None, f)
-                    }
-                })?;
-                if !keep_scanning {
-                    return Ok(());
-                }
-            }
-        } else {
-            let mut index = 0usize;
-            let mut done = false;
-            storage.for_each_row_state(scope.slots[d], &mut |rowid, state| {
-                use core::ops::ControlFlow;
-                let Some(home) = storage.visible_row_home(scope.slots[d], rowid, state, txid)?
-                else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                let this = index;
-                index += 1;
-                let keep_scanning = recycled(arena, recycle_rows, || {
-                    if m[this].get() {
-                        Ok(true)
-                    } else {
-                        let bytes = storage.row_bytes(scope.slots[d], rowid, home, arena)?;
-                        emit_unmatched(bytes, Some(rowid), f)
-                    }
-                })?;
-                if !keep_scanning {
-                    done = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                Ok(ControlFlow::Continue(()))
-            })?;
-            if done {
-                return Ok(());
-            }
+        }
+        if let Some(mut sorter) = phase_match_sorter {
+            let mut compare = compare_external_matches;
+            let phase_run = storage
+                .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+                .expect("external match map has a block store")?;
+            drop(sorter);
+            match_run = combine_external_match_runs(storage, match_run, phase_run)?;
         }
     }
     Ok(())

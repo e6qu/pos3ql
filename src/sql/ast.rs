@@ -731,6 +731,7 @@ pub struct MaterializedCte<'a> {
     pub column_names: &'a [&'a str],
     pub column_types: &'a [(i32, i16)],
     pub rows: &'a [&'a [u8]],
+    pub(crate) external_run: Option<crate::sql::external::ExternalRun>,
 }
 
 /// A base table plus a chain of joins (nested-loop order).

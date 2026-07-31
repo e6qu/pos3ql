@@ -1031,6 +1031,39 @@ pub fn write_json_raw_string(s: &str, out: &mut dyn core::fmt::Write) -> core::f
     out.write_str("\"")
 }
 
+/// Escapes a display value directly into a JSON string literal. Unlike a
+/// fixed intermediate text buffer, the adapter cannot truncate a long datum.
+pub fn write_json_display_string(
+    value: &dyn core::fmt::Display,
+    out: &mut dyn core::fmt::Write,
+) -> core::fmt::Result {
+    struct Escaped<'a>(&'a mut dyn core::fmt::Write);
+    impl core::fmt::Write for Escaped<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            for character in text.chars() {
+                match character {
+                    '"' => self.0.write_str("\\\"")?,
+                    '\\' => self.0.write_str("\\\\")?,
+                    '\n' => self.0.write_str("\\n")?,
+                    '\r' => self.0.write_str("\\r")?,
+                    '\t' => self.0.write_str("\\t")?,
+                    '\x08' => self.0.write_str("\\b")?,
+                    '\x0c' => self.0.write_str("\\f")?,
+                    character if (character as u32) < 0x20 => {
+                        write!(self.0, "\\u{:04x}", character as u32)?
+                    }
+                    character => self.0.write_char(character)?,
+                }
+            }
+            Ok(())
+        }
+    }
+
+    out.write_char('"')?;
+    write!(Escaped(out), "{value}")?;
+    out.write_char('"')
+}
+
 /// Renders a datum as JSON (`row_to_json`/`to_json` → compact spacing;
 /// `to_jsonb` → jsonb spacing with `": "` / `", "`), following PostgreSQL's
 /// `datum_to_json`: numbers and booleans bare, everything else a quoted
@@ -1100,10 +1133,6 @@ pub fn write_datum_json_styled(
             out.write_char('}')
         }
         // Everything else renders as a quoted string of its text form.
-        other => {
-            let mut buf = crate::util::StackStr::<8192>::default();
-            let _ = write!(buf, "{other}");
-            write_json_raw_string(buf.as_str(), out)
-        }
+        other => write_json_display_string(other, out),
     }
 }

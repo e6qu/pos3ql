@@ -78,6 +78,35 @@ impl SubqueryListProbe for ExternalSubqueryList {
     }
 }
 
+/// The type witness for a spooled subquery run's single result column. A
+/// wildcard select item carries no expression to infer from, so its single
+/// expanded column resolves through the scope — mirroring `run_subquery`'s
+/// wildcard expansion, and giving the IN-operand coercion the true column
+/// type even over an empty set. Anything unresolvable falls back to text
+/// (which leaves the operand untouched); the row callback still reports a
+/// genuine arity error.
+fn spooled_column_witness(
+    select: &Select,
+    scope: Option<&QueryScope>,
+    item: &Expr,
+) -> Datum<'static> {
+    match select.items.first() {
+        Some(SelectItem::Wildcard) => scope
+            .filter(|scope| scope.star_columns() == 1)
+            .map_or(Datum::Text(""), |scope| {
+                type_witness(scope.output_type(scope.star_entry(0)))
+            }),
+        Some(SelectItem::TableWildcard(qualifier)) => scope
+            .and_then(|scope| {
+                let table = scope.table_index(qualifier).ok()?;
+                let def = scope.defs[table]?;
+                (def.n_columns == 1).then(|| type_witness(def.columns()[0].ctype))
+            })
+            .unwrap_or(Datum::Text("")),
+        _ => subquery_witness(item, scope),
+    }
+}
+
 /// Spools a one-column `IN (subquery)` result into the provider-neutral run
 /// stack. Membership probes stream it with bounded reader scratch; neither
 /// the expression evaluator nor this representation knows which adapter backs
@@ -114,7 +143,7 @@ fn external_in_subquery<'a>(
     let mut witness = if row_arity > 1 {
         Datum::Record(&[])
     } else {
-        subquery_witness(item, own_scope.as_ref())
+        spooled_column_witness(select, own_scope.as_ref(), item)
     };
     // Plain row-valued subqueries have already been rewritten by
     // `row_projected` to emit one record datum. Set-operation bodies cannot
@@ -221,7 +250,7 @@ fn streaming_scalar_subquery<'a>(
         .from
         .as_ref()
         .and_then(|from| QueryScope::resolve_schema(storage, from, txid, arena).ok());
-    let witness = subquery_witness(item, own_scope.as_ref());
+    let witness = spooled_column_witness(select, own_scope.as_ref(), item);
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);

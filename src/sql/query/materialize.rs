@@ -1152,9 +1152,14 @@ pub(crate) fn external_materialized_into<'a>(
         }
         if staged_len > 0 {
             let encoded = reader.output(staged_len);
+            // A record column must arrive structurally: decoding it as its
+            // rendered text would break row-valued consumers (a `ROW(...) IN
+            // (subquery)` probe compares records, not text). The field
+            // allocations persist for the emitter exactly as any arena
+            // allocation it makes itself.
             let mut output = [Datum::Null; MAX_PROJ];
             for (column, value) in output.iter_mut().enumerate().take(plan.width) {
-                *value = crate::sql::exec::decode_projected_pub(encoded, column);
+                *value = crate::sql::exec::decode_projected_col_record(encoded, column, arena)?;
             }
             if !emit(&output[..plan.width], &source_rowids)? {
                 return Ok(emitted);

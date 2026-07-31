@@ -12375,3 +12375,139 @@ fn create_table_as_builds_and_populates() {
         ["ctas_mood|ctas_mood[]"]
     );
 }
+
+#[test]
+fn count_distinct_over_extended_types() {
+    // count(DISTINCT x) buffers its argument values, so it must never ride the
+    // row-recycling scan: a recycled row would reclaim the buffered datums.
+    // Values validated against PostgreSQL 18.4.
+    let (mut engine, mut budget) = test_engine();
+    let r = |e: &mut Engine, b: &mut Budget, sql: &str| data_rows(&run_with(e, b, sql));
+    // Interval equality is canonical: '1 hour' = '60 min'.
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT x) FROM (VALUES (INTERVAL '1 hour'),(INTERVAL '60 min'),(INTERVAL '2 hours')) t(x)"
+        ),
+        ["2"]
+    );
+    // now() is stable within a statement.
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT now()) FROM generate_series(1, 200) g"
+        ),
+        ["1"]
+    );
+    // bpchar compares blank-stripped, so char(2) 'a' = char(3) 'a '.
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT c) FROM (VALUES ('a'::char(2)), ('a'::char(3))) t(c)"
+        ),
+        ["1"]
+    );
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT r) FROM (VALUES (int4range(1,2)),(int4range(2,3))) t(r)"
+        ),
+        ["2"]
+    );
+    assert_eq!(
+        r(
+            &mut engine,
+            &mut budget,
+            "SELECT count(DISTINCT a) FROM (VALUES ('1.2.3.4'::inet),('1.2.3.4'::inet)) t(a)"
+        ),
+        ["1"]
+    );
+}
+
+#[test]
+fn external_in_subquery_preserves_wildcard_column_coercion() {
+    // PostgreSQL type-checks the IN operand against the subquery's column type
+    // even over an empty set, so 'hello' against an integer column is 22P02.
+    // The externally spooled run must carry that witness just as the inline
+    // value list does.
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("external-in-witness-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-external-in-witness-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE in_witness (x INTEGER)",
+    );
+    for statement in [
+        "SELECT 'hello' IN (SELECT * FROM in_witness)",
+        "SELECT 'hello' NOT IN (SELECT * FROM in_witness)",
+    ] {
+        let out = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&out).contains("22P02"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    // A conforming operand still probes the empty set as FALSE/TRUE.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 1 IN (SELECT * FROM in_witness), 1 NOT IN (SELECT * FROM in_witness)"
+        )),
+        ["f|t"]
+    );
+    run_with(&mut engine, &mut budget, "INSERT INTO in_witness VALUES (1)");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 1 IN (SELECT * FROM in_witness)"
+        )),
+        ["t"]
+    );
+    // A row-valued probe keeps its records structural through the external
+    // sort that ORDER BY / LIMIT forces: rendered text would not compare.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE row_witness (a int, c int);
+         INSERT INTO row_witness VALUES (1, 10), (1, 20), (4, 40)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT (1,1) IN (SELECT a,a FROM row_witness ORDER BY a LIMIT 1),
+                    (4,4) IN (SELECT a,a FROM row_witness ORDER BY a DESC LIMIT 1),
+                    (2,2) IN (SELECT a,a FROM row_witness ORDER BY a LIMIT 1)"
+        )),
+        ["t|t|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(row(a,a)) FROM row_witness ORDER BY a LIMIT 1"
+        )),
+        ["record"]
+    );
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

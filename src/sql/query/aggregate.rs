@@ -388,7 +388,11 @@ fn agg_f64(d: &Datum) -> Option<f64> {
 
 impl<'a> AggState<'a> {
     pub(crate) fn recycling_safe(&self) -> bool {
-        matches!(self.kind, AggKind::Count)
+        // Only count(x)/count(*) retain no per-row arena state. count(DISTINCT
+        // …) buffers argument values in the arena, which a recycling scan
+        // reclaims after each row — every other aggregate buffers or folds
+        // arena-backed values the same way.
+        matches!(self.kind, AggKind::Count) && !self.distinct
     }
 
     pub(crate) fn init(&mut self, node: &'a Expr<'a>) -> Result<(), SqlError> {

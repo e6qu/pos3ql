@@ -803,6 +803,98 @@ pub(crate) fn scan_source_recycling<'a>(
     )
 }
 
+
+/// One build-side entry in a hash join's arena table: the decoded join key,
+/// the row's MVCC identity, and its encoded bytes (kept to assemble matches).
+#[derive(Clone, Copy)]
+struct HashEntry<'a> {
+    hash: u64,
+    key: Datum<'a>,
+    rowid: u64,
+    bytes: &'a [u8],
+}
+
+const EMPTY_HASH_ENTRY: HashEntry<'static> = HashEntry {
+    hash: 0,
+    key: Datum::Null,
+    rowid: 0,
+    bytes: &[],
+};
+
+/// Whether two join-key column types compare and hash identically to the `=`
+/// operator: the same type, or any mix of integer widths (an int is an int at
+/// any width to both `compare_datums` and `hash_key`). Cross-type joins fall
+/// back to the nested loop rather than risk a coercion mismatch.
+fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
+    fn is_integer(t: ColType) -> bool {
+        matches!(t, ColType::Int2 | ColType::Int4 | ColType::Int8)
+    }
+    a == b || (is_integer(a) && is_integer(b))
+}
+
+/// Extracts the single equi-join key for a two-table hash join: a
+/// `probe_col = build_col` conjunct in the ON clause or the WHERE, both plain
+/// column references into the two tables, with compatible types. Returns the
+/// column index in the probe table and in the build table. The key is used
+/// only to generate candidates — the full ON and WHERE still run at the leaf,
+/// so a missed extraction never changes a result, only the access path.
+fn hash_join_key<'a>(
+    scope: &QueryScope<'a>,
+    on: Option<&'a Expr<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
+    probe_t: usize,
+    build_t: usize,
+) -> Result<Option<(usize, usize)>, SqlError> {
+    let mut conjuncts: [&Expr; MAX_CONJUNCTS] = [&Expr::Null; MAX_CONJUNCTS];
+    let mut n = 0usize;
+    for source in [on, where_clause].into_iter().flatten() {
+        let mut flat = [source; MAX_CONJUNCTS];
+        let mut count = 0;
+        let parts: &[&Expr] = if flatten_and(source, &mut flat, &mut count) {
+            &flat[..count]
+        } else {
+            core::slice::from_ref(&source)
+        };
+        for &p in parts {
+            if n < MAX_CONJUNCTS {
+                conjuncts[n] = p;
+                n += 1;
+            }
+        }
+    }
+    for &c in &conjuncts[..n] {
+        let Expr::Binary { operator: BinaryOp::Eq, left, right } = c else {
+            continue;
+        };
+        let Expr::Column { qualifier: lq, name: ln } = **left else {
+            continue;
+        };
+        let Expr::Column { qualifier: rq, name: rn } = **right else {
+            continue;
+        };
+        let (
+            Ok(ResolvedColumn::Table(lt, lc)),
+            Ok(ResolvedColumn::Table(rt, rc)),
+        ) = (scope.find_column(lq, ln), scope.find_column(rq, rn))
+        else {
+            continue;
+        };
+        let (probe_col, build_col) = if lt == probe_t && rt == build_t {
+            (lc, rc)
+        } else if rt == probe_t && lt == build_t {
+            (rc, lc)
+        } else {
+            continue;
+        };
+        let probe_type = scope.defs[probe_t].expect("resolved").columns()[probe_col].ctype;
+        let build_type = scope.defs[build_t].expect("resolved").columns()[build_col].ctype;
+        if join_key_types_compatible(probe_type, build_type) {
+            return Ok(Some((probe_col, build_col)));
+        }
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -926,6 +1018,187 @@ fn scan_source_mode<'a>(
             values,
             rowids: &bound_rowids[..scope.n],
         })
+    }
+
+    /// Hash-join fast path for a two-table inner/cross equi-join over physical
+    /// base tables. Builds the inner (`order[1]`) side into an arena hash
+    /// table keyed by the join column, then probes it with the outer
+    /// (`order[0]`) side, so both tables are scanned once (O(N+M) reads) instead
+    /// of the nested loop's O(N·M). The equi-condition only generates
+    /// candidates; the full ON and WHERE run at the leaf, so a declined or
+    /// overflowing build simply falls back to the nested loop with identical
+    /// results. Returns whether it handled the join.
+    #[allow(clippy::too_many_arguments)]
+    fn try_hash_join<'a>(
+        storage: &'a Storage,
+        scope: &QueryScope<'a>,
+        from: &'a FromClause<'a>,
+        txid: u32,
+        where_clause: Option<&'a Expr<'a>>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        hooks: &EvalHooks<'_, 'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+        order: &[usize],
+        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        recycle_rows: bool,
+        f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        use core::ops::ControlFlow;
+        if scope.n != 2 || from.joins.len() != 1 {
+            return Ok(false);
+        }
+        let join = &from.joins[0];
+        if !matches!(join.kind, JoinKind::Inner | JoinKind::Cross) {
+            return Ok(false);
+        }
+        let probe_t = order[0];
+        let build_t = order[1];
+        if scope.lateral[probe_t]
+            || scope.lateral[build_t]
+            || scope.derived[probe_t].is_some()
+            || scope.derived[build_t].is_some()
+        {
+            return Ok(false);
+        }
+        let on = join.on.or(scope.join_on[0]);
+        let Some((probe_col, build_col)) = hash_join_key(scope, on, where_clause, probe_t, build_t)?
+        else {
+            return Ok(false);
+        };
+
+        // Bound the build side so the arena table stays a cache, and rewind to
+        // a clean fallback if the estimate still overflows the statement arena.
+        let build_slot = scope.slots[build_t];
+        let build_def = scope.defs[build_t].expect("resolved");
+        let build_count = storage.visible_row_count(build_slot, txid)?;
+        const MAX_HASH_ENTRIES: usize = 1 << 15;
+        if build_count == 0 || build_count > MAX_HASH_ENTRIES {
+            return Ok(false);
+        }
+        let mark = arena.mark();
+        let attempt = (|| -> Result<bool, SqlError> {
+            let buckets_len = (build_count * 2).next_power_of_two().max(16);
+            let entries = arena
+                .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
+                .map_err(|_| arena_full())?;
+            let next = arena
+                .alloc_slice_with(build_count, |_| 0u32)
+                .map_err(|_| arena_full())?;
+            let buckets = arena
+                .alloc_slice_with(buckets_len, |_| u32::MAX)
+                .map_err(|_| arena_full())?;
+            let mut build_schema = [ColType::Bool; MAX_COLUMNS];
+            build_def.schema(&mut build_schema);
+            let build_schema = &build_schema[..build_def.n_columns];
+            let mut n = 0usize;
+            storage.for_each_row_state(build_slot, &mut |rowid, state| {
+                let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)? else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
+                let mut buffer = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, build_schema, &mut buffer)?;
+                let key = buffer[build_col];
+                // A NULL join key never matches in an inner equi-join.
+                if key.is_null() {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let hash = hash_key(&[key], &[0]);
+                let bucket = (hash as usize) & (buckets_len - 1);
+                entries[n] = HashEntry { hash, key, rowid, bytes };
+                next[n] = buckets[bucket];
+                buckets[bucket] = n as u32;
+                n += 1;
+                Ok(ControlFlow::Continue(()))
+            })?;
+
+            // Probe: scan the outer side once, resolving each row's key
+            // against the build table. Per-row decode and leaf-eval scratch
+            // recycle; the build table (allocated above the mark) survives.
+            let probe_slot = scope.slots[probe_t];
+            let probe_def = scope.defs[probe_t].expect("resolved");
+            let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
+            probe_def.schema(&mut probe_schema);
+            let probe_schema = &probe_schema[..probe_def.n_columns];
+            storage.for_each_row_state(probe_slot, &mut |rowid, state| {
+                let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                let keep = recycled(arena, recycle_rows, || -> Result<bool, SqlError> {
+                    check_timeout()?;
+                    let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
+                    let mut buffer = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, probe_schema, &mut buffer)?;
+                    let key = buffer[probe_col];
+                    if key.is_null() {
+                        return Ok(true);
+                    }
+                    let hash = hash_key(&[key], &[0]);
+                    let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
+                    while idx != u32::MAX {
+                        let entry = &entries[idx as usize];
+                        if entry.hash == hash && compare_datums(&entry.key, &key)?.is_eq() {
+                            let bound = &mut [None, None];
+                            let bound_rowids = &mut [None, None];
+                            bound[probe_t] = Some(bytes);
+                            bound_rowids[probe_t] = Some(rowid);
+                            bound[build_t] = Some(entry.bytes);
+                            bound_rowids[build_t] = Some(entry.rowid);
+                            let row = assemble(
+                                scope, bound, bound_rowids, order, 2, decode_buffers, arena,
+                            )?;
+                            if let Some(on) = on {
+                                let chained = Chained { inner: &row, outer };
+                                match eval_full(on, arena, params, &chained, hooks)? {
+                                    Datum::Bool(true) => {}
+                                    Datum::Bool(false) | Datum::Null => {
+                                        idx = next[idx as usize];
+                                        continue;
+                                    }
+                                    _ => {
+                                        return Err(sql_err!(
+                                            sqlstate::DATATYPE_MISMATCH,
+                                            "argument of JOIN/ON must be type boolean"
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(w) = where_clause {
+                                let chained = Chained { inner: &row, outer };
+                                if !where_passes(w, arena, params, &chained, hooks)? {
+                                    idx = next[idx as usize];
+                                    continue;
+                                }
+                            }
+                            if !f(&row)? {
+                                return Ok(false);
+                            }
+                        }
+                        idx = next[idx as usize];
+                    }
+                    Ok(true)
+                })?;
+                if !keep {
+                    // The consumer asked to stop early (e.g. LIMIT): short-circuit
+                    // the probe, but the hash join still handled the query.
+                    return Ok(ControlFlow::Break(()));
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            Ok(true)
+        })();
+        match attempt {
+            Ok(_) => Ok(true),
+            Err(e) if e.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => {
+                // The build side overflowed the statement arena: drop the hash
+                // table and run the ordinary nested loop instead. Nothing from
+                // the table is observed past the rewind.
+                unsafe { arena.rewind_to(mark) };
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1488,6 +1761,26 @@ fn scan_source_mode<'a>(
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
+    // A two-table inner/cross equi-join over base tables is faster as a hash
+    // join (both sides scanned once) than as the nested loop below; it falls
+    // back to the nested loop whenever it does not apply.
+    if try_hash_join(
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        order,
+        decode_buffers,
+        recycle_rows,
+        f,
+    )? {
+        return Ok(());
+    }
     let mut match_run = None;
     let mut initial_match_sorter = if external_match_map {
         let mut sorter = storage.external_sorter()?;

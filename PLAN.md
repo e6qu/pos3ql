@@ -481,8 +481,13 @@ cancelled without loss when a collapse supersedes its pair, and its
 half-written SST kept alive in the garbage sweep's keep-set until the
 result publishes. The `SstWriter` now owns its state (buffers + cursors, no
 arena borrow) precisely so a half-written SST can persist between beats.
-What remains of Stage E: the manifest log — low value at today's table
-counts, noted for the day manifests are large.
+Stage E's one open idea — a manifest *log* (append deltas instead of
+rewriting the whole manifest each checkpoint) — is a deliberate non-goal at
+today's scale rather than a deferral: at the configured table counts a full
+manifest is a single ≤256 KiB PUT per checkpoint, so a second persistence
+format over the single most critical object (the manifest root) buys nothing
+and risks the one object that must never be wrong. Revisit only if table
+counts grow to make the rewrite itself the bottleneck.
 
 ### Stage F — MVCC snapshot reads over object-resident data
 

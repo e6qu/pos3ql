@@ -1961,6 +1961,9 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
+        // Make any commit whose upload previously failed durable before this
+        // statement's reads can observe it (see retry_pending_wal_upload).
+        self.retry_pending_wal_upload();
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {

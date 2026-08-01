@@ -60,3 +60,31 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  # Longer standing storage-VOPR run: the mid-flush / mid-compaction crash
+  # invariants (checkpoint under an outage ending in a crash, torn WAL journal
+  # and disk-cache scribbling between incarnations) get more seeds and steps
+  # than the quick in-process default, so a rare recovery divergence has room
+  # to surface. Deterministic per seed — a failure reproduces from
+  # POS3QL_STORAGE_VOPR_SEED0.
+  storage-vopr-extended:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-vopr-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-vopr-
+
+      - name: Storage VOPR (extended sweep)
+        run: cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
+        env:
+          POS3QL_STORAGE_VOPR_SEEDS: 16
+          POS3QL_STORAGE_VOPR_STEPS: 300

@@ -5572,6 +5572,92 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
 }
 
 #[test]
+fn hash_join_matches_nested_loop() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE d (id int, dep text)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE emp (id int, did int, name text)",
+    );
+    // Duplicate build keys (two rows share dep 1), a build key no probe row
+    // hits (dep 9), a probe key with no build row (did 8), and NULLs on both
+    // sides that must never match.
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO d VALUES (1,'eng'),(2,'ops'),(1,'eng2'),(9,'x'),(NULL,'nulld')",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO emp VALUES (1,1,'ada'),(2,2,'bob'),(3,1,'cyd'),(4,8,'dee'),(5,NULL,'eve')",
+    );
+
+    // Inner equi-join: duplicates produce every pairing, NULLs and unmatched
+    // keys drop out. Every row here was checked against real PostgreSQL.
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT e.name, d.dep FROM emp e JOIN d ON e.did = d.id ORDER BY 1, 2",
+    ));
+    assert_eq!(
+        r,
+        ["ada|eng", "ada|eng2", "bob|ops", "cyd|eng", "cyd|eng2"],
+        "inner hash join: {r:?}"
+    );
+
+    // The same join as a cross join with the equi-condition in WHERE takes the
+    // same hash path.
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT e.name, d.dep FROM emp e, d WHERE e.did = d.id ORDER BY 1, 2",
+    ));
+    assert_eq!(
+        r,
+        ["ada|eng", "ada|eng2", "bob|ops", "cyd|eng", "cyd|eng2"],
+        "cross hash join: {r:?}"
+    );
+
+    // Aggregate over the hash join, and a residual ON conjunct applied at the
+    // leaf (the hash key only generates candidates).
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT d.dep, count(*) FROM emp e JOIN d ON e.did = d.id AND e.id > 1 GROUP BY d.dep ORDER BY 1",
+    ));
+    assert_eq!(
+        r,
+        ["eng|1", "eng2|1", "ops|1"],
+        "residual conjunct + aggregate: {r:?}"
+    );
+
+    // LIMIT stops the probe early.
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT e.name, d.dep FROM emp e JOIN d ON e.did = d.id ORDER BY 1, 2 LIMIT 2",
+    ));
+    assert_eq!(r, ["ada|eng", "ada|eng2"], "LIMIT over hash join: {r:?}");
+
+    // Integer-width mix: an int4 key joins an int8 key (hash/compare treat an
+    // int as an int at any width).
+    run_with(&mut e, &mut b, "CREATE TABLE big (id bigint, tag text)");
+    run_with(&mut e, &mut b, "INSERT INTO big VALUES (1,'one'),(2,'two')");
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT e.name, b.tag FROM emp e JOIN big b ON e.did = b.id ORDER BY 1, 2",
+    ));
+    assert_eq!(
+        r,
+        ["ada|one", "bob|two", "cyd|one"],
+        "int4=int8 hash join: {r:?}"
+    );
+}
+
+#[test]
 fn joins_group_by_subqueries() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE d (id int, name text)");

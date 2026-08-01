@@ -10463,6 +10463,70 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
 }
 
 #[test]
+fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("reconcile-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-reconcile-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    let bucket = crate::object_store::sim::open_bucket(&config.object_store_bucket, 7);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(&mut engine, &mut budget, "CREATE TABLE rc (id int, v text)");
+    run_with(&mut engine, &mut budget, "INSERT INTO rc VALUES (1, 'uploaded')");
+
+    // Force the next commit's WAL upload to fail: the row is promoted and
+    // visible (an errored commit's outcome is unknown) but durable only in the
+    // local journal.
+    bucket.borrow_mut().faults.transient_per_mille = 1000;
+    let failed = run_with(&mut engine, &mut budget, "INSERT INTO rc VALUES (2, 'unuploaded')");
+    bucket.borrow_mut().faults.transient_per_mille = 0;
+    assert!(
+        String::from_utf8_lossy(&failed).contains("58030"),
+        "the failed upload must surface as an I/O error: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    // Crash without any intervening statement (no eager retry): row 2 lives
+    // only in the journal.
+    drop(engine);
+
+    // Startup reconciliation re-uploads the journaled tail the bucket lacks,
+    // so row 2 becomes bucket-durable at this restart.
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT id FROM rc ORDER BY id")),
+        ["1", "2"],
+        "row 2 recovered and now reconciled into the bucket"
+    );
+    drop(engine);
+
+    // Wipe the local disk, losing the journal entirely: without reconciliation
+    // row 2 would be gone (its upload failed, and the journal was its only
+    // copy). The reconciled segment must carry it.
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT id FROM rc ORDER BY id")),
+        ["1", "2"],
+        "row 2 survives a wiped journal because reconciliation uploaded it"
+    );
+    drop(engine);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn cold_start_then_commit_then_crash_recovers_every_record() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

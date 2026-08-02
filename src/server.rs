@@ -17,7 +17,7 @@ use crate::sql::Engine;
 
 const LISTENER_TOKEN: u64 = u64::MAX;
 const SHUTDOWN_TOKEN: u64 = u64::MAX - 1;
-/// Reactor token for the durable block-store client's in-flight GET socket.
+/// First reactor token for durable block-store in-flight GET sockets.
 const BLOCK_IO_TOKEN: u64 = u64::MAX - 2;
 
 /// Set by the signal handler; the loop drains and exits when it sees this.
@@ -55,8 +55,8 @@ pub struct Server {
     tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// Read end of the shutdown self-pipe.
     shutdown_read: i32,
-    /// The block-read socket currently registered with the reactor.
-    block_read_fd: Option<i32>,
+    /// One registered socket per fixed durable-block GET slot.
+    block_read_fds: FixedVec<Option<i32>>,
 }
 
 struct Slot {
@@ -105,7 +105,12 @@ impl Server {
             .set_nonblocking(true)
             .map_err(|e| ServerSetupError::Io("set listener nonblocking", e))?;
 
-        let reactor = Reactor::new(budget, max_conns + 1).map_err(|e| match e {
+        let block_read_slots = if config.object_store_on {
+            config.object_store_get_slots
+        } else {
+            0
+        };
+        let reactor = Reactor::new(budget, max_conns + 1 + block_read_slots).map_err(|e| match e {
             crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
             crate::io::reactor::ReactorSetupError::Os(io) => {
                 ServerSetupError::Io("create kqueue", io)
@@ -117,6 +122,10 @@ impl Server {
 
         let mut slots = FixedVec::new(budget, "conn_slots", max_conns)?;
         let mut free = FixedVec::new(budget, "conn_free_list", max_conns)?;
+        let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
+        for _ in 0..block_read_slots {
+            block_read_fds.push(None).expect("sized from object_store_get_slots");
+        }
         for i in (0..max_conns as u32).rev() {
             slots
                 .push(Slot {
@@ -235,7 +244,7 @@ impl Server {
             auth,
             tls_config,
             shutdown_read: pipe_fds[0],
-            block_read_fd: None,
+            block_read_fds,
         })
     }
 
@@ -267,7 +276,7 @@ impl Server {
             // While a checkpoint sweep is mid-flight, poll with the backoff
             // timeout so the loop returns to that work; otherwise block until
             // the next event.
-            let checkpoint_timeout = if self.block_read_fd.is_none()
+            let checkpoint_timeout = if self.block_read_fds.iter().all(Option::is_none)
                 && self.engine.checkpoint_work_pending()
             {
                 Some(beat_backoff)
@@ -292,8 +301,8 @@ impl Server {
                     {}
                 } else if event.token == LISTENER_TOKEN {
                     self.accept_pending();
-                } else if event.token == BLOCK_IO_TOKEN {
-                    self.advance_block_io()?;
+                } else if let Some(slot) = self.block_slot(event.token) {
+                    self.advance_block_io(slot)?;
                 } else {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
@@ -302,7 +311,7 @@ impl Server {
             // socket readiness and no lock-generation change.
             self.wake_lock_waiters();
             self.sync_block_read_interest()?;
-            if self.block_read_fd.is_none() {
+            if self.block_read_fds.iter().all(Option::is_none) {
                 self.engine.enable_async_block_reads();
             }
             // Active checkpoint and compaction work advances even on an
@@ -466,10 +475,10 @@ impl Server {
     /// Called when the block-store client's non-blocking GET socket is
     /// readable. Advances the pending response read; if it completes, the
     /// block is now cached and any parked statement is retried.
-    fn advance_block_io(&mut self) -> std::io::Result<()> {
+    fn advance_block_io(&mut self, slot: usize) -> std::io::Result<()> {
         if self
             .engine
-            .advance_pending_block_read()
+            .advance_pending_block_read(slot)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?
         {
             // The GET completed and the block is cached. Wake parked
@@ -479,22 +488,30 @@ impl Server {
         Ok(())
     }
 
-    /// Keeps exactly the active object-read socket registered. Registration
-    /// failures are surfaced to the server loop; a parked query must never be
-    /// left waiting on an unobserved descriptor.
+    /// Reconciles every fixed object-read slot with the reactor. Registration
+    /// failures surface from the loop; a parked query must never wait on an
+    /// unobserved descriptor.
     fn sync_block_read_interest(&mut self) -> std::io::Result<()> {
-        let wanted = self.engine.pending_block_read_fd();
-        if wanted == self.block_read_fd {
-            return Ok(());
-        }
-        if let Some(fd) = self.block_read_fd.take() {
-            self.reactor.deregister(fd)?;
-        }
-        if let Some(fd) = wanted {
-            self.reactor.register_read(fd, BLOCK_IO_TOKEN)?;
-            self.block_read_fd = Some(fd);
+        assert_eq!(self.block_read_fds.len(), self.engine.block_read_slots());
+        for slot in 0..self.block_read_fds.len() {
+            let wanted = self.engine.pending_block_read_fd(slot);
+            if wanted == self.block_read_fds[slot] {
+                continue;
+            }
+            if let Some(fd) = self.block_read_fds[slot].take() {
+                self.reactor.deregister(fd)?;
+            }
+            if let Some(fd) = wanted {
+                self.reactor.register_read(fd, BLOCK_IO_TOKEN - slot as u64)?;
+                self.block_read_fds[slot] = Some(fd);
+            }
         }
         Ok(())
+    }
+
+    fn block_slot(&self, token: u64) -> Option<usize> {
+        let slot = BLOCK_IO_TOKEN.checked_sub(token)? as usize;
+        (slot < self.block_read_fds.len()).then_some(slot)
     }
 
     /// Retries parked protocol messages after a transaction released row

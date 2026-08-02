@@ -17,9 +17,15 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let config = load_config()?;
-    let server_bytes = Reactor::budget_bytes(config.max_connections as usize + 1)
+    let block_read_slots = if config.object_store_on {
+        config.object_store_get_slots
+    } else {
+        0
+    };
+    let server_bytes = Reactor::budget_bytes(config.max_connections as usize + 1 + block_read_slots)
         + 128 // canned refusal message scratch
-        + (config.max_connections as usize) * 8; // slot bookkeeping worst case
+        + (config.max_connections as usize) * 8
+        + block_read_slots * core::mem::size_of::<Option<i32>>();
     let plan = config.memory_plan(server_bytes, pos3ql::sql::Engine::extra_budget_bytes(&config));
 
     println!("pos3ql starting");

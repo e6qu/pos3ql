@@ -280,10 +280,9 @@ const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
 
 impl Checkpointer {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
-        // Two clients: one for manifest/WAL objects, one inside the block
-        // stack. The cache tiers draw their own budget in the constructor;
-        // this accounts the fixed parts.
-        2 * ObjectStore::budget_bytes(config)
+        // One synchronous manifest/WAL client plus the fixed durable-block
+        // read pool. The cache tiers draw their own budget in the constructor.
+        (1 + config.object_store_get_slots) * ObjectStore::budget_bytes(config)
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + MAX_CKPT_TABLES
@@ -619,9 +618,8 @@ impl Checkpointer {
     /// Provider credentials and adapter selection terminate at
     /// [`crate::object_store`].
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
-        let block_client = ObjectStore::new(config, budget)
+        let base = OwnedObjectStore::new(config, budget, "blocks/")
             .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
-        let base = OwnedObjectStore::new(block_client, "blocks/");
         let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
         if plan.undersized_ram() || plan.undersized_disk() {
             return Err(CheckpointSetupError::ObjectStore(
@@ -690,12 +688,23 @@ impl Checkpointer {
         self.blocks.borrow_mut().disable_async_gets();
     }
 
-    pub(crate) fn pending_block_read_fd(&self) -> Option<std::os::fd::RawFd> {
-        self.blocks.borrow().pending_read_fd()
+    pub(crate) fn block_read_slots(&self) -> usize {
+        self.blocks.borrow().async_read_slots()
     }
 
-    pub(crate) fn advance_pending_block_read(&mut self) -> Result<bool, crate::store::StoreError> {
-        self.blocks.borrow_mut().advance_pending_read()
+    pub(crate) fn block_reads_busy(&self) -> bool {
+        self.blocks.borrow().async_reads_busy()
+    }
+
+    pub(crate) fn pending_block_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        self.blocks.borrow().pending_read_fd(slot)
+    }
+
+    pub(crate) fn advance_pending_block_read(
+        &mut self,
+        slot: usize,
+    ) -> Result<bool, crate::store::StoreError> {
+        self.blocks.borrow_mut().advance_pending_read(slot)
     }
 
     /// Uploads a committed WAL batch as a segment keyed by its first LSN,

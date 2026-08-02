@@ -215,6 +215,20 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            Layer::Base(store) => store.next_hedge_deadline(),
+            Layer::Disk(cache) => cache.next_hedge_deadline(),
+        }
+    }
+
+    fn issue_due_hedges(&mut self, now: std::time::Instant) {
+        match self {
+            Layer::Base(store) => store.issue_due_hedges(now),
+            Layer::Disk(cache) => cache.issue_due_hedges(now),
+        }
+    }
+
     fn io_stats(&self) -> super::BlockIoStats {
         match self {
             Layer::Base(store) => store.io_stats(),
@@ -326,6 +340,20 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(cache) => cache.advance_pending_read(slot),
             TieredStore::WithoutRam(layer) => layer.advance_pending_read(slot),
+        }
+    }
+
+    fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            TieredStore::WithRam(cache) => cache.next_hedge_deadline(),
+            TieredStore::WithoutRam(layer) => layer.next_hedge_deadline(),
+        }
+    }
+
+    fn issue_due_hedges(&mut self, now: std::time::Instant) {
+        match self {
+            TieredStore::WithRam(cache) => cache.issue_due_hedges(now),
+            TieredStore::WithoutRam(layer) => layer.issue_due_hedges(now),
         }
     }
 

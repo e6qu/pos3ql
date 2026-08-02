@@ -15,6 +15,7 @@
 use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
 use crate::mem::budget::Budget;
 use crate::mem::fixed_vec::FixedVec;
+use std::time::{Duration, Instant};
 
 use super::{BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, StoreError, decode, encode};
 
@@ -127,6 +128,7 @@ pub(crate) struct OwnedObjectStore {
     scratch: Vec<u8>,
     stats: BlockIoStats,
     async_gets_enabled: bool,
+    hedge_after: Option<Duration>,
 }
 
 struct ObjectReadSlot {
@@ -135,6 +137,8 @@ struct ObjectReadSlot {
     ready_id: Option<BlockId>,
     error_id: Option<BlockId>,
     pending_error: Option<StoreError>,
+    started_at: Option<Instant>,
+    hedge_issued: bool,
 }
 
 impl OwnedObjectStore {
@@ -155,6 +159,8 @@ impl OwnedObjectStore {
                     ready_id: None,
                     error_id: None,
                     pending_error: None,
+                    started_at: None,
+                    hedge_issued: false,
                 })
                 .expect("object read slots sized from configuration");
         }
@@ -164,6 +170,8 @@ impl OwnedObjectStore {
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
             async_gets_enabled: false,
+            hedge_after: (config.object_store_hedge_after_ms != 0)
+                .then(|| Duration::from_millis(config.object_store_hedge_after_ms)),
         })
     }
 
@@ -190,6 +198,7 @@ impl OwnedObjectStore {
         match slot.client.advance_get() {
             Ok(()) => {
                 slot.ready_id = slot.pending_id.take();
+                slot.started_at = None;
                 Ok(true)
             }
             Err(ObjectError::WouldBlock) => Ok(false),
@@ -197,9 +206,93 @@ impl OwnedObjectStore {
                 slot.client.clear_pending_get();
                 slot.pending_error = Some(store_error(error));
                 slot.error_id = slot.pending_id.take();
+                slot.started_at = None;
                 Ok(true)
             }
         }
+    }
+
+    fn slot_is_free(slot: &ObjectReadSlot) -> bool {
+        slot.pending_id.is_none()
+            && slot.ready_id.is_none()
+            && slot.error_id.is_none()
+            && slot.pending_error.is_none()
+    }
+
+    fn release_siblings(&mut self, id: BlockId, winner: usize) {
+        for (index, slot) in self.slots.as_mut_slice().iter_mut().enumerate() {
+            if index == winner
+                || (slot.pending_id != Some(id)
+                    && slot.ready_id != Some(id)
+                    && slot.error_id != Some(id))
+            {
+                continue;
+            }
+            if slot.pending_id.is_some() {
+                slot.client.clear_pending_get();
+            }
+            slot.pending_id = None;
+            slot.ready_id = None;
+            slot.error_id = None;
+            slot.pending_error = None;
+            slot.started_at = None;
+            slot.hedge_issued = false;
+        }
+    }
+
+    fn next_hedge_deadline(&self) -> Option<Instant> {
+        let hedge_after = self.hedge_after?;
+        self.slots
+            .iter()
+            .filter(|slot| slot.pending_id.is_some() && !slot.hedge_issued)
+            .filter_map(|slot| slot.started_at.and_then(|started| started.checked_add(hedge_after)))
+            .min()
+    }
+
+    fn issue_due_hedges(&mut self, now: Instant) {
+        let Some(deadline) = self.next_hedge_deadline() else {
+            return;
+        };
+        if deadline > now {
+            return;
+        }
+        let Some(source_index) = self.slots.iter().position(|slot| {
+            slot.pending_id.is_some()
+                && !slot.hedge_issued
+                && slot
+                    .started_at
+                    .and_then(|started| self.hedge_after.and_then(|after| started.checked_add(after)))
+                    .is_some_and(|due| due <= now)
+        }) else {
+            return;
+        };
+        let Some(destination_index) = self.slots.iter().position(Self::slot_is_free) else {
+            return;
+        };
+        let id = self.slots[source_index]
+            .pending_id
+            .expect("selected pending hedge source");
+        self.slots[source_index].hedge_issued = true;
+        let destination = &mut self.slots[destination_index];
+        let mut key_buffer = [0u8; 128];
+        let key = key_of(self.prefix, &id, &mut key_buffer);
+        match destination.client.get(key, None) {
+            Ok(_) => {
+                destination.ready_id = Some(id);
+                destination.hedge_issued = true;
+            }
+            Err(ObjectError::WouldBlock) => {
+                destination.pending_id = Some(id);
+                destination.started_at = Some(now);
+                destination.hedge_issued = true;
+            }
+            Err(error) => {
+                destination.error_id = Some(id);
+                destination.pending_error = Some(store_error(error));
+                destination.hedge_issued = true;
+            }
+        }
+        self.stats.object_gets = self.stats.object_gets.saturating_add(1);
     }
 }
 
@@ -223,30 +316,30 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        for slot in self.slots.as_mut_slice() {
-            if slot.pending_id == Some(*id) {
-                return Err(StoreError::NotReady);
-            }
-            if slot.ready_id == Some(*id) {
-                slot.ready_id = None;
-                return decode_block_body(slot.client.body_bytes(), id, into);
-            }
-            if slot.error_id == Some(*id) {
-                slot.error_id = None;
-                return Err(slot.pending_error.take().expect("checked above"));
-            }
+        if let Some(winner) = self.slots.iter().position(|slot| slot.ready_id == Some(*id)) {
+            self.release_siblings(*id, winner);
+            let slot = &mut self.slots[winner];
+            slot.ready_id = None;
+            slot.hedge_issued = false;
+            return decode_block_body(slot.client.body_bytes(), id, into);
         }
-        let Some(slot) = self.slots.iter_mut().find(|slot| {
-            slot.pending_id.is_none()
-                && slot.ready_id.is_none()
-                && slot.error_id.is_none()
-                && slot.pending_error.is_none()
-        }) else {
+        if self.slots.iter().any(|slot| slot.pending_id == Some(*id)) {
+            return Err(StoreError::NotReady);
+        }
+        if let Some(winner) = self.slots.iter().position(|slot| slot.error_id == Some(*id)) {
+            self.release_siblings(*id, winner);
+            let slot = &mut self.slots[winner];
+            slot.error_id = None;
+            slot.hedge_issued = false;
+            return Err(slot.pending_error.take().expect("checked above"));
+        }
+        let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
             return Err(StoreError::NotReady);
         };
         let result = get_block(&mut slot.client, self.prefix, id, into);
         if matches!(result, Err(StoreError::NotReady)) {
             slot.pending_id = Some(*id);
+            slot.started_at = Some(Instant::now());
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
         result
@@ -261,19 +354,17 @@ impl BlockStore for OwnedObjectStore {
                 return Ok(());
             }
         }
-        let Some(slot) = self.slots.iter_mut().find(|slot| {
-            slot.pending_id.is_none()
-                && slot.ready_id.is_none()
-                && slot.error_id.is_none()
-                && slot.pending_error.is_none()
-        }) else {
+        let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
             return Ok(());
         };
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
         match slot.client.get(key, None) {
             Ok(_) => slot.ready_id = Some(*id),
-            Err(ObjectError::WouldBlock) => slot.pending_id = Some(*id),
+            Err(ObjectError::WouldBlock) => {
+                slot.pending_id = Some(*id);
+                slot.started_at = Some(Instant::now());
+            }
             Err(error) => return Err(store_error(error)),
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
@@ -285,18 +376,22 @@ impl BlockStore for OwnedObjectStore {
         id: &BlockId,
         into: &mut [u8],
     ) -> Result<Option<(usize, BlockType)>, StoreError> {
-        for slot in self.slots.as_mut_slice() {
-            if slot.pending_id == Some(*id) {
-                return Ok(None);
-            }
-            if slot.ready_id == Some(*id) {
-                slot.ready_id = None;
-                return decode_block_body(slot.client.body_bytes(), id, into).map(Some);
-            }
-            if slot.error_id == Some(*id) {
-                slot.error_id = None;
-                return Err(slot.pending_error.take().expect("checked above"));
-            }
+        if let Some(winner) = self.slots.iter().position(|slot| slot.ready_id == Some(*id)) {
+            self.release_siblings(*id, winner);
+            let slot = &mut self.slots[winner];
+            slot.ready_id = None;
+            slot.hedge_issued = false;
+            return decode_block_body(slot.client.body_bytes(), id, into).map(Some);
+        }
+        if self.slots.iter().any(|slot| slot.pending_id == Some(*id)) {
+            return Ok(None);
+        }
+        if let Some(winner) = self.slots.iter().position(|slot| slot.error_id == Some(*id)) {
+            self.release_siblings(*id, winner);
+            let slot = &mut self.slots[winner];
+            slot.error_id = None;
+            slot.hedge_issued = false;
+            return Err(slot.pending_error.take().expect("checked above"));
         }
         Ok(None)
     }
@@ -344,6 +439,14 @@ impl BlockStore for OwnedObjectStore {
 
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
         self.advance_pending_read(slot)
+    }
+
+    fn next_hedge_deadline(&self) -> Option<Instant> {
+        self.next_hedge_deadline()
+    }
+
+    fn issue_due_hedges(&mut self, now: Instant) {
+        self.issue_due_hedges(now);
     }
 }
 
@@ -488,6 +591,70 @@ mod tests {
             Some((payload.len(), BlockType::SstData))
         );
         assert_eq!(&output[..payload.len()], payload);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn due_hedge_uses_a_spare_slot_and_releases_the_stalled_request() {
+        let payload = b"hedged body";
+        let mut framed = [0u8; super::super::BLOCK_SIZE];
+        let (id, framed_len) = encode(payload, BlockType::SstData, 0, &mut framed).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = framed[..framed_len].to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut stalled, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            assert!(stalled.read(&mut request).unwrap() > 0);
+            let (mut hedge, _) = listener.accept().unwrap();
+            assert!(hedge.read(&mut request).unwrap() > 0);
+            write!(
+                hedge,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            hedge.write_all(&body).unwrap();
+            // Keep the original socket alive until the winner consumes the
+            // duplicate, proving winner selection actively cancels it.
+            let mut byte = [0u8; 1];
+            let _ = stalled.read(&mut byte);
+        });
+
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_endpoint = format!("127.0.0.1:{port}");
+        config.object_store_bucket = "hedge-test".to_string();
+        config.object_store_access_key = "key".to_string();
+        config.object_store_secret_key = "secret".to_string();
+        config.object_store_get_slots = 2;
+        config.object_store_hedge_after_ms = 1;
+        let mut budget = Budget::new(16 << 20);
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+
+        let mut output = [0u8; 64];
+        assert_eq!(store.get(&id, &mut output), Err(StoreError::NotReady));
+        let deadline = store.next_hedge_deadline().expect("pending read has a deadline");
+        store.issue_due_hedges(deadline);
+        assert!(store.pending_read_fd(1).is_some(), "hedge owns the spare slot");
+        assert_eq!(store.io_stats().object_gets, 2);
+        let mut complete = false;
+        for _ in 0..10_000 {
+            if store.advance_pending_read(1).unwrap() {
+                complete = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(complete, "hedged response did not complete");
+        assert_eq!(
+            store.get(&id, &mut output).unwrap(),
+            (payload.len(), BlockType::SstData)
+        );
+        assert_eq!(&output[..payload.len()], payload);
+        assert!(store.pending_read_fd(0).is_none(), "winner released the stalled sibling");
+        drop(store);
         server.join().unwrap();
     }
 }

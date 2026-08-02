@@ -283,12 +283,14 @@ impl Server {
             } else {
                 None
             };
-            let timeout = match (checkpoint_timeout, self.next_lock_wait_timeout()) {
-                (Some(checkpoint), Some(lock)) => Some(checkpoint.min(lock)),
-                (Some(checkpoint), None) => Some(checkpoint),
-                (None, Some(lock)) => Some(lock),
-                (None, None) => None,
-            };
+            let hedge_timeout = self
+                .engine
+                .next_block_read_hedge_deadline()
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+            let timeout = [checkpoint_timeout, self.next_lock_wait_timeout(), hedge_timeout]
+                .into_iter()
+                .flatten()
+                .min();
             let n = self.reactor.poll(timeout)?;
             for i in 0..n {
                 let event = self.reactor.event(i);
@@ -310,6 +312,8 @@ impl Server {
             // A lock timeout can be the event that woke the reactor, with no
             // socket readiness and no lock-generation change.
             self.wake_lock_waiters();
+            self.engine
+                .issue_due_block_read_hedges(std::time::Instant::now());
             self.sync_block_read_interest()?;
             if self.block_read_fds.iter().all(Option::is_none) {
                 self.engine.enable_async_block_reads();

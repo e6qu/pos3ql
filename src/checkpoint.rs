@@ -707,6 +707,14 @@ impl Checkpointer {
         self.blocks.borrow_mut().advance_pending_read(slot)
     }
 
+    pub(crate) fn next_block_read_hedge_deadline(&self) -> Option<std::time::Instant> {
+        self.blocks.borrow().next_hedge_deadline()
+    }
+
+    pub(crate) fn issue_due_block_read_hedges(&mut self, now: std::time::Instant) {
+        self.blocks.borrow_mut().issue_due_hedges(now);
+    }
+
     /// Uploads a committed WAL batch as a segment keyed by its first LSN,
     /// so a lost-disk cold start can replay everything past the manifest.
     /// Called with the raw journal bytes of one commit.

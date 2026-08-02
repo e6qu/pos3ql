@@ -119,6 +119,9 @@ pub struct Config {
     /// Independently connected durable-block GET slots. Each reserves its
     /// request and response buffers at startup; exhaustion parks the caller.
     pub object_store_get_slots: usize,
+    /// Deadline after which a pending durable-block GET may use one spare
+    /// fixed slot for a duplicate request. Zero disables hedging.
+    pub object_store_hedge_after_ms: u64,
     /// TLS to the object store (rustls, the single whitelisted dependency
     /// exception, isolated behind mem::guard::tls_scope).
     pub object_store_tls: bool,
@@ -186,6 +189,7 @@ impl Config {
             object_store_head_bytes: 16 * KIB,
             object_store_response_bytes: 4 * MIB,
             object_store_get_slots: 4,
+            object_store_hedge_after_ms: 0,
             object_store_tls: false,
             object_store_tls_ca_file: String::new(),
             tls_pool_bytes: 4 * MIB,
@@ -224,6 +228,8 @@ impl Config {
                 "s3_secret_key" => "object_store_secret_key",
                 "s3_head_bytes" => "object_store_head_bytes",
                 "s3_response_bytes" => "object_store_response_bytes",
+                "s3_get_slots" => "object_store_get_slots",
+                "s3_hedge_after_ms" => "object_store_hedge_after_ms",
                 "s3_tls" => "object_store_tls",
                 "s3_tls_ca_file" => "object_store_tls_ca_file",
                 other => other,
@@ -326,6 +332,7 @@ impl Config {
                 "object_store_head_bytes" => config.object_store_head_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "object_store_response_bytes" => config.object_store_response_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "object_store_get_slots" => config.object_store_get_slots = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
+                "object_store_hedge_after_ms" => config.object_store_hedge_after_ms = u64::from(parse_count(value).map_err(|m| ConfigError::at(line_no, m))?),
                 "object_store_tls" => {
                     config.object_store_tls = match value {
                         "on" | "true" => true,
@@ -583,13 +590,20 @@ sql_arena_bytes = 4096
     }
 
     #[test]
+    fn object_store_hedge_deadline_is_configured() {
+        let c = Config::parse("object_store = on\nobject_store_hedge_after_ms = 175\n").unwrap();
+        assert_eq!(c.object_store_hedge_after_ms, 175);
+        assert_eq!(Config::parse("").unwrap().object_store_hedge_after_ms, 0);
+    }
+
+    #[test]
     fn legacy_s3_names_are_strict_aliases() {
         let legacy = Config::parse(
-            "s3 = on\ns3_endpoint = minio:9000\ns3_bucket = db\ns3_tls = on\n",
+            "s3 = on\ns3_endpoint = minio:9000\ns3_bucket = db\ns3_get_slots = 7\ns3_hedge_after_ms = 175\ns3_tls = on\n",
         )
         .unwrap();
         let neutral = Config::parse(
-            "object_store = on\nobject_store_endpoint = minio:9000\nobject_store_bucket = db\nobject_store_tls = on\n",
+            "object_store = on\nobject_store_endpoint = minio:9000\nobject_store_bucket = db\nobject_store_get_slots = 7\nobject_store_hedge_after_ms = 175\nobject_store_tls = on\n",
         )
         .unwrap();
         assert_eq!(legacy, neutral);

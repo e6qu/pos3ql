@@ -805,18 +805,18 @@ pub(crate) fn scan_source_recycling<'a>(
 
 
 /// One build-side entry in a hash join's arena table: the decoded join key,
-/// the row's MVCC identity, and its encoded bytes (kept to assemble matches).
+/// One build-side entry: the join-key hash, the row's MVCC identity, and its
+/// encoded bytes (kept to assemble matches and re-decode the key on a hash
+/// hit, so any key width works without growing the entry).
 #[derive(Clone, Copy)]
 struct HashEntry<'a> {
     hash: u64,
-    key: Datum<'a>,
     rowid: u64,
     bytes: &'a [u8],
 }
 
 const EMPTY_HASH_ENTRY: HashEntry<'static> = HashEntry {
     hash: 0,
-    key: Datum::Null,
     rowid: 0,
     bytes: &[],
 };
@@ -832,21 +832,22 @@ fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
     a == b || (is_integer(a) && is_integer(b))
 }
 
-/// Extracts the single equi-join key for a two-table hash join: a
-/// `probe_col = build_col` conjunct in the ON clause or the WHERE, both plain
-/// column references into the two tables, with compatible types. Returns the
-/// column index in the probe table and in the build table. The key is used
-/// only to generate candidates — the full ON and WHERE still run at the leaf,
-/// so a missed extraction never changes a result, only the access path.
-fn hash_join_key<'a>(
+/// Extracts every equi-join key for a two-table hash join: each
+/// `probe_col = build_col` conjunct in the ON clause or the WHERE that is a
+/// plain column reference into each table with a type compatible with `=`.
+/// Returns the matched pairs (probe column, build column). The keys only
+/// generate candidates — the full ON and WHERE still run at the leaf, so a
+/// missed extraction never changes a result, only the access path.
+#[allow(clippy::type_complexity)]
+fn hash_join_keys<'a>(
     scope: &QueryScope<'a>,
     on: Option<&'a Expr<'a>>,
     where_clause: Option<&'a Expr<'a>>,
     probe_t: usize,
     build_t: usize,
-) -> Result<Option<(usize, usize)>, SqlError> {
+) -> Result<Option<([(usize, usize); 8], usize)>, SqlError> {
     let mut conjuncts: [&Expr; MAX_CONJUNCTS] = [&Expr::Null; MAX_CONJUNCTS];
-    let mut n = 0usize;
+    let mut nc = 0usize;
     for source in [on, where_clause].into_iter().flatten() {
         let mut flat = [source; MAX_CONJUNCTS];
         let mut count = 0;
@@ -856,13 +857,15 @@ fn hash_join_key<'a>(
             core::slice::from_ref(&source)
         };
         for &p in parts {
-            if n < MAX_CONJUNCTS {
-                conjuncts[n] = p;
-                n += 1;
+            if nc < MAX_CONJUNCTS {
+                conjuncts[nc] = p;
+                nc += 1;
             }
         }
     }
-    for &c in &conjuncts[..n] {
+    let mut pairs = [(0usize, 0usize); 8];
+    let mut npairs = 0usize;
+    for &c in &conjuncts[..nc] {
         let Expr::Binary { operator: BinaryOp::Eq, left, right } = c else {
             continue;
         };
@@ -872,10 +875,8 @@ fn hash_join_key<'a>(
         let Expr::Column { qualifier: rq, name: rn } = **right else {
             continue;
         };
-        let (
-            Ok(ResolvedColumn::Table(lt, lc)),
-            Ok(ResolvedColumn::Table(rt, rc)),
-        ) = (scope.find_column(lq, ln), scope.find_column(rq, rn))
+        let (Ok(ResolvedColumn::Table(lt, lc)), Ok(ResolvedColumn::Table(rt, rc))) =
+            (scope.find_column(lq, ln), scope.find_column(rq, rn))
         else {
             continue;
         };
@@ -886,13 +887,14 @@ fn hash_join_key<'a>(
         } else {
             continue;
         };
-        let probe_type = scope.defs[probe_t].expect("resolved").columns()[probe_col].ctype;
-        let build_type = scope.defs[build_t].expect("resolved").columns()[build_col].ctype;
-        if join_key_types_compatible(probe_type, build_type) {
-            return Ok(Some((probe_col, build_col)));
+        let pt = scope.defs[probe_t].expect("resolved").columns()[probe_col].ctype;
+        let bt = scope.defs[build_t].expect("resolved").columns()[build_col].ctype;
+        if join_key_types_compatible(pt, bt) && npairs < pairs.len() {
+            pairs[npairs] = (probe_col, build_col);
+            npairs += 1;
         }
     }
-    Ok(None)
+    if npairs == 0 { Ok(None) } else { Ok(Some((pairs, npairs))) }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1062,7 +1064,7 @@ fn scan_source_mode<'a>(
             return Ok(false);
         }
         let on = join.on.or(scope.join_on[0]);
-        let Some((probe_col, build_col)) = hash_join_key(scope, on, where_clause, probe_t, build_t)?
+        let Some((keys, nkeys)) = hash_join_keys(scope, on, where_clause, probe_t, build_t)?
         else {
             return Ok(false);
         };
@@ -1091,6 +1093,8 @@ fn scan_source_mode<'a>(
             let mut build_schema = [ColType::Bool; MAX_COLUMNS];
             build_def.schema(&mut build_schema);
             let build_schema = &build_schema[..build_def.n_columns];
+            let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let mut key_vals = [Datum::Null; 8];
             let mut n = 0usize;
             storage.for_each_row_state(build_slot, &mut |rowid, state| {
                 let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)? else {
@@ -1099,14 +1103,20 @@ fn scan_source_mode<'a>(
                 let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
                 let mut buffer = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, build_schema, &mut buffer)?;
-                let key = buffer[build_col];
-                // A NULL join key never matches in an inner equi-join.
-                if key.is_null() {
+                let mut any_null = false;
+                for i in 0..nkeys {
+                    key_vals[i] = buffer[keys[i].1];
+                    if key_vals[i].is_null() {
+                        any_null = true;
+                        break;
+                    }
+                }
+                if any_null {
                     return Ok(ControlFlow::Continue(()));
                 }
-                let hash = hash_key(&[key], &[0]);
+                let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
                 let bucket = (hash as usize) & (buckets_len - 1);
-                entries[n] = HashEntry { hash, key, rowid, bytes };
+                entries[n] = HashEntry { hash, rowid, bytes };
                 next[n] = buckets[bucket];
                 buckets[bucket] = n as u32;
                 n += 1;
@@ -1130,49 +1140,70 @@ fn scan_source_mode<'a>(
                     let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
                     let mut buffer = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, probe_schema, &mut buffer)?;
-                    let key = buffer[probe_col];
-                    if key.is_null() {
+                    let mut any_null = false;
+                    for i in 0..nkeys {
+                        key_vals[i] = buffer[keys[i].0];
+                        if key_vals[i].is_null() {
+                            any_null = true;
+                            break;
+                        }
+                    }
+                    if any_null {
                         return Ok(true);
                     }
-                    let hash = hash_key(&[key], &[0]);
+                    let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
                     let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
                     while idx != u32::MAX {
                         let entry = &entries[idx as usize];
-                        if entry.hash == hash && compare_datums(&entry.key, &key)?.is_eq() {
-                            let bound = &mut [None, None];
-                            let bound_rowids = &mut [None, None];
-                            bound[probe_t] = Some(bytes);
-                            bound_rowids[probe_t] = Some(rowid);
-                            bound[build_t] = Some(entry.bytes);
-                            bound_rowids[build_t] = Some(entry.rowid);
-                            let row = assemble(
-                                scope, bound, bound_rowids, order, 2, decode_buffers, arena,
-                            )?;
-                            if let Some(on) = on {
-                                let chained = Chained { inner: &row, outer };
-                                match eval_full(on, arena, params, &chained, hooks)? {
-                                    Datum::Bool(true) => {}
-                                    Datum::Bool(false) | Datum::Null => {
+                        if entry.hash == hash {
+                            // Re-decode the build row's key columns on a hash
+                            // hit and compare each — collisions between different
+                            // keys are rare and rejected here.
+                            let mut build_buf = [Datum::Null; MAX_COLUMNS];
+                            rowenc::decode(entry.bytes, build_schema, &mut build_buf)?;
+                            let mut matched = true;
+                            for i in 0..nkeys {
+                                if !compare_datums(&build_buf[keys[i].1], &key_vals[i])?.is_eq() {
+                                    matched = false;
+                                    break;
+                                }
+                            }
+                            if matched {
+                                let bound = &mut [None, None];
+                                let bound_rowids = &mut [None, None];
+                                bound[probe_t] = Some(bytes);
+                                bound_rowids[probe_t] = Some(rowid);
+                                bound[build_t] = Some(entry.bytes);
+                                bound_rowids[build_t] = Some(entry.rowid);
+                                let row = assemble(
+                                    scope, bound, bound_rowids, order, 2, decode_buffers, arena,
+                                )?;
+                                if let Some(on) = on {
+                                    let chained = Chained { inner: &row, outer };
+                                    match eval_full(on, arena, params, &chained, hooks)? {
+                                        Datum::Bool(true) => {}
+                                        Datum::Bool(false) | Datum::Null => {
+                                            idx = next[idx as usize];
+                                            continue;
+                                        }
+                                        _ => {
+                                            return Err(sql_err!(
+                                                sqlstate::DATATYPE_MISMATCH,
+                                                "argument of JOIN/ON must be type boolean"
+                                            ));
+                                        }
+                                    }
+                                }
+                                if let Some(w) = where_clause {
+                                    let chained = Chained { inner: &row, outer };
+                                    if !where_passes(w, arena, params, &chained, hooks)? {
                                         idx = next[idx as usize];
                                         continue;
                                     }
-                                    _ => {
-                                        return Err(sql_err!(
-                                            sqlstate::DATATYPE_MISMATCH,
-                                            "argument of JOIN/ON must be type boolean"
-                                        ));
-                                    }
                                 }
-                            }
-                            if let Some(w) = where_clause {
-                                let chained = Chained { inner: &row, outer };
-                                if !where_passes(w, arena, params, &chained, hooks)? {
-                                    idx = next[idx as usize];
-                                    continue;
+                                if !f(&row)? {
+                                    return Ok(false);
                                 }
-                            }
-                            if !f(&row)? {
-                                return Ok(false);
                             }
                         }
                         idx = next[idx as usize];

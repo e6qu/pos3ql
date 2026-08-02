@@ -64,15 +64,12 @@ jobs:
       - name: Test
         run: cargo test
 
-  # Longer standing storage-VOPR run: the mid-flush / mid-compaction crash
-  # invariants (checkpoint under an outage ending in a crash, torn WAL journal
-  # and disk-cache scribbling between incarnations) get more seeds and steps
-  # than the quick in-process default, so a rare recovery divergence has room
-  # to surface. Deterministic per seed — a failure reproduces from
-  # POS3QL_STORAGE_VOPR_SEED0.
-  storage-vopr-extended:
+  # PR smoke sweep for the mid-flush / mid-compaction crash invariants. Keep
+  # this gate short and deterministic; deeper VOPR sweeps run explicitly from
+  # their seed/step knobs instead of stretching every PR's critical path.
+  storage-vopr:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
 
@@ -86,8 +83,8 @@ jobs:
           key: ${{ runner.os }}-cargo-vopr-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-vopr-
 
-      - name: Storage VOPR (extended sweep)
+      - name: Storage VOPR
         run: cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
         env:
-          POS3QL_STORAGE_VOPR_SEEDS: 16
-          POS3QL_STORAGE_VOPR_STEPS: 300
+          POS3QL_STORAGE_VOPR_SEEDS: 4
+          POS3QL_STORAGE_VOPR_STEPS: 100

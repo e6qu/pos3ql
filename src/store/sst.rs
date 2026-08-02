@@ -595,11 +595,13 @@ impl SstCursor {
                 return Ok(None);
             }
             if !self.loaded || self.offset >= self.data_len {
-                let Some(id) = locate_data_block(store, &self.handle, index, self.block_ordinal)?
+                let Some((id, next)) =
+                    locate_data_block_with_next(store, &self.handle, index, self.block_ordinal)?
                 else {
                     self.done = true;
                     return Ok(None);
                 };
+                prefetch_data_block(store, next)?;
                 self.data_len = read_data_block(store, &id, data, bounce)?;
                 self.block_ordinal += 1;
                 self.offset = 0;
@@ -663,6 +665,19 @@ pub(crate) fn read_data_block(
             super::BlockError::UnknownType,
         ))),
     }
+}
+
+/// Starts a read whose bytes a sequential scan will need next. The store
+/// retains ownership of a completed body until the demand read consumes it.
+pub(crate) fn prefetch_data_block(
+    store: &mut dyn BlockStore,
+    id: Option<BlockId>,
+) -> Result<(), SstError> {
+    let Some(id) = id else { return Ok(()) };
+    if !store.async_gets_enabled() {
+        return Ok(());
+    }
+    store.prefetch(&id).map_err(SstError::Store)
 }
 
 impl<'a> SstReader<'a> {
@@ -861,6 +876,9 @@ impl<'a> SstReader<'a> {
             };
             for entry_index in start..count {
                 let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
+                let next = (entry_index + 1 < count)
+                    .then(|| block_id_at(self.index_scratch, entry_index + 1, handle.versioned));
+                prefetch_data_block(store, next)?;
                 let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
                 let mut ran_past = false;
                 // A chained entry owns its whole block, so at most one assembly
@@ -928,6 +946,9 @@ impl<'a> SstReader<'a> {
             let end = (start + budget).min(count);
             for entry_index in start..end {
                 let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
+                let next = (entry_index + 1 < end)
+                    .then(|| block_id_at(self.index_scratch, entry_index + 1, handle.versioned));
+                prefetch_data_block(store, next)?;
                 let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
                 for entry in (DataBlock {
                     bytes: &self.data_scratch[..data_len],
@@ -1072,6 +1093,18 @@ pub(crate) fn locate_data_block(
     buf: &mut [u8],
     ordinal: usize,
 ) -> Result<Option<BlockId>, SstError> {
+    Ok(locate_data_block_with_next(store, handle, buf, ordinal)?.map(|(id, _)| id))
+}
+
+/// Resolves one data-block ordinal and, when it shares an index leaf with a
+/// successor, returns that successor for scan lookahead. The index scratch is
+/// otherwise identical to [`locate_data_block`]'s and remains caller-owned.
+pub(crate) fn locate_data_block_with_next(
+    store: &mut dyn BlockStore,
+    handle: &SstHandle,
+    buf: &mut [u8],
+    ordinal: usize,
+) -> Result<Option<(BlockId, Option<BlockId>)>, SstError> {
     load_index(store, &handle.index, buf, handle.versioned)?;
     let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if head != INDEX_ROOT_MAGIC {
@@ -1079,7 +1112,8 @@ pub(crate) fn locate_data_block(
         if ordinal >= count {
             return Ok(None);
         }
-        return Ok(Some(block_id_at(buf, ordinal, handle.versioned)));
+        let next = (ordinal + 1 < count).then(|| block_id_at(buf, ordinal + 1, handle.versioned));
+        return Ok(Some((block_id_at(buf, ordinal, handle.versioned), next)));
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
     let entry_size = root_entry_size(handle.versioned);
@@ -1093,7 +1127,9 @@ pub(crate) fn locate_data_block(
             let mut id = [0u8; 32];
             id.copy_from_slice(&buf[at + key_bytes + 4..at + entry_size]);
             load_index(store, &BlockId(id), buf, handle.versioned)?;
-            return Ok(Some(block_id_at(buf, remaining, handle.versioned)));
+            let next =
+                (remaining + 1 < count).then(|| block_id_at(buf, remaining + 1, handle.versioned));
+            return Ok(Some((block_id_at(buf, remaining, handle.versioned), next)));
         }
         remaining -= count;
     }
@@ -1730,6 +1766,76 @@ mod tests {
             })
             .unwrap();
         out
+    }
+
+    struct LookaheadStore {
+        inner: MemoryBlockStore,
+        requested: Vec<BlockId>,
+    }
+
+    impl BlockStore for LookaheadStore {
+        fn put(
+            &mut self,
+            payload: &[u8],
+            block_type: BlockType,
+            lsn: u64,
+        ) -> Result<BlockId, StoreError> {
+            self.inner.put(payload, block_type, lsn)
+        }
+
+        fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
+            self.requested.push(*id);
+            self.inner.get(id, into)
+        }
+
+        fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
+            self.inner.contains(id)
+        }
+
+        fn async_gets_enabled(&self) -> bool {
+            true
+        }
+
+        fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
+            self.requested.push(*id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scan_requests_the_next_data_block_before_the_current_one() {
+        let (_budget, mut inner) = store();
+        let row = vec![7u8; MAX_PAYLOAD / 2];
+        let handle = build(
+            &mut inner,
+            &[(1, row.clone()), (2, row.clone()), (3, row.clone())],
+        )
+        .unwrap();
+        let mut index = [0u8; MAX_PAYLOAD];
+        let first = locate_data_block(&mut inner, &handle, &mut index, 0)
+            .unwrap()
+            .unwrap();
+        let second = locate_data_block(&mut inner, &handle, &mut index, 1)
+            .unwrap()
+            .unwrap();
+        let mut store = LookaheadStore {
+            inner,
+            requested: Vec::new(),
+        };
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        let mut rows = 0;
+        reader
+            .scan(&mut store, &handle, 1, 3, &mut |_, _| rows += 1)
+            .unwrap();
+        assert_eq!(rows, 3);
+        let requests: Vec<_> = store
+            .requested
+            .iter()
+            .copied()
+            .filter(|id| *id == first || *id == second)
+            .collect();
+        assert_eq!(requests[..2], [second, first]);
     }
 
     #[test]

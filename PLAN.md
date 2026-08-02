@@ -801,8 +801,20 @@ startup-bounded pool of independently connected GET slots; each holds its own
 request identity, response buffer, and terminal state until its parked caller
 consumes it, so concurrent cold reads neither overwrite nor re-fetch one
 another. The manifest and WAL clients remain synchronous so their statement-atomic
-durability contract does not change. The remaining Pillars 2–4 work is
-coalescing/prefetch/hedging, the block-at-a-time executor, and PAX
+durability contract does not change.
+
+**Pillar 2 scan-prefetch slice (2026-08-02).** Sequential SST readers,
+external-run cursors, compaction scans, and the spilled-table member cursor now
+resolve the next data-block identity from the already-loaded index leaf and
+schedule it before consuming the current block. Prefetch is an explicit
+`BlockStore` operation: only reactor-owned GET stacks schedule it, a completed
+body remains owned by its request slot until the demand read consumes it, and
+RAM/disk tiers pass the request through without inventing a buffer or a second
+GET. The one-block lookahead is bounded by the configured GET-slot pool; a
+full pool simply cannot schedule another optional lookahead, while provider
+errors surface through the normal demand read. Cross-leaf lookahead, ranged-GET coalescing, and p95
+hedging remain separate scheduler work. The remaining Pillars 2–4 work is
+coalescing/hedging, the block-at-a-time executor, and PAX
 late materialization described above.
 
 **External-execution slice (2026-07-30).** Physical scans now have a recycling

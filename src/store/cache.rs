@@ -190,6 +190,13 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         Ok((len, block_type))
     }
 
+    fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
+        if self.index.get(id).is_none() {
+            self.inner.prefetch(id)?;
+        }
+        Ok(())
+    }
+
     /// Presence in the cache proves presence in the store — a frame is only
     /// filled from a block the store accepted or returned — so a hit answers
     /// without a round trip. A miss has to ask, because the cache holds a

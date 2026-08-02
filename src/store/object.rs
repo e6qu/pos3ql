@@ -126,6 +126,7 @@ pub(crate) struct OwnedObjectStore {
     prefix: &'static str,
     scratch: Vec<u8>,
     stats: BlockIoStats,
+    async_gets_enabled: bool,
 }
 
 struct ObjectReadSlot {
@@ -162,6 +163,7 @@ impl OwnedObjectStore {
             prefix,
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
+            async_gets_enabled: false,
         })
     }
 
@@ -169,12 +171,14 @@ impl OwnedObjectStore {
         for slot in self.slots.as_mut_slice() {
             slot.client.enable_async_gets();
         }
+        self.async_gets_enabled = true;
     }
 
     fn disable_async_gets(&mut self) {
         for slot in self.slots.as_mut_slice() {
             slot.client.disable_async_gets();
         }
+        self.async_gets_enabled = false;
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
@@ -248,6 +252,34 @@ impl BlockStore for OwnedObjectStore {
         result
     }
 
+    fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
+        for slot in self.slots.as_mut_slice() {
+            if slot.pending_id == Some(*id)
+                || slot.ready_id == Some(*id)
+                || slot.error_id == Some(*id)
+            {
+                return Ok(());
+            }
+        }
+        let Some(slot) = self.slots.iter_mut().find(|slot| {
+            slot.pending_id.is_none()
+                && slot.ready_id.is_none()
+                && slot.error_id.is_none()
+                && slot.pending_error.is_none()
+        }) else {
+            return Ok(());
+        };
+        let mut key_buffer = [0u8; 128];
+        let key = key_of(self.prefix, id, &mut key_buffer);
+        match slot.client.get(key, None) {
+            Ok(_) => slot.ready_id = Some(*id),
+            Err(ObjectError::WouldBlock) => slot.pending_id = Some(*id),
+            Err(error) => return Err(store_error(error)),
+        }
+        self.stats.object_gets = self.stats.object_gets.saturating_add(1);
+        Ok(())
+    }
+
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
@@ -269,6 +301,10 @@ impl BlockStore for OwnedObjectStore {
 
     fn disable_async_gets(&mut self) {
         self.disable_async_gets();
+    }
+
+    fn async_gets_enabled(&self) -> bool {
+        self.async_gets_enabled
     }
 
     fn async_read_slots(&self) -> usize {
@@ -328,6 +364,7 @@ impl BlockStore for ObjectBlockStore<'_> {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -379,6 +416,54 @@ mod tests {
         assert!(store.async_reads_busy());
         drop(store);
         release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn prefetch_keeps_a_completed_body_for_its_demand_read() {
+        let payload = b"prefetched body";
+        let mut framed = [0u8; super::super::BLOCK_SIZE];
+        let (id, framed_len) = encode(payload, BlockType::SstData, 0, &mut framed).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = framed[..framed_len].to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let request_len = stream.read(&mut request).unwrap();
+            assert!(request_len > 0, "client sent an empty request");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_endpoint = format!("127.0.0.1:{port}");
+        config.object_store_bucket = "prefetch-test".to_string();
+        config.object_store_access_key = "key".to_string();
+        config.object_store_secret_key = "secret".to_string();
+        config.object_store_get_slots = 1;
+        let mut budget = Budget::new(16 << 20);
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+        store.prefetch(&id).unwrap();
+        let mut complete = false;
+        for _ in 0..10_000 {
+            if store.advance_pending_read(0).unwrap() {
+                complete = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(complete, "mock object response did not complete");
+        let mut output = [0u8; 64];
+        assert_eq!(store.get(&id, &mut output).unwrap(), (payload.len(), BlockType::SstData));
+        assert_eq!(&output[..payload.len()], payload);
         server.join().unwrap();
     }
 }

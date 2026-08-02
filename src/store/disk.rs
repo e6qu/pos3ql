@@ -243,6 +243,13 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
         Ok((len, block_type))
     }
 
+    fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
+        if self.index.get(id).is_none() {
+            self.inner.prefetch(id)?;
+        }
+        Ok(())
+    }
+
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         if self.index.get(id).is_some() {
             return Ok(true);

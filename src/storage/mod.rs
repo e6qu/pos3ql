@@ -5463,7 +5463,7 @@ impl Storage {
                 // Both index shapes resolve through one helper; the index
                 // buffer is scratch for the descent and the decompression
                 // bounce alike.
-                let Some(id) = crate::store::locate_data_block(
+                let Some((id, next)) = crate::store::locate_data_block_with_next(
                     &mut *blocks,
                     &handle,
                     &mut context.index_buf,
@@ -5474,6 +5474,8 @@ impl Storage {
                     cursor.done = true;
                     return Ok(());
                 };
+                crate::store::prefetch_data_block(&mut *blocks, next)
+                    .map_err(spill_read_error)?;
                 cursor.loaded_len = crate::store::read_data_block(
                     &mut *blocks,
                     &id,

@@ -523,27 +523,31 @@ mod tests {
 
     use super::*;
 
+    fn read_request(stream: &mut std::net::TcpStream) {
+        stream.set_nonblocking(true).unwrap();
+        let mut request = [0u8; 1024];
+        loop {
+            match stream.read(&mut request) {
+                Ok(0) => panic!("client closed before sending its request"),
+                Ok(_) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now()
+                }
+                Err(error) => panic!("read request: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn async_pool_owns_two_independent_block_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (release, proceed) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream.set_nonblocking(true).unwrap();
-                let mut request = [0u8; 1024];
-                loop {
-                    match stream.read(&mut request) {
-                        Ok(0) => break,
-                        Ok(_) => break,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::yield_now()
-                        }
-                        Err(error) => panic!("read request: {error}"),
-                    }
-                }
-            }
+            let (mut first, _) = listener.accept().unwrap();
+            read_request(&mut first);
+            let (mut second, _) = listener.accept().unwrap();
+            read_request(&mut second);
             proceed.recv().unwrap();
         });
 
@@ -631,12 +635,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let body = framed[..framed_len].to_vec();
+        let (hedge_arrived, hedge_ready) = mpsc::channel();
+        let (release_hedge, write_response) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut stalled, _) = listener.accept().unwrap();
             let mut request = [0u8; 1024];
             assert!(stalled.read(&mut request).unwrap() > 0);
             let (mut hedge, _) = listener.accept().unwrap();
             assert!(hedge.read(&mut request).unwrap() > 0);
+            hedge_arrived.send(()).unwrap();
+            write_response.recv().unwrap();
             write!(
                 hedge,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -670,11 +678,13 @@ mod tests {
         // Exercise the timer's strictly-due branch, not equality at an
         // `Instant` boundary whose precision differs across CI runners.
         store.issue_due_hedges(deadline + std::time::Duration::from_nanos(1));
+        hedge_ready.recv().unwrap();
         assert!(
             store.pending_read_fd(1).is_some(),
             "hedge owns the spare slot"
         );
         assert_eq!(store.io_stats().object_gets, 2);
+        release_hedge.send(()).unwrap();
         let mut complete = false;
         for _ in 0..10_000 {
             if store.advance_pending_read(1).unwrap() {

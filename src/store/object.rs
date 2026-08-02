@@ -667,7 +667,9 @@ mod tests {
         let deadline = store
             .next_hedge_deadline()
             .expect("pending read has a deadline");
-        store.issue_due_hedges(deadline);
+        // Exercise the timer's strictly-due branch, not equality at an
+        // `Instant` boundary whose precision differs across CI runners.
+        store.issue_due_hedges(deadline + std::time::Duration::from_nanos(1));
         assert!(
             store.pending_read_fd(1).is_some(),
             "hedge owns the spare slot"

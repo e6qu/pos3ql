@@ -1,8 +1,8 @@
 //! The single-threaded server: one reactor, a fixed array of connection
 //! slots whose buffers are allocated once at startup, and the query engine.
 
-use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -99,7 +99,7 @@ impl From<BudgetError> for ServerSetupError {
 impl Server {
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, ServerSetupError> {
         let max_conns = config.max_connections as usize;
-        let listener = TcpListener::bind(&config.listen_addr)
+        let listener = bind_listener(&config.listen_addr)
             .map_err(|e| ServerSetupError::Io("bind listen_addr", e))?;
         listener
             .set_nonblocking(true)
@@ -642,6 +642,129 @@ impl Server {
     }
 }
 
+/// Binds a TCP listener whose address can immediately be reused after an
+/// ungraceful server exit. This is required for crash recovery: the previous
+/// process may leave completed connections in TCP's closing states.
+fn bind_listener(address: &str) -> std::io::Result<TcpListener> {
+    let mut last_error = None;
+    for socket_address in address.to_socket_addrs()? {
+        match bind_socket_address(socket_address) {
+            Ok(listener) => return Ok(listener),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "listen address resolved to no socket addresses",
+        )
+    }))
+}
+
+fn bind_socket_address(address: SocketAddr) -> std::io::Result<TcpListener> {
+    let domain = match address {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let enabled: libc::c_int = 1;
+        let option_result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        };
+        if option_result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let bind_result = match address {
+            SocketAddr::V4(address) => {
+                #[cfg(target_os = "linux")]
+                let socket_address = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: address.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(address.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                #[cfg(not(target_os = "linux"))]
+                let socket_address = libc::sockaddr_in {
+                    sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                    sin_family: libc::AF_INET as u8,
+                    sin_port: address.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(address.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&socket_address as *const libc::sockaddr_in).cast(),
+                        std::mem::size_of_val(&socket_address) as libc::socklen_t,
+                    )
+                }
+            }
+            SocketAddr::V6(address) => {
+                #[cfg(target_os = "linux")]
+                let socket_address = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: address.port().to_be(),
+                    sin6_flowinfo: address.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: address.ip().octets(),
+                    },
+                    sin6_scope_id: address.scope_id(),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let socket_address = libc::sockaddr_in6 {
+                    sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                    sin6_family: libc::AF_INET6 as u8,
+                    sin6_port: address.port().to_be(),
+                    sin6_flowinfo: address.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: address.ip().octets(),
+                    },
+                    sin6_scope_id: address.scope_id(),
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&socket_address as *const libc::sockaddr_in6).cast(),
+                        std::mem::size_of_val(&socket_address) as libc::socklen_t,
+                    )
+                }
+            }
+        };
+        if bind_result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::listen(fd, libc::SOMAXCONN) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { TcpListener::from_raw_fd(fd) })
+    })();
+    if result.is_err() {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    result
+}
+
 /// Allocation-free stderr write for the post-freeze shutdown path.
 fn stderr_line(msg: &[u8]) {
     unsafe {
@@ -661,4 +784,30 @@ fn log_io(context: &str, e: &std::io::Error) {
         e.kind(),
         e.raw_os_error()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    use super::bind_listener;
+
+    #[test]
+    fn listener_rebinds_after_active_connection_closes() {
+        let listener = bind_listener("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream);
+        drop(listener);
+        client.join().unwrap();
+
+        let replacement = bind_listener(&address.to_string()).unwrap();
+        assert_eq!(replacement.local_addr().unwrap(), address);
+    }
 }

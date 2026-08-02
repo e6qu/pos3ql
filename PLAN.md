@@ -840,6 +840,11 @@ therefore targets five minutes rather than serially multiplying every
 checkpoint/restart/verification cost, with a 15-minute hard ceiling for
 runner variance.
 
+Crash recovery binds its TCP listener with `SO_REUSEADDR` before the address
+is claimed, and its pre-restart harness probe uses the identical bind
+contract. A killed predecessor can therefore be replaced after active
+connections close without weakening exclusive listener ownership.
+
 **External-execution slice (2026-07-30).** Physical scans now have a recycling
 mode: every join depth retains its bound outer rows while reusing row-local
 decode/evaluation space after the recursive callback returns. This separates

@@ -9,13 +9,13 @@ See [docs/terminology.md](docs/terminology.md) for the glossary and naming
 rules; architecture is in [README.md](README.md), the roadmap in
 [PLAN.md](PLAN.md), and standing directives in [AGENTS.md](AGENTS.md).
 
-Last reviewed: 2026-08-02. The bounded SST scan-prefetch and configured
-hedged-GET work introduced no unresolved defect; focused block-store and
-two-level SST traversal tests cover request order, ownership transfer, and
-hedge winner release.
+Last reviewed: 2026-08-03. Crash recovery now owns the killed server PID and
+the server listener explicitly permits safe immediate reuse after a crash;
+focused lifecycle tests cover the TCP rebind contract.
 
 | ID | Status | Found | Description | Repro | Fixed in |
 |----|--------|-------|-------------|-------|----------|
+| B-290 | fixed | 2026-08-03 | **A server killed with active TCP connections used the default listener setup, which lacks `SO_REUSEADDR`; the kernel could retain the old tuple in a closing state and reject the crash-torture replacement's bind for more than ten seconds. The harness then made the inverse mistake: its pre-restart probe omitted the option, so it falsely rejected the server's valid reuse-enabled bind.** The listener and its probe now set `SO_REUSEADDR` before binding, preserving exclusive listening ownership while allowing prompt crash recovery. | `POS3QL_RUN_GROUPS=torture POS3QL_TORTURE_ROUNDS=6 zsh tests/external/run.sh` | this PR |
 | B-289 | fixed | 2026-08-02 | **Crash torture used an `lsof | xargs kill` pipeline to kill the server inherited from `run.sh`; on CI it could kill nothing, after which the replacement correctly remained unable to bind.** `run.sh` now passes that exact initial PID, and the harness explicitly kills it once before owning every later child process; it then probes the exact TCP bind operation before restarting. | GitHub Actions runs 30765288768 and 30765772867 | this PR |
 | B-288 | fixed | 2026-08-02 | **The hedged-GET unit test issued its duplicate exactly at the computed `Instant` deadline, making its assertion depend on platform clock precision at the equality boundary.** The test now advances one nanosecond past the deadline, deterministically exercising the due branch while retaining the same fixed-slot ownership and sibling-release checks. | GitHub Actions run 30764582920, job 91540950312 | this PR |
 | B-287 | fixed | 2026-08-02 | **The PR storage-VOPR gate ran its 16 independent 300-step seeds serially, so the crash/recovery work itself consumed 1,091.99 seconds (the cached compile was only 21.01 seconds).** The harness now distributes those independent deterministic seeds over four fixed 2 MiB-stack workers, preserving coverage while targeting a fourfold wall-time reduction; CI has a 15-minute hard ceiling for runner variance. | GitHub Actions run 30763763131, job 91538794538 | this PR |

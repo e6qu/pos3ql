@@ -55,11 +55,12 @@ def connect_pg():
 
 
 def wait_for_bindable_port(port):
-    """Wait until the exact bind a replacement server needs can succeed."""
+    """Wait until the replacement server's reuse-enabled bind can succeed."""
     deadline = time.time() + 10
     while time.time() < deadline:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
             return
         except OSError:

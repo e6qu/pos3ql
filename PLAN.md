@@ -785,13 +785,20 @@ reads, the right shape for cold object storage) instead of the nested loop's
 O(N·M). The build uses the planner's `reltuples` estimate as its cost and
 arena-capacity gate, avoiding a preliminary visibility scan; a stale
 underestimate fails loudly at the fixed hash-table boundary. The equi-condition
-only generates candidates; the full ON and WHERE still run at the leaf, so a
-declined build uses
-the nested loop with identical results (verified against PostgreSQL 18:
+only generates candidates; the full ON and WHERE still run at the leaf. The
+planner selects the nested-loop plan up front when the hash path is inapplicable
+or exceeds its fixed capacity (verified against PostgreSQL 18:
 duplicates, NULL keys, unmatched keys, cross joins, residual conjuncts,
 aggregates, LIMIT early-stop, int-width-mixed keys, and multi-column keys).
-Pillars 2–4 remain the async fixed-pool I/O scheduler, block-at-a-time
-executor, and PAX
+Pillar 2's first reactor slice now drives an in-flight durable block GET without
+blocking the PostgreSQL socket loop: a miss preserves its block identity and
+response state in the startup-bounded object store, the server registers that
+one descriptor through its platform reactor, and the parked statement retries
+only after the exact response completes or reports its terminal storage error.
+Checkpoint publication waits for a registered read before it takes synchronous
+ownership of the same bounded client. The manifest and WAL clients remain synchronous so their statement-atomic
+durability contract does not change. The remaining Pillars 2–4 work is the
+fixed in-flight request pool, block-at-a-time executor, and PAX
 late materialization described above.
 
 **External-execution slice (2026-07-30).** Physical scans now have a recycling

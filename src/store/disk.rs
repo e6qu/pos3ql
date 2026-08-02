@@ -250,6 +250,22 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
         self.inner.contains(id)
     }
 
+    fn enable_async_gets(&mut self) {
+        self.inner.enable_async_gets();
+    }
+
+    fn disable_async_gets(&mut self) {
+        self.inner.disable_async_gets();
+    }
+
+    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.inner.pending_read_fd()
+    }
+
+    fn advance_pending_read(&mut self) -> Result<bool, StoreError> {
+        self.inner.advance_pending_read()
+    }
+
     fn io_stats(&self) -> BlockIoStats {
         let mut stats = self.inner.io_stats();
         stats.disk_hits = stats.disk_hits.saturating_add(self.stats.hits);

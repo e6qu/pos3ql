@@ -126,6 +126,9 @@ pub struct Conn {
     /// `recv`; completed statements in that message are not replayed.
     parked: bool,
     parked_generation: u64,
+    /// I/O waits are resumed by the block-read completion event, whereas row
+    /// locks wait for a changed lock generation or their timeout.
+    parked_for_io: bool,
     /// Absolute deadline for the current lock acquisition. `None` means
     /// `lock_timeout = 0`; the reactor uses this to wake an otherwise idle
     /// server and retry the retained frontend message as a timeout error.
@@ -192,6 +195,7 @@ impl Conn {
             id: 0,
             parked: false,
             parked_generation: 0,
+            parked_for_io: false,
             parked_deadline: None,
             resume_statement: 0,
             tls: None,
@@ -233,6 +237,7 @@ impl Conn {
         self.id = id;
         self.parked = false;
         self.parked_generation = 0;
+        self.parked_for_io = false;
         self.parked_deadline = None;
         self.resume_statement = 0;
         self.tls = None;
@@ -382,7 +387,11 @@ impl Conn {
     }
 
     pub fn retry_parked(&mut self, engine: &mut Engine, generation: u64) -> After {
-        if !self.parked || (self.parked_generation == generation && !self.lock_timeout_expired()) {
+        if !self.parked
+            || (!self.parked_for_io
+                && self.parked_generation == generation
+                && !self.lock_timeout_expired())
+        {
             return After::Continue;
         }
         self.parked = false;
@@ -409,10 +418,11 @@ impl Conn {
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    fn park_on_lock(&mut self, generation: u64) {
+    fn park(&mut self, io_wait: bool, generation: u64) {
         self.parked = true;
         self.parked_generation = generation;
-        if self.parked_deadline.is_none() {
+        self.parked_for_io = io_wait;
+        if !io_wait && self.parked_deadline.is_none() {
             let timeout_ms = self.guc.lock_timeout_ms();
             if timeout_ms != 0 {
                 self.parked_deadline =
@@ -424,6 +434,7 @@ impl Conn {
     fn finish_lock_wait(&mut self) {
         self.parked = false;
         self.parked_generation = 0;
+        self.parked_for_io = false;
         self.parked_deadline = None;
     }
 
@@ -1730,13 +1741,14 @@ impl Conn {
                     self.phase = Phase::SkipToSync;
                     return Step::Continue;
                 }
-                Ok(crate::sql::ExtendedExecutionStatus::Blocked) => {
+                Ok(crate::sql::ExtendedExecutionStatus::Blocked { io_wait }) => {
                     if paged {
                         self.portals[portal_slot].result.clear();
                     } else {
                         self.send.truncate_to(send_mark);
                     }
-                    self.park_on_lock(engine.lock_generation());
+                    let generation = engine.lock_generation();
+                    self.park(io_wait, generation);
                     return Step::Parked;
                 }
                 Err(WireFull) => {
@@ -1937,10 +1949,12 @@ impl Conn {
             Ok(crate::sql::ExecutionStatus::Blocked {
                 completed_statements,
                 output_mark,
+                io_wait,
             }) => {
                 self.send.truncate_to(output_mark);
                 self.resume_statement = completed_statements;
-                self.park_on_lock(engine.lock_generation());
+                let generation = engine.lock_generation();
+                self.park(io_wait, generation);
                 self.arena.reset();
                 return Step::Parked;
             }

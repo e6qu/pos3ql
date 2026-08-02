@@ -64,6 +64,16 @@ class P3Server:
             [self.binary, "--config", self.conf], stdout=self.log, stderr=self.log
         )
 
+    def connect(self):
+        try:
+            return connect_p3(self.port)
+        except Exception:
+            self.log.flush()
+            print("pos3ql log after failed restart:", file=sys.stderr)
+            with open(self.log.name, "rb") as log:
+                sys.stderr.buffer.write(log.read())
+            raise
+
     def kill9(self):
         if self.proc:
             self.proc.send_signal(signal.SIGKILL)
@@ -130,7 +140,7 @@ def main():
     )
     # run.sh already started the server; adopt it by connecting (the first
     # kill below targets whatever pid holds the port).
-    p3 = connect_p3(port)
+    p3 = server.connect()
     pg = connect_pg()
     p3c, pgc = p3.cursor(), pg.cursor()
 
@@ -213,7 +223,7 @@ def main():
                 break
             time.sleep(0.1)
         server.start()
-        p3 = connect_p3(port)
+        p3 = server.connect()
         p3c = p3.cursor()
         kind = "cold start" if cold else "kill -9 restart"
         if not verify(p3c, pgc, f"(round {rnd}, after {kind})"):

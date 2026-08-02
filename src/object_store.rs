@@ -55,16 +55,8 @@ pub enum Error {
     ResponseTooLarge { content_length: usize, capacity: usize },
     /// The adapter received a malformed response.
     Protocol(&'static str),
-}
-
-impl Error {
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::Status { code: 404, .. })
-    }
-
-    pub fn is_precondition_failed(&self) -> bool {
-        matches!(self, Self::Status { code: 412 | 409, .. })
-    }
+    /// A non-blocking read is not yet ready (WouldBlock).
+    WouldBlock,
 }
 
 impl std::fmt::Display for Error {
@@ -88,7 +80,18 @@ impl std::fmt::Display for Error {
                 "object store response of {content_length} bytes exceeds buffer of {capacity}"
             ),
             Self::Protocol(what) => write!(formatter, "object store protocol error: {what}"),
+            Self::WouldBlock => write!(formatter, "object store i/o not ready"),
         }
+    }
+}
+
+impl Error {
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Status { code: 404, .. })
+    }
+
+    pub fn is_precondition_failed(&self) -> bool {
+        matches!(self, Self::Status { code: 412 | 409, .. })
     }
 }
 
@@ -225,6 +228,44 @@ impl Client {
             Self::Simulator(client) => client.list(prefix, each),
         }
     }
+
+    pub(crate) fn pending_get_fd(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            Self::S3(client) => client.pending_fd(),
+            Self::Simulator(_) => None,
+        }
+    }
+
+    pub(crate) fn enable_async_gets(&mut self) {
+        if let Self::S3(client) = self {
+            client.enable_async_gets();
+        }
+    }
+
+    pub(crate) fn disable_async_gets(&mut self) {
+        if let Self::S3(client) = self {
+            client.disable_async_gets();
+        }
+    }
+
+    /// Advances a pending non-blocking GET. Returns `Ok(())` when the GET
+    /// completed (body is in [`Self::body_bytes`]), or `Err(WouldBlock)` when
+    /// more data is needed.
+    pub(crate) fn advance_get(&mut self) -> Result<(), Error> {
+        match self {
+            Self::S3(client) => client.advance_pending().map(|_| ()),
+            Self::Simulator(_) => Ok(()),
+        }
+    }
+
+    /// Discards an incomplete response after a terminal read error.
+    pub(crate) fn clear_pending_get(&mut self) {
+        match self {
+            Self::S3(client) => client.clear_pending(),
+            Self::Simulator(_) => {}
+        }
+    }
+
 }
 
 /// Stable process-writer identity derived from the durable namespace and local

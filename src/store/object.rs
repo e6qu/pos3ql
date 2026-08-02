@@ -60,6 +60,7 @@ fn key_of<'k>(prefix: &str, id: &BlockId, out: &'k mut [u8; 128]) -> &'k str {
 fn store_error(e: ObjectError) -> StoreError {
     match e {
         ObjectError::Status { code: 404, .. } => StoreError::NotFound,
+        ObjectError::WouldBlock => StoreError::NotReady,
         _ => StoreError::Unavailable,
     }
 }
@@ -94,6 +95,14 @@ fn get_block(
     let key = key_of(prefix, id, &mut key_buffer);
     let result = client.get(key, None).map_err(store_error)?;
     let body = &client.body_bytes()[..result.len];
+    decode_block_body(body, id, into)
+}
+
+fn decode_block_body(
+    body: &[u8],
+    id: &BlockId,
+    into: &mut [u8],
+) -> Result<(usize, BlockType), StoreError> {
     // Verified against the name it was fetched under, not merely against
     // its own header — a bucket handing back a different intact block is
     // exactly what content-addressing is here to catch.
@@ -115,6 +124,11 @@ pub(crate) struct OwnedObjectStore {
     prefix: &'static str,
     scratch: Vec<u8>,
     stats: BlockIoStats,
+    /// Terminal result of the asynchronous read, returned by the parked
+    /// statement's retry instead of starting an unrelated second request.
+    pending_error: Option<StoreError>,
+    pending_id: Option<BlockId>,
+    ready_id: Option<BlockId>,
 }
 
 impl OwnedObjectStore {
@@ -126,6 +140,37 @@ impl OwnedObjectStore {
             prefix,
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
+            pending_error: None,
+            pending_id: None,
+            ready_id: None,
+        }
+    }
+
+    fn enable_async_gets(&mut self) {
+        self.client.enable_async_gets();
+    }
+
+    fn disable_async_gets(&mut self) {
+        self.client.disable_async_gets();
+    }
+
+    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.client.pending_get_fd()
+    }
+
+    fn advance_pending_read(&mut self) -> Result<bool, StoreError> {
+        match self.client.advance_get() {
+            Ok(()) => {
+                self.ready_id = self.pending_id.take();
+                Ok(true)
+            }
+            Err(ObjectError::WouldBlock) => Ok(false),
+            Err(error) => {
+                self.client.clear_pending_get();
+                self.pending_error = Some(store_error(error));
+                self.pending_id = None;
+                Ok(true)
+            }
         }
     }
 }
@@ -150,7 +195,20 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        if self.ready_id == Some(*id) {
+            self.ready_id = None;
+            return decode_block_body(self.client.body_bytes(), id, into);
+        }
+        if self.pending_id.is_some() || self.ready_id.is_some() {
+            return Err(StoreError::NotReady);
+        }
         let result = get_block(&mut self.client, self.prefix, id, into);
+        if matches!(result, Err(StoreError::NotReady)) {
+            self.pending_id = Some(*id);
+        }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
         result
     }
@@ -168,6 +226,22 @@ impl BlockStore for OwnedObjectStore {
 
     fn io_stats(&self) -> BlockIoStats {
         self.stats
+    }
+
+    fn enable_async_gets(&mut self) {
+        self.enable_async_gets();
+    }
+
+    fn disable_async_gets(&mut self) {
+        self.disable_async_gets();
+    }
+
+    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.pending_read_fd()
+    }
+
+    fn advance_pending_read(&mut self) -> Result<bool, StoreError> {
+        self.advance_pending_read()
     }
 }
 

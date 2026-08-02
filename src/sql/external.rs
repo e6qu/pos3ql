@@ -478,7 +478,12 @@ fn row_too_large() -> SqlError {
 }
 
 fn run_error(error: SstError) -> SqlError {
-    sql_err!(sqlstate::IO_ERROR, "external query run failed: {:?}", error)
+    match error {
+        SstError::Store(crate::store::StoreError::NotReady) => {
+            sql_err!(sqlstate::INTERNAL_IO_WAIT, "durable block read in progress")
+        }
+        other => sql_err!(sqlstate::IO_ERROR, "external query run failed: {:?}", other),
+    }
 }
 
 #[cfg(test)]

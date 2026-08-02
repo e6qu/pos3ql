@@ -70,10 +70,11 @@ def wait_for_bindable_port(port):
 
 
 class P3Server:
-    def __init__(self, binary, conf, port, datadir, log):
+    def __init__(self, binary, conf, port, datadir, log, initial_pid):
         self.binary, self.conf, self.port, self.datadir = binary, conf, port, datadir
         self.log = open(log, "ab")
         self.proc = None
+        self.initial_pid = initial_pid
 
     def start(self):
         self.proc = subprocess.Popen(
@@ -95,6 +96,9 @@ class P3Server:
             self.proc.send_signal(signal.SIGKILL)
             self.proc.wait()
             self.proc = None
+        elif self.initial_pid:
+            os.kill(self.initial_pid, signal.SIGKILL)
+            self.initial_pid = None
 
     def wipe_data(self):
         subprocess.run(["rm", "-rf", self.datadir], check=True)
@@ -153,6 +157,7 @@ def main():
         port,
         os.environ["P3_DATADIR"],
         os.environ.get("P3_LOG", "/tmp/p3-torture.log"),
+        int(os.environ["P3_INITIAL_PID"]),
     )
     # run.sh already started the server; adopt it by connecting (the first
     # kill below targets whatever pid holds the port).
@@ -215,15 +220,10 @@ def main():
             # checkpoint publishes the manifest synchronously and prunes the
             # WAL, so nothing depends on the asynchronous segment upload.
             p3c.execute("CHECKPOINT")
-        # Kill the process holding the port (round 0: the run.sh-started one).
-        subprocess.run(
-            f"lsof -ti tcp:{port} -sTCP:LISTEN | xargs kill -9 2>/dev/null",
-            shell=True,
-            check=False,
-        )
-        if server.proc:
-            server.proc.wait()
-            server.proc = None
+        # The first process belongs to run.sh; later ones belong to this
+        # harness. Keep that ownership explicit instead of discovering a
+        # listener by a racy shell pipeline.
+        server.kill9()
         total_kills += 1
         if cold:
             total_cold += 1

@@ -261,6 +261,23 @@ pub(crate) trait BlockStore {
     /// Whether the block is present without reading it.
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError>;
 
+    /// Enables non-blocking object reads for this stack. The server owns the
+    /// resulting socket readiness registration.
+    fn enable_async_gets(&mut self) {}
+
+    fn disable_async_gets(&mut self) {}
+
+    /// The socket of an in-flight object read, if this store has one.
+    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
+    /// Advances an in-flight object read. `Ok(false)` means it remains
+    /// pending; `Ok(true)` means it completed and its caller may retry.
+    fn advance_pending_read(&mut self) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
     /// Cumulative provider-neutral I/O counters for this store stack.
     ///
     /// Every cache layer adds its own counters to the slower layers it wraps,
@@ -315,6 +332,8 @@ pub(crate) enum StoreError {
     BufferTooSmall,
     /// The backing store could not be reached or refused the operation.
     Unavailable,
+    /// A non-blocking fetch is in progress; retry later.
+    NotReady,
 }
 
 impl From<BlockError> for StoreError {

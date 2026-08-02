@@ -17,6 +17,8 @@ use crate::sql::Engine;
 
 const LISTENER_TOKEN: u64 = u64::MAX;
 const SHUTDOWN_TOKEN: u64 = u64::MAX - 1;
+/// Reactor token for the durable block-store client's in-flight GET socket.
+const BLOCK_IO_TOKEN: u64 = u64::MAX - 2;
 
 /// Set by the signal handler; the loop drains and exits when it sees this.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -53,6 +55,8 @@ pub struct Server {
     tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// Read end of the shutdown self-pipe.
     shutdown_read: i32,
+    /// The block-read socket currently registered with the reactor.
+    block_read_fd: Option<i32>,
 }
 
 struct Slot {
@@ -231,6 +235,7 @@ impl Server {
             auth,
             tls_config,
             shutdown_read: pipe_fds[0],
+            block_read_fd: None,
         })
     }
 
@@ -254,6 +259,7 @@ impl Server {
     /// The event loop. Runs until SIGTERM/SIGINT, then drains connections,
     /// takes a final checkpoint, and returns cleanly.
     pub fn run(&mut self) -> std::io::Result<()> {
+        self.engine.enable_async_block_reads();
         // Checkpoint beats run eagerly while healthy and back off for one
         // second after an object-store failure.
         let mut beat_backoff = Duration::ZERO;
@@ -261,7 +267,9 @@ impl Server {
             // While a checkpoint sweep is mid-flight, poll with the backoff
             // timeout so the loop returns to that work; otherwise block until
             // the next event.
-            let checkpoint_timeout = if self.engine.checkpoint_work_pending() {
+            let checkpoint_timeout = if self.block_read_fd.is_none()
+                && self.engine.checkpoint_work_pending()
+            {
                 Some(beat_backoff)
             } else {
                 None
@@ -284,6 +292,8 @@ impl Server {
                     {}
                 } else if event.token == LISTENER_TOKEN {
                     self.accept_pending();
+                } else if event.token == BLOCK_IO_TOKEN {
+                    self.advance_block_io()?;
                 } else {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
@@ -291,6 +301,10 @@ impl Server {
             // A lock timeout can be the event that woke the reactor, with no
             // socket readiness and no lock-generation change.
             self.wake_lock_waiters();
+            self.sync_block_read_interest()?;
+            if self.block_read_fd.is_none() {
+                self.engine.enable_async_block_reads();
+            }
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
@@ -447,6 +461,40 @@ impl Server {
             .iter()
             .filter_map(|slot| slot.conn.lock_wait_remaining())
             .min()
+    }
+
+    /// Called when the block-store client's non-blocking GET socket is
+    /// readable. Advances the pending response read; if it completes, the
+    /// block is now cached and any parked statement is retried.
+    fn advance_block_io(&mut self) -> std::io::Result<()> {
+        if self
+            .engine
+            .advance_pending_block_read()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?
+        {
+            // The GET completed and the block is cached. Wake parked
+            // statements — they'll retry and find the block in cache.
+            self.wake_lock_waiters();
+        }
+        Ok(())
+    }
+
+    /// Keeps exactly the active object-read socket registered. Registration
+    /// failures are surfaced to the server loop; a parked query must never be
+    /// left waiting on an unobserved descriptor.
+    fn sync_block_read_interest(&mut self) -> std::io::Result<()> {
+        let wanted = self.engine.pending_block_read_fd();
+        if wanted == self.block_read_fd {
+            return Ok(());
+        }
+        if let Some(fd) = self.block_read_fd.take() {
+            self.reactor.deregister(fd)?;
+        }
+        if let Some(fd) = wanted {
+            self.reactor.register_read(fd, BLOCK_IO_TOKEN)?;
+            self.block_read_fd = Some(fd);
+        }
+        Ok(())
     }
 
     /// Retries parked protocol messages after a transaction released row

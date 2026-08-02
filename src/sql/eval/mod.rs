@@ -163,6 +163,9 @@ pub mod sqlstate {
     /// Private control-flow sentinel. The wire layer must park the connection
     /// and must never serialize this as an ErrorResponse.
     pub(crate) const INTERNAL_LOCK_WAIT: &str = "PZ001";
+    /// A non-blocking block fetch is in progress; the statement must park and
+    /// retry when the reactor completes the fetch.
+    pub(crate) const INTERNAL_IO_WAIT: &str = "PZ002";
     pub const NAME_TOO_LONG: &str = "42622";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";

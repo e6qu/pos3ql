@@ -169,7 +169,7 @@ fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
 }
 
 pub(crate) struct Checkpointer {
-    client: ObjectStore,
+    pub(crate) client: ObjectStore,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
     /// over content-addressed block objects — `block_cache_bytes` and
     /// `disk_cache_bytes` finally sized to something. SST reads and writes go
@@ -680,6 +680,22 @@ impl Checkpointer {
         &self,
     ) -> std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>> {
         std::rc::Rc::clone(&self.blocks)
+    }
+
+    pub(crate) fn enable_async_block_reads(&mut self) {
+        self.blocks.borrow_mut().enable_async_gets();
+    }
+
+    pub(crate) fn disable_async_block_reads(&mut self) {
+        self.blocks.borrow_mut().disable_async_gets();
+    }
+
+    pub(crate) fn pending_block_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.blocks.borrow().pending_read_fd()
+    }
+
+    pub(crate) fn advance_pending_block_read(&mut self) -> Result<bool, crate::store::StoreError> {
+        self.blocks.borrow_mut().advance_pending_read()
     }
 
     /// Uploads a committed WAL batch as a segment keyed by its first LSN,
@@ -3692,7 +3708,12 @@ fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
 }
 
 fn sst_to_sql(e: crate::store::SstError) -> SqlError {
-    sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", e)
+    match e {
+        crate::store::SstError::Store(crate::store::StoreError::NotReady) => {
+            sql_err!(crate::sql::eval::sqlstate::INTERNAL_IO_WAIT, "block fetch in progress")
+        }
+        other => sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", other),
+    }
 }
 
 fn value_index_to_sql(error: impl core::fmt::Debug) -> SqlError {

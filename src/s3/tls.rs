@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use crate::mem::guard;
@@ -21,6 +22,21 @@ pub enum Transport {
 impl Transport {
     pub(crate) fn plain(stream: TcpStream) -> Self {
         Transport::Plain(stream)
+    }
+
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        let stream = match self {
+            Transport::Plain(s) => s,
+            Transport::Tls(t) => &t.as_ref().expect("live session").sock,
+        };
+        stream.set_nonblocking(nonblocking)
+    }
+
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Transport::Plain(s) => s.as_raw_fd(),
+            Transport::Tls(t) => t.as_ref().expect("live session").sock.as_raw_fd(),
+        }
     }
 
     pub(crate) fn tls(

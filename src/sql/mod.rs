@@ -163,18 +163,22 @@ pub(crate) struct RoleLogin {
 pub enum ExecutionStatus {
     Complete,
     /// The current statement emitted no client-visible output and is parked
-    /// on a row lock. Statements before it in the same simple-query message
-    /// completed exactly once and are skipped when the message resumes.
+    /// on a row lock or a non-blocking block fetch. Statements before it in
+    /// the same simple-query message completed exactly once and are skipped
+    /// when the message resumes.
     Blocked {
         completed_statements: usize,
         output_mark: usize,
+        /// True when the block is an I/O wait (retry on every reactor wake),
+        /// false for a lock wait (retry only on lock-generation change).
+        io_wait: bool,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtendedExecutionStatus {
     Complete(bool),
-    Blocked,
+    Blocked { io_wait: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -1519,6 +1523,38 @@ impl Engine {
         self.ckpt.is_some()
     }
 
+    /// Enables reactor-driven reads only for the durable block stack. Manifest
+    /// and WAL clients retain their synchronous, statement-atomic contracts.
+    pub(crate) fn enable_async_block_reads(&mut self) {
+        if let Some(checkpointer) = self.ckpt.as_mut() {
+            checkpointer.enable_async_block_reads();
+        }
+    }
+
+    pub(crate) fn disable_async_block_reads(&mut self) {
+        if let Some(checkpointer) = self.ckpt.as_mut() {
+            checkpointer.disable_async_block_reads();
+        }
+    }
+
+    pub(crate) fn pending_block_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.ckpt
+            .as_ref()
+            .and_then(crate::checkpoint::Checkpointer::pending_block_read_fd)
+    }
+
+    /// Advances a pending block read. A completed read or a terminal failure
+    /// both wake parked statements; the retry then consumes the cached block
+    /// or returns the real storage error.
+    pub(crate) fn advance_pending_block_read(
+        &mut self,
+    ) -> Result<bool, crate::store::StoreError> {
+        let Some(checkpointer) = self.ckpt.as_mut() else {
+            return Ok(false);
+        };
+        checkpointer.advance_pending_block_read()
+    }
+
     fn validate_maintenance_targets(
         &self,
         targets: &[ast::MaintenanceTarget<'_>],
@@ -1621,7 +1657,12 @@ impl Engine {
         // Everything the snapshot will contain must be journal-durable
         // first, so an interrupted checkpoint never strands acked writes.
         self.wal.commit();
-        match ckpt.checkpoint(&mut self.storage, &mut self.scratch)? {
+        // A checkpoint owns the block stack synchronously: its publication
+        // state machine cannot be rewound as a client statement can.
+        ckpt.disable_async_block_reads();
+        let checkpoint = ckpt.checkpoint(&mut self.storage, &mut self.scratch);
+        ckpt.enable_async_block_reads();
+        match checkpoint? {
             Some(lsn) => {
                 self.after_publish(lsn)?;
                 Ok(true)
@@ -1763,6 +1804,11 @@ impl Engine {
     /// the return is false on a failed beat so the idle driver can back off
     /// a persistently-down bucket.
     pub fn maybe_checkpoint(&mut self) -> bool {
+        // A suspended read owns the sole block client until the reactor
+        // completes it. Checkpoint publication uses that client synchronously.
+        if self.pending_block_read_fd().is_some() {
+            return true;
+        }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return true;
         };
@@ -1778,7 +1824,13 @@ impl Engine {
             return true;
         }
         self.wal.commit();
-        match ckpt.checkpoint_step(&mut self.storage, &mut self.scratch) {
+        // A checkpoint beat advances publication state that cannot be replayed
+        // after yielding. Its block reads therefore own the store
+        // synchronously, just as an explicit CHECKPOINT does.
+        ckpt.disable_async_block_reads();
+        let checkpoint = ckpt.checkpoint_step(&mut self.storage, &mut self.scratch);
+        ckpt.enable_async_block_reads();
+        match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
                 if let Err(e) = self.after_publish(lsn) {
                     eprintln!(
@@ -1886,12 +1938,15 @@ impl Engine {
                         &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
                     );
                     if let Err(mut e) = outcome? {
-                        if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                        if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                            || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
                             self.rollback_waiting_statement(txn, statement_mark);
                             if !lock_timeout_expired {
                                 return Ok(ExecutionStatus::Blocked {
                                     completed_statements: statement_index,
                                     output_mark,
+                                    io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
                                 });
                             }
                             self.storage
@@ -2014,10 +2069,14 @@ impl Engine {
                 Ok(ExtendedExecutionStatus::Complete(true))
             }
             Err(mut e) => {
-                if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                    || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                {
                     self.rollback_waiting_statement(txn, statement_mark);
                     if !lock_timeout_expired {
-                        return Ok(ExtendedExecutionStatus::Blocked);
+                        return Ok(ExtendedExecutionStatus::Blocked {
+                            io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
+                        });
                     }
                     self.storage
                         .rollback_locks_to(txn.txid, statement_mark.lock);
@@ -2990,6 +3049,9 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if statement_writes(statement) {
+            self.disable_async_block_reads();
+        }
         let _guc_eval_scope = guc::enter_eval_scope(guc);
         // Reclaim the shared execution arena from the previous statement: its
         // materialized rows have already been paged to the wire.

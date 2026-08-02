@@ -23,6 +23,16 @@ use crate::util::StackStr;
 
 pub(crate) use rowenc::MAX_COLUMNS;
 
+fn spill_read_error(error: crate::store::SstError) -> SqlError {
+    match error {
+        crate::store::SstError::Store(crate::store::StoreError::NotReady) => sql_err!(
+            sqlstate::INTERNAL_IO_WAIT,
+            "durable block read in progress"
+        ),
+        other => sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", other),
+    }
+}
+
 /// An SQL identifier, owned inline. PostgreSQL caps names at 63 bytes
 /// (NAMEDATALEN - 1); so does this.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5459,7 +5469,7 @@ impl Storage {
                     &mut context.index_buf,
                     cursor.ordinal,
                 )
-                .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?
+                .map_err(spill_read_error)?
                 else {
                     cursor.done = true;
                     return Ok(());
@@ -5470,7 +5480,7 @@ impl Storage {
                     &mut context.member_blocks[member],
                     &mut context.index_buf,
                 )
-                .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+                .map_err(spill_read_error)?;
                 cursor.loaded = Some(cursor.ordinal);
                 cursor.offset = 0;
             }
@@ -5527,7 +5537,7 @@ impl Storage {
             let handle = table.spill_ssts[member].expect("counted");
             let verdict = reader
                 .probe_at(&mut *spill.blocks.borrow_mut(), &handle, rowid, snapshot)
-                .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+                .map_err(spill_read_error)?;
             if let Some(probe) = verdict
                 && best.is_none_or(|current| {
                     probe.key.commit_lsn > current.commit_lsn
@@ -6036,7 +6046,7 @@ impl Storage {
                 let mut reader = crate::store::SstReader::over(index_buf, data_buf, assembly_buf);
                 let got = reader
                     .get_at(&mut *blocks, &handle, rowid, commit_lsn, out)
-                    .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?;
+                    .map_err(spill_read_error)?;
                 match got {
                     Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
                         Ok(&out[..len as usize])
@@ -6114,7 +6124,7 @@ impl Storage {
                     let mut reader = crate::store::SstReader::over(index_buf, data_buf, bounce_buf);
                     reader
                         .get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf)
-                        .map_err(|e| sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", e))?
+                        .map_err(spill_read_error)?
                 };
                 match got {
                     Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {

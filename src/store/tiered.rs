@@ -148,6 +148,34 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    fn enable_async_gets(&mut self) {
+        match self {
+            Layer::Base(store) => store.enable_async_gets(),
+            Layer::Disk(cache) => cache.enable_async_gets(),
+        }
+    }
+
+    fn disable_async_gets(&mut self) {
+        match self {
+            Layer::Base(store) => store.disable_async_gets(),
+            Layer::Disk(cache) => cache.disable_async_gets(),
+        }
+    }
+
+    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            Layer::Base(store) => store.pending_read_fd(),
+            Layer::Disk(cache) => cache.pending_read_fd(),
+        }
+    }
+
+    fn advance_pending_read(&mut self) -> Result<bool, super::StoreError> {
+        match self {
+            Layer::Base(store) => store.advance_pending_read(),
+            Layer::Disk(cache) => cache.advance_pending_read(),
+        }
+    }
+
     fn io_stats(&self) -> super::BlockIoStats {
         match self {
             Layer::Base(store) => store.io_stats(),
@@ -192,6 +220,34 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(c) => c.contains(id),
             TieredStore::WithoutRam(l) => l.contains(id),
+        }
+    }
+
+    fn enable_async_gets(&mut self) {
+        match self {
+            TieredStore::WithRam(cache) => cache.enable_async_gets(),
+            TieredStore::WithoutRam(layer) => layer.enable_async_gets(),
+        }
+    }
+
+    fn disable_async_gets(&mut self) {
+        match self {
+            TieredStore::WithRam(cache) => cache.disable_async_gets(),
+            TieredStore::WithoutRam(layer) => layer.disable_async_gets(),
+        }
+    }
+
+    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            TieredStore::WithRam(cache) => cache.pending_read_fd(),
+            TieredStore::WithoutRam(layer) => layer.pending_read_fd(),
+        }
+    }
+
+    fn advance_pending_read(&mut self) -> Result<bool, super::StoreError> {
+        match self {
+            TieredStore::WithRam(cache) => cache.advance_pending_read(),
+            TieredStore::WithoutRam(layer) => layer.advance_pending_read(),
         }
     }
 

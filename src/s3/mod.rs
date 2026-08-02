@@ -77,6 +77,20 @@ pub struct S3Client {
     head: FixedBuf,
     body: FixedBuf,
     clock: fn() -> i64,
+    /// A non-blocking GET in progress: the response is being read
+    /// incrementally, advanced by the reactor when the socket is ready.
+    pending: Option<PendingResponse>,
+    async_gets: bool,
+}
+
+/// Incremental HTTP-response state for a non-blocking GET. The request was
+/// sent (blocking write — fast); the response is read in chunks via
+/// [`S3Client::advance_pending`], driven by reactor readability events.
+struct PendingResponse {
+    head_end: Option<usize>,
+    status: u16,
+    content_length: usize,
+    body_read: usize,
 }
 
 fn system_clock() -> i64 {
@@ -140,6 +154,8 @@ impl S3Client {
                 config.object_store_response_bytes,
             )?,
             clock: system_clock,
+            pending: None,
+            async_gets: false,
         })
     }
 
@@ -212,17 +228,222 @@ impl S3Client {
     }
 
     /// Downloads an object (or a byte range, inclusive). The bytes are in
-    /// [`Self::body_bytes`] afterwards.
+    /// [`Self::body_bytes`] afterwards. When a non-blocking GET is in
+    /// progress, advances it instead of starting a new request.
     pub fn get(&mut self, key: &str, range: Option<(u64, u64)>) -> Result<GetResult, S3Error> {
-        self.request(
+        if self.pending.is_some() {
+            return self.advance_pending();
+        }
+        if !self.async_gets {
+            return self.request(
+                "GET",
+                key,
+                "",
+                &[],
+                EMPTY_SHA256_HEX,
+                Precondition::None,
+                range,
+            );
+        }
+        // Initiate: send the request (blocking write — fast), then switch to
+        // non-blocking for the response read so the reactor can serve other
+        // connections while we wait.
+        self.send_head_and_connect(
             "GET",
             key,
             "",
-            &[],
+            0,
             EMPTY_SHA256_HEX,
             Precondition::None,
             range,
-        )
+        )?;
+        let stream = self.stream.as_mut().expect("connected above");
+        let send = stream.write_all(&[]).and_then(|()| stream.flush());
+        if let Err(e) = send {
+            self.stream = None;
+            return Err(S3Error::Io {
+                context: "send body",
+                kind: e.kind(),
+                detail: stack_format!(160, "{e}"),
+            });
+        }
+        // Switch to non-blocking for the response read.
+        if let Err(e) = self.stream.as_ref().unwrap().set_nonblocking(true) {
+            self.stream = None;
+            return Err(S3Error::Io {
+                context: "set_nonblocking",
+                kind: e.kind(),
+                detail: stack_format!(160, "{e}"),
+            });
+        }
+        self.head.clear();
+        self.body.clear();
+        self.pending = Some(PendingResponse {
+            head_end: None,
+            status: 0,
+            content_length: 0,
+            body_read: 0,
+        });
+        // Try to read immediately (data might already be available).
+        self.advance_pending()
+    }
+
+    /// Enables reactor-driven object reads. This is configured once by the
+    /// server for the block-store client; all other clients retain blocking
+    /// request semantics.
+    pub fn enable_async_gets(&mut self) {
+        self.async_gets = true;
+    }
+
+    pub fn disable_async_gets(&mut self) {
+        assert!(self.pending.is_none(), "cannot switch a pending GET to blocking");
+        self.async_gets = false;
+    }
+
+    /// Whether a non-blocking GET is in flight.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The raw socket fd of the in-flight GET, for reactor registration.
+    pub fn pending_fd(&self) -> Option<std::os::fd::RawFd> {
+        if self.pending.is_some() {
+            self.stream.as_ref().map(|s| s.raw_fd())
+        } else {
+            None
+        }
+    }
+
+    /// Clears a pending GET (used by PUT/DELETE/LIST paths that need the
+    /// connection: drops it so the next request reconnects).
+    pub fn clear_pending(&mut self) {
+        if self.pending.is_some() {
+            self.pending = None;
+            self.stream = None; // force reconnect
+        }
+    }
+
+    /// Reads more of the pending GET response. Returns `Ok` when the full
+    /// response is available, or `Err(WouldBlock)` when more data is needed.
+    pub fn advance_pending(&mut self) -> Result<GetResult, S3Error> {
+        let stream = self.stream.as_mut().expect("pending implies connected");
+        let pending = self.pending.as_mut().expect("pending set above");
+
+        // Phase 1: read the HTTP head (until \r\n\r\n).
+        if pending.head_end.is_none() {
+            loop {
+                if let Some(pos) = find_head_end(self.head.readable()) {
+                    pending.head_end = Some(pos);
+                    break;
+                }
+                let space = self.head.writable();
+                if space.is_empty() {
+                    self.clear_pending();
+                    return Err(S3Error::Protocol("response head too large"));
+                }
+                match stream.read(space) {
+                    Ok(0) => {
+                        self.clear_pending();
+                        return Err(S3Error::Io {
+                            context: "read head",
+                            kind: std::io::ErrorKind::UnexpectedEof,
+                            detail: StackStr::new(),
+                        });
+                    }
+                    Ok(n) => self.head.advance(n),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Err(S3Error::WouldBlock);
+                    }
+                    Err(e) => {
+                        self.clear_pending();
+                        return Err(S3Error::Io {
+                            context: "read head",
+                            kind: e.kind(),
+                            detail: stack_format!(160, "{e}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 2: parse the head (once).
+        let head_end = pending.head_end.unwrap();
+        let (status, content_length, etag, chunked) =
+            parse_head(&self.head.readable()[..head_end])?;
+        pending.status = status;
+        pending.content_length = content_length;
+
+        if content_length > self.body.capacity() {
+            self.clear_pending();
+            return Err(S3Error::ResponseTooLarge {
+                content_length,
+                capacity: self.body.capacity(),
+            });
+        }
+
+        // Move any body bytes that arrived with the head (first read only).
+        if pending.body_read == 0 {
+            let already = self.head.readable().len() - head_end;
+            let take = already.min(content_length);
+            if take > 0 {
+                assert!(
+                    self.body.append(&self.head.readable()[head_end..head_end + take]),
+                    "checked against capacity"
+                );
+                pending.body_read = take;
+            }
+        }
+
+        // Phase 3: read the body.
+        while pending.body_read < content_length {
+            let space = self.body.writable();
+            let want = (content_length - pending.body_read).min(space.len());
+            match stream.read(&mut space[..want]) {
+                Ok(0) => {
+                    self.clear_pending();
+                    return Err(S3Error::Io {
+                        context: "read body",
+                        kind: std::io::ErrorKind::UnexpectedEof,
+                        detail: StackStr::new(),
+                    });
+                }
+                Ok(n) => {
+                    self.body.advance(n);
+                    pending.body_read += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(S3Error::WouldBlock);
+                }
+                Err(e) => {
+                    self.clear_pending();
+                    return Err(S3Error::Io {
+                        context: "read body",
+                        kind: e.kind(),
+                        detail: stack_format!(160, "{e}"),
+                    });
+                }
+            }
+        }
+
+        // Phase 4: complete. Deregister from the reactor and restore blocking.
+        let _ = self.stream.as_ref().unwrap().set_nonblocking(false);
+        self.pending = None;
+        if chunked {
+            // The scheduler admits only fixed-length object responses.
+            self.clear_pending();
+            return Err(S3Error::Protocol("chunked encoding not supported in non-blocking GET"));
+        }
+        if !(200..300).contains(&status) {
+            let text = core::str::from_utf8(self.body.readable()).unwrap_or("");
+            return Err(S3Error::Status {
+                code: status,
+                message: stack_format!(256, "{}", text),
+            });
+        }
+        Ok(GetResult {
+            len: self.body.readable().len(),
+            etag,
+        })
     }
 
     pub fn body_bytes(&self) -> &[u8] {
@@ -326,6 +547,8 @@ impl S3Client {
         precondition: Precondition,
         range: Option<(u64, u64)>,
     ) -> Result<GetResult, S3Error> {
+        // Drop any pending non-blocking GET so the connection is clean.
+        self.clear_pending();
         let mut last: Option<S3Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
@@ -1011,6 +1234,34 @@ mod tests {
         let got = client.get("k", Some((10, 14))).unwrap();
         assert_eq!(got.len, 5);
         assert_eq!(client.body_bytes(), b"hello");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn async_get_completes_without_a_second_request() {
+        let (port, server) = mock_server(
+            "HTTP/1.1 200 OK\r\ncontent-length: 5\r\netag: \"e\"\r\n\r\nhello",
+            |_| {},
+        );
+        let config = test_config(port);
+        let mut budget = Budget::new(1 << 20);
+        let mut client = S3Client::new(&config, &mut budget).unwrap();
+        client.with_clock(|| 1_440_938_160);
+        client.enable_async_gets();
+        let mut result = client.get("k", None);
+        while matches!(result, Err(S3Error::WouldBlock)) {
+            let fd = client.pending_fd().expect("pending GET keeps its socket");
+            let mut event = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(unsafe { libc::poll(&mut event, 1, 1_000) } > 0);
+            result = client.advance_pending();
+        }
+        assert_eq!(result.unwrap().len, 5);
+        assert_eq!(client.body_bytes(), b"hello");
+        assert!(!client.has_pending());
         server.join().unwrap();
     }
 

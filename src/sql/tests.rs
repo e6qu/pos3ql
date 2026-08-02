@@ -8103,6 +8103,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
         ExecutionStatus::Blocked {
             completed_statements: 0,
             output_mark: 0,
+            io_wait: false,
         }
     );
     assert!(send.is_empty(), "a parked statement emits no wire output");

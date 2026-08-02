@@ -176,6 +176,17 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    fn take_prefetch(
+        &mut self,
+        id: &super::BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, super::BlockType)>, super::StoreError> {
+        match self {
+            Layer::Base(store) => store.take_prefetch(id, into),
+            Layer::Disk(cache) => cache.take_prefetch(id, into),
+        }
+    }
+
     fn async_read_slots(&self) -> usize {
         match self {
             Layer::Base(store) => store.async_read_slots(),
@@ -276,6 +287,17 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(cache) => cache.prefetch(id),
             TieredStore::WithoutRam(layer) => layer.prefetch(id),
+        }
+    }
+
+    fn take_prefetch(
+        &mut self,
+        id: &super::BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, super::BlockType)>, super::StoreError> {
+        match self {
+            TieredStore::WithRam(cache) => cache.take_prefetch(id, into),
+            TieredStore::WithoutRam(layer) => layer.take_prefetch(id, into),
         }
     }
 

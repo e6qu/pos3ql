@@ -250,6 +250,18 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
         Ok(())
     }
 
+    fn take_prefetch(
+        &mut self,
+        id: &BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        let Some((len, block_type)) = self.inner.take_prefetch(id, into)? else {
+            return Ok(None);
+        };
+        self.admit(*id, block_type, 0, &into[..len]);
+        Ok(Some((len, block_type)))
+    }
+
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         if self.index.get(id).is_some() {
             return Ok(true);

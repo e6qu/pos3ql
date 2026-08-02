@@ -812,8 +812,11 @@ body remains owned by its request slot until the demand read consumes it, and
 RAM/disk tiers pass the request through without inventing a buffer or a second
 GET. The one-block lookahead is bounded by the configured GET-slot pool; a
 full pool simply cannot schedule another optional lookahead, while provider
-errors surface through the normal demand read. Cross-leaf lookahead, ranged-GET coalescing, and p95
-hedging remain separate scheduler work. The remaining Pillars 2–4 work is
+errors surface through the normal demand read. Cross-leaf lookahead now keeps
+the same ownership contract: a cursor schedules the next index leaf, takes
+only that completed speculative body, then schedules the leaf's first data
+block before crossing the boundary. Ranged-GET coalescing and p95 hedging
+remain separate scheduler work. The remaining Pillars 2–4 work is
 coalescing/hedging, the block-at-a-time executor, and PAX
 late materialization described above.
 

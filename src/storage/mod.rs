@@ -2479,6 +2479,8 @@ struct MemberCursor {
     /// and how many bytes of it are the block (the buffer is oversized).
     loaded: Option<usize>,
     loaded_len: usize,
+    prefetched_leaf: Option<(usize, crate::store::BlockId)>,
+    prefetched_data: Option<(usize, crate::store::BlockId)>,
     /// The head entry, parsed as one immutable row-version key.
     head: Option<(crate::store::SstKey, bool, u32)>,
     done: bool,
@@ -5358,6 +5360,8 @@ impl Storage {
             offset: 0,
             loaded: None,
             loaded_len: 0,
+            prefetched_leaf: None,
+            prefetched_data: None,
             head: None,
             done: false,
         }; MAX_SPILL_SSTS];
@@ -5458,24 +5462,60 @@ impl Storage {
         }
         let handle = table.spill_ssts[member].expect("cursor members exist");
         loop {
+            if let Some((ordinal, leaf)) = cursor.prefetched_leaf {
+                let mut blocks = spill.blocks.borrow_mut();
+                if let Some(id) = crate::store::take_prefetched_index_first_data(
+                    &mut *blocks,
+                    &leaf,
+                    &mut context.index_buf,
+                    handle.versioned,
+                )
+                .map_err(spill_read_error)?
+                {
+                    crate::store::prefetch_data_block(&mut *blocks, Some(id))
+                        .map_err(spill_read_error)?;
+                    cursor.prefetched_leaf = None;
+                    cursor.prefetched_data = Some((ordinal, id));
+                }
+            }
             if cursor.loaded != Some(cursor.ordinal) {
                 let mut blocks = spill.blocks.borrow_mut();
                 // Both index shapes resolve through one helper; the index
                 // buffer is scratch for the descent and the decompression
                 // bounce alike.
-                let Some((id, next)) = crate::store::locate_data_block_with_next(
-                    &mut *blocks,
-                    &handle,
-                    &mut context.index_buf,
-                    cursor.ordinal,
-                )
-                .map_err(spill_read_error)?
-                else {
-                    cursor.done = true;
-                    return Ok(());
+                let id = if let Some((ordinal, id)) = cursor.prefetched_data
+                    && ordinal == cursor.ordinal
+                {
+                    cursor.prefetched_data = None;
+                    id
+                } else {
+                    let Some((id, next)) = crate::store::locate_data_block_with_next(
+                        &mut *blocks,
+                        &handle,
+                        &mut context.index_buf,
+                        cursor.ordinal,
+                    )
+                    .map_err(spill_read_error)?
+                    else {
+                        cursor.done = true;
+                        return Ok(());
+                    };
+                    match next {
+                        Some(crate::store::DataBlockLookahead::Data(next)) => {
+                            crate::store::prefetch_data_block(&mut *blocks, Some(next))
+                                .map_err(spill_read_error)?;
+                            cursor.prefetched_data = Some((cursor.ordinal + 1, next));
+                        }
+                        Some(crate::store::DataBlockLookahead::Leaf(leaf)) => {
+                            crate::store::BlockStore::prefetch(&mut *blocks, &leaf).map_err(
+                                |error| spill_read_error(crate::store::SstError::Store(error)),
+                            )?;
+                            cursor.prefetched_leaf = Some((cursor.ordinal + 1, leaf));
+                        }
+                        None => {}
+                    }
+                    id
                 };
-                crate::store::prefetch_data_block(&mut *blocks, next)
-                    .map_err(spill_read_error)?;
                 cursor.loaded_len = crate::store::read_data_block(
                     &mut *blocks,
                     &id,

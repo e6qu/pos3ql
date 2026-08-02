@@ -280,6 +280,27 @@ impl BlockStore for OwnedObjectStore {
         Ok(())
     }
 
+    fn take_prefetch(
+        &mut self,
+        id: &BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        for slot in self.slots.as_mut_slice() {
+            if slot.pending_id == Some(*id) {
+                return Ok(None);
+            }
+            if slot.ready_id == Some(*id) {
+                slot.ready_id = None;
+                return decode_block_body(slot.client.body_bytes(), id, into).map(Some);
+            }
+            if slot.error_id == Some(*id) {
+                slot.error_id = None;
+                return Err(slot.pending_error.take().expect("checked above"));
+            }
+        }
+        Ok(None)
+    }
+
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
@@ -462,7 +483,10 @@ mod tests {
         }
         assert!(complete, "mock object response did not complete");
         let mut output = [0u8; 64];
-        assert_eq!(store.get(&id, &mut output).unwrap(), (payload.len(), BlockType::SstData));
+        assert_eq!(
+            store.take_prefetch(&id, &mut output).unwrap(),
+            Some((payload.len(), BlockType::SstData))
+        );
         assert_eq!(&output[..payload.len()], payload);
         server.join().unwrap();
     }

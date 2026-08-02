@@ -562,6 +562,8 @@ pub(crate) struct SstCursor {
     offset: usize,
     data_len: usize,
     loaded: bool,
+    prefetched_leaf: Option<(usize, BlockId)>,
+    prefetched_data: Option<(usize, BlockId)>,
     done: bool,
 }
 
@@ -573,6 +575,8 @@ impl SstCursor {
             offset: 0,
             data_len: 0,
             loaded: false,
+            prefetched_leaf: None,
+            prefetched_data: None,
             done: false,
         }
     }
@@ -594,14 +598,27 @@ impl SstCursor {
             if self.done {
                 return Ok(None);
             }
+            self.advance_lookahead(store, index)?;
             if !self.loaded || self.offset >= self.data_len {
-                let Some((id, next)) =
-                    locate_data_block_with_next(store, &self.handle, index, self.block_ordinal)?
-                else {
-                    self.done = true;
-                    return Ok(None);
+                let id = if let Some((ordinal, id)) = self.prefetched_data
+                    && ordinal == self.block_ordinal
+                {
+                    self.prefetched_data = None;
+                    id
+                } else {
+                    let Some((id, next)) = locate_data_block_with_next(
+                        store,
+                        &self.handle,
+                        index,
+                        self.block_ordinal,
+                    )?
+                    else {
+                        self.done = true;
+                        return Ok(None);
+                    };
+                    self.schedule_lookahead(store, self.block_ordinal + 1, next)?;
+                    id
                 };
-                prefetch_data_block(store, next)?;
                 self.data_len = read_data_block(store, &id, data, bounce)?;
                 self.block_ordinal += 1;
                 self.offset = 0;
@@ -634,6 +651,51 @@ impl SstCursor {
             return Ok(Some((entry.key.rowid, entry.total_len)));
         }
     }
+
+    fn schedule_lookahead(
+        &mut self,
+        store: &mut dyn BlockStore,
+        ordinal: usize,
+        next: Option<DataBlockLookahead>,
+    ) -> Result<(), SstError> {
+        match next {
+            Some(DataBlockLookahead::Data(id)) => {
+                prefetch_data_block(store, Some(id))?;
+                self.prefetched_data = Some((ordinal, id));
+            }
+            Some(DataBlockLookahead::Leaf(id)) => {
+                store.prefetch(&id)?;
+                self.prefetched_leaf = Some((ordinal, id));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn advance_lookahead(
+        &mut self,
+        store: &mut dyn BlockStore,
+        index: &mut [u8],
+    ) -> Result<(), SstError> {
+        let Some((ordinal, leaf)) = self.prefetched_leaf else {
+            return Ok(());
+        };
+        let Some(id) =
+            take_prefetched_index_first_data(store, &leaf, index, self.handle.versioned)?
+        else {
+            return Ok(());
+        };
+        self.prefetched_leaf = None;
+        prefetch_data_block(store, Some(id))?;
+        self.prefetched_data = Some((ordinal, id));
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DataBlockLookahead {
+    Data(BlockId),
+    Leaf(BlockId),
 }
 
 /// One SST's best version for a snapshot. `len == None` is a deletion marker.
@@ -678,6 +740,21 @@ pub(crate) fn prefetch_data_block(
         return Ok(());
     }
     store.prefetch(&id).map_err(SstError::Store)
+}
+
+/// Decodes one completed prefetched index leaf and returns its first data
+/// block identity. The transfer is confined to the scheduler's named request.
+pub(crate) fn take_prefetched_index_first_data(
+    store: &mut dyn BlockStore,
+    id: &BlockId,
+    into: &mut [u8],
+    versioned: bool,
+) -> Result<Option<BlockId>, SstError> {
+    let Some((_, block_type)) = store.take_prefetch(id, into)? else {
+        return Ok(None);
+    };
+    validate_index_type(block_type, versioned)?;
+    Ok(Some(block_id_at(into, 0, versioned)))
 }
 
 impl<'a> SstReader<'a> {
@@ -1104,7 +1181,7 @@ pub(crate) fn locate_data_block_with_next(
     handle: &SstHandle,
     buf: &mut [u8],
     ordinal: usize,
-) -> Result<Option<(BlockId, Option<BlockId>)>, SstError> {
+) -> Result<Option<(BlockId, Option<DataBlockLookahead>)>, SstError> {
     load_index(store, &handle.index, buf, handle.versioned)?;
     let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if head != INDEX_ROOT_MAGIC {
@@ -1112,7 +1189,8 @@ pub(crate) fn locate_data_block_with_next(
         if ordinal >= count {
             return Ok(None);
         }
-        let next = (ordinal + 1 < count).then(|| block_id_at(buf, ordinal + 1, handle.versioned));
+        let next = (ordinal + 1 < count)
+            .then(|| DataBlockLookahead::Data(block_id_at(buf, ordinal + 1, handle.versioned)));
         return Ok(Some((block_id_at(buf, ordinal, handle.versioned), next)));
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
@@ -1124,11 +1202,24 @@ pub(crate) fn locate_data_block_with_next(
         let count = u32::from_le_bytes(buf[at + key_bytes..at + key_bytes + 4].try_into().unwrap())
             as usize;
         if remaining < count {
+            let next_leaf = (leaf + 1 < leaves).then(|| {
+                let next_at = 8 + (leaf + 1) * entry_size;
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&buf[next_at + key_bytes + 4..next_at + entry_size]);
+                BlockId(id)
+            });
             let mut id = [0u8; 32];
             id.copy_from_slice(&buf[at + key_bytes + 4..at + entry_size]);
             load_index(store, &BlockId(id), buf, handle.versioned)?;
-            let next =
-                (remaining + 1 < count).then(|| block_id_at(buf, remaining + 1, handle.versioned));
+            let next = if remaining + 1 < count {
+                Some(DataBlockLookahead::Data(block_id_at(
+                    buf,
+                    remaining + 1,
+                    handle.versioned,
+                )))
+            } else {
+                next_leaf.map(DataBlockLookahead::Leaf)
+            };
             return Ok(Some((block_id_at(buf, remaining, handle.versioned), next)));
         }
         remaining -= count;
@@ -1248,6 +1339,11 @@ fn load_index(
     versioned: bool,
 ) -> Result<usize, SstError> {
     let (length, block_type) = store.get(id, into)?;
+    validate_index_type(block_type, versioned)?;
+    Ok(length)
+}
+
+fn validate_index_type(block_type: BlockType, versioned: bool) -> Result<(), SstError> {
     let expected = if versioned {
         BlockType::SstIndexV2
     } else {
@@ -1258,7 +1354,7 @@ fn load_index(
             super::BlockError::UnknownType,
         )));
     }
-    Ok(length)
+    Ok(())
 }
 
 /// One row read out of a data block. For an ordinary entry `head` is the
@@ -1771,6 +1867,7 @@ mod tests {
     struct LookaheadStore {
         inner: MemoryBlockStore,
         requested: Vec<BlockId>,
+        prefetched: Vec<BlockId>,
     }
 
     impl BlockStore for LookaheadStore {
@@ -1798,7 +1895,21 @@ mod tests {
 
         fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
             self.requested.push(*id);
+            self.prefetched.push(*id);
             Ok(())
+        }
+
+        fn take_prefetch(
+            &mut self,
+            id: &BlockId,
+            into: &mut [u8],
+        ) -> Result<Option<(usize, BlockType)>, StoreError> {
+            let Some(position) = self.prefetched.iter().position(|candidate| candidate == id)
+            else {
+                return Ok(None);
+            };
+            self.prefetched.swap_remove(position);
+            self.inner.get(id, into).map(Some)
         }
     }
 
@@ -1821,6 +1932,7 @@ mod tests {
         let mut store = LookaheadStore {
             inner,
             requested: Vec::new(),
+            prefetched: Vec::new(),
         };
         let arena = arena();
         let mut reader = SstReader::new(&arena).unwrap();
@@ -2041,6 +2153,54 @@ mod tests {
             lo = next;
         }
         assert_eq!(walked, written);
+
+        // The cursor turns the next leaf's completed index response into its
+        // first data-block prefetch before it crosses that leaf boundary.
+        let second_leaf_at = 8 + VERSIONED_ROOT_ENTRY;
+        let mut second_leaf = [0u8; 32];
+        second_leaf.copy_from_slice(&buf[second_leaf_at + 20..second_leaf_at + 52]);
+        let second_leaf = BlockId(second_leaf);
+        s.get(&second_leaf, &mut buf).unwrap();
+        let second_leaf_first_data = block_id_at(&buf, 0, true);
+        let mut lookahead = LookaheadStore {
+            inner: s,
+            requested: Vec::new(),
+            prefetched: Vec::new(),
+        };
+        let mut cursor = SstCursor::new(handle);
+        let mut index = vec![0u8; MAX_PAYLOAD];
+        let mut data = vec![0u8; MAX_PAYLOAD];
+        let mut bounce = vec![0u8; MAX_PAYLOAD];
+        let mut copy = vec![0u8; 128 * 1024];
+        let mut cursor_rows = 0;
+        while cursor
+            .next_copy(
+                &mut lookahead,
+                &mut index,
+                &mut data,
+                &mut bounce,
+                &mut copy,
+            )
+            .unwrap()
+            .is_some()
+        {
+            cursor_rows += 1;
+        }
+        assert_eq!(cursor_rows, written.len());
+        let leaf_at = lookahead
+            .requested
+            .iter()
+            .position(|id| *id == second_leaf)
+            .expect("second leaf scheduled");
+        let data_at = lookahead
+            .requested
+            .iter()
+            .position(|id| *id == second_leaf_first_data)
+            .expect("first data block from second leaf scheduled");
+        assert!(
+            leaf_at < data_at,
+            "leaf completion must reveal its data prefetch"
+        );
     }
 
     #[test]

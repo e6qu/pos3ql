@@ -72,11 +72,11 @@ pub(crate) mod lz4;
 #[cfg(test)]
 pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
+pub(crate) use sst::{DataBlockLookahead, SstCursor, SstHandle, SstKey, SstReader};
 pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
-pub(crate) use sst::{SstCursor, SstHandle, SstKey, SstReader};
 pub(crate) use sst::{
     block_keys_at, data_block_total, locate_data_block, locate_data_block_with_next,
-    prefetch_data_block, read_data_block,
+    prefetch_data_block, read_data_block, take_prefetched_index_first_data,
 };
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};
@@ -314,6 +314,17 @@ pub(crate) trait BlockStore {
     /// response when the cache stack has no resident tier.
     fn prefetch(&mut self, _id: &BlockId) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    /// Transfers a completed speculative response into `into`. `None` means
+    /// this request is still pending or was never scheduled; ordinary demand
+    /// reads retain ownership of every other response.
+    fn take_prefetch(
+        &mut self,
+        _id: &BlockId,
+        _into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        Ok(None)
     }
 
     /// Number of independently connected asynchronous read slots.

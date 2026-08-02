@@ -197,6 +197,18 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         Ok(())
     }
 
+    fn take_prefetch(
+        &mut self,
+        id: &BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        let Some((len, block_type)) = self.inner.take_prefetch(id, into)? else {
+            return Ok(None);
+        };
+        self.admit(*id, block_type, &into[..len]);
+        Ok(Some((len, block_type)))
+    }
+
     /// Presence in the cache proves presence in the store — a frame is only
     /// filled from a block the store accepted or returned — so a hit answers
     /// without a round trip. A miss has to ask, because the cache holds a

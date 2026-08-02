@@ -834,10 +834,11 @@ selected when the block cursor is cheaper. Repository formatting is now part
 of CI (`cargo fmt --check`), and the object-store regression bounds cold
 full-scan GETs while checking the selected plan is no more expensive.
 
-The deterministic storage-VOPR remains a crash/recovery guard, but the PR
-workflow runs a bounded four-seed, 100-step smoke sweep with a five-minute
-hard timeout. Longer sweeps are explicit seed/step invocations, keeping the
-merge gate responsive without hiding failures behind a best-effort timeout.
+The deterministic storage-VOPR keeps its 16-seed, 300-step endurance sweep,
+but distributes independent seeds over four bounded workers. The merge gate
+therefore targets five minutes rather than serially multiplying every
+checkpoint/restart/verification cost, with a 15-minute hard ceiling for
+runner variance.
 
 **External-execution slice (2026-07-30).** Physical scans now have a recycling
 mode: every join depth retains its bound outer rows while reusing row-local

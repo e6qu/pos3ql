@@ -64,12 +64,11 @@ jobs:
       - name: Test
         run: cargo test
 
-  # PR smoke sweep for the mid-flush / mid-compaction crash invariants. Keep
-  # this gate short and deterministic; deeper VOPR sweeps run explicitly from
-  # their seed/step knobs instead of stretching every PR's critical path.
+  # Independent deterministic seeds run on four bounded workers. This retains
+  # the endurance sweep while keeping the PR critical path near five minutes.
   storage-vopr:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -83,8 +82,8 @@ jobs:
           key: ${{ runner.os }}-cargo-vopr-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-vopr-
 
-      - name: Storage VOPR
+      - name: Storage VOPR (parallel extended sweep)
         run: cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
         env:
-          POS3QL_STORAGE_VOPR_SEEDS: 4
-          POS3QL_STORAGE_VOPR_STEPS: 100
+          POS3QL_STORAGE_VOPR_SEEDS: 16
+          POS3QL_STORAGE_VOPR_STEPS: 300

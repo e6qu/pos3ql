@@ -795,10 +795,14 @@ blocking the PostgreSQL socket loop: a miss preserves its block identity and
 response state in the startup-bounded object store, the server registers that
 one descriptor through its platform reactor, and the parked statement retries
 only after the exact response completes or reports its terminal storage error.
-Checkpoint publication waits for a registered read before it takes synchronous
-ownership of the same bounded client. The manifest and WAL clients remain synchronous so their statement-atomic
-durability contract does not change. The remaining Pillars 2–4 work is the
-fixed in-flight request pool, block-at-a-time executor, and PAX
+Checkpoint publication waits for registered reads before it takes synchronous
+ownership of the same bounded client. The block stack now has a configured,
+startup-bounded pool of independently connected GET slots; each holds its own
+request identity, response buffer, and terminal state until its parked caller
+consumes it, so concurrent cold reads neither overwrite nor re-fetch one
+another. The manifest and WAL clients remain synchronous so their statement-atomic
+durability contract does not change. The remaining Pillars 2–4 work is
+coalescing/prefetch/hedging, the block-at-a-time executor, and PAX
 late materialization described above.
 
 **External-execution slice (2026-07-30).** Physical scans now have a recycling

@@ -26,6 +26,34 @@
 // has it: an `expect` would be unfulfilled in the --tests build and fail it.
 #![allow(dead_code)]
 
+macro_rules! delegate_async_block_reads {
+    () => {
+        fn enable_async_gets(&mut self) {
+            self.inner.enable_async_gets();
+        }
+
+        fn disable_async_gets(&mut self) {
+            self.inner.disable_async_gets();
+        }
+
+        fn async_read_slots(&self) -> usize {
+            self.inner.async_read_slots()
+        }
+
+        fn async_reads_busy(&self) -> bool {
+            self.inner.async_reads_busy()
+        }
+
+        fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+            self.inner.pending_read_fd(slot)
+        }
+
+        fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
+            self.inner.advance_pending_read(slot)
+        }
+    };
+}
+
 mod bloom;
 mod cache;
 mod disk;
@@ -267,14 +295,25 @@ pub(crate) trait BlockStore {
 
     fn disable_async_gets(&mut self) {}
 
+    /// Number of independently connected asynchronous read slots.
+    fn async_read_slots(&self) -> usize {
+        0
+    }
+
+    /// Whether any asynchronous slot still belongs to a caller, including a
+    /// completed body or terminal error awaiting that caller's retry.
+    fn async_reads_busy(&self) -> bool {
+        false
+    }
+
     /// The socket of an in-flight object read, if this store has one.
-    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn pending_read_fd(&self, _slot: usize) -> Option<std::os::fd::RawFd> {
         None
     }
 
     /// Advances an in-flight object read. `Ok(false)` means it remains
     /// pending; `Ok(true)` means it completed and its caller may retry.
-    fn advance_pending_read(&mut self) -> Result<bool, StoreError> {
+    fn advance_pending_read(&mut self, _slot: usize) -> Result<bool, StoreError> {
         Ok(false)
     }
 

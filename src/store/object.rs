@@ -13,6 +13,8 @@
 //! *different* block that is itself intact.
 
 use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
+use crate::mem::budget::Budget;
+use crate::mem::fixed_vec::FixedVec;
 
 use super::{BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, StoreError, decode, encode};
 
@@ -120,55 +122,77 @@ fn decode_block_body(
 /// The bucket store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
-    client: ObjectStore,
+    slots: FixedVec<ObjectReadSlot>,
     prefix: &'static str,
     scratch: Vec<u8>,
     stats: BlockIoStats,
-    /// Terminal result of the asynchronous read, returned by the parked
-    /// statement's retry instead of starting an unrelated second request.
-    pending_error: Option<StoreError>,
+}
+
+struct ObjectReadSlot {
+    client: ObjectStore,
     pending_id: Option<BlockId>,
     ready_id: Option<BlockId>,
+    error_id: Option<BlockId>,
+    pending_error: Option<StoreError>,
 }
 
 impl OwnedObjectStore {
     /// Startup-only: the scratch Vec is reserved once, before the allocator
     /// freezes, and never grows.
-    pub(crate) fn new(client: ObjectStore, prefix: &'static str) -> Self {
-        Self {
-            client,
+    pub(crate) fn new(
+        config: &crate::config::Config,
+        budget: &mut Budget,
+        prefix: &'static str,
+    ) -> Result<Self, crate::object_store::SetupError> {
+        let mut slots = FixedVec::new(budget, "object_store_get_slots", config.object_store_get_slots)
+            .map_err(crate::object_store::SetupError::Budget)?;
+        for _ in 0..config.object_store_get_slots {
+            slots
+                .push(ObjectReadSlot {
+                    client: ObjectStore::new(config, budget)?,
+                    pending_id: None,
+                    ready_id: None,
+                    error_id: None,
+                    pending_error: None,
+                })
+                .expect("object read slots sized from configuration");
+        }
+        Ok(Self {
+            slots,
             prefix,
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
-            pending_error: None,
-            pending_id: None,
-            ready_id: None,
-        }
+        })
     }
 
     fn enable_async_gets(&mut self) {
-        self.client.enable_async_gets();
+        for slot in self.slots.as_mut_slice() {
+            slot.client.enable_async_gets();
+        }
     }
 
     fn disable_async_gets(&mut self) {
-        self.client.disable_async_gets();
+        for slot in self.slots.as_mut_slice() {
+            slot.client.disable_async_gets();
+        }
     }
 
-    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
-        self.client.pending_get_fd()
+    fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        self.slots.get(slot)?.client.pending_get_fd()
     }
 
-    fn advance_pending_read(&mut self) -> Result<bool, StoreError> {
-        match self.client.advance_get() {
+    fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
+        let slot = self.slots.get_mut(slot).expect("reactor slot is bounded");
+        match slot.client.advance_get() {
             Ok(()) => {
-                self.ready_id = self.pending_id.take();
+                slot.ready_id = slot.pending_id.take();
                 Ok(true)
             }
             Err(ObjectError::WouldBlock) => Ok(false),
             Err(error) => {
-                self.client.clear_pending_get();
-                self.pending_error = Some(store_error(error));
-                self.pending_id = None;
+                slot.client.clear_pending_get();
+                slot.pending_error = Some(store_error(error));
+                slot.error_id = slot.pending_id.take();
                 Ok(true)
             }
         }
@@ -183,7 +207,7 @@ impl BlockStore for OwnedObjectStore {
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
         let result = put_block(
-            &mut self.client,
+            &mut self.slots[0].client,
             self.prefix,
             &mut self.scratch,
             payload,
@@ -195,19 +219,30 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        if let Some(error) = self.pending_error.take() {
-            return Err(error);
+        for slot in self.slots.as_mut_slice() {
+            if slot.pending_id == Some(*id) {
+                return Err(StoreError::NotReady);
+            }
+            if slot.ready_id == Some(*id) {
+                slot.ready_id = None;
+                return decode_block_body(slot.client.body_bytes(), id, into);
+            }
+            if slot.error_id == Some(*id) {
+                slot.error_id = None;
+                return Err(slot.pending_error.take().expect("checked above"));
+            }
         }
-        if self.ready_id == Some(*id) {
-            self.ready_id = None;
-            return decode_block_body(self.client.body_bytes(), id, into);
-        }
-        if self.pending_id.is_some() || self.ready_id.is_some() {
+        let Some(slot) = self.slots.iter_mut().find(|slot| {
+            slot.pending_id.is_none()
+                && slot.ready_id.is_none()
+                && slot.error_id.is_none()
+                && slot.pending_error.is_none()
+        }) else {
             return Err(StoreError::NotReady);
-        }
-        let result = get_block(&mut self.client, self.prefix, id, into);
+        };
+        let result = get_block(&mut slot.client, self.prefix, id, into);
         if matches!(result, Err(StoreError::NotReady)) {
-            self.pending_id = Some(*id);
+            slot.pending_id = Some(*id);
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
         result
@@ -217,7 +252,7 @@ impl BlockStore for OwnedObjectStore {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
         self.stats.object_contains = self.stats.object_contains.saturating_add(1);
-        match self.client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
+        match self.slots[0].client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
             Ok(_) => Ok(true),
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
@@ -236,12 +271,22 @@ impl BlockStore for OwnedObjectStore {
         self.disable_async_gets();
     }
 
-    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
-        self.pending_read_fd()
+    fn async_read_slots(&self) -> usize {
+        self.slots.len()
     }
 
-    fn advance_pending_read(&mut self) -> Result<bool, StoreError> {
-        self.advance_pending_read()
+    fn async_reads_busy(&self) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.pending_id.is_some() || slot.ready_id.is_some() || slot.error_id.is_some()
+        })
+    }
+
+    fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        self.pending_read_fd(slot)
+    }
+
+    fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
+        self.advance_pending_read(slot)
     }
 }
 
@@ -277,5 +322,63 @@ impl BlockStore for ObjectBlockStore<'_> {
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    use super::*;
+
+    #[test]
+    fn async_pool_owns_two_independent_block_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, proceed) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_nonblocking(true).unwrap();
+                let mut request = [0u8; 1024];
+                loop {
+                    match stream.read(&mut request) {
+                        Ok(0) => break,
+                        Ok(_) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::yield_now()
+                        }
+                        Err(error) => panic!("read request: {error}"),
+                    }
+                }
+            }
+            proceed.recv().unwrap();
+        });
+
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_endpoint = format!("127.0.0.1:{port}");
+        config.object_store_bucket = "pool-test".to_string();
+        config.object_store_access_key = "key".to_string();
+        config.object_store_secret_key = "secret".to_string();
+        config.object_store_get_slots = 2;
+        let mut budget = Budget::new(16 << 20);
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+
+        let first = BlockId::of(b"first");
+        let second = BlockId::of(b"second");
+        let mut output = [0u8; 32];
+        assert_eq!(store.get(&first, &mut output), Err(StoreError::NotReady));
+        assert_eq!(store.get(&second, &mut output), Err(StoreError::NotReady));
+        let first_fd = store.pending_read_fd(0).expect("first slot pending");
+        let second_fd = store.pending_read_fd(1).expect("second slot pending");
+        assert_ne!(first_fd, second_fd);
+        assert!(store.async_reads_busy());
+        drop(store);
+        release.send(()).unwrap();
+        server.join().unwrap();
     }
 }

@@ -116,6 +116,9 @@ pub struct Config {
     pub object_store_head_bytes: usize,
     /// Largest response body (bounds ranged GETs and LIST pages).
     pub object_store_response_bytes: usize,
+    /// Independently connected durable-block GET slots. Each reserves its
+    /// request and response buffers at startup; exhaustion parks the caller.
+    pub object_store_get_slots: usize,
     /// TLS to the object store (rustls, the single whitelisted dependency
     /// exception, isolated behind mem::guard::tls_scope).
     pub object_store_tls: bool,
@@ -182,6 +185,7 @@ impl Config {
             object_store_secret_key: String::new(),
             object_store_head_bytes: 16 * KIB,
             object_store_response_bytes: 4 * MIB,
+            object_store_get_slots: 4,
             object_store_tls: false,
             object_store_tls_ca_file: String::new(),
             tls_pool_bytes: 4 * MIB,
@@ -321,6 +325,7 @@ impl Config {
                 "object_store_secret_key" => config.object_store_secret_key = value.to_string(),
                 "object_store_head_bytes" => config.object_store_head_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
                 "object_store_response_bytes" => config.object_store_response_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "object_store_get_slots" => config.object_store_get_slots = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
                 "object_store_tls" => {
                     config.object_store_tls = match value {
                         "on" | "true" => true,
@@ -357,6 +362,12 @@ impl Config {
         // asynchronous backup of local disk. Every acknowledged WAL batch
         // must therefore be present there; RAM and disk remain caches.
         if config.object_store_on {
+            if config.object_store_get_slots == 0 {
+                return Err(ConfigError::at(
+                    0,
+                    "object_store_get_slots must be at least 1".to_string(),
+                ));
+            }
             if !seen.iter().any(|s| s == "wal_upload") {
                 config.wal_upload = true;
             }
@@ -561,6 +572,14 @@ sql_arena_bytes = 4096
         // The simulator mode is object storage too.
         let c = Config::parse("object_store = sim\n").unwrap();
         assert!(c.object_store_sim && c.wal_upload && c.wal_upload_sync);
+    }
+
+    #[test]
+    fn object_store_get_slots_are_fixed_and_nonzero() {
+        let c = Config::parse("object_store = on\nobject_store_get_slots = 7\n").unwrap();
+        assert_eq!(c.object_store_get_slots, 7);
+        let err = Config::parse("object_store = on\nobject_store_get_slots = 0\n").unwrap_err();
+        assert!(err.message.contains("at least 1"), "{err}");
     }
 
     #[test]

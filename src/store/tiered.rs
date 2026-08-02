@@ -162,17 +162,31 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
-    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn async_read_slots(&self) -> usize {
         match self {
-            Layer::Base(store) => store.pending_read_fd(),
-            Layer::Disk(cache) => cache.pending_read_fd(),
+            Layer::Base(store) => store.async_read_slots(),
+            Layer::Disk(cache) => cache.async_read_slots(),
         }
     }
 
-    fn advance_pending_read(&mut self) -> Result<bool, super::StoreError> {
+    fn async_reads_busy(&self) -> bool {
         match self {
-            Layer::Base(store) => store.advance_pending_read(),
-            Layer::Disk(cache) => cache.advance_pending_read(),
+            Layer::Base(store) => store.async_reads_busy(),
+            Layer::Disk(cache) => cache.async_reads_busy(),
+        }
+    }
+
+    fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        match self {
+            Layer::Base(store) => store.pending_read_fd(slot),
+            Layer::Disk(cache) => cache.pending_read_fd(slot),
+        }
+    }
+
+    fn advance_pending_read(&mut self, slot: usize) -> Result<bool, super::StoreError> {
+        match self {
+            Layer::Base(store) => store.advance_pending_read(slot),
+            Layer::Disk(cache) => cache.advance_pending_read(slot),
         }
     }
 
@@ -237,17 +251,31 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         }
     }
 
-    fn pending_read_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn async_read_slots(&self) -> usize {
         match self {
-            TieredStore::WithRam(cache) => cache.pending_read_fd(),
-            TieredStore::WithoutRam(layer) => layer.pending_read_fd(),
+            TieredStore::WithRam(cache) => cache.async_read_slots(),
+            TieredStore::WithoutRam(layer) => layer.async_read_slots(),
         }
     }
 
-    fn advance_pending_read(&mut self) -> Result<bool, super::StoreError> {
+    fn async_reads_busy(&self) -> bool {
         match self {
-            TieredStore::WithRam(cache) => cache.advance_pending_read(),
-            TieredStore::WithoutRam(layer) => layer.advance_pending_read(),
+            TieredStore::WithRam(cache) => cache.async_reads_busy(),
+            TieredStore::WithoutRam(layer) => layer.async_reads_busy(),
+        }
+    }
+
+    fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        match self {
+            TieredStore::WithRam(cache) => cache.pending_read_fd(slot),
+            TieredStore::WithoutRam(layer) => layer.pending_read_fd(slot),
+        }
+    }
+
+    fn advance_pending_read(&mut self, slot: usize) -> Result<bool, super::StoreError> {
+        match self {
+            TieredStore::WithRam(cache) => cache.advance_pending_read(slot),
+            TieredStore::WithoutRam(layer) => layer.advance_pending_read(slot),
         }
     }
 

@@ -1537,22 +1537,34 @@ impl Engine {
         }
     }
 
-    pub(crate) fn pending_block_read_fd(&self) -> Option<std::os::fd::RawFd> {
+    pub(crate) fn block_read_slots(&self) -> usize {
         self.ckpt
             .as_ref()
-            .and_then(crate::checkpoint::Checkpointer::pending_block_read_fd)
+            .map_or(0, crate::checkpoint::Checkpointer::block_read_slots)
+    }
+
+    pub(crate) fn pending_block_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        self.ckpt
+            .as_ref()
+            .and_then(|checkpointer| checkpointer.pending_block_read_fd(slot))
+    }
+
+    fn block_reads_pending(&self) -> bool {
+        self.ckpt
+            .as_ref()
+            .is_some_and(crate::checkpoint::Checkpointer::block_reads_busy)
     }
 
     /// Advances a pending block read. A completed read or a terminal failure
     /// both wake parked statements; the retry then consumes the cached block
     /// or returns the real storage error.
     pub(crate) fn advance_pending_block_read(
-        &mut self,
+        &mut self, slot: usize,
     ) -> Result<bool, crate::store::StoreError> {
         let Some(checkpointer) = self.ckpt.as_mut() else {
             return Ok(false);
         };
-        checkpointer.advance_pending_block_read()
+        checkpointer.advance_pending_block_read(slot)
     }
 
     fn validate_maintenance_targets(
@@ -1806,7 +1818,7 @@ impl Engine {
     pub fn maybe_checkpoint(&mut self) -> bool {
         // A suspended read owns the sole block client until the reactor
         // completes it. Checkpoint publication uses that client synchronously.
-        if self.pending_block_read_fd().is_some() {
+        if self.block_reads_pending() {
             return true;
         }
         let Some(ckpt) = self.ckpt.as_mut() else {
@@ -3049,6 +3061,12 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if statement_writes(statement) && self.block_reads_pending() {
+            return Ok(Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "durable block reads in progress"
+            )));
+        }
         if statement_writes(statement) {
             self.disable_async_block_reads();
         }

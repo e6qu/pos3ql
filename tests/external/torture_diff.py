@@ -19,6 +19,7 @@ import argparse
 import os
 import random
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -51,6 +52,21 @@ def connect_pg():
         dbname=os.environ.get("PGDATABASE", os.environ.get("PGUSER", "postgres")),
         autocommit=True,
     )
+
+
+def wait_for_bindable_port(port):
+    """Wait until the exact bind a replacement server needs can succeed."""
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", port))
+            return
+        except OSError:
+            time.sleep(0.1)
+        finally:
+            probe.close()
+    raise RuntimeError(f"port {port} did not become bindable after crash")
 
 
 class P3Server:
@@ -212,16 +228,9 @@ def main():
         if cold:
             total_cold += 1
             server.wipe_data()
-        # The killed listener's port can linger for a moment; binding into it
-        # fails the whole run, so wait until it is genuinely free.
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            probe = subprocess.run(
-                f"lsof -ti tcp:{port} -sTCP:LISTEN", shell=True, capture_output=True
-            )
-            if not probe.stdout.strip():
-                break
-            time.sleep(0.1)
+        # A vanished listener is insufficient: the kernel can still reject
+        # the replacement's bind while post-kill sockets unwind.
+        wait_for_bindable_port(port)
         server.start()
         p3 = server.connect()
         p3c = p3.cursor()

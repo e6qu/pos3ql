@@ -162,6 +162,20 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    fn async_gets_enabled(&self) -> bool {
+        match self {
+            Layer::Base(store) => store.async_gets_enabled(),
+            Layer::Disk(cache) => cache.async_gets_enabled(),
+        }
+    }
+
+    fn prefetch(&mut self, id: &super::BlockId) -> Result<(), super::StoreError> {
+        match self {
+            Layer::Base(store) => store.prefetch(id),
+            Layer::Disk(cache) => cache.prefetch(id),
+        }
+    }
+
     fn async_read_slots(&self) -> usize {
         match self {
             Layer::Base(store) => store.async_read_slots(),
@@ -248,6 +262,20 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(cache) => cache.disable_async_gets(),
             TieredStore::WithoutRam(layer) => layer.disable_async_gets(),
+        }
+    }
+
+    fn async_gets_enabled(&self) -> bool {
+        match self {
+            TieredStore::WithRam(cache) => cache.async_gets_enabled(),
+            TieredStore::WithoutRam(layer) => layer.async_gets_enabled(),
+        }
+    }
+
+    fn prefetch(&mut self, id: &super::BlockId) -> Result<(), super::StoreError> {
+        match self {
+            TieredStore::WithRam(cache) => cache.prefetch(id),
+            TieredStore::WithoutRam(layer) => layer.prefetch(id),
         }
     }
 

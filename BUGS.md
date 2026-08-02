@@ -9,6 +9,10 @@ See [docs/terminology.md](docs/terminology.md) for the glossary and naming
 rules; architecture is in [README.md](README.md), the roadmap in
 [PLAN.md](PLAN.md), and standing directives in [AGENTS.md](AGENTS.md).
 
+Last reviewed: 2026-08-02. The bounded SST scan-prefetch work introduced no
+unresolved defect; its request-ownership and lookahead order are covered by
+focused block-store tests in the same change.
+
 | ID | Status | Found | Description | Repro | Fixed in |
 |----|--------|-------|-------------|-------|----------|
 | B-285 | fixed | 2026-08-02 | **The first reactor-driven S3 GET draft registered a socket from the checkpointer's manifest/WAL client, but spilled-table and external-run reads use the separate client nested in the tiered block store.** A cold query could therefore park on a descriptor that never advanced its own request; even a completed response was discarded and retried as a second GET. Separately, those readers serialized the expected `NotReady` state as a client-visible 58030 instead of parking, and parking an I/O wait under sentinel generation zero meant it could remain dormant while the lock generation was also zero. An automatic checkpoint could also attempt to change a live block client back to synchronous mode. The block-store trait now carries the bounded async-read state through every cache layer, preserving the requested block identity and completed response until the parked statement consumes it; both spill and external-run error choke points map that state to the internal I/O wait. Connection state now distinguishes I/O readiness from lock-generation waits. The server registers exactly that descriptor through its cross-platform reactor, and checkpoint publication waits for that registered operation before taking synchronous ownership; registration failures surface from the loop rather than being ignored. | `cargo test async_get_completes_without_a_second_request --lib`; `POS3QL_RUN_GROUPS=overlay,ingest,tls zsh tests/external/run.sh`; MinIO crash torture with a cold spilled read | this PR |

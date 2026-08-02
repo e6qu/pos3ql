@@ -36,6 +36,10 @@ macro_rules! delegate_async_block_reads {
             self.inner.disable_async_gets();
         }
 
+        fn async_gets_enabled(&self) -> bool {
+            self.inner.async_gets_enabled()
+        }
+
         fn async_read_slots(&self) -> usize {
             self.inner.async_read_slots()
         }
@@ -70,7 +74,10 @@ pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
 pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
 pub(crate) use sst::{SstCursor, SstHandle, SstKey, SstReader};
-pub(crate) use sst::{block_keys_at, data_block_total, locate_data_block, read_data_block};
+pub(crate) use sst::{
+    block_keys_at, data_block_total, locate_data_block, locate_data_block_with_next,
+    prefetch_data_block, read_data_block,
+};
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};
 pub(crate) use value::{
@@ -294,6 +301,20 @@ pub(crate) trait BlockStore {
     fn enable_async_gets(&mut self) {}
 
     fn disable_async_gets(&mut self) {}
+
+    /// Whether this stack currently turns GETs into reactor-owned requests.
+    /// A scan uses this to schedule lookahead only when the request can remain
+    /// in flight while it consumes its current block.
+    fn async_gets_enabled(&self) -> bool {
+        false
+    }
+
+    /// Schedules a read without transferring its completed body to a caller.
+    /// The later `get` for `id` owns that transfer, so a prefetch cannot lose a
+    /// response when the cache stack has no resident tier.
+    fn prefetch(&mut self, _id: &BlockId) -> Result<(), StoreError> {
+        Ok(())
+    }
 
     /// Number of independently connected asynchronous read slots.
     fn async_read_slots(&self) -> usize {

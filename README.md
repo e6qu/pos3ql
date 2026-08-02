@@ -58,6 +58,9 @@ static-memory discipline holds everywhere else.
 The documented durable-storage settings use the `object_store*` prefix.
 Existing `s3*` settings remain strict compatibility aliases; configuring both
 names for one setting is an error rather than an override.
+`object_store_hedge_after_ms` configures a duplicate read deadline for a
+stalled block GET; zero disables hedging, and any duplicate uses only a spare
+startup-bounded GET slot.
 
 ## Status
 

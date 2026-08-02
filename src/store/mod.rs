@@ -55,6 +55,14 @@ macro_rules! delegate_async_block_reads {
         fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
             self.inner.advance_pending_read(slot)
         }
+
+        fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
+            self.inner.next_hedge_deadline()
+        }
+
+        fn issue_due_hedges(&mut self, now: std::time::Instant) {
+            self.inner.issue_due_hedges(now);
+        }
     };
 }
 
@@ -348,6 +356,16 @@ pub(crate) trait BlockStore {
     fn advance_pending_read(&mut self, _slot: usize) -> Result<bool, StoreError> {
         Ok(false)
     }
+
+    /// The next configured p95 hedge deadline for a pending object read.
+    fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    /// Starts every due duplicate GET that fits in the startup-bounded slot
+    /// pool. A hedge is best-effort scheduling; its winner still transfers
+    /// through the ordinary demand read.
+    fn issue_due_hedges(&mut self, _now: std::time::Instant) {}
 
     /// Cumulative provider-neutral I/O counters for this store stack.
     ///

@@ -816,8 +816,11 @@ errors surface through the normal demand read. Cross-leaf lookahead now keeps
 the same ownership contract: a cursor schedules the next index leaf, takes
 only that completed speculative body, then schedules the leaf's first data
 block before crossing the boundary. Ranged-GET coalescing and p95 hedging
-remain separate scheduler work. The remaining Pillars 2–4 work is
-coalescing/hedging, the block-at-a-time executor, and PAX
+remain separate scheduler work. A configured hedge is now available too:
+`object_store_hedge_after_ms` starts one duplicate of a still-pending GET on a
+spare fixed slot after that deadline (zero disables it); the first verified
+body wins and releases its sibling. The remaining Pillars 2–4 work is
+coalescing, the block-at-a-time executor, and PAX
 late materialization described above.
 
 **External-execution slice (2026-07-30).** Physical scans now have a recycling

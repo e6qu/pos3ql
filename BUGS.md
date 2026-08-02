@@ -9,9 +9,10 @@ See [docs/terminology.md](docs/terminology.md) for the glossary and naming
 rules; architecture is in [README.md](README.md), the roadmap in
 [PLAN.md](PLAN.md), and standing directives in [AGENTS.md](AGENTS.md).
 
-Last reviewed: 2026-08-02. The bounded SST scan-prefetch work, including
-cross-leaf request ownership, introduced no unresolved defect; focused
-block-store and two-level SST traversal tests cover the order and transfer.
+Last reviewed: 2026-08-02. The bounded SST scan-prefetch and configured
+hedged-GET work introduced no unresolved defect; focused block-store and
+two-level SST traversal tests cover request order, ownership transfer, and
+hedge winner release.
 
 | ID | Status | Found | Description | Repro | Fixed in |
 |----|--------|-------|-------------|-------|----------|

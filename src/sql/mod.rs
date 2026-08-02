@@ -1567,6 +1567,18 @@ impl Engine {
         checkpointer.advance_pending_block_read(slot)
     }
 
+    pub(crate) fn next_block_read_hedge_deadline(&self) -> Option<std::time::Instant> {
+        self.ckpt
+            .as_ref()
+            .and_then(crate::checkpoint::Checkpointer::next_block_read_hedge_deadline)
+    }
+
+    pub(crate) fn issue_due_block_read_hedges(&mut self, now: std::time::Instant) {
+        if let Some(checkpointer) = self.ckpt.as_mut() {
+            checkpointer.issue_due_block_read_hedges(now);
+        }
+    }
+
     fn validate_maintenance_targets(
         &self,
         targets: &[ast::MaintenanceTarget<'_>],

@@ -1051,7 +1051,7 @@ fn scan_source_mode<'a>(
             return Ok(false);
         }
         let join = &from.joins[0];
-        if !matches!(join.kind, JoinKind::Inner | JoinKind::Cross) {
+        if !matches!(join.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) {
             return Ok(false);
         }
         let probe_t = order[0];
@@ -1124,17 +1124,36 @@ fn scan_source_mode<'a>(
             })?;
 
             // Probe: scan the outer side once, resolving each row's key
-            // against the build table. Per-row decode and leaf-eval scratch
+            // against the build table. The outer side is iterated in the same
+            // sorted order the nested loop uses (rowid/offset), so un-ORDER-BY'd
+            // output matches byte-for-byte. Per-row decode and leaf-eval scratch
             // recycle; the build table (allocated above the mark) survives.
             let probe_slot = scope.slots[probe_t];
             let probe_def = scope.defs[probe_t].expect("resolved");
             let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
             probe_def.schema(&mut probe_schema);
             let probe_schema = &probe_schema[..probe_def.n_columns];
+            // Collect and sort the probe table's visible rows to match the
+            // nested loop's output order.
+            let probe_count = storage.visible_row_count(probe_slot, txid)?;
+            let probe_ordered = arena
+                .alloc_slice_with(probe_count.max(1), |_| {
+                    (0u64, crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }))
+                })
+                .map_err(|_| arena_full())?;
+            let mut probe_fill = 0usize;
             storage.for_each_row_state(probe_slot, &mut |rowid, state| {
-                let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? else {
-                    return Ok(ControlFlow::Continue(()));
-                };
+                if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
+                    probe_ordered[probe_fill] = (rowid, home);
+                    probe_fill += 1;
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            probe_ordered[..probe_fill].sort_unstable_by_key(|(rowid, home)| match home {
+                crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
+                crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
+            });
+            for &(rowid, home) in &probe_ordered[..probe_fill] {
                 let keep = recycled(arena, recycle_rows, || -> Result<bool, SqlError> {
                     check_timeout()?;
                     let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
@@ -1148,75 +1167,90 @@ fn scan_source_mode<'a>(
                             break;
                         }
                     }
-                    if any_null {
-                        return Ok(true);
-                    }
-                    let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
-                    let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
-                    while idx != u32::MAX {
-                        let entry = &entries[idx as usize];
-                        if entry.hash == hash {
-                            // Re-decode the build row's key columns on a hash
-                            // hit and compare each — collisions between different
-                            // keys are rare and rejected here.
-                            let mut build_buf = [Datum::Null; MAX_COLUMNS];
-                            rowenc::decode(entry.bytes, build_schema, &mut build_buf)?;
-                            let mut matched = true;
-                            for i in 0..nkeys {
-                                if !compare_datums(&build_buf[keys[i].1], &key_vals[i])?.is_eq() {
-                                    matched = false;
-                                    break;
+                    let mut matched_any = false;
+                    if !any_null {
+                        let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                        let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
+                        while idx != u32::MAX {
+                            let entry = &entries[idx as usize];
+                            if entry.hash == hash {
+                                let mut build_buf = [Datum::Null; MAX_COLUMNS];
+                                rowenc::decode(entry.bytes, build_schema, &mut build_buf)?;
+                                let mut matched = true;
+                                for i in 0..nkeys {
+                                    if !compare_datums(&build_buf[keys[i].1], &key_vals[i])?.is_eq() {
+                                        matched = false;
+                                        break;
+                                    }
                                 }
-                            }
-                            if matched {
-                                let bound = &mut [None, None];
-                                let bound_rowids = &mut [None, None];
-                                bound[probe_t] = Some(bytes);
-                                bound_rowids[probe_t] = Some(rowid);
-                                bound[build_t] = Some(entry.bytes);
-                                bound_rowids[build_t] = Some(entry.rowid);
-                                let row = assemble(
-                                    scope, bound, bound_rowids, order, 2, decode_buffers, arena,
-                                )?;
-                                if let Some(on) = on {
-                                    let chained = Chained { inner: &row, outer };
-                                    match eval_full(on, arena, params, &chained, hooks)? {
-                                        Datum::Bool(true) => {}
-                                        Datum::Bool(false) | Datum::Null => {
+                                if matched {
+                                    let bound = &mut [None, None];
+                                    let bound_rowids = &mut [None, None];
+                                    bound[probe_t] = Some(bytes);
+                                    bound_rowids[probe_t] = Some(rowid);
+                                    bound[build_t] = Some(entry.bytes);
+                                    bound_rowids[build_t] = Some(entry.rowid);
+                                    let row = assemble(
+                                        scope, bound, bound_rowids, order, 2, decode_buffers, arena,
+                                    )?;
+                                    if let Some(on) = on {
+                                        let chained = Chained { inner: &row, outer };
+                                        match eval_full(on, arena, params, &chained, hooks)? {
+                                            Datum::Bool(true) => {}
+                                            Datum::Bool(false) | Datum::Null => {
+                                                idx = next[idx as usize];
+                                                continue;
+                                            }
+                                            _ => {
+                                                return Err(sql_err!(
+                                                    sqlstate::DATATYPE_MISMATCH,
+                                                    "argument of JOIN/ON must be type boolean"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    matched_any = true;
+                                    if let Some(w) = where_clause {
+                                        let chained = Chained { inner: &row, outer };
+                                        if !where_passes(w, arena, params, &chained, hooks)? {
                                             idx = next[idx as usize];
                                             continue;
                                         }
-                                        _ => {
-                                            return Err(sql_err!(
-                                                sqlstate::DATATYPE_MISMATCH,
-                                                "argument of JOIN/ON must be type boolean"
-                                            ));
-                                        }
                                     }
-                                }
-                                if let Some(w) = where_clause {
-                                    let chained = Chained { inner: &row, outer };
-                                    if !where_passes(w, arena, params, &chained, hooks)? {
-                                        idx = next[idx as usize];
-                                        continue;
+                                    if !f(&row)? {
+                                        return Ok(false);
                                     }
-                                }
-                                if !f(&row)? {
-                                    return Ok(false);
                                 }
                             }
+                            idx = next[idx as usize];
                         }
-                        idx = next[idx as usize];
+                    }
+                    // LEFT JOIN: no ON-passing match (NULL key, or all candidates
+                    // rejected) → preserve the outer row with NULLs for the inner.
+                    if !matched_any && matches!(join.kind, JoinKind::Left) {
+                        let bound = &mut [None, None];
+                        let bound_rowids = &mut [None, None];
+                        bound[probe_t] = Some(bytes);
+                        bound_rowids[probe_t] = Some(rowid);
+                        let row = assemble(
+                            scope, bound, bound_rowids, order, 2, decode_buffers, arena,
+                        )?;
+                        if let Some(w) = where_clause {
+                            let chained = Chained { inner: &row, outer };
+                            if !where_passes(w, arena, params, &chained, hooks)? {
+                                return Ok(true);
+                            }
+                        }
+                        if !f(&row)? {
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
                 })?;
                 if !keep {
-                    // The consumer asked to stop early (e.g. LIMIT): short-circuit
-                    // the probe, but the hash join still handled the query.
-                    return Ok(ControlFlow::Break(()));
+                    break;
                 }
-                Ok(ControlFlow::Continue(()))
-            })?;
+            }
             Ok(true)
         })();
         match attempt {

@@ -9,9 +9,10 @@ See [docs/terminology.md](docs/terminology.md) for the glossary and naming
 rules; architecture is in [README.md](README.md), the roadmap in
 [PLAN.md](PLAN.md), and standing directives in [AGENTS.md](AGENTS.md).
 
-Last reviewed: 2026-08-03. Crash recovery now owns the killed server PID and
-the server listener explicitly permits safe immediate reuse after a crash;
-focused lifecycle tests cover the TCP rebind contract.
+Last reviewed: 2026-08-03. Crash recovery owns the killed server PID and the
+server listener explicitly permits safe immediate reuse after a crash; the
+cold merged-SST scan also has a fixed, recycling 128-row handoff to the
+executor, covered by the forced-cold query regression.
 
 | ID | Status | Found | Description | Repro | Fixed in |
 |----|--------|-------|-------------|-------|----------|

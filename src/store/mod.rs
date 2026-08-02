@@ -321,8 +321,8 @@ pub(crate) trait BlockStore {
     /// Schedules a read without transferring its completed body to a caller.
     /// The later `get` for `id` owns that transfer, so a prefetch cannot lose a
     /// response when the cache stack has no resident tier.
-    fn prefetch(&mut self, _id: &BlockId) -> Result<(), StoreError> {
-        Ok(())
+    fn prefetch(&mut self, _id: &BlockId) -> Result<PrefetchState, StoreError> {
+        Ok(PrefetchState::Unavailable)
     }
 
     /// Transfers a completed speculative response into `into`. `None` means
@@ -392,6 +392,20 @@ pub(crate) struct BlockIoStats {
     pub(crate) disk_hits: u64,
     pub(crate) disk_misses: u64,
     pub(crate) object_gets: u64,
+    /// Completed durable-block response bodies. This differs from issued GETs:
+    /// a hedge or failed request may never deliver a body.
+    pub(crate) object_read_completions: u64,
+    /// Payload bytes carried by completed durable-block GET responses.
+    pub(crate) object_read_bytes: u64,
+    /// Elapsed wall time awaiting completed durable-block GET responses.
+    /// Telemetry calibrates future plans only; it is not durable state.
+    pub(crate) object_read_micros: u64,
+    /// Speculative reads accepted into an owned fixed GET slot.
+    pub(crate) object_prefetch_scheduled: u64,
+    /// Speculative reads that reused an already-owned request or cache body.
+    pub(crate) object_prefetch_reused: u64,
+    /// Speculative reads refused because every fixed GET slot was owned.
+    pub(crate) object_prefetch_saturated: u64,
     pub(crate) object_puts: u64,
     pub(crate) object_contains: u64,
 }
@@ -404,10 +418,41 @@ impl BlockIoStats {
             disk_hits: self.disk_hits.saturating_sub(earlier.disk_hits),
             disk_misses: self.disk_misses.saturating_sub(earlier.disk_misses),
             object_gets: self.object_gets.saturating_sub(earlier.object_gets),
+            object_read_completions: self
+                .object_read_completions
+                .saturating_sub(earlier.object_read_completions),
+            object_read_bytes: self
+                .object_read_bytes
+                .saturating_sub(earlier.object_read_bytes),
+            object_read_micros: self
+                .object_read_micros
+                .saturating_sub(earlier.object_read_micros),
+            object_prefetch_scheduled: self
+                .object_prefetch_scheduled
+                .saturating_sub(earlier.object_prefetch_scheduled),
+            object_prefetch_reused: self
+                .object_prefetch_reused
+                .saturating_sub(earlier.object_prefetch_reused),
+            object_prefetch_saturated: self
+                .object_prefetch_saturated
+                .saturating_sub(earlier.object_prefetch_saturated),
             object_puts: self.object_puts.saturating_sub(earlier.object_puts),
             object_contains: self.object_contains.saturating_sub(earlier.object_contains),
         }
     }
+}
+
+/// The scheduler's explicit disposition for one speculative block request.
+/// A full bounded pool is not an error for a lookahead optimization, but it is
+/// observable rather than silently treated as if the request had been issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefetchState {
+    Scheduled,
+    Reused,
+    Saturated,
+    /// This stack cannot retain an asynchronous response. Callers must only
+    /// ask for prefetch after checking [`BlockStore::async_gets_enabled`].
+    Unavailable,
 }
 
 /// A block store's failures, kept separate from [`BlockError`] so a caller can

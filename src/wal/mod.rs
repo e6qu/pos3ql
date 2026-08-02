@@ -26,13 +26,14 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
     CheckConstraint, ColumnMeta, ColumnStatistics, DependencyClass, FkAction, ForeignKey,
-    MAX_COLUMNS, MAX_INDEX_COLS, OwnedDatum, RoleAttributes, SqlName, StoredQueryDependencies,
-    TableDef, TableStatistics, UniqueKey,
+    MAX_COLUMNS, MAX_INDEX_COLS, MAX_MULTICOLUMN_STATISTICS, MultiColumnStatistics, OwnedDatum,
+    RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
 };
 
 use crc32c::crc32c;
 
 const HEADER_LEN: usize = 24;
+const TABLE_STATISTICS_V2: u8 = u8::MAX;
 
 const KIND_CREATE: u8 = 1;
 const KIND_DROP: u8 = 2;
@@ -165,8 +166,10 @@ impl WalTableStatistics<'_> {
     fn encoded_len(self) -> usize {
         match self {
             Self::Captured(statistics) => {
-                8 + 4
+                1 + 8
+                    + 4
                     + 8
+                    + 1
                     + 1
                     + statistics
                         .columns
@@ -174,6 +177,12 @@ impl WalTableStatistics<'_> {
                         .filter(|column| column.valid)
                         .count()
                         * (1 + 4 + 8 + 4 + 4)
+                    + statistics
+                        .multi_columns
+                        .iter()
+                        .filter(|statistics| statistics.valid)
+                        .map(|statistics| 1 + statistics.n_columns as usize * 2 + 8 + 8)
+                        .sum::<usize>()
             }
             Self::Encoded(bytes) => bytes.len(),
         }
@@ -187,10 +196,17 @@ impl WalTableStatistics<'_> {
                     .iter()
                     .filter(|column| column.valid)
                     .count();
-                let mut ok = buffer.append(&statistics.rows.to_le_bytes())
+                let valid_multi_columns = statistics
+                    .multi_columns
+                    .iter()
+                    .filter(|statistics| statistics.valid)
+                    .count();
+                let mut ok = buffer.append(&[TABLE_STATISTICS_V2])
+                    && buffer.append(&statistics.rows.to_le_bytes())
                     && buffer.append(&statistics.average_row_width.to_le_bytes())
                     && buffer.append(&statistics.analyzed_generation.to_le_bytes())
-                    && buffer.append(&[valid_columns as u8]);
+                    && buffer.append(&[valid_columns as u8])
+                    && buffer.append(&[valid_multi_columns as u8]);
                 for (index, column) in statistics.columns.iter().enumerate() {
                     if !column.valid {
                         continue;
@@ -200,6 +216,18 @@ impl WalTableStatistics<'_> {
                         && buffer.append(&column.distinct_values.to_le_bytes())
                         && buffer.append(&column.distinct_fraction_ppm.to_le_bytes())
                         && buffer.append(&column.average_width.to_le_bytes());
+                }
+                for multi in statistics
+                    .multi_columns
+                    .iter()
+                    .filter(|statistics| statistics.valid)
+                {
+                    ok &= buffer.append(&[multi.n_columns]);
+                    for column in &multi.columns[..multi.n_columns as usize] {
+                        ok &= buffer.append(&column.to_le_bytes());
+                    }
+                    ok &= buffer.append(&multi.non_null_rows.to_le_bytes())
+                        && buffer.append(&multi.distinct_values.to_le_bytes());
                 }
                 ok
             }
@@ -1730,6 +1758,10 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
 
 fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
     let mut at = 0usize;
+    let version_two = payload.first().copied() == Some(TABLE_STATISTICS_V2);
+    if version_two {
+        at += 1;
+    }
     let rows = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
     at += 8;
     let average_row_width = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -1741,12 +1773,23 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
     if count > MAX_COLUMNS {
         return None;
     }
+    let multi_count = if version_two {
+        let count = *payload.get(at)? as usize;
+        at += 1;
+        if count > MAX_MULTICOLUMN_STATISTICS {
+            return None;
+        }
+        count
+    } else {
+        0
+    };
     let mut statistics = TableStatistics {
         valid: true,
         rows,
         average_row_width,
         analyzed_generation,
         columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
+        multi_columns: [MultiColumnStatistics::EMPTY; MAX_MULTICOLUMN_STATISTICS],
     };
     for _ in 0..count {
         let column = *payload.get(at)? as usize;
@@ -1774,6 +1817,41 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
             distinct_values,
             distinct_fraction_ppm,
             average_width,
+        };
+    }
+    for multi_index in 0..multi_count {
+        let n_columns = *payload.get(at)? as usize;
+        at += 1;
+        if !(2..=MAX_INDEX_COLS).contains(&n_columns) {
+            return None;
+        }
+        let mut columns = [0u16; MAX_INDEX_COLS];
+        for column in &mut columns[..n_columns] {
+            *column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            if usize::from(*column) >= MAX_COLUMNS {
+                return None;
+            }
+        }
+        let non_null_rows = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+        at += 8;
+        let distinct_values = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+        at += 8;
+        if statistics.multi_columns[..multi_index]
+            .iter()
+            .any(|existing| {
+                existing.n_columns as usize == n_columns
+                    && existing.columns[..n_columns] == columns[..n_columns]
+            })
+        {
+            return None;
+        }
+        statistics.multi_columns[multi_index] = MultiColumnStatistics {
+            valid: true,
+            columns,
+            n_columns: n_columns as u8,
+            non_null_rows,
+            distinct_values,
         };
     }
     (at == payload.len()).then_some(statistics)

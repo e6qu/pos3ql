@@ -17,7 +17,10 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
 use std::time::{Duration, Instant};
 
-use super::{BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, StoreError, decode, encode};
+use super::{
+    BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, PrefetchState, StoreError, decode,
+    encode,
+};
 
 /// Blocks kept as objects under a key prefix.
 pub(crate) struct ObjectBlockStore<'c> {
@@ -186,6 +189,15 @@ impl OwnedObjectStore {
         self.async_gets_enabled = true;
     }
 
+    fn record_completed_read(&mut self, started: Instant, bytes: usize) {
+        self.stats.object_read_completions = self.stats.object_read_completions.saturating_add(1);
+        self.stats.object_read_bytes = self.stats.object_read_bytes.saturating_add(bytes as u64);
+        self.stats.object_read_micros = self
+            .stats
+            .object_read_micros
+            .saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
     fn disable_async_gets(&mut self) {
         for slot in self.slots.as_mut_slice() {
             slot.client.disable_async_gets();
@@ -198,22 +210,32 @@ impl OwnedObjectStore {
     }
 
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
-        let slot = self.slots.get_mut(slot).expect("reactor slot is bounded");
-        match slot.client.advance_get() {
-            Ok(()) => {
-                slot.ready_id = slot.pending_id.take();
-                slot.started_at = None;
-                Ok(true)
+        let (result, completed) = {
+            let slot = self.slots.get_mut(slot).expect("reactor slot is bounded");
+            match slot.client.advance_get() {
+                Ok(()) => {
+                    let started = slot
+                        .started_at
+                        .take()
+                        .expect("pending GET has a start time");
+                    let bytes = slot.client.body_bytes().len();
+                    slot.ready_id = slot.pending_id.take();
+                    (Ok(true), Some((started, bytes)))
+                }
+                Err(ObjectError::WouldBlock) => (Ok(false), None),
+                Err(error) => {
+                    slot.client.clear_pending_get();
+                    slot.pending_error = Some(store_error(error));
+                    slot.error_id = slot.pending_id.take();
+                    slot.started_at = None;
+                    (Ok(true), None)
+                }
             }
-            Err(ObjectError::WouldBlock) => Ok(false),
-            Err(error) => {
-                slot.client.clear_pending_get();
-                slot.pending_error = Some(store_error(error));
-                slot.error_id = slot.pending_id.take();
-                slot.started_at = None;
-                Ok(true)
-            }
+        };
+        if let Some((started, bytes)) = completed {
+            self.record_completed_read(started, bytes);
         }
+        result
     }
 
     fn slot_is_free(slot: &ObjectReadSlot) -> bool {
@@ -283,24 +305,32 @@ impl OwnedObjectStore {
             .pending_id
             .expect("selected pending hedge source");
         self.slots[source_index].hedge_issued = true;
-        let destination = &mut self.slots[destination_index];
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, &id, &mut key_buffer);
-        match destination.client.get(key, None) {
-            Ok(_) => {
-                destination.ready_id = Some(id);
-                destination.hedge_issued = true;
+        let completed = {
+            let destination = &mut self.slots[destination_index];
+            match destination.client.get(key, None) {
+                Ok(result) => {
+                    destination.ready_id = Some(id);
+                    destination.hedge_issued = true;
+                    Some(result.len)
+                }
+                Err(ObjectError::WouldBlock) => {
+                    destination.pending_id = Some(id);
+                    destination.started_at = Some(now);
+                    destination.hedge_issued = true;
+                    None
+                }
+                Err(error) => {
+                    destination.error_id = Some(id);
+                    destination.pending_error = Some(store_error(error));
+                    destination.hedge_issued = true;
+                    None
+                }
             }
-            Err(ObjectError::WouldBlock) => {
-                destination.pending_id = Some(id);
-                destination.started_at = Some(now);
-                destination.hedge_issued = true;
-            }
-            Err(error) => {
-                destination.error_id = Some(id);
-                destination.pending_error = Some(store_error(error));
-                destination.hedge_issued = true;
-            }
+        };
+        if let Some(bytes) = completed {
+            self.record_completed_read(now, bytes);
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
     }
@@ -351,42 +381,65 @@ impl BlockStore for OwnedObjectStore {
             slot.hedge_issued = false;
             return Err(slot.pending_error.take().expect("checked above"));
         }
-        let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
-            return Err(StoreError::NotReady);
+        let started = Instant::now();
+        let result = {
+            let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
+                return Err(StoreError::NotReady);
+            };
+            let result = get_block(&mut slot.client, self.prefix, id, into);
+            if matches!(result, Err(StoreError::NotReady)) {
+                slot.pending_id = Some(*id);
+                slot.started_at = Some(started);
+            }
+            result
         };
-        let result = get_block(&mut slot.client, self.prefix, id, into);
-        if matches!(result, Err(StoreError::NotReady)) {
-            slot.pending_id = Some(*id);
-            slot.started_at = Some(Instant::now());
+        if let Ok((len, _)) = result {
+            self.record_completed_read(started, len);
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
         result
     }
 
-    fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
+    fn prefetch(&mut self, id: &BlockId) -> Result<PrefetchState, StoreError> {
         for slot in self.slots.as_mut_slice() {
             if slot.pending_id == Some(*id)
                 || slot.ready_id == Some(*id)
                 || slot.error_id == Some(*id)
             {
-                return Ok(());
+                self.stats.object_prefetch_reused =
+                    self.stats.object_prefetch_reused.saturating_add(1);
+                return Ok(PrefetchState::Reused);
             }
         }
-        let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
-            return Ok(());
-        };
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
-        match slot.client.get(key, None) {
-            Ok(_) => slot.ready_id = Some(*id),
-            Err(ObjectError::WouldBlock) => {
-                slot.pending_id = Some(*id);
-                slot.started_at = Some(Instant::now());
+        let started = Instant::now();
+        let completed = {
+            let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
+                self.stats.object_prefetch_saturated =
+                    self.stats.object_prefetch_saturated.saturating_add(1);
+                return Ok(PrefetchState::Saturated);
+            };
+            match slot.client.get(key, None) {
+                Ok(result) => {
+                    slot.ready_id = Some(*id);
+                    Some(result.len)
+                }
+                Err(ObjectError::WouldBlock) => {
+                    slot.pending_id = Some(*id);
+                    slot.started_at = Some(started);
+                    None
+                }
+                Err(error) => return Err(store_error(error)),
             }
-            Err(error) => return Err(store_error(error)),
+        };
+        if let Some(bytes) = completed {
+            self.record_completed_read(started, bytes);
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
-        Ok(())
+        self.stats.object_prefetch_scheduled =
+            self.stats.object_prefetch_scheduled.saturating_add(1);
+        Ok(PrefetchState::Scheduled)
     }
 
     fn take_prefetch(
@@ -608,7 +661,7 @@ mod tests {
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         store.enable_async_gets();
-        store.prefetch(&id).unwrap();
+        assert_eq!(store.prefetch(&id).unwrap(), PrefetchState::Scheduled);
         let mut complete = false;
         for _ in 0..10_000 {
             if store.advance_pending_read(0).unwrap() {
@@ -624,6 +677,12 @@ mod tests {
             Some((payload.len(), BlockType::SstData))
         );
         assert_eq!(&output[..payload.len()], payload);
+        let stats = store.io_stats();
+        assert_eq!(stats.object_prefetch_scheduled, 1);
+        assert_eq!(stats.object_prefetch_reused, 0);
+        assert_eq!(stats.object_prefetch_saturated, 0);
+        assert_eq!(stats.object_read_completions, 1);
+        assert_eq!(stats.object_read_bytes, framed_len as u64);
         server.join().unwrap();
     }
 

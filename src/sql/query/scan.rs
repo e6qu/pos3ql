@@ -1627,21 +1627,21 @@ fn scan_source_mode<'a>(
             if candidates.is_none() && storage.spill_rows_are_unshadowed(slot) {
                 let mut index = 0usize;
                 let mut aborted = false;
-                storage.for_each_spilled_row_bytes(
-                    slot,
-                    arena,
-                    recycle_rows,
-                    &mut |rowid, bytes| {
+                storage.for_each_spilled_row_batch(slot, arena, recycle_rows, &mut |rows| {
+                    for spilled in rows {
                         check_timeout()?;
                         let this = index;
                         index += 1;
-                        if !visit_candidate!(this, bytes, Some(rowid))? {
+                        let keep_scanning = recycled(arena, recycle_rows, || {
+                            visit_candidate!(this, spilled.bytes, Some(spilled.rowid))
+                        })?;
+                        if !keep_scanning {
                             aborted = true;
                             return Ok(core::ops::ControlFlow::Break(()));
                         }
-                        Ok(core::ops::ControlFlow::Continue(()))
-                    },
-                )?;
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })?;
                 if aborted {
                     return Ok(false);
                 }

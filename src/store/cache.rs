@@ -195,11 +195,11 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         Ok((len, block_type))
     }
 
-    fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
+    fn prefetch(&mut self, id: &BlockId) -> Result<super::PrefetchState, StoreError> {
         if self.index.get(id).is_none() {
-            self.inner.prefetch(id)?;
+            return self.inner.prefetch(id);
         }
-        Ok(())
+        Ok(super::PrefetchState::Reused)
     }
 
     fn take_prefetch(

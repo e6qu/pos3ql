@@ -1018,6 +1018,8 @@ impl Checkpointer {
                             analyzed_generation,
                             columns: [crate::storage::ColumnStatistics::EMPTY;
                                 crate::storage::MAX_COLUMNS],
+                            multi_columns: [crate::storage::MultiColumnStatistics::EMPTY;
+                                crate::storage::MAX_MULTICOLUMN_STATISTICS],
                         },
                     ));
                 }
@@ -1064,6 +1066,68 @@ impl Checkpointer {
                         distinct_values,
                         distinct_fraction_ppm,
                         average_width,
+                    };
+                }
+                Some("mcstat") => {
+                    let table_index: usize =
+                        parse_field(words.next(), "multi statistics table index")?;
+                    let n_columns: usize =
+                        parse_field(words.next(), "multi statistics column count")?;
+                    if !(2..=crate::storage::MAX_INDEX_COLS).contains(&n_columns) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "multi-column statistics width out of range",
+                        ));
+                    }
+                    let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+                    for column in &mut columns[..n_columns] {
+                        *column = parse_field(words.next(), "multi statistics column")?;
+                        if usize::from(*column) >= crate::storage::MAX_COLUMNS {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "multi-column statistics column out of range",
+                            ));
+                        }
+                    }
+                    let non_null_rows: u64 =
+                        parse_field(words.next(), "multi statistics non-null rows")?;
+                    let distinct_values: u64 =
+                        parse_field(words.next(), "multi statistics distinct values")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "malformed multi-column statistics",
+                        ));
+                    }
+                    let Some((_, statistics)) = table_statistics
+                        .iter_mut()
+                        .find(|(existing, _)| *existing == table_index)
+                    else {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "multi-column statistics precede table statistics",
+                        ));
+                    };
+                    if statistics.multi_columns.iter().any(|statistic| {
+                        statistic.valid
+                            && statistic.n_columns as usize == n_columns
+                            && statistic.columns[..n_columns] == columns[..n_columns]
+                    }) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate multi-column statistics",
+                        ));
+                    }
+                    let Some(slot) = statistics
+                        .multi_columns
+                        .iter_mut()
+                        .find(|statistic| !statistic.valid)
+                    else {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "too many multi-column statistics",
+                        ));
+                    };
+                    *slot = crate::storage::MultiColumnStatistics {
+                        valid: true,
+                        columns,
+                        n_columns: n_columns as u8,
+                        non_null_rows,
+                        distinct_values,
                     };
                 }
                 Some("tsch") => {
@@ -2599,6 +2663,31 @@ impl Checkpointer {
                             statistics.average_width
                         ),
                     )?;
+                }
+                for statistics in table
+                    .statistics
+                    .multi_columns
+                    .iter()
+                    .filter(|statistic| statistic.valid)
+                {
+                    use core::fmt::Write;
+                    let mut line = StackStr::<256>::new();
+                    let _ = write!(line, "mcstat {slot} {}", statistics.n_columns);
+                    for column in &statistics.columns[..statistics.n_columns as usize] {
+                        let _ = write!(line, " {column}");
+                    }
+                    let _ = write!(
+                        line,
+                        " {} {}",
+                        statistics.non_null_rows, statistics.distinct_values
+                    );
+                    if line.is_truncated() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "multi-column statistics manifest line exceeds its fixed buffer"
+                        ));
+                    }
+                    write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
                 }
             }
             for (ci, c) in table.def.columns().iter().enumerate() {

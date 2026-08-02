@@ -804,7 +804,6 @@ pub(crate) fn scan_source_recycling<'a>(
 }
 
 
-/// One build-side entry in a hash join's arena table: the decoded join key,
 /// One build-side entry: the join-key hash, the row's MVCC identity, and its
 /// encoded bytes (kept to assemble matches and re-decode the key on a hash
 /// hit, so any key width works without growing the entry).
@@ -1069,17 +1068,18 @@ fn scan_source_mode<'a>(
             return Ok(false);
         };
 
-        // Bound the build side so the arena table stays a cache, and rewind to
-        // a clean fallback if the estimate still overflows the statement arena.
+        // Cost-gate from ANALYZE's reltuples estimate, without a preliminary
+        // visibility scan that would fetch the build side twice. The selected
+        // fixed-capacity hash table fails loudly if a stale underestimate
+        // exceeds it; an overestimate merely leaves unused arena slots.
         let build_slot = scope.slots[build_t];
         let build_def = scope.defs[build_t].expect("resolved");
-        let build_count = storage.visible_row_count(build_slot, txid)?;
+        let build_count = storage.planning_row_estimate(build_slot) as usize;
         const MAX_HASH_ENTRIES: usize = 1 << 15;
         if build_count == 0 || build_count > MAX_HASH_ENTRIES {
             return Ok(false);
         }
-        let mark = arena.mark();
-        let attempt = (|| -> Result<bool, SqlError> {
+        let handled = (|| -> Result<bool, SqlError> {
             let buckets_len = (build_count * 2).next_power_of_two().max(16);
             let entries = arena
                 .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
@@ -1113,6 +1113,9 @@ fn scan_source_mode<'a>(
                 }
                 if any_null {
                     return Ok(ControlFlow::Continue(()));
+                }
+                if n == entries.len() {
+                    return Err(arena_full());
                 }
                 let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
                 let bucket = (hash as usize) & (buckets_len - 1);
@@ -1252,18 +1255,8 @@ fn scan_source_mode<'a>(
                 }
             }
             Ok(true)
-        })();
-        match attempt {
-            Ok(_) => Ok(true),
-            Err(e) if e.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => {
-                // The build side overflowed the statement arena: drop the hash
-                // table and run the ordinary nested loop instead. Nothing from
-                // the table is observed past the rewind.
-                unsafe { arena.rewind_to(mark) };
-                Ok(false)
-            }
-            Err(e) => Err(e),
-        }
+        })()?;
+        Ok(handled)
     }
 
     #[allow(clippy::too_many_arguments)]

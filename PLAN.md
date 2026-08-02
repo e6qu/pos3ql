@@ -782,8 +782,11 @@ base tables — single-column and multi-column keys (composite FKs, natural
 keys) — the inner side is built into an arena hash table keyed by the join
 column(s), the outer side probes it, so both tables are scanned once (O(N+M)
 reads, the right shape for cold object storage) instead of the nested loop's
-O(N·M). The equi-condition only generates candidates; the full ON and WHERE
-still run at the leaf, so a declined or arena-overflowing build falls back to
+O(N·M). The build uses the planner's `reltuples` estimate as its cost and
+arena-capacity gate, avoiding a preliminary visibility scan; a stale
+underestimate fails loudly at the fixed hash-table boundary. The equi-condition
+only generates candidates; the full ON and WHERE still run at the leaf, so a
+declined build uses
 the nested loop with identical results (verified against PostgreSQL 18:
 duplicates, NULL keys, unmatched keys, cross joins, residual conjuncts,
 aggregates, LIMIT early-stop, int-width-mixed keys, and multi-column keys).
